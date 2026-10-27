@@ -19,8 +19,8 @@ use pioneer_client::providers::diagnostics::{
     cli_runtime_mcp_readiness_reason_from_code,
 };
 use pioneer_client::providers::types::{
-    CLIAgentRuntimeKind, GatewayCliRuntimeInstanceSettings, RuntimeCapabilities,
-    RuntimeDiagnosticLevel, RuntimeStatus, RuntimeSummary,
+    GatewayCliRuntimeInstanceSettings, RuntimeCapabilities, RuntimeDiagnosticLevel, RuntimeStatus,
+    RuntimeSummary,
 };
 use pioneer_client::providers::{cli_runtime_settings as cli_provider_settings, selectors};
 use std::{cmp::Ordering, collections::HashSet};
@@ -896,6 +896,8 @@ impl ProviderCatalogView {
             ("ovhcloud", false) => "logos/providers/ovhcloud-light.svg",
             ("openai", true) => "logos/providers/openai-dark.svg",
             ("openai", false) => "logos/providers/openai-light.svg",
+            ("vercel-ai-gateway", true) => "logos/providers/vercel-dark.svg",
+            ("vercel-ai-gateway", false) => "logos/providers/vercel-light.svg",
             ("xai", true) => "logos/providers/xai-dark.svg",
             ("xai", false) => "logos/providers/xai-light.svg",
             ("yi", true) => "logos/providers/yi-dark.svg",

@@ -358,8 +358,13 @@ mod tests {
             spec("memory_search"),
             spec("task_create"),
             spec("artifact_prepare"),
-            spec("computer_use"),
+            spec("cua_get_window_state"),
+            spec("threads_list"),
+            spec("threads_history_read"),
+            spec("threads_search"),
+            spec("threads_children_list"),
             spec("threads_start_options"),
+            spec("threads_identity_models_list"),
             spec("threads_turn_start"),
             spec("thread_create"),
             spec("thread_message_send"),
@@ -392,16 +397,41 @@ mod tests {
         assert!(!snapshot.contains_name("memory_search").await);
         assert!(!snapshot.contains_name("task_create").await);
         assert!(!snapshot.contains_name("artifact_prepare").await);
-        assert!(!snapshot.contains_name("computer_use").await);
+        assert!(!snapshot.contains_name("cua_get_window_state").await);
         for name in [
+            "threads_list",
+            "threads_history_read",
+            "threads_search",
+            "threads_children_list",
             "threads_start_options",
+            "threads_identity_models_list",
             "threads_turn_start",
             "thread_create",
             "thread_message_send",
         ] {
             assert!(!snapshot.contains_name(name).await);
         }
-        assert_eq!(snapshot.all_specs().len(), 16);
+        assert_eq!(snapshot.all_specs().len(), 21);
+        // Domain expansion must make the registered readers callable while
+        // keeping unrelated domains closed.
+        snapshot
+            .set_visible_by_name(
+                &crate::domain::THREADS_DOMAIN_TOOL_NAMES
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .await;
+        for name in [
+            "threads_list",
+            "threads_history_read",
+            "threads_search",
+            "threads_children_list",
+            "threads_identity_models_list",
+        ] {
+            assert!(snapshot.contains_name(name).await);
+        }
+        assert!(!snapshot.contains_name("task_create").await);
     }
 
     fn visibility_input() -> FinalToolVisibilityInput {
@@ -484,7 +514,7 @@ mod tests {
                 "memory_search".to_owned(),
                 "task_create".to_owned(),
                 "artifact_prepare".to_owned(),
-                "computer_use".to_owned(),
+                "cua_get_window_state".to_owned(),
                 "read_skill".to_owned(),
                 "skill.weather".to_owned(),
                 "mcp.browser.open".to_owned(),

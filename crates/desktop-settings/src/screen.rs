@@ -421,7 +421,8 @@ impl SettingsScreenView {
                 if p.payload().value.is_none() {
                     self.gateway.settings = None;
                 }
-                self.gateway.settings_loading = p.payload().loading;
+                self.gateway.settings_loading =
+                    p.payload().loading || (page == SettingsPage::Voice && p.payload().pending);
                 self.gateway.settings_error = p.payload().error.clone();
                 if page == SettingsPage::Voice {
                     self.voice_input_action_error = p.payload().error.clone();
@@ -1182,6 +1183,19 @@ mod render_tests {
                 window_cx.debug_bounds(marker).is_some(),
                 "missing rendered {marker}"
             );
+            if page == Some(SettingsPage::Voice) {
+                let model = window_cx
+                    .debug_bounds("settings-voice-input-model-row")
+                    .expect("Voice Input model row");
+                let mode = window_cx
+                    .debug_bounds("settings-voice-input-transcription-mode-row")
+                    .expect("Voice Input transcription mode row");
+                let progress = window_cx.debug_bounds(marker).unwrap();
+                assert!(model.bottom() <= mode.top());
+                assert!(mode.bottom() <= progress.top());
+                assert_eq!(model.left(), mode.left());
+                assert_eq!(model.right(), mode.right());
+            }
         }
     }
 }

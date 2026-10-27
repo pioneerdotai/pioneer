@@ -27,6 +27,12 @@ pub(super) enum MainContentView {
     AgentsDoc,
     Other,
 }
+#[derive(Default, PartialEq, Eq)]
+struct SidebarOwner {
+    endpoint_id: Option<String>,
+    // Client preserves this across transport rotation of the same auth session.
+    authorization_connection: u64,
+}
 pub(super) struct ThreadSidebarView {
     pub client: Arc<ClientCore>,
     load_expansion: Rc<dyn Fn(&str, &mut App) -> HashMap<String, bool>>,
@@ -38,7 +44,13 @@ pub(super) struct ThreadSidebarView {
     pub rename_workspace_dialog: crate::DialogPresenter,
     pub create_workspace_dialog: crate::DialogPresenter,
     pub tree_structure: Vec<(String, usize, bool, bool)>,
-    pub task_activity_indicators: HashMap<String, Entity<crate::tree_view::TaskActivityIndicator>>,
+    pub task_activity_indicators:
+        Rc<HashMap<String, Entity<crate::tree_view::TaskActivityIndicator>>>,
+    pub retained_sidebar_rows: HashMap<String, crate::tree_view::SidebarRetainedRow>,
+    pub prepared_sidebar: crate::tree_view::SidebarPreparation,
+    pub visible_node_count: usize,
+    owner: SidebarOwner,
+    principal_capabilities: pioneer_client::authorization::PrincipalPresentationCapabilities,
 
     registrar: Arc<dyn ClientBindingRegistrar>,
     binding: Arc<Binding>,
@@ -56,7 +68,9 @@ pub(super) struct ThreadSidebarView {
     pub thread_scope_capabilities: pioneer_client::authorization::ThreadPresentationCapabilities,
     changes: Option<Task<()>>,
     tree_events: Option<Subscription>,
+    tree_changes: Option<Subscription>,
     pub context_locked: bool,
+    last_workspace_unavailable: bool,
     presented_workspace: Option<String>,
     pending_new_thread: bool,
 }
@@ -109,10 +123,14 @@ impl ThreadSidebarView {
                     if let Some(workspace) = view.active_workspace_id() {
                         (view.save_expansion)(workspace, view.thread_folder_expanded.clone(), cx);
                     }
+                    view.update_visible_node_count();
                     cx.notify();
                 }
             },
         );
+        let tree_changes = cx.observe(&thread_tree_state, |view, _, cx| {
+            view.refresh_sidebar_row_tree_presentations(cx);
+        });
         let mut view = Self {
             load_expansion: config.load_expansion,
             save_expansion: config.save_expansion,
@@ -123,7 +141,12 @@ impl ThreadSidebarView {
             rename_workspace_dialog: config.rename_workspace_dialog,
             create_workspace_dialog: config.create_workspace_dialog,
             tree_structure: vec![],
-            task_activity_indicators: HashMap::new(),
+            task_activity_indicators: Rc::default(),
+            retained_sidebar_rows: HashMap::new(),
+            prepared_sidebar: Default::default(),
+            visible_node_count: 0,
+            owner: Default::default(),
+            principal_capabilities: Default::default(),
             client: config.client,
             registrar: config.registrar,
             binding,
@@ -141,7 +164,9 @@ impl ThreadSidebarView {
             thread_scope_capabilities: Default::default(),
             changes: Some(task),
             tree_events: Some(tree_events),
+            tree_changes: Some(tree_changes),
             context_locked: false,
+            last_workspace_unavailable: true,
             presented_workspace: None,
             pending_new_thread: false,
         };
@@ -190,12 +215,44 @@ impl ThreadSidebarView {
                 .request_workspace_bootstrap(request.persisted_workspace_id);
         }
         let navigation = self.client.navigation_snapshot();
-        let workspace_changed = self.navigation.workspace_id() != navigation.workspace_id()
-            || self.tree_registration.is_none();
+        let owner = SidebarOwner {
+            endpoint_id: session.startup.endpoint_id.clone(),
+            authorization_connection: self.client.authorization_connection_generation(),
+        };
+        let owner_changed = self.owner != owner;
+        let navigation_changed = self.navigation.workspace_id() != navigation.workspace_id()
+            || self.navigation.active_thread_id() != navigation.active_thread_id()
+            || self.navigation.destination() != navigation.destination()
+            || self.navigation.agents_document_scope() != navigation.agents_document_scope()
+            || self
+                .navigation
+                .lineage()
+                .last()
+                .map(|entry| entry.parent_thread_id())
+                != navigation
+                    .lineage()
+                    .last()
+                    .map(|entry| entry.parent_thread_id())
+            || self
+                .navigation
+                .workspace_id()
+                .and_then(|id| self.navigation.draft(id))
+                != navigation
+                    .workspace_id()
+                    .and_then(|id| navigation.draft(id));
+        let workspace_changed = owner_changed
+            || self.navigation.workspace_id() != navigation.workspace_id()
+            || (navigation.workspace_id().is_some() && self.tree_registration.is_none());
         if workspace_changed {
             self.pending_new_thread = false;
+            if owner_changed {
+                self.presented_workspace = None;
+            }
             self.tree_registration.take();
-            self.input = None;
+            self.tree_structure.clear();
+            self.retained_sidebar_rows.clear();
+            self.prepared_sidebar = Default::default();
+            self.task_activity_indicators = Rc::default();
             self.thread_folder_expanded = navigation
                 .workspace_id()
                 .map(|id| (self.load_expansion)(id, cx))
@@ -219,8 +276,9 @@ impl ThreadSidebarView {
                 ));
             }
         }
-        if self.navigation.active_thread_id() != navigation.active_thread_id()
-            || self.composer_registration.is_none()
+        if owner_changed
+            || self.navigation.active_thread_id() != navigation.active_thread_id()
+            || (navigation.active_thread_id().is_some() && self.composer_registration.is_none())
         {
             self.composer_registration.take();
             self.binding
@@ -250,20 +308,30 @@ impl ThreadSidebarView {
                 );
             }
         }
+        self.owner = owner;
+        let agents_scope_changed =
+            self.active_agents_doc_editor_scope.as_ref() != navigation.agents_document_scope();
         self.active_agents_doc_editor_scope = navigation.agents_document_scope().cloned();
+        let mut expansion_changed = false;
         if let Some(scope) = &self.active_agents_doc_editor_scope {
             self.selected_node =
                 Some(pioneer_client::threads::tree::sidebar_agents_doc_node_id_for_scope(scope));
-            if let Some(folder) = scope.folder_id() {
-                self.thread_folder_expanded.insert(folder.to_owned(), true);
+            if (workspace_changed || agents_scope_changed)
+                && let Some(folder) = scope.folder_id()
+            {
+                expansion_changed =
+                    self.thread_folder_expanded.insert(folder.to_owned(), true) != Some(true);
             }
         }
         self.navigation = navigation;
-        self.catalog = self.client.workspace_catalog();
+        let catalog = self.client.workspace_catalog();
+        let catalog_changed = self.catalog.as_ref() != catalog.as_ref();
+        self.catalog = catalog;
         self.input = self
             .navigation
             .workspace_id()
             .and_then(|workspace| self.client.workspace_tree(workspace));
+        let previous_thread_capabilities = self.thread_scope_capabilities;
         self.thread_scope_capabilities_thread_id =
             self.navigation.active_thread_id().map(str::to_owned);
         self.thread_scope_capabilities = self
@@ -277,8 +345,35 @@ impl ThreadSidebarView {
                     snapshot.thread.as_ref().map(|thread| &thread.capabilities),
                 )
             });
-        self.context_locked = self.composer_context_locked();
-        self.rebuild_sidebar_tree_state(cx);
+        let principal_capabilities = self.principal_presentation_capabilities();
+        let capabilities_changed = self.principal_capabilities != principal_capabilities
+            || previous_thread_capabilities != self.thread_scope_capabilities;
+        self.principal_capabilities = principal_capabilities;
+        let context_locked = self.composer_context_locked();
+        let lock_changed = self.context_locked != context_locked;
+        self.context_locked = context_locked;
+        let workspace_unavailable = self.workspace_unavailable();
+        let availability_changed = self.last_workspace_unavailable != workspace_unavailable;
+        self.last_workspace_unavailable = workspace_unavailable;
+        let tree_changed = self.refresh_sidebar_tree_state(
+            workspace_changed || expansion_changed,
+            navigation_changed,
+            cx,
+        );
+        // Permission-only changes need row inputs refreshed without resetting
+        // Tree items. Tree/navigation changes already reconciled the rows.
+        if capabilities_changed && !tree_changed && !navigation_changed {
+            self.refresh_sidebar_row_views(cx);
+        }
+        if tree_changed
+            || navigation_changed
+            || catalog_changed
+            || capabilities_changed
+            || lock_changed
+            || availability_changed
+        {
+            cx.notify();
+        }
         let workspace = self.navigation.workspace_id();
         let thread = self.navigation.active_thread_id();
         let pending_draft = self.pending_new_thread
@@ -298,6 +393,17 @@ impl ThreadSidebarView {
         }
     }
 
+    pub(super) fn sidebar_row_owner_is_current(&self) -> bool {
+        self.owner.endpoint_id == self.client.gateway_session().startup.endpoint_id
+            && self.owner.authorization_connection
+                == self.client.authorization_connection_generation()
+            && self.active_workspace_id() == self.client.navigation_snapshot().workspace_id()
+    }
+
+    pub(super) fn workspace_unavailable(&self) -> bool {
+        self.client.current_auth().is_none() || self.client.gateway_refresh_in_flight()
+    }
+
     fn composer_context_locked(&self) -> bool {
         use pioneer_client::composer::store::ComposerOperationKind;
         self.navigation
@@ -309,13 +415,28 @@ impl ThreadSidebarView {
                 _ => false,
             })
     }
-    pub fn close(&mut self) {
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.release_bindings();
+        // The retained tree owns its last renderer, including snapshot handles.
+        // Release those captures even if the closed view is still retained.
+        self.thread_tree_state.update(cx, |state, cx| {
+            *state = TreeState::new(cx);
+        });
+        self.tree_structure.clear();
+        self.visible_node_count = 0;
+    }
+    fn release_bindings(&mut self) {
         self.changes.take();
         self.tree_events.take();
+        self.tree_changes.take();
         self.tree_registration.take();
         self.composer_registration.take();
         self.registrations.clear();
+        self.binding.publications.borrow_mut().clear();
         self.input = None;
+        self.retained_sidebar_rows.clear();
+        self.prepared_sidebar = Default::default();
+        self.task_activity_indicators = Rc::default();
     }
     pub fn active_workspace_id(&self) -> Option<&str> {
         self.navigation.workspace_id()
@@ -386,9 +507,6 @@ impl ThreadSidebarView {
             .filter(|p| p.snapshot().workspace_id == workspace)
             .map(|p| p.snapshot().placements_by_thread_id.values().collect())
             .unwrap_or_default()
-    }
-    pub fn sorted_thread_ids_for_workspace(&self, workspace: &str) -> Vec<String> {
-        self.client.directory_thread_ids(workspace)
     }
     pub fn agents_doc_summaries(
         &self,
@@ -514,7 +632,13 @@ impl ThreadSidebarView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let expansion_changed = scope.folder_id().is_some_and(|folder| {
+            self.thread_folder_expanded.insert(folder.to_owned(), true) != Some(true)
+        });
         self.active_agents_doc_editor_scope = Some(scope.clone());
+        if self.refresh_sidebar_tree_state(expansion_changed, false, cx) {
+            cx.notify();
+        }
         cx.emit(WorkspaceNavigationEvent::OpenAgentsDocument { scope });
     }
     pub fn open_root_agents_doc_editor_from_sidebar(
@@ -706,7 +830,7 @@ impl ThreadSidebarView {
 }
 impl Drop for ThreadSidebarView {
     fn drop(&mut self) {
-        self.close();
+        self.release_bindings();
     }
 }
 impl Render for ThreadSidebarView {

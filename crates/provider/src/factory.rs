@@ -3,6 +3,7 @@ use crate::providers::{
     AnthropicProvider, AuthStyle, AzureOpenAiProvider, BedrockProvider,
     ChatCompletionsApiCompatibleProvider, CopilotProvider, DeepSeekProvider, GeminiProvider,
     GlmProvider, LocalProvider, OllamaProvider, OpenAiProvider, OpenRouterProvider, TelnyxProvider,
+    VercelAiGatewayProvider,
 };
 use crate::traits::Provider;
 use crate::types::{InputTypeSupport, ProviderInputCapabilities, ProviderTimeoutPolicy};
@@ -202,6 +203,12 @@ fn create_provider_with_timeout_policy_inner(
                 )))
             }
         }
+        "vercel-ai-gateway" => Ok(Box::new(VercelAiGatewayProvider::from_context(
+            api_key,
+            endpoint.expect("Vercel endpoint definition"),
+            timeout_policy,
+            authority_fingerprint,
+        ))),
         "local" => Ok(Box::new(LocalProvider::new())),
         "gemini" => Ok(Box::new(GeminiProvider::with_base_url_and_timeout_policy(
             api_key,

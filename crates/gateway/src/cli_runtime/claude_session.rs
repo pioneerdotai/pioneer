@@ -142,19 +142,17 @@ struct ClaudeNativeMcpItemKey {
 struct ClaudeNativeMcpItemCorrelation {
     canonical_callable_name: String,
     arguments_fingerprint: String,
-    sequence: u64,
     facade_request_id: Option<String>,
 }
 
 #[derive(Default)]
-struct ClaudeNativeMcpCorrelationLedger {
+pub(crate) struct ClaudeNativeMcpCorrelationLedger {
     items: std::sync::Mutex<HashMap<ClaudeNativeMcpItemKey, ClaudeNativeMcpItemCorrelation>>,
-    next_sequence: AtomicU64,
     changed: tokio::sync::Notify,
 }
 
 impl ClaudeNativeMcpCorrelationLedger {
-    fn register(
+    pub(crate) fn register(
         &self,
         binding: &crate::cli_runtime::claude_mcp::ClaudeNativeMcpItemBinding,
     ) -> Result<()> {
@@ -180,7 +178,6 @@ impl ClaudeNativeMcpCorrelationLedger {
             ClaudeNativeMcpItemCorrelation {
                 canonical_callable_name: binding.canonical_callable_name.clone(),
                 arguments_fingerprint: binding.arguments_fingerprint.clone(),
-                sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
                 facade_request_id: None,
             },
         );
@@ -189,52 +186,56 @@ impl ClaudeNativeMcpCorrelationLedger {
         Ok(())
     }
 
-    async fn claim(
+    fn claim_exact(
         &self,
-        canonical_callable_name: &str,
-        arguments_fingerprint: &str,
-        facade_request_id: &str,
-    ) -> Option<ClaudeNativeMcpItemKey> {
-        let notified = self.changed.notified();
-        if let Some(key) = self.claim_now(
-            canonical_callable_name,
-            arguments_fingerprint,
-            facade_request_id,
-        ) {
-            return Some(key);
-        }
-        let _ = tokio_timeout(Duration::from_secs(2), notified).await;
-        self.claim_now(
-            canonical_callable_name,
-            arguments_fingerprint,
-            facade_request_id,
-        )
-    }
-
-    fn claim_now(
-        &self,
-        canonical_callable_name: &str,
-        arguments_fingerprint: &str,
-        facade_request_id: &str,
-    ) -> Option<ClaudeNativeMcpItemKey> {
+        invocation: &TurnMcpInvocation,
+        fingerprint: &str,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<bool, TurnMcpInvocationError> {
+        let identity = invocation.native_call.as_ref().ok_or_else(|| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "Claude native identity is missing",
+            )
+        })?;
+        let key = ClaudeNativeMcpItemKey {
+            native_thread_id: identity.native_thread_id.clone(),
+            native_turn_id: identity.native_turn_id.clone(),
+            native_item_id: identity.native_item_id.clone(),
+        };
         let mut items = self
             .items
             .lock()
-            .expect("Claude native MCP correlation ledger should not be poisoned");
-        let key = items
-            .iter()
-            .filter(|(_, item)| {
-                item.facade_request_id.is_none()
-                    && item.canonical_callable_name == canonical_callable_name
-                    && item.arguments_fingerprint == arguments_fingerprint
-            })
-            .min_by_key(|(_, item)| item.sequence)
-            .map(|(key, _)| key.clone())?;
-        items
-            .get_mut(&key)
-            .expect("selected Claude MCP correlation must exist")
-            .facade_request_id = Some(facade_request_id.to_owned());
-        Some(key)
+            .expect("Claude native MCP ledger should not be poisoned");
+        if cancellation.is_cancelled() {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled,
+                "Claude MCP admission cancelled",
+            ));
+        }
+        if invocation
+            .admission_deadline
+            .is_none_or(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::TimedOut,
+                "Claude MCP admission timed out",
+            ));
+        }
+        let Some(item) = items.get_mut(&key) else {
+            return Ok(false);
+        };
+        if item.canonical_callable_name != invocation.canonical_callable_name
+            || item.arguments_fingerprint != fingerprint
+            || item.facade_request_id.is_some()
+        {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "Claude native item mismatches this invocation or is already used",
+            ));
+        }
+        item.facade_request_id = Some(invocation.provider_call_id.clone());
+        Ok(true)
     }
 
     fn contains_exact_permission(&self, request: &ClaudeNativeMcpPermissionRequest) -> bool {
@@ -270,9 +271,11 @@ trait ClaudeMcpPermissionAuthorizer: Send + Sync {
     ) -> Result<bool>;
 }
 
-struct ClaudeCorrelatingTurnMcpInvoker {
-    inner: Arc<dyn TurnMcpInvoker>,
-    native_items: Arc<ClaudeNativeMcpCorrelationLedger>,
+pub(crate) struct ClaudeCorrelatingTurnMcpInvoker {
+    pub(crate) inner: Arc<dyn TurnMcpInvoker>,
+    pub(crate) native_items: Arc<ClaudeNativeMcpCorrelationLedger>,
+    pub(crate) coordinator: Arc<crate::cli_runtime::mcp::coordinator::CliMcpCoordinator>,
+    pub(crate) bound_grant: crate::cli_runtime::mcp::grants::CliMcpBoundGrant,
 }
 
 #[async_trait]
@@ -293,23 +296,48 @@ impl TurnMcpInvoker for ClaudeCorrelatingTurnMcpInvoker {
                         "Claude MCP invocation arguments are not canonicalizable",
                     )
                 })?;
-        let facade_request_id = invocation.provider_call_id.clone();
-        let native_item = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => None,
-            native_item = self.native_items.claim(
-                invocation.canonical_callable_name.as_str(),
-                arguments_fingerprint.as_str(),
-                facade_request_id.as_str(),
-            ) => native_item,
-        }
-        .ok_or_else(|| {
-            crate::turn_mcp::invoker::TurnMcpInvocationError::new(
-                crate::turn_mcp::invoker::TurnMcpInvocationErrorCode::SessionBindingUnavailable,
-                "Claude MCP facade call has no matching native tool_use item",
+        let deadline = invocation.admission_deadline.ok_or_else(|| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "Claude admission deadline is missing",
             )
         })?;
-        invocation.provider_call_id = native_item.native_item_id;
+        loop {
+            let notified = self.native_items.changed.notified();
+            let claim = self.coordinator.claim_correlated_call(
+                &self.bound_grant,
+                &invocation,
+                &cancellation,
+                || {
+                    self.native_items.claim_exact(
+                        &invocation,
+                        &arguments_fingerprint,
+                        &cancellation,
+                    )
+                },
+            );
+            let claimed = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::Cancelled, "Claude MCP admission cancelled")),
+                () = tokio::time::sleep_until(deadline) => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::TimedOut, "Claude MCP confirmation timed out")),
+                claimed = claim => claimed?,
+            };
+            if claimed {
+                break;
+            }
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::Cancelled, "Claude MCP admission cancelled")),
+                () = tokio::time::sleep_until(deadline) => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::TimedOut, "Claude MCP confirmation timed out")),
+                () = notified => {},
+            }
+        }
+        invocation.provider_call_id = invocation
+            .native_call
+            .as_ref()
+            .expect("claimed Claude identity")
+            .native_item_id
+            .clone();
         self.inner.invoke(invocation, cancellation).await
     }
 }
@@ -371,10 +399,13 @@ impl ClaudeRequiredMcpBridge {
                         Arc::new(ClaudeCorrelatingTurnMcpInvoker {
                             inner: self.invoker.clone(),
                             native_items: self.native_items.clone(),
+                            coordinator: self.supervisor.coordinator(),
+                            bound_grant: attachment.bound_grant.clone(),
                         }),
                         self.projection_generation,
                         self.projection.clone(),
                         self.facade_limits.clone(),
+                        crate::cli_runtime::mcp::facade::CliMcpCallContract::Claude,
                     )
                     .map_err(|error| anyhow!("Claude MCP facade build failed: {error}"))?;
                     let server = tokio::spawn(server.run());
@@ -2080,7 +2111,7 @@ enum ClaudeMcpToolLifecycle {
 impl ClaudeStreamClient {
     fn new(
         stdin: ChildStdin,
-        event_tx: mpsc::Sender<RuntimeEvent>,
+        event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
         provider_session_verifier: ClaudeProviderSessionVerifier,
         mcp: Option<ClaudeMcpEventContext>,
         native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
@@ -2102,7 +2133,7 @@ impl ClaudeStreamClient {
 
     fn new_for_local_probe(
         stdin: ChildStdin,
-        event_tx: mpsc::Sender<RuntimeEvent>,
+        event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
         expected_provider_session_id: uuid::Uuid,
     ) -> Self {
         Self {
@@ -2122,7 +2153,7 @@ impl ClaudeStreamClient {
     #[cfg(test)]
     fn new_for_test_with_mcp(
         stdin: ChildStdin,
-        event_tx: mpsc::Sender<RuntimeEvent>,
+        event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
         expected_provider_session_id: uuid::Uuid,
         mcp: Option<ClaudeMcpEventContext>,
     ) -> Self {
@@ -2405,7 +2436,7 @@ impl ClaudeStreamClient {
                     Self::decode_complete_stdout_frame(frame)
                 }
                 pioneer_cli_agent_runtime::SpooledNativeFrame::Oversized { file, .. } => {
-                    match tokio::task::spawn_blocking(move || {
+                    match pioneer_observability::work::spawn_blocking(move || {
                         Self::decode_spooled_stdout_frame(file)
                     })
                     .await
@@ -3280,7 +3311,7 @@ impl ClaudeStreamClient {
             );
             if matches!(
                 tool.binding.canonical_callable_name.as_str(),
-                "task_wait" | "task_get" | "task_cancel" | "task_accept"
+                "task_wait" | "task_get" | "task_cancel" | "task_finish" | "task_accept"
             ) && tool
                 .binding
                 .metadata
@@ -4109,6 +4140,7 @@ pub(crate) mod tests {
                 thread_id: "t".into(),
                 turn_id: "u".into(),
                 recovery: None,
+                codex_retry_attempt_id: None,
             },
             &RuntimeEvent::ItemCompleted(item.clone()),
         );
@@ -4144,6 +4176,7 @@ pub(crate) mod tests {
             thread_id: "t".into(),
             turn_id: "u".into(),
             recovery: None,
+            codex_retry_attempt_id: None,
         };
         for (success, text) in [(true, "ok\n"), (false, "shell failed\n")] {
             let e = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
@@ -4590,7 +4623,7 @@ pub(crate) mod tests {
     ) -> (
         Arc<ClaudeStreamClient>,
         tokio::process::Child,
-        mpsc::Receiver<RuntimeEvent>,
+        mpsc::Receiver<pioneer_observability::work::WorkItem<RuntimeEvent>>,
     ) {
         let script = r#"
 while IFS= read -r line; do
@@ -4894,6 +4927,7 @@ done
                     thread_id: "thread".into(),
                     turn_id: "turn".into(),
                     recovery: None,
+                    codex_retry_attempt_id: None,
                 },
                 &event,
             );
@@ -4983,6 +5017,7 @@ done
             thread_id: "thread".to_owned(),
             turn_id: "turn".to_owned(),
             recovery: None,
+            codex_retry_attempt_id: None,
         };
         let projected_start = project_cli_runtime_event(&projector_context, &started[0]);
         let projected_terminal = project_cli_runtime_event(&projector_context, &completed[0]);
@@ -5045,49 +5080,6 @@ done
             "zero/unknown process generation must fail closed"
         );
 
-        let ledger = ClaudeNativeMcpCorrelationLedger::default();
-        let first_parallel = projection
-            .bind_native_tool_use(
-                "claude",
-                7,
-                provider_session_id.to_string().as_str(),
-                "provider-turn",
-                "same-signature-a",
-                "mcp__pioneer__mcp_server_tool_a",
-                &json!({"value": 8}),
-            )
-            .expect("first parallel binding");
-        let second_parallel = projection
-            .bind_native_tool_use(
-                "claude",
-                7,
-                provider_session_id.to_string().as_str(),
-                "provider-turn",
-                "same-signature-b",
-                "mcp__pioneer__mcp_server_tool_a",
-                &json!({"value": 8}),
-            )
-            .expect("second parallel binding");
-        ledger.register(&first_parallel).expect("register first");
-        ledger.register(&second_parallel).expect("register second");
-        let first_claim = ledger
-            .claim(
-                first_parallel.canonical_callable_name.as_str(),
-                first_parallel.arguments_fingerprint.as_str(),
-                "facade-a",
-            )
-            .await
-            .expect("claim first parallel item");
-        let second_claim = ledger
-            .claim(
-                second_parallel.canonical_callable_name.as_str(),
-                second_parallel.arguments_fingerprint.as_str(),
-                "facade-b",
-            )
-            .await
-            .expect("claim second parallel item");
-        assert_eq!(first_claim.native_item_id, "same-signature-a");
-        assert_eq!(second_claim.native_item_id, "same-signature-b");
         let _ = child.kill().await;
     }
 
@@ -5157,7 +5149,7 @@ done
             .expect("session mismatch event timeout")
             .expect("session mismatch event");
         assert!(matches!(
-            mismatch,
+            mismatch.value,
             RuntimeEvent::Error(RuntimeErrorEvent { code: Some(code), .. })
                 if code == "claude_session_identity_invalid"
         ));
@@ -5197,7 +5189,7 @@ done
                 .await
                 .expect("EOF reconciliation event timeout")
                 .expect("EOF reconciliation event");
-            match event {
+            match event.value {
                 RuntimeEvent::ItemCompleted(item) if item.native_item_id == "call-eof" => {
                     eof_terminal_count += 1;
                     assert_eq!(item.metadata.unwrap()["status"], json!("failed"));
@@ -5671,8 +5663,10 @@ done
         let instance = claude_instance(temp.path().join("home").display().to_string());
         let mut selected = Vec::new();
         for name in [
+            "html",
             "tasks",
             "subagents",
+            "pioneer-system-html",
             "pioneer-system-tasks",
             "pioneer-system-subagents",
         ] {
@@ -5691,6 +5685,8 @@ done
             selected.push(selected_skill_fixture(&path, name));
         }
         let expected_names = [
+            "html",
+            "pioneer-system-html",
             "pioneer-system-subagents",
             "pioneer-system-tasks",
             "subagents",
@@ -5707,7 +5703,7 @@ done
             )
             .unwrap();
             let plugins = arg_values_after(&config.args, "--plugin-dir");
-            assert_eq!(plugins.len(), 4);
+            assert_eq!(plugins.len(), 6);
             let mut bindings = Vec::new();
             for (index, (plugin, name)) in plugins.iter().zip(expected_names).enumerate() {
                 let skill = selected

@@ -157,6 +157,9 @@ fn episodic_item(
                 .to_owned(),
             ),
             turn_id: Some("turn_prev".to_owned()),
+            item_id: None,
+            index_item_id: None,
+            source_kind: None,
             task_id: matches!(
                 source,
                 MemoryEpisodicRecallSourceKind::CurrentTask
@@ -952,6 +955,110 @@ async fn episodic_provider_timeout_skips_mode_without_turn_failure() {
     assert!(result.diagnostics.iter().any(|diagnostic| {
         diagnostic.contains("memory.episodic_recall.mode_timed_out:current_thread")
     }));
+}
+
+#[test]
+fn episodic_prompt_budget_preserves_full_anchor_and_truncates_only_text() {
+    for preceding_text in [None, Some("Earlier relevant context.")] {
+        let mut item = episodic_item(
+            "indexed-message",
+            MemoryEpisodicRecallSourceKind::CurrentThread,
+            &"я".repeat(360),
+        );
+        item.provenance.workspace_id = "NUGv0bchbHd1yFqLnTbCA".to_owned();
+        item.provenance.thread_id = Some("AV928MckoLxOvzDD7S20J".to_owned());
+        item.provenance.turn_id = Some("db76nHQyHGXJ39niXhGjX".to_owned());
+        item.provenance.item_id = Some("mRSdkWE83hsR5aLIM3DyS".to_owned());
+        item.provenance.source_kind = Some("message".to_owned());
+        let mut items = Vec::new();
+        if let Some(text) = preceding_text {
+            items.push(episodic_item(
+                "earlier-result",
+                MemoryEpisodicRecallSourceKind::CurrentThread,
+                text,
+            ));
+        }
+        items.push(item);
+        let contributions = memory_episodic_recall_prompt_context_contributions(
+            items,
+            false,
+            &MemoryActiveRecallConfig {
+                max_prompt_chars: 400,
+                ..MemoryActiveRecallConfig::default()
+            },
+        );
+        assert_eq!(contributions.len(), 1);
+        let contribution = &contributions[0];
+        let content = contribution.content.as_str();
+        assert!(content.chars().count() <= 400);
+        assert!(contribution.truncated);
+        let lines = content.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), if preceding_text.is_some() { 2 } else { 1 });
+        if let Some(text) = preceding_text {
+            assert!(lines[0].ends_with(text));
+        }
+        let line = lines.last().expect("indexed result is retained");
+        let (label, text) = line.rsplit_once("]: ").expect("label and snippet");
+        let (_, reference) = label.split_once("source=").expect("source reference");
+        let reference: serde_json::Value = serde_json::from_str(reference).expect("complete JSON");
+        assert_eq!(
+            reference,
+            serde_json::json!({
+                "workspaceId": "NUGv0bchbHd1yFqLnTbCA",
+                "threadId": "AV928MckoLxOvzDD7S20J",
+                "anchor": {
+                    "turnId": "db76nHQyHGXJ39niXhGjX",
+                    "itemId": "mRSdkWE83hsR5aLIM3DyS"
+                },
+                "sourceKind": "message"
+            })
+        );
+        assert!(!text.is_empty());
+        assert!(text.chars().count() < 360);
+        assert!(text.chars().all(|ch| ch == 'я'));
+    }
+}
+
+#[test]
+fn episodic_prompt_skips_unfittable_reference_without_losing_prior_context() {
+    let earlier = episodic_item(
+        "earlier-result",
+        MemoryEpisodicRecallSourceKind::CurrentThread,
+        "Earlier relevant context.",
+    );
+    let mut oversized = episodic_item(
+        "oversized-reference",
+        MemoryEpisodicRecallSourceKind::CurrentThread,
+        "Useful snippet.",
+    );
+    oversized.provenance.thread_id = Some("t".repeat(400));
+    oversized.provenance.item_id = Some("item".to_owned());
+    let config = MemoryActiveRecallConfig {
+        max_prompt_chars: 400,
+        ..MemoryActiveRecallConfig::default()
+    };
+    assert!(
+        memory_episodic_recall_prompt_context_contributions(
+            vec![oversized.clone()],
+            false,
+            &config,
+        )
+        .is_empty()
+    );
+    let contributions = memory_episodic_recall_prompt_context_contributions(
+        vec![earlier, oversized],
+        false,
+        &config,
+    );
+    assert_eq!(contributions.len(), 1);
+    assert!(contributions[0].truncated);
+    assert!(
+        contributions[0]
+            .content
+            .as_str()
+            .ends_with("Earlier relevant context.")
+    );
+    assert_eq!(contributions[0].source_refs.len(), 1);
 }
 
 #[tokio::test]

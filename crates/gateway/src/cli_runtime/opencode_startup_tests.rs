@@ -594,7 +594,6 @@ async fn startup_prepare_deadline_preserves_last_process_cause_without_another_s
     let fixture = StartupFixture::new(BUSY, "ready").await;
     let gate = PhaseGate::new(StartupPhase::PreparingPlugin, 2);
     let budget = Duration::from_millis(fixture.instance.startup_probe_timeout_ms);
-    let started = Instant::now();
     let env = SensitiveEnvironment::new();
     let future = PHASE_GATE.scope(
         gate.clone(),
@@ -607,12 +606,17 @@ async fn startup_prepare_deadline_preserves_last_process_cause_without_another_s
     }
     assert_eq!(fixture.starts().len(), 1);
     fixture.assert_stopped();
-    // No fake process remains. Expire the same startup clock while preparation
-    // is held, rather than depending on filesystem timing or long sleeps.
+    // No fake process remains. Advance a full budget from this checkpoint so
+    // the startup deadline expires regardless of time spent before it began.
     tokio::time::pause();
-    tokio::time::advance(budget.saturating_sub(started.elapsed())).await;
+    tokio::time::advance(budget).await;
+    let expired = Instant::now();
     let probe = future.await;
-    assert!(started.elapsed() <= budget + Duration::from_millis(10));
+    assert_eq!(
+        Instant::now(),
+        expired,
+        "preparation must already be expired"
+    );
     assert_eq!(probe.status, OpenCodeProbeStatus::SpawnFailed);
     let message = probe.message.unwrap();
     assert!(message.contains("preparing catalog plugin"), "{message}");

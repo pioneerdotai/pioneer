@@ -221,6 +221,7 @@
 "timeline.system.capability_kind_skill" = "Skill"
 "timeline.system.checkpoint_label" = "Checkpoint"
 "timeline.system.code" = "Code:"
+"timeline.system.codex_request_retried" = "Codex hat eine Wiederholung der Anfrage nach einer vorübergehenden Störung gemeldet."
 "timeline.system.continued_label" = "Fortgesetzt"
 "timeline.system.detail_agent_rounds" = "Agent-Runden"
 "timeline.system.detail_checkpoint" = "Checkpoint"

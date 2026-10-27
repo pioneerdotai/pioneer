@@ -2319,15 +2319,15 @@ mod tests {
                 .iter()
                 .all(|estimate| estimate.input_tokens > 0)
         );
-        assert_eq!(budgeted.request.messages[1].content_parts.len(), 2);
+        assert_eq!(budgeted.request.messages[2].content_parts.len(), 2);
         assert!(matches!(
-            &budgeted.request.messages[1].content_parts[0],
+            &budgeted.request.messages[2].content_parts[0],
             MessageContentPart::Image { image }
                 if image.sha256.is_some()
                     && image.artifact.as_ref().is_some_and(|artifact| artifact.artifact_id == "artifact-image")
         ));
         assert!(matches!(
-            &budgeted.request.messages[1].content_parts[1],
+            &budgeted.request.messages[2].content_parts[1],
             MessageContentPart::File { file }
                 if file.sha256.is_some()
                     && file.artifact.as_ref().is_some_and(|artifact| artifact.artifact_id == "artifact-file")
@@ -2924,7 +2924,7 @@ mod tests {
     fn direct_convert_tool_attachment_splits_into_tool_and_user_messages() {
         let provider = test_provider().with_vision(true);
         let mut tool_message =
-            ChatMessage::tool_result("call_1", "computer_use", "{\"status\":\"ok\"}");
+            ChatMessage::tool_result("call_1", "cua_get_window_state", "{\"status\":\"ok\"}");
         tool_message.content_parts.push(MessageContentPart::image(MessageAttachment {
             mime_type: "image/png".to_owned(),
             name: Some("snapshot.png".to_owned()),
@@ -2945,7 +2945,10 @@ mod tests {
         assert_eq!(api_messages[0].role, "user");
         assert_eq!(api_messages[1].role, "tool");
         assert_eq!(api_messages[1].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(api_messages[1].name.as_deref(), Some("computer_use"));
+        assert_eq!(
+            api_messages[1].name.as_deref(),
+            Some("cua_get_window_state")
+        );
         assert_eq!(api_messages[2].role, "user");
         match api_messages[2].content.as_ref() {
             Some(ApiMessageContent::Parts(parts)) => {

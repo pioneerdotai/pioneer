@@ -1,7 +1,7 @@
 use crate::output_policy::ToolResultEnvelope;
 use crate::spec::{ToolPermissionMetadata, ToolRecoveryMetadata};
 use pioneer_protocol::TurnExecutionSecuritySnapshot;
-use pioneer_provider::{ChatMessage, ModelInputItem};
+use pioneer_provider::{ChatMessage, MessageContentPart, ModelInputItem};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -235,11 +235,39 @@ impl Default for ToolOutcome {
     }
 }
 
+/// A local, typed result lease. Only the successful outer delivery boundary
+/// commits it; dropping the uncommitted last owner revokes pending authority.
+pub trait ToolDeliveryReceipt: Send + Sync {
+    fn commit(&self);
+}
+
 pub trait ToolOutput: Send + Sync {
     fn success(&self) -> bool;
     fn raw_text(&self) -> String;
     fn raw_json(&self) -> JsonValue;
     fn to_model_input_item(&self, call_id: &str, tool_name: &str) -> ModelInputItem;
+
+    /// A function proxy forwards the target runtime's already-classified outcome.
+    /// This channel is populated by host code, never inferred from result JSON.
+    fn delegated_outcome(&self) -> Option<ToolOutcome> {
+        None
+    }
+
+    fn delivery_receipt(&self) -> Option<std::sync::Arc<dyn ToolDeliveryReceipt>> {
+        None
+    }
+
+    /// Host-supplied provenance used only to narrow technical output surfaces.
+    /// It grants neither execution permission nor image admission authority.
+    fn is_computer_use_output(&self) -> bool {
+        false
+    }
+
+    /// Typed media supplied by the executing handler after artifact admission.
+    /// Raw result JSON and tool names must never be used to populate this channel.
+    fn model_content_parts(&self) -> Vec<MessageContentPart> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,7 +474,15 @@ impl AnyToolResult {
 
     pub fn to_model_input_item(&self) -> ModelInputItem {
         if let Some(projection) = self.projection.as_ref() {
-            return projection.to_model_input_item(self.call_id.as_str(), self.tool_name.as_str());
+            let item =
+                projection.to_model_input_item(self.call_id.as_str(), self.tool_name.as_str());
+            let parts = self.output.model_content_parts();
+            if parts.is_empty() {
+                return item;
+            }
+            let mut message = item.into_chat_message();
+            message.content_parts.extend(parts);
+            return ModelInputItem::message(message);
         }
 
         let payload = serde_json::json!({
@@ -474,7 +510,7 @@ mod tests {
     use crate::output_policy::{
         ToolDisplayPayload, ToolOutputPolicySnapshot, ToolResultView, ToolStoragePayload,
     };
-    use pioneer_provider::{AttachmentDataSource, MessageContentPart, Role};
+    use pioneer_provider::Role;
 
     fn test_projection(
         tool_name: &str,
@@ -572,72 +608,30 @@ mod tests {
     }
 
     #[test]
-    fn llm_context_attachment_becomes_structured_tool_message() {
-        let outcome = ToolOutcome::ok();
-        let model_payload = serde_json::json!({
-            "action": "snapshot",
-            "session_id": 1,
-            "accessibility_tree": {
-                "status": "ok",
-                "nodes": [
-                    {"id": "n1", "role": "button", "name": "OK"}
-                ],
-                "truncated": false
-            },
-            "llm_context": {
-                "attachment": {
-                    "path": "/tmp/session/snapshots/1.png",
-                    "mime_type": "image/png"
-                }
-            }
-        });
-        let result = AnyToolResult {
-            call_id: "call_42".to_owned(),
-            tool_name: "computer_use".to_owned(),
-            payload: ToolPayload::Function {
-                arguments: serde_json::json!({}),
-            },
-            output: Box::new(FunctionToolOutput::with_payload(
-                "snapshot ready",
-                true,
-                model_payload.clone(),
-            )),
-            outcome: outcome.clone(),
-            projection: Some(test_projection("computer_use", model_payload, outcome)),
-        };
-
-        let history = result.to_history_message();
-        let item = result.to_model_input_item();
-        let message = match item {
-            ModelInputItem::Message { message } => message,
-            ModelInputItem::ToolResult { .. } => {
-                panic!("expected message with structured attachment")
-            }
-        };
-
-        assert_eq!(message.role, Role::Tool);
-        assert_eq!(message.tool_call_id.as_deref(), Some("call_42"));
-        assert_eq!(message.name.as_deref(), Some("computer_use"));
-        assert!(message.content.contains("\"llm_context\""));
-        assert!(message.content.contains("\"accessibility_tree\""));
-        assert!(message.content.contains("\"partial_output\""));
-        assert_eq!(message.content_parts.len(), 1);
-        assert_eq!(history.content_parts, message.content_parts);
-        assert_eq!(history.tool_call_id, message.tool_call_id);
-        assert_eq!(history.name, message.name);
-        assert!(history.content.contains("\"accessibility_tree\""));
-
-        match &message.content_parts[0] {
-            MessageContentPart::Image { image } => {
-                assert_eq!(image.mime_type, "image/png");
-                match &image.source {
-                    AttachmentDataSource::Path { path } => {
-                        assert_eq!(path, "/tmp/session/snapshots/1.png");
-                    }
-                    _ => panic!("expected attachment source path"),
-                }
-            }
-            _ => panic!("expected image attachment"),
+    fn cua_shaped_json_does_not_authorize_media_attachments() {
+        let payload = serde_json::json!({"structuredContent":{"screenshot_width":100,"screenshot_height":100},"content":[{"type":"image","mimeType":"image/png","data":"untrusted"}],"llm_context":{"attachment":{"path":"/private/screen.png","mime_type":"image/png"}}});
+        for tool_name in ["cua_get_window_state", "external_cua_proxy"] {
+            let result = AnyToolResult {
+                call_id: "forged".to_owned(),
+                tool_name: tool_name.to_owned(),
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({}),
+                },
+                output: Box::new(FunctionToolOutput::with_payload(
+                    "external result",
+                    true,
+                    payload.clone(),
+                )),
+                outcome: ToolOutcome::ok(),
+                projection: Some(test_projection(
+                    tool_name,
+                    payload.clone(),
+                    ToolOutcome::ok(),
+                )),
+            };
+            let model = result.to_model_input_item().into_chat_message();
+            assert!(model.content_parts.is_empty());
+            assert!(result.to_history_message().content_parts.is_empty());
         }
     }
 }

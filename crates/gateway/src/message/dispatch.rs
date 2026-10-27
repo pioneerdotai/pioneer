@@ -24,8 +24,8 @@ use pioneer_protocol::{
     SkillsPackUpdateParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
     SkillsUpdateParams, TaskAcceptParams, TaskAgendaParams, TaskCancelParams,
     TaskCompletionInboxEntryParams, TaskCompletionInboxListParams, TaskCreateParams,
-    TaskDeliveriesParams, TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams,
-    TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
+    TaskDeliveriesParams, TaskDetachParams, TaskEventsParams, TaskFinishParams, TaskGetParams,
+    TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
     TaskTreeParams as TaskTreeTaskParams, TaskUserNotificationAcknowledgeParams,
     TaskUserNotificationListParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams,
@@ -252,6 +252,9 @@ fn vector_provider_key_name(
         Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter) => {
             Some("openrouter")
         }
+        Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::VercelAiGateway) => {
+            Some("vercel-ai-gateway")
+        }
         Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local) | None => None,
     }
 }
@@ -438,36 +441,72 @@ impl MessageProcessor {
         } else {
             None
         };
-        let dispatched = message_future(pioneer_observability::turn_startup::scope_stage(
-            startup_key,
-            pioneer_observability::turn_startup::Stage::GatewayDispatch,
-            async move {
-                let admission_span = pioneer_observability::turn_startup::current_stage(
-                    pioneer_observability::turn_startup::Stage::Admission,
-                );
-                let admission = match self.authorize_normal_request(&context, &request).await {
-                    Ok(admission) => admission,
-                    Err(response) => {
-                        self.send_error(context.connection_id(), response).await;
-                        return;
-                    }
-                };
+        use pioneer_observability::work::{Boundary, ExecutorRole, Trigger, WorkCarrier, WorkKind};
+        let work_kind = match normal_method_entry(request.method.as_str()).map(|entry| entry.action)
+        {
+            Ok(
+                ResourceAction::AgentTurnStart
+                | ResourceAction::AgentExecutionResume
+                | ResourceAction::AgentExecutionSteer,
+            ) => WorkKind::RpcTurn,
+            Ok(
+                ResourceAction::WorkspaceList
+                | ResourceAction::WorkspaceRead
+                | ResourceAction::ThreadRead
+                | ResourceAction::AgentExecutionObserve
+                | ResourceAction::AgentRequestObserve
+                | ResourceAction::ArtifactRead
+                | ResourceAction::MemoryRead
+                | ResourceAction::TaskRead
+                | ResourceAction::TaskReadOperator
+                | ResourceAction::AgentsDocumentRead,
+            ) => WorkKind::RpcRead,
+            Ok(
+                ResourceAction::GatewayManage
+                | ResourceAction::AgentExecutionCancel
+                | ResourceAction::ChildControl,
+            ) => WorkKind::RpcControl,
+            Ok(_) => WorkKind::RpcMutation,
+            Err(_) => WorkKind::RpcUnknown,
+        };
+        // The network boundary carries no general remote parent in this protocol.
+        let work = WorkCarrier::independent(
+            Boundary::Rpc,
+            work_kind,
+            Trigger::Rpc,
+            ExecutorRole::Gateway,
+        );
+        let dispatched =
+            message_future(work.scope(pioneer_observability::turn_startup::scope_stage(
+                startup_key,
+                pioneer_observability::turn_startup::Stage::GatewayDispatch,
+                async move {
+                    let admission_span = pioneer_observability::turn_startup::current_stage(
+                        pioneer_observability::turn_startup::Stage::Admission,
+                    );
+                    let admission = match self.authorize_normal_request(&context, &request).await {
+                        Ok(admission) => admission,
+                        Err(response) => {
+                            self.send_error(context.connection_id(), response).await;
+                            return;
+                        }
+                    };
 
-                drop(admission_span);
-                // Large start workflows expose dedicated erased futures so constructing them does
-                // not share one native stack frame with every branch in the dispatch match.
-                let handler = if request.method == methods::TURN_START {
-                    self.dispatch_turn_start(context, request, admission)
-                } else if request.method == methods::THREAD_START {
-                    self.dispatch_thread_start(context, request, admission)
-                } else if request.method == methods::SETTINGS_UPDATE {
-                    self.dispatch_settings_update(context, request)
-                } else {
-                    self.process_request_inner(context, request, admission)
-                };
-                handler.await;
-            },
-        ));
+                    drop(admission_span);
+                    // Large start workflows expose dedicated erased futures so constructing them does
+                    // not share one native stack frame with every branch in the dispatch match.
+                    let handler = if request.method == methods::TURN_START {
+                        self.dispatch_turn_start(context, request, admission)
+                    } else if request.method == methods::THREAD_START {
+                        self.dispatch_thread_start(context, request, admission)
+                    } else if request.method == methods::SETTINGS_UPDATE {
+                        self.dispatch_settings_update(context, request)
+                    } else {
+                        self.process_request_inner(context, request, admission)
+                    };
+                    handler.await;
+                },
+            )));
 
         instrument_message_future(dispatched, span)
     }
@@ -1530,7 +1569,8 @@ impl MessageProcessor {
             ResourceResolverKind::Workspace
                 if matches!(
                     request.method.as_str(),
-                    methods::ARTIFACT_CAPABILITIES
+                    methods::WORKSPACE_PUSH
+                        | methods::ARTIFACT_CAPABILITIES
                         | methods::ARTIFACT_LIST
                         | methods::SKILLS_LIST
                         | methods::CLI_RUNTIME_LIST
@@ -1558,6 +1598,11 @@ impl MessageProcessor {
                 };
                 let params = request.params.clone().unwrap_or_else(empty_object_value);
                 let workspace_id = match request.method.as_str() {
+                    methods::WORKSPACE_PUSH => {
+                        serde_json::from_value::<pioneer_protocol::WorkspacePushParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
                     methods::ARTIFACT_CAPABILITIES => {
                         serde_json::from_value::<ArtifactCapabilitiesParams>(params)
                             .map_err(|_| invalid_params())?
@@ -4409,12 +4454,18 @@ impl MessageProcessor {
                     )
                     .await;
                 }
+                methods::WORKSPACE_PUSH => {
+                    match serde_json::from_value::<pioneer_protocol::WorkspacePushParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params) => self.workspace_push(&context, request.id, params).await,
+                        Err(_) => self.send_error(connection_id, JsonRpcErrorResponse::new(Some(request.id), INVALID_PARAMS_CODE, "invalid push params")).await,
+                    }
+                }
                 methods::THREAD_TREE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadTreeParams>(params_value) {
                         Ok(params) => {
                             crate::database::attribution::scope_database_workload(
-                                pioneer_observability::DatabaseWorkload::ThreadTreeLoad,
+                                pioneer_observability::DatabaseWorkload::ThreadTreeLoad, pioneer_observability::DatabaseOperationSite::ThreadTreeLoad,
                                 self.thread_tree(
                                     &context,
                                     admission.workspace().expect(
@@ -4790,7 +4841,7 @@ impl MessageProcessor {
                                 .expect("central admission supplies thread proof");
                             debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
                             crate::database::attribution::scope_database_workload(
-                                pioneer_observability::DatabaseWorkload::TimelinePage,
+                                pioneer_observability::DatabaseWorkload::TimelinePage, pioneer_observability::DatabaseOperationSite::TimelinePage,
                                 self.thread_timeline_page(&context, proof, request.id, params),
                             )
                                 .await;
@@ -7013,6 +7064,29 @@ impl MessageProcessor {
                         }
                     }
                 }
+                methods::TASK_FINISH => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TaskFinishParams>(params_value) {
+                        Ok(params) => {
+                            self.task_finish(&context, admission.task(), request.id, params)
+                                .await
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TASK_FINISH
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
                 methods::TASK_RESCHEDULE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskRescheduleParams>(params_value) {
@@ -7540,10 +7614,29 @@ impl MessageProcessor {
         .await
     }
 
-    async fn update_gateway_settings(
+    pub(super) async fn update_gateway_settings(
         &self,
         request_context: &RequestContext,
         update: pioneer_protocol::GatewaySettingsUpdate,
+    ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
+        self.update_gateway_settings_with_saver(
+            request_context,
+            update,
+            crate::settings::save_gateway_settings,
+        )
+        .await
+    }
+
+    // One application path, with an injectable file writer for deterministic
+    // save/rollback failure coverage; production always uses the atomic writer.
+    pub(super) async fn update_gateway_settings_with_saver(
+        &self,
+        request_context: &RequestContext,
+        update: pioneer_protocol::GatewaySettingsUpdate,
+        save_settings: impl Fn(
+            &std::path::Path,
+            &crate::settings::GatewaySettings,
+        ) -> anyhow::Result<()>,
     ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
         let connection_id = request_context.connection_id();
         let _settings_guard = self.gateway_settings_update_lock.lock().await;
@@ -7624,8 +7717,11 @@ impl MessageProcessor {
                 )
                 .vector_search
         });
-        let changes =
+        let mut changes =
             settings.apply_protocol_update_for_workspace(update, workspace_id.as_deref())?;
+        let changed_cli_runtime_ids =
+            settings.changed_cli_runtime_ids(&previous_settings, &config.gateway);
+        changes.cli_runtimes = !changed_cli_runtime_ids.is_empty();
         let cli_identity_instances = if changes.cli_runtimes {
             let effective_gateway = settings.apply_to_gateway_config(config.gateway.clone());
             let identity_settings = settings.effective_cli_runtime_settings(&config.gateway);
@@ -7692,9 +7788,17 @@ impl MessageProcessor {
                 }
             }
         }
-        if let Err(error) =
-            crate::settings::save_gateway_settings(settings_path.as_path(), &settings)
-        {
+        if let Err(error) = save_settings(settings_path.as_path(), &settings) {
+            let readiness_error = self
+                .reconcile_cli_readiness_after_settings_write_error(
+                    &settings_path,
+                    &previous_settings,
+                    &settings,
+                    &config.gateway,
+                    &changed_cli_runtime_ids,
+                )
+                .await
+                .err();
             if let Some(previous_proxy) = previous_catalog_proxy.as_ref() {
                 let rollback = match previous_proxy {
                     Some(proxy_url) => self.gateway_secrets.set_model_catalog_proxy(proxy_url),
@@ -7720,7 +7824,10 @@ impl MessageProcessor {
                     );
                 }
             }
-            return Err(error);
+            return match readiness_error {
+                Some(readiness_error) => Err(error).context(format!("{readiness_error:#}")),
+                None => Err(error),
+            };
         }
         let cli_identity_projection: anyhow::Result<()> = async {
             let Some(instances) = cli_identity_instances else {
@@ -7741,9 +7848,21 @@ impl MessageProcessor {
         }
         .await;
         if let Err(commit_error) = cli_identity_projection {
-            let restore_error =
-                crate::settings::save_gateway_settings(settings_path.as_path(), &previous_settings)
-                    .err();
+            let restore_error = save_settings(settings_path.as_path(), &previous_settings).err();
+            let readiness_error = if restore_error.is_some() {
+                self.reconcile_cli_readiness_after_settings_write_error(
+                    &settings_path,
+                    &previous_settings,
+                    &settings,
+                    &config.gateway,
+                    &changed_cli_runtime_ids,
+                )
+                .await
+                .err()
+            } else {
+                None
+            };
+
             if let Some(previous_proxy) = previous_catalog_proxy.as_ref() {
                 let rollback = match previous_proxy {
                     Some(proxy_url) => self.gateway_secrets.set_model_catalog_proxy(proxy_url),
@@ -7783,16 +7902,20 @@ impl MessageProcessor {
                     "failed to roll back keepawake setting after CLI identity commit failure"
                 );
             }
-            return match (restore_error, projection_restore_error) {
+            let result = match (restore_error, projection_restore_error) {
                 (Some(restore_error), _) => Err(anyhow::anyhow!(
-                    "failed to apply CLI identity settings projection: {commit_error}; failed to restore settings file: {restore_error}"
+                    "failed to apply CLI identity settings projection: {commit_error:#}; failed to restore settings file: {restore_error:#}"
                 )),
                 (None, Some(projection_restore_error)) => Err(anyhow::anyhow!(
-                    "failed to apply CLI identity settings projection: {commit_error}; settings file was restored, but the previous identity projection could not be restored: {projection_restore_error}"
+                    "failed to apply CLI identity settings projection: {commit_error:#}; settings file was restored, but the previous identity projection could not be restored: {projection_restore_error:#}"
                 )),
                 (None, None) => Err(commit_error).context(
                     "failed to apply CLI identity settings projection; settings file restored",
                 ),
+            };
+            return match readiness_error {
+                Some(readiness_error) => result.context(format!("{readiness_error:#}")),
+                None => result,
             };
         }
 
@@ -7807,14 +7930,12 @@ impl MessageProcessor {
             pioneer_provider::catalog::runtime::configure_refresh_proxy(proxy_url)?;
         }
 
-        if changes.cli_runtimes {
-            match workspace_id.as_deref() {
-                Some(workspace_id) => {
-                    self.invalidate_and_request_cli_runtime_warmup(workspace_id.to_owned())
-                        .await;
-                }
-                None => self.invalidate_and_request_all_cli_runtime_warmup().await,
-            }
+        if !changed_cli_runtime_ids.is_empty() {
+            let instances = settings
+                .apply_to_gateway_config(config.gateway.clone())
+                .effective_cli_agent_runtime_instances();
+            self.invalidate_and_request_cli_runtime_instances(&changed_cli_runtime_ids, &instances)
+                .await;
         }
 
         if changes.self_improvement {
@@ -7846,7 +7967,7 @@ impl MessageProcessor {
             }
         }
 
-        if changes.voice_input.changed || changes.voice_input.retry_install {
+        if changes.voice_input.reconfigure || changes.voice_input.retry_install {
             if let Some(supervisor) = self.voice_input_supervisor.as_ref() {
                 let desired = crate::voice::supervisor::VoiceInputDesiredState::from_config(
                     &settings.effective_voice_input_config(&config.gateway.voice),
@@ -7988,7 +8109,72 @@ impl MessageProcessor {
             );
         }
 
+        if changes.voice_input.changed {
+            self.send_gateway_management_notification(
+                events::GATEWAY_VOICE_INPUT_STATUS_CHANGED,
+                &pioneer_protocol::GatewayVoiceInputStatusChangedNotification {
+                    settings: snapshot.voice_input.clone(),
+                },
+            )
+            .await;
+        }
+
         Ok(snapshot)
+    }
+
+    /// The settings application lock remains held through this readback and
+    /// fence. Neither a saver error nor a rollback error proves that rename did
+    /// not happen. Only confirmed equality allows old CLI evidence to survive.
+    async fn reconcile_cli_readiness_after_settings_write_error(
+        &self,
+        settings_path: &std::path::Path,
+        previous: &crate::settings::GatewaySettings,
+        attempted: &crate::settings::GatewaySettings,
+        config: &pioneer_config::GatewayConfig,
+        attempted_ids: &std::collections::BTreeSet<String>,
+    ) -> anyhow::Result<()> {
+        if attempted_ids.is_empty() {
+            return Ok(());
+        }
+        let (ids, instances, read_error) =
+            match crate::settings::read_gateway_settings(settings_path, config.settings_version) {
+                Ok(actual) => (
+                    actual.changed_cli_runtime_ids(previous, config),
+                    actual
+                        .apply_to_gateway_config(config.clone())
+                        .effective_cli_agent_runtime_instances(),
+                    None,
+                ),
+                Err(error) => {
+                    // Keep existing identities visible as errors when the actual
+                    // file is unknown; also fence newly added IDs. No old account,
+                    // models or MCP evidence can authorize the uncertain config.
+                    let mut fallback = attempted
+                        .apply_to_gateway_config(config.clone())
+                        .effective_cli_agent_runtime_instances()
+                        .into_iter()
+                        .map(|instance| (instance.id.clone(), instance))
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    fallback.extend(
+                        previous
+                            .apply_to_gateway_config(config.clone())
+                            .effective_cli_agent_runtime_instances()
+                            .into_iter()
+                            .map(|instance| (instance.id.clone(), instance)),
+                    );
+                    (
+                        attempted_ids.clone(),
+                        fallback.into_values().collect(),
+                        Some(error),
+                    )
+                }
+            };
+        self.invalidate_cli_runtime_instances(&ids, &instances, true)
+            .await;
+        match read_error {
+            Some(error) => Err(error).context("failed to confirm persisted CLI configuration after settings write error; affected readiness was invalidated"),
+            None => Ok(()),
+        }
     }
 
     async fn gateway_settings_snapshot_from_settings(

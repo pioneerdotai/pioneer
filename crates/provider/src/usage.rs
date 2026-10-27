@@ -300,6 +300,16 @@ pub fn accounting(
     model: &str,
     catalog: Option<&crate::catalog::ModelCatalog>,
 ) -> Value {
+    accounting_with_entry(usage, provider, model, catalog, None)
+}
+
+pub(crate) fn accounting_with_entry(
+    usage: &TokenUsage,
+    provider: &str,
+    model: &str,
+    catalog: Option<&crate::catalog::ModelCatalog>,
+    native: Option<&crate::catalog::CatalogModel>,
+) -> Value {
     let raw = usage.raw_usage.as_ref();
     let reported = raw
         .and_then(|r| {
@@ -316,7 +326,9 @@ pub fn accounting(
         "provenance":"provider_response_usage.cost",
         "details":raw.map(|r|r["cost_details"].clone()),
     }));
-    let requested_entry = catalog.and_then(|c| c.model(provider, model));
+    let requested_entry = native
+        .filter(|entry| entry.id == model)
+        .or_else(|| catalog.and_then(|c| c.model(provider, model)));
     let dynamic_router =
         provider == "openrouter" && matches!(model, "openrouter/auto" | "openrouter/auto-beta");
     let billing_model = match usage.reported_model.as_deref() {
@@ -328,7 +340,11 @@ pub fn accounting(
         _ if dynamic_router => None,
         _ => Some(model),
     };
-    let entry = billing_model.and_then(|id| catalog.and_then(|c| c.model(provider, id)));
+    let entry = billing_model.and_then(|id| {
+        native
+            .filter(|entry| entry.id == id)
+            .or_else(|| catalog.and_then(|c| c.model(provider, id)))
+    });
     let eligibility = if dynamic_router && billing_model.is_none() {
         Err("missing_selected_billing_model")
     } else {
@@ -392,13 +408,19 @@ fn pricing_eligibility(
     // OpenAI documents shared model token tariffs for Chat and Responses:
     // https://developers.openai.com/api/docs/pricing (APIs not priced separately).
     // This narrow API equivalence does not confer endpoint/model equivalence.
-    let matching_api = (provider == "openai"
-        && ((usage.api.as_deref() == Some("chat_completions") && entry.api == "openai-responses")
-            || usage.api.as_deref() == Some("responses")
-                && matches!(
-                    entry.api.as_str(),
-                    "openai-responses" | "openai-completions"
-                )))
+    let matching_api = (provider == "vercel-ai-gateway"
+        && matches!(
+            (usage.api.as_deref(), entry.api.as_str()),
+            (Some("responses"), "openai-responses") | (Some("embeddings"), "openai-embeddings")
+        ))
+        || (provider == "openai"
+            && ((usage.api.as_deref() == Some("chat_completions")
+                && entry.api == "openai-responses")
+                || usage.api.as_deref() == Some("responses")
+                    && matches!(
+                        entry.api.as_str(),
+                        "openai-responses" | "openai-completions"
+                    )))
         || matches!(
             (usage.api.as_deref(), entry.api.as_str()),
             (Some("chat_completions"), "openai-completions")
@@ -529,6 +551,9 @@ fn estimate(
     // TTL, modality, non-token fees and opaque tier conditions need a separate
     // pricing contract. Preserve them, never flatten them into a zero charge.
     let source = metadata.get("pricingSource");
+    if source.is_some_and(|s| s.get("unknownRateContract").is_some_and(|v| !v.is_null())) {
+        return None;
+    }
     if source
         .and_then(|s| s.get("raw"))
         .and_then(Value::as_object)
@@ -660,6 +685,7 @@ pub(crate) struct UsageContext {
     route: Option<String>,
     attempt: String,
     catalog: Option<std::sync::Arc<crate::catalog::ModelCatalog>>,
+    native: Option<crate::catalog::CatalogModel>,
 }
 impl UsageContext {
     pub(crate) fn capture(provider: &dyn crate::Provider, model: &str) -> Self {
@@ -670,7 +696,10 @@ impl UsageContext {
             api_version: provider.usage_api_version(),
             route: provider.usage_route(),
             attempt: pioneer_protocol::generate_id(21),
-            catalog: crate::catalog::model_catalog().ok(),
+            catalog: crate::catalog::model_catalog()
+                .ok()
+                .filter(|_| provider.name() != "vercel-ai-gateway"),
+            native: provider.model_catalog_entry(model),
         }
     }
     pub(crate) fn capture_request(
@@ -699,11 +728,12 @@ impl UsageContext {
         usage.api_version = self.api_version.clone();
         usage.route = self.route.clone();
         usage.physical_attempt_id = Some(self.attempt.clone());
-        usage.accounting = Some(accounting(
+        usage.accounting = Some(accounting_with_entry(
             usage,
             &self.provider,
             &self.model,
             self.catalog.as_deref(),
+            self.native.as_ref(),
         ));
     }
 }

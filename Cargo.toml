@@ -45,7 +45,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.63.0"
+version = "0.66.0"
 edition = "2024"
 license = "MIT"
 authors = ["Pioneer Contributors"]
@@ -100,6 +100,9 @@ notify = { version = "=8.2.0", default-features = true }
 same-file = "=1.0.6"
 async-stream = "0.3"
 
+# Computer use
+cua-driver-sdk = { git = "https://github.com/trycua/cua" }
+
 # Error handling
 anyhow = "1"
 
@@ -125,15 +128,15 @@ log = "0.4"
 env_logger = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3" }
-sentry = { version = "0.49", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "transport", "tracing"] }
+sentry = { version = "0.49", default-features = false, features = ["anyhow", "backtrace", "contexts", "debug-images", "panic", "transport", "tracing"] }
 dotenvy = "0.15"
 opentelemetry = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace", "http-proto", "reqwest-blocking-client", "experimental-http-retry"] }
 
 # UI
-gpui-kit = { git = "https://github.com/pioneerdotai/gpui-kit", rev = "68792e528b1e130c05c7335a9ec0644a095af8f9", default-features = false, features = ["gpui-fast"] }
-gpui-webview = { git = "https://github.com/pioneerdotai/gpui-kit", rev = "68792e528b1e130c05c7335a9ec0644a095af8f9" }
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", branch = "main", default-features = false, features = ["gpui-fast"] }
+gpui-webview = { git = "https://github.com/longbridge/gpui-kit", branch = "main", features = ["gpui-fast"] }
 wry = { version = "0.53.3", package = "lb-wry" }
 terminal = { path = "crates/terminal" }
 markdown = "1"
@@ -159,8 +162,6 @@ nono = { git = "https://github.com/nolabs-ai/nono", tag = "v0.66.0", default-fea
 scraper = "0.27"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
-xcap = "0.9"
-xa11y = "0.15"
 tempfile = "3"
 fs4 = "1.1"
 lazy_static = "1.5"
@@ -175,7 +176,7 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 transcribe-rs = { version = "0.3.11", features = ["onnx", "whisper-cpp"] }
 
 # Agent memory capsule store
-memvid-core = { git = "https://github.com/pioneerdotai/memory", tag = "v3.1.8", default-features = false, features = ["lex", "temporal_track", "simd", "vec"] }
+memvid-core = { git = "https://github.com/pioneerdotai/memory", tag = "v4.0.1", default-features = false, features = ["lex", "temporal_track", "simd", "vec"] }
 
 # Embed
 rust-embed = "8"
@@ -188,7 +189,7 @@ sys-locale = "0.3"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "multipart", "blocking", "socks", "gzip"] }
 bytes = "1"
 http = "1"
-rathole = { git = "https://github.com/pioneerdotai/relay.git", version = "0.6.1", default-features = false, features = ["client"] }
+rathole = { git = "https://github.com/pioneerdotai/relay.git", rev = "62103cbd83e9533304e62cba6c14fb4871a08c43", version = "0.6.1", default-features = false, features = ["client"] }
 
 # Crypto
 hmac = "0.13"
@@ -217,8 +218,7 @@ zstd = { version = "0.14", features = ["experimental"] }
 rmcp = { version = "3.5", default-features = false, features = ["auth", "client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 process-wrap = { version = "10", features = ["tokio1"] }
 
-# Patched Fast composition from the Pioneer fork.
 [patch.crates-io]
-gpui-fast = { git = "https://github.com/pioneerdotai/gpui-fast", branch = "cargo/composition-input" }
-gpui-fast-linux = { git = "https://github.com/pioneerdotai/gpui-fast", branch = "cargo/composition-input" }
-gpui-fast-macos = { git = "https://github.com/pioneerdotai/gpui-fast", branch = "cargo/composition-input" }
+gpui-fast-macos = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "b870cdb1dbc60bf2cb09b04f287aa8ca778ca3d2" }
+gpui-fast-windows = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "b870cdb1dbc60bf2cb09b04f287aa8ca778ca3d2" }
+gpui-fast-linux = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "b870cdb1dbc60bf2cb09b04f287aa8ca778ca3d2" }

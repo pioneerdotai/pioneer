@@ -39,9 +39,11 @@ pub(crate) enum ExecutionContinuityPolicy {
     StopOnAuthorityLoss,
 }
 
-/// Immutable resource ceiling carried by every execution grant. A role may
-/// narrow actions inside this boundary, but cannot widen a Turn beyond its
-/// admitted collaboration capsule.
+/// Immutable resource ceiling for execution and mutations. A role cannot widen
+/// writes beyond the admitted collaboration capsule. Observation of another
+/// conversation requires the separately admitted ThreadObserveWorkspace action
+/// and a fresh initiating-user ACL proof for that exact source; it never creates
+/// a write route or changes this boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExecutionResourceBoundary {
@@ -904,6 +906,41 @@ impl ExecutionAdmissionService {
             actions.insert(action.safe_name().to_owned());
         }
 
+        // Creation is optional and belongs to the workspace, not to the
+        // existing source thread. Never lend a later collaborator's broader
+        // create rights to an execution that did not admit them.
+        for action in [
+            ResourceAction::ThreadCreatePrivate,
+            ResourceAction::ThreadCreateWorkspace,
+        ] {
+            if self
+                .root_action_allowed(principal, request, action, runtime_draft)
+                .await?
+            {
+                actions.insert(action.safe_name().to_owned());
+            }
+        }
+
+        // Cross-conversation observation is a separate, initiator-admitted grant.
+        // It is deliberately absent from the shared capsule's unconditional
+        // runtime actions: a later collaborator must not lend this authority.
+        if self
+            .require_root_action(
+                principal,
+                request,
+                ResourceAction::ThreadObserveWorkspace,
+                runtime_draft,
+            )
+            .await
+            .is_ok()
+        {
+            actions.insert(
+                ResourceAction::ThreadObserveWorkspace
+                    .safe_name()
+                    .to_owned(),
+            );
+        }
+
         let operational_projection_fingerprint = self
             .policy
             .operational_projection(
@@ -1050,22 +1087,35 @@ impl ExecutionAdmissionService {
         action: ResourceAction,
         runtime_draft: Option<&RuntimeDraftAccess>,
     ) -> Result<bool> {
-        let gate =
-            self.policy
-                .authorize_action(principal.kind, principal.role_key.as_ref(), action);
+        let source_action = if action.is_thread_creation() {
+            ResourceAction::ThreadRead
+        } else {
+            action
+        };
+        let gate = self.policy.authorize_action(
+            principal.kind,
+            principal.role_key.as_ref(),
+            source_action,
+        );
         let resolved = match runtime_draft {
             Some(access)
                 if access.workspace_id() == workspace_id
                     && access.thread_id() == root_thread_id =>
             {
                 self.resolver
-                    .authorize_runtime_draft(principal, &gate, action, access)
+                    .authorize_runtime_draft(principal, &gate, source_action, access)
                     .await
             }
             Some(_) => bail!("runtime draft differs from the execution root"),
             None => {
                 self.resolver
-                    .authorize_thread(principal, &gate, action, root_thread_id, Some(workspace_id))
+                    .authorize_thread(
+                        principal,
+                        &gate,
+                        source_action,
+                        root_thread_id,
+                        Some(workspace_id),
+                    )
                     .await
             }
         }
@@ -1075,7 +1125,21 @@ impl ExecutionAdmissionService {
                 action.safe_name()
             )
         })?;
-        Ok(matches!(resolved, ProofResolution::Authorized(_)))
+        if !matches!(resolved, ProofResolution::Authorized(_)) {
+            return Ok(false);
+        }
+        if action.is_thread_creation() {
+            let gate =
+                self.policy
+                    .authorize_action(principal.kind, principal.role_key.as_ref(), action);
+            return Ok(matches!(
+                self.resolver
+                    .authorize_workspace(principal, &gate, action, workspace_id)
+                    .await?,
+                ProofResolution::Authorized(_)
+            ));
+        }
+        Ok(true)
     }
 }
 
@@ -1329,6 +1393,55 @@ impl ExecutionAuthorizationContext {
         self.grant_manifest.allows_action(action)
     }
 
+    /// Optional creation permissions in a new agent-origin Task admission may
+    /// only narrow its creator's immutable grants, even if the user's current
+    /// role can create more kinds of conversations.
+    pub(crate) fn constrain_thread_creation_grants(
+        &mut self,
+        source_actions: &BTreeSet<ResourceAction>,
+    ) {
+        self.grant_manifest.actions.retain(|name| {
+            ResourceAction::from_safe_name(name).is_none_or(|action| {
+                !action.is_thread_creation() || source_actions.contains(&action)
+            })
+        });
+    }
+
+    pub(crate) fn child_launch_executor_allowed(&self, executor: &str, cli: bool) -> bool {
+        let Ok((kind, role)) = self.registered_role_identity() else {
+            return false;
+        };
+        let policy = AuthorizationService::new();
+        if cli {
+            self.grants_action(ResourceAction::CliRuntimeUse)
+                && policy.cli_runtime_allowed(kind, role.as_ref(), executor)
+        } else {
+            self.grants_action(ResourceAction::ProviderUse)
+                && policy.provider_allowed(kind, role.as_ref(), executor)
+        }
+    }
+
+    /// A new child may select another model within its admitted actions and
+    /// registered role. The parent's exact execution grant remains immutable.
+    pub(crate) fn child_launch_model_allowed(
+        &self,
+        provider: &str,
+        model: &str,
+        cli: bool,
+    ) -> bool {
+        let Ok((kind, role)) = self.registered_role_identity() else {
+            return false;
+        };
+        let policy = AuthorizationService::new();
+        if cli {
+            self.grants_action(ResourceAction::CliRuntimeUse)
+                && policy.cli_model_allowed(kind, role.as_ref(), provider, model)
+        } else {
+            self.grants_action(ResourceAction::ProviderUse)
+                && policy.provider_model_allowed(kind, role.as_ref(), provider, model)
+        }
+    }
+
     pub(crate) const fn human_interaction_budget(&self) -> HumanInteractionBudget {
         self.human_interaction_budget
     }
@@ -1579,6 +1692,82 @@ impl ExecutionAuthorizationContext {
             bail!("provider authority changed; execution requires a fresh admission");
         }
         Ok(())
+    }
+
+    pub(crate) fn provider_authority_for_selection(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<&str> {
+        self.grant_manifest
+            .provider
+            .as_ref()
+            .filter(|grant| grant.provider == provider && grant.model == model)
+            .map(|grant| grant.authority_fingerprint.as_str())
+    }
+
+    /// A Task is an allowance for future executions, not a credential lease.
+    /// Only a new execution may resolve the current connection, and only after
+    /// the saved provider/model and capsule authority passed lease revalidation.
+    /// Keep all other saved facts, including role, actions and resource caps.
+    /// Existing execution recovery must use verify_current_provider_authority.
+    pub(crate) fn resolve_new_task_provider_authority(
+        &self,
+        registry: &pioneer_provider::ProviderRegistry,
+        revalidated: &RevalidatedExecutionAuthorization,
+    ) -> Result<Self> {
+        revalidated.verify_context(self)?;
+        let mut resolved = self.clone();
+        // Older non-composer CLI Task admissions encode the selected runtime
+        // as a provider grant. Its registry fingerprint is an immutable source
+        // fence, not an API credential that can be refreshed or constructed.
+        if self.continuation_provider().is_some_and(|(provider, _)| {
+            provider
+                .strip_prefix("cli_runtime:")
+                .is_some_and(|id| !id.is_empty())
+        }) {
+            self.verify_current_provider_authority(registry)?;
+            return Ok(resolved);
+        }
+        if let Some(provider) = resolved.grant_manifest.provider.as_mut() {
+            let (kind, role) = self.registered_role_identity()?;
+            let policy = AuthorizationService::new();
+            if !self.grants_action(ResourceAction::ProviderUse)
+                || !policy.provider_model_allowed(
+                    kind,
+                    role.as_ref(),
+                    &provider.provider,
+                    &provider.model,
+                )
+                || !policy.provider_model_allowed(
+                    revalidated.principal.kind,
+                    revalidated.principal.role_key.as_ref(),
+                    &provider.provider,
+                    &provider.model,
+                )
+            {
+                bail!("saved Task provider/model is no longer granted");
+            }
+            // Resolve the same workspace-scoped instance through the registry:
+            // keys, endpoint/proxy validation and revocation remain registry-owned.
+            // This constructs an adapter; it does not call the external service.
+            let expected = registry.available_authority_fingerprint_for_workspace(
+                &self.workspace_id,
+                &provider.provider,
+            )?;
+            let current =
+                registry.get_or_create_for_workspace(&self.workspace_id, &provider.provider)?;
+            provider.authority_fingerprint = current
+                .authority_fingerprint()
+                .context("Task provider has no current workspace authority")?
+                .to_owned();
+            if provider.authority_fingerprint != expected.as_str() {
+                bail!("Task provider changed during new execution admission");
+            }
+        }
+        resolved.grant_manifest.validate()?;
+        resolved.verify_current_provider_authority(registry)?;
+        Ok(resolved)
     }
 
     pub(crate) fn to_persisted_json(&self) -> Result<String> {
@@ -2174,23 +2363,41 @@ impl ExecutionAuthorizationContext {
                 )
                 .await?
                 .context("direct Agent child author execution is missing")?;
-                let expected_child_generation = parent_execution
-                    .execution_generation
-                    .checked_add(1)
-                    .context("direct Agent child generation exceeds persistence bounds")?;
+                let independent_root = child_execution.parent_execution_id.is_none()
+                    && child_execution.id == child_execution.work_graph_root_execution_id
+                    && child_execution.home_root_thread_id == scope.thread_id;
+                if independent_root {
+                    self.verify_independent_agent_start(
+                        store,
+                        &child_execution,
+                        parent_execution.id.as_str(),
+                        turn.id.as_str(),
+                    )
+                    .await?;
+                }
+                let expected_child_generation = if independent_root {
+                    1
+                } else {
+                    parent_execution
+                        .execution_generation
+                        .checked_add(1)
+                        .context("direct Agent child generation exceeds persistence bounds")?
+                };
                 if child_response.presentation_snapshot_id
                     != child_execution
                         .presentation_snapshot_id
                         .as_deref()
                         .unwrap_or_default()
                     || child_execution.id == parent_execution.id
-                    || child_execution.parent_execution_id.as_deref()
-                        != Some(parent_execution.id.as_str())
+                    || (!independent_root
+                        && child_execution.parent_execution_id.as_deref()
+                            != Some(parent_execution.id.as_str()))
                     || child_execution.parent_task_id.is_some()
                     || child_execution.parent_thread_id.as_deref() != Some(scope.thread_id.as_str())
                     || child_execution.home_root_thread_id != self.root_thread_id
-                    || child_execution.work_graph_root_execution_id
-                        != parent_execution.work_graph_root_execution_id
+                    || (!independent_root
+                        && child_execution.work_graph_root_execution_id
+                            != parent_execution.work_graph_root_execution_id)
                     || child_execution.execution_generation != expected_child_generation
                     || child_execution.authorization_context_fingerprint
                         != self.authorization_fingerprint()?
@@ -2315,6 +2522,61 @@ impl ExecutionAuthorizationContext {
 
             Ok(Some(parent_turn_id.to_owned()))
         })
+    }
+
+    /// Validate provenance independently from parent liveness. A source may
+    /// finish or be cancelled after the atomic action/turn admission.
+    pub(crate) async fn verify_independent_agent_start(
+        &self,
+        store: &CrudStore,
+        execution: &pioneer_entity::agent_execution::Model,
+        author_execution_id: &str,
+        turn_id: &str,
+    ) -> Result<()> {
+        let db = store.database_connection();
+        let grant = pioneer_crud::load_agent_execution_grant(&db, &execution.id)
+            .await?
+            .context("independent Agent start has no immutable grant")?;
+        let grant: serde_json::Value = serde_json::from_str(&grant.grant_json)?;
+        let action_id = grant
+            .get("source_action_id")
+            .and_then(serde_json::Value::as_str)
+            .context("independent Agent start has no source action")?;
+        let action = pioneer_crud::load_agent_action(&db, action_id)
+            .await?
+            .context("independent Agent source action is missing")?;
+        let receipt = pioneer_crud::load_agent_action_receipt(&db, action_id)
+            .await?
+            .context("independent Agent source receipt is missing")?;
+        let outbox = pioneer_crud::load_agent_action_outbox(&db, action_id)
+            .await?
+            .context("independent Agent source outbox is missing")?;
+        let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json)?;
+        if execution.parent_execution_id.is_some()
+            || execution.id != execution.work_graph_root_execution_id
+            || execution.workspace_id != self.workspace_id
+            || execution.home_root_thread_id != self.root_thread_id
+            || execution.authorization_context_fingerprint != self.authorization_fingerprint()?
+            || grant
+                .get("source_execution_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(author_execution_id)
+            || grant.get("turn_id").and_then(serde_json::Value::as_str) != Some(turn_id)
+            || action.execution_id != author_execution_id
+            || action.action_kind != "start_agent"
+            || action.status != "committed"
+            || receipt.decision != "allowed"
+            || receipt.actor_kind != "agent_execution"
+            || receipt.actor_id.as_deref() != Some(author_execution_id)
+            || outbox.owner_execution_id != author_execution_id
+            || payload
+                .get("spawned_execution_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(execution.id.as_str())
+        {
+            bail!("independent Agent start differs from its canonical source action");
+        }
+        Ok(())
     }
 
     fn verify_authority_derivation(&self, admitted: &Self) -> Result<()> {
@@ -2816,6 +3078,47 @@ impl ExecutionAuthorizationContext {
         })
     }
 
+    /// A standalone conversation is new work for the initiating user. Prove
+    /// its current admission without replacing or widening this inherited
+    /// immutable context. Shared continuation authority alone is insufficient.
+    pub(crate) async fn revalidate_new_root_launch(
+        &self,
+        store: &CrudStore,
+        request: &ExecutionAdmissionRequest,
+        permission: &TurnPermissionProfileSnapshot,
+        revision: u64,
+    ) -> Result<AuthenticatedSessionPrincipal> {
+        if request.workspace_id != self.workspace_id
+            || request.root_thread_id != self.root_thread_id
+        {
+            bail!("new root launch differs from its inherited authority scope");
+        }
+        let principal =
+            super::lease::collaboration_authority_principal(store, &self.initiating_principal_id)
+                .await?;
+        let proof = ExecutionAdmissionService::new(store.clone())
+            .admit_context(
+                &principal,
+                revision,
+                request,
+                Some(&pioneer_protocol::task_permission_cap_from_snapshot(
+                    permission,
+                )),
+            )
+            .await?;
+        let current_cap =
+            pioneer_protocol::task_permission_cap_snapshot(proof.permission_profile_cap());
+        if pioneer_protocol::intersect_turn_permission_profiles(
+            permission,
+            &current_cap,
+            permission.source,
+        ) != *permission
+        {
+            bail!("new root launch exceeds the initiating user's current permission cap");
+        }
+        Ok(principal)
+    }
+
     /// Derives an agent child continuation and, for an already-authorized
     /// route, binds recovery to the destination collaboration root while
     /// retaining the source principal/policy provenance and action ceiling.
@@ -3040,11 +3343,35 @@ impl ExecutionAuthorizationContext {
             &current_cap,
             pioneer_protocol::TurnPermissionProfileSource::TaskPermissionCap,
         );
+        let resolver = AuthorizationResolver::new(store.clone());
+        if action.is_thread_creation() {
+            // Source access and workspace creation are separate proofs.
+            if !matches!(
+                resolver
+                    .authorize_workspace(
+                        principal,
+                        &action_gate,
+                        action,
+                        self.workspace_id.as_str()
+                    )
+                    .await?,
+                ProofResolution::Authorized(_)
+            ) {
+                bail!("current collaborator cannot create this kind of thread in the workspace");
+            }
+        }
+        let source_action = if action.is_thread_creation() {
+            ResourceAction::ThreadRead
+        } else {
+            action
+        };
+        let source_gate =
+            policy.authorize_action(principal.kind, principal.role_key.as_ref(), source_action);
         let authorization = AuthorizationResolver::new(store.clone())
             .authorize_thread(
                 principal,
-                &action_gate,
-                action,
+                &source_gate,
+                source_action,
                 self.root_thread_id.as_str(),
                 Some(self.workspace_id.as_str()),
             )
@@ -3309,6 +3636,15 @@ impl RevalidatedExecutionAuthorization {
         &self.principal
     }
 
+    /// Read sources belong to the admitted initiating user, even when another
+    /// collaborator currently supplies backend continuation authority.
+    pub(crate) async fn initiating_principal(
+        &self,
+        store: &CrudStore,
+    ) -> Result<AuthenticatedSessionPrincipal> {
+        super::lease::collaboration_authority_principal(store, &self.admitted_principal_id).await
+    }
+
     pub(crate) fn authorization(&self) -> &AuthorizedThread {
         &self.authorization
     }
@@ -3476,6 +3812,10 @@ impl RuntimeDraftMaterialization {
 }
 
 impl ExecutionAuthorizationAdmission {
+    pub(crate) fn permission_profile_cap(&self) -> &TurnPermissionProfileCap {
+        &self.permission_profile_cap
+    }
+
     pub(crate) async fn project_root_action(
         &self,
         store: &CrudStore,
@@ -3602,6 +3942,10 @@ impl ExecutionAuthorizationAdmission {
             root_route_grants: Vec::new(),
             runtime_draft: None,
         })
+    }
+
+    pub(crate) fn initiating_principal_id(&self) -> &PrincipalId {
+        &self.initiating_principal_id
     }
 
     pub(crate) const fn uses_scoped_collaboration_policy(&self) -> bool {

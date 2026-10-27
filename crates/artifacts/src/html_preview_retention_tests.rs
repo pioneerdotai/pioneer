@@ -212,28 +212,46 @@ async fn html_preview_lists_filter_before_identity_pagination_and_preserve_publi
 }
 
 #[tokio::test]
-async fn html_preview_active_delivery_frozen_context_and_legacy_copies_release_after_owners() {
+async fn html_preview_active_delivery_frozen_context_and_copies_release_both_formats() {
+    preview_release_after_owners(false).await;
+    preview_release_after_owners(true).await;
+}
+
+async fn preview_release_after_owners(six_frames: bool) {
     use pioneer_provider::{ChatMessage, MessageContentPart};
     let mut harness = preview_fixture().await;
     harness.service.gc_policy.grace_secs = 0;
-    let source = harness
-        .service
-        .ingest_bytes(preview_request("input", b"<html>source</html>".to_vec()))
-        .await
-        .unwrap();
+    let mut source_request = preview_request("input", b"<html>source</html>".to_vec());
+    if six_frames {
+        source_request.metadata.get_mut("htmlTool").unwrap()["version"] = json!(2);
+    }
+    let source = harness.service.ingest_bytes(source_request).await.unwrap();
     let mut summaries = Vec::new();
     let mut parts = Vec::new();
     let mut images = Vec::new();
+    let mut previews = Vec::new();
     let mut old_paths = Vec::new();
-    for width in [360, 768, 1024] {
-        let summary = harness
-            .service
-            .ingest_bytes(preview_request(
-                &width.to_string(),
-                test_png_bytes(width, 2),
-            ))
-            .await
-            .unwrap();
+    let frames = if six_frames {
+        vec![
+            ("light-360", 360),
+            ("light-768", 768),
+            ("light-1024", 1024),
+            ("dark-360", 360),
+            ("dark-768", 768),
+            ("dark-1024", 1024),
+        ]
+    } else {
+        vec![("360", 360), ("768", 768), ("1024", 1024)]
+    };
+    for (index, width) in &frames {
+        let mut request = preview_request(index, test_png_bytes(*width, 2));
+        if six_frames {
+            request.metadata.get_mut("htmlTool").unwrap()["version"] = json!(2);
+            request.metadata.get_mut("htmlTool").unwrap()["details"] = json!({
+                "width":width,"appearance":index.split('-').next().unwrap()
+            });
+        }
+        let summary = harness.service.ingest_bytes(request).await.unwrap();
         let original = harness
             .service
             .resolve_provider_attachment(
@@ -267,15 +285,24 @@ async fn html_preview_active_delivery_frozen_context_and_legacy_copies_release_a
         attachment.source = pioneer_provider::AttachmentDataSource::Path {
             path: legacy.to_string_lossy().into_owned(),
         };
-        images.push(json!({"width":width,"attachment":attachment}));
+        let mut image = json!({"width":width,"attachment":attachment});
+        let mut preview = json!({"width":width,"artifact":summary.artifact});
+        if six_frames {
+            let appearance = index.split('-').next().unwrap();
+            image["appearance"] = json!(appearance);
+            preview["appearance"] = json!(appearance);
+        }
+        images.push(image);
+        previews.push(preview);
         parts.push(MessageContentPart::image(attachment));
         summaries.push(summary);
     }
-    let mut message = ChatMessage::tool_result(
-        "provider-call",
-        "html_preview",
-        json!({"source":source.artifact,"previews":[],"llm_context":{"images":images}}).to_string(),
-    );
+    let mut result =
+        json!({"source":source.artifact,"previews":previews,"llm_context":{"images":images}});
+    if six_frames {
+        result["formatVersion"] = json!(2);
+    }
+    let mut message = ChatMessage::tool_result("provider-call", "html_preview", result.to_string());
     message.content_parts = parts;
     let entry = pioneer_crud::NewTurnLlmContextEntry {
         turn_id: "preview-turn".into(),
@@ -354,7 +381,8 @@ async fn html_preview_active_delivery_frozen_context_and_legacy_copies_release_a
     drop(delivery);
     // An abort in the middle of version retirement rolls the canonical archive
     // and every logical owner back together; no file deletion is yet eligible.
-    harness.store.database_connection().execute_unprepared("CREATE TRIGGER fail_preview_release BEFORE DELETE ON artifact_version WHEN EXISTS(SELECT 1 FROM artifact a WHERE a.id=OLD.artifact_id AND a.created_by_actor_id='html_preview' AND json_extract(a.metadata_json,'$.htmlTool.index')='768') BEGIN SELECT RAISE(ABORT,'fixture release rollback'); END").await.unwrap();
+    let failing_index = if six_frames { "dark-768" } else { "768" };
+    harness.store.database_connection().execute_unprepared(&format!("CREATE TRIGGER fail_preview_release BEFORE DELETE ON artifact_version WHEN EXISTS(SELECT 1 FROM artifact a WHERE a.id=OLD.artifact_id AND a.created_by_actor_id='html_preview' AND json_extract(a.metadata_json,'$.htmlTool.index')='{failing_index}') BEGIN SELECT RAISE(ABORT,'fixture release rollback'); END")).await.unwrap();
     let mut rollback_progress = crate::HtmlPreviewMaintenanceProgress::default();
     let mut rolled_back = false;
     for _ in 0..64 {
@@ -378,7 +406,7 @@ async fn html_preview_active_delivery_frozen_context_and_legacy_copies_release_a
     let retained: serde_json::Value = serde_json::from_str(&retained[0].payload).unwrap();
     assert_eq!(
         retained["value"]["content_parts"].as_array().unwrap().len(),
-        3
+        frames.len()
     );
     harness
         .store
@@ -911,4 +939,70 @@ async fn html_preview_quiescent_pass_reaches_idle_and_discovers_later_preview() 
         assert!(idle);
     }
     assert!(!path.exists());
+}
+
+// Capture-layout validation is a retention boundary: ambiguous/mixed siblings
+// must keep every exact version instead of retiring a plausible subset.
+#[tokio::test]
+async fn html_preview_retention_preserves_mixed_duplicate_and_oversized_groups() {
+    for indices in [
+        vec!["input", "light-360", "light-360"],
+        vec!["input", "light-360", "360"],
+        vec![
+            "input",
+            "light-360",
+            "light-768",
+            "light-1024",
+            "dark-360",
+            "dark-768",
+            "dark-1024",
+            "unexpected",
+        ],
+    ] {
+        let harness = preview_fixture().await;
+        let mut summaries = Vec::new();
+        for (ordinal, index) in indices.iter().enumerate() {
+            let mut request = preview_request(index, vec![ordinal as u8]);
+            if *index != "360" {
+                request.metadata.get_mut("htmlTool").unwrap()["version"] = json!(2);
+            }
+            summaries.push(harness.service.ingest_bytes(request).await.unwrap());
+        }
+        harness
+            .store
+            .database_connection()
+            .execute_unprepared("UPDATE turn SET status='completed' WHERE id='preview-turn'")
+            .await
+            .unwrap();
+        let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
+        let mut rejected = false;
+        for _ in 0..128 {
+            match harness
+                .service
+                .html_preview_maintenance_quantum(&mut progress)
+                .await
+            {
+                Err(_) => {
+                    rejected = true;
+                    break;
+                }
+                Ok(false) => break,
+                Ok(true) => {}
+            }
+        }
+        assert!(rejected, "ambiguous capture group must be preserved");
+        for summary in summaries {
+            assert!(
+                harness
+                    .store
+                    .get_artifact_version_blob(
+                        "ws_a",
+                        &summary.artifact.artifact_id,
+                        summary.artifact.version_id.as_deref(),
+                    )
+                    .await
+                    .is_ok()
+            );
+        }
+    }
 }

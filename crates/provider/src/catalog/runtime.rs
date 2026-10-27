@@ -206,6 +206,12 @@ fn retain_unavailable_sources(
     use generator::SOURCE_URLS;
     for (provider, models) in previous.models {
         for (id, model) in models {
+            if provider == "vercel-ai-gateway"
+                && (model["api"] != "openai-responses"
+                    || model["baseUrl"] != "https://ai-gateway.vercel.sh/v1")
+            {
+                continue;
+            }
             let source = model["pricingSource"]["url"].as_str();
             let unavailable = source.is_some_and(|url| {
                 SOURCE_URLS.contains(&url) && snapshot.source_body(url).is_none()
@@ -248,13 +254,23 @@ fn retain_unavailable_sources(
     let capabilities = current
         .tool_capabilities
         .get_or_insert_with(Default::default);
-    for (provider, models) in previous.tool_capabilities.unwrap_or_default() {
+    for (provider, mut models) in previous.tool_capabilities.unwrap_or_default() {
         let native_failed = match provider.as_str() {
             "openrouter" => snapshot.source_body(SOURCE_URLS[1]).is_none(),
             "vercel-ai-gateway" => snapshot.source_body(SOURCE_URLS[2]).is_none(),
             _ => false,
         };
         if native_failed {
+            if provider == "vercel-ai-gateway" {
+                models.retain(|id, supported| {
+                    !*supported
+                        || current
+                            .models
+                            .get(&provider)
+                            .and_then(|models| models.get(id))
+                            .is_some_and(|model| model["api"] == "openai-responses")
+                });
+            }
             capabilities.insert(provider, models);
         } else if !matches!(provider.as_str(), "openrouter" | "vercel-ai-gateway")
             && (snapshot.source_body(SOURCE_URLS[0]).is_none()
@@ -316,7 +332,10 @@ pub async fn run_catalog_updates(directory: PathBuf, cancellation: CancellationT
     }
     let saved_directory = directory.clone();
     if !matches!(
-        tokio::task::spawn_blocking(move || restore_or_install_catalog(&saved_directory)).await,
+        pioneer_observability::work::spawn_blocking(move || restore_or_install_catalog(
+            &saved_directory
+        ))
+        .await,
         Ok(Ok(()))
     ) {
         tracing::warn!("model catalog cache unavailable; awaiting successful download");
@@ -358,10 +377,12 @@ async fn run_updates(
         let result = match snapshot {
             Ok(snapshot) => {
                 let directory = directory.clone();
-                tokio::task::spawn_blocking(move || prepare_update(&directory, snapshot))
-                    .await
-                    .context("model catalog update task")
-                    .and_then(|result| result)
+                pioneer_observability::work::spawn_blocking(move || {
+                    prepare_update(&directory, snapshot)
+                })
+                .await
+                .context("model catalog update task")
+                .and_then(|result| result)
             }
             Err(error) => Err(error),
         };
@@ -411,6 +432,78 @@ mod tests {
             .name
             .clone()
     }
+    #[test]
+    fn stale_vercel_cache_and_orphan_tool_facts_do_not_return_after_failed_refresh() {
+        for malformed_success in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = snapshot("before");
+            prepare_update(dir.path(), source.clone()).unwrap();
+            let mut saved = load_saved_cache(dir.path()).unwrap().unwrap();
+            for model in saved
+                .catalog
+                .models
+                .get_mut("vercel-ai-gateway")
+                .unwrap()
+                .values_mut()
+            {
+                model["api"] = serde_json::json!("anthropic-messages");
+                model["baseUrl"] = serde_json::json!("https://ai-gateway.vercel.sh");
+            }
+            saved
+                .catalog
+                .tool_capabilities
+                .as_mut()
+                .unwrap()
+                .entry("vercel-ai-gateway".into())
+                .or_default()
+                .insert("legacy/orphan-positive".into(), true);
+            let old_openrouter = saved.catalog.models["openrouter"].clone();
+            persist_bytes(dir.path(), &serde_json::to_vec(&saved).unwrap()).unwrap();
+            let restored = load_cache(dir.path()).unwrap().unwrap();
+            assert_eq!(
+                restored.tool_support("vercel-ai-gateway", "legacy/orphan-positive"),
+                None
+            );
+            let mut newer = source;
+            let failed = newer.sources.get_mut(generator::SOURCE_URLS[2]).unwrap();
+            failed.status = if malformed_success { 200 } else { 503 };
+            failed.body = serde_json::json!({"invalid":"not a listing"});
+            newer
+                .sources
+                .get_mut(generator::SOURCE_URLS[1])
+                .unwrap()
+                .status = 503;
+            newer
+                .sources
+                .get_mut(generator::SOURCE_URLS[0])
+                .unwrap()
+                .body["openai"]["models"]["gpt-5-nano"]["name"] = serde_json::json!("healthy");
+            let updated = prepare_update(dir.path(), newer).unwrap();
+            assert_eq!(
+                updated.model("openai", "gpt-5-nano").unwrap().name,
+                "healthy"
+            );
+            assert_eq!(
+                updated.tool_support("vercel-ai-gateway", "legacy/orphan-positive"),
+                None
+            );
+            let persisted = load_saved_cache(dir.path()).unwrap().unwrap();
+            assert!(
+                persisted
+                    .catalog
+                    .models
+                    .get("vercel-ai-gateway")
+                    .is_none_or(|models| models.is_empty())
+            );
+            assert_eq!(persisted.catalog.models["openrouter"], old_openrouter);
+            assert!(
+                persisted.catalog.diagnostics.iter().any(
+                    |d| d.source == generator::SOURCE_URLS[2] && d.code == "source_unavailable"
+                )
+            );
+        }
+    }
+
     #[test]
     fn partial_refresh_preserves_failed_source_evidence_and_updates_healthy_sources() {
         for failed_url in generator::SOURCE_URLS {

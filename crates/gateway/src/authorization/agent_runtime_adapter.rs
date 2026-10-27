@@ -239,6 +239,31 @@ impl BoundAgentActionAdapter {
         safe
     }
 
+    /// Bind only the resolved model metadata. This does not change the identity,
+    /// capability or route options the caller already selected, so their option
+    /// IDs and generation must remain stable during launch resolution.
+    pub(crate) fn install_selected_launch_profiles(
+        &mut self,
+        profiles: Vec<AgentExecutionProfileProjection>,
+    ) -> AgentToolOptionsProjection {
+        self.start_options.profiles = super::project_bounded_start_options(
+            self.start_options.agents.clone(),
+            profiles,
+            &self.envelope,
+            self.current_policy_generation,
+        )
+        .profiles;
+        let mut safe = self.start_options.clone().safe_tool_projection();
+        populate_binding_options(
+            &self.root,
+            self.same_capsule_targets.as_slice(),
+            self.routes.as_slice(),
+            &task_agent_capabilities(&self.envelope),
+            &mut safe,
+        );
+        safe
+    }
+
     pub(crate) fn resolve_task_launch(
         &self,
         selection: &pioneer_protocol::AgentLaunchSelection,
@@ -276,22 +301,23 @@ impl BoundAgentActionAdapter {
         })
     }
 
-    pub(crate) fn resolve_named_task_reviewer_launch(
+    pub(crate) fn named_task_reviewer_identity(
         &self,
         nickname: &str,
-    ) -> Result<(AgentIdentityProjection, AgentExecutionProfileProjection), AgentToolAdapterError>
-    {
+        saved_ceiling: &pioneer_protocol::ChildAgentLaunchGrantSet,
+    ) -> Result<AgentIdentityProjection, AgentToolAdapterError> {
         let nickname = nickname.trim();
         if nickname.is_empty() {
             return Err(AgentToolAdapterError::InvalidInput(
                 "reviewer agent nickname is required".to_owned(),
             ));
         }
-        let mut identities = self
-            .start_options
-            .agents
-            .iter()
-            .filter(|identity| identity.nickname.eq_ignore_ascii_case(nickname));
+        let mut identities = self.start_options.agents.iter().filter(|identity| {
+            saved_ceiling.identities.iter().any(|saved| {
+                saved.nickname.eq_ignore_ascii_case(nickname)
+                    && pioneer_protocol::agent_identity_has_same_launch_source(identity, saved)
+            })
+        });
         let identity = identities.next().cloned().ok_or_else(|| {
             AgentToolAdapterError::InvalidInput(
                 "reviewer agent identity is stale or unavailable".to_owned(),
@@ -302,6 +328,16 @@ impl BoundAgentActionAdapter {
                 "reviewer agent nickname is ambiguous".to_owned(),
             ));
         }
+        Ok(identity)
+    }
+
+    pub(crate) fn resolve_named_task_reviewer_launch(
+        &self,
+        nickname: &str,
+        saved_ceiling: &pioneer_protocol::ChildAgentLaunchGrantSet,
+    ) -> Result<(AgentIdentityProjection, AgentExecutionProfileProjection), AgentToolAdapterError>
+    {
+        let identity = self.named_task_reviewer_identity(nickname, saved_ceiling)?;
         let mut profiles = self.start_options.profiles.iter().filter(|profile| {
             profile
                 .compatible_agent_identity_ids
@@ -459,27 +495,24 @@ impl BoundAgentActionAdapter {
         if !identities.iter().any(|candidate| candidate == identity) {
             identities.push(identity.clone());
         }
-        let mut profiles = self.start_options.profiles.clone();
-        if !profiles.iter().any(|candidate| candidate == profile) {
-            profiles.push(profile.clone());
-        }
-        let child_launch_grant =
-            pioneer_protocol::ChildAgentLaunchGrantSet::new(identities, profiles)
-                .and_then(|grant| {
-                    grant.with_policy(
-                        self.start_options.inherit_parent_agent_available,
-                        self.start_options.derived_ephemeral_available,
-                        self.start_options.inherit_parent_profile_available,
-                        self.start_options.allowed_skill_ids.clone(),
-                        self.start_options.allowed_mcp_server_ids.clone(),
-                        self.start_options.max_permission_profile.clone(),
-                    )
-                })
-                .map_err(|_| {
-                    AgentToolAdapterError::InvalidInput(
-                        "Task child launch grant is invalid".to_owned(),
-                    )
-                })?;
+        pioneer_protocol::validate_selected_agent_launch_profile(identity, profile, &identities)
+            .map_err(|_| {
+                AgentToolAdapterError::InvalidInput("Task selected profile is invalid".to_owned())
+            })?;
+        let child_launch_grant = pioneer_protocol::ChildAgentLaunchGrantSet::new(identities)
+            .and_then(|grant| {
+                grant.with_policy(
+                    self.start_options.inherit_parent_agent_available,
+                    self.start_options.derived_ephemeral_available,
+                    self.start_options.inherit_parent_profile_available,
+                    self.start_options.allowed_skill_ids.clone(),
+                    self.start_options.allowed_mcp_server_ids.clone(),
+                    self.start_options.max_permission_profile.clone(),
+                )
+            })
+            .map_err(|_| {
+                AgentToolAdapterError::InvalidInput("Task child launch grant is invalid".to_owned())
+            })?;
         Ok(task_authorization_grant_seed_from_envelope(
             envelope,
             child_launch_grant,
@@ -491,6 +524,32 @@ impl BoundAgentActionAdapter {
     pub(crate) fn prepare(
         &mut self,
         intent: &AgentActionIntent,
+    ) -> Result<PreparedAgentAction, AgentToolAdapterError> {
+        self.prepare_with_placement(intent, false)
+    }
+
+    /// The destination shape is read by the server, never supplied by a tool
+    /// argument. A visible root is independent only through its exact route to
+    /// another capsule; routed internal threads remain ordinary children.
+    pub(crate) fn prepare_start_agent(
+        &mut self,
+        intent: &AgentActionIntent,
+        destination_is_visible_root: bool,
+    ) -> Result<PreparedAgentAction, AgentToolAdapterError> {
+        let independent_root = destination_is_visible_root
+            && matches!(intent, AgentActionIntent::StartAgent { .. })
+            && self.route_for_intent(intent)?.is_some_and(|route| {
+                !route.same_capsule
+                    && route.destination_thread_id == route.destination_capsule_id
+                    && route.destination_capsule_id != self.root.home_root_thread_id
+            });
+        self.prepare_with_placement(intent, independent_root)
+    }
+
+    fn prepare_with_placement(
+        &mut self,
+        intent: &AgentActionIntent,
+        independent_root: bool,
     ) -> Result<PreparedAgentAction, AgentToolAdapterError> {
         let route = self.route_for_intent(intent)?.cloned();
         let same_capsule_thread_ids = self
@@ -510,7 +569,12 @@ impl BoundAgentActionAdapter {
                 self.branch_key.clone(),
                 self.attempt_generation,
                 self.current_policy_generation,
-                self.depth.saturating_add(1),
+                if independent_root {
+                    0
+                } else {
+                    self.depth.saturating_add(1)
+                },
+                independent_root,
             )
             .map_err(AgentToolAdapterError::from)?;
         prepared.execution_grant_fingerprint = self.execution_grant_fingerprint.clone();
@@ -595,7 +659,12 @@ impl BoundAgentActionAdapter {
             start,
             &self.start_options,
             prepared.route.clone(),
-            self.depth.saturating_add(1),
+            if prepared.independent_root {
+                0
+            } else {
+                self.depth.saturating_add(1)
+            },
+            prepared.independent_root,
             branch_key,
             &self.policy,
             RoleDefinitionRegistry::new(),
@@ -622,7 +691,9 @@ impl BoundAgentActionAdapter {
         let idempotency_key = idempotency_key_for_call(call_id, tool);
         let execution_id = self.root.execution_id.clone();
         let intent = match tool {
-            AgentModelToolName::AgentStartOptions => return Ok(None),
+            AgentModelToolName::AgentStartOptions | AgentModelToolName::IdentityModelsList => {
+                return Ok(None);
+            }
             AgentModelToolName::SendMessage => {
                 let input: AgentSendMessageToolInput = decode(arguments)?;
                 AgentActionIntent::SendMessage {
@@ -654,10 +725,7 @@ impl BoundAgentActionAdapter {
             }
             AgentModelToolName::StartAgent => {
                 let input: AgentStartToolInput = decode(arguments)?;
-                validate_tool_launch(
-                    &input.launch,
-                    options.ok_or(AgentToolAdapterError::OptionsUnavailable)?,
-                )?;
+                validate_tool_launch(&input.launch, &self.start_options.safe_tool_projection())?;
                 AgentActionIntent::StartAgent {
                     action_id,
                     execution_id,
@@ -674,10 +742,7 @@ impl BoundAgentActionAdapter {
             }
             AgentModelToolName::CreateTask => {
                 let input: AgentTaskToolInput = decode(arguments)?;
-                validate_tool_launch(
-                    &input.launch,
-                    options.ok_or(AgentToolAdapterError::OptionsUnavailable)?,
-                )?;
+                validate_tool_launch(&input.launch, &self.start_options.safe_tool_projection())?;
                 let selection = AgentTaskActionSelection {
                     task_template_id: input.task_template_id,
                     launch: input.launch.into_server_selection(),
@@ -695,10 +760,7 @@ impl BoundAgentActionAdapter {
             }
             AgentModelToolName::ScheduleTask => {
                 let input: AgentScheduleTaskToolInput = decode(arguments)?;
-                validate_tool_launch(
-                    &input.launch,
-                    options.ok_or(AgentToolAdapterError::OptionsUnavailable)?,
-                )?;
+                validate_tool_launch(&input.launch, &self.start_options.safe_tool_projection())?;
                 AgentActionIntent::ScheduleTask {
                     action_id,
                     execution_id,
@@ -742,6 +804,28 @@ impl BoundAgentActionAdapter {
             }
         };
         Ok(Some(intent))
+    }
+
+    pub(crate) fn restrict_thread_creation_options(
+        &self,
+        options: &mut AgentToolOptionsProjection,
+        private: bool,
+        workspace: bool,
+    ) {
+        options.thread_creation_options.retain(|option| {
+            (private
+                && option.id
+                    == thread_creation_option_id(
+                        &self.root,
+                        &AgentThreadAudienceTemplate::HomeCapsule,
+                    ))
+                || (workspace
+                    && option.id
+                        == thread_creation_option_id(
+                            &self.root,
+                            &AgentThreadAudienceTemplate::RootDelegation,
+                        ))
+        });
     }
 
     fn resolve_thread_creation_option(
@@ -865,6 +949,7 @@ impl BoundAgentActionAdapter {
             receipt_id: Some(projection.receipt_id.clone()),
             outbox_id: Some(projection.outbox_id.clone()),
             public_message: None,
+            target_options: Vec::new(),
         }
     }
 }
@@ -879,6 +964,11 @@ fn validate_tool_launch(
     selection: &AgentToolLaunchSelection,
     options: &AgentToolOptionsProjection,
 ) -> Result<(), AgentToolAdapterError> {
+    if selection.use_default_reasoning && selection.reasoning.is_some() {
+        return Err(AgentToolAdapterError::InvalidInput(
+            "default reasoning and an explicit effort are mutually exclusive".to_owned(),
+        ));
+    }
     if selection.skill_ids.iter().collect::<BTreeSet<_>>().len() != selection.skill_ids.len()
         || selection
             .mcp_server_ids
@@ -914,7 +1004,9 @@ fn validate_tool_launch(
     };
     let profile = match &selection.profile {
         AgentToolProfileChoice::InheritParent if options.inherit_parent_profile_available => None,
-        AgentToolProfileChoice::Exact(id) => {
+        // The server resolves this against current metadata before materialization.
+        AgentToolProfileChoice::Model { .. } => None,
+        AgentToolProfileChoice::Exact { id } => {
             let profile = options
                 .profiles
                 .iter()
@@ -1263,6 +1355,7 @@ pub(crate) fn materialize_selected_task_agent_action_binding(
     depth: u16,
     role_key: &str,
     policy_generation: u64,
+    parent: &BoundAgentActionAdapter,
 ) -> Result<
     (
         BoundAgentActionAdapter,
@@ -1276,7 +1369,7 @@ pub(crate) fn materialize_selected_task_agent_action_binding(
         identity_status: pioneer_protocol::AgentIdentityStatus::Active,
         role_key: role_key.to_owned(),
         root_capsule_id: root_capsule_id.to_owned(),
-        parent_envelope: None,
+        parent_envelope: Some(parent.envelope.clone()),
         policy_generation,
     }
     .derive_envelope(RoleDefinitionRegistry::new())
@@ -1378,10 +1471,13 @@ fn populate_binding_options(
             label: "Approved routed destination".to_owned(),
         }));
     if capabilities.contains(&AgentToolCapability::ThreadCreate) {
-        let mut audiences = vec![(
-            AgentThreadAudienceTemplate::HomeCapsule,
-            "Current collaboration",
-        )];
+        let mut audiences = Vec::new();
+        if root.envelope.allows(ResourceAction::ThreadCreatePrivate) {
+            audiences.push((
+                AgentThreadAudienceTemplate::HomeCapsule,
+                "Current collaboration",
+            ));
+        }
         if root.envelope.allows(ResourceAction::ThreadCreateWorkspace) {
             audiences.push((
                 AgentThreadAudienceTemplate::RootDelegation,
@@ -1427,6 +1523,9 @@ fn task_agent_capabilities(envelope: &AgentSecurityEnvelope) -> BTreeSet<AgentTo
     .into_iter()
     .filter_map(|(capability, action)| envelope.allows(action).then_some(capability))
     .collect::<BTreeSet<_>>();
+    if envelope.allows(ResourceAction::ThreadCreateWorkspace) {
+        capabilities.insert(AgentToolCapability::ThreadCreate);
+    }
     if envelope.allows(ResourceAction::ChildStart)
         && envelope.allows(ResourceAction::AgentTurnStart)
     {
@@ -1534,6 +1633,7 @@ mod tests {
         let adapter = test_adapter();
         for tool in [
             AgentModelToolName::AgentStartOptions,
+            AgentModelToolName::IdentityModelsList,
             AgentModelToolName::Wait,
             AgentModelToolName::Result,
         ] {
@@ -1629,9 +1729,9 @@ mod tests {
             id: AgentIdentityId::new("A99999999999999999999").unwrap(),
         };
         let mut profile = exact_tool_launch();
-        profile.profile = AgentToolProfileChoice::Exact(
-            pioneer_protocol::AgentExecutionProfileId::new("P99999999999999999999").unwrap(),
-        );
+        profile.profile = AgentToolProfileChoice::Exact {
+            id: pioneer_protocol::AgentExecutionProfileId::new("P99999999999999999999").unwrap(),
+        };
         let current_target = adapter.current_target_option_id();
         for (launch, target_option_id) in [
             (permission, current_target.clone()),
@@ -1740,6 +1840,7 @@ mod tests {
     #[test]
     fn task_management_intents_require_the_exact_current_action_not_just_control_capability() {
         for control in [
+            pioneer_protocol::AgentTaskControl::Finish,
             pioneer_protocol::AgentTaskControl::Update,
             pioneer_protocol::AgentTaskControl::Pause,
             pioneer_protocol::AgentTaskControl::Reschedule,
@@ -1892,12 +1993,13 @@ mod tests {
             identity: AgentToolIdentityChoice::Exact {
                 id: AgentIdentityId::new("A12345678901234567890").unwrap(),
             },
-            profile: AgentToolProfileChoice::Exact(
-                AgentExecutionProfileId::new("P12345678901234567890").unwrap(),
-            ),
+            profile: AgentToolProfileChoice::Exact {
+                id: AgentExecutionProfileId::new("P12345678901234567890").unwrap(),
+            },
             reasoning: Some(TurnReasoningSelection {
                 effort: "medium".to_owned(),
             }),
+            use_default_reasoning: false,
             permission_profile: Some(TurnPermissionProfileSelection {
                 mode: TurnPermissionMode::Supervised,
             }),

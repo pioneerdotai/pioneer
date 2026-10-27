@@ -57,28 +57,44 @@ case "$mode" in
     require_zip_entry "$target" '^Pioneer\.app/Contents/MacOS/pioneer-app$'
     require_zip_entry "$target" '^Pioneer\.app/Contents/MacOS/pioneer-app-updater$'
     require_zip_entry "$target" '^Pioneer\.app/Contents/Resources/gateway/pioneer-bootstrap$'
-    require_zip_entry "$target" '^Pioneer\.app/Contents/Resources/gateway/pioneer-gateway-macos-.*\.(gz|zip)$'
+    require_zip_entry "$target" '^Pioneer\.app/Contents/Resources/gateway/pioneer-gateway-macos-.*-computer-use-package\.zip$'
     require_zip_entry "$target" '^Pioneer\.app/Contents/Resources/gateway/SHA256SUMS$'
+    gateway_asset="$(mktemp -t pioneer-gateway)"
+    trap 'rm -f "$gateway_asset"' EXIT
+    gateway_entry="$(unzip -Z1 "$target" | grep -E '^Pioneer\.app/Contents/Resources/gateway/pioneer-gateway-macos-.*-computer-use-package\.zip$')"
+    unzip -p "$target" "$gateway_entry" > "$gateway_asset"
+    require_zip_entry "$gateway_asset" '^cua/Pioneer Gateway\.app/Contents/MacOS/pioneer$'
+    require_zip_entry "$gateway_asset" '^cua/Pioneer Gateway\.app/Contents/Helpers/cua-driver$'
+    require_zip_entry "$gateway_asset" '^cua/manifest\.json$'
     ;;
   linux-appdir)
     require_path "$target/usr/bin/pioneer-app"
     require_path "$target/usr/bin/pioneer-app-updater"
     require_path "$target/usr/bin/gateway/pioneer-bootstrap"
     require_path "$target/usr/bin/gateway/SHA256SUMS"
-    if ! compgen -G "$target/usr/bin/gateway/pioneer-gateway-linux-*.gz" >/dev/null; then
+    if ! compgen -G "$target/usr/bin/gateway/pioneer-gateway-linux-*-computer-use-package.zip" >/dev/null; then
       echo "missing bundled Linux gateway asset in $target/usr/bin/gateway" >&2
       exit 1
     fi
+    for asset in "$target"/usr/bin/gateway/pioneer-gateway-linux-*-computer-use-package.zip; do
+      require_zip_entry "$asset" '^cua/cua-driver$'
+      require_zip_entry "$asset" '^cua/manifest\.json$'
+    done
     ;;
   windows-stage)
     require_path "$target/pioneer-app.exe"
     require_path "$target/pioneer-app-updater.exe"
     require_path "$target/gateway/pioneer-bootstrap.exe"
     require_path "$target/gateway/SHA256SUMS"
-    if ! compgen -G "$target/gateway/pioneer-gateway-windows-*.zip" >/dev/null; then
+    if ! compgen -G "$target/gateway/pioneer-gateway-windows-*-computer-use-package.zip" >/dev/null; then
       echo "missing bundled Windows gateway asset in $target/gateway" >&2
       exit 1
     fi
+    for asset in "$target"/gateway/pioneer-gateway-windows-*-computer-use-package.zip; do
+      require_zip_entry "$asset" '^cua/cua-driver\.exe$'
+      require_zip_entry "$asset" '^cua/cua-driver-uia\.exe$'
+      require_zip_entry "$asset" '^cua/manifest\.json$'
+    done
     ;;
   *)
     usage

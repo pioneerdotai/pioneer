@@ -430,6 +430,7 @@ pub fn vector_provider_key_provider_id(
     match provider {
         GatewayThreadEpisodicVectorProvider::OpenAi => Some("openai"),
         GatewayThreadEpisodicVectorProvider::OpenRouter => Some("openrouter"),
+        GatewayThreadEpisodicVectorProvider::VercelAiGateway => Some("vercel-ai-gateway"),
         GatewayThreadEpisodicVectorProvider::Local => None,
     }
 }

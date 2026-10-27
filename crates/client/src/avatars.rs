@@ -320,7 +320,7 @@ impl AvatarCacheService {
         let _operation = operation_gate.lock().await;
         let runtime_home = self.runtime_home.clone();
         let gateway_id = self.gateway_id.clone();
-        tokio::task::spawn_blocking(move || {
+        pioneer_observability::work::spawn_blocking(move || {
             remove_owned_directory(
                 runtime_home.as_path(),
                 avatar_cache_root(runtime_home.as_path())

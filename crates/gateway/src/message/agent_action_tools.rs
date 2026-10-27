@@ -91,6 +91,22 @@ pub(crate) async fn current_agent_identity_source_fence(
             {
                 anyhow::bail!("CLI Agent source projection is stale");
             }
+            let presentation = pioneer_crud::load_agent_presentation_snapshot(
+                &database,
+                execution
+                    .presentation_snapshot_id
+                    .as_deref()
+                    .context("CLI execution has no saved presentation")?,
+            )
+            .await?
+            .context("CLI execution presentation is unavailable")?;
+            if presentation.agent_identity_id != execution.agent_identity_id
+                || presentation.source_revision != execution.identity_source_revision
+                || presentation.source_fingerprint != execution.identity_source_fingerprint
+                || presentation.role_label.as_deref() != Some(runtime.kind.as_str())
+            {
+                anyhow::bail!("CLI execution source changed its admitted runtime kind");
+            }
         }
         pioneer_crud::SOURCE_EPHEMERAL => {}
         _ => anyhow::bail!("Agent identity source kind is unsupported"),
@@ -144,34 +160,19 @@ impl AgentActionRuntimeBinding {
             .ok_or_else(|| {
                 anyhow::anyhow!("AgentExecution is missing while projecting launch options")
             })?;
-        let fallback_thread = processor
-            .crud_store
-            .get_thread_model(execution.home_root_thread_id.as_str())
-            .await?;
-        let default_provider = match &facts.profile.backend {
-            pioneer_protocol::AgentExecutionProfileBackend::ApiProvider => {
-                facts.profile.provider_id.clone()
-            }
-            _ => fallback_thread
-                .as_ref()
-                .map(|thread| thread.model_provider.clone())
-                .ok_or_else(|| anyhow::anyhow!("launch catalog has no API provider fallback"))?,
-        };
-        let default_model = fallback_thread
-            .as_ref()
-            .map(|thread| thread.model.clone())
-            .unwrap_or_else(|| facts.profile.model_id.clone());
-        let (current_identities, current_profiles) = current_workspace_launch_catalog(
-            processor,
-            execution.workspace_id.as_str(),
-            &facts.identity,
-            &facts.profile,
-            default_provider.as_str(),
-            default_model.as_str(),
-        )
-        .await?;
         let ceiling =
             load_execution_child_launch_ceiling(&database, facts.execution_id.as_str()).await?;
+        let authority = processor
+            .load_turn_execution_authorization_context(turn_id)
+            .await?;
+        let (current_identities, current_profiles) = current_workspace_launch_options(
+            processor,
+            &execution.workspace_id,
+            &facts.identity,
+            &facts.profile,
+            &authority,
+        )
+        .await?;
         let (projected_identities, projected_profiles) =
             intersect_child_launch_ceiling(&ceiling, &current_identities, &current_profiles);
         let parent_identity_available = ceiling.allow_inherit_parent_identity
@@ -182,9 +183,6 @@ impl AgentActionRuntimeBinding {
             && projected_profiles
                 .iter()
                 .any(|profile| profile.id == facts.profile.id);
-        let authority = processor
-            .load_turn_execution_authorization_context(turn_id)
-            .await?;
         let graph_root = pioneer_crud::load_agent_execution(
             &database,
             execution.work_graph_root_execution_id.as_str(),
@@ -192,40 +190,51 @@ impl AgentActionRuntimeBinding {
         .await?
         .ok_or_else(|| anyhow::anyhow!("launch catalog graph root is missing"))?;
         if authority.workspace_id() != execution.workspace_id
-            || authority.root_thread_id() != graph_root.home_root_thread_id
+            || graph_root.workspace_id != execution.workspace_id
+            // A routed child has its own destination capsule while retaining
+            // the parent's work graph for resource accounting.
+            || authority.root_thread_id() != execution.home_root_thread_id
         {
             anyhow::bail!("launch catalog authority differs from its AgentExecution");
         }
         let mut same_capsule_targets = Vec::new();
-        for lineage in processor
-            .crud_store
-            .list_task_thread_lineage_by_root_thread_bounded(
-                execution.home_root_thread_id.as_str(),
-                pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES as u64,
-            )
-            .await?
-        {
-            if lineage.root_thread_id != execution.home_root_thread_id {
-                continue;
-            }
-            let Some(thread) = processor
+        let mut lineage_after = None;
+        loop {
+            let page = processor
                 .crud_store
-                .get_thread_model(lineage.child_thread_id.as_str())
-                .await?
-            else {
-                continue;
-            };
-            if thread.workspace_id != execution.workspace_id {
-                continue;
+                .list_task_thread_lineage_by_root_thread_page(
+                    execution.home_root_thread_id.as_str(),
+                    lineage_after.as_deref(),
+                )
+                .await?;
+            let done = page.len() < 200;
+            lineage_after = page.last().map(|edge| edge.child_thread_id.clone());
+            for lineage in page {
+                if lineage.root_thread_id != execution.home_root_thread_id {
+                    continue;
+                }
+                let Some(thread) = processor
+                    .crud_store
+                    .get_thread_model(lineage.child_thread_id.as_str())
+                    .await?
+                else {
+                    continue;
+                };
+                if thread.workspace_id != execution.workspace_id {
+                    continue;
+                }
+                let label = thread
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("Internal collaboration thread")
+                    .to_owned();
+                same_capsule_targets.push((thread.id, label));
             }
-            let label = thread
-                .name
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .unwrap_or("Internal collaboration thread")
-                .to_owned();
-            same_capsule_targets.push((thread.id, label));
+            if done {
+                break;
+            }
         }
         let allowed_skill_ids = authority
             .granted_skill_ids()
@@ -298,6 +307,27 @@ impl AgentActionRuntimeBinding {
                     .map_err(|message| anyhow::anyhow!(message))?,
             );
         }
+        let revision = processor.current_authorization_revision().await?;
+        let private = processor
+            .execution_leases
+            .revalidate_context(
+                processor.crud_store.as_ref(),
+                &authority,
+                crate::authorization::ResourceAction::ThreadCreatePrivate,
+                revision,
+            )
+            .await
+            .is_ok();
+        let workspace = processor
+            .execution_leases
+            .revalidate_context(
+                processor.crud_store.as_ref(),
+                &authority,
+                crate::authorization::ResourceAction::ThreadCreateWorkspace,
+                revision,
+            )
+            .await
+            .is_ok();
         let mut adapter = self.adapter.lock().await;
         adapter
             .replace_same_capsule_targets(same_capsule_targets)
@@ -315,8 +345,72 @@ impl AgentActionRuntimeBinding {
             allowed_mcp_server_ids,
             effective_permission_cap,
         );
+        adapter.restrict_thread_creation_options(&mut self.options, private, workspace);
         Ok(())
     }
+}
+
+/// Nickname-only reviewer selection has always required one unambiguous model.
+/// Discover only that identity's executors, then let the existing resolver
+/// reject zero or multiple choices. These profiles remain transient.
+pub(crate) async fn prepare_named_reviewer_launch(
+    binding: &mut AgentActionRuntimeBinding,
+    processor: &MessageProcessor,
+    turn_id: &str,
+    nickname: &str,
+    ceiling: &pioneer_protocol::ChildAgentLaunchGrantSet,
+) -> anyhow::Result<()> {
+    let adapter = binding.adapter.lock().await;
+    let identity = adapter
+        .named_task_reviewer_identity(nickname, ceiling)
+        .map_err(|error| anyhow::anyhow!("reviewer identity is unavailable: {error:?}"))?;
+    let facts = adapter.persistence_facts();
+    drop(adapter);
+    let database = processor.crud_store.database_connection();
+    let authority = processor
+        .load_turn_execution_authorization_context(turn_id)
+        .await?;
+    let source = pioneer_crud::load_active_agent_identity(
+        &database,
+        authority.workspace_id(),
+        identity.id.as_str(),
+    )
+    .await?
+    .context("reviewer source is unavailable")?;
+    let runtimes = processor.load_cli_runtime_instances()?;
+    let mut profiles = Vec::new();
+    for executor in identity_models_catalog(
+        processor,
+        &source.workspace_id,
+        &identity,
+        &source.source_id,
+        &authority,
+    )
+    .await?
+    {
+        for model in executor.models {
+            let mut profile = workspace_launch_profile(
+                &identity,
+                &source.source_id,
+                &runtimes,
+                &executor.provider_id,
+                &model.id,
+                &[],
+                &facts.profile.allowed_permission_profiles,
+                facts.profile.catalog_generation,
+                facts.profile.policy_generation,
+            )?;
+            apply_launch_model_metadata(&mut profile, &model);
+            profile.provider_display_name = executor.display_name.clone();
+            profiles.push(profile);
+        }
+    }
+    binding.options = binding
+        .adapter
+        .lock()
+        .await
+        .install_selected_launch_profiles(profiles);
+    Ok(())
 }
 
 async fn load_execution_child_launch_ceiling<C: sea_orm::ConnectionTrait>(
@@ -349,20 +443,21 @@ fn intersect_child_launch_ceiling(
     Vec<pioneer_protocol::AgentIdentityProjection>,
     Vec<pioneer_protocol::AgentExecutionProfileProjection>,
 ) {
-    let identities = ceiling
-        .identities
+    let identities = current_identities
         .iter()
-        .filter(|granted| current_identities.iter().any(|current| current == *granted))
+        .filter(|current| {
+            ceiling.identities.iter().any(|granted| {
+                pioneer_protocol::agent_identity_has_same_launch_source(current, granted)
+            })
+        })
         .cloned()
         .collect::<Vec<_>>();
     let identity_ids = identities
         .iter()
         .map(|identity| identity.id.clone())
         .collect::<BTreeSet<_>>();
-    let profiles = ceiling
-        .profiles
+    let profiles = current_profiles
         .iter()
-        .filter(|granted| current_profiles.iter().any(|current| current == *granted))
         .filter(|profile| {
             profile
                 .compatible_agent_identity_ids
@@ -374,13 +469,282 @@ fn intersect_child_launch_ceiling(
     (identities, profiles)
 }
 
-pub(crate) async fn current_workspace_launch_catalog(
+/// Resolve a saved source without reselecting a provider, model or permissions
+/// from the composer. Historical presentation authenticates old contracts;
+/// the current source and presentation become the *new* execution snapshot.
+pub(crate) async fn current_saved_launch_identity(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    saved: &pioneer_protocol::AgentIdentityProjection,
+    profile: &pioneer_protocol::AgentExecutionProfileProjection,
+) -> anyhow::Result<Option<pioneer_protocol::AgentIdentityProjection>> {
+    let catalog =
+        if saved.source_kind == pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance {
+            cli_identity_catalog(processor, &processor.load_cli_runtime_instances()?)?
+        } else {
+            Vec::new()
+        };
+    current_saved_launch_identity_from_catalog(processor, workspace_id, saved, profile, &catalog)
+        .await
+}
+
+async fn current_saved_launch_identity_from_catalog(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    saved: &pioneer_protocol::AgentIdentityProjection,
+    profile: &pioneer_protocol::AgentExecutionProfileProjection,
+    cli_catalog: &[pioneer_crud::CliRuntimeIdentitySeed],
+) -> anyhow::Result<Option<pioneer_protocol::AgentIdentityProjection>> {
+    use pioneer_protocol::{AgentExecutionProfileBackend, AgentIdentitySourceKind};
+    if saved.source_kind == AgentIdentitySourceKind::Ephemeral {
+        return Ok(Some(saved.clone()));
+    }
+    let database = processor.crud_store.database_connection();
+    let Some(row) = pioneer_crud::load_agent_identity(&database, saved.id.as_str()).await? else {
+        return Ok(None);
+    };
+    if row.workspace_id != workspace_id || row.status != "active" || row.retired_at.is_some() {
+        return Ok(None);
+    }
+    let valid_source = match (saved.source_kind, &profile.backend) {
+        (AgentIdentitySourceKind::NativeAgent, AgentExecutionProfileBackend::ApiProvider)
+            if row.source_kind == pioneer_crud::SOURCE_NATIVE_AGENT =>
+        {
+            pioneer_crud::load_native_agent_config(&database, &row.source_id)
+                .await?
+                .is_some_and(|config| {
+                    config.workspace_id == workspace_id
+                        && config.enabled
+                        && config.config_revision == row.source_revision
+                })
+        }
+        (
+            AgentIdentitySourceKind::CliRuntimeInstance,
+            AgentExecutionProfileBackend::CliRuntime {
+                runtime_instance_id,
+            },
+        ) if row.source_kind == pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE
+            && row.source_id == *runtime_instance_id
+            && profile.provider_id == format!("cli_runtime:{runtime_instance_id}") =>
+        {
+            cli_catalog.iter().any(|runtime| {
+                runtime.id == row.source_id
+                    && runtime.enabled
+                    && saved.role_label.as_deref() == Some(runtime.kind.as_str())
+                    && pioneer_crud::cli_runtime_identity_fingerprint(runtime)
+                        == row.source_fingerprint
+            })
+        }
+        _ => false,
+    };
+    if !valid_source || !profile.compatible_agent_identity_ids.contains(&saved.id) {
+        return Ok(None);
+    }
+    let historical = pioneer_crud::load_current_agent_presentation_snapshot(
+        &database,
+        saved.id.as_str(),
+        i64::try_from(saved.source_revision).unwrap_or(-1),
+        &saved.source_fingerprint,
+    )
+    .await?;
+    if !historical.is_some_and(|snapshot| {
+        snapshot.display_name == saved.display_name
+            && snapshot.nickname == saved.nickname
+            && snapshot.avatar_revision == saved.avatar_revision
+            && snapshot.role_label == saved.role_label
+    }) {
+        anyhow::bail!("saved launch identity has no matching historical presentation");
+    }
+    let snapshot = pioneer_crud::load_current_agent_presentation_snapshot(
+        &database,
+        &row.id,
+        row.source_revision,
+        &row.source_fingerprint,
+    )
+    .await?
+    .context("current launch identity has no presentation snapshot")?;
+    let mut current = saved.clone();
+    current.source_revision = u64::try_from(row.source_revision)?;
+    current.source_fingerprint = row.source_fingerprint;
+    current.display_name = snapshot.display_name;
+    current.nickname = snapshot.nickname;
+    current.avatar_revision = snapshot.avatar_revision;
+    current.role_label = snapshot.role_label;
+    if !pioneer_protocol::agent_identity_has_same_launch_source(&current, saved) {
+        return Ok(None);
+    }
+    Ok(Some(current))
+}
+
+pub(crate) async fn current_saved_cli_profile_identity(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    ceiling: &pioneer_protocol::ChildAgentLaunchGrantSet,
+    profile: &pioneer_protocol::AgentExecutionProfileProjection,
+) -> anyhow::Result<Option<pioneer_protocol::AgentIdentityProjection>> {
+    let cli_catalog = cli_identity_catalog(processor, &processor.load_cli_runtime_instances()?)?;
+    for saved in ceiling.identities.iter().filter(|identity| {
+        identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
+            && profile.compatible_agent_identity_ids.contains(&identity.id)
+    }) {
+        if let Some(current) = current_saved_launch_identity_from_catalog(
+            processor,
+            workspace_id,
+            saved,
+            profile,
+            &cli_catalog,
+        )
+        .await?
+        {
+            return Ok(Some(current));
+        }
+    }
+    Ok(None)
+}
+
+/// Uses the same provider discovery and Gateway-owned CLI snapshots as the
+/// public model endpoints. Diagnostics are fixed strings: source errors can
+/// contain credentials, host paths or provider response bodies.
+async fn identity_models_catalog(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    identity: &pioneer_protocol::AgentIdentityProjection,
+    source_id: &str,
+    authority: &crate::authorization::ExecutionAuthorizationContext,
+) -> anyhow::Result<Vec<pioneer_protocol::AgentToolExecutorModels>> {
+    use pioneer_protocol::{
+        AgentIdentitySourceKind, AgentToolBackendKind, AgentToolExecutorModels,
+        AgentToolModelOption,
+    };
+    let mut executors = Vec::new();
+    match identity.source_kind {
+        AgentIdentitySourceKind::NativeAgent | AgentIdentitySourceKind::Ephemeral => {
+            if !authority.grants_action(crate::authorization::ResourceAction::ProviderUse) {
+                return Ok(executors);
+            }
+            for definition in pioneer_provider::provider_definitions() {
+                // The built-in local adapter only provides embeddings and
+                // transcription, so it cannot be a chat launch candidate.
+                if definition.name == "local"
+                    || !authority.child_launch_executor_allowed(definition.name, false)
+                    || !processor.member_provider_is_configured(workspace_id, definition.name)
+                {
+                    continue;
+                }
+                let mut executor = AgentToolExecutorModels {
+                    provider_id: definition.name.to_owned(),
+                    display_name: definition.name.to_owned(),
+                    backend: AgentToolBackendKind::Api,
+                    models: Vec::new(),
+                    default_model_id: None,
+                    unavailable_reason: None,
+                };
+                match processor
+                    .provider_models_catalog(workspace_id, definition.name)
+                    .await
+                {
+                    Ok(models) => {
+                        executor.models = models
+                            .into_iter()
+                            .filter(|model| {
+                                model.active != Some(false)
+                                    && authority.child_launch_model_allowed(
+                                        definition.name,
+                                        &model.id,
+                                        false,
+                                    )
+                            })
+                            .map(|model| AgentToolModelOption {
+                                display_name: model
+                                    .name
+                                    .filter(|name| !name.trim().is_empty())
+                                    .unwrap_or_else(|| model.id.clone()),
+                                id: model.id,
+                                reasoning: model.capabilities.reasoning,
+                            })
+                            .collect();
+                    }
+                    Err(_) => {
+                        executor.unavailable_reason =
+                            Some("Provider model catalog is unavailable".to_owned())
+                    }
+                }
+                if !executor.models.is_empty() || executor.unavailable_reason.is_some() {
+                    executors.push(executor);
+                }
+            }
+        }
+        AgentIdentitySourceKind::CliRuntimeInstance => {
+            if !authority.child_launch_executor_allowed(source_id, true) {
+                return Ok(executors);
+            }
+            let provider_id = format!("cli_runtime:{source_id}");
+            let mut executor = AgentToolExecutorModels {
+                provider_id: provider_id.clone(),
+                display_name: identity.display_name.clone(),
+                backend: AgentToolBackendKind::Cli,
+                models: Vec::new(),
+                default_model_id: None,
+                unavailable_reason: None,
+            };
+            match processor.cli_launch_models_catalog(workspace_id, source_id).await {
+                Ok(models) => executor.models = models.into_iter()
+                    .filter(|model| model.active != Some(false)
+                        && authority.child_launch_model_allowed(source_id, &model.id, true))
+                    .map(|model| {
+                        let model = super::turn_handlers::provider_model_from_runtime_model_for_reasoning_lookup(&provider_id, model);
+                        AgentToolModelOption { display_name: model.name.filter(|name| !name.trim().is_empty()).unwrap_or_else(|| model.id.clone()), id: model.id,
+                            reasoning: model.capabilities.reasoning }
+                    }).collect(),
+                Err(_) => executor.unavailable_reason = Some("CLI readiness model catalog is unavailable".to_owned()),
+            }
+            executors.push(executor);
+        }
+    }
+    for executor in &mut executors {
+        executor.models.sort_by(|a, b| a.id.cmp(&b.id));
+        executor.models.dedup_by(|a, b| a.id == b.id);
+    }
+    Ok(executors)
+}
+
+fn apply_launch_model_metadata(
+    profile: &mut pioneer_protocol::AgentExecutionProfileProjection,
+    model: &pioneer_protocol::AgentToolModelOption,
+) {
+    profile.model_display_name = model.display_name.clone();
+    profile.allowed_reasoning = model
+        .reasoning
+        .as_ref()
+        .filter(|reasoning| reasoning.supported != Some(false))
+        .map(|reasoning| {
+            reasoning
+                .effort_options
+                .iter()
+                .filter_map(|effort| {
+                    let effort = pioneer_protocol::normalize_metadata_reasoning_effort(effort)?;
+                    if (matches!(
+                        profile.backend,
+                        pioneer_protocol::AgentExecutionProfileBackend::ApiProvider
+                    ) && pioneer_protocol::ReasoningEffort::from_str(&effort).is_none())
+                        || (reasoning.mandatory == Some(true) && effort == "none")
+                    {
+                        return None;
+                    }
+                    Some(pioneer_protocol::TurnReasoningSelection { effort })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+}
+
+/// Project live identity sources and the already selected profile without model discovery.
+pub(crate) async fn current_workspace_launch_options(
     processor: &MessageProcessor,
     workspace_id: &str,
     parent_identity: &pioneer_protocol::AgentIdentityProjection,
     parent_profile: &pioneer_protocol::AgentExecutionProfileProjection,
-    default_provider: &str,
-    default_model: &str,
+    _authority: &crate::authorization::ExecutionAuthorizationContext,
 ) -> anyhow::Result<(
     Vec<pioneer_protocol::AgentIdentityProjection>,
     Vec<pioneer_protocol::AgentExecutionProfileProjection>,
@@ -388,112 +752,102 @@ pub(crate) async fn current_workspace_launch_catalog(
     let database = processor.crud_store.database_connection();
     let cli_runtimes = processor.load_cli_runtime_instances()?;
     let cli_identity_catalog = cli_identity_catalog(processor, cli_runtimes.as_slice())?;
-    let identities = pioneer_crud::list_active_agent_identities(&database, workspace_id).await?;
     let mut projected_identities = Vec::new();
-    let mut projected_profiles = Vec::new();
+    let mut projected_profiles = Vec::<pioneer_protocol::AgentExecutionProfileProjection>::new();
 
-    for identity in identities {
-        let source_kind = match identity.source_kind.as_str() {
-            pioneer_crud::SOURCE_NATIVE_AGENT => {
-                let Some(config) =
-                    pioneer_crud::load_native_agent_config(&database, identity.source_id.as_str())
-                        .await?
-                else {
-                    continue;
-                };
-                if !config.enabled
-                    || config.workspace_id != workspace_id
-                    || config.config_revision != identity.source_revision
-                {
-                    continue;
-                }
-                pioneer_protocol::AgentIdentitySourceKind::NativeAgent
-            }
-            pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE => {
-                let Some(runtime) = cli_identity_catalog
-                    .iter()
-                    .find(|runtime| runtime.id == identity.source_id && runtime.enabled)
-                else {
-                    continue;
-                };
-                if pioneer_crud::cli_runtime_identity_fingerprint(runtime)
-                    != identity.source_fingerprint
-                {
-                    continue;
-                }
-                pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
-            }
-            // Persisted ephemeral identities are execution-local history and
-            // are never reusable catalog entries.
-            pioneer_crud::SOURCE_EPHEMERAL => continue,
-            _ => continue,
-        };
-        let Some(snapshot) = pioneer_crud::load_current_agent_presentation_snapshot(
+    let mut identity_after = None;
+    loop {
+        let identities = pioneer_crud::list_active_agent_identities_page(
             &database,
-            identity.id.as_str(),
-            identity.source_revision,
-            identity.source_fingerprint.as_str(),
+            workspace_id,
+            identity_after.as_deref(),
         )
-        .await?
-        else {
-            continue;
-        };
-        let projection = pioneer_protocol::AgentIdentityProjection::new(
-            pioneer_protocol::AgentIdentityId::new(identity.id.clone()).map_err(|error| {
-                anyhow::anyhow!("workspace agent identity has invalid id: {error:?}")
-            })?,
-            source_kind,
-            snapshot.display_name,
-            snapshot.nickname,
-            snapshot.avatar_revision,
-            snapshot.role_label,
-            u64::try_from(identity.source_revision)
-                .map_err(|_| anyhow::anyhow!("workspace identity revision is invalid"))?,
-            identity.source_fingerprint,
-        )
-        .map_err(|error| anyhow::anyhow!("workspace identity projection is invalid: {error:?}"))?;
-        let profile = if projection.id == parent_identity.id {
-            parent_profile.clone()
-        } else {
-            workspace_launch_profile(
-                &projection,
-                identity.source_id.as_str(),
-                cli_runtimes.as_slice(),
-                default_provider,
-                default_model,
-                parent_profile.allowed_reasoning.as_slice(),
-                parent_profile.allowed_permission_profiles.as_slice(),
-                parent_profile.catalog_generation.max(1),
-                parent_profile.policy_generation.max(1),
-            )?
-        };
-        projected_identities.push(projection);
-        projected_profiles.push(profile);
+        .await?;
+        let done = identities.len() < 200;
+        identity_after = identities.last().map(|identity| identity.id.clone());
+        for identity in identities {
+            let source_kind = match identity.source_kind.as_str() {
+                pioneer_crud::SOURCE_NATIVE_AGENT => {
+                    let Some(config) = pioneer_crud::load_native_agent_config(
+                        &database,
+                        identity.source_id.as_str(),
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    if !config.enabled
+                        || config.workspace_id != workspace_id
+                        || config.config_revision != identity.source_revision
+                    {
+                        continue;
+                    }
+                    pioneer_protocol::AgentIdentitySourceKind::NativeAgent
+                }
+                pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE => {
+                    let Some(runtime) = cli_identity_catalog
+                        .iter()
+                        .find(|runtime| runtime.id == identity.source_id && runtime.enabled)
+                    else {
+                        continue;
+                    };
+                    if pioneer_crud::cli_runtime_identity_fingerprint(runtime)
+                        != identity.source_fingerprint
+                    {
+                        continue;
+                    }
+                    pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
+                }
+                // Persisted ephemeral identities are execution-local history and
+                // are never reusable catalog entries.
+                pioneer_crud::SOURCE_EPHEMERAL => continue,
+                _ => continue,
+            };
+            let Some(snapshot) = pioneer_crud::load_current_agent_presentation_snapshot(
+                &database,
+                identity.id.as_str(),
+                identity.source_revision,
+                identity.source_fingerprint.as_str(),
+            )
+            .await?
+            else {
+                continue;
+            };
+            let projection = pioneer_protocol::AgentIdentityProjection::new(
+                pioneer_protocol::AgentIdentityId::new(identity.id.clone()).map_err(|error| {
+                    anyhow::anyhow!("workspace agent identity has invalid id: {error:?}")
+                })?,
+                source_kind,
+                snapshot.display_name,
+                snapshot.nickname,
+                snapshot.avatar_revision,
+                snapshot.role_label,
+                u64::try_from(identity.source_revision)
+                    .map_err(|_| anyhow::anyhow!("workspace identity revision is invalid"))?,
+                identity.source_fingerprint,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("workspace identity projection is invalid: {error:?}")
+            })?;
+            projected_identities.push(projection);
+        }
+        if done {
+            break;
+        }
     }
 
     if parent_identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::Ephemeral {
         projected_identities.push(parent_identity.clone());
+    }
+    if projected_identities
+        .iter()
+        .any(|id| id.id == parent_identity.id)
+        && !projected_profiles.iter().any(|p| p.id == parent_profile.id)
+    {
         projected_profiles.push(parent_profile.clone());
     }
     projected_identities.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
     projected_profiles.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-    if projected_identities.len() > pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES {
-        let mut bounded = projected_identities
-            .iter()
-            .filter(|identity| identity.id == parent_identity.id)
-            .cloned()
-            .collect::<Vec<_>>();
-        let remaining = pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES
-            .saturating_sub(bounded.len());
-        bounded.extend(
-            projected_identities
-                .into_iter()
-                .filter(|identity| identity.id != parent_identity.id)
-                .take(remaining),
-        );
-        bounded.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        projected_identities = bounded;
-    }
     let visible_ids = projected_identities
         .iter()
         .map(|identity| identity.id.clone())
@@ -505,23 +859,6 @@ pub(crate) async fn current_workspace_launch_catalog(
                 .iter()
                 .all(|identity_id| visible_ids.contains(identity_id))
     });
-    if projected_profiles.len() > pioneer_protocol::ChildAgentLaunchGrantSet::MAX_PROFILES {
-        let mut bounded = projected_profiles
-            .iter()
-            .filter(|profile| profile.id == parent_profile.id)
-            .cloned()
-            .collect::<Vec<_>>();
-        let remaining =
-            pioneer_protocol::ChildAgentLaunchGrantSet::MAX_PROFILES.saturating_sub(bounded.len());
-        bounded.extend(
-            projected_profiles
-                .into_iter()
-                .filter(|profile| profile.id != parent_profile.id)
-                .take(remaining),
-        );
-        bounded.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        projected_profiles = bounded;
-    }
     Ok((projected_identities, projected_profiles))
 }
 
@@ -530,23 +867,21 @@ pub(crate) async fn current_workspace_child_launch_ceiling(
     workspace_id: &str,
     parent_identity: &pioneer_protocol::AgentIdentityProjection,
     parent_profile: &pioneer_protocol::AgentExecutionProfileProjection,
-    default_provider: &str,
-    default_model: &str,
+    authority: &crate::authorization::ExecutionAuthorizationContext,
     allow_server_derived_ephemeral: bool,
     skill_ids: Vec<pioneer_protocol::SkillId>,
     mcp_server_ids: Vec<String>,
     max_permission_profile: pioneer_protocol::TurnPermissionProfileCap,
 ) -> anyhow::Result<pioneer_protocol::ChildAgentLaunchGrantSet> {
-    let (identities, profiles) = current_workspace_launch_catalog(
+    let (identities, _) = current_workspace_launch_options(
         processor,
         workspace_id,
         parent_identity,
         parent_profile,
-        default_provider,
-        default_model,
+        authority,
     )
     .await?;
-    pioneer_protocol::ChildAgentLaunchGrantSet::new(identities, profiles)
+    pioneer_protocol::ChildAgentLaunchGrantSet::new(identities)
         .and_then(|grant| {
             grant.with_policy(
                 true,
@@ -642,6 +977,15 @@ pub(crate) async fn resolve_workspace_task_launch(
     )>,
 )> {
     use pioneer_protocol::{AgentExecutionProfileSelection, AgentIdentitySelection};
+    let mut normalized_selection = selection.cloned();
+    if let Some(reasoning) = normalized_selection
+        .as_mut()
+        .and_then(|selection| selection.execution.reasoning.as_mut())
+    {
+        reasoning.effort = pioneer_protocol::normalize_metadata_reasoning_effort(&reasoning.effort)
+            .ok_or_else(|| anyhow::anyhow!("Task reasoning effort is empty"))?;
+    }
+    let selection = normalized_selection.as_ref();
 
     let requested_cli_runtime_id = match requested_backend {
         Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { runtime_id, .. }) => {
@@ -783,7 +1127,7 @@ pub(crate) async fn resolve_workspace_task_launch(
         .and_then(|selection| selection.execution.reasoning.clone())
         .into_iter()
         .collect::<Vec<_>>();
-    let profile = workspace_launch_profile(
+    let mut profile = workspace_launch_profile(
         &identity,
         source_id.as_str(),
         cli_runtimes.as_slice(),
@@ -798,6 +1142,72 @@ pub(crate) async fn resolve_workspace_task_launch(
         policy_generation,
         policy_generation,
     )?;
+    let discovered = match &profile.backend {
+        pioneer_protocol::AgentExecutionProfileBackend::ApiProvider => processor
+            .provider_models_catalog(workspace_id, &profile.provider_id)
+            .await
+            .ok()
+            .and_then(|models| {
+                models
+                    .into_iter()
+                    .find(|model| model.id == profile.model_id)
+            }),
+        pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+            runtime_instance_id,
+        } => processor
+            .cli_launch_models_catalog(workspace_id, runtime_instance_id)
+            .await
+            .ok()
+            .and_then(|models| {
+                models
+                    .into_iter()
+                    .find(|model| model.id == profile.model_id)
+            })
+            .map(|model| {
+                super::turn_handlers::provider_model_from_runtime_model_for_reasoning_lookup(
+                    &profile.provider_id,
+                    model,
+                )
+            }),
+        pioneer_protocol::AgentExecutionProfileBackend::AcpAgentRuntime { .. } => None,
+    };
+    if discovered.is_none()
+        && selection.is_some_and(|selection| {
+            matches!(
+                selection.execution.profile,
+                AgentExecutionProfileSelection::Model { .. }
+            )
+        })
+    {
+        anyhow::bail!("Task model is unavailable in the selected executor catalog");
+    }
+    if let Some(model) = discovered {
+        if model.active == Some(false) {
+            anyhow::bail!("Task model is unavailable");
+        }
+
+        let model = pioneer_protocol::AgentToolModelOption {
+            display_name: model
+                .name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| model.id.clone()),
+            id: model.id,
+            reasoning: model.capabilities.reasoning,
+        };
+        apply_launch_model_metadata(&mut profile, &model);
+        if matches!(
+            profile.backend,
+            pioneer_protocol::AgentExecutionProfileBackend::CliRuntime { .. }
+        ) {
+            profile.provider_display_name = identity.display_name.clone();
+        }
+        if selection
+            .and_then(|selection| selection.execution.reasoning.as_ref())
+            .is_some_and(|reasoning| !profile.allowed_reasoning.contains(reasoning))
+        {
+            anyhow::bail!("Task reasoning is unavailable for the selected model");
+        }
+    }
     if let Some(
         selection @ pioneer_protocol::AgentLaunchSelection {
             agent: AgentIdentitySelection::ServerDerivedEphemeral { .. },
@@ -839,6 +1249,18 @@ pub(crate) async fn resolve_workspace_task_launch(
         Some(AgentExecutionProfileSelection::InheritParent) => {
             anyhow::bail!("public Task launch requires an exact execution profile")
         }
+        Some(AgentExecutionProfileSelection::Model {
+            provider_id,
+            model_id,
+        }) => {
+            if model_id != &profile.model_id
+                || provider_id
+                    .as_ref()
+                    .is_some_and(|id| id != &profile.provider_id)
+            {
+                anyhow::bail!("Task model selection differs from its admitted executor/model");
+            }
+        }
     }
     let canonical = selection
         .cloned()
@@ -865,10 +1287,604 @@ pub(crate) async fn resolve_workspace_task_launch(
     Ok((canonical, Some((identity, profile))))
 }
 
-/// Freeze the already normalized Turn capability set into the durable Task
-/// launch selection. Composer keeps its presentation payload separately, but
-/// the actor contract must carry the exact execution IDs used by both API and
-/// CLI Agent backends.
+pub(crate) fn execution_backend_for_profile(
+    processor: &MessageProcessor,
+    profile: &pioneer_protocol::AgentExecutionProfileProjection,
+) -> Result<Option<pioneer_protocol::AgentExecutionBackend>, ToolError> {
+    Ok(match &profile.backend {
+        pioneer_protocol::AgentExecutionProfileBackend::ApiProvider => {
+            Some(pioneer_protocol::AgentExecutionBackend::ApiProvider {
+                provider: profile.provider_id.clone(),
+            })
+        }
+        pioneer_protocol::AgentExecutionProfileBackend::AcpAgentRuntime { runtime_id } => {
+            Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime {
+                runtime_id: runtime_id.clone(),
+            })
+        }
+        pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+            runtime_instance_id,
+        } => {
+            let runtime = processor
+                .load_cli_runtime_instances()
+                .map_err(|error| {
+                    ToolError::execution_failed(format!(
+                        "failed to resolve CLI runtime selection: {error:#}"
+                    ))
+                })?
+                .into_iter()
+                .find(|runtime| runtime.id == *runtime_instance_id && runtime.enabled)
+                .ok_or_else(|| {
+                    ToolError::execution_failed("selected CLI runtime is no longer available")
+                })?;
+            let runtime_kind = match runtime.kind {
+                pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => {
+                    pioneer_protocol::CLIAgentRuntimeKind::Codex
+                }
+                pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
+                    pioneer_protocol::CLIAgentRuntimeKind::Claude
+                }
+                pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                    pioneer_protocol::CLIAgentRuntimeKind::OpenCode
+                }
+            };
+            Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime {
+                runtime_id: runtime_instance_id.clone(),
+                runtime_kind,
+            })
+        }
+    })
+}
+
+/// Revalidate the selected model at new-launch admission. Recovery dispatch
+/// uses its persisted exact grant; it never reselects from this catalog.
+pub(crate) async fn validate_new_launch_model(
+    processor: &MessageProcessor,
+    context: &TurnToolContext,
+    profile: &pioneer_protocol::AgentExecutionProfileProjection,
+    reasoning: Option<&pioneer_protocol::TurnReasoningSelection>,
+    authority: &crate::authorization::ExecutionAuthorizationContext,
+    inherit_current: bool,
+) -> Result<(), ToolError> {
+    let workspace_id = context.workspace_id.as_str();
+    let (executor, cli) = match &profile.backend {
+        pioneer_protocol::AgentExecutionProfileBackend::ApiProvider => {
+            (profile.provider_id.as_str(), false)
+        }
+        pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+            runtime_instance_id,
+        } => (runtime_instance_id.as_str(), true),
+        pioneer_protocol::AgentExecutionProfileBackend::AcpAgentRuntime { .. } => {
+            return Err(ToolError::invalid_arguments(
+                "agent_execution_profile_unavailable",
+            ));
+        }
+    };
+    if !authority.child_launch_executor_allowed(executor, cli)
+        || !authority.child_launch_model_allowed(executor, &profile.model_id, cli)
+        || (!cli && !processor.member_provider_is_configured(workspace_id, &profile.provider_id))
+    {
+        return Err(ToolError::invalid_arguments(
+            "agent_execution_selection_not_allowed",
+        ));
+    }
+    let runtime = processor
+        .crud_store
+        .get_turn_runtime_snapshot(&context.turn_id)
+        .await
+        .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+    if inherit_current
+        && runtime.as_ref().is_some_and(|runtime| {
+            runtime.workspace_id == context.workspace_id
+                && runtime.thread_id == context.thread_id
+                && runtime.provider_name == profile.provider_id
+                && runtime.model == profile.model_id
+                && runtime.reasoning_effort.as_deref()
+                    == reasoning.map(|reasoning| reasoning.effort.as_str())
+        })
+    {
+        return Ok(());
+    }
+    let model = match &profile.backend {
+        pioneer_protocol::AgentExecutionProfileBackend::ApiProvider => processor
+            .provider_models_catalog(workspace_id, &profile.provider_id)
+            .await
+            .map_err(|_| ToolError::execution_failed("agent_execution_profile_unavailable"))?
+            .into_iter()
+            .find(|model| model.id == profile.model_id && model.active != Some(false)),
+        pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+            runtime_instance_id,
+        } => processor
+            .cli_launch_models_catalog(workspace_id, runtime_instance_id)
+            .await
+            .map_err(|_| ToolError::execution_failed("agent_execution_profile_unavailable"))?
+            .into_iter()
+            .find(|model| model.id == profile.model_id && model.active != Some(false))
+            .map(|model| {
+                super::turn_handlers::provider_model_from_runtime_model_for_reasoning_lookup(
+                    &profile.provider_id,
+                    model,
+                )
+            }),
+        pioneer_protocol::AgentExecutionProfileBackend::AcpAgentRuntime { .. } => None,
+    }
+    .ok_or_else(|| ToolError::invalid_arguments("agent_execution_profile_unavailable"))?;
+    if let Some(selection) = reasoning {
+        let metadata =
+            model.capabilities.reasoning.as_ref().ok_or_else(|| {
+                ToolError::invalid_arguments("agent_execution_selection_not_allowed")
+            })?;
+        if metadata.supported == Some(false)
+            || (metadata.mandatory == Some(true)
+                && pioneer_protocol::reasoning_effort_comparison_key(&selection.effort).as_deref()
+                    == Some("none"))
+            || !metadata.effort_options.iter().any(|effort| {
+                pioneer_protocol::reasoning_effort_comparison_key(effort)
+                    == pioneer_protocol::reasoning_effort_comparison_key(&selection.effort)
+            })
+        {
+            return Err(ToolError::invalid_arguments(
+                "agent_execution_selection_not_allowed",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve metadata only for the chosen executor/model. The identity list is
+/// the saved delegation boundary; catalog contents never become that boundary.
+async fn selected_launch_profile(
+    processor: &MessageProcessor,
+    context: &TurnToolContext,
+    selection: &pioneer_protocol::AgentToolLaunchSelection,
+    facts: &crate::authorization::AgentExecutionPersistenceFacts,
+    options: &AgentToolOptionsProjection,
+    authority: &crate::authorization::ExecutionAuthorizationContext,
+) -> Result<pioneer_protocol::AgentExecutionProfileProjection, ToolError> {
+    use pioneer_protocol::{
+        AgentToolIdentityChoice as Identity, AgentToolProfileChoice as Profile,
+    };
+    let denied = || ToolError::invalid_arguments("agent_execution_selection_not_allowed");
+    let identity_id = match &selection.identity {
+        Identity::InheritParent if options.inherit_parent_identity_available => &facts.identity.id,
+        Identity::ServerDerivedEphemeral { .. } if options.derived_ephemeral_identity_available => {
+            &facts.identity.id
+        }
+        Identity::Exact { id } if options.contains_identity(id) => id,
+        Identity::DefaultPioneer => {
+            &options
+                .identities
+                .iter()
+                .find(|identity| identity.nickname.eq_ignore_ascii_case("pioneer"))
+                .ok_or_else(denied)?
+                .id
+        }
+        _ => return Err(denied()),
+    };
+    let ephemeral = matches!(selection.identity, Identity::ServerDerivedEphemeral { .. })
+        || (identity_id == &facts.identity.id
+            && facts.identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::Ephemeral);
+    let inherited = matches!(selection.profile, Profile::InheritParent)
+        || matches!(&selection.profile, Profile::Exact { id } if id == &facts.profile.id);
+    if matches!(selection.profile, Profile::InheritParent)
+        && !options.inherit_parent_profile_available
+    {
+        return Err(denied());
+    }
+    if inherited
+        && (identity_id == &facts.identity.id || ephemeral)
+        && (selection.reasoning.is_none()
+            || selection
+                .reasoning
+                .as_ref()
+                .is_some_and(|reasoning| facts.profile.allowed_reasoning.contains(reasoning)))
+    {
+        return Ok(facts.profile.clone());
+    }
+    let (requested_provider, requested_model) = match &selection.profile {
+        Profile::Model {
+            provider_id,
+            model_id,
+        } => (provider_id.as_deref(), Some(model_id.as_str())),
+        Profile::InheritParent | Profile::Exact { .. } if inherited => (None, None),
+        _ => return Err(denied()),
+    };
+    let provider_hint = requested_provider.unwrap_or(&facts.profile.provider_id);
+    let database = processor.crud_store.database_connection();
+    let mut selected = None;
+    // Ephemeral CLI launches must retain an admitted registered CLI source.
+    // For a named identity, its own source determines the backend.
+    for safe in &options.identities {
+        if !ephemeral && &safe.id != identity_id {
+            continue;
+        }
+        let Some(row) = pioneer_crud::load_active_agent_identity(
+            &database,
+            &context.workspace_id,
+            safe.id.as_str(),
+        )
+        .await
+        .map_err(|_| ToolError::execution_failed("agent_identity_unavailable"))?
+        else {
+            continue;
+        };
+        if ephemeral
+            && (row.source_kind == pioneer_crud::SOURCE_EPHEMERAL
+                || match provider_hint.strip_prefix("cli_runtime:") {
+                    Some(runtime_id) => {
+                        row.source_kind != pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE
+                            || row.source_id != runtime_id
+                    }
+                    None => row.source_kind != pioneer_crud::SOURCE_NATIVE_AGENT,
+                })
+        {
+            continue;
+        }
+        selected = Some(row);
+        break;
+    }
+    let source = selected.ok_or_else(denied)?;
+    let mut identity = facts.identity.clone();
+    if source.id != facts.identity.id.as_str() {
+        let ceiling = load_execution_child_launch_ceiling(&database, facts.execution_id.as_str())
+            .await
+            .map_err(|_| ToolError::execution_failed("agent_execution_stale"))?;
+        identity = ceiling
+            .identities
+            .into_iter()
+            .find(|identity| identity.id.as_str() == source.id)
+            .ok_or_else(denied)?;
+    }
+    let cli = source.source_kind == pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE;
+    let compatible_parent_executor = match &facts.profile.backend {
+        pioneer_protocol::AgentExecutionProfileBackend::ApiProvider => !cli,
+        pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+            runtime_instance_id,
+        } => cli && runtime_instance_id == &source.source_id,
+        pioneer_protocol::AgentExecutionProfileBackend::AcpAgentRuntime { .. } => false,
+    };
+    // Exact names a previously projected profile; it cannot select another
+    // executor through the identity-change defaulting rule.
+    if matches!(selection.profile, Profile::Exact { .. }) && !compatible_parent_executor {
+        return Err(denied());
+    }
+    let (provider_id, model) = if !cli
+        && requested_provider.is_none()
+        && !compatible_parent_executor
+    {
+        // Only the explicitly selected identity needs discovery here. A CLI
+        // parent supplies neither an API provider nor an API model default.
+        let executors = identity_models_catalog(
+            processor,
+            &context.workspace_id,
+            &identity,
+            &source.source_id,
+            authority,
+        )
+        .await
+        .map_err(|_| ToolError::execution_failed("agent_execution_profile_unavailable"))?;
+        if executors
+            .iter()
+            .any(|executor| executor.unavailable_reason.is_some())
+        {
+            return Err(ToolError::execution_failed(
+                "agent_execution_profile_unavailable",
+            ));
+        }
+        let mut candidates = executors
+            .into_iter()
+            .flat_map(|executor| {
+                let provider_id = executor.provider_id;
+                executor
+                    .models
+                    .into_iter()
+                    .map(move |model| (provider_id.clone(), model))
+            })
+            .filter(|(_, model)| requested_model.is_none_or(|id| model.id == id));
+        let selected = candidates.next().ok_or_else(denied)?;
+        if candidates.next().is_some() {
+            return Err(denied());
+        }
+        selected
+    } else {
+        let provider_id = if cli {
+            let provider_id = format!("cli_runtime:{}", source.source_id);
+            if requested_provider.is_some_and(|id| id != provider_id) {
+                return Err(denied());
+            }
+            provider_id
+        } else {
+            requested_provider
+                .unwrap_or(&facts.profile.provider_id)
+                .to_owned()
+        };
+        let executor = if cli {
+            source.source_id.as_str()
+        } else {
+            provider_id.as_str()
+        };
+        let unique_cli =
+            matches!(selection.profile, Profile::InheritParent) && !compatible_parent_executor;
+        let model_id = requested_model.unwrap_or(&facts.profile.model_id);
+        if !authority.child_launch_executor_allowed(executor, cli)
+            || (!unique_cli && !authority.child_launch_model_allowed(executor, model_id, cli))
+            || (!cli
+                && !processor.member_provider_is_configured(&context.workspace_id, &provider_id))
+        {
+            return Err(denied());
+        }
+        let models = if cli {
+            processor.cli_launch_models_catalog(&context.workspace_id, executor).await
+                .map(|models| models.into_iter().map(|model|
+                    super::turn_handlers::provider_model_from_runtime_model_for_reasoning_lookup(&provider_id, model)
+                ).collect::<Vec<_>>())
+        } else {
+            processor.provider_models_catalog(&context.workspace_id, &provider_id).await
+        }.map_err(|_| ToolError::execution_failed("agent_execution_profile_unavailable"))?;
+        let model = if unique_cli {
+            let mut compatible = models.into_iter().filter(|model| {
+                model.active != Some(false)
+                    && authority.child_launch_model_allowed(executor, &model.id, true)
+            });
+            let model = compatible.next().ok_or_else(denied)?;
+            if compatible.next().is_some() {
+                return Err(denied());
+            }
+            model
+        } else {
+            models
+                .into_iter()
+                .find(|model| model.id == model_id && model.active != Some(false))
+                .ok_or_else(|| {
+                    ToolError::invalid_arguments("agent_execution_profile_unavailable")
+                })?
+        };
+        (
+            provider_id,
+            pioneer_protocol::AgentToolModelOption {
+                display_name: model.name.unwrap_or_else(|| model.id.clone()),
+                id: model.id,
+                reasoning: model.capabilities.reasoning,
+            },
+        )
+    };
+    let executor = if cli {
+        source.source_id.as_str()
+    } else {
+        provider_id.as_str()
+    };
+    if !authority.child_launch_model_allowed(executor, &model.id, cli) {
+        return Err(denied());
+    }
+    let runtimes = processor
+        .load_cli_runtime_instances()
+        .map_err(|_| ToolError::execution_failed("agent_identity_unavailable"))?;
+    let mut profile = workspace_launch_profile(
+        &identity,
+        &source.source_id,
+        &runtimes,
+        &provider_id,
+        &model.id,
+        &[],
+        &facts.profile.allowed_permission_profiles,
+        facts.profile.catalog_generation,
+        facts.profile.policy_generation,
+    )
+    .map_err(|_| denied())?;
+    if current_saved_launch_identity(processor, &context.workspace_id, &identity, &profile)
+        .await
+        .map_err(|_| ToolError::execution_failed("agent_identity_unavailable"))?
+        .is_none()
+    {
+        return Err(denied());
+    }
+    apply_launch_model_metadata(&mut profile, &model);
+    if cli {
+        profile.provider_display_name = identity.display_name;
+    }
+    if identity_id == &facts.identity.id
+        && profile.backend == facts.profile.backend
+        && profile.provider_id == facts.profile.provider_id
+        && profile.model_id == facts.profile.model_id
+    {
+        profile.id = facts.profile.id.clone();
+        profile.fingerprint = facts.profile.fingerprint.clone();
+    }
+    if facts.identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::Ephemeral
+        && identity_id == &facts.identity.id
+        && !matches!(selection.identity, Identity::ServerDerivedEphemeral { .. })
+        && !profile
+            .compatible_agent_identity_ids
+            .contains(&facts.identity.id)
+    {
+        profile
+            .compatible_agent_identity_ids
+            .push(facts.identity.id.clone());
+        profile.compatible_agent_identity_ids.sort();
+        profile.fingerprint = hex::encode(Sha256::digest(
+            format!(
+                "agent-derived-profile\0{}\0{}",
+                profile.fingerprint, facts.identity.id,
+            )
+            .as_bytes(),
+        ));
+    }
+    Ok(profile)
+}
+
+/// Bind the decoded tool launch before default resolution or conversion to Exact.
+/// This is independent of the selected profile and the normalized action hash.
+fn tool_launch_request_fingerprint(
+    selection: &pioneer_protocol::AgentToolLaunchSelection,
+) -> Result<String, ToolError> {
+    let request = serde_json::to_vec(selection)
+        .map_err(|_| ToolError::internal("failed to fingerprint tool launch request"))?;
+    let mut digest = Sha256::new();
+    digest.update(b"pioneer:agent-tool-launch-request\0");
+    digest.update(request);
+    Ok(hex::encode(digest.finalize()))
+}
+
+/// Resolve defaults from this execution, never from the destination thread.
+/// The resulting exact selection is what the action/task ledger persists.
+pub(crate) async fn resolve_tool_launch(
+    processor: &MessageProcessor,
+    context: &TurnToolContext,
+    mut selection: pioneer_protocol::AgentToolLaunchSelection,
+    stable_seed: &str,
+) -> Result<
+    (
+        pioneer_protocol::AgentToolLaunchSelection,
+        pioneer_protocol::AgentExecutionProfileProjection,
+    ),
+    ToolError,
+> {
+    let requested_launch_fingerprint = tool_launch_request_fingerprint(&selection)?;
+    let mut binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .ok_or_else(|| ToolError::execution_failed("agent_execution_stale"))?;
+    if selection.use_default_reasoning && selection.reasoning.is_some() {
+        return Err(ToolError::invalid_arguments(
+            "agent_execution_selection_not_allowed",
+        ));
+    }
+    if let Some(reasoning) = &mut selection.reasoning {
+        reasoning.effort = pioneer_protocol::normalize_metadata_reasoning_effort(&reasoning.effort)
+            .ok_or_else(|| ToolError::invalid_arguments("agent_execution_selection_not_allowed"))?;
+    }
+    let facts = binding.adapter.lock().await.persistence_facts();
+    let authority = processor
+        .load_turn_execution_authorization_context(&context.turn_id)
+        .await
+        .map_err(|_| ToolError::execution_failed("agent_execution_stale"))?;
+    let database = processor.crud_store.database_connection();
+    let replay = pioneer_crud::load_agent_action_outbox(
+        &database,
+        crate::authorization::action_id_for_call(stable_seed).as_str(),
+    )
+    .await
+    .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+    let mut saved_profile = None;
+    if let Some(outbox) = replay {
+        if outbox.owner_execution_id != facts.execution_id.as_str() {
+            return Err(ToolError::invalid_arguments(
+                "agent action idempotency key was reused with different input",
+            ));
+        }
+        let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json)
+            .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+        if let Some(execution_id) = payload
+            .get("spawned_execution_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            let saved_request_fingerprint = payload
+                .get("launch_request_fingerprint")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+            if saved_request_fingerprint != requested_launch_fingerprint {
+                return Err(ToolError::invalid_arguments(
+                    "agent action idempotency key was reused with different input",
+                ));
+            }
+            let grant = pioneer_crud::load_agent_execution_grant(&database, execution_id)
+                .await
+                .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?
+                .ok_or_else(|| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+            let grant: serde_json::Value = serde_json::from_str(&grant.grant_json)
+                .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+            let profile: pioneer_protocol::AgentExecutionProfileProjection =
+                serde_json::from_value(grant["profile"].clone())
+                    .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+            if !match &selection.profile {
+                pioneer_protocol::AgentToolProfileChoice::Model {
+                    provider_id,
+                    model_id,
+                } => {
+                    model_id == &profile.model_id
+                        && provider_id
+                            .as_ref()
+                            .is_none_or(|id| id == &profile.provider_id)
+                }
+                pioneer_protocol::AgentToolProfileChoice::Exact { id } => id == &profile.id,
+                // The original launch request matched before this profile
+                // could influence resolution. The handler also verifies the
+                // normalized action, including all non-launch arguments.
+                pioneer_protocol::AgentToolProfileChoice::InheritParent => true,
+            } {
+                return Err(ToolError::execution_failed("agent_runtime_integrity_lost"));
+            }
+            saved_profile = Some(profile);
+        }
+    }
+    let selected = match saved_profile {
+        Some(profile) => profile,
+        None => {
+            selected_launch_profile(
+                processor,
+                context,
+                &selection,
+                &facts,
+                &binding.options,
+                &authority,
+            )
+            .await?
+        }
+    };
+    let mut adapter = binding.adapter.lock().await;
+    binding.options = adapter.install_selected_launch_profiles(vec![selected.clone()]);
+    let ephemeral = matches!(
+        selection.identity,
+        pioneer_protocol::AgentToolIdentityChoice::ServerDerivedEphemeral { .. }
+    );
+    let server_selection = selection.clone().into_server_selection();
+    let (identity, profile) = if ephemeral {
+        adapter.resolve_ephemeral_task_launch(&server_selection, stable_seed)
+    } else {
+        adapter.resolve_task_launch(&server_selection)
+    }
+    .map_err(|_| ToolError::invalid_arguments("agent_execution_selection_not_allowed"))?;
+    drop(adapter);
+    processor
+        .register_agent_action_binding(context.turn_id.clone(), binding)
+        .await;
+    if !selection.use_default_reasoning
+        && selection.reasoning.is_none()
+        && (identity.id == facts.identity.id || ephemeral)
+    {
+        let runtime = processor
+            .crud_store
+            .get_turn_runtime_snapshot(&context.turn_id)
+            .await
+            .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?
+            .ok_or_else(|| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+        if runtime.workspace_id != context.workspace_id
+            || runtime.thread_id != context.thread_id
+            || runtime.model != facts.profile.model_id
+            || runtime.provider_name != facts.profile.provider_id
+        {
+            return Err(ToolError::execution_failed("agent_runtime_integrity_lost"));
+        }
+        selection.reasoning = runtime
+            .reasoning_effort
+            .map(|effort| pioneer_protocol::TurnReasoningSelection { effort });
+    }
+    if selection
+        .reasoning
+        .as_ref()
+        .is_some_and(|reasoning| !profile.allowed_reasoning.contains(reasoning))
+    {
+        return Err(ToolError::invalid_arguments(
+            "agent_execution_selection_not_allowed",
+        ));
+    }
+    if !ephemeral {
+        selection.identity = pioneer_protocol::AgentToolIdentityChoice::Exact { id: identity.id };
+    }
+    selection.profile = pioneer_protocol::AgentToolProfileChoice::Exact { id: profile.id };
+    Ok((selection, selected))
+}
+
 pub(crate) fn pin_launch_selection_capabilities(
     launch: &mut pioneer_protocol::AgentLaunchSelection,
     capabilities: &[pioneer_protocol::TurnCapability],
@@ -1252,6 +2268,14 @@ async fn ensure_root_agent_action_binding(
         .crud_store
         .get_cli_runtime_turn_binding(context.turn_id.as_str())
         .await?;
+    let runtime = processor
+        .crud_store
+        .get_turn_runtime_snapshot(&context.turn_id)
+        .await?
+        .context("root execution runtime snapshot is unavailable")?;
+    let mut thread = thread;
+    thread.model = runtime.model;
+    thread.model_provider = runtime.provider_name;
     let prepared = prepare_root_agent_execution_admission(
         processor,
         context,
@@ -1263,6 +2287,7 @@ async fn ensure_root_agent_action_binding(
         cli_binding
             .as_ref()
             .map(|binding| binding.runtime_id.as_str()),
+        runtime.reasoning_effort.as_deref(),
     )
     .await?;
     let committed = processor
@@ -1298,6 +2323,7 @@ pub(crate) async fn prepare_root_agent_execution_admission(
     requested_launch: Option<&pioneer_protocol::AgentLaunchSelection>,
     requested_backend: Option<&pioneer_protocol::AgentExecutionBackend>,
     bound_cli_runtime_id: Option<&str>,
+    effective_reasoning_effort: Option<&str>,
 ) -> anyhow::Result<PreparedRootAgentExecutionAdmission> {
     if thread.id != context.thread_id
         || thread.workspace_id != context.workspace_id
@@ -1503,8 +2529,10 @@ pub(crate) async fn prepare_root_agent_execution_admission(
     )
     .map_err(|error| anyhow::anyhow!("root Agent identity is invalid: {error:?}"))?;
     let policy_generation = processor.current_authorization_revision().await?.max(1);
-    let allowed_reasoning = requested_launch
-        .and_then(|launch| launch.execution.reasoning.clone())
+    let allowed_reasoning = effective_reasoning_effort
+        .map(|effort| pioneer_protocol::TurnReasoningSelection {
+            effort: effort.to_owned(),
+        })
         .into_iter()
         .collect::<Vec<_>>();
     let base_profile = workspace_launch_profile(
@@ -1522,13 +2550,12 @@ pub(crate) async fn prepare_root_agent_execution_admission(
         policy_generation,
         policy_generation,
     )?;
-    let (mut child_identities, mut child_profiles) = current_workspace_launch_catalog(
+    let (mut child_identities, child_profiles) = current_workspace_launch_options(
         processor,
         context.workspace_id.as_str(),
         &base_identity,
         &base_profile,
-        thread.model_provider.as_str(),
-        thread.model.as_str(),
+        authority,
     )
     .await?;
     let child_skill_ids = authority
@@ -1540,7 +2567,7 @@ pub(crate) async fn prepare_root_agent_execution_admission(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let selection =
+    let mut selection =
         requested_launch
             .cloned()
             .unwrap_or_else(|| pioneer_protocol::AgentLaunchSelection {
@@ -1564,6 +2591,10 @@ pub(crate) async fn prepare_root_agent_execution_admission(
                     selected_capabilities: Vec::new(),
                 },
             });
+    selection.execution.reasoning =
+        effective_reasoning_effort.map(|effort| pioneer_protocol::TurnReasoningSelection {
+            effort: effort.to_owned(),
+        });
     let start_options = pioneer_protocol::AgentStartOptionsProjection {
         agents: child_identities.clone(),
         inherit_parent_agent_available: false,
@@ -1614,6 +2645,13 @@ pub(crate) async fn prepare_root_agent_execution_admission(
         crate::authorization::resolve_agent_launch_selection(&selection, &start_options, None, None)
     }
     .map_err(|error| anyhow::anyhow!("root Agent launch is invalid: {error:?}"))?;
+    if profile.backend != base_profile.backend
+        || profile.provider_id != base_profile.provider_id
+        || profile.model_id != base_profile.model_id
+    {
+        anyhow::bail!("root Agent profile differs from the applied executor/model");
+    }
+
     if let Some(reasoning) = selection.execution.reasoning.as_ref()
         && !profile.allowed_reasoning.contains(reasoning)
     {
@@ -1621,11 +2659,8 @@ pub(crate) async fn prepare_root_agent_execution_admission(
     }
     if deriving_ephemeral {
         child_identities.push(identity.clone());
-        child_profiles.push(profile.clone());
         child_identities.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
         child_identities.dedup_by(|left, right| left.id == right.id);
-        child_profiles.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        child_profiles.dedup_by(|left, right| left.id == right.id);
     }
     let identity_source_kind = if deriving_ephemeral {
         pioneer_crud::SOURCE_EPHEMERAL.to_owned()
@@ -1656,20 +2691,19 @@ pub(crate) async fn prepare_root_agent_execution_admission(
     .ok_or_else(|| anyhow::anyhow!("root Agent authorization envelope is unavailable"))?;
     let agent_authorization_fingerprint = agent_authorization_envelope.fingerprint.clone();
     let agent_authorization_allowed_actions = agent_authorization_envelope.allowed_action_names();
-    let child_launch_grant =
-        pioneer_protocol::ChildAgentLaunchGrantSet::new(child_identities, child_profiles)
-            .and_then(|grant| {
-                grant.with_policy(
-                    true,
-                    agent_authorization_envelope
-                        .allows(crate::authorization::ResourceAction::ChildStart),
-                    true,
-                    child_skill_ids,
-                    authority.granted_mcp_server_capability_ids().to_vec(),
-                    authority.permission_profile_cap().clone(),
-                )
-            })
-            .map_err(|error| anyhow::anyhow!("root child launch ceiling is invalid: {error:?}"))?;
+    let child_launch_grant = pioneer_protocol::ChildAgentLaunchGrantSet::new(child_identities)
+        .and_then(|grant| {
+            grant.with_policy(
+                true,
+                agent_authorization_envelope
+                    .allows(crate::authorization::ResourceAction::ChildStart),
+                true,
+                child_skill_ids,
+                authority.granted_mcp_server_capability_ids().to_vec(),
+                authority.permission_profile_cap().clone(),
+            )
+        })
+        .map_err(|error| anyhow::anyhow!("root child launch ceiling is invalid: {error:?}"))?;
     let execution_id_value = root_agent_execution_id_for_turn(context.turn_id.as_str());
     let execution_id = AgentExecutionId::new(execution_id_value.clone())
         .map_err(|error| anyhow::anyhow!("root Agent execution id is invalid: {error:?}"))?;
@@ -1911,9 +2945,16 @@ pub(crate) async fn materialize(
     processor: Arc<MessageProcessor>,
     context: TurnToolContext,
 ) -> Result<pioneer_agent::TurnToolMaterialization, String> {
-    ensure_root_agent_action_binding(&processor, &context, None, None)
+    materialize_with_proof(processor, context)
         .await
-        .map_err(|error| format!("failed to bind root Agent execution: {error:#}"))?;
+        .map_err(|error| format!("failed to bind root Agent execution: {error:#}"))
+}
+
+pub(crate) async fn materialize_with_proof(
+    processor: Arc<MessageProcessor>,
+    context: TurnToolContext,
+) -> anyhow::Result<pioneer_agent::TurnToolMaterialization> {
+    ensure_root_agent_action_binding(&processor, &context, None, None).await?;
     let Some(binding) = processor
         .agent_action_binding(context.turn_id.as_str())
         .await
@@ -1963,7 +3004,6 @@ pub(crate) async fn materialize(
             name,
             Arc::new(AgentActionToolHandler {
                 adapter: adapter.clone(),
-                options: options.clone(),
                 tool: entry.name,
                 processor: Arc::downgrade(&processor),
                 context: context.clone(),
@@ -1982,6 +3022,7 @@ fn agent_tool_recovery(tool: AgentModelToolName) -> ToolRecoveryMetadata {
     if matches!(
         tool,
         AgentModelToolName::AgentStartOptions
+            | AgentModelToolName::IdentityModelsList
             | AgentModelToolName::Wait
             | AgentModelToolName::Result
     ) {
@@ -2005,7 +3046,6 @@ fn agent_tool_recovery(tool: AgentModelToolName) -> ToolRecoveryMetadata {
 
 struct AgentActionToolHandler {
     adapter: Arc<Mutex<BoundAgentActionAdapter>>,
-    options: Option<AgentToolOptionsProjection>,
     tool: AgentModelToolName,
     processor: Weak<MessageProcessor>,
     context: TurnToolContext,
@@ -2116,12 +3156,48 @@ where
                     .await
                     .map(|_| false)
                 }
-                Err(_error) => {
-                    let marked = pioneer_crud::mark_agent_action_outbox_failed(
+                Ok(AgentActionOutboxDispatch::Rejected(_))
+                    if attempts == pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS =>
+                {
+                    // Exhausted StartAgent reconciliation returns Rejected only
+                    // after canonical acceptance, fenced cleanup and memory sync.
+                    // ACK that boundary so closed history leaves its due index.
+                    pioneer_crud::mark_agent_action_outbox_delivered(
                         database,
                         &outbox_id,
                         attempts,
                         pioneer_crud::utc_now(),
+                    )
+                    .await
+                }
+                Ok(AgentActionOutboxDispatch::Rejected(failure)) => {
+                    pioneer_crud::mark_agent_action_outbox_failed_with_cause(
+                        database,
+                        &outbox_id,
+                        attempts,
+                        pioneer_crud::utc_now(),
+                        failure,
+                        true,
+                    )
+                    .await
+                    .map(|_| false)
+                }
+                Err(error) => {
+                    let failure = if agent_start_has_storage_failure(&error) {
+                        pioneer_crud::AgentActionOutboxFailure::StorageUnavailable
+                    } else {
+                        error
+                            .downcast_ref::<pioneer_crud::AgentActionOutboxFailure>()
+                            .copied()
+                            .unwrap_or(pioneer_crud::AgentActionOutboxFailure::OutcomeUnknown)
+                    };
+                    let marked = pioneer_crud::mark_agent_action_outbox_failed_with_cause(
+                        database,
+                        &outbox_id,
+                        attempts,
+                        pioneer_crud::utc_now(),
+                        failure,
+                        false,
                     )
                     .await;
                     if matches!(marked, Ok(true))
@@ -2131,7 +3207,7 @@ where
                             outbox_id,
                             action_id,
                             attempts = attempts,
-                            failure_class = "outbox_delivery_failed",
+                            failure_class = failure.safe_name(),
                             "agent domain action outbox reached its delivery retry limit"
                         );
                     }
@@ -2162,39 +3238,426 @@ pub(super) enum AgentActionOutboxDispatch {
     Delivered,
     AwaitingPermit,
     AwaitingRuntime,
+    Rejected(pioneer_crud::AgentActionOutboxFailure),
+}
+
+// Failure to obtain a proof is different from a proof denying the action.
+// Keep the database cause intact across semantic context boundaries. A driver
+// query/connection failure (including SQLITE_IOERR) cannot establish denial;
+// parsed-but-invalid envelopes and missing/denied authority still can.
+pub(super) fn agent_start_has_storage_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<sea_orm::DbErr>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    sea_orm::DbErr::ConnectionAcquire(_)
+                        | sea_orm::DbErr::Conn(_)
+                        | sea_orm::DbErr::Exec(_)
+                        | sea_orm::DbErr::Query(_)
+                )
+            })
+            || source.downcast_ref::<sea_orm::ConnAcquireErr>().is_some()
+    }) || pioneer_sqlite::is_anyhow_sqlite_transient_access(error)
+        || super::agent_runtime::native_preparation_has_typed_sqlite_lock(error)
+}
+
+pub(super) fn agent_start_proof_error(
+    error: anyhow::Error,
+    semantic_failure: pioneer_crud::AgentActionOutboxFailure,
+) -> anyhow::Error {
+    let failure = if agent_start_has_storage_failure(&error) {
+        pioneer_crud::AgentActionOutboxFailure::StorageUnavailable
+    } else {
+        semantic_failure
+    };
+    error.context(failure)
 }
 
 async fn dispatch_agent_action_outbox_row(
     processor: &Arc<MessageProcessor>,
     row: &pioneer_entity::agent_action_outbox::Model,
 ) -> anyhow::Result<AgentActionOutboxDispatch> {
-    let payload: serde_json::Value = serde_json::from_str(row.payload_json.as_str())?;
+    use pioneer_crud::AgentActionOutboxFailure as Failure;
+    if row.last_error.as_deref() == Some(pioneer_crud::AGENT_START_RECONCILIATION_REQUIRED) {
+        return match finalize_rejected_agent_start(processor, row, Failure::OutcomeUnknown).await? {
+            AgentStartReconciliation::Finalized => {
+                Ok(AgentActionOutboxDispatch::Rejected(Failure::OutcomeUnknown))
+            }
+            AgentStartReconciliation::RuntimeOwned => Ok(AgentActionOutboxDispatch::Delivered),
+            AgentStartReconciliation::Unresolved => Err(Failure::OutcomeUnknown.into()),
+        };
+    }
+    match dispatch_agent_action_outbox_row_inner(processor, row).await {
+        Err(error) if agent_start_has_storage_failure(&error) => Err(error),
+        Err(error)
+            if error.downcast_ref::<Failure>().is_some_and(|failure| {
+                matches!(
+                    failure,
+                    Failure::InvalidStart
+                        | Failure::AuthorityDenied
+                        | Failure::RuntimeUnavailable
+                        | Failure::ForegroundConflict
+                        | Failure::OutcomeUnknown
+                )
+            }) =>
+        {
+            let failure = *error.downcast_ref::<Failure>().expect("typed rejection");
+            match finalize_rejected_agent_start(processor, row, failure).await {
+                Ok(AgentStartReconciliation::Finalized) => {
+                    Ok(AgentActionOutboxDispatch::Rejected(failure))
+                }
+                Ok(AgentStartReconciliation::RuntimeOwned) => {
+                    Ok(AgentActionOutboxDispatch::Delivered)
+                }
+                Ok(AgentStartReconciliation::Unresolved) => Err(error),
+                Err(finalization) => Err(finalization.context(failure)),
+            }
+        }
+        Err(error) if row.attempts >= pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS => {
+            // Unknown transport/preparation outcomes must first reconcile the
+            // exact runtime. The finalizer refuses any potentially live owner.
+            match finalize_rejected_agent_start(processor, row, Failure::OutcomeUnknown).await {
+                Ok(AgentStartReconciliation::Finalized) => {
+                    Ok(AgentActionOutboxDispatch::Rejected(Failure::OutcomeUnknown))
+                }
+                Ok(AgentStartReconciliation::RuntimeOwned) => {
+                    Ok(AgentActionOutboxDispatch::Delivered)
+                }
+                Ok(AgentStartReconciliation::Unresolved) => Err(error),
+                Err(finalization) => Err(finalization),
+            }
+        }
+        result => result,
+    }
+}
+
+enum AgentStartReconciliation {
+    Finalized,
+    RuntimeOwned,
+    Unresolved,
+}
+
+fn is_legacy_agent_child_grant(grant: &serde_json::Value) -> bool {
+    grant.get("kind").and_then(serde_json::Value::as_str) == Some("agent_child")
+        && ["source_action_id", "source_execution_id", "turn_id"]
+            .iter()
+            .all(|field| grant.get(*field).is_none())
+}
+
+// Parent identity alone cannot bind two sibling starts to their source actions.
+// Both producers bind the input Turn ID to its action; callers also validate
+// the saved Turn author, response execution/presentation and owner/generation.
+async fn agent_start_grant_matches_source(
+    processor: &MessageProcessor,
+    row: &pioneer_entity::agent_action_outbox::Model,
+    execution: &pioneer_entity::agent_execution::Model,
+    saved_grant: &pioneer_entity::agent_execution_grant::Model,
+    grant: &serde_json::Value,
+    turn_id: &str,
+) -> anyhow::Result<bool> {
+    if saved_grant.parent_execution_id != execution.parent_execution_id
+        || saved_grant.child_identity_id != execution.agent_identity_id
+        || grant
+            .get("execution_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(execution.id.as_str())
+    {
+        return Ok(false);
+    }
+    if !is_legacy_agent_child_grant(grant) {
+        // Present but invalid/contradictory source fields never enable fallback.
+        return Ok(grant
+            .get("source_action_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(row.action_id.as_str())
+            && grant
+                .get("source_execution_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(row.owner_execution_id.as_str())
+            && grant.get("turn_id").and_then(serde_json::Value::as_str) == Some(turn_id));
+    }
+    // The historical producer used this exact action-derived input Turn ID.
+    // Its saved allowed receipt and the caller's exact response link prove the
+    // source without rewriting the old grant or restoring user payload.
+    if execution.parent_execution_id.as_deref() != Some(row.owner_execution_id.as_str())
+        || grant
+            .get("parent_execution_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(row.owner_execution_id.as_str())
+        || turn_id
+            != pioneer_crud::canonical_agent_id(
+                'T',
+                &format!("agent-start-turn\0{}", row.action_id),
+            )
+    {
+        return Ok(false);
+    }
+    let database = processor.crud_store.database_connection();
+    let action = pioneer_crud::load_agent_action(&database, &row.action_id).await?;
+    let receipt = pioneer_crud::load_agent_action_receipt(&database, &row.action_id).await?;
+    Ok(action.is_some_and(|action| {
+        action.status == "committed"
+            && action.action_kind == "start_agent"
+            && action.execution_id == row.owner_execution_id
+    }) && receipt.is_some_and(|receipt| {
+        receipt.decision == "allowed"
+            && receipt.actor_kind == "agent_execution"
+            && receipt.actor_id.as_deref() == Some(row.owner_execution_id.as_str())
+    }))
+}
+
+// A malformed envelope must never terminalize an unrelated Turn. Bind the
+// compensating terminal event to the exact saved response and current owner.
+async fn finalize_rejected_agent_start(
+    processor: &Arc<MessageProcessor>,
+    row: &pioneer_entity::agent_action_outbox::Model,
+    failure: pioneer_crud::AgentActionOutboxFailure,
+) -> anyhow::Result<AgentStartReconciliation> {
+    let payload: serde_json::Value = serde_json::from_str(&row.payload_json)?;
+    let Some(execution_id) = payload
+        .get("spawned_execution_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(AgentStartReconciliation::Unresolved);
+    };
+    let legacy_compacted = payload.get("_pioneer_compacted").is_some()
+        && payload.pointer("/dispatch/turn_id").is_none();
+    let Some(saved_grant) = pioneer_crud::load_agent_execution_grant(
+        &processor.crud_store.database_connection(),
+        execution_id,
+    )
+    .await?
+    else {
+        return Ok(AgentStartReconciliation::Unresolved);
+    };
+    let grant: serde_json::Value = serde_json::from_str(&saved_grant.grant_json)?;
+    let canonical_turn_id =
+        pioneer_crud::canonical_agent_id('T', &format!("agent-start-turn\0{}", row.action_id));
+    let Some(turn_id) = payload
+        .pointer("/dispatch/turn_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            legacy_compacted
+                .then(|| grant.get("turn_id"))
+                .flatten()
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    (legacy_compacted && is_legacy_agent_child_grant(&grant))
+                        .then_some(canonical_turn_id.as_str())
+                })
+        })
+    else {
+        return Ok(AgentStartReconciliation::Unresolved);
+    };
+    let store = &processor.crud_store;
+    let Some(response) =
+        pioneer_crud::load_agent_turn_response(&store.database_connection(), turn_id).await?
+    else {
+        return Ok(AgentStartReconciliation::Unresolved);
+    };
+    let Some(owner) = store.get_turn_execution(turn_id).await? else {
+        return Ok(AgentStartReconciliation::Unresolved);
+    };
+    let Some(execution) =
+        pioneer_crud::load_agent_execution(&store.database_connection(), execution_id).await?
+    else {
+        return Ok(AgentStartReconciliation::Unresolved);
+    };
+    if response.execution_id != execution_id
+        || Some(response.presentation_snapshot_id.as_str())
+            != execution.presentation_snapshot_id.as_deref()
+        || execution.workspace_id != owner.workspace_id
+        || execution.parent_thread_id.as_deref() != Some(owner.thread_id.as_str())
+        || !agent_start_grant_matches_source(
+            processor,
+            row,
+            &execution,
+            &saved_grant,
+            &grant,
+            turn_id,
+        )
+        .await?
+        || (!legacy_compacted
+            && payload
+                .pointer("/dispatch/execution_generation")
+                .and_then(serde_json::Value::as_i64)
+                != Some(execution.execution_generation))
+    {
+        return Ok(AgentStartReconciliation::Unresolved);
+    }
+    let action = pioneer_crud::load_agent_action(&store.database_connection(), &row.action_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("rejected StartAgent source action is missing"))?;
+    let receipt =
+        pioneer_crud::load_agent_action_receipt(&store.database_connection(), &row.action_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("rejected StartAgent source receipt is missing"))?;
+    let (workspace_id, authored_turn) = store
+        .get_turn(&owner.thread_id, turn_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("rejected StartAgent Turn is missing"))?;
+    if workspace_id != owner.workspace_id
+        || action.status != "committed" || action.action_kind != "start_agent"
+        || action.execution_id != row.owner_execution_id || receipt.decision != "allowed"
+        || receipt.actor_kind != "agent_execution"
+        || receipt.actor_id.as_deref() != Some(row.owner_execution_id.as_str())
+        || !authored_turn.author.as_ref().is_some_and(|author| matches!(&author.actor,
+            pioneer_protocol::PersistedActorRef::AgentExecution(id) if id.as_str() == row.owner_execution_id)) {
+        return Ok(AgentStartReconciliation::Unresolved);
+    }
+    if let Some(parent) = execution.parent_execution_id.as_deref() {
+        if parent != row.owner_execution_id {
+            return Ok(AgentStartReconciliation::Unresolved);
+        }
+    }
+    if authored_turn.status != pioneer_protocol::TurnStatus::InProgress {
+        if !store
+            .finalize_terminal_agent_turn_owned(&owner, execution_id, pioneer_crud::utc_now())
+            .await?
+        {
+            return Ok(AgentStartReconciliation::Unresolved);
+        }
+        return Ok(
+            if processor
+                .synchronize_projected_native_terminal_turn(
+                    &owner.workspace_id,
+                    &owner.thread_id,
+                    turn_id,
+                )
+                .await?
+            {
+                AgentStartReconciliation::Finalized
+            } else {
+                AgentStartReconciliation::Unresolved
+            },
+        );
+    }
+    if store.native_turn_has_accepted_terminal(turn_id).await? {
+        // Projection, cleanup and memory synchronization still owe confirmation.
+        // Runtime evidence cannot acknowledge a pending canonical terminal.
+        return Ok(AgentStartReconciliation::Unresolved);
+    }
+    // Process ownership protects active mutation, not acknowledgement of an
+    // already canonical terminal generation after Gateway restart.
+    if owner.owner_id != processor.turn_execution_owner_id.as_ref() {
+        return Ok(AgentStartReconciliation::Unresolved);
+    }
+    if legacy_compacted {
+        // A recovered compacted link can confirm only a canonical terminal.
+        // It never authorizes activation or refusal of a later generation.
+        return Ok(AgentStartReconciliation::Unresolved);
+    }
+    if owner.owner_generation > 1 {
+        return Ok(AgentStartReconciliation::RuntimeOwned); // recovery/resume owns its outcome
+    }
+    // Reconcile potential effects before a local refusal. A runtime that has
+    // already accepted the Turn owns its outcome; a lost ACK is not a new start.
+    if owner.started_at.is_some()
+        || store
+            .latest_cli_runtime_turn_attempt(turn_id)
+            .await?
+            .is_some()
+    {
+        return Ok(AgentStartReconciliation::RuntimeOwned);
+    }
+    if owner.executor_kind != pioneer_crud::TurnExecutorKind::CliRuntime {
+        match processor
+            .agent_manager
+            .observe_turn(&owner.thread_id, turn_id)
+            .await
+        {
+            Ok(Some(_)) => return Ok(AgentStartReconciliation::RuntimeOwned),
+            Ok(None) | Err(pioneer_agent::AgentControlError::ThreadNotFound) => {}
+            Err(_) => return Ok(AgentStartReconciliation::Unresolved),
+        }
+    }
+    processor
+        .ensure_thread_loaded(&owner.thread_id, &owner.workspace_id)
+        .await?;
+    let mut terminal_turn = authored_turn;
+    terminal_turn.error = Some(failure.safe_name().to_owned());
+    let event = if failure == pioneer_crud::AgentActionOutboxFailure::OutcomeUnknown {
+        terminal_turn.status = pioneer_protocol::TurnStatus::Blocked;
+        pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(
+            pioneer_protocol::TurnBlockedNotification {
+                workspace_id: owner.workspace_id.clone(),
+                thread_id: owner.thread_id.clone(),
+                turn: terminal_turn,
+                resume: None,
+            },
+        )
+    } else {
+        terminal_turn.status = pioneer_protocol::TurnStatus::Failed;
+        pioneer_crud::CanonicalTurnEventPayload::TurnFailed(
+            pioneer_protocol::TurnFailedNotification {
+                workspace_id: owner.workspace_id.clone(),
+                thread_id: owner.thread_id.clone(),
+                turn: terminal_turn,
+            },
+        )
+    };
+    let timestamp = pioneer_crud::utc_now().timestamp();
+    store
+        .materialize_unactivated_turn_refusal_owned(event.clone(), timestamp, owner.clone())
+        .await?;
+    #[cfg(test)]
+    processor
+        .completed_history_preparation_barrier
+        .wait_if_armed(
+            "__agent_start_after_terminal_acceptance__",
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    // Confirm through the existing Gateway publication/synchronization path.
+    // Acceptance above already owns the terminal result and released resources.
+    processor
+        .materialize_native_agent_turn_event(event, timestamp, None)
+        .await?;
+    if !processor
+        .synchronize_projected_native_terminal_turn(&owner.workspace_id, &owner.thread_id, turn_id)
+        .await?
+    {
+        return Ok(AgentStartReconciliation::Unresolved);
+    }
+    Ok(AgentStartReconciliation::Finalized)
+}
+
+async fn dispatch_agent_action_outbox_row_inner(
+    processor: &Arc<MessageProcessor>,
+    row: &pioneer_entity::agent_action_outbox::Model,
+) -> anyhow::Result<AgentActionOutboxDispatch> {
+    use pioneer_crud::AgentActionOutboxFailure as Failure;
+    let payload: serde_json::Value =
+        serde_json::from_str(row.payload_json.as_str()).map_err(|_| Failure::InvalidStart)?;
     if payload.get("kind").and_then(serde_json::Value::as_str) != Some("start_agent") {
         return Ok(AgentActionOutboxDispatch::Delivered);
     }
     let execution_id = payload
         .get("spawned_execution_id")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("StartAgent outbox has no spawned execution"))?;
+        .ok_or(Failure::InvalidStart)?;
     let dispatch: DurableAgentStartDispatch = serde_json::from_value(
         payload
             .get("dispatch")
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("StartAgent outbox has no dispatch envelope"))?,
-    )?;
+            .ok_or(Failure::InvalidStart)?,
+    )
+    .map_err(|_| Failure::InvalidStart)?;
     if dispatch.thread_id != dispatch.params.thread_id
         || dispatch.turn_id != dispatch.params.turn_id
         || dispatch.identity_source_revision != dispatch.identity.source_revision
         || dispatch.identity_source_fingerprint != dispatch.identity.source_fingerprint
     {
-        anyhow::bail!("StartAgent outbox dispatch envelope is inconsistent");
+        return Err(Failure::InvalidStart.into());
     }
     let execution = pioneer_crud::load_agent_execution(
         &processor.crud_store.database_connection(),
         execution_id,
     )
     .await?
-    .ok_or_else(|| anyhow::anyhow!("StartAgent execution is missing"))?;
+    .ok_or(Failure::InvalidStart)?;
     if execution.id != execution_id
         || execution.agent_identity_id != dispatch.identity.id.as_str()
         || execution.identity_source_revision
@@ -2207,54 +3670,94 @@ async fn dispatch_agent_action_outbox_row(
         || execution.work_graph_root_execution_id != dispatch.work_graph_root_execution_id.as_str()
         || execution.execution_generation != dispatch.execution_generation
     {
-        anyhow::bail!("StartAgent outbox differs from its durable execution");
+        return Err(Failure::InvalidStart.into());
     }
     let identity = pioneer_crud::load_agent_identity(
         &processor.crud_store.database_connection(),
         dispatch.identity.id.as_str(),
     )
     .await?
-    .ok_or_else(|| anyhow::anyhow!("StartAgent identity is missing"))?;
+    .ok_or(Failure::InvalidStart)?;
     if identity.workspace_id != execution.workspace_id || identity.status != "active" {
-        anyhow::bail!("StartAgent identity continuity check failed");
+        return Err(Failure::InvalidStart.into());
     }
     let target_thread = processor
         .crud_store
         .get_thread_model(dispatch.thread_id.as_str())
         .await?
-        .ok_or_else(|| anyhow::anyhow!("StartAgent target thread is missing"))?;
+        .ok_or(Failure::InvalidStart)?;
     if target_thread.workspace_id != execution.workspace_id {
-        anyhow::bail!("StartAgent target thread left its admitted workspace");
+        return Err(Failure::InvalidStart.into());
     }
     let (_, committed_turn) = processor
         .crud_store
         .get_turn(dispatch.thread_id.as_str(), dispatch.turn_id.as_str())
         .await?
-        .ok_or_else(|| anyhow::anyhow!("committed StartAgent Turn is missing"))?;
-    let input_author = committed_turn
-        .author
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("committed StartAgent Turn has no exact input author"))?;
+        .ok_or(Failure::InvalidStart)?;
+    let input_author = committed_turn.author.clone().ok_or(Failure::InvalidStart)?;
     let pioneer_protocol::PersistedActorRef::AgentExecution(input_execution_id) =
         &input_author.actor
     else {
-        anyhow::bail!("committed StartAgent input author is not an AgentExecution");
+        return Err(Failure::InvalidStart.into());
     };
-    if execution.parent_execution_id.as_deref() != Some(input_execution_id.as_str()) {
-        anyhow::bail!("committed StartAgent input author is not the child execution parent");
+    let saved_grant = pioneer_crud::load_agent_execution_grant(
+        &processor.crud_store.database_connection(),
+        &execution.id,
+    )
+    .await?
+    .ok_or(Failure::InvalidStart)?;
+    let grant: serde_json::Value =
+        serde_json::from_str(&saved_grant.grant_json).map_err(|_| Failure::InvalidStart)?;
+    if row.owner_execution_id != input_execution_id.as_str()
+        || !agent_start_grant_matches_source(
+            processor,
+            row,
+            &execution,
+            &saved_grant,
+            &grant,
+            &dispatch.turn_id,
+        )
+        .await?
+    {
+        return Err(Failure::InvalidStart.into());
+    }
+    let independent_root = execution.parent_execution_id.is_none()
+        && execution.id == execution.work_graph_root_execution_id
+        && execution.home_root_thread_id == dispatch.thread_id;
+    if independent_root {
+        let authority = processor
+            .load_turn_execution_authorization_context(&dispatch.turn_id)
+            .await
+            .map_err(|error| agent_start_proof_error(error, Failure::InvalidStart))?;
+        authority
+            .verify_independent_agent_start(
+                processor.crud_store.as_ref(),
+                &execution,
+                input_execution_id.as_str(),
+                &dispatch.turn_id,
+            )
+            .await
+            .map_err(|error| agent_start_proof_error(error, Failure::InvalidStart))?;
+    } else if execution.parent_execution_id.as_deref() != Some(input_execution_id.as_str()) {
+        return Err(Failure::InvalidStart.into());
     }
     let response = pioneer_crud::load_agent_turn_response(
         &processor.crud_store.database_connection(),
         dispatch.turn_id.as_str(),
     )
     .await?
-    .ok_or_else(|| anyhow::anyhow!("committed StartAgent Turn has no response execution"))?;
+    .ok_or(Failure::InvalidStart)?;
     if response.execution_id != execution.id
         || Some(response.presentation_snapshot_id.as_str())
             != execution.presentation_snapshot_id.as_deref()
     {
-        anyhow::bail!("committed StartAgent response differs from its child execution");
+        return Err(Failure::InvalidStart.into());
     }
+    let owner = processor
+        .crud_store
+        .get_turn_execution(&dispatch.turn_id)
+        .await?
+        .ok_or(Failure::InvalidStart)?;
     processor
         .ensure_thread_loaded(dispatch.thread_id.as_str(), execution.workspace_id.as_str())
         .await?;
@@ -2263,31 +3766,113 @@ async fn dispatch_agent_action_outbox_row(
             execution.status.as_str(),
             "completed" | "succeeded" | "failed" | "blocked" | "cancelled" | "timed_out"
         )
+        || processor
+            .crud_store
+            .native_turn_has_accepted_terminal(&dispatch.turn_id)
+            .await?
     {
-        // The runtime was already activated (or has since reached a terminal
-        // state). This is the crash-after-dispatch replay window: acknowledge
-        // the outbox without starting the same provider/CLI turn again.
+        if committed_turn.status != pioneer_protocol::TurnStatus::InProgress {
+            anyhow::ensure!(
+                processor
+                    .crud_store
+                    .finalize_terminal_agent_turn_owned(
+                        &owner,
+                        &execution.id,
+                        pioneer_crud::utc_now()
+                    )
+                    .await?,
+                Failure::PreparationUnavailable
+            );
+            anyhow::ensure!(
+                processor
+                    .synchronize_projected_native_terminal_turn(
+                        &owner.workspace_id,
+                        &owner.thread_id,
+                        &dispatch.turn_id,
+                    )
+                    .await?,
+                Failure::PreparationUnavailable
+            );
+        } else {
+            // A terminal graph alone does not prove canonical projection or
+            // recovery ownership. Reconciliation retains the outbox obligation.
+            return Err(Failure::OutcomeUnknown.into());
+        }
+        // Delivery acknowledgement confirms only the dispatch boundary. The
+        // canonical Turn remains the source of truth for the model's outcome.
         return Ok(AgentActionOutboxDispatch::Delivered);
     }
-    if processor
-        .agent_manager
-        .observe_turn(dispatch.thread_id.as_str(), dispatch.turn_id.as_str())
-        .await
-        .map_err(|error| anyhow::anyhow!("native control-plane observation failed: {error}"))?
-        .is_some()
-    {
+    if owner.owner_id != processor.turn_execution_owner_id.as_ref() {
+        return Err(Failure::AuthorityDenied.into());
+    }
+    if owner.owner_generation > 1 {
+        // Recovery/resume has taken ownership of this Turn. Its own runtime
+        // protocol owns activation; the initial outbox must not start it again.
         return Ok(AgentActionOutboxDispatch::Delivered);
+    }
+    let cli = matches!(
+        dispatch.params.execution_backend,
+        Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
+    );
+    if cli {
+        if processor
+            .crud_store
+            .latest_cli_runtime_turn_attempt(&dispatch.turn_id)
+            .await?
+            .is_some()
+        {
+            return Ok(AgentActionOutboxDispatch::Delivered);
+        }
+    } else {
+        match processor
+            .agent_manager
+            .observe_turn(&dispatch.thread_id, &dispatch.turn_id)
+            .await
+        {
+            Ok(Some(_)) => return Ok(AgentActionOutboxDispatch::Delivered),
+            Ok(None) | Err(pioneer_agent::AgentControlError::ThreadNotFound) => {}
+            Err(_) => return Err(Failure::ControlUnavailable.into()),
+        }
+        if processor
+            .crud_store
+            .get_turn_runtime_snapshot(&dispatch.turn_id)
+            .await?
+            .is_some()
+            && !(owner.owner_generation == 1
+                && owner.started_at.is_none()
+                && matches!(
+                    owner.status,
+                    pioneer_crud::TurnExecutionStatus::Starting
+                        | pioneer_crud::TurnExecutionStatus::Queued
+                ))
+        {
+            // A preparation snapshot is persisted before the initial CAS. Only
+            // a successful claim (or later generation) makes activation ambiguous.
+            return Err(Failure::OutcomeUnknown.into());
+        }
     }
     if processor
         .thread_manager
-        .has_running_turn_other_than(dispatch.thread_id.as_str(), dispatch.turn_id.as_str())
+        .has_running_turn_other_than(&dispatch.thread_id, &dispatch.turn_id)
         .await
-        || processor
-            .agent_manager
-            .active_turn_id(dispatch.thread_id.as_str())
-            .await
-            .is_some_and(|active_turn_id| active_turn_id != dispatch.turn_id)
+        || (!cli
+            && processor
+                .agent_manager
+                .active_turn_id(&dispatch.thread_id)
+                .await
+                .is_some_and(|active| active != dispatch.turn_id))
     {
+        let user_root = dispatch.home_root_thread_id == dispatch.thread_id
+            && target_thread.sidebar_visibility
+                == pioneer_protocol::ThreadSidebarVisibility::Visible
+            && processor
+                .crud_store
+                .get_task_thread_lineage(&dispatch.thread_id)
+                .await?
+                .is_none();
+        if user_root {
+            return Err(Failure::ForegroundConflict.into());
+        }
         return Ok(AgentActionOutboxDispatch::AwaitingRuntime);
     }
     let resource = pioneer_crud::load_agent_execution_resource_state(
@@ -2295,12 +3880,12 @@ async fn dispatch_agent_action_outbox_row(
         execution_id,
     )
     .await?
-    .ok_or_else(|| anyhow::anyhow!("StartAgent execution resource state is missing"))?;
+    .ok_or(Failure::InvalidStart)?;
     if resource.status == "queued" && resource.permit_id.is_none() {
         return Ok(AgentActionOutboxDispatch::AwaitingPermit);
     }
     if resource.status != "running" || resource.permit_id.is_none() {
-        anyhow::bail!("StartAgent execution has an inconsistent durable permit state");
+        return Err(Failure::InvalidStart.into());
     }
     let input = processor
         .crud_store
@@ -2309,17 +3894,77 @@ async fn dispatch_agent_action_outbox_row(
     let outcome = processor
         .thread_manager
         .rehydrate_committed_agent_turn(&dispatch.params, input)
-        .await?;
+        .await
+        .map_err(|error| agent_start_proof_error(error, Failure::InvalidStart))?;
+    #[cfg(test)]
+    processor
+        .completed_history_preparation_barrier
+        .wait_if_armed(
+            "__agent_start_before_authority_read__",
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
     let authority = processor
         .load_turn_execution_authorization_context(dispatch.turn_id.as_str())
-        .await?;
+        .await
+        .map_err(|error| agent_start_proof_error(error, Failure::AuthorityDenied))?;
     if authority.workspace_id() != execution.workspace_id
         || authority.root_thread_id() != execution.home_root_thread_id
         || authority.authorization_fingerprint()? != execution.authorization_context_fingerprint
     {
-        anyhow::bail!("StartAgent durable authority no longer matches its execution");
+        return Err(Failure::InvalidStart.into());
     }
     let policy_generation = processor.current_authorization_revision().await?;
+    if independent_root {
+        let provider_authority = if cli {
+            None
+        } else {
+            Some(
+                processor
+                    .provider_registry
+                    .available_authority_fingerprint_for_workspace(
+                        &execution.workspace_id,
+                        dispatch
+                            .params
+                            .model_provider
+                            .as_deref()
+                            .ok_or(Failure::InvalidStart)?,
+                    )?
+                    .as_str()
+                    .to_owned(),
+            )
+        };
+        let request = crate::authorization::ExecutionAdmissionRequest::for_turn(
+            crate::authorization::ExecutionAdmissionEntryPoint::AgentTurnStart,
+            crate::authorization::ResourceAction::AgentTurnStart,
+            Vec::new(),
+            &execution.workspace_id,
+            &dispatch.home_root_thread_id,
+            dispatch
+                .params
+                .model_provider
+                .as_deref()
+                .ok_or(Failure::InvalidStart)?,
+            dispatch
+                .params
+                .model
+                .as_deref()
+                .ok_or(Failure::InvalidStart)?,
+            &dispatch.params,
+            &dispatch.params.capabilities,
+            provider_authority,
+        )?;
+        authority
+            .revalidate_new_root_launch(
+                processor.crud_store.as_ref(),
+                &request,
+                &outcome.materialization.turn.permission_profile,
+                policy_generation,
+            )
+            .await
+            .map_err(|error| agent_start_proof_error(error, Failure::AuthorityDenied))?;
+    }
+
     let execution_id = AgentExecutionId::new(execution.id.clone())
         .map_err(|error| anyhow::anyhow!("invalid durable StartAgent execution: {error:?}"))?;
     let execution_generation = u64::try_from(dispatch.execution_generation)
@@ -2356,11 +4001,79 @@ async fn dispatch_agent_action_outbox_row(
         Some(pioneer_protocol::AgentExecutionBackend::ApiProvider { .. }) => {
             let prepared = processor
                 .prepare_committed_agent_api_turn(&dispatch.params, outcome, &authority)
-                .await
-                .map_err(anyhow::Error::msg)?;
+                .await?;
+            #[cfg(test)]
+            processor
+                .completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__agent_start_before_activation_claim__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            if !processor
+                .crud_store
+                .claim_unactivated_agent_turn(&owner)
+                .await?
+            {
+                return Ok(AgentActionOutboxDispatch::AwaitingRuntime);
+            }
+            #[cfg(test)]
+            processor
+                .completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__agent_start_after_activation_claim__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
             processor
                 .dispatch_prepared_api_provider_turn_start(prepared)
                 .await;
+            // The shared helper also serves ordinary callers and may fail to
+            // persist either recovery or a terminal result. Its return is not ACK.
+            if processor
+                .crud_store
+                .native_turn_has_accepted_terminal(&dispatch.turn_id)
+                .await?
+            {
+                anyhow::ensure!(
+                    processor
+                        .crud_store
+                        .finalize_terminal_agent_turn_owned(
+                            &owner,
+                            &execution.id,
+                            pioneer_crud::utc_now(),
+                        )
+                        .await?,
+                    Failure::PreparationUnavailable
+                );
+                anyhow::ensure!(
+                    processor
+                        .synchronize_projected_native_terminal_turn(
+                            &owner.workspace_id,
+                            &owner.thread_id,
+                            &dispatch.turn_id,
+                        )
+                        .await?,
+                    Failure::PreparationUnavailable
+                );
+            } else if processor
+                .crud_store
+                .find_unresolved_recovery_job_for_turn(&dispatch.turn_id)
+                .await?
+                .is_none()
+            {
+                match processor
+                    .agent_manager
+                    .observe_turn(&dispatch.thread_id, &dispatch.turn_id)
+                    .await
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(pioneer_agent::AgentControlError::ThreadNotFound) => {
+                        return Err(Failure::OutcomeUnknown.into());
+                    }
+                    Err(_) => return Err(Failure::ControlUnavailable.into()),
+                }
+            }
         }
         Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime {
             runtime_id,
@@ -2376,18 +4089,12 @@ async fn dispatch_agent_action_outbox_row(
                     anyhow::anyhow!("committed StartAgent CLI Turn has no security snapshot")
                 })?
                 .snapshot;
-            // Main CLI execution receives the new command, never a Pioneer
-            // history projection or a summary prepared for native continuation.
-            // The outbox owns activation. Clear only the in-memory rehydrated
-            // draft before the shared CLI admission path recreates the same
-            // deterministic, already-durable Turn idempotently.
-            processor
-                .thread_manager
-                .rollback_turn_start(outcome.rollback_context)
-                .await;
+            // The shared dispatcher prepares the already-committed Turn. It
+            // must neither remove its input nor admit/persist it a second time.
             let prepared = processor
                 .prepare_committed_agent_cli_runtime_turn(
                     dispatch.params,
+                    outcome,
                     runtime_id,
                     runtime_kind,
                     permission_profile,
@@ -2397,19 +4104,55 @@ async fn dispatch_agent_action_outbox_row(
                     dispatch.thread_id,
                     input_author,
                 )
-                .await?;
+                .await
+                .map_err(|error| error.context(Failure::PreparationUnavailable))?;
             processor
                 .activate_prepared_committed_agent_cli_runtime_turn(prepared)
                 .await?;
         }
-        Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { runtime_id }) => {
-            anyhow::bail!(
-                "committed StartAgent ACP runtime `{runtime_id}` has no installed dispatcher"
-            );
+        Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. }) | None => {
+            return Err(Failure::RuntimeUnavailable.into());
         }
-        None => anyhow::bail!("committed StartAgent has no exact execution backend"),
     }
     Ok(AgentActionOutboxDispatch::Delivered)
+}
+
+impl AgentActionToolHandler {
+    async fn launch_catalog_page(
+        &self,
+        processor: &MessageProcessor,
+        payload: serde_json::Value,
+        limit: u32,
+        cursor: Option<&str>,
+        identity: Option<&str>,
+    ) -> Result<serde_json::Value, ToolError> {
+        processor
+            .revalidate_tool_execution_authorization(
+                &self.context.workspace_id,
+                &self.context.thread_id,
+                &self.context.turn_id,
+                None,
+                crate::authorization::ResourceAction::ThreadRead,
+            )
+            .await
+            .map_err(|_| ToolError::execution_failed("agent_action_not_allowed"))?;
+        let codec = processor
+            .thread_read_cursor_codec()
+            .map_err(|_| ToolError::internal("catalog cursor unavailable"))?;
+        let scope = serde_json::json!([
+            "launch-catalog-v1",
+            self.context.workspace_id,
+            self.context.thread_id,
+            self.context.turn_id,
+            self.tool,
+            identity,
+            limit
+        ])
+        .to_string();
+        super::thread_launch_pages::catalog_page(payload, limit, cursor, &codec, &scope).map_err(
+            |_| ToolError::invalid_arguments("agent_catalog_cursor_invalid_or_stale_restart"),
+        )
+    }
 }
 
 #[async_trait]
@@ -2420,8 +4163,150 @@ impl ToolHandler for AgentActionToolHandler {
         _trace: ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let result = async {
+            let processor = self
+                .processor
+                .upgrade()
+                .ok_or_else(|| ToolError::execution_failed("agent_execution_stale"))?;
+            let mut binding = processor
+                .agent_action_binding(&self.context.turn_id)
+                .await
+                .ok_or_else(|| ToolError::execution_failed("agent_execution_stale"))?;
+            binding
+                .refresh_start_options_catalog(&processor, &self.context.turn_id)
+                .await
+                .map_err(|_| ToolError::execution_failed("agent_execution_stale"))?;
+            let mut options = binding.options.clone();
+            processor
+                .register_agent_action_binding(self.context.turn_id.clone(), binding)
+                .await;
+            if self.tool == AgentModelToolName::IdentityModelsList {
+                let input: pioneer_protocol::AgentIdentityModelsToolInput =
+                    match invocation.payload {
+                        ToolPayload::Function { arguments } => serde_json::from_value(arguments),
+                        ToolPayload::Custom { input } => serde_json::from_str(&input),
+                        _ => return Err(ToolError::invalid_arguments("agent_invalid_arguments")),
+                    }
+                    .map_err(|_| ToolError::invalid_arguments("agent_invalid_arguments"))?;
+                let identity = options
+                    .identities
+                    .iter()
+                    .find(|id| id.id == input.identity_id)
+                    .cloned()
+                    .ok_or_else(|| ToolError::invalid_arguments("agent_identity_unavailable"))?;
+                let facts = self.adapter.lock().await.persistence_facts();
+                let ceiling = load_execution_child_launch_ceiling(
+                    &processor.crud_store.database_connection(),
+                    facts.execution_id.as_str(),
+                )
+                .await
+                .map_err(|_| ToolError::execution_failed("agent_execution_stale"))?;
+                let projection = ceiling
+                    .identities
+                    .iter()
+                    .find(|id| id.id == input.identity_id)
+                    .ok_or_else(|| ToolError::invalid_arguments("agent_identity_unavailable"))?;
+                let source = pioneer_crud::load_agent_identity(
+                    &processor.crud_store.database_connection(),
+                    input.identity_id.as_str(),
+                )
+                .await
+                .map_err(|_| ToolError::execution_failed("agent_identity_unavailable"))?
+                .ok_or_else(|| ToolError::execution_failed("agent_identity_unavailable"))?;
+                let authority = processor
+                    .load_turn_execution_authorization_context(&self.context.turn_id)
+                    .await
+                    .map_err(|_| ToolError::execution_failed("agent_execution_stale"))?;
+                processor
+                    .execution_leases
+                    .revalidate_context(
+                        processor.crud_store.as_ref(),
+                        &authority,
+                        crate::authorization::ResourceAction::ThreadRead,
+                        processor
+                            .current_authorization_revision()
+                            .await
+                            .map_err(|_| ToolError::execution_failed("agent_execution_stale"))?,
+                    )
+                    .await
+                    .map_err(|_| ToolError::execution_failed("agent_action_not_allowed"))?;
+                let mut catalog_identity = projection.clone();
+                catalog_identity.display_name = identity.display_name.clone();
+                let catalog_source_id = if projection.source_kind
+                    == pioneer_protocol::AgentIdentitySourceKind::Ephemeral
+                {
+                    Some(&facts.profile)
+                        .filter(|profile| {
+                            profile
+                                .compatible_agent_identity_ids
+                                .contains(&input.identity_id)
+                        })
+                        .and_then(|profile| match &profile.backend {
+                            pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+                                runtime_instance_id,
+                            } => Some(runtime_instance_id.clone()),
+                            _ => None,
+                        })
+                } else {
+                    None
+                };
+                if catalog_source_id.is_some() {
+                    catalog_identity.source_kind =
+                        pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance;
+                }
+                let mut executors = identity_models_catalog(
+                    &processor,
+                    &self.context.workspace_id,
+                    &catalog_identity,
+                    catalog_source_id.as_deref().unwrap_or(&source.source_id),
+                    &authority,
+                )
+                .await
+                .map_err(|_| ToolError::execution_failed("agent_execution_profile_unavailable"))?;
+                for executor in &mut executors {
+                    if executor.provider_id == facts.profile.provider_id
+                        && executor
+                            .models
+                            .iter()
+                            .any(|model| model.id == facts.profile.model_id)
+                    {
+                        executor.default_model_id = Some(facts.profile.model_id.clone());
+                    }
+                }
+                for executor in &mut executors {
+                    if executor.models.is_empty() && executor.unavailable_reason.is_none() {
+                        executor.unavailable_reason = Some(
+                            "No models are available within this execution's launch grant"
+                                .to_owned(),
+                        );
+                    }
+                }
+                let payload =
+                    serde_json::to_value(pioneer_protocol::AgentIdentityModelsToolResult {
+                        identity_id: input.identity_id.clone(),
+                        identity: Some(identity),
+                        executors,
+                        next_cursor: None,
+                        eof: true,
+                        fragments: Vec::new(),
+                    })
+                    .map_err(|_| ToolError::internal("agent_runtime_integrity_lost"))?;
+                let payload = self
+                    .launch_catalog_page(
+                        &processor,
+                        payload,
+                        input.limit,
+                        input.cursor.as_deref(),
+                        Some(input.identity_id.as_str()),
+                    )
+                    .await?;
+                return Ok(Box::new(FunctionToolOutput::with_payload(
+                    "Identity model options",
+                    true,
+                    payload,
+                )) as Box<dyn ToolOutput>);
+            }
             if self.tool == AgentModelToolName::AgentStartOptions {
-                let _: AgentStartOptionsToolInput = match invocation.payload {
+                let input: AgentStartOptionsToolInput = match invocation.payload {
                     ToolPayload::Function { arguments } => serde_json::from_value(arguments),
                     ToolPayload::Custom { input } => serde_json::from_str(input.as_str()),
                     _ => {
@@ -2429,12 +4314,18 @@ impl ToolHandler for AgentActionToolHandler {
                     }
                 }
                 .map_err(|_| ToolError::invalid_arguments("agent_invalid_arguments"))?;
-                let options = self.options.as_ref().ok_or_else(|| {
-                    ToolError::execution_failed("agent start options are unavailable")
-                })?;
-                let payload = serde_json::to_value(options).map_err(|error| {
+                let payload = serde_json::to_value(&options).map_err(|error| {
                     ToolError::internal(format!("failed to encode options: {error}"))
                 })?;
+                let payload = self
+                    .launch_catalog_page(
+                        &processor,
+                        payload,
+                        input.limit,
+                        input.cursor.as_deref(),
+                        None,
+                    )
+                    .await?;
                 return Ok(Box::new(FunctionToolOutput::with_payload(
                     "server-projected agent options",
                     true,
@@ -2442,7 +4333,7 @@ impl ToolHandler for AgentActionToolHandler {
                 )) as Box<dyn ToolOutput>);
             }
 
-            let arguments = match invocation.payload {
+            let mut arguments = match invocation.payload {
                 ToolPayload::Function { arguments } => arguments,
                 ToolPayload::Custom { input } => serde_json::from_str(&input).map_err(|error| {
                     ToolError::invalid_arguments(format!("invalid agent tool arguments: {error}"))
@@ -2455,13 +4346,35 @@ impl ToolHandler for AgentActionToolHandler {
                 }
             };
 
-            let adapter = self.adapter.lock().await;
+            let mut requested_launch = None;
+            let mut selected_profile = None;
+            if self.tool == AgentModelToolName::StartAgent {
+                let mut input: pioneer_protocol::AgentStartToolInput =
+                    serde_json::from_value(arguments)
+                        .map_err(|_| ToolError::invalid_arguments("agent_invalid_arguments"))?;
+                requested_launch = Some(input.launch.clone());
+                let (launch, profile) = resolve_tool_launch(
+                    &processor,
+                    &self.context,
+                    input.launch.clone(),
+                    &invocation.call_id,
+                )
+                .await?;
+                input.launch = launch;
+                selected_profile = Some(profile);
+                arguments = serde_json::to_value(input)
+                    .map_err(|_| ToolError::internal("agent_runtime_integrity_lost"))?;
+            }
+            let mut adapter = self.adapter.lock().await;
+            if let Some(profile) = selected_profile.as_ref() {
+                options = adapter.install_selected_launch_profiles(vec![profile.clone()]);
+            }
             let intent = adapter
                 .intent_from_model_call(
                     invocation.call_id.as_str(),
                     self.tool,
                     arguments,
-                    self.options.as_ref(),
+                    Some(&options),
                 )
                 .map_err(adapter_tool_error)?;
             let Some(intent) = intent else {
@@ -2549,6 +4462,13 @@ impl ToolHandler for AgentActionToolHandler {
                     receipt_id: Some(receipt.id),
                     outbox_id: Some(outbox.id),
                     public_message: None,
+                    target_options: if replay_kind
+                        == pioneer_protocol::AgentActionKind::CreateThread
+                    {
+                        options.target_options.clone()
+                    } else {
+                        Vec::new()
+                    },
                 };
                 let payload = serde_json::to_value(&safe).map_err(|error| {
                     ToolError::internal(format!("failed to encode replay result: {error}"))
@@ -2648,11 +4568,43 @@ impl ToolHandler for AgentActionToolHandler {
                             "failed to load parent execution authority: {error:#}"
                         ))
                     })?;
+                // Resolve destination shape before either depth gate. Route
+                // authority and the other-capsule binding are still checked
+                // by the adapter/service, separately from this server fact.
+                let destination_is_visible_root = match &start.target {
+                    AgentStartTarget::RoutedThread { thread_id, .. } => {
+                        let target = processor
+                            .crud_store
+                            .get_thread_model(thread_id)
+                            .await
+                            .map_err(|_| {
+                                ToolError::execution_failed("agent_runtime_integrity_lost")
+                            })?
+                            .ok_or_else(|| {
+                                ToolError::execution_failed("Agent target is unavailable")
+                            })?;
+                        target.workspace_id == self.context.workspace_id
+                            && target.sidebar_visibility
+                                == pioneer_protocol::ThreadSidebarVisibility::Visible
+                            && processor
+                                .crud_store
+                                .get_task_thread_lineage(thread_id)
+                                .await
+                                .map_err(|_| {
+                                    ToolError::execution_failed("agent_runtime_integrity_lost")
+                                })?
+                                .is_none()
+                    }
+                    _ => false,
+                };
                 let mut adapter = self.adapter.lock().await;
-                let prepared = adapter.prepare(&intent).map_err(adapter_tool_error)?;
-                let options = self.options.as_ref().ok_or_else(|| {
-                    ToolError::execution_failed("agent start options are unavailable")
-                })?;
+                if let Some(profile) = selected_profile {
+                    options = adapter.install_selected_launch_profiles(vec![profile]);
+                }
+                let prepared = adapter
+                    .prepare_start_agent(&intent, destination_is_visible_root)
+                    .map_err(adapter_tool_error)?;
+                let options = &options;
                 let child = adapter
                     .materialize_start_agent(
                         &prepared,
@@ -2675,7 +4627,16 @@ impl ToolHandler for AgentActionToolHandler {
                 apply_current_identity_source_fence(&mut plan, &source_fence);
                 drop(adapter);
                 return self
-                    .commit_start_agent(start, parent_authority, parent_facts, child, plan)
+                    .commit_start_agent(
+                        start,
+                        parent_authority,
+                        parent_facts,
+                        child,
+                        plan,
+                        requested_launch.ok_or_else(|| {
+                            ToolError::internal("StartAgent has no original tool launch request")
+                        })?,
+                    )
                     .await;
             }
 
@@ -2696,10 +4657,23 @@ impl AgentActionToolHandler {
         parent_facts: crate::authorization::AgentExecutionPersistenceFacts,
         child: crate::authorization::MaterializedChildAgentStart,
         mut plan: crate::authorization::AgentActionCommitPlan,
+        requested_launch: pioneer_protocol::AgentToolLaunchSelection,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let processor = self.processor.upgrade().ok_or_else(|| {
             ToolError::execution_failed("message processor is no longer available")
         })?;
+        validate_new_launch_model(
+            &processor,
+            &self.context,
+            &child.grant.profile,
+            start.launch.execution.reasoning.as_ref(),
+            &parent_authority,
+            matches!(
+                &requested_launch.profile,
+                pioneer_protocol::AgentToolProfileChoice::InheritParent
+            ),
+        )
+        .await?;
         let thread_id = match &start.target {
             AgentStartTarget::CurrentThread => self.context.thread_id.clone(),
             AgentStartTarget::SameCapsuleThread { thread_id }
@@ -2718,6 +4692,25 @@ impl AgentActionToolHandler {
                 "Agent target is unavailable for the current execution",
             ));
         }
+        // A routed user conversation owns a new work graph. Internal capsule
+        // destinations continue to use the existing child lifecycle.
+        let user_root = thread_id == child.grant.home_root_thread_id
+            && target_thread.sidebar_visibility
+                == pioneer_protocol::ThreadSidebarVisibility::Visible
+            && processor
+                .crud_store
+                .get_task_thread_lineage(&thread_id)
+                .await
+                .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?
+                .is_none();
+        let current_independent_root =
+            user_root && child.grant.home_root_thread_id != parent_facts.home_root_thread_id;
+        let independent_root = child.grant.independent_root;
+        if independent_root != current_independent_root {
+            return Err(ToolError::execution_failed(
+                "Agent target placement changed before commit",
+            ));
+        }
         processor
             .ensure_thread_loaded(thread_id.as_str(), self.context.workspace_id.as_str())
             .await
@@ -2725,49 +4718,7 @@ impl AgentActionToolHandler {
                 ToolError::execution_failed(format!("failed to load Agent target: {error:#}"))
             })?;
 
-        let execution_backend = match &child.grant.profile.backend {
-            pioneer_protocol::AgentExecutionProfileBackend::ApiProvider => {
-                Some(pioneer_protocol::AgentExecutionBackend::ApiProvider {
-                    provider: child.grant.profile.provider_id.clone(),
-                })
-            }
-            pioneer_protocol::AgentExecutionProfileBackend::AcpAgentRuntime { runtime_id } => {
-                Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime {
-                    runtime_id: runtime_id.clone(),
-                })
-            }
-            pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
-                runtime_instance_id,
-            } => {
-                let runtime = processor
-                    .load_cli_runtime_instances()
-                    .map_err(|error| {
-                        ToolError::execution_failed(format!(
-                            "failed to resolve CLI runtime selection: {error:#}"
-                        ))
-                    })?
-                    .into_iter()
-                    .find(|runtime| runtime.id == *runtime_instance_id && runtime.enabled)
-                    .ok_or_else(|| {
-                        ToolError::execution_failed("selected CLI runtime is no longer available")
-                    })?;
-                let runtime_kind = match runtime.kind {
-                    pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => {
-                        pioneer_protocol::CLIAgentRuntimeKind::Codex
-                    }
-                    pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
-                        pioneer_protocol::CLIAgentRuntimeKind::Claude
-                    }
-                    pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode => {
-                        pioneer_protocol::CLIAgentRuntimeKind::OpenCode
-                    }
-                };
-                Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime {
-                    runtime_id: runtime_instance_id.clone(),
-                    runtime_kind,
-                })
-            }
-        };
+        let execution_backend = execution_backend_for_profile(&processor, &child.grant.profile)?;
         let permission_profile = pioneer_protocol::resolve_turn_permission_profile(
             start.launch.execution.permission_profile.as_ref(),
         );
@@ -2874,7 +4825,7 @@ impl AgentActionToolHandler {
         .then(|| {
             processor
                 .provider_registry
-                .authority_fingerprint_for_workspace(
+                .available_authority_fingerprint_for_workspace(
                     self.context.workspace_id.as_str(),
                     child.grant.profile.provider_id.as_str(),
                 )
@@ -2936,6 +4887,41 @@ impl AgentActionToolHandler {
                     "child Agent policy generation is unavailable: {error:#}"
                 ))
             })?;
+        if independent_root {
+            let request = crate::authorization::ExecutionAdmissionRequest::for_turn(
+                crate::authorization::ExecutionAdmissionEntryPoint::AgentTurnStart,
+                crate::authorization::ResourceAction::AgentTurnStart,
+                Vec::new(),
+                &self.context.workspace_id,
+                &child.grant.home_root_thread_id,
+                &child.grant.profile.provider_id,
+                &child.grant.profile.model_id,
+                &params,
+                &params.capabilities,
+                provider_authority
+                    .as_ref()
+                    .map(|value| value.as_str().to_owned()),
+            )
+            .map_err(|_| ToolError::execution_failed("agent_action_not_allowed"))?;
+            let principal = child_authority
+                .revalidate_new_root_launch(
+                    processor.crud_store.as_ref(),
+                    &request,
+                    &permission_profile,
+                    authorization_revision,
+                )
+                .await
+                .map_err(|_| ToolError::execution_failed("agent_action_not_allowed"))?;
+            parent_authority
+                .revalidate_root_for_collaborator(
+                    processor.crud_store.as_ref(),
+                    &principal,
+                    crate::authorization::ResourceAction::AgentTurnStart,
+                    authorization_revision,
+                )
+                .await
+                .map_err(|_| ToolError::execution_failed("agent_action_not_allowed"))?;
+        }
         let child_authority_revalidation = processor
             .execution_leases
             .revalidate_context(
@@ -2999,12 +4985,18 @@ impl AgentActionToolHandler {
             i64::try_from(child.grant.identity.source_revision).map_err(|_| {
                 ToolError::execution_failed("child identity revision exceeds persistence bounds")
             })?;
-        let execution_generation = i64::try_from(parent_facts.execution_generation)
-            .ok()
-            .and_then(|generation| generation.checked_add(1))
-            .ok_or_else(|| {
-                ToolError::execution_failed("child execution generation exceeds persistence bounds")
-            })?;
+        let execution_generation = if independent_root {
+            1
+        } else {
+            i64::try_from(parent_facts.execution_generation)
+                .ok()
+                .and_then(|generation| generation.checked_add(1))
+                .ok_or_else(|| {
+                    ToolError::execution_failed(
+                        "child execution generation exceeds persistence bounds",
+                    )
+                })?
+        };
         let (child_adapter, child_options, child_capabilities) =
             crate::authorization::materialize_child_agent_action_binding(
                 &child.grant,
@@ -3074,8 +5066,11 @@ impl AgentActionToolHandler {
         let agent_authorization_fingerprint = child.grant.envelope.fingerprint.clone();
         let execution_id = child.grant.execution_id.clone();
         let child_grant_json = serde_json::json!({
-            "kind": "agent_child",
-            "parent_execution_id": parent_facts.execution_id.clone(),
+            "kind": if independent_root { "root_turn" } else { "agent_child" },
+            "turn_id": turn_id.clone(),
+            "source_execution_id": parent_facts.execution_id.clone(),
+            "source_action_id": plan.projection.action_id.clone(),
+            "parent_execution_id": (!independent_root).then(|| parent_facts.execution_id.clone()),
             "execution_id": execution_id.clone(),
             "root_execution_id": child.grant.root_execution_id.clone(),
             "home_root_thread_id": child.grant.home_root_thread_id.clone(),
@@ -3097,7 +5092,7 @@ impl AgentActionToolHandler {
                 "failed to fingerprint child launch grant: {error:#}"
             ))
         })?;
-        let graph = pioneer_crud::AgentExecutionGraphCommitInput {
+        let mut graph = pioneer_crud::AgentExecutionGraphCommitInput {
             identity: pioneer_crud::AgentIdentityInput {
                 id: child.grant.identity.id.as_str().to_owned(),
                 workspace_id: self.context.workspace_id.clone(),
@@ -3126,7 +5121,8 @@ impl AgentActionToolHandler {
                 agent_identity_id: child.grant.identity.id.as_str().to_owned(),
                 identity_source_revision: source_revision,
                 identity_source_fingerprint: child.grant.identity.source_fingerprint.clone(),
-                parent_execution_id: Some(parent_facts.execution_id.as_str().to_owned()),
+                parent_execution_id: (!independent_root)
+                    .then(|| parent_facts.execution_id.as_str().to_owned()),
                 parent_task_id: None,
                 parent_thread_id: Some(thread_id.clone()),
                 home_root_thread_id: child.grant.home_root_thread_id.clone(),
@@ -3156,7 +5152,7 @@ impl AgentActionToolHandler {
                 id: resource.resource_state_id.clone(),
                 execution_id: execution_id.as_str().to_owned(),
                 attempt_generation: resource.attempt_generation,
-                branch_key: resource.branch_key.clone(),
+                branch_key: child.grant.branch_key.clone(),
                 fair_order: resource.fair_order,
                 now: now.clone(),
             },
@@ -3166,7 +5162,8 @@ impl AgentActionToolHandler {
                     &format!("agent-start-grant\0{execution_id}"),
                 ),
                 execution_id: execution_id.as_str().to_owned(),
-                parent_execution_id: Some(parent_facts.execution_id.as_str().to_owned()),
+                parent_execution_id: (!independent_root)
+                    .then(|| parent_facts.execution_id.as_str().to_owned()),
                 child_identity_id: child.grant.identity.id.as_str().to_owned(),
                 grant_fingerprint: child_grant_fingerprint,
                 grant_json: child_grant_json,
@@ -3199,6 +5196,9 @@ impl AgentActionToolHandler {
             task_occurrence_contract: None,
             contract_now: now.timestamp(),
         };
+        if independent_root {
+            graph.root_execution = Some(graph.child_execution.clone());
+        }
         let mut outbox_payload: serde_json::Value =
             serde_json::from_str(plan.input.outbox_payload_json.as_str()).map_err(|error| {
                 ToolError::internal(format!("invalid planned action outbox payload: {error}"))
@@ -3206,6 +5206,10 @@ impl AgentActionToolHandler {
         let outbox_object = outbox_payload
             .as_object_mut()
             .ok_or_else(|| ToolError::internal("planned action outbox payload is not an object"))?;
+        outbox_object.insert(
+            "launch_request_fingerprint".to_owned(),
+            serde_json::Value::String(tool_launch_request_fingerprint(&requested_launch)?),
+        );
         outbox_object.insert(
             "dispatch".to_owned(),
             serde_json::json!({
@@ -3236,17 +5240,35 @@ impl AgentActionToolHandler {
         // durable commit. Every fallible identity, authority, presentation,
         // graph and outbox preparation step above therefore leaves no phantom
         // child Turn behind when it fails.
-        let outcome = processor
-            .thread_manager
-            .concurrent_agent_turn_start_with_permission_profile(
-                params.clone(),
-                permission_profile,
-                child.authored_turn.author.clone(),
-            )
-            .await
-            .map_err(|error| {
-                ToolError::execution_failed(format!("failed to prepare child Agent: {error:#}"))
-            })?;
+        let outcome = if user_root {
+            processor
+                .thread_manager
+                .agent_turn_start_with_permission_profile(
+                    params.clone(),
+                    permission_profile,
+                    child.authored_turn.author.clone(),
+                )
+                .await
+        } else {
+            processor
+                .thread_manager
+                .concurrent_agent_turn_start_with_permission_profile(
+                    params.clone(),
+                    permission_profile,
+                    child.authored_turn.author.clone(),
+                )
+                .await
+        }
+        .map_err(|error| {
+            if error
+                .downcast_ref::<crate::thread::ForegroundTurnConflict>()
+                .is_some()
+            {
+                ToolError::execution_failed(AgentPublicOutcome::AgentActionConflict.as_str())
+            } else {
+                ToolError::execution_failed(format!("failed to prepare Agent: {error:#}"))
+            }
+        })?;
         let graph_result = match processor
             .crud_store
             .materialize_agent_turn_start_with_graph_and_action(
@@ -3254,7 +5276,10 @@ impl AgentActionToolHandler {
                 outcome.materialization.sandbox_mode,
                 &outcome.materialization.turn,
                 &outcome.materialization.input,
-                None,
+                params
+                    .reasoning
+                    .as_ref()
+                    .map(|reasoning| reasoning.effort.as_str()),
                 child.authored_turn.author.actor.clone(),
                 audit_event,
                 authority_json.as_str(),
@@ -3292,6 +5317,18 @@ impl AgentActionToolHandler {
                 )));
             }
         };
+        let sidebar_visible = outcome.materialization.thread.sidebar_visibility
+            == pioneer_protocol::ThreadSidebarVisibility::Visible;
+        if sidebar_visible {
+            processor.dirty_push(
+                &outcome.started_notification.workspace_id,
+                Some(&outcome.started_notification.thread_id),
+                None,
+                None,
+                false,
+                None,
+            );
+        }
         plan.projection.queued = graph_result.queued;
         processor
             .register_execution_lease(turn_id.as_str())
@@ -3326,9 +5363,14 @@ impl AgentActionToolHandler {
                 outcome.started_notification_connection_ids.clone(),
             )
             .await;
-        processor
-            .notify_thread_tree_changed(self.context.workspace_id.clone())
-            .await;
+        if sidebar_visible {
+            processor
+                .notify_thread_unread_legacy(
+                    &self.context.workspace_id,
+                    &outcome.started_notification.thread_id,
+                )
+                .await;
+        }
         let safe = BoundAgentActionAdapter::safe_result(&plan.projection);
         let payload = serde_json::to_value(&safe).map_err(|error| {
             ToolError::internal(format!("failed to encode agent result: {error}"))
@@ -3355,6 +5397,24 @@ impl AgentActionToolHandler {
         let processor = self.processor.upgrade().ok_or_else(|| {
             ToolError::execution_failed("message processor is no longer available")
         })?;
+        let create_action = match audience {
+            pioneer_protocol::AgentThreadAudienceTemplate::HomeCapsule => {
+                crate::authorization::ResourceAction::ThreadCreatePrivate
+            }
+            pioneer_protocol::AgentThreadAudienceTemplate::RootDelegation => {
+                crate::authorization::ResourceAction::ThreadCreateWorkspace
+            }
+        };
+        processor
+            .revalidate_tool_execution_authorization(
+                &self.context.workspace_id,
+                &self.context.thread_id,
+                &self.context.turn_id,
+                None,
+                create_action,
+            )
+            .await
+            .map_err(|_| ToolError::execution_failed("agent_action_not_allowed"))?;
         let source_thread = processor
             .crud_store
             .get_thread_model(self.context.thread_id.as_str())
@@ -3447,6 +5507,17 @@ impl AgentActionToolHandler {
         } else {
             None
         };
+        let runtime = processor
+            .crud_store
+            .get_turn_runtime_snapshot(&self.context.turn_id)
+            .await
+            .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?
+            .ok_or_else(|| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+        if runtime.model != facts.profile.model_id
+            || runtime.provider_name != facts.profile.provider_id
+        {
+            return Err(ToolError::execution_failed("agent_runtime_integrity_lost"));
+        }
         let thread = pioneer_protocol::Thread {
             workspace_id: self.context.workspace_id.clone(),
             id: thread_id.clone(),
@@ -3454,9 +5525,9 @@ impl AgentActionToolHandler {
             preview: String::new(),
             preview_author: None,
             mode: ThreadMode::Message,
-            model: source_thread.model,
-            model_provider: source_thread.model_provider,
-            reasoning_effort: source_thread.reasoning_effort,
+            model: facts.profile.model_id.clone(),
+            model_provider: facts.profile.provider_id.clone(),
+            reasoning_effort: runtime.reasoning_effort,
             created_at: now.timestamp(),
             updated_at: now.timestamp(),
             status: pioneer_protocol::ThreadStatus::Idle,
@@ -3571,7 +5642,7 @@ impl AgentActionToolHandler {
             );
         }
         plan.input.outbox_payload_json = outbox_payload.to_string();
-        let safe = BoundAgentActionAdapter::safe_result(&plan.projection);
+        let mut safe = BoundAgentActionAdapter::safe_result(&plan.projection);
         processor
             .crud_store
             .commit_agent_thread_creation_with_action(
@@ -3619,9 +5690,20 @@ impl AgentActionToolHandler {
             .await;
         Self::mark_outbox_delivered(processor.as_ref(), plan.projection.outbox_id.as_str()).await;
 
-        let payload = serde_json::to_value(&safe).map_err(|error| {
-            ToolError::internal(format!("failed to encode agent result: {error}"))
-        })?;
+        let mut binding = processor
+            .agent_action_binding(&self.context.turn_id)
+            .await
+            .ok_or_else(|| ToolError::execution_failed("agent_execution_stale"))?;
+        binding
+            .refresh_start_options_catalog(&processor, &self.context.turn_id)
+            .await
+            .map_err(|_| ToolError::execution_failed("agent_execution_stale"))?;
+        safe.target_options = binding.options.target_options.clone();
+        let payload = serde_json::to_value(&safe)
+            .map_err(|_| ToolError::internal("agent_runtime_integrity_lost"))?;
+        processor
+            .register_agent_action_binding(self.context.turn_id.clone(), binding)
+            .await;
         Ok(Box::new(FunctionToolOutput::with_payload(
             "agent Thread committed",
             true,
@@ -3718,6 +5800,18 @@ impl AgentActionToolHandler {
             .map_err(|error| {
                 ToolError::execution_failed(format!("failed to commit agent message: {error:#}"))
             })?;
+        let sidebar_visible = outcome.materialization.thread.sidebar_visibility
+            == pioneer_protocol::ThreadSidebarVisibility::Visible;
+        if sidebar_visible {
+            processor.dirty_push(
+                &outcome.completed_notification.workspace_id,
+                Some(&thread_id),
+                None,
+                None,
+                false,
+                None,
+            );
+        }
         if let Err(_error) = processor
             .thread_manager
             .commit_completed_message_turn(&outcome)
@@ -3752,9 +5846,14 @@ impl AgentActionToolHandler {
                 outcome.completed_notification.turn.id.as_str(),
             )
             .await;
-        processor
-            .notify_thread_tree_changed(outcome.completed_notification.workspace_id)
-            .await;
+        if sidebar_visible {
+            processor
+                .notify_thread_unread_legacy(
+                    &outcome.completed_notification.workspace_id,
+                    &thread_id,
+                )
+                .await;
+        }
         Self::mark_outbox_delivered(processor.as_ref(), plan.projection.outbox_id.as_str()).await;
 
         let payload = serde_json::to_value(&safe).map_err(|error| {
@@ -3920,8 +6019,11 @@ pub(crate) fn sanitize_agent_tool_error(error: ToolError) -> ToolError {
     match error {
         // This exact public code is assigned at decoding boundaries. Unknown
         // InvalidArguments also include semantic failures after decoding.
-        ToolError::InvalidArguments(message) if message == "agent_invalid_arguments" => {
-            ToolError::invalid_arguments("agent_invalid_arguments")
+        ToolError::InvalidArguments(message)
+            if message == "agent_invalid_arguments"
+                || message == "agent_catalog_cursor_invalid_or_stale_restart" =>
+        {
+            ToolError::invalid_arguments(message)
         }
         ToolError::InvalidArguments(message) => ToolError::invalid_arguments(
             stable_outcome(message.as_str())
@@ -3954,6 +6056,7 @@ fn denied_output(outcome: AgentPublicOutcome, message: &str) -> Box<dyn ToolOutp
         receipt_id: None,
         outbox_id: None,
         public_message: Some(message.to_owned()),
+        target_options: Vec::new(),
     };
     let payload = serde_json::to_value(safe).expect("safe agent result serializes");
     Box::new(FunctionToolOutput::with_payload(message, false, payload))
@@ -4053,6 +6156,14 @@ mod tests {
             direct_decode.to_string(),
             "invalid arguments: agent_invalid_arguments"
         );
+        let restart = sanitize_agent_tool_error(ToolError::invalid_arguments(
+            "agent_catalog_cursor_invalid_or_stale_restart",
+        ));
+        assert!(
+            restart
+                .to_string()
+                .contains("agent_catalog_cursor_invalid_or_stale_restart")
+        );
         let denied = sanitize_agent_tool_error(adapter_tool_error(AgentToolAdapterError::Action(
             crate::authorization::AgentActionServiceError::NotAuthorized("hidden policy detail"),
         )));
@@ -4113,11 +6224,9 @@ mod tests {
     fn current_catalog_can_only_narrow_an_immutable_child_launch_ceiling() {
         let granted_identity = identity("A12345678901234567890", 1);
         let granted_profile = profile("P12345678901234567890", &granted_identity);
-        let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(
-            vec![granted_identity.clone()],
-            vec![granted_profile.clone()],
-        )
-        .unwrap();
+        let ceiling =
+            pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![granted_identity.clone()])
+                .unwrap();
         let added_identity = identity("A12345678901234567891", 1);
         let added_profile = profile("P12345678901234567891", &added_identity);
         let (identities, profiles) = intersect_child_launch_ceiling(
@@ -4130,6 +6239,92 @@ mod tests {
 
         let (identities, profiles) =
             intersect_child_launch_ceiling(&ceiling, &[identity("A12345678901234567890", 2)], &[]);
+        assert_eq!(identities, vec![identity("A12345678901234567890", 2)]);
+        assert!(profiles.is_empty());
+    }
+
+    #[test]
+    fn large_identity_boundary_excludes_new_sources_without_pinning_model_metadata() {
+        let granted_identities = (0..140)
+            .map(|n| identity(&format!("A{n:020}"), 1))
+            .collect::<Vec<_>>();
+        let granted_profiles = (0..300)
+            .map(|n| profile(&format!("P{n:020}"), &granted_identities[n % 140]))
+            .collect::<Vec<_>>();
+        let ceiling =
+            pioneer_protocol::ChildAgentLaunchGrantSet::new(granted_identities.clone()).unwrap();
+        let restored: pioneer_protocol::ChildAgentLaunchGrantSet =
+            serde_json::from_str(&serde_json::to_string(&ceiling).unwrap()).unwrap();
+        restored.validate().unwrap();
+        let mut current_identities = granted_identities.clone();
+        let extra = identity("Z12345678901234567890", 1);
+        let mut current_profiles = granted_profiles.clone();
+        current_profiles.push(profile("Z12345678901234567891", &extra));
+        current_identities.push(extra);
+        let (identities, profiles) =
+            intersect_child_launch_ceiling(&restored, &current_identities, &current_profiles);
+        assert_eq!(identities, granted_identities);
+        assert_eq!(profiles, granted_profiles);
+        let options = pioneer_protocol::AgentStartOptionsProjection {
+            agents: identities,
+            profiles,
+            inherit_parent_agent_available: false,
+            derived_ephemeral_available: false,
+            inherit_parent_profile_available: false,
+            allowed_skill_ids: Vec::new(),
+            allowed_mcp_server_ids: Vec::new(),
+            max_permission_profile: restored.max_permission_profile.clone(),
+            generation_fingerprint: "saved".into(),
+        };
+        let mut selection = pioneer_protocol::AgentLaunchSelection {
+            agent: pioneer_protocol::AgentIdentitySelection::Exact {
+                agent_identity_id: granted_identities[299 % 140].id.clone(),
+            },
+            execution: pioneer_protocol::AgentExecutionSelection {
+                profile: pioneer_protocol::AgentExecutionProfileSelection::Exact {
+                    profile_id: granted_profiles[299].id.clone(),
+                },
+                reasoning: None,
+                permission_profile: None,
+                skill_ids: Vec::new(),
+                mcp_server_ids: Vec::new(),
+                selected_capabilities: Vec::new(),
+            },
+        };
+        assert!(
+            crate::authorization::resolve_agent_launch_selection(&selection, &options, None, None)
+                .is_ok()
+        );
+        selection.execution.profile = pioneer_protocol::AgentExecutionProfileSelection::Exact {
+            profile_id: pioneer_protocol::AgentExecutionProfileId::new("Z12345678901234567891")
+                .unwrap(),
+        };
+        assert!(
+            crate::authorization::resolve_agent_launch_selection(&selection, &options, None, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn current_models_do_not_widen_the_saved_identity_boundary() {
+        let granted_identity = identity("A12345678901234567890", 1);
+        let ceiling =
+            pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![granted_identity.clone()])
+                .unwrap();
+        let current_identity = identity("A12345678901234567890", 8);
+        let mut later_model = profile("P12345678901234567890", &current_identity);
+        later_model.model_id = "added-later".to_owned();
+        let (identities, profiles) = intersect_child_launch_ceiling(
+            &ceiling,
+            &[current_identity.clone()],
+            &[later_model.clone()],
+        );
+        assert_eq!(identities, vec![current_identity.clone()]);
+        assert_eq!(profiles, vec![later_model.clone()]);
+        let mut replaced = current_identity;
+        replaced.source_kind = pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance;
+        let (identities, profiles) =
+            intersect_child_launch_ceiling(&ceiling, &[replaced], &[later_model]);
         assert!(identities.is_empty());
         assert!(profiles.is_empty());
     }

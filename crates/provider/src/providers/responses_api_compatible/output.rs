@@ -23,6 +23,7 @@ struct Item {
     raw_bytes: usize,
     phase: Option<Option<AgentMessagePhase>>,
     phase_resolved: bool,
+    provisional: bool,
     done: bool,
     parts: BTreeMap<usize, Part>,
     summary: BTreeMap<usize, Part>,
@@ -50,6 +51,7 @@ pub(super) struct Reducer {
     parallel: Option<bool>,
     allowed_tools: Option<std::collections::BTreeSet<String>>,
     choice: Option<crate::ToolChoice>,
+    provisional_messages: bool,
 }
 impl Reducer {
     pub(super) fn new(
@@ -75,7 +77,12 @@ impl Reducer {
             parallel,
             allowed_tools: None,
             choice: None,
+            provisional_messages: false,
         }
+    }
+    pub(super) fn with_provisional_messages(mut self, enabled: bool) -> Self {
+        self.provisional_messages = enabled;
+        self
     }
     pub(super) fn bind_request(&mut self, request: &crate::ChatRequest) {
         self.allowed_tools = Some(
@@ -466,7 +473,7 @@ impl Reducer {
                 if blocked {
                     continue;
                 }
-                if !item.phase_resolved {
+                if !item.phase_resolved && !self.provisional_messages {
                     blocked = true;
                     continue;
                 }
@@ -486,18 +493,37 @@ impl Reducer {
                     chunks.push(chunk);
                 };
                 if !item.started {
-                    emit(Boundary::Start, String::new());
+                    item.provisional = !item.phase_resolved;
+                    emit(
+                        if item.provisional {
+                            Boundary::StartProvisional
+                        } else {
+                            Boundary::Start
+                        },
+                        String::new(),
+                    );
                     item.started = true;
+                } else if item.provisional && item.phase_resolved {
+                    emit(Boundary::Resolve, String::new());
+                    item.provisional = false;
                 }
                 let delta = Self::ordered_delta(&mut item.parts);
                 if !delta.is_empty() {
                     emit(Boundary::Delta, delta);
                 }
-                if item.done && !item.ended {
+                if item.done && item.phase_resolved && !item.ended {
                     emit(Boundary::End, String::new());
                     item.ended = true;
                 }
-                blocked |= !item.ended;
+                // Wire order and semantic resolution are different gates. A
+                // sealed provisional item must not stall later real text while
+                // its phase still waits for the terminal snapshot. The collector
+                // keeps the accepted result cursor behind unresolved messages.
+                blocked |= if self.provisional_messages {
+                    !item.done
+                } else {
+                    !item.ended
+                };
             } else if item.raw["type"] == "reasoning" {
                 if reasoning_blocked {
                     continue;

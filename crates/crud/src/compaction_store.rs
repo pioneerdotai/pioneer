@@ -14,6 +14,20 @@ use pioneer_compaction::runner::RunnerState;
 use pioneer_compaction::{Checkpoint, ModelBudget, OperationSnapshot, SourceRef};
 
 impl CrudStore {
+    /// Canonical ownership and disclosure metadata, independent of full result
+    /// payload size. Every canonical tool item is visible in timeline projection;
+    /// non-tool/hidden system records are excluded in the repository query.
+    pub async fn tool_result_access_source(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        item: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        repositories::compaction::tool_result_access_source(self, workspace, thread, turn, item)
+            .await
+    }
+
     /// One restart-safe, payload-free page of legacy history preparation.
     /// Dropping the caller cancels work; a later caller resumes its durable cursor.
     pub async fn compaction_prepare_history_quantum(
@@ -661,6 +675,55 @@ impl CrudStore {
     pub async fn compaction_history_check_is_current(&self, turn: &str) -> Result<bool> {
         repositories::compaction::background::compaction_history_check_is_current(
             &self.connection,
+            turn,
+            None,
+        )
+        .await
+    }
+    pub async fn compaction_history_check_revision_is_current(
+        &self,
+        turn: &str,
+        revision: i64,
+    ) -> Result<bool> {
+        repositories::compaction::background::compaction_history_check_is_current(
+            &self.connection,
+            turn,
+            Some(revision),
+        )
+        .await
+    }
+    pub async fn compaction_root_history_activity(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+    ) -> Result<Option<i64>> {
+        repositories::compaction::background::root_history_activity(
+            &self.connection,
+            workspace,
+            thread,
+            turn,
+        )
+        .await
+    }
+    pub async fn compaction_root_history_busy(
+        &self,
+        workspace: &str,
+        thread: &str,
+    ) -> Result<bool> {
+        repositories::compaction::background::root_history_busy(&self.connection, workspace, thread)
+            .await
+    }
+    pub async fn compaction_root_for_execution(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+    ) -> Result<Option<String>> {
+        repositories::compaction::background::root_for_history_execution(
+            &self.connection,
+            workspace,
+            thread,
             turn,
         )
         .await

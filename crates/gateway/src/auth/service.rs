@@ -3766,6 +3766,7 @@ mod tests {
         // no database capacity survives into the outbound acknowledgement.
         let transaction = service.database.begin().await.unwrap();
         let mut deferred = std::collections::VecDeque::new();
+        let outbound = crate::session::SessionOutbound::from(outbound);
         let processing = crate::transport::process_with_access_renewals(
             async {
                 admitted_rx.await.unwrap();

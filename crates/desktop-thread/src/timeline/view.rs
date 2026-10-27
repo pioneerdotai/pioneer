@@ -449,7 +449,7 @@ impl TimelineView {
             .h_full()
             .relative()
             .overflow_hidden()
-            .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, window, cx| {
+            .on_scroll(cx.listener(|view, event: &ScrollEvent, window, cx| {
                 super::controller::DesktopTimelineController::dispatch(view, &super::controller::TimelineAction::Scroll { delta_y: event.delta.pixel_delta(window.line_height()).y }, window, cx);
             }))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| { if event.pressed_button == Some(MouseButton::Left) { super::controller::DesktopTimelineController::schedule(view, window, cx); } }))

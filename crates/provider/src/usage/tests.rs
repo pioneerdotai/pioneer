@@ -358,6 +358,7 @@ fn billing_context(
         ),
         attempt: "physical-attempt".into(),
         catalog: Some(catalog),
+        native: None,
     }
 }
 fn billing_usage() -> TokenUsage {
@@ -620,5 +621,71 @@ fn responses_pricing_keeps_route_and_model_guards_for_both_catalog_api_names() {
             usage.accounting.unwrap()["pricing_eligibility"]["eligible"],
             false
         );
+    }
+}
+
+#[test]
+fn vercel_responses_fixed_tariff_is_estimated_but_conditional_tariffs_are_not() {
+    let base = "https://ai-gateway.vercel.sh/v1";
+    for pricing in [
+        json!({"input":"0.000002","output":"0.000006"}),
+        json!({"input":"0.000002","output":"0.000006","varies_by_provider":true}),
+        json!({"input":"0.000002","output":"0.000006","input_tiers":[{"threshold":1000,"price":"0.000004"}]}),
+    ] {
+        let raw = json!({"id":"fixture/priced","type":"language","tags":["tool-use"],"modalities":{"input":["text"],"output":["text"]},"pricing":pricing});
+        let normalized = crate::catalog::generator::vercel_model(&raw).unwrap();
+        let mut entry = serde_json::to_value(normalized).unwrap();
+        entry["pricingEvidenceVersion"] = json!(1);
+        entry["pricingUnits"] = json!("USD_per_million_tokens");
+        let catalog = crate::catalog::ModelCatalog::parse(
+            &json!({"vercel-ai-gateway":{"fixture/priced":entry}}).to_string(),
+            &json!({"vercel-ai-gateway":{"fixture/priced":{"contextWindow":{"kind":"fallback","expression":"fixture"},"maxTokens":{"kind":"fallback","expression":"fixture"}}}}).to_string(),
+        ).unwrap();
+        let usage = TokenUsage {
+            api: Some("responses".into()),
+            route: route(base, "/responses"),
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cache_read_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            ..Default::default()
+        };
+        let evidence = accounting(
+            &usage,
+            "vercel-ai-gateway",
+            "fixture/priced",
+            Some(&catalog),
+        );
+        assert_eq!(evidence["pricing"]["source"]["raw"], pricing);
+        if pricing.as_object().unwrap().len() == 2 {
+            assert!(
+                (evidence["estimated_cost"]["amount"].as_f64().unwrap() - 0.00032).abs() < 1e-10
+            );
+            let mut partial = usage.clone();
+            partial.output_tokens = None;
+            assert!(
+                accounting(
+                    &partial,
+                    "vercel-ai-gateway",
+                    "fixture/priced",
+                    Some(&catalog)
+                )["estimated_cost"]
+                    .is_null()
+            );
+            let mut foreign = usage;
+            foreign.route = route("https://private.example/v1", "/responses");
+            assert!(
+                accounting(
+                    &foreign,
+                    "vercel-ai-gateway",
+                    "fixture/priced",
+                    Some(&catalog)
+                )["estimated_cost"]
+                    .is_null()
+            );
+        } else {
+            assert!(evidence["estimated_cost"].is_null());
+            assert_eq!(evidence["price_status"], "unknown_or_conditional_price");
+        }
     }
 }

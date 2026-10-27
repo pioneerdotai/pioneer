@@ -2168,6 +2168,7 @@ impl MessageProcessor {
     }
 
     pub(super) async fn notify_thread_tree_changed(&self, workspace_id: String) {
+        self.dirty_push(&workspace_id, None, None, None, true, None);
         let notification = ThreadTreeChangedNotification { workspace_id };
         self.send_notification_to_workspace_connections(
             notification.workspace_id.as_str(),

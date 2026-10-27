@@ -61,6 +61,27 @@ pub trait Provider: Send + Sync {
         ProviderCapabilities::default()
     }
 
+    /// Prepare connection-owned model facts before selecting tools or admitting input.
+    /// The default does no work; providers with lazy discovery own its caching.
+    /// Callers must keep this future within their cancellation/deadline scope.
+    async fn prepare_model(&self, _model: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Budget facts for the selected connection, including discovered private
+    /// models. Public providers retain the existing catalog resolution.
+    async fn model_limits(&self, model: &str) -> Result<crate::catalog::CatalogLimits> {
+        Ok(crate::catalog::model_catalog()?.limits(self.name(), model))
+    }
+
+    /// Optional authority-owned model facts, including usage accounting evidence.
+    /// When present, the owning provider also decides `model_tool_calling`;
+    /// wrappers must not substitute public facts for that model decision.
+    /// These facts must never be published into the process-wide public catalog.
+    fn model_catalog_entry(&self, _model: &str) -> Option<crate::catalog::CatalogModel> {
+        None
+    }
+
     /// Adapter capability is a protocol ceiling; known catalog model support
     /// can narrow it. Absence remains unknown, not evidence for every model.
     fn model_tool_calling(&self, model: &str) -> bool {
@@ -226,6 +247,28 @@ mod tests {
         let provider = MockProvider;
         let error = anyhow::anyhow!("opaque provider rejection");
         assert!(provider.classify_failure(&error).is_none());
+    }
+
+    #[tokio::test]
+    async fn mock_provider_chat() {
+        let provider = MockProvider;
+        // Default preparation must not require a catalog entry or discovery.
+        provider.prepare_model("test-model").await.unwrap();
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage::user("hello")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+
+        let response = provider.chat(request).await.unwrap();
+        assert_eq!(response.text, "mock response");
+        assert_eq!(response.usage.as_ref().unwrap().input_tokens, Some(10));
     }
 
     #[tokio::test]

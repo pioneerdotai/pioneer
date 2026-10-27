@@ -434,25 +434,34 @@ impl MessageProcessor {
         }
         // Activity changes use the existing authorized tree invalidation path.
         // Progress/heartbeat/streaming deltas deliberately do not enter it.
-        if task_event_changes_tree_activity(&event.payload)
-            && pioneer_crud::resolve_task_authorization_scope(
+        if task_event_changes_tree_activity(&event.payload) {
+            if let Some(root) = pioneer_crud::resolve_task_authorization_scope(
                 &self.crud_store.database_connection(),
                 &task_response.task.id,
                 Some(&task_response.task.workspace_id),
                 None,
             )
             .await?
-            .is_some_and(|scope| scope.root_thread_id.is_some())
-        {
-            self.send_notification_to_task_workspace_connections(
-                task_response.task.id.as_str(),
-                task_response.task.workspace_id.as_str(),
-                events::THREAD_TREE_CHANGED,
-                &ThreadTreeChangedNotification {
-                    workspace_id: task_response.task.workspace_id.clone(),
-                },
-            )
-            .await;
+            .and_then(|scope| scope.root_thread_id)
+            {
+                self.dirty_push(
+                    &task_response.task.workspace_id,
+                    None,
+                    Some(&root),
+                    None,
+                    false,
+                    None,
+                );
+                self.send_notification_to_task_workspace_connections(
+                    &task_response.task.id,
+                    &task_response.task.workspace_id,
+                    events::THREAD_TREE_CHANGED,
+                    &ThreadTreeChangedNotification {
+                        workspace_id: task_response.task.workspace_id.clone(),
+                    },
+                )
+                .await;
+            }
         }
         if matches!(event.payload, TaskEventPayload::RunStarting { .. }) {
             // The dispatch claim has no conversation/timeline side effects.
@@ -498,6 +507,32 @@ impl MessageProcessor {
                 | TaskEventPayload::TaskThreadLineageCreated { .. }
                 | TaskEventPayload::ChildThreadLinked { .. }
         ) {
+            let changes_inbox =
+                !matches!(
+                    &event.payload,
+                    TaskEventPayload::RunStarted { .. } | TaskEventPayload::TaskResumed { .. }
+                        // Task terminal projections change lifecycle only. Each
+                        // changed run has its own durable Run terminal event;
+                        // direct task terminal/cancel does not rewrite historical
+                        // run cards. Metadata/root/access events below still reset.
+                        | TaskEventPayload::TaskCompleted { .. }
+                        | TaskEventPayload::TaskFailed { .. }
+                        | TaskEventPayload::TaskBlocked { .. }
+                        | TaskEventPayload::TaskCancelled { .. }
+                ) && (!matches!(&event.payload, TaskEventPayload::RunCreated { .. })
+                    || task_response
+                        .run
+                        .as_ref()
+                        .is_some_and(|run| run.status.is_terminal()));
+            if changes_inbox {
+                if let Some(run_id) = context.run_id.as_deref() {
+                    self.dirty_push(&workspace_id, None, None, Some(run_id), false, None);
+                } else {
+                    // Task metadata/root/lineage may affect several historical
+                    // unread runs; a latest-only lookup is insufficient.
+                    self.dirty_push_inbox(&workspace_id, None, None);
+                }
+            }
             self.send_notification_to_task_workspace_connections(
                 &notification_task_id,
                 &workspace_id,
@@ -1573,6 +1608,9 @@ async fn task_delivery_child_lineage(
 }
 
 fn task_event_changes_tree_activity(payload: &TaskEventPayload) -> bool {
+    // Active-run state owns this projection. Pure TaskCompleted/Failed/Blocked/
+    // Cancelled lifecycle mirrors do not change it; direct cancellation emits
+    // a separate event for each changed run just like terminal orchestration.
     matches!(
         payload,
         TaskEventPayload::RunStarting { .. }

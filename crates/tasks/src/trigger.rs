@@ -76,6 +76,13 @@ impl TaskTriggerCalculator {
                 let _ = tz;
                 Ok(())
             }
+            TaskTriggerSpec::External {
+                source,
+                event_type,
+                filter,
+            } if source == "webhook" && (event_type.is_some() || filter.is_some()) => {
+                bail!("webhook triggers do not accept eventType or filters")
+            }
             TaskTriggerSpec::Manual { .. } | TaskTriggerSpec::External { .. } => Ok(()),
         }
     }
@@ -533,6 +540,7 @@ mod tests {
         catch_up_policy: Option<TaskTriggerCatchUpPolicy>,
     ) -> TaskTrigger {
         TaskTrigger {
+            webhook_secret_ref: None,
             id: "cron_test".to_owned(),
             task_id: "task_test".to_owned(),
             status: TaskTriggerStatus::Active,

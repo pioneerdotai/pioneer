@@ -29,6 +29,7 @@ mod permission_handlers;
 mod provider_handlers;
 mod provider_readiness;
 mod reconciliation_diagnostics;
+mod scoped_push;
 pub(crate) mod skills;
 mod summary;
 mod task_agent_executor;
@@ -39,12 +40,19 @@ mod task_handlers;
 mod tasks;
 #[cfg(test)]
 mod tests;
+mod webhook_endpoint;
 #[cfg(test)]
 pub(crate) use tests::{test_summary_config, test_tool_loop_config};
 mod thread_agents_doc_handlers;
 mod thread_file_handlers;
 mod thread_handlers;
-mod thread_tool_results;
+mod thread_history_read;
+mod thread_launch_pages;
+mod thread_read_cursor;
+pub(crate) mod thread_read_tools;
+mod thread_result_sources;
+pub(crate) mod thread_search_tools;
+pub(crate) mod thread_tool_results;
 mod timeline_cursor;
 mod timeline_handlers;
 mod timeline_notifications;
@@ -149,10 +157,7 @@ use crate::thread_episodic::{
     ThreadEpisodicIndexExecutor, ThreadEpisodicIngestor, ThreadEpisodicRecallService,
     ThreadEpisodicRuntimeConfig,
 };
-use crate::thread_episodic_hooks::{
-    ThreadContextRecallHookConfig, ThreadEpisodicMemoryRecallProvider,
-    thread_context_recall_hook_package,
-};
+use crate::thread_episodic_hooks::ThreadEpisodicMemoryRecallProvider;
 use anyhow::Context as AnyhowContext;
 use futures_util::FutureExt;
 use pioneer_agent::MemoryLoopConfig;
@@ -164,9 +169,9 @@ use pioneer_artifacts::{
 };
 use pioneer_config::{
     GatewayArtifactsConfig, GatewayCliAgentRuntimeCommandHeartbeatConfig,
-    GatewayCommandExecutionTimeoutConfig, GatewayContextCompactionTimeoutConfig,
-    GatewayHookRecoveryConfig, GatewayProviderStreamItemTimeoutConfig,
-    GatewayThreadEpisodicVectorSearchConfig,
+    GatewayCommandExecutionTimeoutConfig, GatewayContextCompactionConfig,
+    GatewayContextCompactionTimeoutConfig, GatewayHookRecoveryConfig,
+    GatewayProviderStreamItemTimeoutConfig, GatewayThreadEpisodicVectorSearchConfig,
 };
 use pioneer_crud::{
     CliRuntimePendingRequestRecord,
@@ -221,8 +226,8 @@ use pioneer_protocol::{
     RuntimeStatus, RuntimeSummary, SkillsUploadAbortParams, SkillsUploadFinishParams,
     SkillsUploadStartParams, SystemEventLevel, TaskAcceptParams, TaskAgendaParams,
     TaskCancelParams, TaskCreateParams, TaskDeliveriesParams, TaskDelivery, TaskDeliveryAttempt,
-    TaskDeliveryMode, TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams,
-    TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
+    TaskDeliveryMode, TaskDetachParams, TaskEventsParams, TaskFinishParams, TaskGetParams,
+    TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
     TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocArchiveResponse, ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams,
     ThreadAgentsDocGetResponse, ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
@@ -424,6 +429,12 @@ where
             .with_subscriber(dispatch)
             .bind_hub(sentry::Hub::current())
     };
+    let future = pioneer_observability::work::inherit(
+        pioneer_observability::work::Boundary::MessageFreshTask,
+        pioneer_observability::work::WorkKind::Message,
+        pioneer_observability::work::ExecutorRole::Gateway,
+        future,
+    );
     AbortOnDropMessageTask::new(tokio::spawn(future))
         .join()
         .await
@@ -452,6 +463,7 @@ pub(crate) struct MessageProcessorResilienceConfig {
     pub command_execution_timeout: GatewayCommandExecutionTimeoutConfig,
     pub provider_stream_item_timeout: GatewayProviderStreamItemTimeoutConfig,
     pub context_compaction_timeout: GatewayContextCompactionTimeoutConfig,
+    pub context_compaction: GatewayContextCompactionConfig,
     pub cli_runtime_command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig,
 }
 
@@ -461,6 +473,7 @@ impl Default for MessageProcessorResilienceConfig {
             command_execution_timeout: GatewayCommandExecutionTimeoutConfig::default(),
             provider_stream_item_timeout: GatewayProviderStreamItemTimeoutConfig::default(),
             context_compaction_timeout: GatewayContextCompactionTimeoutConfig::default(),
+            context_compaction: GatewayContextCompactionConfig::default(),
             cli_runtime_command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig::default(),
         }
     }
@@ -534,19 +547,17 @@ async fn sleep_after_transient_storage_poll_failure(transient_storage_poll_faile
     true
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ThreadTitleJobState {
     Pending,
     Running,
     Succeeded,
     FailedRetriable,
     FailedNonRetriable,
-}
-
-impl ThreadTitleJobState {
-    const fn is_active(self) -> bool {
-        matches!(self, Self::Pending | Self::Running | Self::FailedRetriable)
-    }
+    // Retain the original user text only while waiting for recovery. This is
+    // not name provenance or a queue of completion triggers.
+    DeferredUntilSuccessfulTurn(Arc<str>),
+    AwaitingSuccessfulTurn(Arc<str>),
 }
 
 #[derive(Clone)]
@@ -562,6 +573,7 @@ pub struct MessageProcessor {
     agent_manager: Arc<AgentManager>,
     provider_registry: Arc<ProviderRegistry>,
     session_manager: Arc<SessionManager>,
+    push_scopes: Arc<scoped_push::PushScopes>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
     execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
     observation_governor: Arc<crate::authorization::ObservationAdmissionGovernor>,
@@ -580,6 +592,7 @@ pub struct MessageProcessor {
     pub(crate) crud_store: Arc<CrudStore>,
     gateway_secrets: Arc<GatewaySecrets>,
     invitation_gateway_base_url: Arc<pioneer_protocol::GatewayBaseUrl>,
+    gateway_listen_addr: Arc<std::sync::RwLock<Option<std::net::SocketAddr>>>,
     summary_config: Arc<summary::SummaryConfig>,
     compaction_settings: Arc<StdRwLock<pioneer_compaction::CompactionSettings>>,
     completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
@@ -604,6 +617,8 @@ pub struct MessageProcessor {
     task_cli_readiness_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
     #[cfg(test)]
     task_output_capture_failures: Arc<std::sync::Mutex<HashMap<String, anyhow::Error>>>,
+    pub(crate) context_compaction_config: GatewayContextCompactionConfig,
+    pub(crate) compaction_clock: Arc<dyn crate::compaction::CompactionClock>,
     pub(crate) compaction_coordinator: Arc<crate::compaction::ContextCompactionCoordinator>,
     cli_history_shutdown: tokio_util::sync::CancellationToken,
     #[cfg(test)]
@@ -628,6 +643,10 @@ pub struct MessageProcessor {
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
     agent_message_buffers: Arc<Mutex<HashMap<String, AgentMarkdownBuffer>>>,
+    #[cfg(test)]
+    markdown_delta_parse_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    progress_item_type_lookup_count: Arc<AtomicU64>,
     progress_items: Arc<Mutex<ProgressItemRegistry>>,
     agent_action_bindings:
         Arc<Mutex<HashMap<String, agent_action_tools::AgentActionRuntimeBinding>>>,
@@ -654,7 +673,7 @@ pub struct MessageProcessor {
         >,
     >,
     cli_runtime_session_turn_leases:
-        Arc<Mutex<HashMap<String, tokio::sync::OwnedMutexGuard<()>>>>,
+        Arc<Mutex<HashMap<String, (tokio::sync::OwnedMutexGuard<()>, crate::cli_runtime::manager::CLIAgentRuntimeSessionHandle)>>>,
     cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker,
     artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
     artifact_output_dirs: Arc<Mutex<HashMap<String, pioneer_artifacts::ArtifactOutputDir>>>,
@@ -728,13 +747,15 @@ struct AgentListenerTask {
 
 #[derive(Default)]
 struct AgentMarkdownBuffer {
+    turn_id: String,
     text: String,
     stats: Arc<AgentMarkdownBufferStats>,
 }
 
 impl AgentMarkdownBuffer {
-    fn new(text: String) -> Self {
+    fn new(turn_id: String, text: String) -> Self {
         Self {
+            turn_id,
             text,
             stats: Arc::new(AgentMarkdownBufferStats::default()),
         }
@@ -940,6 +961,7 @@ impl AgentMarkdownBufferStats {
 
 #[derive(Clone)]
 struct MemoryBridgeProviders {
+    episodic_provider: Arc<ThreadEpisodicMemoryRecallProvider>,
     memory_provider: Arc<crate::memory_tools::GatewayMemoryProvider>,
     memory_policy_provider: Arc<crate::memory_policy::GatewayMemoryTurnPolicyProvider>,
 }
@@ -1021,6 +1043,9 @@ struct TaskEventFanoutSummary {
 }
 
 impl MessageProcessor {
+    pub(crate) fn computer_use_config(&self) -> pioneer_tools::ComputerUseToolsConfig {
+        self.tool_loop_config.computer_use.clone()
+    }
     #[cfg(test)]
     pub fn new_with_memory_runtime(
         thread_manager: Arc<ThreadManager>,
@@ -1207,6 +1232,7 @@ impl MessageProcessor {
             agent_manager,
             provider_registry,
             session_manager,
+            push_scopes: Arc::new(scoped_push::PushScopes::default()),
             authorization_invalidation_hub,
             execution_leases,
             observation_governor,
@@ -1222,6 +1248,7 @@ impl MessageProcessor {
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
+            gateway_listen_addr: Arc::new(std::sync::RwLock::new(None)),
             invitation_gateway_base_url: Arc::new(
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
@@ -1246,6 +1273,8 @@ impl MessageProcessor {
             task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            context_compaction_config: resilience_config.context_compaction,
+            compaction_clock: Arc::new(crate::compaction::SystemCompactionClock::default()),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
@@ -1292,6 +1321,10 @@ impl MessageProcessor {
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            markdown_delta_parse_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            progress_item_type_lookup_count: Arc::new(AtomicU64::new(0)),
             progress_items: Arc::new(Mutex::new(ProgressItemRegistry::default())),
             agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
@@ -1423,15 +1456,28 @@ impl MessageProcessor {
                     break;
                 }
 
-                let status = status_rx.borrow().clone();
+                let Some(processor) = processor.upgrade() else {
+                    break;
+                };
+                let status = match processor
+                    .persist_current_remote_access_public_base_url()
+                    .await
+                {
+                    Ok(status) => status,
+                    Err(_) => {
+                        tracing::warn!("failed to persist current relay public address");
+                        processor
+                            .remote_access_supervisor
+                            .as_ref()
+                            .expect("remote access supervisor")
+                            .status_snapshot()
+                    }
+                };
                 if status == previous {
                     continue;
                 }
                 previous = status.clone();
 
-                let Some(processor) = processor.upgrade() else {
-                    break;
-                };
                 processor
                     .send_gateway_management_notification(
                         events::GATEWAY_REMOTE_ACCESS_STATUS_CHANGED,
@@ -1492,6 +1538,21 @@ impl MessageProcessor {
                 let Some(processor) = processor.upgrade() else {
                     break;
                 };
+                // Serialize with settings saves so an older engine event cannot
+                // overwrite a newly persisted session mode on another client.
+                let _settings_guard = processor.gateway_settings_update_lock.lock().await;
+                settings = processor
+                    .voice_input_supervisor
+                    .as_ref()
+                    .map(|supervisor| supervisor.settings_snapshot())
+                    .unwrap_or_default();
+                if processor
+                    .apply_persisted_voice_input_mode(&mut settings)
+                    .is_err()
+                {
+                    warn!("failed to read Voice Input mode for status publication");
+                    continue;
+                }
                 processor
                     .send_gateway_management_notification(
                         events::GATEWAY_VOICE_INPUT_STATUS_CHANGED,
@@ -1504,6 +1565,28 @@ impl MessageProcessor {
                 last_notification = tokio::time::Instant::now();
             }
         });
+    }
+
+    fn apply_persisted_voice_input_mode(
+        &self,
+        settings: &mut pioneer_protocol::GatewayVoiceInputSettings,
+    ) -> anyhow::Result<()> {
+        #[cfg(not(test))]
+        let config = pioneer_config::AppConfig::load()?;
+        #[cfg(test)]
+        let config = crate::isolated_test_app_config()?;
+        let file_name = crate::settings::normalize_settings_file_name(
+            config.gateway.settings_file_name.as_str(),
+        )?;
+        let persisted = crate::settings::load_or_create_gateway_settings(
+            &self.artifact_runtime_home.join(&file_name),
+            config.gateway.settings_version,
+            &file_name,
+        )?;
+        settings.transcribe_while_recording = persisted
+            .effective_voice_input_config(&config.gateway.voice)
+            .transcribe_while_recording;
+        Ok(())
     }
 
     pub(crate) fn thread_episodic_vector_refill_status_sender(
@@ -1868,6 +1951,12 @@ impl MessageProcessor {
     }
 
     pub async fn bind_agent_tool_bridges(self: &Arc<Self>) {
+        self.tool_loop_config
+            .computer_use
+            .image_admission
+            .set(Arc::new(artifact_tools::GatewayCuaImageSink(
+                Arc::downgrade(self),
+            )));
         self.bind_permission_approval_bridge().await;
         self.bind_task_bridge().await;
         self.bind_artifact_tool_bridge().await;
@@ -2023,6 +2112,9 @@ impl MessageProcessor {
             .await;
 
         let bridge = MemoryBridgeProviders {
+            episodic_provider: Arc::new(ThreadEpisodicMemoryRecallProvider::new(Arc::downgrade(
+                self,
+            ))),
             memory_provider,
             memory_policy_provider,
         };
@@ -2038,30 +2130,10 @@ impl MessageProcessor {
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_policy_provider),
-                Some(Arc::new(ThreadEpisodicMemoryRecallProvider::new(
-                    self.thread_episodic_recall_service.clone(),
-                    self.crud_store.clone(),
-                ))),
+                Some(bridge.episodic_provider),
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.memory_loop_config(),
             ))
-            .and_then(|builder| {
-                let thread_config = self
-                    .thread_episodic_runtime_config
-                    .read()
-                    .map(|config| config.clone())
-                    .unwrap_or_default();
-                builder.install(thread_context_recall_hook_package(
-                    self.thread_episodic_recall_service.clone(),
-                    Some(self.crud_store.clone()),
-                    self.memory_loop_config(),
-                    ThreadContextRecallHookConfig {
-                        enabled: thread_config.enabled && thread_config.recall_enabled,
-                        max_prompt_chars: thread_config.hook_max_prompt_chars,
-                        max_candidates: thread_config.hook_max_candidates,
-                    },
-                ))
-            })
             .and_then(|builder| {
                 builder.install(agents_doc_prompt_hook_package(self.crud_store.clone()))
             }) {
@@ -2171,6 +2243,26 @@ impl MessageProcessor {
         // a barrier: no in-flight progress can reinsert state behind it.
         self.execution_leases.finish(turn_id).await;
         self.progress_items.lock().await.forget_turn(turn_id);
+        let removed = {
+            let mut buffers = self.agent_message_buffers.lock().await;
+            let mut removed = Vec::new();
+            buffers.retain(|_, buffer| {
+                if buffer.turn_id == turn_id {
+                    removed.push(std::mem::take(buffer));
+                    false
+                } else {
+                    true
+                }
+            });
+            removed
+        };
+        for buffer in removed {
+            Self::record_agent_markdown_buffer(
+                &buffer,
+                buffer.text.len(),
+                pioneer_observability::GatewayMarkdownMessageOutcome::Abandoned,
+            );
+        }
     }
 
     pub(crate) async fn validate_task_execution_admission_seed(
@@ -2366,6 +2458,7 @@ impl MessageProcessor {
             let cycle = AssertUnwindSafe(async {
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::ExecutionOwnerHeartbeat,
                     retry_transient_storage_access(|| {
                         store.heartbeat_turn_executions_owned_by(
                             owner.as_ref(),
@@ -2413,6 +2506,7 @@ impl MessageProcessor {
                 let now = now_timestamp_secs();
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ProjectionRecovery,
+                    pioneer_observability::DatabaseOperationSite::ProjectionReplay,
                     retry_transient_storage_access(|| {
                         this.crud_store.replay_due_turn_event_projections(now, 64)
                     }),
@@ -2441,6 +2535,7 @@ impl MessageProcessor {
 
                 let result = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::FinalizationRecovery,
+                    pioneer_observability::DatabaseOperationSite::PreparedFinalizationReconcile,
                     retry_transient_storage_access(|| {
                         this.reconcile_prepared_native_turn_finalizations(now, 64)
                     }),
@@ -2475,6 +2570,7 @@ impl MessageProcessor {
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::EventDelivery,
+                    pioneer_observability::DatabaseOperationSite::NativeEventDelivery,
                     retry_transient_storage_access(|| {
                         this.process_due_native_turn_event_deliveries(now, 64)
                     }),
@@ -2509,6 +2605,7 @@ impl MessageProcessor {
                 let now = now_timestamp_secs();
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    pioneer_observability::DatabaseOperationSite::TaskChildReconcile,
                     this.reconcile_terminal_task_child_turns_with_retry(64),
                 )
                 .await
@@ -2523,6 +2620,7 @@ impl MessageProcessor {
 
                 let result = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    pioneer_observability::DatabaseOperationSite::TaskOccurrenceReconcile,
                     this.reconcile_terminal_task_run_occurrence_turns(64),
                 )
                 .await;
@@ -2554,6 +2652,7 @@ impl MessageProcessor {
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    pioneer_observability::DatabaseOperationSite::TaskDelivery,
                     this.process_due_task_deliveries(now, 64),
                 )
                 .await
@@ -2838,6 +2937,7 @@ impl MessageProcessor {
                 if now >= next_skill_upload_cleanup {
                     crate::database::attribution::scope_database_workload(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::StaleSkillUploadCleanup,
                         maintenance.cleanup_stale_skill_uploads(now),
                     )
                     .await;
@@ -2849,6 +2949,7 @@ impl MessageProcessor {
                 // authoritative liveness check before any destructive claim.
                 crate::database::attribution::scope_database_workload(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::CliCommandHeartbeat,
                     this.heartbeat_due_cli_runtime_command_items(now),
                 )
                 .await;
@@ -2857,6 +2958,7 @@ impl MessageProcessor {
                     crate::authorization::AgentWorkResourcePolicy::default();
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::QueuedExecutionPromotion,
                     retry_transient_storage_access(|| {
                         this.crud_store.promote_queued_agent_executions(
                             pioneer_crud::utc_now(),
@@ -2876,6 +2978,7 @@ impl MessageProcessor {
                             if let Err(error) =
                                 crate::database::attribution::scope_database_workload_result(
                                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                    pioneer_observability::DatabaseOperationSite::AgentOutboxWake,
                                     pioneer_crud::wake_agent_action_outbox_for_execution(
                                         &database,
                                         execution.execution_id.as_str(),
@@ -2897,7 +3000,7 @@ impl MessageProcessor {
                             .collect::<std::collections::BTreeSet<_>>();
                         for root_execution_id in roots {
                             crate::database::attribution::scope_database_workload(
-                                pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                pioneer_observability::DatabaseWorkload::ExecutionSupervision, pioneer_observability::DatabaseOperationSite::AgentGraphNotification,
                                 this.notify_agent_work_graph_state_changed(
                                     root_execution_id.as_str(),
                                 ),
@@ -2922,6 +3025,7 @@ impl MessageProcessor {
                         now.saturating_add(AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS);
                     match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::TerminalExecutionCompaction,
                         retry_transient_storage_access(|| {
                             let database = maintenance.crud_store.database_connection();
                             async move {
@@ -2968,6 +3072,7 @@ impl MessageProcessor {
                         now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_INTERVAL_SECONDS);
                     match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::NativeTerminalEffectRequeue,
                         retry_transient_storage_access(|| {
                             maintenance
                                 .crud_store
@@ -3010,6 +3115,7 @@ impl MessageProcessor {
                         now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS);
                     match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::NativeTerminalEffectPurge,
                         retry_transient_storage_access(|| {
                             maintenance
                                 .crud_store
@@ -3049,6 +3155,7 @@ impl MessageProcessor {
 
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::AgentActionOutbox,
                     // One input quantum. Report errors/back off only after all
                     // independent known-committed rows have had their dispatch.
                     agent_action_tools::process_due_agent_action_outbox(&this, 64),
@@ -3092,6 +3199,7 @@ impl MessageProcessor {
 
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::ExecutionTimeoutPoll,
                     retry_transient_storage_access(|| {
                         this.poll_timeouts_respecting_human_wait(now, 64)
                     }),
@@ -3102,6 +3210,7 @@ impl MessageProcessor {
                         for candidate in candidates {
                             crate::database::attribution::scope_database_workload(
                                 pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                pioneer_observability::DatabaseOperationSite::ExecutionTimeoutApply,
                                 this.handle_timeout_candidate(candidate, now),
                             )
                             .await;
@@ -3121,6 +3230,7 @@ impl MessageProcessor {
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::RecoveryTerminalizationAudit,
+                    pioneer_observability::DatabaseOperationSite::RecoveryTerminalizationAudit,
                     retry_transient_storage_access(|| {
                         this.crud_store
                             .enqueue_missing_recovery_terminalizations(64, now)
@@ -3140,6 +3250,7 @@ impl MessageProcessor {
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::RecoveryTerminalizationApply,
+                    pioneer_observability::DatabaseOperationSite::RecoveryTerminalizationApply,
                     retry_transient_storage_access(|| {
                         this.process_due_recovery_terminalizations(now, 64)
                     }),
@@ -3158,6 +3269,7 @@ impl MessageProcessor {
 
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::RecoveryJobs,
                     retry_transient_storage_access(|| {
                         this.recovery_coordinator.run_ready_jobs(now, 64)
                     }),
@@ -3168,6 +3280,7 @@ impl MessageProcessor {
                         for event in events {
                             crate::database::attribution::scope_database_workload(
                                 pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                pioneer_observability::DatabaseOperationSite::RecoveryEventApply,
                                 this.handle_recovery_event(event, now),
                             )
                             .await;
@@ -3187,6 +3300,7 @@ impl MessageProcessor {
 
                 crate::database::attribution::scope_database_workload(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::StaleCliTurnFailure,
                     this.fail_stale_cli_runtime_turns(
                         now_timestamp_millis(),
                         &mut cli_runtime_stale_turn_scan,
@@ -3602,6 +3716,7 @@ impl MessageProcessor {
                 if config.enabled && (!first_pass || config.startup_scan) {
                     crate::database::attribution::scope_database_workload(
                         pioneer_observability::DatabaseWorkload::HookRecovery,
+                        pioneer_observability::DatabaseOperationSite::HookRecovery,
                         this.run_hook_recovery_pass(config.clone()),
                     )
                     .await;
@@ -3688,6 +3803,7 @@ impl MessageProcessor {
                 };
                 let result = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskEventFanout,
+                    pioneer_observability::DatabaseOperationSite::TaskEventFanout,
                     this.for_background_reconciliation()
                         .task_event_fanout_quantum(),
                 )
@@ -4666,7 +4782,6 @@ impl MessageProcessor {
             },
             computer_use: pioneer_tools::ComputerUseToolsConfig {
                 runtime_home_dir: std::env::temp_dir().join("pioneer-message-tests"),
-                artifacts_subdir: "tools/computer_use".to_owned(),
                 ..pioneer_tools::ComputerUseToolsConfig::default()
             },
             skills: pioneer_agent::SkillsLoopConfig {
@@ -4792,6 +4907,7 @@ impl MessageProcessor {
             agent_manager,
             provider_registry,
             session_manager,
+            push_scopes: Arc::new(scoped_push::PushScopes::default()),
             authorization_invalidation_hub,
             execution_leases,
             observation_governor,
@@ -4807,6 +4923,7 @@ impl MessageProcessor {
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
+            gateway_listen_addr: Arc::new(std::sync::RwLock::new(None)),
             invitation_gateway_base_url: Arc::new(
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
@@ -4831,6 +4948,8 @@ impl MessageProcessor {
             task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            context_compaction_config: GatewayContextCompactionConfig::default(),
+            compaction_clock: Arc::new(crate::compaction::SystemCompactionClock::default()),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
@@ -4868,6 +4987,10 @@ impl MessageProcessor {
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            markdown_delta_parse_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            progress_item_type_lookup_count: Arc::new(AtomicU64::new(0)),
             progress_items: Arc::new(Mutex::new(ProgressItemRegistry::default())),
             agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),

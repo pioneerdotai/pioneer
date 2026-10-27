@@ -656,7 +656,9 @@ impl TaskProjector {
                 agent_spec,
                 ..
             } => project_future(async move {
-                if task_is_terminal_db(db, task_model.id.as_str()).await? {
+                if task_is_terminal_db(db, task_model.id.as_str()).await?
+                    && task_model.finish_request().is_none()
+                {
                     return Ok(());
                 }
                 task::upsert_prepared_task(
@@ -702,10 +704,15 @@ impl TaskProjector {
                     })?,
                 )
                 .await?;
-                if task_has_nonterminal_run_db(db, trigger.task_id.as_str()).await? {
+                if task::finish_requested(db, trigger.task_id.as_str()).await?
+                    || task_has_nonterminal_run_db(db, trigger.task_id.as_str()).await?
+                {
                     return Ok(());
                 }
-                let status = if trigger.next_fire_at.is_some() {
+                let status = if matches!(&trigger.spec, pioneer_protocol::TaskTriggerSpec::External { source, .. } if source == "webhook")
+                {
+                    TaskStatus::Waiting
+                } else if trigger.next_fire_at.is_some() {
                     TaskStatus::Scheduled
                 } else {
                     TaskStatus::Queued
@@ -1354,7 +1361,7 @@ pub(crate) async fn prepare_delivery_authority_boundary<C: ConnectionTrait>(
     if task.workspace_id != delivery.workspace_id {
         anyhow::bail!("Task delivery Task belongs to another workspace");
     }
-    let occurrence_row = task_actor_contract::find_task_occurrence_row_by_run(db, &delivery.run_id)
+    let occurrence_row = task_actor_contract::find_terminal_occurrence_row(db, &delivery.run_id)
         .await?
         .context("Task delivery has no exact occurrence")?;
     let occurrence =

@@ -169,6 +169,8 @@ select_model = "Select model"
 dialog_title = "Select Preflight Model"
 
 [settings.voice_input]
+transcribe_while_recording = "Transcribe while recording"
+transcribe_while_recording_description = "When off, transcription starts after recording ends."
 label = "Voice Input"
 description = "Use a local transcription model for voice messages."
 no_model_selected = "No model selected"

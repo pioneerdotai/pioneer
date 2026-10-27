@@ -23,7 +23,7 @@ pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
             biased;
             _ = cancellation.cancelled() => return,
             result = crate::database::attribution::scope_database_workload_result(
-                pioneer_observability::DatabaseWorkload::NativeEventCleanup,
+                pioneer_observability::DatabaseWorkload::NativeEventCleanup, pioneer_observability::DatabaseOperationSite::NativeEventCleanupQuantum,
                 async {
                     if bootstrap_phase {
                         let outcome = store.bootstrap_native_event_cleanup_quantum().await?;

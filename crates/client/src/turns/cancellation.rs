@@ -38,6 +38,7 @@ pub struct TurnCancellationIntent {
 }
 #[derive(Clone)]
 struct CancellationRequest {
+    work_context: pioneer_observability::work::WorkCarrier,
     identity: TurnCancellationIdentity,
     token: ThreadOperationToken,
     params: pioneer_protocol::TurnCancelParams,
@@ -51,6 +52,7 @@ pub(crate) struct TurnCancellationController {
     suspended: BTreeSet<String>,
     subscriptions: BTreeMap<String, usize>,
     sender: Option<mpsc::SyncSender<CancellationRequest>>,
+    observer: Option<pioneer_observability::queues::QueueObserver>,
     task: Option<std::thread::JoinHandle<()>>,
 }
 impl TurnCancellationController {
@@ -166,6 +168,12 @@ impl ClientCore {
             generation: owner.generation,
         };
         let request = CancellationRequest {
+            work_context: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
             identity: identity.clone(),
             token,
             params,
@@ -180,10 +188,14 @@ impl ClientCore {
                 state: TurnCancellationState::Pending,
             },
         );
-        let queued = owner
-            .sender
-            .as_ref()
-            .is_some_and(|tx| tx.try_send(request.clone()).is_ok());
+        let queued = owner.sender.as_ref().is_some_and(|tx| {
+            pioneer_observability::queues::observe_try_send(
+                owner.observer.as_ref(),
+                pioneer_observability::queues::QueueBytes::Unsupported,
+                || tx.try_send(request.clone()),
+            )
+            .is_ok()
+        });
         drop(owner);
         if !queued {
             self.complete_turn_cancellation(request, Err("Turn cancellation unavailable".into()));
@@ -367,11 +379,29 @@ impl ClientCore {
     }
     pub(crate) fn start_turn_cancellation_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel::<CancellationRequest>(64);
+        let queue_observer = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(64),
+            "unsupported: controller request payload/shared references are not serialized",
+        );
+        let worker_queue = queue_observer.clone();
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-turn-cancellation".into())
             .spawn(move || {
                 while let Ok(request) = receiver.recv() {
+                    worker_queue.dequeued(pioneer_observability::queues::QueueBytes::Unsupported);
+                    let mut processing = worker_queue.processing();
+                    let carrier = request.work_context.clone().received(
+                        pioneer_observability::work::Boundary::StdThread,
+                        pioneer_observability::work::WorkKind::ClientCommand,
+                        pioneer_observability::work::ExecutorRole::ClientController,
+                    );
+                    let _scope = carrier.enter();
+                    let mut active_work = pioneer_observability::live::WorkGuard::start(
+                        pioneer_observability::work::current(),
+                        false,
+                    );
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
@@ -390,7 +420,14 @@ impl ClientCore {
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
+                    let outcome = if result.is_ok() {
+                        pioneer_observability::work::Outcome::Completed
+                    } else {
+                        pioneer_observability::work::Outcome::Failed
+                    };
                     core.complete_turn_cancellation(request, result);
+                    processing.processed();
+                    active_work.finish(outcome);
                 }
             })
             .expect("turn cancellation worker could not start");
@@ -398,6 +435,7 @@ impl ClientCore {
             .turn_cancellations
             .lock()
             .expect("turn cancellations poisoned");
+        owner.observer = Some(queue_observer);
         owner.sender = Some(sender);
         owner.task = Some(task);
     }

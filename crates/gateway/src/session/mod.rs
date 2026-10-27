@@ -16,6 +16,147 @@ use crate::request_context::ConnectionContext;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+use pioneer_observability::{
+    queues::{QueueBytes, QueueKind, QueueObserver, QueueOutcome},
+    work::{Boundary, ExecutorRole, WorkItem, WorkKind},
+};
+
+#[derive(Clone)]
+enum OutboundChannel {
+    Plain(mpsc::Sender<Message>),
+    Observed(mpsc::Sender<WorkItem<Message>>),
+}
+/// Observer at the existing session-owned outbound lane, not a new transport.
+#[derive(Clone)]
+pub(crate) struct SessionOutbound {
+    channel: OutboundChannel,
+    observer: QueueObserver,
+}
+impl SessionOutbound {
+    pub(crate) fn observed(sender: mpsc::Sender<WorkItem<Message>>) -> Self {
+        let observer = QueueObserver::new(
+            QueueKind::GatewayOutbound,
+            Some(sender.max_capacity()),
+            "WebSocket text/binary payload bytes; framing/envelope excluded",
+        );
+        Self {
+            channel: OutboundChannel::Observed(sender),
+            observer,
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        match &self.channel {
+            OutboundChannel::Plain(tx) => tx.capacity(),
+            OutboundChannel::Observed(tx) => tx.capacity(),
+        }
+    }
+    pub(crate) async fn send(
+        &self,
+        message: Message,
+    ) -> Result<(), mpsc::error::SendError<Message>> {
+        let mut wait = self.observer.send_wait();
+        let _live_wait = pioneer_observability::live::WaitGuard::new(
+            pioneer_observability::live::WaitKind::ChannelCapacity,
+        );
+        let bytes = message_bytes(&message);
+        match &self.channel {
+            OutboundChannel::Observed(tx) => {
+                let permit = match tx.reserve().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        self.observer.outcome(QueueOutcome::Rejected, 1);
+                        return Err(mpsc::error::SendError(message));
+                    }
+                };
+                wait.complete();
+                permit.send(
+                    WorkItem::new(
+                        message,
+                        Boundary::EventLane,
+                        WorkKind::Event,
+                        ExecutorRole::Gateway,
+                    )
+                    .observed(self.observer.clone(), bytes),
+                );
+            }
+            OutboundChannel::Plain(tx) => {
+                let permit = match tx.reserve().await {
+                    Ok(p) => p,
+                    Err(_) => return Err(mpsc::error::SendError(message)),
+                };
+                wait.complete();
+                self.observer.enqueued(bytes);
+                permit.send(message);
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn try_send(
+        &self,
+        message: Message,
+    ) -> Result<(), mpsc::error::TrySendError<Message>> {
+        let bytes = message_bytes(&message);
+        match &self.channel {
+            OutboundChannel::Observed(tx) => match tx.try_reserve() {
+                Ok(p) => {
+                    p.send(
+                        WorkItem::new(
+                            message,
+                            Boundary::EventLane,
+                            WorkKind::Event,
+                            ExecutorRole::Gateway,
+                        )
+                        .observed(self.observer.clone(), bytes),
+                    );
+                    Ok(())
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.observer.outcome(QueueOutcome::Rejected, 1);
+                    Err(mpsc::error::TrySendError::Full(message))
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.observer.outcome(QueueOutcome::Rejected, 1);
+                    Err(mpsc::error::TrySendError::Closed(message))
+                }
+            },
+            OutboundChannel::Plain(tx) => match tx.try_reserve() {
+                Ok(p) => {
+                    self.observer.enqueued(bytes);
+                    p.send(message);
+                    Ok(())
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    Err(mpsc::error::TrySendError::Full(message))
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Err(mpsc::error::TrySendError::Closed(message))
+                }
+            },
+        }
+    }
+}
+impl From<mpsc::Sender<Message>> for SessionOutbound {
+    fn from(sender: mpsc::Sender<Message>) -> Self {
+        let observer = QueueObserver::new(
+            QueueKind::GatewayOutbound,
+            Some(sender.max_capacity()),
+            "compatibility sender; payload bytes; receiver coverage unavailable",
+        );
+        Self {
+            channel: OutboundChannel::Plain(sender),
+            observer,
+        }
+    }
+}
+fn message_bytes(message: &Message) -> QueueBytes {
+    QueueBytes::Known(match message {
+        Message::Text(text) => text.len(),
+        Message::Binary(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
+        Message::Close(frame) => frame.as_ref().map_or(0, |f| f.reason.len() + 2),
+    } as u64)
+}
+
 pub type ConnectionId = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,8 +196,9 @@ const TERMINATED_SESSION_TOMBSTONE_TTL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone)]
 struct SessionConnection {
-    sender: mpsc::Sender<Message>,
+    sender: SessionOutbound,
     termination_tx: watch::Sender<Option<AuthSessionTerminationReason>>,
+    scope_change_tx: watch::Sender<()>,
     workspace_id: Option<String>,
     principal: Arc<AuthenticatedSessionPrincipal>,
 }
@@ -81,9 +223,18 @@ impl SessionManager {
         Self::default()
     }
 
+    #[cfg(test)]
     pub async fn register_connection(
         &self,
         sender: mpsc::Sender<Message>,
+        principal: Arc<AuthenticatedSessionPrincipal>,
+    ) -> Result<ConnectionId> {
+        self.register_outbound_connection(sender.into(), principal)
+            .await
+    }
+    pub(crate) async fn register_outbound_connection(
+        &self,
+        sender: SessionOutbound,
         principal: Arc<AuthenticatedSessionPrincipal>,
     ) -> Result<ConnectionId> {
         // Serialize registration against post-commit revocation. Without this
@@ -103,11 +254,13 @@ impl SessionManager {
         let session_id = principal.session_id.to_string();
         let device_id = principal.device_id.to_string();
         let (termination_tx, _) = watch::channel(None);
+        let (scope_change_tx, _) = watch::channel(());
         self.connections.write().await.insert(
             connection_id,
             SessionConnection {
                 sender,
                 termination_tx,
+                scope_change_tx,
                 workspace_id: None,
                 principal,
             },
@@ -226,6 +379,7 @@ impl SessionManager {
         if now >= expected.access_expires_at_unix {
             return Err(ConnectionRenewalError::AccessExpired);
         }
+        connection.scope_change_tx.send_replace(());
         connection.principal = next.clone();
         Ok(ConnectionContext::new(connection_id, next))
     }
@@ -289,6 +443,18 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("connection `{connection_id}` is not registered"))
     }
 
+    pub(crate) async fn connection_scope_receiver(
+        &self,
+        id: ConnectionId,
+    ) -> Result<watch::Receiver<()>> {
+        self.connections
+            .read()
+            .await
+            .get(&id)
+            .map(|connection| connection.scope_change_tx.subscribe())
+            .ok_or_else(|| anyhow!("connection is not registered"))
+    }
+
     pub async fn set_connection_workspace(
         &self,
         connection_id: ConnectionId,
@@ -299,10 +465,14 @@ impl SessionManager {
             return;
         };
 
-        connection.workspace_id = workspace_id.and_then(|value| {
+        let workspace_id = workspace_id.and_then(|value| {
             let trimmed = value.trim();
             (!trimmed.is_empty()).then_some(trimmed.to_owned())
         });
+        if workspace_id != connection.workspace_id {
+            connection.scope_change_tx.send_replace(());
+            connection.workspace_id = workspace_id;
+        }
     }
 
     pub async fn send_text(&self, connection_id: ConnectionId, payload: String) -> Result<()> {
@@ -326,9 +496,31 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Best-effort notification delivery. Unlike request/response writes this
-    /// never waits for outbound capacity: a lagging socket is fenced so it
-    /// cannot apply backpressure to lifecycle persistence or other clients.
+    /// Run a synchronous final scope/generation gate at the existing outbound
+    /// lane. The callback cannot await or hold database capacity.
+    pub(crate) async fn with_notification_outbound<T>(
+        &self,
+        connection_id: ConnectionId,
+        expected: &AuthenticatedSessionPrincipal,
+        workspace: &str,
+        enqueue: impl FnOnce(&SessionOutbound) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let connections = self.connections.read().await;
+        let connection = connections
+            .get(&connection_id)
+            .ok_or_else(|| anyhow!("connection is not registered"))?;
+        let now = crate::helpers::unix_timestamp_secs()?;
+        if connection.principal.as_ref() != expected
+            || connection.workspace_id.as_deref() != Some(workspace)
+            || connection.termination_tx.borrow().is_some()
+            || now >= expected.access_expires_at_unix
+        {
+            return Ok(None);
+        }
+        enqueue(&connection.sender).map(Some)
+    }
+
+    /// Best-effort delivery; a saturated socket is retired instead of queued.
     pub async fn try_send_notification_text(
         &self,
         connection_id: ConnectionId,
@@ -472,7 +664,8 @@ mod tests {
         TEST_SUPERUSER_PRINCIPAL_ID, authenticated_test_superuser,
         register_authenticated_test_connection,
     };
-    use super::{SessionManager, TERMINATED_SESSION_TOMBSTONE_TTL};
+    use super::{SessionManager, SessionOutbound, TERMINATED_SESSION_TOMBSTONE_TTL};
+    use anyhow::anyhow;
     use axum::extract::ws::Message;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -876,6 +1069,92 @@ mod tests {
             Some(pioneer_protocol::AuthSessionTerminationReason::SessionRevoked)
         );
         assert!(manager.connection_principal(connection_id).await.is_err());
+    }
+    #[tokio::test]
+    async fn queued_derived_payload_checks_current_workspace_identity_and_expiry_at_enqueue() {
+        let manager = SessionManager::new();
+        let principal = authenticated_test_superuser();
+        let (tx, mut rx) = mpsc::channel(4);
+        let connection = manager
+            .register_connection(tx, principal.clone())
+            .await
+            .unwrap();
+        manager
+            .set_connection_workspace(connection, Some("first".into()))
+            .await;
+        let send = |outbound: &SessionOutbound| {
+            outbound
+                .try_send(Message::Text("derived value".into()))
+                .map_err(|error| anyhow!("{error}"))?;
+            Ok(())
+        };
+        assert!(
+            manager
+                .with_notification_outbound(connection, &principal, "first", send)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            rx.recv().await.unwrap().into_text().unwrap(),
+            "derived value"
+        );
+        manager
+            .set_connection_workspace(connection, Some("second".into()))
+            .await;
+        assert!(
+            manager
+                .with_notification_outbound(connection, &principal, "first", send)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let mut renewed = (*principal).clone();
+        renewed.access_jti = "new-access-token".into();
+        manager
+            .renew_connection_principal(connection, &principal, Arc::new(renewed.clone()))
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .with_notification_outbound(connection, &principal, "second", send)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manager
+                .with_notification_outbound(connection, &renewed, "second", send)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let _ = rx.recv().await.unwrap();
+        let mut expired = renewed;
+        expired.access_expires_at_unix = 0;
+        let (expired_tx, mut expired_rx) = mpsc::channel(1);
+        let expired_connection = manager
+            .register_connection(expired_tx, Arc::new(expired.clone()))
+            .await
+            .unwrap();
+        manager
+            .set_connection_workspace(expired_connection, Some("second".into()))
+            .await;
+        assert!(
+            manager
+                .with_notification_outbound(expired_connection, &expired, "second", send)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            expired_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

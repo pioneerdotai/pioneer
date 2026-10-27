@@ -7,9 +7,9 @@ use crate::{
 
 use pioneer_protocol::{
     McpListItem, McpListResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse,
-    RuntimeCapabilities, RuntimeStatus, RuntimeSummary, SkillId, SkillListItem, SkillListResponse,
-    TurnCapability, TurnCapabilityKind, TurnMcpServerCapabilitySummary,
-    TurnMcpToolCapabilitySummary, TurnSkillCapabilitySummary, UserMessageAttachment,
+    RuntimeCapabilities, RuntimeSummary, SkillId, SkillListItem, SkillListResponse, TurnCapability,
+    TurnCapabilityKind, TurnMcpServerCapabilitySummary, TurnMcpToolCapabilitySummary,
+    TurnSkillCapabilitySummary, UserMessageAttachment,
 };
 use std::collections::HashSet;
 
@@ -185,7 +185,7 @@ impl ComposerCapabilityTarget {
 
 /// Canonical capability matrix shared by Rust clients and their focused tests.
 ///
-/// Stale, disabled, or missing CLI summaries resolve to the `cli_neither`
+/// Disabled or missing CLI summaries resolve to the `cli_neither`
 /// policy; provider-switch behavior is a reduction from one row to another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ComposerCapabilityMatrixCase {
@@ -242,15 +242,17 @@ pub fn composer_capability_target_for_provider(
         return ComposerCapabilityTarget::native();
     };
 
-    let Some(runtime) = runtimes.iter().find(|runtime| {
-        runtime.runtime_id == runtime_id
-            && runtime.enabled
-            && matches!(runtime.status, RuntimeStatus::Ready)
-    }) else {
+    let Some(_runtime) = runtimes
+        .iter()
+        .find(|runtime| runtime.runtime_id == runtime_id && runtime.enabled)
+    else {
         return ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::unsupported_cli());
     };
 
-    ComposerCapabilityTarget::from_cli_runtime_capabilities(&runtime.capabilities)
+    // A background technical/account probe is diagnostic evidence, not a
+    // revocation of the user's explicit selection. Preserve the structural
+    // selection; Gateway validates the current MCP contract during preflight.
+    ComposerCapabilityTarget::cli_submission()
 }
 
 /// Structural capability target used when a turn is submitted.

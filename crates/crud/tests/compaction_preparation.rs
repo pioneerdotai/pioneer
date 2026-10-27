@@ -778,27 +778,67 @@ async fn history_check_retry_survives_disk_reopen_and_cancelled_writer_admission
     let reader = Database::connect(options).await.unwrap();
     let database = SqliteDatabase::new(reader, writer);
     let store = CrudStore::new(database.clone()).with_maintenance_access();
+    // Keep the shared legacy fixture cold. Only a new principal input and
+    // its canonical ready answer may create optional root work.
+    let mut thread = store.get_thread_model("thread").await.unwrap().unwrap();
+    thread.updated_at = 1;
+    let (_, mut turn) = store.get_turn("thread", "turn").await.unwrap().unwrap();
+    turn.id = "root-turn".into();
+    turn.status = pioneer_protocol::TurnStatus::InProgress;
     store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
+        .materialize_turn_start(
+            &thread,
+            pioneer_protocol::SandboxMode::FullAccess,
+            &turn,
+            &[pioneer_protocol::UserInput::Text {
+                text: "new root question".into(),
+                text_elements: Vec::new(),
+            }],
+            pioneer_protocol::PersistedActorRef::Principal(
+                pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap(),
+            ),
+        )
         .await
         .unwrap();
     store
-        .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: turn.id.clone(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "root-answer".into(),
+                    text: "ready root answer".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            1,
+        )
         .await
         .unwrap();
+    turn.status = pioneer_protocol::TurnStatus::Completed;
     store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+        .materialize_turn_completed(
+            pioneer_protocol::TurnCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn,
+            },
+            1,
+        )
         .await
         .unwrap();
     let page = store.compaction_due_history_checks(1000).await.unwrap();
     assert_eq!(page.len(), 1);
+    assert_eq!(page[0].turn_id, "root-turn");
+    let revision = page[0].revision;
     let held = database.begin().await.unwrap();
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            store.compaction_claim_history_check("turn", page[0].revision, 1000)
+            store.compaction_claim_history_check("root-turn", revision, 1000)
         )
         .await
         .is_err()
@@ -810,29 +850,29 @@ async fn history_check_retry_survives_disk_reopen_and_cancelled_writer_admission
             "SELECT count(*) AS n FROM turn"
         )
         .await,
-        2
+        3
     );
     held.rollback().await.unwrap();
     assert_eq!(
         scalar(
             &store,
-            "SELECT revision AS n FROM compaction_history_check WHERE turn_id='turn'"
+            "SELECT revision AS n FROM compaction_history_check WHERE turn_id='root-turn'"
         )
         .await,
-        0
+        revision
     );
     let claim = store
-        .compaction_claim_history_check("turn", 0, 1000)
+        .compaction_claim_history_check("root-turn", revision, 1000)
         .await
         .unwrap()
         .unwrap();
     store
-        .compaction_begin_history_attempt("turn", claim.revision, "{}", "safe-digest", 1000)
+        .compaction_begin_history_attempt("root-turn", claim.revision, "{}", "safe-digest", 1000)
         .await
         .unwrap();
     store
         .compaction_record_history_result(
-            "turn",
+            "root-turn",
             claim.revision,
             0,
             O::Retryable,
@@ -856,7 +896,7 @@ async fn history_check_retry_survives_disk_reopen_and_cancelled_writer_admission
     let page = reopened.compaction_due_history_checks(61000).await.unwrap();
     assert_eq!(page[0].failures, 1);
     assert_eq!(page[0].config_hash.as_deref(), Some("safe-digest"));
-    let row = pioneer_entity::compaction_history_check::Entity::find_by_id("turn")
+    let row = pioneer_entity::compaction_history_check::Entity::find_by_id("root-turn")
         .one(&reopened.database_connection())
         .await
         .unwrap()

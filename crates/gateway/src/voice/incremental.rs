@@ -102,6 +102,7 @@ pub(crate) fn start(
     workers: &VoiceFinalizations,
     lease: VoiceFinalizationLease,
     transcriber: SessionSpeechTranscriber,
+    transcribe_while_recording: bool,
 ) -> Result<(), VoiceChunkIngestError> {
     let cancellation = transcriber.cancellation.clone();
     let (sender, receiver) = oneshot::channel();
@@ -119,21 +120,153 @@ pub(crate) fn start(
     // inbox without an engine lock, and is explicitly joined by the gateway's
     // tracker at shutdown. No task or second audio queue per network chunk.
     let store = store.worker_view();
-    workers.tasks.spawn_blocking(move || {
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            process(
-                &store,
-                &session_id,
-                &cancellation,
-                &transcriber,
-                transcriber.is_moonshine_base,
-            )
-        }))
-        .unwrap_or_else(|_| Err(worker_error("voice processing worker panicked")));
-        store.processing_finished(&session_id);
-        let _ = sender.send(VoiceProcessingCompletion { outcome, lease });
-    });
+    workers
+        .tasks
+        .spawn_blocking(pioneer_observability::work::blocking(move || {
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                if transcribe_while_recording {
+                    process(
+                        &store,
+                        &session_id,
+                        &cancellation,
+                        &transcriber,
+                        transcriber.is_moonshine_base,
+                    )
+                } else {
+                    process_buffered(
+                        &store,
+                        &session_id,
+                        &cancellation,
+                        &transcriber,
+                        transcriber.is_moonshine_base,
+                    )
+                }
+            }))
+            .unwrap_or_else(|_| Err(worker_error("voice processing worker panicked")));
+            store.processing_finished(&session_id);
+            let _ = sender.send(VoiceProcessingCompletion { outcome, lease });
+        }));
     Ok(())
+}
+
+// Whole-session preparation uses the same VAD filtering and final-onset
+// handling as incremental, but never invokes its bounded-window/text planner.
+// All accepted chunks transfer out of the inbox only after Commit.
+fn process_buffered(
+    store: &GatewayVoiceSessionBufferStore,
+    session_id: &str,
+    cancellation: &CancellationToken,
+    transcriber: &impl VoiceSpeechTranscriber,
+    is_moonshine_base: bool,
+) -> Result<GatewayVoiceSessionPipelineOutcome, VoiceError> {
+    ensure_active(cancellation)?;
+    let chunks = store
+        .take_closed_processing_chunks(session_id)
+        .map_err(|error| error.into_voice_error())?;
+    ensure_active(cancellation)?;
+    let key = store.processing_startup_key(session_id);
+    pioneer_observability::turn_startup::scope_sync(key, || {
+        let detector = EnergyVoiceActivityDetector::new(ENERGY_VAD_THRESHOLD_FLOOR)
+            .map_err(|_| worker_error("failed to initialize voice VAD"))?;
+        let mut vad = SmoothedVoiceVad::new(detector, VoiceVadConfig::default())
+            .map_err(|_| worker_error("failed to initialize voice VAD"))?;
+        let mut signal = SignalAccumulator::default();
+        let mut pending = Vec::with_capacity(VOICE_VAD_FRAME_SAMPLES);
+        // At most one extra normalized recording, bounded by the existing
+        // lifetime ingress budget (raw + normalized). Reserve exactly once to
+        // avoid geometric capacity growth; source chunks drop during the pass.
+        let source_samples: usize = chunks
+            .iter()
+            .map(|chunk| chunk.normalized_samples.len())
+            .sum();
+        let mut speech = Vec::with_capacity(source_samples.max(if is_moonshine_base {
+            MIN_MOONSHINE_BASE_INPUT_SAMPLES
+        } else {
+            0
+        }));
+        {
+            let _stage = pioneer_observability::turn_startup::current_stage(
+                pioneer_observability::turn_startup::Stage::VoiceVad,
+            );
+            for chunk in chunks {
+                ensure_active(cancellation)?;
+                signal.add_samples(&chunk.normalized_samples);
+                for sample in chunk.normalized_samples {
+                    pending.push(sample);
+                    if pending.len() == VOICE_VAD_FRAME_SAMPLES {
+                        ensure_active(cancellation)?;
+                        if let SmoothedVadFrame::Speech(samples) = vad
+                            .push_incremental_frame(&pending)
+                            .map_err(|_| worker_error("failed to segment voice audio"))?
+                        {
+                            speech.extend(samples);
+                        }
+                        pending.clear();
+                    }
+                }
+            }
+            speech.extend(
+                vad.finish_incremental_tail(&pending)
+                    .map_err(|_| worker_error("failed to segment final voice audio"))?,
+            );
+        }
+        ensure_active(cancellation)?;
+        let signal_stats = signal.finish();
+        let speech_samples = speech.len();
+        if speech_samples == 0 {
+            return Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
+                no_speech: VoiceTranscriptionNoSpeech {
+                    reason: VoiceTranscriptionNoSpeechReason::NoSpeechDetected,
+                    total_samples: signal_stats.total_samples,
+                },
+                signal_stats,
+            });
+        }
+        if is_moonshine_base {
+            prepare_moonshine_base_samples(&mut speech);
+        }
+        let native_samples = speech.len();
+        let buffer = PreparedSpeechBuffer {
+            sample_rate_hz: VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ,
+            total_samples: signal_stats.total_samples,
+            segments: vec![VoiceSpeechSegment {
+                start_sample: 0,
+                end_sample: native_samples,
+                samples: speech,
+            }],
+        };
+        // The session adapter checks generation and cancellation after waiting
+        // for the engine lock and immediately before entering native inference.
+        ensure_active(cancellation)?;
+        let text = transcriber
+            .transcribe_speech(&buffer)
+            .map_err(|error| error.into_voice_error())?
+            .trim()
+            .to_owned();
+        ensure_active(cancellation)?;
+        if text.is_empty() {
+            return Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
+                no_speech: VoiceTranscriptionNoSpeech {
+                    reason: VoiceTranscriptionNoSpeechReason::EmptyTranscript,
+                    total_samples: signal_stats.total_samples,
+                },
+                signal_stats,
+            });
+        }
+        Ok(GatewayVoiceSessionPipelineOutcome::Transcript {
+            transcript: VoiceTranscript {
+                text,
+                diagnostics: VoiceTranscriptionDiagnostics {
+                    sample_rate_hz: VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ,
+                    total_samples: signal_stats.total_samples,
+                    speech_samples,
+                    segment_count: 1,
+                    strategy: VoiceTranscriptionStrategy::BufferedGatewaySession,
+                },
+            },
+            signal_stats,
+        })
+    })
 }
 
 fn process(
@@ -392,7 +525,12 @@ impl IncrementalSpeech {
             )?;
             (
                 preferred_cut,
-                align_boundary(&self.full_hypothesis.text, &left.text, &right.text),
+                project_boundary(
+                    &self.full_hypothesis.text,
+                    &left.text,
+                    &right.text,
+                    Some((preferred_cut, self.speech.len())),
+                ),
             )
         };
         let text_end = text_end.max(self.owned_text_start);
@@ -423,6 +561,10 @@ impl IncrementalSpeech {
             context.text
         };
         let tail = self.full_hypothesis.text[text_end..].to_owned();
+        // Transfer the projected left text BEFORE discarding its PCM. Only the
+        // projected right slice remains replaceable on the next refresh. A
+        // textual tie here must not use the context-exclusion bias in refresh:
+        // that could leave the entire old whole in a now unsupported tail.
         append_text(
             &mut self.text,
             &self.full_hypothesis.text[self.owned_text_start..text_end],
@@ -759,30 +901,51 @@ fn edit_costs(
 }
 
 fn align_boundary(whole: &str, left: &str, right: &str) -> usize {
+    project_boundary(whole, left, right, None)
+}
+
+// A partition transfers ownership before PCM eviction; context exclusion only
+// removes technical replay. They need different tie priors: favoring the best
+// prefix fit is conservative for exclusion, but can discard left ownership at
+// a partition. Neither prior establishes exact acoustic correspondence.
+fn project_boundary(
+    whole: &str,
+    left: &str,
+    right: &str,
+    partition: Option<(usize, usize)>,
+) -> usize {
     let mut whole_units = alignment_units(whole, false);
     let mut left_units = alignment_units(left, false);
     let mut right_units = alignment_units(right, false);
     // The partition can lie inside one coarse unit even with other correct
-    // words around it. Boundary probe units that form a prefix of that unit
-    // indicate insufficient resolution, NOT confirmed ownership. Keep the
-    // one-unit fallback for disagreement with no such textual match.
-    let scalar = left_units
-        .last()
-        .zip(right_units.first())
-        .is_some_and(|(left, right)| {
-            whole_units.len() == 1
-                || whole_units.iter().any(|unit| {
-                    unit.raw
-                        .strip_prefix(left.raw)
-                        .is_some_and(|rest| rest.starts_with(right.raw))
-                        || (!left.key.is_empty()
-                            && !right.key.is_empty()
-                            && unit
-                                .key
-                                .strip_prefix(left.key.as_str())
-                                .is_some_and(|rest| rest.starts_with(right.key.as_str())))
-                })
-        });
+    // words around it. An unmatched boundary probe also needs refinement: a
+    // typo must not prevent locating the other probe inside a coarse unit.
+    // Matching coarse words stay intact (including long repeated sequences).
+    // This is resolution selection, not evidence of confirmed ownership.
+    let unmatched = |probe: &AlignmentUnit<'_>| {
+        !whole_units
+            .iter()
+            .any(|unit| unit.raw == probe.raw || (!probe.key.is_empty() && unit.key == probe.key))
+    };
+    let scalar = left_units.last().is_some_and(unmatched)
+        || right_units.first().is_some_and(unmatched)
+        || left_units
+            .last()
+            .zip(right_units.first())
+            .is_some_and(|(left, right)| {
+                whole_units.len() == 1
+                    || whole_units.iter().any(|unit| {
+                        unit.raw
+                            .strip_prefix(left.raw)
+                            .is_some_and(|rest| rest.starts_with(right.raw))
+                            || (!left.key.is_empty()
+                                && !right.key.is_empty()
+                                && unit
+                                    .key
+                                    .strip_prefix(left.key.as_str())
+                                    .is_some_and(|rest| rest.starts_with(right.key.as_str())))
+                    })
+            });
     if scalar {
         // Use one shared resolution for ALL sequences, then only one global
         // edit-distance projection. Both modes retain the 2,048-unit cap and
@@ -793,18 +956,30 @@ fn align_boundary(whole: &str, left: &str, right: &str) -> usize {
     }
     let prefix = edit_costs(&left_units, &whole_units, false);
     let suffix = edit_costs(&right_units, &whole_units, true);
-    // A tie cannot establish true acoustic ownership. Prefer the better prefix
-    // fit so new repeated tail words cannot be assigned to old context merely
-    // because the tail grew; then use probe token counts as a deterministic
-    // prior. Neither rule is evidence of correct acoustic ownership.
-    let prior =
-        whole_units.len() * left_units.len() / (left_units.len() + right_units.len()).max(1);
+    // At eviction, use the known PCM partition as a positional tie prior.
+    // Probe omissions (even just one empty side) must not bias every unmatched
+    // whole unit into the replaceable tail. This assumes roughly even text
+    // density ONLY among equally good edit projections; it supplies no timing.
+    // Context exclusion instead keeps the probe-count prior behind prefix fit.
+    let probe_units = left_units.len() + right_units.len();
+    let prior = partition.map_or_else(
+        || whole_units.len() * left_units.len() / probe_units.max(1),
+        |(left_samples, samples)| (whole_units.len() * left_samples + samples / 2) / samples.max(1),
+    );
     let split = (0..=whole_units.len())
         .min_by_key(|index| {
+            let (first_tie, second_tie) = if partition.is_some() {
+                (index.abs_diff(prior), prefix[*index])
+            } else {
+                // A growing tail is not evidence of more old context: prefer
+                // the better prefix fit before the positional prior, preserving
+                // genuinely new occurrences of repeated words.
+                (prefix[*index], index.abs_diff(prior))
+            };
             (
                 prefix[*index] + suffix[whole_units.len() - *index],
-                prefix[*index],
-                index.abs_diff(prior),
+                first_tie,
+                second_tie,
                 *index,
             )
         })
@@ -978,6 +1153,16 @@ mod tests {
         is_moonshine_base: bool,
         fake: &impl VoiceSpeechTranscriber,
     ) -> Result<GatewayVoiceSessionPipelineOutcome, VoiceError> {
+        closed_input_mode(audio, packet_samples, is_moonshine_base, fake, false)
+    }
+
+    fn closed_input_mode(
+        audio: &[i16],
+        packet_samples: usize,
+        is_moonshine_base: bool,
+        fake: &impl VoiceSpeechTranscriber,
+        buffered: bool,
+    ) -> Result<GatewayVoiceSessionPipelineOutcome, VoiceError> {
         let store = GatewayVoiceSessionBufferStore::default();
         let cancellation = CancellationToken::new();
         let (_sender, receiver) = oneshot::channel();
@@ -1004,7 +1189,312 @@ mod tests {
                 .unwrap();
         }
         let _completion = store.finish_processing("session").unwrap();
-        process(&store, "session", &cancellation, fake, is_moonshine_base)
+        if buffered {
+            process_buffered(&store, "session", &cancellation, fake, is_moonshine_base)
+        } else {
+            process(&store, "session", &cancellation, fake, is_moonshine_base)
+        }
+    }
+
+    #[test]
+    fn buffered_full_recording_is_one_exact_call_across_packet_boundaries() {
+        // Longer than the incremental window, with a residual shorter than one
+        // VAD frame. Every sample is voiced; literal expected PCM is independent
+        // of the normalization/segmentation implementation under test.
+        let audio: Vec<i16> = (0..20 * 16000 + 137)
+            .map(|ix| 8000 + (ix % 4000) as i16)
+            .collect();
+        let expected: Vec<f32> = audio
+            .iter()
+            .map(|sample| f32::from(*sample) / 32768.0)
+            .collect();
+        for packet in [137, 480, 1599, 1600] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let capture = calls.clone();
+            let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
+                capture.lock().unwrap().push(buffer.flattened_samples());
+                Ok(" full recording ".to_owned())
+            }));
+            let outcome = closed_input_mode(&audio, packet, false, &fake, true).unwrap();
+            assert_eq!(*calls.lock().unwrap(), vec![expected.clone()]);
+            let GatewayVoiceSessionPipelineOutcome::Transcript {
+                transcript,
+                signal_stats,
+            } = outcome
+            else {
+                panic!("full transcript expected");
+            };
+            assert_eq!(transcript.text, "full recording");
+            assert_eq!(transcript.diagnostics.total_samples, audio.len());
+            assert_eq!(transcript.diagnostics.speech_samples, audio.len());
+            assert_eq!(signal_stats.total_samples, audio.len());
+            assert_eq!(
+                transcript.diagnostics.strategy,
+                VoiceTranscriptionStrategy::BufferedGatewaySession
+            );
+        }
+    }
+
+    #[test]
+    fn buffered_vad_joins_speech_once_without_replaying_long_pauses() {
+        let mut audio = vec![12000; 960];
+        audio.extend(vec![0; 480 * 40]);
+        audio.extend(vec![16000; 960 + 79]);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let capture = calls.clone();
+        let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
+            capture.lock().unwrap().push(buffer.flattened_samples());
+            Ok("joined".to_owned())
+        }));
+        closed_input_mode(&audio, 137, false, &fake, true).unwrap();
+        // Existing VAD: fifteen frames of hangover after first speech; fifteen
+        // preceding frames (fourteen noise + first onset) at the next onset.
+        let mut expected = vec![12000.0 / 32768.0; 960];
+        expected.extend(vec![0.0; 480 * (15 + 14)]);
+        expected.extend(vec![16000.0 / 32768.0; 960 + 79]);
+        assert_eq!(*calls.lock().unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn buffered_short_onset_tail_padding_silence_empty_text_and_failure() {
+        for source_samples in [1, 137, 479, 480, 481, 959, 960, 1599] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let capture = calls.clone();
+            let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
+                capture.lock().unwrap().push(buffer.flattened_samples());
+                Ok("short".to_owned())
+            }));
+            let outcome =
+                closed_input_mode(&vec![12000; source_samples], 137, true, &fake, true).unwrap();
+            let mut expected = vec![12000.0 / 32768.0; source_samples];
+            expected.resize(1600, 0.0);
+            assert_eq!(*calls.lock().unwrap(), vec![expected]);
+            let GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. } = outcome else {
+                panic!("short speech expected");
+            };
+            assert_eq!(transcript.diagnostics.total_samples, source_samples);
+            assert_eq!(transcript.diagnostics.speech_samples, source_samples);
+        }
+        let never = TestSpeechTranscriber(Arc::new(|_| panic!("silence must not call ASR")));
+        for (amplitude, is_moonshine_base) in [(0, false), (50, false), (0, true), (50, true)] {
+            for count in [0, 137, 960, 32000] {
+                let outcome = closed_input_mode(
+                    &vec![amplitude; count],
+                    137,
+                    is_moonshine_base,
+                    &never,
+                    true,
+                )
+                .unwrap();
+                let GatewayVoiceSessionPipelineOutcome::NoSpeech { no_speech, .. } = outcome else {
+                    panic!("silence or low-energy noise expected");
+                };
+                assert_eq!(no_speech.total_samples, count);
+            }
+        }
+        let empty = TestSpeechTranscriber(Arc::new(|_| Ok(" \n ".to_owned())));
+        assert!(matches!(
+            closed_input_mode(&[12000; 960], 137, false, &empty, true).unwrap(),
+            GatewayVoiceSessionPipelineOutcome::NoSpeech {
+                no_speech: VoiceTranscriptionNoSpeech {
+                    reason: VoiceTranscriptionNoSpeechReason::EmptyTranscript,
+                    ..
+                },
+                ..
+            }
+        ));
+        let failure = TestSpeechTranscriber(Arc::new(|_| {
+            Err(transcription_error(
+                VoiceTranscriptionErrorKind::RuntimeFailure,
+                "native failed",
+            ))
+        }));
+        assert!(closed_input_mode(&[12000; 960], 137, false, &failure, true).is_err());
+    }
+
+    fn append_test_packet(
+        store: &GatewayVoiceSessionBufferStore,
+        id: &str,
+        sequence: u64,
+        samples: &[i16],
+    ) -> super::super::session_buffer::VoiceChunkIngestReport {
+        let pcm: Vec<_> = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        store
+            .append_chunk(
+                VoiceChunkFrameHeader {
+                    session_id: id.to_owned(),
+                    sequence,
+                    sample_rate_hz: 16000,
+                    channels: 1,
+                    encoding: VoiceAudioEncoding::PcmS16Le,
+                    payload_len: pcm.len() as u64,
+                    captured_at_unix_ms: None,
+                    duration_ms: None,
+                },
+                pcm,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn buffered_commit_drains_unique_ordered_backlog_and_rejects_late_packets() {
+        let store = GatewayVoiceSessionBufferStore::default();
+        let token = CancellationToken::new();
+        let (_sender, receiver) = oneshot::channel();
+        store
+            .start_processing(
+                "session".to_owned(),
+                VoiceAudioFormat::pioneer_streaming_target(),
+                token.clone(),
+                receiver,
+            )
+            .unwrap();
+        append_test_packet(&store, "session", 0, &[8000; 1600]);
+        assert!(append_test_packet(&store, "session", 0, &[20000; 1600]).already_buffered);
+        assert_eq!(
+            append_test_packet(&store, "session", 3, &[12000; 1600]).missing_chunks,
+            2
+        );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured = calls.clone();
+        let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
+            captured.lock().unwrap().push(buffer.flattened_samples());
+            Ok("unique".to_owned())
+        }));
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| process_buffered(&store, "session", &token, &fake, false));
+            append_test_packet(&store, "session", 4, &[16000; 79]);
+            // The close and append boundary is the production inbox mutex.
+            let _completion = store.finish_processing("session").unwrap();
+            assert!(
+                store
+                    .append_chunk(
+                        VoiceChunkFrameHeader {
+                            session_id: "session".to_owned(),
+                            sequence: 5,
+                            sample_rate_hz: 16000,
+                            channels: 1,
+                            encoding: VoiceAudioEncoding::PcmS16Le,
+                            payload_len: 2,
+                            captured_at_unix_ms: None,
+                            duration_ms: None,
+                        },
+                        vec![0, 0]
+                    )
+                    .is_err()
+            );
+            let outcome = worker.join().unwrap().unwrap();
+            let GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. } = outcome else {
+                panic!("transcript expected");
+            };
+            assert_eq!(transcript.diagnostics.total_samples, 3279);
+            assert_eq!(transcript.diagnostics.speech_samples, 3279);
+        });
+        let mut expected = vec![8000.0 / 32768.0; 1600];
+        expected.extend(vec![12000.0 / 32768.0; 1600]);
+        expected.extend(vec![16000.0 / 32768.0; 79]);
+        assert_eq!(*calls.lock().unwrap(), vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn buffered_worker_waits_for_commit_and_retains_native_lease_on_cancel_or_shutdown() {
+        use super::super::supervisor::{EagerVoiceEngineLoader, FilesystemVoiceModelInstaller};
+        for shutdown in [false, true] {
+            let store = GatewayVoiceSessionBufferStore::default();
+            let workers = VoiceFinalizations::default();
+            let lease = workers.reserve(1).unwrap();
+            let other_leases: Vec<_> = (2..=4).map(|id| workers.reserve(id).unwrap()).collect();
+            let token = workers.shutdown.child_token();
+            let supervisor = Arc::new(VoiceInputSupervisor::new(
+                Arc::new(FilesystemVoiceModelInstaller::new(
+                    crate::isolated_test_app_config().unwrap(),
+                    std::path::PathBuf::new(),
+                )),
+                Arc::new(EagerVoiceEngineLoader),
+            ));
+            let (entered, mut native_entered) = tokio::sync::mpsc::unbounded_channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let released = Arc::new(Mutex::new(released));
+            let fake = Arc::new(move |buffer: &PreparedSpeechBuffer| {
+                entered.send(buffer.flattened_samples()).unwrap();
+                released.lock().unwrap().recv().unwrap();
+                Ok("must not escape cancellation".to_owned())
+            });
+            start(
+                store.clone(),
+                "session".to_owned(),
+                VoiceAudioFormat::pioneer_streaming_target(),
+                &workers,
+                lease,
+                SessionSpeechTranscriber {
+                    supervisor,
+                    generation: 0,
+                    is_moonshine_base: false,
+                    cancellation: token.clone(),
+                    fake: Some(fake),
+                },
+                false,
+            )
+            .unwrap();
+            for sequence in 0..40 {
+                append_test_packet(&store, "session", sequence, &[12000; 1600]);
+            }
+            assert!(native_entered.try_recv().is_err());
+            let completion = store.finish_processing("session").unwrap();
+            let native_pcm =
+                tokio::time::timeout(std::time::Duration::from_secs(5), native_entered.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(native_pcm, vec![12000.0 / 32768.0; 64000]);
+            if shutdown {
+                workers.close();
+                store.cancel_all();
+            } else {
+                store.remove_session("session").unwrap();
+            }
+            assert!(token.is_cancelled());
+            drop(completion);
+            // Even a dropped result receiver cannot free native capacity early.
+            assert!(workers.reserve(1).is_none());
+            assert!(workers.reserve(5).is_none());
+            release.send(()).unwrap();
+            drop(other_leases);
+            workers.tasks.close();
+            tokio::time::timeout(std::time::Duration::from_secs(5), workers.tasks.wait())
+                .await
+                .unwrap();
+            assert!(!workers.has_active_work());
+            assert!(native_entered.try_recv().is_err());
+            if !shutdown {
+                assert!(workers.reserve(1).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn buffered_cancel_before_commit_does_not_enter_inference() {
+        let store = GatewayVoiceSessionBufferStore::default();
+        let token = CancellationToken::new();
+        let (_sender, receiver) = oneshot::channel();
+        store
+            .start_processing(
+                "session".to_owned(),
+                VoiceAudioFormat::pioneer_streaming_target(),
+                token.clone(),
+                receiver,
+            )
+            .unwrap();
+        append_test_packet(&store, "session", 0, &[12000; 960]);
+        let fake = TestSpeechTranscriber(Arc::new(|_| panic!("cancelled input cannot call ASR")));
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| process_buffered(&store, "session", &token, &fake, false));
+            store.remove_session("session").unwrap();
+            assert!(worker.join().unwrap().is_err());
+        });
     }
 
     fn open_store() -> GatewayVoiceSessionBufferStore {
@@ -1470,6 +1960,95 @@ mod tests {
                     2 * MAX_SPEECH_WINDOW_SAMPLES + audio.len() - cut + 2 * LEFT_CONTEXT_SAMPLES
                 );
             }
+        }
+    }
+
+    #[test]
+    fn inexact_mixed_probes_keep_ownership_through_two_advances_and_commit() {
+        // Constant magnitude keeps VAD and the energy partition deterministic.
+        // The negative context identifies the second whole by its actual PCM,
+        // independently of invocation order. No decoder text is an expectation.
+        let mut audio = vec![12000_i16; 30 * 16000 + 7];
+        audio[144000..168000].fill(-12000);
+        let normalized: Vec<_> = audio.iter().map(|s| f32::from(*s) / 32768.0).collect();
+        for (left, right, context, timing) in [
+            ("ทดสอป", "ระบบ OK", "อบ", "none"),
+            ("ทดสอป", "ระบบ OK", "อบ", "coarse"),
+            ("ทดสอป", "ระบบ OK", "อบ", "nonfinite"),
+            ("", "ระบบ OK", "", "none"),
+            ("ทดสอป", "", "", "none"),
+            ("", "", "", "none"),
+            ("XXXXX", "YYYYYYYYYY", "", "none"),
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let captured = calls.clone();
+            let fake = HypothesisTranscriber(move |buffer: &PreparedSpeechBuffer| {
+                let samples = buffer.flattened_samples();
+                let count = samples.len();
+                let negative = samples[0] < 0.0;
+                let text = match (count, negative) {
+                    // The left typo used to suppress refinement and assign
+                    // zero bytes to the PCM about to be evicted.
+                    (288000, false) => "ทดสอบระบบ OK",
+                    (168000, false) => left,
+                    (120000, false) => right,
+                    (24000, true) => context,
+                    // The later OK is a real new occurrence; the first OK in
+                    // the final whole is technical replay of confirmed PCM.
+                    (288000, true) => "อบระบบ OK OK FIN",
+                    (180000, true) => "อบระบบ OK",
+                    (108000, false) => "OK FIN",
+                    (24000, false) => "OK",
+                    (180007, false) => "OK OK FIN fin.",
+                    _ => panic!("unexpected PCM span: {count}, negative={negative}"),
+                }
+                .to_owned();
+                let segments = match timing {
+                    "none" => None,
+                    _ => Some(vec![transcribe_rs::TranscriptionSegment {
+                        start: 0.0,
+                        end: if timing == "nonfinite" {
+                            f32::NAN
+                        } else {
+                            count as f32 / 16000.0
+                        },
+                        text: text.clone(),
+                    }]),
+                };
+                captured.lock().unwrap().push(samples);
+                Ok(VoiceSpeechHypothesis { text, segments })
+            });
+            let result = closed_input(&audio, 317, false, &fake).unwrap();
+            let GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. } = result else {
+                panic!("mixed transcript expected after two window advances");
+            };
+            assert_eq!(
+                transcript.text, "ทดสอบระบบ OK OK FIN fin.",
+                "{left:?}/{right:?}/{context:?}/{timing}"
+            );
+            assert_eq!(transcript.diagnostics.segment_count, 3);
+            assert_eq!(transcript.diagnostics.speech_samples, 480007);
+            assert_eq!(transcript.diagnostics.total_samples, 480007);
+            let calls = calls.lock().unwrap();
+            // Two disjoint partitions and their bounded context, then a changed
+            // final refresh after new source. No retry-until-agreement calls.
+            let spans = [
+                (0, 288000),
+                (0, 168000),
+                (168000, 288000),
+                (144000, 168000),
+                (144000, 432000),
+                (144000, 324000),
+                (324000, 432000),
+                (300000, 324000),
+                (300000, 480007),
+            ];
+            assert_eq!(calls.len(), spans.len());
+            for (call, (start, end)) in calls.iter().zip(spans) {
+                assert_eq!(call.as_slice(), &normalized[start..end]);
+                assert!(call.len() <= MAX_SPEECH_WINDOW_SAMPLES);
+            }
+            assert_eq!(calls.iter().map(Vec::len).sum::<usize>(), 1380007);
         }
     }
 
@@ -2351,70 +2930,84 @@ mod tests {
 
     #[test]
     fn voice_incremental_two_sessions_keep_audio_and_results_separate() {
-        let store = GatewayVoiceSessionBufferStore::default();
-        let cancellation = CancellationToken::new();
-        for (id, amplitude, count) in [("first", 12000_i16, 967), ("second", 6000_i16, 1)] {
-            let (_sender, receiver) = oneshot::channel();
-            store
-                .start_processing(
-                    id.to_owned(),
-                    VoiceAudioFormat::pioneer_streaming_target(),
-                    cancellation.child_token(),
-                    receiver,
+        for buffered in [false, true] {
+            let store = GatewayVoiceSessionBufferStore::default();
+            let cancellation = CancellationToken::new();
+            for (id, amplitude, count) in [("first", 12000_i16, 967), ("second", 6000_i16, 1)] {
+                let (_sender, receiver) = oneshot::channel();
+                store
+                    .start_processing(
+                        id.to_owned(),
+                        VoiceAudioFormat::pioneer_streaming_target(),
+                        cancellation.child_token(),
+                        receiver,
+                    )
+                    .unwrap();
+                let pcm: Vec<_> = std::iter::repeat_n(amplitude, count)
+                    .flat_map(i16::to_le_bytes)
+                    .collect();
+                store
+                    .append_chunk(
+                        VoiceChunkFrameHeader {
+                            session_id: id.to_owned(),
+                            sequence: 0,
+                            sample_rate_hz: 16000,
+                            channels: 1,
+                            encoding: VoiceAudioEncoding::PcmS16Le,
+                            payload_len: pcm.len() as u64,
+                            captured_at_unix_ms: None,
+                            duration_ms: None,
+                        },
+                        pcm,
+                    )
+                    .unwrap();
+                let _completion = store.finish_processing(id).unwrap();
+            }
+            let first = TestSpeechTranscriber(Arc::new(|buffer| {
+                assert_eq!(buffer.flattened_samples(), vec![12000.0 / 32768.0; 967]);
+                Ok("first result".to_owned())
+            }));
+            let second = TestSpeechTranscriber(Arc::new(|buffer| {
+                assert_eq!(buffer.flattened_samples(), vec![6000.0 / 32768.0]);
+                Ok("second result".to_owned())
+            }));
+            let (first, second) = std::thread::scope(|scope| {
+                let first = scope.spawn(|| {
+                    if buffered {
+                        process_buffered(&store, "first", &cancellation, &first, false)
+                    } else {
+                        process(&store, "first", &cancellation, &first, false)
+                    }
+                });
+                let second = scope.spawn(|| {
+                    if buffered {
+                        process_buffered(&store, "second", &cancellation, &second, false)
+                    } else {
+                        process(&store, "second", &cancellation, &second, false)
+                    }
+                });
+                (
+                    first.join().unwrap().unwrap(),
+                    second.join().unwrap().unwrap(),
                 )
-                .unwrap();
-            let pcm: Vec<_> = std::iter::repeat_n(amplitude, count)
-                .flat_map(i16::to_le_bytes)
-                .collect();
-            store
-                .append_chunk(
-                    VoiceChunkFrameHeader {
-                        session_id: id.to_owned(),
-                        sequence: 0,
-                        sample_rate_hz: 16000,
-                        channels: 1,
-                        encoding: VoiceAudioEncoding::PcmS16Le,
-                        payload_len: pcm.len() as u64,
-                        captured_at_unix_ms: None,
-                        duration_ms: None,
-                    },
-                    pcm,
-                )
-                .unwrap();
-            let _completion = store.finish_processing(id).unwrap();
+            });
+            let GatewayVoiceSessionPipelineOutcome::Transcript {
+                transcript: first, ..
+            } = first
+            else {
+                panic!("first transcript");
+            };
+            let GatewayVoiceSessionPipelineOutcome::Transcript {
+                transcript: second, ..
+            } = second
+            else {
+                panic!("second transcript");
+            };
+            assert_eq!(first.text, "first result");
+            assert_eq!(second.text, "second result");
+            assert_eq!(first.diagnostics.total_samples, 967);
+            assert_eq!(second.diagnostics.total_samples, 1);
         }
-        let first = TestSpeechTranscriber(Arc::new(|buffer| {
-            assert_eq!(buffer.flattened_samples(), vec![12000.0 / 32768.0; 967]);
-            Ok("first result".to_owned())
-        }));
-        let second = TestSpeechTranscriber(Arc::new(|buffer| {
-            assert_eq!(buffer.flattened_samples(), vec![6000.0 / 32768.0]);
-            Ok("second result".to_owned())
-        }));
-        let (first, second) = std::thread::scope(|scope| {
-            let first = scope.spawn(|| process(&store, "first", &cancellation, &first, false));
-            let second = scope.spawn(|| process(&store, "second", &cancellation, &second, false));
-            (
-                first.join().unwrap().unwrap(),
-                second.join().unwrap().unwrap(),
-            )
-        });
-        let GatewayVoiceSessionPipelineOutcome::Transcript {
-            transcript: first, ..
-        } = first
-        else {
-            panic!("first transcript");
-        };
-        let GatewayVoiceSessionPipelineOutcome::Transcript {
-            transcript: second, ..
-        } = second
-        else {
-            panic!("second transcript");
-        };
-        assert_eq!(first.text, "first result");
-        assert_eq!(second.text, "second result");
-        assert_eq!(first.diagnostics.total_samples, 967);
-        assert_eq!(second.diagnostics.total_samples, 1);
     }
 
     #[test]

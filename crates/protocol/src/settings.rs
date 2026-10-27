@@ -210,10 +210,12 @@ pub struct GatewayVoiceInputRuntimeSnapshot {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayVoiceInputSettings {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_transcribe_while_recording")]
+    pub transcribe_while_recording: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<GatewayVoiceInputProvider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,10 +224,28 @@ pub struct GatewayVoiceInputSettings {
     pub runtime: GatewayVoiceInputRuntimeSnapshot,
 }
 
+const fn default_transcribe_while_recording() -> bool {
+    true
+}
+
+impl Default for GatewayVoiceInputSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            transcribe_while_recording: true,
+            provider: None,
+            model: None,
+            runtime: GatewayVoiceInputRuntimeSnapshot::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayVoiceInputSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcribe_while_recording: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<Option<GatewayVoiceInputProvider>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -445,6 +465,8 @@ pub enum GatewayThreadEpisodicVectorProvider {
     OpenAi,
     #[serde(rename = "openrouter")]
     OpenRouter,
+    #[serde(rename = "vercel-ai-gateway")]
+    VercelAiGateway,
     #[serde(rename = "local")]
     Local,
 }
@@ -676,6 +698,9 @@ impl Default for GatewayRemoteAccessTransport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayRemoteAccessStatusSnapshot {
+    /// Present only for the currently authenticated relay connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<crate::GatewayBaseUrl>,
     #[serde(default)]
     pub state: GatewayRemoteAccessState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -694,6 +719,7 @@ pub struct GatewayRemoteAccessStatusChangedNotification {
 impl Default for GatewayRemoteAccessStatusSnapshot {
     fn default() -> Self {
         Self {
+            public_base_url: None,
             state: GatewayRemoteAccessState::Disabled,
             error_kind: None,
             message: None,
@@ -1229,6 +1255,10 @@ mod tests {
                 GatewayThreadEpisodicVectorProvider::OpenRouter,
                 "openai/text-embedding-3-small",
             ),
+            (
+                GatewayThreadEpisodicVectorProvider::VercelAiGateway,
+                "private/team-embedding",
+            ),
         ] {
             let settings = GatewayThreadEpisodicVectorSearchSettings {
                 enabled: true,
@@ -1393,6 +1423,7 @@ mod tests {
 
         assert_eq!(snapshot.voice_input, GatewayVoiceInputSettings::default());
         assert!(!snapshot.voice_input.enabled);
+        assert!(snapshot.voice_input.transcribe_while_recording);
         assert_eq!(snapshot.voice_input.provider, None);
         assert_eq!(snapshot.voice_input.model, None);
         assert_eq!(
@@ -1406,6 +1437,7 @@ mod tests {
     fn voice_input_settings_and_update_roundtrip_without_artifact_metadata() {
         let settings = GatewayVoiceInputSettings {
             enabled: true,
+            transcribe_while_recording: false,
             provider: Some(GatewayVoiceInputProvider::Local),
             model: Some("parakeet-tdt-0.6b-v3".to_owned()),
             runtime: GatewayVoiceInputRuntimeSnapshot {
@@ -1429,6 +1461,7 @@ mod tests {
 
         let update = GatewayVoiceInputSettingsUpdate {
             enabled: Some(true),
+            transcribe_while_recording: Some(false),
             provider: Some(Some(GatewayVoiceInputProvider::Local)),
             model: Some(Some("parakeet-tdt-0.6b-v3".to_owned())),
             retry_install: true,
@@ -1442,6 +1475,25 @@ mod tests {
         let default_update = serde_json::to_value(GatewayVoiceInputSettingsUpdate::default())
             .expect("default voice update should serialize");
         assert!(default_update.get("retry_install").is_none());
+        assert!(default_update.get("transcribe_while_recording").is_none());
+    }
+
+    #[test]
+    fn voice_mode_omission_defaults_incremental_but_update_omission_is_not_a_reset() {
+        let settings: GatewayVoiceInputSettings = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "provider": "local",
+            "model": "small"
+        }))
+        .unwrap();
+        assert!(settings.transcribe_while_recording);
+        let partial: GatewayVoiceInputSettingsUpdate =
+            serde_json::from_value(serde_json::json!({"model":"moonshine-base"})).unwrap();
+        assert_eq!(partial.transcribe_while_recording, None);
+        let explicit: GatewayVoiceInputSettingsUpdate =
+            serde_json::from_value(serde_json::json!({"transcribe_while_recording": false}))
+                .unwrap();
+        assert_eq!(explicit.transcribe_while_recording, Some(false));
     }
 
     #[test]

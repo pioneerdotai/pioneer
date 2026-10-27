@@ -77,6 +77,7 @@ pub enum GatewayNotification {
     ThreadUpdated(ThreadUpdatedNotification),
     ThreadParticipantsChanged(ThreadParticipantsChangedNotification),
     ThreadTreeChanged(ThreadTreeChangedNotification),
+    WorkspacePush(crate::WorkspacePushNotification),
     ThreadAgentsDocChanged(ThreadAgentsDocChangedNotification),
     ThreadTimelineBlocksChanged(ThreadTimelineBlocksChangedNotification),
     ThreadReadCursorChanged(ThreadReadCursorChangedNotification),
@@ -179,9 +180,26 @@ impl GatewayNotification {
     pub fn from_jsonrpc(notification: JsonRpcNotification) -> Option<Self> {
         let method = notification.method;
 
-        let params = notification.params?;
+        let params = match notification.params {
+            Some(params) => params,
+            // Losing even an empty/omitted scoped frame requires reconciliation;
+            // do not silently discard it before the shared recovery owner sees it.
+            None if method == events::WORKSPACE_PUSH_CHANGED => {
+                return Some(Self::Unknown(unknown_notification(
+                    method,
+                    serde_json::Value::Null,
+                )));
+            }
+            None => return None,
+        };
 
         match method.as_str() {
+            events::WORKSPACE_PUSH_CHANGED => {
+                match serde_json::from_value::<crate::WorkspacePushNotification>(params.clone()) {
+                    Ok(notification) => Some(Self::WorkspacePush(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
             events::ACCESS_CHANGED => {
                 match serde_json::from_value::<AccessChangedNotification>(params.clone()) {
                     Ok(notification) => Some(Self::AccessChanged(notification)),

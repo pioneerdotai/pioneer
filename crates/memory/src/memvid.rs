@@ -330,26 +330,27 @@ impl MemoryBackend for MemvidMemoryBackend {
         let options = put_options(&request, &resolved, frame_uri.as_str());
         let path_for_task = path.clone();
         let frame_uri_for_task = frame_uri.clone();
-        let outcome = tokio::task::spawn_blocking(move || -> Result<MemvidPutOutcome> {
-            let mut memvid = open_or_create_memvid(path_for_task.as_path())?;
-            match memvid.frame_by_uri(frame_uri_for_task.as_str()) {
-                Ok(frame) if frame.status == FrameStatus::Active => {
-                    memvid.update_frame(frame.id, Some(content), options, None)?;
+        let outcome =
+            pioneer_observability::work::spawn_blocking(move || -> Result<MemvidPutOutcome> {
+                let mut memvid = open_or_create_memvid(path_for_task.as_path())?;
+                match memvid.frame_by_uri(frame_uri_for_task.as_str()) {
+                    Ok(frame) if frame.status == FrameStatus::Active => {
+                        memvid.update_frame(frame.id, Some(content), options, None)?;
+                    }
+                    _ => {
+                        memvid.put_bytes_with_options(content.as_slice(), options)?;
+                    }
                 }
-                _ => {
-                    memvid.put_bytes_with_options(content.as_slice(), options)?;
-                }
-            }
-            memvid.commit()?;
-            let frame = memvid.frame_by_uri(frame_uri_for_task.as_str())?;
-            let stats = memvid.stats()?;
-            Ok(MemvidPutOutcome {
-                frame_id: frame.id,
-                active_frame_count: stats.active_frame_count,
+                memvid.commit()?;
+                let frame = memvid.frame_by_uri(frame_uri_for_task.as_str())?;
+                let stats = memvid.stats()?;
+                Ok(MemvidPutOutcome {
+                    frame_id: frame.id,
+                    active_frame_count: stats.active_frame_count,
+                })
             })
-        })
-        .await
-        .context("memvid put task failed")??;
+            .await
+            .context("memvid put task failed")??;
 
         let capsule = self
             .refresh_capsule_count(
@@ -406,21 +407,23 @@ impl MemoryBackend for MemvidMemoryBackend {
         };
         let path_for_task = path.clone();
         let frame_uri_for_task = frame_uri.clone();
-        let loaded = tokio::task::spawn_blocking(move || -> Result<Option<MemvidGetOutcome>> {
-            let mut memvid = open_read_only_memvid(path_for_task.as_path())?;
-            let frame = match memvid.frame_by_uri(frame_uri_for_task.as_str()) {
-                Ok(frame) if frame.status == FrameStatus::Active => frame,
-                Ok(_) => return Ok(None),
-                Err(_) => return Ok(None),
-            };
-            let payload = memvid.frame_canonical_payload(frame.id)?;
-            let content = decode_payload(payload.as_slice())?;
-            Ok(Some(MemvidGetOutcome {
-                content,
-                frame_id: frame.id,
-                metadata: frame.extra_metadata,
-            }))
-        })
+        let loaded = pioneer_observability::work::spawn_blocking(
+            move || -> Result<Option<MemvidGetOutcome>> {
+                let mut memvid = open_read_only_memvid(path_for_task.as_path())?;
+                let frame = match memvid.frame_by_uri(frame_uri_for_task.as_str()) {
+                    Ok(frame) if frame.status == FrameStatus::Active => frame,
+                    Ok(_) => return Ok(None),
+                    Err(_) => return Ok(None),
+                };
+                let payload = memvid.frame_canonical_payload(frame.id)?;
+                let content = decode_payload(payload.as_slice())?;
+                Ok(Some(MemvidGetOutcome {
+                    content,
+                    frame_id: frame.id,
+                    metadata: frame.extra_metadata,
+                }))
+            },
+        )
         .await
         .context("memvid get task failed")??;
 
@@ -511,8 +514,8 @@ impl MemoryBackend for MemvidMemoryBackend {
                 memvid_search_request(query, per_capsule_limit as usize, DEFAULT_SNIPPET_CHARS);
             let scope_key_hash = resolved.scope_key_hash.clone();
             let scope_kind = scope_kind_to_db(resolved.scope.kind).to_owned();
-            let capsule_hits_result =
-                tokio::task::spawn_blocking(move || -> Result<Vec<BackendSearchHit>> {
+            let capsule_hits_result = pioneer_observability::work::spawn_blocking(
+                move || -> Result<Vec<BackendSearchHit>> {
                     let mut memvid = open_read_only_memvid(path_for_task.as_path())?;
                     let response = memvid.search(search_request)?;
                     Ok(response
@@ -526,9 +529,10 @@ impl MemoryBackend for MemvidMemoryBackend {
                             )
                         })
                         .collect())
-                })
-                .await
-                .context("memvid search task failed")?;
+                },
+            )
+            .await
+            .context("memvid search task failed")?;
             let capsule_hits = match capsule_hits_result {
                 Ok(capsule_hits) => capsule_hits,
                 Err(error) => {
@@ -617,43 +621,45 @@ impl MemoryBackend for MemvidMemoryBackend {
         let path_for_task = path.clone();
         let frame_id = request.frame_id;
         let frame_uri_for_task = frame_uri.clone();
-        let outcome = tokio::task::spawn_blocking(move || -> Result<MemvidDeleteOutcome> {
-            let mut memvid = Memvid::open(path_for_task.as_path())?;
-            let frame = if let Some(frame_id) = frame_id {
-                let frame = memvid
-                    .frame_by_id(u64::try_from(frame_id).context("negative memvid frame id")?)?;
-                if frame.uri.as_deref() == Some(frame_uri_for_task.as_str())
-                    && frame.status == FrameStatus::Active
-                {
-                    Some(frame)
+        let outcome =
+            pioneer_observability::work::spawn_blocking(move || -> Result<MemvidDeleteOutcome> {
+                let mut memvid = Memvid::open(path_for_task.as_path())?;
+                let frame = if let Some(frame_id) = frame_id {
+                    let frame = memvid.frame_by_id(
+                        u64::try_from(frame_id).context("negative memvid frame id")?,
+                    )?;
+                    if frame.uri.as_deref() == Some(frame_uri_for_task.as_str())
+                        && frame.status == FrameStatus::Active
+                    {
+                        Some(frame)
+                    } else {
+                        memvid
+                            .frame_by_uri(frame_uri_for_task.as_str())
+                            .ok()
+                            .filter(|candidate| candidate.status == FrameStatus::Active)
+                    }
                 } else {
                     memvid
                         .frame_by_uri(frame_uri_for_task.as_str())
                         .ok()
                         .filter(|candidate| candidate.status == FrameStatus::Active)
-                }
-            } else {
-                memvid
-                    .frame_by_uri(frame_uri_for_task.as_str())
-                    .ok()
-                    .filter(|candidate| candidate.status == FrameStatus::Active)
-            };
+                };
 
-            let Some(frame) = frame else {
-                return Ok(MemvidDeleteOutcome {
-                    deleted: false,
+                let Some(frame) = frame else {
+                    return Ok(MemvidDeleteOutcome {
+                        deleted: false,
+                        active_frame_count: memvid.stats()?.active_frame_count,
+                    });
+                };
+                memvid.delete_frame(frame.id)?;
+                memvid.commit()?;
+                Ok(MemvidDeleteOutcome {
+                    deleted: true,
                     active_frame_count: memvid.stats()?.active_frame_count,
-                });
-            };
-            memvid.delete_frame(frame.id)?;
-            memvid.commit()?;
-            Ok(MemvidDeleteOutcome {
-                deleted: true,
-                active_frame_count: memvid.stats()?.active_frame_count,
+                })
             })
-        })
-        .await
-        .context("memvid delete task failed")??;
+            .await
+            .context("memvid delete task failed")??;
 
         self.refresh_capsule_count(
             capsule,
@@ -700,6 +706,7 @@ pub fn memvid_search_request(
     snippet_chars: usize,
 ) -> SearchRequest {
     SearchRequest {
+        query_embedding: None,
         query: query.into(),
         top_k,
         snippet_chars,

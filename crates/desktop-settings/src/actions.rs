@@ -152,6 +152,13 @@ impl SettingsScreenView {
         self.intent(SettingsIntent::VoiceRetry);
         true
     }
+    pub fn apply_voice_input_transcribe_while_recording(
+        &mut self,
+        enabled: bool,
+        _: &mut Context<Self>,
+    ) {
+        self.intent(SettingsIntent::VoiceTranscribeWhileRecording { enabled });
+    }
     pub fn active_workspace_file_opener(&self, cx: &App) -> FileOpenerId {
         self.config
             .platform

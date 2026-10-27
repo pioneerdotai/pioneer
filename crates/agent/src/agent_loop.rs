@@ -12,6 +12,7 @@ use crate::hooks::{
 };
 use futures_util::FutureExt;
 use pioneer_hooks::{HookRuntime, TurnPostTurnStatus};
+use pioneer_observability::work::{Boundary, ExecutorRole, Outcome, WorkCarrier, WorkKind};
 use pioneer_protocol::{
     AgentDurableEvent, ExecutionWindowStatus, NativeTerminalEffectGate, NativeTerminalEffectKind,
     NativeTerminalEffectPayload, NativeTerminalEffectPreparation, NativeTerminalEffectSpec,
@@ -198,6 +199,92 @@ where
     Box::pin(future)
 }
 
+// One logical guard shared only by its actor and current execution window.
+// This is not another registry: finish takes the existing WorkGuard once.
+// The per-owner mutex is used on terminal/drop only, never per poll or IO.
+#[derive(Clone, Default)]
+struct TurnWorkOwner(Option<Arc<std::sync::Mutex<TurnWorkState>>>);
+struct TurnWorkState {
+    live: Option<pioneer_observability::live::WorkGuard>,
+    work: WorkCarrier,
+}
+impl TurnWorkOwner {
+    fn new(work: &WorkCarrier) -> Self {
+        Self(work.context().map(|context| {
+            Arc::new(std::sync::Mutex::new(TurnWorkState {
+                live: Some(pioneer_observability::live::WorkGuard::start(
+                    Some(context),
+                    false,
+                )),
+                work: work.clone(),
+            }))
+        }))
+    }
+    fn carrier(&self) -> WorkCarrier {
+        self.0.as_ref().map_or_else(WorkCarrier::default, |owner| {
+            let state = owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.live.is_some() {
+                state.work.clone()
+            } else {
+                WorkCarrier::default()
+            }
+        })
+    }
+    fn cancelled(&self) {
+        // Actual window Drop is sticky, while the actor still owns cleanup.
+        // The bounded memory-only update creates no entry and performs no IO.
+        if let Some(owner) = self.0.as_ref() {
+            let state = owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(live) = state.live.as_ref() {
+                live.cancel_on_finish();
+            }
+        }
+    }
+    fn finish(&self, outcome: Outcome) {
+        let Some(owner) = self.0.as_ref() else {
+            return;
+        };
+        let (live, work) = {
+            let mut state = owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (state.live.take(), std::mem::take(&mut state.work))
+        };
+        // Release inherited DB/causal metadata and the owner mutex before
+        // touching the shared live store. All finish paths are idempotent.
+        drop(work);
+        if let Some(mut live) = live {
+            live.finish(outcome);
+        }
+    }
+}
+impl Drop for TurnWorkOwner {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.finish(Outcome::Panicked);
+        }
+    }
+}
+struct TurnTaskObservation {
+    owner: TurnWorkOwner,
+    returned: bool,
+}
+impl Drop for TurnTaskObservation {
+    fn drop(&mut self) {
+        if !self.returned {
+            if std::thread::panicking() {
+                self.owner.finish(Outcome::Panicked);
+            } else {
+                self.owner.cancelled();
+            }
+        }
+    }
+}
+
 pub(super) async fn run_agent_loop(
     thread_id: String,
     workspace_id: String,
@@ -224,6 +311,9 @@ pub(super) async fn run_agent_loop(
     let mut active_recovery: Option<RecoveryAttemptContext> = None;
     let mut last_turn_observation: Option<(String, super::ExecutionTurnObservation)> = None;
     let mut next_turn_run_id: u64 = 1;
+    // One logical turn entry spans execution windows AND the actor's durable
+    // terminal handling. Per-poll execution scopes lease that same token.
+    let mut active_turn_live: Option<TurnWorkOwner> = None;
 
     macro_rules! handle_loop_commit {
         ($outcome:expr) => {
@@ -254,11 +344,13 @@ pub(super) async fn run_agent_loop(
                     continue;
                 }
                 LoopDurableCommitOutcome::CooperativeCancellation => {
+                    if let Some(live) = active_turn_live.take() { live.finish(Outcome::Cancelled); }
                     // Cooperative process control alone is not a durable result.
                     debug!(thread_id = %thread_id, "stopping agent loop after cooperative commit cancellation");
                     return;
                 }
                 LoopDurableCommitOutcome::PermanentRejection { .. } => {
+                    if let Some(live) = active_turn_live.take() { live.finish(Outcome::Failed); }
                     // The publisher emitted the one ERROR for this refusal.
                     debug!(thread_id = %thread_id, "stopping agent loop after permanent durable event rejection");
                     return;
@@ -267,17 +359,25 @@ pub(super) async fn run_agent_loop(
         };
     }
 
+    macro_rules! turn_work {
+        () => {
+            active_turn_live
+                .as_ref()
+                .map_or_else(WorkCarrier::default, TurnWorkOwner::carrier)
+        };
+    }
     macro_rules! commit_or_stop {
         ($event:expr $(,)?) => {
             handle_loop_commit!(
-                publish_loop_durable_event(
-                    event_hub.as_ref(),
-                    $event,
-                    active_turn_control
-                        .as_ref()
-                        .map(TurnExecutionControl::cancellation_token)
-                )
-                .await
+                turn_work!()
+                    .scope(publish_loop_durable_event(
+                        event_hub.as_ref(),
+                        $event,
+                        active_turn_control
+                            .as_ref()
+                            .map(TurnExecutionControl::cancellation_token)
+                    ))
+                    .await
             );
         };
     }
@@ -285,7 +385,11 @@ pub(super) async fn run_agent_loop(
     // Cooperative cancellation must not cancel a terminal commit.
     macro_rules! commit_terminal_or_stop {
         ($event:expr $(,)?) => {
-            handle_loop_commit!(publish_loop_durable_event(event_hub.as_ref(), $event, None).await);
+            handle_loop_commit!(
+                turn_work!()
+                    .scope(publish_loop_durable_event(event_hub.as_ref(), $event, None))
+                    .await
+            );
         };
     }
 
@@ -297,9 +401,10 @@ pub(super) async fn run_agent_loop(
                     turn_id = %$turn_id,
                     "terminal transition lost its immutable runtime snapshot"
                 );
+                if let Some(live) = active_turn_live.take() { live.finish(Outcome::Failed); }
                 return;
             };
-            let preparation = terminal_effect_preparation(
+            let preparation = turn_work!().run(|| terminal_effect_preparation(
                 workspace_id.as_str(),
                 thread_id.as_str(),
                 $turn_id.as_str(),
@@ -307,7 +412,7 @@ pub(super) async fn run_agent_loop(
                 snapshot,
                 $dispatch,
                 $cleanup,
-            );
+            ));
             commit_terminal_or_stop!(AgentDurableEvent::NativeTerminalEffectsPrepared {
                 preparation,
             });
@@ -319,6 +424,11 @@ pub(super) async fn run_agent_loop(
             if let (Some(turn_id), Some(run_id)) = (active_turn_id.as_deref(), active_turn_run_id) {
                 control_plane.clear(turn_id, run_id);
             }
+            // ProviderFailure has no local observation; all other normal
+            // terminals finish explicitly in record_turn_observation below.
+            if let Some(live) = active_turn_live.take() {
+                live.finish(Outcome::Failed);
+            }
             active_turn_id = None;
             active_turn_run_id = None;
             active_turn_control = None;
@@ -329,6 +439,19 @@ pub(super) async fn run_agent_loop(
     macro_rules! record_turn_observation {
         ($turn_id:expr, $observation:expr $(,)?) => {{
             let observation = $observation;
+            let outcome = match observation.status {
+                super::ExecutionTurnStatus::InProgress => None,
+                super::ExecutionTurnStatus::Completed => Some(Outcome::Completed),
+                super::ExecutionTurnStatus::Interrupted => Some(Outcome::Cancelled),
+                super::ExecutionTurnStatus::Blocked | super::ExecutionTurnStatus::Failed => {
+                    Some(Outcome::Failed)
+                }
+            };
+            if let Some(outcome) = outcome {
+                if let Some(live) = active_turn_live.take() {
+                    live.finish(outcome);
+                }
+            }
             if let Some(run_id) = active_turn_run_id {
                 control_plane.set_observation($turn_id.as_str(), run_id, observation.clone());
             }
@@ -337,6 +460,17 @@ pub(super) async fn run_agent_loop(
     }
 
     while let Some(command) = command_rx.recv().await {
+        let command = match command {
+            AgentCommand::CancelTurn {
+                expected_run_id: Some(expected),
+                ack,
+                ..
+            } if active_turn_run_id != Some(expected) => {
+                let _ = ack.send(Err(super::AgentControlError::TurnMismatch));
+                continue;
+            }
+            command => command,
+        };
         // Retain the completed turn's Stop fence without owning background
         // preparation. Durable registration already happened before provider
         // execution and the Gateway worker owns all later work.
@@ -364,6 +498,7 @@ pub(super) async fn run_agent_loop(
         }
         match command {
             AgentCommand::StartTurn {
+                work,
                 turn_id,
                 mode,
                 hook_runtime_context,
@@ -473,13 +608,23 @@ pub(super) async fn run_agent_loop(
                 last_turn_observation = None;
                 let task_recovery = None;
 
-                let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
+                let mut turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
+                turn_control.initial_cancellation_registration =
+                    turn_request.execution_window_index == 1;
                 active_turn_control = Some(turn_control.clone());
                 control_plane.activate(turn_id.clone(), run_id, turn_control.clone());
 
                 active_turn_run_id = Some(run_id);
 
+                let work = work.received(
+                    Boundary::MessageFreshTask,
+                    WorkKind::RpcTurn,
+                    ExecutorRole::Gateway,
+                );
+                active_turn_live = Some(TurnWorkOwner::new(&work));
                 active_turn_task = Some(ActiveTurnTask::new(spawn_turn_task(
+                    work,
+                    active_turn_live.clone().unwrap_or_default(),
                     command_tx.clone(),
                     event_hub.clone(),
                     thread_id.clone(),
@@ -626,6 +771,9 @@ pub(super) async fn run_agent_loop(
                                 turn_id = %turn_id,
                                 "turn continuation lost its immutable runtime snapshot"
                             );
+                            if let Some(live) = active_turn_live.take() {
+                                live.finish(Outcome::Failed);
+                            }
                             return;
                         };
                         let total_budget = runtime_snapshot_for_continuation
@@ -814,10 +962,15 @@ pub(super) async fn run_agent_loop(
                                 turn_id = %turn_id,
                                 "turn continuation lost its immutable runtime snapshot"
                             );
+                            if let Some(live) = active_turn_live.take() {
+                                live.finish(Outcome::Failed);
+                            }
                             return;
                         };
 
                         active_turn_task = Some(ActiveTurnTask::new(spawn_turn_task(
+                            turn_work!(),
+                            active_turn_live.clone().unwrap_or_default(),
                             command_tx.clone(),
                             event_hub.clone(),
                             thread_id.clone(),
@@ -1004,6 +1157,9 @@ pub(super) async fn run_agent_loop(
             AgentCommand::CancelTurn {
                 turn_id,
                 reason,
+                expected_run_id: _,
+                completion_ack,
+                cancellation_owner,
                 ack,
             } => {
                 if let Some(outcome) = ack.completed() {
@@ -1030,11 +1186,13 @@ pub(super) async fn run_agent_loop(
                     control.cancel_all_attempts();
                 }
 
-                // The caller is acknowledging process-control admission, not
-                // waiting for a second terminal lifecycle publication. The
-                // Gateway has already committed Interrupted before issuing
-                // this command, while the actor must remain free to finish
-                // cooperative shutdown and its durable terminal obligations.
+                let durable_cancellation = active_turn_control
+                    .as_ref()
+                    .is_some_and(|control| control.has_durable_cancellation(&turn_id));
+                // ACK only process admission of the accepted control command.
+                // Both ordinary Task cancellation and generation-bound Gateway
+                // Stop leave durable publication with this actor. Only the
+                // separate completion receipt confirms canonical completion.
                 let _ = ack.send(Ok(()));
 
                 if let Some(task) = active_turn_task.take() {
@@ -1044,9 +1202,6 @@ pub(super) async fn run_agent_loop(
                 let runtime_snapshot = active_runtime_snapshot.clone();
                 let recovery = active_recovery.clone();
                 let reason_for_dispatch = reason.clone();
-                let durable_cancellation = active_turn_control
-                    .as_ref()
-                    .is_some_and(|control| control.has_durable_cancellation(&turn_id));
                 if !durable_cancellation {
                     // A direct caller may cancel during the initial registration
                     // ACK. Finish registration from the captured turn context;
@@ -1057,6 +1212,9 @@ pub(super) async fn run_agent_loop(
                             event_kind = "turn_interrupted",
                             "native cancellation lost its immutable runtime context"
                         );
+                        if let Some(live) = active_turn_live.take() {
+                            live.finish(Outcome::Failed);
+                        }
                         return;
                     };
                     let context_dispatch = synthesize_post_turn_failure_dispatch(
@@ -1087,11 +1245,17 @@ pub(super) async fn run_agent_loop(
                                     .is_some_and(|r| r.execution_window_index == 1),
                         }
                     );
+                }
+                if !durable_cancellation || cancellation_owner.is_some() {
+                    // The actor keeps the existing durable publication obligation
+                    // after process ACK, through registration and canonical acceptance.
+                    // A generation-bound Stop carries the exact Gateway owner fence.
                     commit_terminal_or_stop!(AgentDurableEvent::TurnInterrupted {
                         thread_id: thread_id.clone(),
                         turn_id: turn_id.clone(),
                         reason,
                         recovery,
+                        cancellation_owner,
                     },);
                 }
                 record_turn_observation!(
@@ -1101,6 +1265,9 @@ pub(super) async fn run_agent_loop(
                         message: Some(reason_for_dispatch),
                     },
                 );
+                if let Some(completion_ack) = completion_ack {
+                    let _ = completion_ack.send(());
+                }
                 clear_active_turn_control!();
                 active_turn_request = None;
                 active_recovery = None;
@@ -1122,7 +1289,7 @@ pub(super) async fn run_agent_loop(
                 };
                 let _ = ack.send(Ok(observation));
             }
-            AgentCommand::StartRecoveryAttempt { request, ack } => {
+            AgentCommand::StartRecoveryAttempt { work, request, ack } => {
                 if let Some(outcome) = ack.completed() {
                     let _ = ack.send(outcome);
                     continue;
@@ -1194,7 +1361,15 @@ pub(super) async fn run_agent_loop(
                     let recovery = recovery_context(&request);
                     active_recovery = Some(recovery.clone());
 
+                    let work = work.received(
+                        Boundary::MessageFreshTask,
+                        WorkKind::RpcTurn,
+                        ExecutorRole::Gateway,
+                    );
+                    active_turn_live = Some(TurnWorkOwner::new(&work));
                     active_turn_task = Some(ActiveTurnTask::new(spawn_turn_task(
+                        work,
+                        active_turn_live.clone().unwrap_or_default(),
                         command_tx.clone(),
                         event_hub.clone(),
                         thread_id.clone(),
@@ -1360,7 +1535,15 @@ pub(super) async fn run_agent_loop(
                 active_turn_control = Some(turn_control.clone());
                 control_plane.activate(request.turn_id.clone(), run_id, turn_control.clone());
 
+                let work = work.received(
+                    Boundary::MessageFreshTask,
+                    WorkKind::RpcTurn,
+                    ExecutorRole::Gateway,
+                );
+                active_turn_live = Some(TurnWorkOwner::new(&work));
                 active_turn_task = Some(ActiveTurnTask::new(spawn_turn_task(
+                    work,
+                    active_turn_live.clone().unwrap_or_default(),
                     command_tx.clone(),
                     event_hub.clone(),
                     thread_id.clone(),
@@ -1375,6 +1558,7 @@ pub(super) async fn run_agent_loop(
                 )));
             }
             AgentCommand::StartRestoredRecoveryTurn {
+                work,
                 turn_request,
                 recovery_request,
                 ack,
@@ -1485,7 +1669,15 @@ pub(super) async fn run_agent_loop(
                 last_runtime_snapshot = Some(runtime_snapshot.clone());
                 active_recovery = Some(recovery.clone());
 
+                let work = work.received(
+                    Boundary::MessageFreshTask,
+                    WorkKind::RpcTurn,
+                    ExecutorRole::Gateway,
+                );
+                active_turn_live = Some(TurnWorkOwner::new(&work));
                 active_turn_task = Some(ActiveTurnTask::new(spawn_turn_task(
+                    work,
+                    active_turn_live.clone().unwrap_or_default(),
                     command_tx.clone(),
                     event_hub.clone(),
                     thread_id.clone(),
@@ -1505,6 +1697,9 @@ pub(super) async fn run_agent_loop(
                 if active_turn_id.as_deref() == Some(&turn_id) && active_turn_run_id == Some(run_id)
                 {
                     // Registration emitted the single safe ERROR. No provider ran.
+                    if let Some(live) = active_turn_live.take() {
+                        live.finish(Outcome::Failed);
+                    }
                     return;
                 }
             }
@@ -1522,6 +1717,8 @@ pub(super) async fn run_agent_loop(
 }
 
 fn spawn_turn_task(
+    work: WorkCarrier,
+    observation: TurnWorkOwner,
     command_tx: mpsc::Sender<AgentCommand>,
     event_hub: Arc<AgentEventHub>,
     thread_id: String,
@@ -1534,168 +1731,203 @@ fn spawn_turn_task(
     recovery: Option<RecoveryAttemptContext>,
     run_id: u64,
 ) -> JoinHandle<()> {
+    let observation = TurnTaskObservation {
+        owner: observation,
+        returned: false,
+    };
     tokio::spawn(turn_flow_future(async move {
-        // Admission ACK remains process control; provider/tool work cannot begin
-        // until its immutable cancellation description has a durable ACK.
-        let initial_turn = recovery.is_none() && turn_request.execution_window_index == 1;
-        let cancellation_dispatch = if initial_turn {
-            synthesize_post_turn_failure_dispatch(
-                &workspace_id,
-                &thread_id,
-                &turn_request.turn_id,
-                Some(&turn_request),
-                TurnPostTurnStatus::Interrupted,
-                String::new(),
-            )
-        } else {
-            None
-        };
-        let mut cancellation_context =
-            crate::post_turn::identify_native_cancellation(terminal_effect_preparation(
-                &workspace_id,
-                &thread_id,
-                &turn_request.turn_id,
-                run_id,
-                &runtime_snapshot,
-                cancellation_dispatch,
-                Some(String::new()),
-            ));
-        if !initial_turn {
-            cancellation_context.effects.clear();
-        }
-        if let Some((batch_id, _)) = turn_control.restored_recovery.as_ref() {
-            // The durable delivery identity must distinguish restored attempts,
-            // even when a replacement actor restarts its local run counter.
-            cancellation_context.batch_id = batch_id.clone();
-        }
-        match publish_loop_durable_event(
-            &event_hub,
-            AgentDurableEvent::NativeCancellationContextPrepared {
-                preparation: cancellation_context,
-                initial_turn,
-            },
-            Some(turn_control.cancellation_token()),
-        )
-        .await
-        {
-            LoopDurableCommitOutcome::Committed => {}
-            LoopDurableCommitOutcome::PermanentRejection { .. } => {
-                let _ = command_tx
-                    .send(AgentCommand::DurableStartRejected {
-                        turn_id: turn_request.turn_id.clone(),
-                        run_id,
-                    })
-                    .await;
-                return;
+        let mut observation = observation;
+        let outcome = AssertUnwindSafe(work.scope_outcome(async move {
+            // Admission ACK remains process control; provider/tool work cannot begin
+            // until its immutable cancellation description has a durable ACK.
+            let initial_turn = recovery.is_none() && turn_request.execution_window_index == 1;
+            let cancellation_dispatch = if initial_turn {
+                synthesize_post_turn_failure_dispatch(
+                    &workspace_id,
+                    &thread_id,
+                    &turn_request.turn_id,
+                    Some(&turn_request),
+                    TurnPostTurnStatus::Interrupted,
+                    String::new(),
+                )
+            } else {
+                None
+            };
+            let mut cancellation_context =
+                crate::post_turn::identify_native_cancellation(terminal_effect_preparation(
+                    &workspace_id,
+                    &thread_id,
+                    &turn_request.turn_id,
+                    run_id,
+                    &runtime_snapshot,
+                    cancellation_dispatch,
+                    Some(String::new()),
+                ));
+            if !initial_turn {
+                cancellation_context.effects.clear();
             }
-            _ => return,
-        }
-
-        let NativeTurnRuntimeSnapshot {
-            context_controller,
-            generation: _,
-            tool_loop_config,
-            mcp_tool_provider,
-            turn_tool_provider,
-            turn_finalization_provider,
-            task_tool_provider,
-            task_cleanup_runtime_contract: _,
-            hook_runtime,
-            tool_bundle_artifacts,
-            post_turn_hook_dispatch_policy: _,
-            interrupted_hook_snapshot: _,
-            permission_approval_broker,
-        } = runtime_snapshot;
-        let missing_context_recovery = turn_request.execution_options.context_overflow_recovery
-            && context_controller.is_none();
-        let context_session = context_controller.map(|controller| {
-            Arc::new(crate::compaction::controller::NativeContextSession::new(
-                crate::compaction::controller::NativeContext {
-                    overflow_recovery: turn_request.execution_options.context_overflow_recovery,
-                    recovery_deadline_ms: turn_request
-                        .execution_options
-                        .context_recovery_deadline_ms,
-                    workspace_id: workspace_id.clone(),
-                    thread_id: thread_id.clone(),
-                    turn_id: turn_request.turn_id.clone(),
-                    conversation_thread_id: turn_request
-                        .hook_runtime_context
-                        .conversation_thread_id
-                        .clone(),
-                    provider_instance: turn_request.provider_name.clone(),
-                    provider: provider.clone(),
-                    events: event_hub.clone(),
-                    cancellation: turn_control.cancellation_token(),
+            if let Some((batch_id, _)) = turn_control.restored_recovery.as_ref() {
+                // The durable delivery identity must distinguish restored attempts,
+                // even when a replacement actor restarts its local run counter.
+                cancellation_context.batch_id = batch_id.clone();
+            }
+            match publish_loop_durable_event(
+                &event_hub,
+                AgentDurableEvent::NativeCancellationContextPrepared {
+                    preparation: cancellation_context,
+                    initial_turn,
                 },
-                controller,
-            ))
-        });
-        let result = AssertUnwindSafe(turn_flow_future(execute_turn_flow(
-            missing_context_recovery,
-            context_session.clone(),
-            thread_id.clone(),
-            turn_request.turn_id.clone(),
-            workspace_id,
-            turn_request.mode,
-            provider_registry,
-            provider,
-            turn_request.model,
-            turn_request.hook_runtime_context,
-            turn_request.reasoning,
-            turn_request.workspace_skill_policies,
-            turn_request.skill_catalog,
-            turn_request.agent_skill_overlay,
-            turn_request.input,
-            turn_request.capabilities,
-            turn_request.resolved_artifacts,
-            turn_request.runtime_environment,
-            turn_request.history,
-            turn_request.retained_provider_history,
-            turn_request.execution_window_index,
-            turn_request.execution_checkpoint_context,
-            turn_request.permission_profile,
-            turn_request.execution_security_snapshot,
-            turn_request.execution_options.force_non_stream,
-            turn_request.execution_options.disable_tool_calling,
-            turn_request.execution_options.continue_generation_hint,
-            tool_loop_config,
-            mcp_tool_provider,
-            turn_tool_provider,
-            turn_finalization_provider,
-            task_tool_provider,
-            hook_runtime,
-            tool_bundle_artifacts,
-            permission_approval_broker,
-            turn_control,
-            recovery,
-            event_hub,
-        )))
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|panic| {
-            let message = panic_payload_message(panic.as_ref());
-            error!(
-                thread_id = %thread_id,
-                turn_id = %turn_request.turn_id,
-                message,
-                "agent turn task panicked"
-            );
-            TurnTaskCompletion {
-                result: Err(TurnTaskFailure::Terminal(format!(
-                    "agent turn task panicked: {message}"
-                ))),
-                post_turn_dispatch: None,
+                Some(turn_control.cancellation_token()),
+            )
+            .await
+            {
+                LoopDurableCommitOutcome::Committed => {
+                    turn_control
+                        .cancellation_context_registered
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                LoopDurableCommitOutcome::PermanentRejection { .. } => {
+                    let _ = command_tx
+                        .send(AgentCommand::DurableStartRejected {
+                            turn_id: turn_request.turn_id.clone(),
+                            run_id,
+                        })
+                        .await;
+                    return Outcome::Failed;
+                }
+                LoopDurableCommitOutcome::CooperativeCancellation
+                | LoopDurableCommitOutcome::SupersededByDurableInterruption => {
+                    return Outcome::Cancelled;
+                }
             }
-        });
 
-        let _ = command_tx
-            .send(AgentCommand::TurnTaskFinished {
-                turn_id: turn_request.turn_id,
-                run_id,
-                completion: result,
-                context_session,
-            })
+            let NativeTurnRuntimeSnapshot {
+                context_controller,
+                generation: _,
+                tool_loop_config,
+                mcp_tool_provider,
+                turn_tool_provider,
+                turn_finalization_provider,
+                task_tool_provider,
+                task_cleanup_runtime_contract: _,
+                hook_runtime,
+                tool_bundle_artifacts,
+                post_turn_hook_dispatch_policy: _,
+                interrupted_hook_snapshot: _,
+                permission_approval_broker,
+            } = runtime_snapshot;
+            let missing_context_recovery = turn_request.execution_options.context_overflow_recovery
+                && context_controller.is_none();
+            let context_session = context_controller.map(|controller| {
+                Arc::new(crate::compaction::controller::NativeContextSession::new(
+                    crate::compaction::controller::NativeContext {
+                        overflow_recovery: turn_request.execution_options.context_overflow_recovery,
+                        recovery_deadline_ms: turn_request
+                            .execution_options
+                            .context_recovery_deadline_ms,
+                        workspace_id: workspace_id.clone(),
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_request.turn_id.clone(),
+                        conversation_thread_id: turn_request
+                            .hook_runtime_context
+                            .conversation_thread_id
+                            .clone(),
+                        provider_instance: turn_request.provider_name.clone(),
+                        provider: provider.clone(),
+                        events: event_hub.clone(),
+                        cancellation: turn_control.cancellation_token(),
+                    },
+                    controller,
+                ))
+            });
+            let attempted = AssertUnwindSafe(turn_flow_future(execute_turn_flow(
+                missing_context_recovery,
+                context_session.clone(),
+                thread_id.clone(),
+                turn_request.turn_id.clone(),
+                workspace_id,
+                turn_request.mode,
+                provider_registry,
+                provider,
+                turn_request.model,
+                turn_request.hook_runtime_context,
+                turn_request.reasoning,
+                turn_request.workspace_skill_policies,
+                turn_request.skill_catalog,
+                turn_request.agent_skill_overlay,
+                turn_request.input,
+                turn_request.capabilities,
+                turn_request.resolved_artifacts,
+                turn_request.runtime_environment,
+                turn_request.history,
+                turn_request.retained_provider_history,
+                turn_request.execution_window_index,
+                turn_request.execution_checkpoint_context,
+                turn_request.permission_profile,
+                turn_request.execution_security_snapshot,
+                turn_request.execution_options.force_non_stream,
+                turn_request.execution_options.disable_tool_calling,
+                turn_request.execution_options.continue_generation_hint,
+                tool_loop_config,
+                mcp_tool_provider,
+                turn_tool_provider,
+                turn_finalization_provider,
+                task_tool_provider,
+                hook_runtime,
+                tool_bundle_artifacts,
+                permission_approval_broker,
+                turn_control,
+                recovery,
+                event_hub,
+            )))
+            .catch_unwind()
             .await;
+            let panicked = attempted.is_err();
+            let result = attempted.unwrap_or_else(|panic| {
+                let message = panic_payload_message(panic.as_ref());
+                error!(
+                    thread_id = %thread_id,
+                    turn_id = %turn_request.turn_id,
+                    message,
+                    "agent turn task panicked"
+                );
+                TurnTaskCompletion {
+                    result: Err(TurnTaskFailure::Terminal(format!(
+                        "agent turn task panicked: {message}"
+                    ))),
+                    post_turn_dispatch: None,
+                }
+            });
+
+            // A cancellation request alone is not an operation outcome. The
+            // actor's Interrupted terminal / actual task Drop supplies Cancelled;
+            // a completed turn must not be relabelled by a late token signal.
+            let outcome = if panicked {
+                Outcome::Panicked
+            } else if result.result.is_err() {
+                Outcome::Failed
+            } else {
+                Outcome::Completed
+            };
+            let _ = command_tx
+                .send(AgentCommand::TurnTaskFinished {
+                    turn_id: turn_request.turn_id,
+                    run_id,
+                    completion: result,
+                    context_session,
+                })
+                .await;
+            outcome
+        }))
+        .catch_unwind()
+        .await;
+        observation.returned = true;
+        if let Err(panic) = outcome {
+            // Preserve the original unhandled task panic/control semantics,
+            // while retiring observation even before execute_turn_flow's catch.
+            observation.owner.finish(Outcome::Panicked);
+            std::panic::resume_unwind(panic);
+        }
     }))
 }
 
@@ -2246,6 +2478,104 @@ mod tests {
             thread_id: "thread_1".to_owned(),
             turn_id: turn_id.to_owned(),
             recovery: None,
+        }
+    }
+
+    #[test]
+    fn turn_task_observation_drop_and_unhandled_panic_retire_shared_owner_once() {
+        use pioneer_observability::{
+            live::{self, JournalPayload, WorkState},
+            work::{Boundary, ExecutorRole, Outcome, Trigger, WorkCarrier, WorkKind},
+        };
+        let _lock = crate::TURN_OBSERVATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                pioneer_observability::set_telemetry_enabled(self.0);
+            }
+        }
+        let _restore = Restore(pioneer_observability::telemetry_enabled());
+        for expected in [Outcome::Completed, Outcome::Cancelled, Outcome::Panicked] {
+            pioneer_observability::set_telemetry_enabled(false);
+            pioneer_observability::set_telemetry_enabled(true);
+            let work = WorkCarrier::independent(
+                Boundary::MessageFreshTask,
+                WorkKind::RpcTurn,
+                Trigger::Event,
+                ExecutorRole::Gateway,
+            );
+            let context = work.context().unwrap();
+            let owner = super::TurnWorkOwner::new(&work);
+            let mut task = super::TurnTaskObservation {
+                owner: owner.clone(),
+                returned: false,
+            };
+            match expected {
+                Outcome::Completed => {
+                    task.returned = true;
+                    drop(task);
+                    assert!(
+                        live::snapshot()
+                            .unwrap()
+                            .active
+                            .iter()
+                            .any(|entry| entry.context.token == context.token),
+                        "normal window return keeps logical actor ownership"
+                    );
+                    owner.finish(Outcome::Completed);
+                }
+                Outcome::Cancelled => {
+                    drop(task); // includes a never-polled window
+                    assert!(
+                        live::snapshot()
+                            .unwrap()
+                            .active
+                            .iter()
+                            .any(|entry| entry.context.token == context.token),
+                        "actor still owns real cancellation cleanup"
+                    );
+                    owner.finish(Outcome::Completed); // late success cannot erase actual window Drop
+                }
+                Outcome::Panicked => {
+                    assert!(
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                            let _task = task;
+                            panic!("pre-flow fixture panic");
+                        }))
+                        .is_err()
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                owner.carrier().context().is_none(),
+                "later actor cleanup cannot resurrect finished work"
+            );
+            owner.carrier().run(|| {});
+            owner.finish(Outcome::Completed); // late normal completion is inert
+            let snapshot = live::snapshot().unwrap();
+            assert!(
+                snapshot
+                    .active
+                    .iter()
+                    .all(|entry| entry.context.token != context.token)
+            );
+            let terminals: Vec<_> = snapshot
+                .journal
+                .iter()
+                .filter_map(|record| match &record.payload {
+                    JournalPayload::Work(entry) if entry.context.token == context.token => {
+                        match entry.state {
+                            WorkState::Terminal(outcome) => Some(outcome),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(terminals, [expected]);
         }
     }
 

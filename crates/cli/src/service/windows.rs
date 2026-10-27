@@ -32,8 +32,9 @@ pub fn start_gateway_service(
         $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         $action = New-ScheduledTaskAction -Execute 'powershell' -Argument $actionArgs
         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
         $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
-        Register-ScheduledTask -TaskName '{task_name_escaped}' -Action $action -Trigger $trigger -Settings $settings -Description 'Persistent Pioneer gateway service' -User $user -RunLevel Limited -Force | Out-Null
+        Register-ScheduledTask -TaskName '{task_name_escaped}' -Action $action -Trigger $trigger -Settings $settings -Description 'Persistent Pioneer gateway service' -Principal $principal -Force | Out-Null
         Start-ScheduledTask -TaskName '{task_name_escaped}'"#
         ))
     })?;
@@ -162,7 +163,6 @@ mod tests {
     use super::{WINDOWS_LOGON_TASK_SCOPE_WARNING_CODE, logon_task_scope_warnings};
     use crate::service::ServiceSettings;
     use pioneer_config::InstallManagedBy;
-    use std::path::PathBuf;
 
     #[test]
     fn logon_task_scope_warning_is_suppressed_for_desktop_managed_installs() {
@@ -182,8 +182,6 @@ mod tests {
         ServiceSettings {
             service_name: "com.pioneer.gateway.test".to_owned(),
             legacy_service_names: Vec::new(),
-            runtime_home_dir: PathBuf::from("C:\\Users\\Test\\Pioneer"),
-            macos_background_item_name: "Pioneer".to_owned(),
             macos_associated_bundle_identifier: "ai.pioneer.test".to_owned(),
             managed_by,
         }

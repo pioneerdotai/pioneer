@@ -930,6 +930,7 @@ const fn resource_supports_action(access: ResolvedResourceAccess, action: Resour
         ResolvedResourceAccess::Thread(_) => matches!(
             action,
             ResourceAction::ThreadRead
+                | ResourceAction::ThreadObserveWorkspace
                 | ResourceAction::MessageCreate
                 | ResourceAction::MessageEditOwn
                 | ResourceAction::MessageDeleteOwn
@@ -1098,12 +1099,13 @@ mod tests {
         WorkspaceAccessFacts,
     };
 
-    const MEMBER_RESOURCE_ACTIONS: [ResourceAction; 65] = [
+    const MEMBER_RESOURCE_ACTIONS: [ResourceAction; 66] = [
         ResourceAction::WorkspaceList,
         ResourceAction::WorkspaceRead,
         ResourceAction::ThreadCreatePrivate,
         ResourceAction::ThreadCreateWorkspace,
         ResourceAction::ThreadRead,
+        ResourceAction::ThreadObserveWorkspace,
         ResourceAction::MessageCreate,
         ResourceAction::MessageEditOwn,
         ResourceAction::MessageDeleteOwn,

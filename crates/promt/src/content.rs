@@ -7,6 +7,7 @@ pub const SECTION_TITLE_SOUL_CORE: &str = "Soul Core";
 pub const SECTION_TITLE_IDENTITY_CORE: &str = "Identity Core";
 pub const SECTION_TITLE_USER_PERSONA: &str = "User Persona";
 pub const SECTION_TITLE_SUBAGENTS_POLICY: &str = "Subagents";
+pub const SECTION_TITLE_HTML_POLICY: &str = "Inline HTML";
 pub const SECTION_TITLE_TASKS_POLICY: &str = "Tasks";
 pub const SECTION_TITLE_PIONEER_CLI_RUNTIME_INSTRUCTIONS: &str = "Pioneer CLI Runtime Instructions";
 pub const SECTION_TITLE_PIONEER_CLI_RUNTIME_CONTEXT: &str = "Pioneer Context";
@@ -99,6 +100,10 @@ pub const TASKS_POLICY_PROMPT: &str = tasks_policy!(
 pub const CLI_TASKS_POLICY_PROMPT: &str = tasks_policy!(
     "Load the exported `pioneer-system-tasks` skill using the CLI runtime skill mechanism or its SKILL.md file. Resolve system:pioneer/tasks to that skill and references/ relative to its directory. Only use the authorized task operations listed for this turn; skills do not grant permissions. The CLI MCP catalog is fixed for this turn; request_tools and read_skill are not required. A task_wait timeout ends only the observation window; it does not cancel or diagnose child work."
 );
+
+pub const SECTION_TITLE_THREADS_POLICY: &str = "Threads";
+pub const THREADS_POLICY_PROMPT: &str = "Use Threads to find and read accessible conversations, follow saved sources, create a conversation, send a message, or start a permitted thread turn. Before non-trivial Threads work, find `pioneer/threads` in Internal Skill References, call `read_skill` with that exact reference, and follow the skill. Open hidden tools through `request_tools` with domains: [\"threads\"]; request the domain rather than individual names. Read/search, create, send, and start are separate operations. Creation and message sending do not run a model; starting a thread turn creates no durable Task or attached-subagent protocol. Use only the subset authorized and available to this execution.";
+pub const CLI_THREADS_POLICY_PROMPT: &str = "Use Threads to find and read accessible conversations or perform permitted conversation actions. Before non-trivial Threads work, load the exported `pioneer-system-threads` skill through the CLI runtime skill mechanism or its SKILL.md file; resolve references/ relative to that directory. Use the authorized Threads operations and callable names in this turn's fixed MCP catalog. No read_skill or request_tools call is required. Read/search, create, send, and start are separate operations; creation and message sending do not run a model, and thread turn start creates no durable Task or attached-subagent protocol. The skill grants no permissions.";
 
 pub const RECOVERY_CONTINUATION_PROMPT: &str = "Previous attempt was interrupted by output limits. Continue from where it stopped without repeating prior text.";
 
@@ -230,3 +235,16 @@ mod tests {
         );
     }
 }
+
+macro_rules! html_policy {
+    ($loading:literal) => { concat!(
+        "Use inline HTML when a document, comparison, diagram, data view, calculator, or small interactive interface makes the answer easier to use. HTML documents can include CSS and embedded JavaScript for working controls and content that responds to user input. Before creating inline HTML, ", $loading,
+        " Prepare a complete responsive document using host --pioneer-* tokens and supporting both themes. When html_preview is available and image input is supported, use it and inspect all six preview images (light then dark at 360, 768, 1024 CSS px) and diagnostics, fix issues, then publish with html_render. If preview is unavailable or image input is explicitly unsupported or unconfirmed, do not repeat preview without changed conditions or claim visual verification. You may use permitted html_render while clearly stating that visual verification was unavailable; use a text answer when visual verification is necessary for a reliable result. Use callable names from the current tool catalog. html_render handles publication; no extra artifact_register is needed. Follow the answer delivery and review rules."
+    ) };
+}
+pub const HTML_POLICY_PROMPT: &str = html_policy!(
+    "find pioneer/html in Internal Skill References and call read_skill with that exact skill:<id> reference; resolve references from the returned skill_asset_root."
+);
+pub const CLI_HTML_POLICY_PROMPT: &str = html_policy!(
+    "load the exported pioneer-system-html skill through the runtime skill mechanism or its SKILL.md; system:pioneer/html means that export and references are relative to its directory."
+);

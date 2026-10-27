@@ -1,3 +1,13 @@
+mod thread_search;
+pub use thread_search::{
+    ThreadsSearchFragment, ThreadsSearchPageFragment, ThreadsSearchParams, ThreadsSearchResponse,
+    ThreadsSearchSource, ThreadsSearchThread,
+};
+mod thread_read;
+pub use thread_read::{
+    ThreadHistoryAnchor, ThreadHistoryDirection, ThreadsChildrenListParams,
+    ThreadsHistoryReadParams, ThreadsListParams,
+};
 mod thread_tool_result;
 pub use thread_tool_result::{
     ThreadToolResultCursor, ThreadToolResultReadParams, ThreadToolResultReadResponse,
@@ -37,6 +47,11 @@ pub use recovery_diagnostic::{
     RecoveryStopReason,
 };
 mod schema;
+mod scoped_push;
+pub use scoped_push::{
+    TaskInboxPatch, ThreadIndicatorPatch, ThreadMetadataPatch, WorkspacePushNotification,
+    WorkspacePushParams, WorkspacePushResponse,
+};
 mod settings;
 mod skills;
 mod system_assets;
@@ -82,8 +97,9 @@ pub use agent_launch::{
     AgentExecutionProfileProjection, AgentExecutionProfileSelection, AgentExecutionSelection,
     AgentIdentitySelection, AgentLaunchSelection, AgentLaunchSelectionError,
     AgentStartOptionsProjection, AgentStartTarget, ChildAgentLaunchGrantMigrationError,
-    ChildAgentLaunchGrantSet, ChildAgentLaunchGrantSetError, ReasoningCeiling, StartAgentIntent,
-    migrate_embedded_child_launch_grant_json_to_current,
+    ChildAgentLaunchGrantSet, ChildAgentLaunchGrantSetError, StartAgentIntent,
+    agent_execution_profile_is_no_wider, agent_identity_has_same_launch_source,
+    migrate_embedded_child_launch_grant_json_to_current, validate_selected_agent_launch_profile,
 };
 pub use agent_route::{
     AgentDelegationRouteCreateParams, AgentDelegationRouteListParams,
@@ -93,15 +109,17 @@ pub use agent_route::{
     AgentRouteStatus, AgentRouteValidationError, validate_agent_route_graph,
 };
 pub use agent_tools::{
-    AgentControlTaskToolInput, AgentCreateThreadToolInput, AgentModelToolCatalogEntry,
+    AgentCatalogFragment, AgentControlTaskToolInput, AgentCreateThreadToolInput,
+    AgentIdentityModelsToolInput, AgentIdentityModelsToolResult, AgentModelToolCatalogEntry,
     AgentModelToolName, AgentPublicOutcome, AgentResultToolInput, AgentReviewTaskToolInput,
     AgentScheduleTaskToolInput, AgentSendMessageToolInput, AgentStartOptionsToolInput,
-    AgentStartToolInput, AgentTaskToolInput, AgentToolBackendKind, AgentToolCapability,
-    AgentToolIdentityChoice, AgentToolIdentityOption, AgentToolLaunchSelection,
-    AgentToolOptionsProjection, AgentToolProfileChoice, AgentToolProfileOption,
-    AgentToolResultStatus, AgentToolSafeResult, AgentToolTargetOption,
-    AgentToolThreadCreationOption, AgentWaitToolInput, agent_start_options_catalog_entry,
-    project_agent_model_tool_catalog,
+    AgentStartOptionsToolResult, AgentStartToolInput, AgentTaskToolInput, AgentToolBackendKind,
+    AgentToolCapability, AgentToolExecutorModels, AgentToolIdentityChoice, AgentToolIdentityOption,
+    AgentToolLaunchSelection, AgentToolModelOption, AgentToolOptionsProjection,
+    AgentToolProfileChoice, AgentToolProfileOption, AgentToolResultStatus, AgentToolSafeResult,
+    AgentToolTargetOption, AgentToolThreadCreationOption, AgentWaitToolInput,
+    agent_identity_models_catalog_entry, agent_start_options_catalog_entry,
+    agent_turn_start_catalog_entry, project_agent_model_tool_catalog,
 };
 pub use app_url::{
     PIONEER_DEVELOPMENT_URL_SCHEME, PIONEER_PRODUCTION_URL_SCHEME, PioneerAppUrlScheme,
@@ -381,32 +399,34 @@ pub use task::{
     TaskDependencyCondition, TaskDependencyTriggerMode, TaskDependencyTriggerPolicy,
     TaskDetachParams, TaskDetachResponse, TaskDetachedNotification, TaskError, TaskErrorClass,
     TaskEvent, TaskEventPayload, TaskEventsParams, TaskEventsResponse, TaskExecutorKind,
-    TaskExternalTriggerFilter, TaskFailedNotification, TaskGetParams, TaskGetResponse,
-    TaskLifecyclePolicy, TaskListParams, TaskListResponse, TaskManualActor, TaskMetadata,
-    TaskNotificationContext, TaskOperatorDeliveries, TaskOperatorDetails, TaskOwnerKind,
-    TaskParentTerminalAction, TaskPauseParams, TaskPauseResponse, TaskPausedNotification,
-    TaskProgressDetails, TaskProgressNotification, TaskQueuedNotification,
-    TaskRecoveredNotification, TaskRescheduleParams, TaskRescheduleReason, TaskRescheduleResponse,
+    TaskExternalTriggerFilter, TaskFailedNotification, TaskFinishParams, TaskFinishRequest,
+    TaskFinishResponse, TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams,
+    TaskListResponse, TaskManualActor, TaskMetadata, TaskNotificationContext,
+    TaskOperatorDeliveries, TaskOperatorDetails, TaskOwnerKind, TaskParentTerminalAction,
+    TaskPauseParams, TaskPauseResponse, TaskPausedNotification, TaskProgressDetails,
+    TaskProgressNotification, TaskQueuedNotification, TaskRecoveredNotification,
+    TaskRescheduleParams, TaskRescheduleReason, TaskRescheduleResponse,
     TaskRescheduledNotification, TaskResourceBudget, TaskResult, TaskResultCandidate,
     TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
     TaskResultReviewEventKind, TaskResultReviewResolutionStrategy, TaskResultReviewerKind,
     TaskResultReviewerRef, TaskResultReviewerSpec, TaskResumeParams, TaskResumeResponse,
     TaskResumedNotification, TaskRetryBackoffKind, TaskRetryPolicy, TaskReviseParams,
     TaskReviseResponse, TaskRun, TaskRunCompletedNotification, TaskRunCreatedNotification,
-    TaskRunExecution, TaskRunExecutionStatus, TaskRunFailedNotification,
+    TaskRunExecution, TaskRunExecutionStatus, TaskRunFailedNotification, TaskRunInputEncoding,
     TaskRunStartedNotification, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
-    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskScheduledNotification, TaskSchema,
-    TaskStatus, TaskThreadLineage, TaskTimeoutPolicy, TaskTree, TaskTreeChangedNotification,
-    TaskTreeParams, TaskTreeResponse, TaskTrigger, TaskTriggerCatchUpMode,
-    TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
-    TaskTriggerStatus, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskUpdatedNotification,
-    TaskUserNotification, TaskUserNotificationAcknowledgeParams,
+    TaskRunTriggerInput, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus,
+    TaskScheduledNotification, TaskSchema, TaskStatus, TaskThreadLineage, TaskTimeoutPolicy,
+    TaskTree, TaskTreeChangedNotification, TaskTreeParams, TaskTreeResponse, TaskTrigger,
+    TaskTriggerCatchUpMode, TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind,
+    TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse,
+    TaskUpdatedNotification, TaskUserNotification, TaskUserNotificationAcknowledgeParams,
     TaskUserNotificationAcknowledgeResponse, TaskUserNotificationDeliveredNotification,
     TaskUserNotificationListParams, TaskUserNotificationListResponse, TaskValue, TaskWaitItem,
     TaskWaitMode, TaskWaitNonWaitableItem, TaskWaitNonWaitableReason, TaskWaitParams,
     TaskWaitResponse, TaskWaitReviewAction, TaskWaitReviewItem, TaskWaitRevisionBlockedReason,
-    TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus,
-    ThreadLineage, task_delivery_id_from_result_item_id, task_delivery_result_item_id,
+    TaskWebhookScope, TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind,
+    TaskWriteLockStatus, ThreadLineage, task_delivery_id_from_result_item_id,
+    task_delivery_result_item_id,
 };
 pub use task_actor::{
     TaskActorContract, TaskActorContractError, TaskDeliveryActorContract,
@@ -449,25 +469,25 @@ pub use thread_file::{
     THREAD_FILE_VIEW_MAX_BYTES, ThreadFileViewGrantCreateParams, ThreadFileViewGrantCreateResponse,
 };
 pub use timeline::{
-    ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams, ThreadTimelinePageResponse,
-    TimelineBlock, TimelineBlockKind, TimelineChangeReason, TimelineCursor, TimelinePageAnchor,
-    TimelinePageInfo, TimelineReplySummary, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
-    TurnWorkItemsChangedNotification, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
-    TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState,
-    TurnWorkStateChangedNotification, TurnWorkTombstone,
+    CodexRetryNotice, ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams,
+    ThreadTimelinePageResponse, TimelineBlock, TimelineBlockKind, TimelineChangeReason,
+    TimelineCursor, TimelinePageAnchor, TimelinePageInfo, TimelineReplySummary, TurnWorkBlock,
+    TurnWorkItem, TurnWorkItemStatus, TurnWorkItemsChangedNotification, TurnWorkItemsGetParams,
+    TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation,
+    TurnWorkState, TurnWorkStateChangedNotification, TurnWorkTombstone,
 };
 pub use turn::{
     AgentExecutionBackend, AgentMessagePhase, BackendSecurityCapabilities, ByteRange,
-    CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy, ContextCompressedNotification,
-    ContextCompressingNotification, DeltaOutputPolicy, DiagnosticExcerptPolicy,
-    EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT, EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
-    EmptyStrictObligationCollector, ExecutionCheckpointOriginalRequestSummary,
-    ExecutionCheckpointPayload, ExecutionCheckpointProviderBudgetInput,
-    ExecutionCheckpointProviderBudgetSummary, ExecutionCheckpointStrictObligation,
-    ExecutionCheckpointToolCallSummary, ExecutionCheckpointToolNoProgressExactVariant,
-    ExecutionCheckpointToolNoProgressState, ExecutionCheckpointToolNoProgressStrategy,
-    ExecutionCheckpointToolSummary, ExecutionCheckpointWindowSummary,
-    ExecutionWindowExhaustionReason, ExecutionWindowStatus,
+    CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy, CUA_TOOL_NAMES,
+    ContextCompressedNotification, ContextCompressingNotification, DeltaOutputPolicy,
+    DiagnosticExcerptPolicy, EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT,
+    EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION, EmptyStrictObligationCollector,
+    ExecutionCheckpointOriginalRequestSummary, ExecutionCheckpointPayload,
+    ExecutionCheckpointProviderBudgetInput, ExecutionCheckpointProviderBudgetSummary,
+    ExecutionCheckpointStrictObligation, ExecutionCheckpointToolCallSummary,
+    ExecutionCheckpointToolNoProgressExactVariant, ExecutionCheckpointToolNoProgressState,
+    ExecutionCheckpointToolNoProgressStrategy, ExecutionCheckpointToolSummary,
+    ExecutionCheckpointWindowSummary, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
     HISTORICAL_COMMAND_LLM_PROJECTION_VERSION, HistoricalCommandLlmProjection,
     HistoricalCommandOutput, HistoricalCommandOutputSource, HistoricalCommandRepresentation,
     HistoricalCommandResult, ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
@@ -483,12 +503,12 @@ pub use turn::{
     ProviderFailureDetails, ProviderFailureStage, ProviderTransportKind, ReasoningEffort,
     RecoveryAction, RecoveryJobStatus, RecoveryOutputPolicy, RecoveryTrigger, SandboxBackendKind,
     SandboxBackendRequirement, StaticStrictObligationCollector, StorageOutputPolicy,
-    StrictObligationCollector, SystemEventLevel, TURN_EXECUTION_ATTACHMENT_REFERENCE_MAX_COUNT,
-    TURN_EXECUTION_CAPABILITY_MAX_COUNT, TURN_EXECUTION_INPUT_MAX_BYTES,
-    TURN_EXECUTION_INPUT_MAX_ITEMS, TURN_EXECUTION_MENTION_MAX_COUNT,
-    TURN_EXECUTION_REQUEST_MAX_BYTES, TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
-    TURN_EXECUTION_TEXT_ELEMENT_MAX_COUNT, TURN_MESSAGE_INPUT_MAX_BYTES,
-    TURN_MESSAGE_INPUT_MAX_ITEMS, TURN_MESSAGE_MENTION_MAX_COUNT,
+    StrictObligationCollector, SystemEventLevel, TOOL_RESPONSE_MAX_BYTES,
+    TURN_EXECUTION_ATTACHMENT_REFERENCE_MAX_COUNT, TURN_EXECUTION_CAPABILITY_MAX_COUNT,
+    TURN_EXECUTION_INPUT_MAX_BYTES, TURN_EXECUTION_INPUT_MAX_ITEMS,
+    TURN_EXECUTION_MENTION_MAX_COUNT, TURN_EXECUTION_REQUEST_MAX_BYTES,
+    TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION, TURN_EXECUTION_TEXT_ELEMENT_MAX_COUNT,
+    TURN_MESSAGE_INPUT_MAX_BYTES, TURN_MESSAGE_INPUT_MAX_ITEMS, TURN_MESSAGE_MENTION_MAX_COUNT,
     TURN_MESSAGE_REVISION_CURSOR_MAX_BYTES, TURN_MESSAGE_REVISION_PAGE_DEFAULT_LIMIT,
     TURN_MESSAGE_REVISION_PAGE_MAX_LIMIT, TextElement, ThreadReadCursor,
     ThreadReadCursorChangedNotification, ThreadReadParams, ThreadReadPosition, ThreadReadResponse,

@@ -26,7 +26,7 @@ pub fn process_text_payload(
         String,
         Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
     >,
-    event_tx: &Sender<GatewayWsEvent>,
+    event_tx: &super::client::GatewayWsEventSender,
 ) -> Option<GatewayNotification> {
     let value = match serde_json::from_str::<JsonValue>(payload) {
         Ok(value) => value,
@@ -123,6 +123,7 @@ mod tests {
     #[test]
     fn decode_routes_unknown_gateway_notification() {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
         let mut pending_artifact_upload_chunks = HashMap::new();
@@ -148,7 +149,8 @@ mod tests {
 
         let event = event_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("expected websocket event");
+            .expect("expected websocket event")
+            .value;
         assert!(matches!(
             event,
             GatewayWsEvent::Notification {
@@ -161,6 +163,7 @@ mod tests {
     #[test]
     fn decode_routes_typed_item_completed_notification() {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
         let mut pending_artifact_upload_chunks = HashMap::new();
@@ -208,7 +211,8 @@ mod tests {
 
         let event = event_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("expected websocket event");
+            .expect("expected websocket event")
+            .value;
         let GatewayWsEvent::Notification {
             notification: GatewayNotification::ItemCompleted(notification),
             ..
@@ -222,6 +226,7 @@ mod tests {
     #[test]
     fn decode_routes_thread_updated_notification() {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
         let mut pending_artifact_upload_chunks = HashMap::new();
@@ -257,7 +262,8 @@ mod tests {
 
         let event = event_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("expected websocket event");
+            .expect("expected websocket event")
+            .value;
         let GatewayWsEvent::Notification {
             notification: GatewayNotification::ThreadUpdated(notification),
             ..
@@ -273,6 +279,7 @@ mod tests {
     #[test]
     fn decode_routes_workspace_changed_notification() {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
         let mut pending_artifact_upload_chunks = HashMap::new();
@@ -304,7 +311,8 @@ mod tests {
 
         let event = event_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("expected websocket event");
+            .expect("expected websocket event")
+            .value;
         let GatewayWsEvent::Notification {
             notification: GatewayNotification::WorkspaceChanged(notification),
             ..
@@ -320,6 +328,7 @@ mod tests {
     #[test]
     fn decode_routes_minimal_access_changed_notification() {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
         let mut pending_artifact_upload_chunks = HashMap::new();
@@ -346,7 +355,8 @@ mod tests {
 
         let event = event_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("expected websocket event");
+            .expect("expected websocket event")
+            .value;
         let GatewayWsEvent::Notification {
             notification: GatewayNotification::AccessChanged(notification),
             ..
@@ -363,6 +373,7 @@ mod tests {
     #[test]
     fn decode_routes_artifact_upload_ack_to_pending_sender() {
         let (event_tx, _event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
         let mut pending_artifact_upload_chunks = HashMap::new();
@@ -408,6 +419,7 @@ mod tests {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
         pending_requests.insert("req_1".to_owned(), response_tx);
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let payload = json!({
             "jsonrpc": "2.0",
             "id": "req_1",

@@ -32,7 +32,12 @@ impl PostStartupScope {
             .children
             .lock()
             .expect("post-startup child task registry")
-            .spawn(future);
+            .spawn(pioneer_observability::work::inherit(
+                pioneer_observability::work::Boundary::PostStartup,
+                pioneer_observability::work::WorkKind::PostStartup,
+                pioneer_observability::work::ExecutorRole::PostStartup,
+                future,
+            ));
     }
 }
 
@@ -59,7 +64,13 @@ impl PostStartupSupervisor {
                 children: Mutex::new(JoinSet::new()),
             }),
         };
-        let worker = tokio::spawn(run(scope.clone()));
+        let carrier = pioneer_observability::work::WorkCarrier::independent(
+            pioneer_observability::work::Boundary::PostStartup,
+            pioneer_observability::work::WorkKind::PostStartup,
+            pioneer_observability::work::Trigger::Lifecycle,
+            pioneer_observability::work::ExecutorRole::PostStartup,
+        );
+        let worker = tokio::spawn(carrier.scope(run(scope.clone())));
         Self {
             scope,
             worker: Some(worker),

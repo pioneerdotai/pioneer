@@ -59,6 +59,7 @@ pub enum MessageDeletionIntent {
 }
 #[derive(Clone)]
 struct DeletionRequest {
+    work_context: pioneer_observability::work::WorkCarrier,
     request_generation: u64,
     plan: MessageDeletionPlan,
     auth_ticket: (u64, Option<u64>),
@@ -70,6 +71,7 @@ pub(crate) struct MessageDeletionController {
     subscriptions: BTreeMap<String, usize>,
     suspended: BTreeSet<String>,
     sender: Option<mpsc::SyncSender<DeletionRequest>>,
+    observer: Option<pioneer_observability::queues::QueueObserver>,
     task: Option<std::thread::JoinHandle<()>>,
 }
 impl MessageDeletionController {
@@ -253,13 +255,24 @@ impl ClientCore {
                 let mut next = (**current).clone();
                 next.request_generation = owner.generation();
                 let queued = owner.sender.as_ref().is_some_and(|sender| {
-                    sender
-                        .try_send(DeletionRequest {
-                            plan: next.plan.clone(),
-                            request_generation: next.request_generation,
-                            auth_ticket: ticket,
-                        })
-                        .is_ok()
+                    pioneer_observability::queues::observe_try_send(
+                        owner.observer.as_ref(),
+                        pioneer_observability::queues::QueueBytes::Unsupported,
+                        || {
+                            sender.try_send(DeletionRequest {
+                                work_context: pioneer_observability::work::WorkCarrier::child(
+                                    pioneer_observability::work::Boundary::StdThread,
+                                    pioneer_observability::work::WorkKind::ClientCommand,
+                                    pioneer_observability::work::Trigger::Event,
+                                    pioneer_observability::work::ExecutorRole::ClientController,
+                                ),
+                                plan: next.plan.clone(),
+                                request_generation: next.request_generation,
+                                auth_ticket: ticket,
+                            })
+                        },
+                    )
+                    .is_ok()
                 });
                 next.state = if queued {
                     MessageDeletionState::Pending
@@ -400,11 +413,29 @@ impl ClientCore {
     }
     pub(crate) fn start_message_deletion_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel::<DeletionRequest>(64);
+        let queue_observer = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(64),
+            "unsupported: controller request payload/shared references are not serialized",
+        );
+        let worker_queue = queue_observer.clone();
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-message-deletion".into())
             .spawn(move || {
                 while let Ok(request) = receiver.recv() {
+                    worker_queue.dequeued(pioneer_observability::queues::QueueBytes::Unsupported);
+                    let mut processing = worker_queue.processing();
+                    let carrier = request.work_context.clone().received(
+                        pioneer_observability::work::Boundary::StdThread,
+                        pioneer_observability::work::WorkKind::ClientCommand,
+                        pioneer_observability::work::ExecutorRole::ClientController,
+                    );
+                    let _scope = carrier.enter();
+                    let mut active_work = pioneer_observability::live::WorkGuard::start(
+                        pioneer_observability::work::current(),
+                        false,
+                    );
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
@@ -438,7 +469,14 @@ impl ClientCore {
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
+                    let outcome = if result.is_ok() {
+                        pioneer_observability::work::Outcome::Completed
+                    } else {
+                        pioneer_observability::work::Outcome::Failed
+                    };
                     core.complete_message_deletion(&request, result);
+                    processing.processed();
+                    active_work.finish(outcome);
                 }
             })
             .expect("message deletion worker could not start");
@@ -446,6 +484,7 @@ impl ClientCore {
             .message_deletions
             .lock()
             .expect("message deletion owner poisoned");
+        owner.observer = Some(queue_observer);
         owner.sender = Some(sender);
         owner.task = Some(task);
     }

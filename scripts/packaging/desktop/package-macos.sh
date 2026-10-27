@@ -289,7 +289,7 @@ PY
 usage() {
   cat <<'USAGE'
 Usage:
-  package-macos.sh --target <rust-target> [--out-dir <dir>]
+  package-macos.sh --target <rust-target> [--out-dir <dir>] [--skip-build]
 
 Examples:
   package-macos.sh --target aarch64-apple-darwin
@@ -299,9 +299,13 @@ USAGE
 
 TARGET=""
 OUT_DIR=""
+SKIP_BUILD=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --skip-build)
+      SKIP_BUILD=true
+      ;;
     --target)
       shift
       [[ $# -gt 0 ]] || {
@@ -358,7 +362,7 @@ case "$PIONEER_APP_URL_SCHEME" in
 esac
 export PIONEER_APP_URL_SCHEME
 
-require_cmd cargo
+if [[ "$SKIP_BUILD" != true ]]; then require_cmd cargo; fi
 require_cmd hdiutil
 require_cmd gzip
 require_cmd ditto
@@ -370,9 +374,16 @@ if [[ -z "$OUT_DIR" ]]; then
 fi
 mkdir -p "$OUT_DIR"
 
-cargo build --release -p pioneer-desktop --target "$TARGET"
-cargo build --release -p pioneer-app-updater --target "$TARGET"
-cargo build --release -p pioneer-cli --features computer-use --target "$TARGET"
+if [[ "$SKIP_BUILD" != true ]]; then
+  cargo update -p cua-driver-sdk
+  cargo build --locked --release -p pioneer-desktop --target "$TARGET"
+  cargo build --locked --release -p pioneer-app-updater --target "$TARGET"
+  MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --locked --release -p pioneer-cli --features computer-use --target "$TARGET"
+  if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+    python3 scripts/packaging/symbol-inputs.py export --target "$TARGET" "$PIONEER_SYMBOL_INPUTS_DIR" \
+      "target/$TARGET/release/pioneer-app" "target/$TARGET/release/pioneer" "target/$TARGET/release/pioneer-app-updater"
+  fi
+fi
 
 WORK_DIR="$(mktemp -d)"
 DMG_MOUNT_DIR=""
@@ -410,8 +421,10 @@ fi
 cp "$MACOS_ICON_SOURCE" "$RESOURCES_DIR/$MACOS_ICON_NAME"
 
 cp "target/$TARGET/release/pioneer-app" "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}"
+strip -S "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}"
 chmod 0755 "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}"
 cp "target/$TARGET/release/pioneer-app-updater" "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}"
+strip -S "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}"
 chmod 0755 "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}"
 
 if [[ ! -x "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}" ]]; then
@@ -423,14 +436,11 @@ GATEWAY_BUNDLE_DIR="$RESOURCES_DIR/gateway"
 mkdir -p "$GATEWAY_BUNDLE_DIR"
 copy_macos_x86_64_onnxruntime_dylibs "$GATEWAY_BUNDLE_DIR"
 
-if [[ "$TARGET" == "x86_64-apple-darwin" ]]; then
-  GATEWAY_ASSET_NAME="pioneer-gateway-macos-${ARCH}.zip"
-else
-  GATEWAY_ASSET_NAME="pioneer-gateway-macos-${ARCH}.gz"
-fi
+GATEWAY_ASSET_NAME="pioneer-gateway-macos-${ARCH}-computer-use-package.zip"
 GATEWAY_ASSET_PATH="$GATEWAY_BUNDLE_DIR/$GATEWAY_ASSET_NAME"
 GATEWAY_BINARY_RAW="$WORK_DIR/pioneer-gateway-${ARCH}"
 cp "target/$TARGET/release/pioneer" "$GATEWAY_BINARY_RAW"
+strip -S "$GATEWAY_BINARY_RAW"
 chmod 0755 "$GATEWAY_BINARY_RAW"
 
 if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
@@ -439,22 +449,14 @@ if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
   codesign --verify --strict "$GATEWAY_BINARY_RAW"
 fi
 
+# The archive and the bootstrap may later receive different signing envelopes.
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$GATEWAY_BINARY_RAW" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
 cp "$GATEWAY_BINARY_RAW" "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
 chmod 0755 "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
 
-if [[ "$TARGET" == "x86_64-apple-darwin" ]]; then
-  require_cmd zip
-  GATEWAY_ASSET_BINARY_PATH="$GATEWAY_BUNDLE_DIR/pioneer"
-  cp "$GATEWAY_BINARY_RAW" "$GATEWAY_ASSET_BINARY_PATH"
-  chmod 0755 "$GATEWAY_ASSET_BINARY_PATH"
-  (
-    cd "$GATEWAY_BUNDLE_DIR"
-    zip -9 "$GATEWAY_ASSET_PATH" pioneer libonnxruntime*.dylib
-  )
-  rm -f "$GATEWAY_ASSET_BINARY_PATH"
-else
-  gzip -f --stdout --best "$GATEWAY_BINARY_RAW" > "$GATEWAY_ASSET_PATH"
-fi
+python3 scripts/packaging/cua-driver.py --target "$TARGET" --binary "$GATEWAY_BINARY_RAW" --archive "$GATEWAY_ASSET_PATH"
 
 GATEWAY_SHA256="$(sha256_file "$GATEWAY_ASSET_PATH")"
 printf 'sha256:%s %s\n' "$GATEWAY_SHA256" "$GATEWAY_ASSET_NAME" > "$GATEWAY_BUNDLE_DIR/SHA256SUMS"
@@ -492,7 +494,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     </dict>
   </array>
   <key>LSMinimumSystemVersion</key>
-  <string>12.0</string>
+  <string>13.0</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Pioneer uses your microphone for voice input while you hold to talk.</string>
 </dict>
@@ -525,6 +527,13 @@ if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
 fi
 
 APP_ZIP_NAME="Pioneer-${ARCH}.app.zip"
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+  python3 scripts/packaging/symbol-inputs.py record "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
 APP_ZIP_PATH="$OUT_DIR/$APP_ZIP_NAME"
 rm -f "$APP_ZIP_PATH"
 ditto -c -k --keepParent "$APP_DIR" "$APP_ZIP_PATH"

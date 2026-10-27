@@ -101,6 +101,9 @@ pub struct OtlpTelemetryConfig {
 
 pub(crate) struct ObservabilityState {
     pub(crate) target: TelemetryTarget,
+    resource_sampler: Option<crate::resources::ResourceSampler>,
+    pub(crate) diagnostics: Mutex<Option<crate::diagnostics::DiagnosticOwner>>,
+    availability: Arc<ExportAvailability>,
     meter_provider: SdkMeterProvider,
     tracer_provider: SdkTracerProvider,
     pub(crate) tracer: SdkTracer,
@@ -194,11 +197,14 @@ pub fn init_otlp_observability_for(
         .with_resource(resource)
         .with_batch_exporter(ConsentGatedSpanExporter {
             inner: trace_exporter,
-            availability,
+            availability: availability.clone(),
         })
         .build();
     let meter = meter_provider.meter(target.instrumentation_name());
     crate::turn_startup::init(&meter);
+    crate::work::init(&meter);
+    crate::queues::init(&meter);
+    crate::live::init(&meter);
     let startup_metrics = StartupMetrics::new(
         &meter,
         target.startup_duration_name(),
@@ -223,12 +229,24 @@ pub fn init_otlp_observability_for(
         (target == TelemetryTarget::Desktop).then(|| DesktopUpdateMetrics::new(&meter));
     let desktop_gateway_lifecycle_metrics =
         (target == TelemetryTarget::Desktop).then(|| DesktopGatewayLifecycleMetrics::new(&meter));
+    let resource_sampler = if matches!(target, TelemetryTarget::Gateway | TelemetryTarget::Desktop)
+    {
+        Some(
+            crate::resources::ResourceSampler::start(&meter)
+                .context("failed to start resource sampler")?,
+        )
+    } else {
+        None
+    };
     let gateway_metrics = (target == TelemetryTarget::Gateway).then(|| GatewayMetrics::new(meter));
     let tracer = tracer_provider.tracer(target.instrumentation_name());
 
     OBSERVABILITY
         .set(ObservabilityState {
             target,
+            availability,
+            resource_sampler,
+            diagnostics: Mutex::new(None),
             meter_provider,
             tracer_provider,
             tracer,
@@ -243,11 +261,32 @@ pub fn init_otlp_observability_for(
         .map_err(|_| anyhow::anyhow!("OTLP observability pipeline was initialized concurrently"))
 }
 
+/// The executable's lifetime guard also calls this on startup failure/cancel.
+/// Idempotent: owns and joins only the new native observers/profiler children.
+pub fn stop_local_observers() {
+    let Some(state) = OBSERVABILITY.get() else {
+        return;
+    };
+    if let Some(mut diagnostics) = state
+        .diagnostics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        diagnostics.shutdown();
+    }
+    if let Some(sampler) = &state.resource_sampler {
+        sampler.shutdown();
+    }
+    crate::runtime::shutdown();
+}
+
 pub fn shutdown_observability(timeout: Duration) -> Result<()> {
     let Some(state) = OBSERVABILITY.get() else {
         return Ok(());
     };
 
+    stop_local_observers();
     let trace_result = state
         .tracer_provider
         .shutdown_with_timeout(timeout)
@@ -351,6 +390,31 @@ fn resource(
         .with_attributes([
             KeyValue::new("service.version", service_version.to_owned()),
             KeyValue::new(
+                "service.instance.id",
+                crate::identity::run_identity().run_id.clone(),
+            ),
+            KeyValue::new(
+                "pioneer.build.manifest.id",
+                crate::identity::run_identity().build.manifest_id.clone(),
+            ),
+            KeyValue::new(
+                "pioneer.build.target",
+                crate::identity::run_identity()
+                    .build
+                    .target
+                    .clone()
+                    .unwrap_or_else(|| "unavailable".into()),
+            ),
+            KeyValue::new(
+                "pioneer.build.profile",
+                crate::identity::run_identity()
+                    .build
+                    .profile
+                    .clone()
+                    .unwrap_or_else(|| "unavailable".into()),
+            ),
+            KeyValue::new("pioneer.observability.schema", 1_i64),
+            KeyValue::new(
                 "deployment.environment.name",
                 deployment_environment.to_owned(),
             ),
@@ -416,6 +480,8 @@ struct ExportAvailability {
 
 #[derive(Debug, Default)]
 struct ExportAvailabilityState {
+    last_success_metrics: Option<Instant>,
+    last_success_traces: Option<Instant>,
     unavailable_signals: u8,
     episode_started_at: Option<Instant>,
     last_report_at: Option<Instant>,
@@ -446,6 +512,11 @@ enum ExportDiagnostic {
 }
 
 impl ExportAvailabilityState {
+    fn has_export_observation(&self) -> bool {
+        self.total_failed_exports > 0
+            || self.last_success_metrics.is_some()
+            || self.last_success_traces.is_some()
+    }
     fn summary(&self, now: Instant) -> ExportOutageSummary {
         ExportOutageSummary {
             total_suppressed_episodes: self.total_suppressed_episodes,
@@ -461,6 +532,13 @@ impl ExportAvailabilityState {
 
     fn observe(&mut self, signal_bit: u8, failed: bool, now: Instant) -> ExportDiagnostic {
         let previous = self.unavailable_signals;
+        if !failed {
+            if signal_bit == 1 {
+                self.last_success_metrics = Some(now);
+            } else {
+                self.last_success_traces = Some(now);
+            }
+        }
         if failed {
             self.unavailable_signals |= signal_bit;
             self.total_failed_exports = self.total_failed_exports.saturating_add(1);
@@ -616,7 +694,10 @@ where
             return Ok(());
         }
         let epoch = super::telemetry_consent_snapshot().1 as i64;
-        batch.retain_mut(|span| startup_span_attributes_allowed(&mut span.attributes, epoch));
+        batch.retain_mut(|span| {
+            startup_span_attributes_allowed(&mut span.attributes, epoch)
+                && observation_span_epoch_allowed(&span.attributes, epoch)
+        });
         let result = self.inner.export(batch).await;
         self.availability.observe("traces", 0b10, &result);
         result
@@ -1412,5 +1493,67 @@ mod startup_consent_tests {
         assert_eq!(current, vec![KeyValue::new("stage", "cli.initialize")]);
         let mut unrelated = vec![KeyValue::new("stage", "unrelated")];
         assert!(super::startup_span_attributes_allowed(&mut unrelated, 3));
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ExportHealth {
+    pub source: String,
+    pub observed: bool,
+    pub unavailable_signals: u8,
+    pub failed_exports: u64,
+    pub metrics_last_success_age_ms: Option<u64>,
+    pub traces_last_success_age_ms: Option<u64>,
+    pub backend_completeness: String,
+}
+pub(crate) fn export_health() -> ExportHealth {
+    let base=ExportHealth{source:"SDK final transport Result, not downstream durable/backend acceptance".into(),observed:false,unavailable_signals:0,failed_exports:0,metrics_last_success_age_ms:None,traces_last_success_age_ms:None,backend_completeness:"unknown; OTLP partial-success and asynchronous downstream completeness not exposed by SDK Result".into()};
+    let Some(owner) = state() else { return base };
+    let state = owner
+        .availability
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    ExportHealth {
+        observed: state.has_export_observation(),
+        unavailable_signals: state.unavailable_signals,
+        failed_exports: state.total_failed_exports,
+        metrics_last_success_age_ms: state.last_success_metrics.map(|last| {
+            now.saturating_duration_since(last)
+                .as_millis()
+                .min(u64::MAX as u128) as u64
+        }),
+        traces_last_success_age_ms: state.last_success_traces.map(|last| {
+            now.saturating_duration_since(last)
+                .as_millis()
+                .min(u64::MAX as u128) as u64
+        }),
+        ..base
+    }
+}
+
+fn observation_span_epoch_allowed(attributes: &[opentelemetry::KeyValue], epoch: i64) -> bool {
+    attributes
+        .iter()
+        .find(|a| a.key.as_str() == "pioneer.consent.generation")
+        .is_none_or(|a| a.value == opentelemetry::Value::String(epoch.to_string().into()))
+}
+
+#[cfg(test)]
+mod export_health_source_tests {
+    use super::*;
+    #[test]
+    fn registered_exporter_without_a_result_is_not_an_observed_zero() {
+        let mut state = ExportAvailabilityState::default();
+        assert!(!state.has_export_observation());
+        state.observe(0b01, true, Instant::now());
+        assert!(state.has_export_observation());
+        assert!(state.last_success_metrics.is_none());
+        let mut successful = ExportAvailabilityState::default();
+        successful.observe(0b10, false, Instant::now());
+        assert!(successful.has_export_observation());
+        assert_eq!(successful.total_failed_exports, 0);
+        assert!(successful.last_success_traces.is_some());
     }
 }

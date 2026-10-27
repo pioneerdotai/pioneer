@@ -6,7 +6,6 @@ pub(crate) const HISTORY_USER_ARTIFACT_REFS_HEADER: &str =
     "Available artifacts from this user message:";
 pub(crate) const HISTORY_ASSISTANT_ARTIFACT_REFS_HEADER: &str =
     "Available artifacts from this assistant message:";
-pub(crate) const EPISODIC_ARTIFACT_REFS_HEADER_PREFIX: &str = "Available artifacts for ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HistoryArtifactRefRole {
@@ -24,19 +23,6 @@ pub(crate) fn append_history_artifact_refs(
         HistoryArtifactRefRole::Assistant => HISTORY_ASSISTANT_ARTIFACT_REFS_HEADER,
     };
     render_artifact_refs_block(header, text, refs)
-}
-
-pub(crate) fn append_episodic_artifact_refs(
-    text: &str,
-    source_id: &str,
-    refs: &[ConversationArtifactRef],
-) -> String {
-    let source_id = source_id.trim();
-    if refs.is_empty() || source_id.is_empty() {
-        return text.to_owned();
-    }
-    let header = format!("{EPISODIC_ARTIFACT_REFS_HEADER_PREFIX}{source_id}:");
-    render_artifact_refs_block(header.as_str(), Some(text), refs).unwrap_or_else(|| text.to_owned())
 }
 
 fn render_artifact_refs_block(
@@ -196,16 +182,5 @@ mod tests {
         .expect("rendered");
 
         assert_eq!(rendered.matches("artifactId=art_car").count(), 1);
-    }
-
-    #[test]
-    fn episodic_artifact_refs_name_exact_source_id() {
-        let rendered = append_episodic_artifact_refs(
-            "- [thread:turn_1/item_1/chunk_0]: Что за машина?",
-            "thread:turn_1/item_1/chunk_0",
-            &[artifact_ref()],
-        );
-
-        assert!(rendered.contains("Available artifacts for thread:turn_1/item_1/chunk_0:"));
     }
 }

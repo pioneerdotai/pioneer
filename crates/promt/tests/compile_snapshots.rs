@@ -109,7 +109,10 @@ fn execution_continuation_runtime_section(
     }
 }
 
-fn compile_continuation_prompt(profile: PromptProfile) -> CompiledPromptBundle {
+fn compile_continuation_prompt(
+    profile: PromptProfile,
+    computer_use_available: bool,
+) -> CompiledPromptBundle {
     let root = fixture_root(match profile {
         PromptProfile::AssistantFull => "continuation_full",
         PromptProfile::AssistantMinimal => "continuation_minimal",
@@ -131,10 +134,13 @@ fn compile_continuation_prompt(profile: PromptProfile) -> CompiledPromptBundle {
         retry_instruction: None,
         include_tool_recovery_policy: true,
         include_task_orchestration_policy: false,
+        include_threads_policy: false,
+        include_html_policy: false,
         continue_generation_hint: true,
         runtime_sections: runtime_sections_with_request_tools_catalog(
             &[continuation_section],
             true,
+            computer_use_available,
         ),
         dynamic_sections: Vec::new(),
         dynamic_context: None,
@@ -212,6 +218,8 @@ fn assistant_full_snapshot() {
         retry_instruction: Some("retry with corrected arguments".to_owned()),
         include_tool_recovery_policy: true,
         include_task_orchestration_policy: false,
+        include_threads_policy: false,
+        include_html_policy: false,
         continue_generation_hint: true,
         runtime_sections: Vec::new(),
         dynamic_sections: Vec::new(),
@@ -254,6 +262,8 @@ fn assistant_minimal_snapshot() {
         retry_instruction: None,
         include_tool_recovery_policy: true,
         include_task_orchestration_policy: false,
+        include_threads_policy: false,
+        include_html_policy: false,
         continue_generation_hint: false,
         runtime_sections: Vec::new(),
         dynamic_sections: Vec::new(),
@@ -278,6 +288,8 @@ fn assistant_none_snapshot() {
         retry_instruction: Some("retry with corrected arguments".to_owned()),
         include_tool_recovery_policy: true,
         include_task_orchestration_policy: false,
+        include_threads_policy: false,
+        include_html_policy: false,
         continue_generation_hint: true,
         runtime_sections: Vec::new(),
         dynamic_sections: Vec::new(),
@@ -309,6 +321,8 @@ fn native_delivery_plan_preserves_compiled_prompt_bytes_for_every_profile() {
             retry_instruction: Some("retry with corrected arguments".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
+            include_html_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -332,10 +346,7 @@ fn native_delivery_plan_preserves_compiled_prompt_bytes_for_every_profile() {
 
 #[test]
 fn continuation_prompt_assistant_full_snapshot() {
-    let compiled = compile_continuation_prompt(PromptProfile::AssistantFull);
-
-    insta::assert_snapshot!(continuation_snapshot_view(PromptProfile::AssistantFull, &compiled), @r###"
-profile=AssistantFull
+    let expected = r###"profile=AssistantFull
 section_ids:
 - identity_base
 - assistant_safety
@@ -365,28 +376,43 @@ Strict unresolved obligations: none reported by runtime validators.
 Prior visible assistant text: I drafted the outline and verified two files.
 
 ## Hidden Tool Domains
-Some tool domains and their tools are hidden until requested. If you need a hidden domain and its tools are not currently visible, call request_tools.
-A tool listed in more than one domain becomes visible when any of those domains is opened.
+For hidden tools, call request_tools to open their domain.
+Shared tools become visible when any listed domain opens.
 
 Domains:
-- threads: threads_tools_result_read, threads_start_options, thread_message_send, thread_create, threads_turn_start.
+- threads: threads_tools_result_read, threads_list, threads_history_read, threads_search, threads_children_list, threads_start_options, threads_identity_models_list, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
-- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
+- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
-- computer_use: computer_use.
+- computer_use: cua_click, cua_clipboard_read, cua_clipboard_write, cua_drag, cua_get_cursor_position, cua_get_desktop_state, cua_get_screen_size, cua_get_window_state, cua_hotkey, cua_invoke_menu, cua_list_apps, cua_list_windows, cua_press_key, cua_scroll, cua_set_window_frame, cua_type_text, cua_verify_state, cua_get_browser_state, cua_browser_prepare, cua_browser_navigate, cua_browser_click, cua_browser_type, cua_browser_select, cua_browser_dialog, cua_browser_set_input_files.
 
 ## Recovery Continuation
 Previous attempt was interrupted by output limits. Continue from where it stopped without repeating prior text.
-"###);
-    assert_continuation_prompt_contract(&compiled);
+"###;
+    for computer_use_available in [false, true] {
+        let compiled =
+            compile_continuation_prompt(PromptProfile::AssistantFull, computer_use_available);
+        let expected =
+            if computer_use_available && !pioneer_tools::computer_use_tool_specs().is_empty() {
+                expected.to_owned()
+            } else {
+                expected
+                    .lines()
+                    .filter(|line| !line.starts_with("- computer_use: "))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+        pretty_assertions::assert_eq!(
+            continuation_snapshot_view(PromptProfile::AssistantFull, &compiled),
+            expected.trim_end_matches('\n'),
+        );
+        assert_continuation_prompt_contract(&compiled);
+    }
 }
 
 #[test]
 fn continuation_prompt_assistant_minimal_snapshot() {
-    let compiled = compile_continuation_prompt(PromptProfile::AssistantMinimal);
-
-    insta::assert_snapshot!(continuation_snapshot_view(PromptProfile::AssistantMinimal, &compiled), @r###"
-profile=AssistantMinimal
+    let expected = r###"profile=AssistantMinimal
 section_ids:
 - identity_base
 - assistant_safety
@@ -416,20 +442,38 @@ Strict unresolved obligations: none reported by runtime validators.
 Prior visible assistant text: I drafted the outline and verified two files.
 
 ## Hidden Tool Domains
-Some tool domains and their tools are hidden until requested. If you need a hidden domain and its tools are not currently visible, call request_tools.
-A tool listed in more than one domain becomes visible when any of those domains is opened.
+For hidden tools, call request_tools to open their domain.
+Shared tools become visible when any listed domain opens.
 
 Domains:
-- threads: threads_tools_result_read, threads_start_options, thread_message_send, thread_create, threads_turn_start.
+- threads: threads_tools_result_read, threads_list, threads_history_read, threads_search, threads_children_list, threads_start_options, threads_identity_models_list, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
-- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
+- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
-- computer_use: computer_use.
+- computer_use: cua_click, cua_clipboard_read, cua_clipboard_write, cua_drag, cua_get_cursor_position, cua_get_desktop_state, cua_get_screen_size, cua_get_window_state, cua_hotkey, cua_invoke_menu, cua_list_apps, cua_list_windows, cua_press_key, cua_scroll, cua_set_window_frame, cua_type_text, cua_verify_state, cua_get_browser_state, cua_browser_prepare, cua_browser_navigate, cua_browser_click, cua_browser_type, cua_browser_select, cua_browser_dialog, cua_browser_set_input_files.
 
 ## Recovery Continuation
 Previous attempt was interrupted by output limits. Continue from where it stopped without repeating prior text.
-"###);
-    assert_continuation_prompt_contract(&compiled);
+"###;
+    for computer_use_available in [false, true] {
+        let compiled =
+            compile_continuation_prompt(PromptProfile::AssistantMinimal, computer_use_available);
+        let expected =
+            if computer_use_available && !pioneer_tools::computer_use_tool_specs().is_empty() {
+                expected.to_owned()
+            } else {
+                expected
+                    .lines()
+                    .filter(|line| !line.starts_with("- computer_use: "))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+        pretty_assertions::assert_eq!(
+            continuation_snapshot_view(PromptProfile::AssistantMinimal, &compiled),
+            expected.trim_end_matches('\n'),
+        );
+        assert_continuation_prompt_contract(&compiled);
+    }
 }
 
 #[test]
@@ -462,10 +506,13 @@ fn continuation_window_facts_are_bounded() {
         retry_instruction: None,
         include_tool_recovery_policy: true,
         include_task_orchestration_policy: false,
+        include_threads_policy: false,
+        include_html_policy: false,
         continue_generation_hint: true,
         runtime_sections: runtime_sections_with_request_tools_catalog(
             &[continuation_section],
             true,
+            false,
         ),
         dynamic_sections: Vec::new(),
         dynamic_context: None,
@@ -499,6 +546,8 @@ fn truncation_snapshot() {
         retry_instruction: None,
         include_tool_recovery_policy: true,
         include_task_orchestration_policy: false,
+        include_threads_policy: false,
+        include_html_policy: false,
         continue_generation_hint: false,
         runtime_sections: Vec::new(),
         dynamic_sections: Vec::new(),

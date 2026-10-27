@@ -77,9 +77,10 @@ impl PostExecutionPolicy {
 
     fn apply(&self, invocation: &ToolInvocation, result: &mut AnyToolResult) {
         let raw_output_json = result.raw_output_json();
-        let outcome =
+        let outcome = result.output.delegated_outcome().unwrap_or_else(|| {
             self.classifier
-                .classify_result(invocation, &raw_output_json, result.success());
+                .classify_result(invocation, &raw_output_json, result.success())
+        });
         result.set_outcome(outcome);
     }
 
@@ -2722,8 +2723,8 @@ mod tests {
             assert_eq!(intent.action, PermissionActionKind::ComputerUse);
             assert_eq!(reason, PermissionDecisionReason::PolicyRequiresApproval);
             assert_eq!(
-                intent.scope.entries.get("action").map(String::as_str),
-                Some("act")
+                intent.scope.entries.get("operation").map(String::as_str),
+                Some("cua_type_text")
             );
             assert!(intent.scope.entries.contains_key("payload_hash"));
             match &invocation.payload {
@@ -3035,18 +3036,13 @@ mod tests {
     #[tokio::test]
     async fn supervised_computer_use_prompt_dispatches_exact_payload_once() {
         let arguments = serde_json::json!({
-            "action": "act",
-            "session_id": 42,
-            "act": {
-                "type": "input",
-                "text": "exact payload must survive approval",
-                "target": { "node_id": "field-1" }
-            }
+            "target": { "kind": "window", "pid": 42, "window_id": 9 },
+            "text": "exact payload must survive approval", "delivery_mode": "background"
         });
         let handler_calls = Arc::new(AtomicUsize::new(0));
         let approval_calls = Arc::new(AtomicUsize::new(0));
         let registry = registry_with_named_handlers([(
-            "computer_use",
+            "cua_type_text",
             Arc::new(FunctionPayloadAssertHandler {
                 calls: handler_calls.clone(),
                 expected_arguments: arguments.clone(),
@@ -3068,9 +3064,9 @@ mod tests {
                 pioneer_protocol::TurnPermissionProfileSource::Composer,
             ),
         );
-        let invocation = invocation_for_tool("computer_use", ToolPayload::Function { arguments });
+        let invocation = invocation_for_tool("cua_type_text", ToolPayload::Function { arguments });
         let trace =
-            crate::events::ToolEventBus::default().start_trace("turn", "call_1", "computer_use");
+            crate::events::ToolEventBus::default().start_trace("turn", "call_1", "cua_type_text");
 
         orchestrator
             .run_with_context(&registry, invocation, &trace, &context)

@@ -160,6 +160,7 @@ pub(crate) async fn prepare_completed_history(
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut diagnostic,
     )
     .await?;
@@ -190,17 +191,29 @@ pub(crate) async fn prepare_completed_history_owned(
     suspending: Arc<std::sync::atomic::AtomicBool>,
     accepted_projection: Option<super::frozen::PreparedHistory>,
     cli_cwd: Option<&str>,
+    root_check_revision: Option<i64>,
     diagnostic: &mut HistoryCheckDiagnostic,
 ) -> Result<HistoryCheckOutcome> {
     // The owner chooses the database class: foreground transfer is part of
     // turn startup; the completed-turn worker passes a maintenance handle.
     let store = scoped_store.clone();
-    let clock: Arc<dyn CompactionClock> = Arc::new(SystemCompactionClock::default());
+    let clock: Arc<dyn CompactionClock> = if root_check_revision.is_some() {
+        processor.compaction_clock.clone()
+    } else {
+        Arc::new(SystemCompactionClock::default())
+    };
     let deadline = clock
         .now_ms()
         .saturating_add(pioneer_compaction::OPERATION_MILLIS)
         .min(original_deadline.unwrap_or(u64::MAX));
     diagnostic.stage = "executor".into();
+    let _conversation_lease = if priority == super::ContextWorkPriority::Foreground {
+        processor
+            .acquire_composer_history_priority(&store, workspace, thread, turn, &cancellation)
+            .await?
+    } else {
+        None
+    };
     let Some(lease) = processor
         .compaction_coordinator
         .acquire(workspace, thread, priority, &cancellation)
@@ -210,6 +223,27 @@ pub(crate) async fn prepare_completed_history_owned(
         return Ok(HistoryCheckOutcome::WaitingExecutor);
     };
     let cancellation = lease.cancellation();
+    if let Some(revision) = root_check_revision {
+        let admission = async {
+            if !store
+                .compaction_history_check_revision_is_current(turn, revision)
+                .await?
+            {
+                return Ok(Some(HistoryCheckOutcome::Cancelled));
+            }
+            processor
+                .root_history_check_admission(workspace, thread, turn, clock.now_ms())
+                .await
+        };
+        let outcome = tokio::select! { biased;
+            _ = cancellation.cancelled() => return Ok(HistoryCheckOutcome::Cancelled),
+            _ = clock.sleep_until(deadline) => return Err(HistoryCheckDeadline.into()),
+            result = admission => result?,
+        };
+        if let Some(outcome) = outcome {
+            return Ok(outcome);
+        }
+    }
     diagnostic.stage = "catalog".into();
     if pioneer_provider::catalog::model_catalog().is_err() {
         diagnostic.code = "catalog_unavailable".into();
@@ -233,8 +267,14 @@ pub(crate) async fn prepare_completed_history_owned(
         diagnostic.code = "history_preparation_incomplete".into();
         return Ok(HistoryCheckOutcome::Preparing);
     }
+    let mut authorization_revision = None;
     let prepare = async {
-        if accepted_projection.is_none() {
+        authorization_revision = if root_check_revision.is_some() {
+            Some(processor.initialize_authorization_generation().await?)
+        } else {
+            None
+        };
+        if accepted_projection.is_none() && root_check_revision.is_none() {
             ensure!(
                 store
                     .compaction_turn_is_completed(workspace, thread, turn)
@@ -327,7 +367,15 @@ pub(crate) async fn prepare_completed_history_owned(
         } else {
             &current.model
         };
-        let limits = pioneer_provider::catalog::model_catalog()?.limits(&catalog, catalog_model);
+        let limits = if current.transport == Transport::Api {
+            processor
+                .provider_registry()
+                .get_or_create_for_workspace(workspace, &current.instance)?
+                .model_limits(catalog_model)
+                .await?
+        } else {
+            pioneer_provider::catalog::model_catalog()?.limits(&catalog, catalog_model)
+        };
         let budget = ModelBudget::new(
             Some(limits.context_window),
             limits.max_input,
@@ -470,6 +518,25 @@ pub(crate) async fn prepare_completed_history_owned(
         let selection =
             effective_selection(current, settings.selection.as_ref(), cli_override).clone();
         diagnostic.stage = "summary_configuration".into();
+        if let Some(revision) = authorization_revision {
+            if processor.initialize_authorization_generation().await? != revision {
+                return Ok(Some(Err(HistoryCheckOutcome::Preparing)));
+            }
+        }
+        if let Some(revision) = root_check_revision {
+            if !store
+                .compaction_history_check_revision_is_current(turn, revision)
+                .await?
+            {
+                return Ok(Some(Err(HistoryCheckOutcome::Cancelled)));
+            }
+            if let Some(outcome) = processor
+                .root_history_check_admission(workspace, thread, turn, clock.now_ms())
+                .await?
+            {
+                return Ok(Some(Err(outcome)));
+            }
+        }
         let summarizer = super::service::make_summarizer(
             processor.provider_registry().as_ref(),
             &store,
@@ -625,15 +692,19 @@ pub(crate) async fn prepare_completed_history_owned(
             clock.now_ms(),
         )
         .await?;
-        Ok::<_, anyhow::Error>(Some((snapshot, summarizer, projection)))
+        Ok::<_, anyhow::Error>(Some(Ok((snapshot, summarizer, projection))))
     };
     let operation = tokio::select! { biased;
         _ = cancellation.cancelled() => return Ok(HistoryCheckOutcome::Cancelled),
         _ = clock.sleep_until(deadline) => return Err(HistoryCheckDeadline.into()),
         result = prepare => result?,
     };
-    let Some((snapshot, summarizer, projection)) = operation else {
+    let Some(operation) = operation else {
         return Ok(HistoryCheckOutcome::Fits);
+    };
+    let (snapshot, summarizer, projection) = match operation {
+        Ok(operation) => operation,
+        Err(outcome) => return Ok(outcome),
     };
     diagnostic.stage = "summarization".into();
     diagnostic.operation = Some(snapshot.id.clone());
@@ -649,6 +720,38 @@ pub(crate) async fn prepare_completed_history_owned(
         clock.clone(),
     )
     .with_execution_turn(turn.into());
+    if let Some(revision) = root_check_revision {
+        // Admission may span several bounded metadata quanta. Recheck at the
+        // service boundary, with the same cancellation and operation deadline.
+        let admission = async {
+            let authority_changed = if let Some(revision) = authorization_revision {
+                processor.initialize_authorization_generation().await? != revision
+            } else {
+                false
+            };
+            if authority_changed
+                || !runner
+                    .store
+                    .compaction_history_check_revision_is_current(turn, revision)
+                    .await?
+            {
+                Ok(Some(HistoryCheckOutcome::Cancelled))
+            } else {
+                processor
+                    .root_history_check_admission(workspace, thread, turn, clock.now_ms())
+                    .await
+            }
+        };
+        let (outcome, reason) = tokio::select! { biased;
+            _ = cancellation.cancelled() => (Some(HistoryCheckOutcome::Cancelled), FailureKind::Cancelled),
+            _ = clock.sleep_until(operation_deadline) => (Some(HistoryCheckOutcome::Failed), FailureKind::Deadline),
+            result = admission => (result?, FailureKind::Cancelled),
+        };
+        if let Some(outcome) = outcome {
+            runner.reconcile(reason).await?;
+            return Ok(outcome);
+        }
+    }
     let exit = tokio::select! { biased;
         _ = clock.sleep_until(operation_deadline) => CompactionExit::Reconcile(FailureKind::Deadline),
         result = runner.run(cancellation) => result?,

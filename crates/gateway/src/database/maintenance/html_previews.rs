@@ -63,7 +63,7 @@ pub(super) async fn run(
         let result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return,
-            result = quantum(&store, &service, &mut progress) => result,
+            result = crate::database::attribution::scope_database_workload_result(pioneer_observability::DatabaseWorkload::HtmlPreviewMaintenance, pioneer_observability::DatabaseOperationSite::HtmlPreviewQuantum,quantum(&store, &service, &mut progress)) => result,
         };
         let pause = match result {
             Ok(true) => Duration::from_millis(10),
@@ -77,7 +77,7 @@ pub(super) async fn run(
         };
         tokio::select! {
             _ = cancellation.cancelled() => return,
-            _ = tokio::time::sleep(pause) => {},
+            _ = pioneer_observability::live::sleeping(pause,tokio::time::sleep(pause)) => {},
         }
     }
 }

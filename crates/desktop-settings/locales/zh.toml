@@ -169,6 +169,8 @@ select_model = "选择模型"
 dialog_title = "选择 Preflight 模型"
 
 [settings.voice_input]
+transcribe_while_recording = "录音时转录"
+transcribe_while_recording_description = "关闭后，将在录音结束后开始转录。"
 label = "语音输入"
 description = "使用本地转录模型处理语音消息。"
 no_model_selected = "未选择模型"

@@ -389,7 +389,7 @@ impl ModelSelectorDialog {
     fn open(options: SharedModelSelectorOptions, window: &mut Window, cx: &mut App) {
         static NEXT_PICKER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT_PICKER
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |value| value.checked_add(1),

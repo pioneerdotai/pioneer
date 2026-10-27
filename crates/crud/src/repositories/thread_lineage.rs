@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use pioneer_entity::thread_lineage;
 use pioneer_protocol::TaskThreadLineage;
 use sea_orm::sea_query::OnConflict;
@@ -72,22 +72,47 @@ pub async fn list_lineage_by_root_thread<C: ConnectionTrait>(
         .context("failed to list thread lineage subtree")
 }
 
-pub async fn list_lineage_by_root_thread_bounded<C: ConnectionTrait>(
+pub async fn list_lineage_by_root_thread_page<C: ConnectionTrait>(
     db: &C,
     root_thread_id: &str,
+    after: Option<&str>,
+) -> Result<Vec<thread_lineage::Model>> {
+    let mut query = thread_lineage::Entity::find()
+        .filter(thread_lineage::Column::RootThreadId.eq(root_thread_id.to_owned()));
+    if let Some(after) = after {
+        query = query.filter(thread_lineage::Column::ChildThreadId.gt(after));
+    }
+    query
+        .order_by_asc(thread_lineage::Column::ChildThreadId)
+        .limit(200)
+        .all(db)
+        .await
+        .context("failed to list lineage page")
+}
+
+/// One bounded step for direct-child enumeration or cursor-driven DFS.
+/// Unique child IDs give an exclusive, immutable keyset even when creation
+/// timestamps coincide. No root/depth filter: the actual parent edge is the
+/// authority, including for a subtree rooted at an intermediate node.
+pub async fn list_children_page<C: ConnectionTrait>(
+    db: &C,
+    parent_thread_id: &str,
+    after_child_thread_id: Option<&str>,
     limit: u64,
 ) -> Result<Vec<thread_lineage::Model>> {
-    if limit == 0 || limit > 128 {
-        bail!("thread lineage projection exceeds its bounded limit");
+    anyhow::ensure!(
+        (1..=200).contains(&limit),
+        "child candidate page limit must be 1..=200"
+    );
+    let mut query = thread_lineage::Entity::find()
+        .filter(thread_lineage::Column::ParentThreadId.eq(parent_thread_id.to_owned()));
+    if let Some(after) = after_child_thread_id {
+        query = query.filter(thread_lineage::Column::ChildThreadId.gt(after.to_owned()));
     }
-    let rows = thread_lineage::Entity::find()
-        .filter(thread_lineage::Column::RootThreadId.eq(root_thread_id.to_owned()))
-        .order_by_asc(thread_lineage::Column::Depth)
-        .order_by_asc(thread_lineage::Column::CreatedAt)
+    query
         .order_by_asc(thread_lineage::Column::ChildThreadId)
         .limit(limit)
         .all(db)
         .await
-        .context("failed to list bounded thread lineage subtree")?;
-    Ok(rows)
+        .context("failed to list child lineage page")
 }

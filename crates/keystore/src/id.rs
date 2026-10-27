@@ -14,6 +14,7 @@ pub const GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE: &str = "pioneer.gateway.access
 pub const GATEWAY_AUTH_CREDENTIAL_HMAC_KEY_SERVICE: &str =
     "pioneer.gateway.auth_credential_hmac_key";
 pub const GATEWAY_REMOTE_ACCESS_SECRET_SERVICE: &str = "pioneer.gateway.remote_access_secret";
+pub const TASK_WEBHOOK_SECRET_SERVICE: &str = "pioneer.gateway.task_webhook_secret";
 pub const DESKTOP_GATEWAY_SESSION_SERVICE: &str = "pioneer.desktop.gateway_session";
 
 const GATEWAY_AUTH_KEY_USER: &str = "gateway";
@@ -115,6 +116,13 @@ impl SecretId {
         Self::from_service_user(GATEWAY_REMOTE_ACCESS_SECRET_SERVICE, secret_ref)
     }
 
+    pub fn task_webhook_secret(secret_ref: &str) -> Result<Self> {
+        Self::from_service_user(
+            TASK_WEBHOOK_SECRET_SERVICE,
+            validate_user("task webhook secret ref", secret_ref)?,
+        )
+    }
+
     pub fn service(&self) -> &str {
         &self.service
     }
@@ -148,6 +156,7 @@ pub enum SecretKind {
     GatewayAuthCredentialHmacKey,
     GatewayRemoteAccessSecret,
     DesktopGatewaySession,
+    TaskWebhookSecret,
 }
 
 impl SecretKind {
@@ -165,6 +174,7 @@ impl SecretKind {
             SecretKind::GatewayAuthCredentialHmacKey => GATEWAY_AUTH_CREDENTIAL_HMAC_KEY_SERVICE,
             SecretKind::GatewayRemoteAccessSecret => GATEWAY_REMOTE_ACCESS_SECRET_SERVICE,
             SecretKind::DesktopGatewaySession => DESKTOP_GATEWAY_SESSION_SERVICE,
+            SecretKind::TaskWebhookSecret => TASK_WEBHOOK_SECRET_SERVICE,
         }
     }
 
@@ -184,6 +194,7 @@ impl SecretKind {
             }
             GATEWAY_REMOTE_ACCESS_SECRET_SERVICE => Some(SecretKind::GatewayRemoteAccessSecret),
             DESKTOP_GATEWAY_SESSION_SERVICE => Some(SecretKind::DesktopGatewaySession),
+            TASK_WEBHOOK_SECRET_SERVICE => Some(SecretKind::TaskWebhookSecret),
             _ => None,
         }
     }

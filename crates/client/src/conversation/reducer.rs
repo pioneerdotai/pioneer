@@ -14,7 +14,7 @@ use pioneer_protocol::{
 use serde_json::Value as JsonValue;
 use std::{
     cmp::Ordering,
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     sync::Arc,
 };
@@ -317,6 +317,9 @@ pub struct ConversationProjector {
     // Identity changes only on an accepted phase change, including snapshot sync.
     // A request can retain it to distinguish a repeat from departure and return.
     turn_phase_markers: HashMap<String, Arc<TurnPhase>>,
+    // Runtime progress only. These views have no canonical item, completed
+    // copy, or history identity. Never serialize them as semantic phase facts.
+    provider_previews: HashSet<String>,
     timeline_counter: u64,
     synthetic_item_counter: u64,
 }
@@ -328,6 +331,7 @@ impl ConversationProjector {
         self.item_timeline_index.clear();
         self.turn_index.clear();
         self.turn_phase_markers.clear();
+        self.provider_previews.clear();
         self.timeline_counter = 0;
         self.synthetic_item_counter = 0;
     }
@@ -392,6 +396,11 @@ impl ConversationProjector {
             turn.error.clone(),
         );
         self.view_state.upsert_turn_snapshot_metadata(turn);
+        if turn.status != TurnStatus::InProgress {
+            // Reconciliation can observe completion after the live terminal event
+            // was missed. Runtime previews must not survive that snapshot.
+            self.discard_provider_previews(&turn.id, None);
+        }
     }
 
     pub fn apply_local_turn_start_requested(
@@ -1245,6 +1254,112 @@ impl ConversationProjector {
         self.insert_timeline_entry(timeline_entry);
     }
 
+    pub(super) fn preview_provider_message(
+        &mut self,
+        turn_id: &str,
+        item_id: &str,
+        text: &str,
+        ts: i64,
+    ) {
+        if text.is_empty()
+            || self
+                .turn_index
+                .get(turn_id)
+                .and_then(|index| self.view_state.turns.get(*index))
+                .is_some_and(|turn| !matches!(turn.phase, TurnPhase::Starting | TurnPhase::Running))
+        {
+            return;
+        }
+        if self.provider_previews.contains(item_id) {
+            self.append_item_delta(item_id, text, None, ts);
+            return;
+        }
+        if self.view_state.items.iter().any(|item| {
+            item.turn_id == turn_id
+                && !self.provider_previews.contains(&item.id)
+                && matches!(
+                    &item.item,
+                    TurnItem::AgentMessage {
+                        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                        ..
+                    }
+                )
+        }) || self.item_index.contains_key(item_id)
+        {
+            return;
+        }
+        self.provider_previews.insert(item_id.to_owned());
+        // AgentMessage is the existing text presentation container. Its default
+        // phase is not semantic evidence: this runtime view is explicitly marked
+        // provisional and is discarded/replaced before canonical publication.
+        self.start_item_view(
+            item_id,
+            turn_id,
+            super::handlers::ITEM_TYPE_AGENT_MESSAGE,
+            TimelineEntryStatus::Running,
+            text.to_owned(),
+            None,
+            TurnItem::AgentMessage {
+                id: item_id.to_owned(),
+                text: String::new(),
+                phase: Default::default(),
+                markdown: None,
+                markdown_version: None,
+            },
+            Some(serde_json::json!({"runtimeDeltaKind":"provider_message_preview"})),
+            ts,
+        );
+    }
+
+    pub(super) fn resolve_provider_previews(
+        &mut self,
+        turn_id: &str,
+        item_id: &str,
+        final_answer: bool,
+    ) {
+        self.discard_provider_previews(turn_id, (!final_answer).then_some(item_id));
+    }
+
+    fn discard_provider_previews(&mut self, turn_id: &str, only: Option<&str>) {
+        if self.provider_previews.is_empty() {
+            return;
+        }
+        let removed = self
+            .view_state
+            .items
+            .iter()
+            .filter(|item| {
+                item.turn_id == turn_id
+                    && self.provider_previews.contains(&item.id)
+                    && only.is_none_or(|id| item.id == id)
+            })
+            .map(|item| item.id.clone())
+            .collect::<HashSet<_>>();
+        if removed.is_empty() {
+            return;
+        }
+        self.provider_previews.retain(|id| !removed.contains(id));
+        self.view_state
+            .items
+            .retain(|item| !removed.contains(&item.id));
+        self.view_state
+            .timeline
+            .retain(|entry| !removed.contains(&entry.item_id));
+        self.item_index = self
+            .view_state
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item.id.clone(), index))
+            .collect();
+        for entry in &mut self.view_state.timeline {
+            if let Some(index) = self.item_index.get(&entry.item_id) {
+                entry.item_index = *index;
+            }
+        }
+        self.rebuild_item_timeline_index();
+    }
+
     pub fn append_item_delta(
         &mut self,
         item_id: &str,
@@ -1265,7 +1380,26 @@ impl ConversationProjector {
                 item.status = TimelineEntryStatus::Running;
                 item.updated_at_unix_ms = Some(ts_unix_ms);
             }
-            if let Some(markdown) = markdown.clone() {
+            let prose = matches!(
+                &item.item,
+                TurnItem::AgentMessage { .. } | TurnItem::Reasoning { .. }
+            );
+            if prose && !preserve_terminal {
+                // A missing AST means raw fallback for the updated source.
+                // Clear every presentation fallback, including a restored payload.
+                item.final_markdown = None;
+                item.partial_markdown = markdown;
+                if item.partial_markdown.is_none()
+                    && let TurnItem::AgentMessage {
+                        markdown,
+                        markdown_version,
+                        ..
+                    } = &mut item.item
+                {
+                    *markdown = None;
+                    *markdown_version = None;
+                }
+            } else if !prose && let Some(markdown) = markdown {
                 item.partial_markdown = Some(markdown);
             }
         }
@@ -1365,6 +1499,7 @@ impl ConversationProjector {
         terminal_status: TimelineEntryStatus,
         ts_unix_ms: i64,
     ) {
+        self.discard_provider_previews(turn_id, None);
         for item in &mut self.view_state.items {
             if item.turn_id != turn_id {
                 continue;

@@ -47,6 +47,12 @@ where
     F: Future<Output = TaskRuntimeResult<T>> + Send + 'static,
     T: Send + 'static,
 {
+    let future = pioneer_observability::work::inherit_result(
+        pioneer_observability::work::Boundary::TaskFreshTask,
+        pioneer_observability::work::WorkKind::Task,
+        pioneer_observability::work::ExecutorRole::Task,
+        future,
+    );
     AbortOnDropTask::new(tokio::spawn(future))
         .join()
         .await

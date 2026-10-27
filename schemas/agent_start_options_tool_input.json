@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentStartOptionsToolInput",
+  "description": "Read-only catalog pagination. Target and execution context are server-owned.",
+  "type": "object",
+  "properties": {
+    "cursor": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "limit": {
+      "type": "integer",
+      "format": "uint32",
+      "default": 100,
+      "minimum": 1,
+      "maximum": 100
+    }
+  },
+  "additionalProperties": false
+}

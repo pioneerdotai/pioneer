@@ -3,6 +3,7 @@ use pioneer_client::{core::ClientCore, state::snapshot::ActiveThreadSnapshot};
 use pioneer_crud::{TurnExecutionStatus, TurnExecutorKind};
 use pioneer_protocol::{
     GatewayNotification, NativeTerminalEffectPreparation, ThreadUpdatedNotification,
+    TurnStartParams,
 };
 use pioneer_sqlite::SqliteWriteClass;
 use sea_orm::ActiveModelTrait;
@@ -77,6 +78,20 @@ fn recovered_native_turn_stop_restore_failure_rejects_pre_start_ack() {
 struct RecoveryProvider {
     barrier: CancellationBarrierProvider,
     calls: Arc<AtomicU64>,
+    cancelled: Arc<AtomicU64>,
+}
+
+struct PendingProviderCall {
+    cancelled: Arc<AtomicU64>,
+    returned: bool,
+}
+
+impl Drop for PendingProviderCall {
+    fn drop(&mut self) {
+        if !self.returned {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 #[async_trait::async_trait]
 impl Provider for RecoveryProvider {
@@ -88,7 +103,13 @@ impl Provider for RecoveryProvider {
     }
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.barrier.chat(request).await
+        let mut pending = PendingProviderCall {
+            cancelled: self.cancelled.clone(),
+            returned: false,
+        };
+        let response = self.barrier.chat(request).await;
+        pending.returned = true;
+        response
     }
     async fn stream_chat(
         &self,
@@ -354,6 +375,7 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
             release: Arc::new(Notify::new()),
         },
         calls: calls.clone(),
+        cancelled: Arc::new(AtomicU64::new(0)),
     });
     let mut processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("test-model", "openai")),
@@ -1512,4 +1534,1316 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
             .await
             .is_err()
     );
+}
+
+#[derive(Clone, Copy)]
+enum InitialStopPhase {
+    ActorBeforeRegistration,
+    RegistrationWinsEarlyCommit,
+    ActorAppearsBeforeRegistration,
+    RegistrationAfterControlAckWindow,
+    CanonicalStorageUnavailable,
+    RegistrationStorageUnavailable,
+    RegistrationWriteStorageUnavailable,
+    DirectChildBeforeRegistration,
+    NativeTaskBeforeRegistration,
+    GraphFenceStorageUnavailable,
+    AcceptedProjectionPending,
+    ProjectionStorageUnavailable,
+    BeforeActorProjectionStorageUnavailable,
+    GraphFenceProjectionUnavailable,
+}
+
+// These phase tests use one executor thread: observing the control registry's
+// Applied process control observes its synchronous out-of-band cancellation.
+// Registration remains behind the barrier; no sleep or provider race is used.
+#[tokio::test]
+async fn public_native_stop_finishes_actor_admission_before_context_registration() {
+    exercise_initial_native_stop(InitialStopPhase::ActorBeforeRegistration).await;
+}
+
+#[tokio::test]
+async fn public_native_stop_switches_to_registered_context_when_early_writer_loses_phase() {
+    exercise_initial_native_stop(InitialStopPhase::RegistrationWinsEarlyCommit).await;
+}
+
+#[tokio::test]
+async fn public_native_stop_follows_actor_appearing_before_registration() {
+    exercise_initial_native_stop(InitialStopPhase::ActorAppearsBeforeRegistration).await;
+}
+
+#[tokio::test]
+async fn public_native_stop_retains_completion_after_the_process_ack_window() {
+    exercise_initial_native_stop(InitialStopPhase::RegistrationAfterControlAckWindow).await;
+}
+
+#[tokio::test]
+async fn public_initial_stop_retains_completion_across_a_real_terminal_storage_failure() {
+    exercise_initial_native_stop(InitialStopPhase::CanonicalStorageUnavailable).await;
+}
+
+#[tokio::test]
+async fn public_initial_stop_retains_completion_across_registration_storage_failure() {
+    exercise_initial_native_stop(InitialStopPhase::RegistrationStorageUnavailable).await;
+}
+
+#[tokio::test]
+async fn public_initial_stop_retains_completion_across_registration_write_failure() {
+    exercise_initial_native_stop(InitialStopPhase::RegistrationWriteStorageUnavailable).await;
+}
+
+#[tokio::test]
+async fn public_root_stop_finishes_a_direct_threads_child_after_delayed_registration() {
+    exercise_initial_native_stop(InitialStopPhase::DirectChildBeforeRegistration).await;
+}
+
+#[tokio::test]
+async fn native_task_cancel_ack_keeps_the_actor_owning_delayed_durable_publication() {
+    exercise_initial_native_stop(InitialStopPhase::NativeTaskBeforeRegistration).await;
+}
+
+#[tokio::test]
+async fn public_root_stop_rediscovers_unfinished_children_after_a_graph_fence() {
+    exercise_initial_native_stop(InitialStopPhase::GraphFenceStorageUnavailable).await;
+}
+
+#[tokio::test]
+async fn public_initial_stop_waits_for_accepted_cancellation_projection() {
+    exercise_initial_native_stop(InitialStopPhase::AcceptedProjectionPending).await;
+}
+
+#[tokio::test]
+async fn public_initial_stop_retains_actor_after_a_real_projection_failure() {
+    exercise_initial_native_stop(InitialStopPhase::ProjectionStorageUnavailable).await;
+}
+
+#[tokio::test]
+async fn public_early_stop_and_repeat_wait_for_real_projection_without_an_actor() {
+    exercise_initial_native_stop(InitialStopPhase::BeforeActorProjectionStorageUnavailable).await;
+}
+
+#[tokio::test]
+async fn public_root_stop_retries_a_direct_child_after_real_projection_failure() {
+    exercise_initial_native_stop(InitialStopPhase::GraphFenceProjectionUnavailable).await;
+}
+
+async fn exercise_initial_native_stop(phase: InitialStopPhase) {
+    let thread = "thread_initial_native_stop";
+    let turn = "turn_initial_native_stop";
+    let (tx, mut rx) = mpsc::channel(256);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let (workspaces, store, workspace) = setup_workspace_manager().await;
+    ensure_test_superuser_execution_authority(store.as_ref()).await;
+    let secrets = test_gateway_secrets();
+    secrets
+        .set_workspace_provider_api_key(&workspace, "openai", "fixture-key")
+        .unwrap();
+    let calls = Arc::new(AtomicU64::new(0));
+    let provider_cancelled = Arc::new(AtomicU64::new(0));
+    let provider = Arc::new(RecoveryProvider {
+        barrier: CancellationBarrierProvider {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        },
+        calls: calls.clone(),
+        cancelled: provider_cancelled.clone(),
+    });
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "openai")),
+        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai", provider,
+        )),
+        sessions,
+        workspaces,
+        store.clone(),
+        secrets,
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    let client = ClientCore::new();
+    let opened = open(&processor, connection, &mut rx, &client, &workspace, thread).await;
+    store
+        .upsert_thread_model(
+            &opened,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(opened, None)
+        .await
+        .unwrap();
+    // Use ordinary admission/preparation, retaining the prepared runtime at its
+    // actual pre-dispatch boundary rather than inventing a cancellation context.
+    let admission =
+        test_execution_authorization_admission(&processor, connection, &workspace, thread).await;
+    let params: TurnStartParams = serde_json::from_value(json!({
+        "thread_id":thread, "turn_id":turn,
+        "model":"test-model", "model_provider":"openai", "mode":ThreadMode::Agent,
+        "execution_backend":{"type":"apiProvider","provider":"openai"},
+        "permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access(),
+        "input":[{"type":"text","text":"stop before the first model call"}]
+    }))
+    .unwrap();
+    let prepared = processor
+        .prepare_api_provider_turn_start(
+            connection,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
+            None,
+            params,
+            None,
+            crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            admission,
+        )
+        .await
+        .unwrap();
+    let crate::message::turn_handlers::ApiProviderTurnAdmission::New(prepared) = prepared else {
+        panic!("first admission must prepare a new runtime");
+    };
+    let owner = store.get_turn_execution(turn).await.unwrap().unwrap();
+    let db = store.database_connection();
+    let response = pioneer_crud::load_agent_turn_response(&db, turn)
+        .await
+        .unwrap()
+        .unwrap();
+    let resource = pioneer_crud::load_agent_execution_resource_state(&db, &response.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let permit_id = resource
+        .permit_id
+        .clone()
+        .expect("ordinary admission must acquire its permit");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let cancel_id = generate_test_request_id("initialstop", "cancel");
+    let request = json!({"jsonrpc":"2.0","id":cancel_id,"method":"turn/cancel",
+        "params":{"thread_id":thread,"turn_id":turn}})
+    .to_string();
+    match phase {
+        InitialStopPhase::BeforeActorProjectionStorageUnavailable => {
+            drop(prepared);
+            // Preparation creates an idle actor before dispatch. Remove that
+            // idle actor to exercise the durable Stop path without a runtime.
+            assert!(
+                processor
+                    .agent_manager
+                    .active_turn_id(thread)
+                    .await
+                    .is_none()
+            );
+            processor.agent_manager.remove_thread(thread).await;
+            assert!(!processor.agent_manager.has_thread(thread).await);
+            // Drive the durable live consumer explicitly after replay. A failed
+            // background delivery can otherwise remain in retry backoff when
+            // the synchronous repeat Stop returns its successful response.
+            processor
+                .native_turn_event_delivery_kick_running
+                .store(true, Ordering::SeqCst);
+            db.execute_unprepared("CREATE TRIGGER reject_early_projection BEFORE UPDATE OF status ON turn WHEN NEW.status = 'interrupted' BEGIN SELECT RAISE(ABORT, 'fixture projection unavailable'); END").await.unwrap();
+            for suffix in ["first-pending", "repeat-pending"] {
+                let id = generate_test_request_id("initialstop", suffix);
+                let mut pending: JsonValue = serde_json::from_str(&request).unwrap();
+                pending["id"] = json!(id);
+                processor
+                    .process_request_for_connection(connection, &pending.to_string())
+                    .await;
+                recv_error_by_id(&mut rx, &id).await;
+                assert!(store.native_turn_has_accepted_terminal(turn).await.unwrap());
+                assert_eq!(
+                    store
+                        .get_turn(thread, turn)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .status,
+                    TurnStatus::InProgress
+                );
+                assert_eq!(
+                    processor
+                        .thread_manager
+                        .turn_get(thread, turn)
+                        .await
+                        .unwrap()
+                        .1
+                        .status,
+                    TurnStatus::Interrupted
+                );
+                assert!(!processor.agent_manager.has_thread(thread).await);
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            }
+            db.execute_unprepared("DROP TRIGGER reject_early_projection")
+                .await
+                .unwrap();
+            let replay = store
+                .with_maintenance_access()
+                .replay_due_turn_event_projections(now_timestamp_secs() + 120, 64)
+                .await
+                .unwrap();
+            assert!(replay.projected > 0);
+            processor
+                .process_request_for_connection(connection, &request)
+                .await;
+            deliver_completion_live(&processor, &store, turn).await;
+            assert_eq!(
+                completion_live_delivery(&store, turn).await.status,
+                "delivered"
+            );
+            processor
+                .native_turn_event_delivery_kick_running
+                .store(false, Ordering::SeqCst);
+        }
+        InitialStopPhase::NativeTaskBeforeRegistration => {
+            processor.bind_task_bridge().await;
+            processor.arm_completed_history_preparation_barrier(
+                "__native_initial_control_before_registration__",
+            );
+            let created = create_task_for_test(
+                &processor,
+                test_task_create_params(&workspace, thread, turn, "cancel a real native Task", 3),
+            )
+            .await
+            .unwrap();
+            let run = created.run.unwrap();
+            let child = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
+            timeout(
+                Duration::from_secs(10),
+                processor.wait_for_completed_history_preparation_barrier(),
+            )
+            .await
+            .unwrap();
+            let child_owner = store
+                .get_turn_execution(&child.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(child_owner.started_at.is_some());
+            assert!(
+                store
+                    .native_cancellation_context(&child.child_turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            // This invokes TaskAgentExecutor::cancel_run and its ordinary
+            // AgentManager CancelTurn, not the Gateway initial Stop receipt.
+            timeout(
+                Duration::from_secs(1),
+                processor.task_runtime.service().cancel_task(
+                    pioneer_tasks::TaskMutationContext {
+                        actor_id: Some(authenticated_test_superuser().principal_id.to_string()),
+                        ..Default::default()
+                    },
+                    pioneer_protocol::TaskCancelParams {
+                        task_id: created.task.id.clone(),
+                        reason: Some("one Task cancellation".into()),
+                        scope: pioneer_protocol::TaskCancelScope::FullSubtree,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if matches!(
+                        processor
+                            .agent_manager
+                            .control_operation_status(
+                                &child.child_thread_id,
+                                &pioneer_agent::AgentControlOperationId::CancelTurn {
+                                    turn_id: child.child_turn_id.clone()
+                                },
+                            )
+                            .await
+                            .unwrap(),
+                        Some(pioneer_agent::AgentControlOperationStatus::Applied { .. })
+                    ) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(3)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                processor
+                    .agent_manager
+                    .has_thread(&child.child_thread_id)
+                    .await
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            tokio::time::resume();
+            processor.release_completed_history_preparation_barrier();
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if store
+                        .get_turn(&child.child_thread_id, &child.child_turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .status
+                        == TurnStatus::Interrupted
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let stopped = store
+                .get_turn_execution(&child.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (stopped.owner_id, stopped.owner_generation),
+                (child_owner.owner_id, child_owner.owner_generation)
+            );
+            assert_eq!(stopped.status, TurnExecutionStatus::Interrupted);
+            assert_eq!(
+                store.get_task_run(&run.id).await.unwrap().unwrap().status,
+                pioneer_protocol::TaskRunStatus::Cancelled
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            wait_for_cancelled_native_actor_cleanup(
+                &processor.agent_manager,
+                &child.child_thread_id,
+            )
+            .await;
+            drop(prepared);
+            processor
+                .process_request_for_connection(connection, &request)
+                .await;
+        }
+        InitialStopPhase::DirectChildBeforeRegistration
+        | InitialStopPhase::GraphFenceStorageUnavailable
+        | InitialStopPhase::GraphFenceProjectionUnavailable => {
+            let tools = processor
+                .materialize_agent_action_tools(pioneer_agent::TurnToolContext {
+                    workspace_id: workspace.clone(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                })
+                .await
+                .unwrap();
+            let mut children = Vec::new();
+            let mut child_owners = std::collections::BTreeMap::new();
+            let mut child_permits = std::collections::BTreeMap::new();
+            for index in 0..if matches!(
+                phase,
+                InitialStopPhase::GraphFenceStorageUnavailable
+                    | InitialStopPhase::GraphFenceProjectionUnavailable
+            ) {
+                2
+            } else {
+                1
+            } {
+                let binding = processor.agent_action_binding(turn).await.unwrap();
+                let creation = binding
+                    .options
+                    .thread_creation_options
+                    .iter()
+                    .find(|o| o.label == "Current collaboration")
+                    .unwrap();
+                let created = super::thread_launch_choices::call(
+                    &tools,
+                    "thread_create",
+                    &format!("initial-stop-child-create-{index}"),
+                    json!({"optionId":creation.id}),
+                )
+                .await;
+                let target = created["targetOptions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|option| {
+                        !binding
+                            .options
+                            .target_options
+                            .iter()
+                            .any(|old| Some(old.id.as_str()) == option["id"].as_str())
+                    })
+                    .unwrap()["id"]
+                    .clone();
+                let start_id = format!("initial-stop-child-start-{index}");
+                super::thread_launch_choices::call(&tools,"threads_turn_start",&start_id,json!({
+                "targetOptionId":target,"input":[{"type":"text","text":"Run in the root work graph"}],
+                "launch":{"useDefaultReasoning":true}
+            })).await;
+                let row = pioneer_crud::load_agent_action_outbox(
+                    &db,
+                    crate::authorization::action_id_for_call(&start_id).as_str(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
+                let child_turn = payload["dispatch"]["turn_id"].as_str().unwrap();
+                let child_thread = payload["dispatch"]["thread_id"].as_str().unwrap();
+                let canonical = store
+                    .get_turn(child_thread, child_turn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1;
+                // A loaded thread can still have an unloaded target Turn.
+                // Load it before Stop so the memory assertion checks the actual
+                // terminal synchronization rather than a later restoration.
+                processor
+                    .ensure_runtime_turn_loaded_for_lifecycle(&workspace, child_thread, &canonical)
+                    .await
+                    .unwrap();
+                child_owners.insert(
+                    child_turn.to_owned(),
+                    store.get_turn_execution(child_turn).await.unwrap().unwrap(),
+                );
+                children.push(payload);
+            }
+            if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
+                // Both descendants must be inside real provider work when the
+                // public root Stop accepts the first interruption. Never release
+                // the provider: dropping its future is the cancellation proof.
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap();
+                timeout(Duration::from_secs(10), async {
+                    while calls.load(Ordering::SeqCst) < children.len() as u64 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                for payload in &children {
+                    let child_thread = payload["dispatch"]["thread_id"].as_str().unwrap();
+                    let child_turn = payload["dispatch"]["turn_id"].as_str().unwrap();
+                    // Keep the child loaded for the memory/projection comparison
+                    // after Stop. Terminal cleanup can unload an idle thread
+                    // that has no subscribers.
+                    assert!(
+                        processor
+                            .thread_manager
+                            .subscribe_connection(child_thread, connection)
+                            .await
+                    );
+                    assert_eq!(
+                        processor
+                            .agent_manager
+                            .active_turn_id(child_thread)
+                            .await
+                            .as_deref(),
+                        Some(child_turn)
+                    );
+                    assert!(
+                        store
+                            .native_cancellation_context(child_turn)
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
+                    let resource = pioneer_crud::load_agent_execution_resource_state(
+                        &db,
+                        payload["spawned_execution_id"].as_str().unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(resource.status, "running");
+                    child_permits.insert(child_turn.to_owned(), resource.permit_id.unwrap());
+                }
+                assert_eq!(provider_cancelled.load(Ordering::SeqCst), 0);
+            }
+            if matches!(
+                phase,
+                InitialStopPhase::GraphFenceStorageUnavailable
+                    | InitialStopPhase::GraphFenceProjectionUnavailable
+            ) {
+                let read = Arc::new(Notify::new());
+                let continue_commit = Arc::new(Notify::new());
+                *processor
+                    .native_cancellation_materialization_barrier
+                    .lock()
+                    .await = Some((read.clone(), continue_commit.clone()));
+                let mut first_request: JsonValue = serde_json::from_str(&request).unwrap();
+                let failed_id = generate_test_request_id("initialstop", "graph-storage");
+                first_request["id"] = json!(failed_id);
+                let first_stop = tokio::spawn({
+                    let processor = processor.clone();
+                    async move {
+                        processor
+                            .process_request_for_connection(connection, &first_request.to_string())
+                            .await
+                    }
+                });
+                timeout(Duration::from_secs(10), read.notified())
+                    .await
+                    .unwrap();
+                let mut first_turn = None;
+                for payload in &children {
+                    let child_thread = payload["dispatch"]["thread_id"].as_str().unwrap();
+                    let child_turn = payload["dispatch"]["turn_id"].as_str().unwrap();
+                    if processor
+                        .thread_manager
+                        .turn_get(child_thread, child_turn)
+                        .await
+                        .unwrap()
+                        .1
+                        .status
+                        == TurnStatus::Interrupted
+                    {
+                        assert!(first_turn.replace(child_turn.to_owned()).is_none());
+                    }
+                }
+                let first_turn = first_turn
+                    .expect("the first child holds provisional interruption before its writer");
+                // The graph fence has committed; fail the actual first child's
+                // append or projection, irrespective of traversal order.
+                let trigger = if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable)
+                {
+                    format!(
+                        "CREATE TRIGGER fail_graph_child BEFORE UPDATE OF status ON turn WHEN NEW.id='{first_turn}' AND NEW.status='interrupted' BEGIN SELECT RAISE(ABORT,'fixture projection unavailable'); END"
+                    )
+                } else {
+                    format!(
+                        "CREATE TRIGGER fail_graph_child BEFORE INSERT ON turn_event WHEN NEW.turn_id='{first_turn}' BEGIN SELECT RAISE(ABORT,'fixture storage unavailable'); END"
+                    )
+                };
+                db.execute_unprepared(&trigger).await.unwrap();
+                continue_commit.notify_one();
+                timeout(Duration::from_secs(10), first_stop)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                recv_error_by_id(&mut rx, &failed_id).await;
+                assert_eq!(
+                    store
+                        .get_turn(thread, turn)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .status,
+                    TurnStatus::InProgress
+                );
+                for payload in &children {
+                    let child_thread = payload["dispatch"]["thread_id"].as_str().unwrap();
+                    let child_turn = payload["dispatch"]["turn_id"].as_str().unwrap();
+                    let execution = payload["spawned_execution_id"].as_str().unwrap();
+                    assert_eq!(
+                        pioneer_crud::load_agent_execution(&db, execution)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .status,
+                        "cancelled"
+                    );
+                    assert_eq!(
+                        store
+                            .get_turn(child_thread, child_turn)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .1
+                            .status,
+                        if child_turn == first_turn {
+                            TurnStatus::InProgress
+                        } else {
+                            TurnStatus::Interrupted
+                        }
+                    );
+                }
+                if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
+                    assert!(
+                        store
+                            .native_turn_has_accepted_terminal(&first_turn)
+                            .await
+                            .unwrap()
+                    );
+                    timeout(Duration::from_secs(10), async {
+                        while provider_cancelled.load(Ordering::SeqCst) != children.len() as u64 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    for payload in &children {
+                        wait_for_cancelled_native_actor_cleanup(
+                            &processor.agent_manager,
+                            payload["dispatch"]["thread_id"].as_str().unwrap(),
+                        )
+                        .await;
+                    }
+                    let id = generate_test_request_id("initialstop", "graph-repeat-pending");
+                    let mut pending: JsonValue = serde_json::from_str(&request).unwrap();
+                    pending["id"] = json!(id);
+                    processor
+                        .process_request_for_connection(connection, &pending.to_string())
+                        .await;
+                    recv_error_by_id(&mut rx, &id).await;
+                }
+                db.execute_unprepared("DROP TRIGGER fail_graph_child")
+                    .await
+                    .unwrap();
+                if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
+                    store
+                        .with_maintenance_access()
+                        .replay_due_turn_event_projections(now_timestamp_secs() + 120, 64)
+                        .await
+                        .unwrap();
+                }
+                processor
+                    .process_request_for_connection(connection, &request)
+                    .await;
+                for payload in &children {
+                    let child_thread = payload["dispatch"]["thread_id"].as_str().unwrap();
+                    let child_turn = payload["dispatch"]["turn_id"].as_str().unwrap();
+                    assert_eq!(
+                        store
+                            .get_turn(child_thread, child_turn)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .1
+                            .status,
+                        TurnStatus::Interrupted
+                    );
+                    let stopped = store.get_turn_execution(child_turn).await.unwrap().unwrap();
+                    let original = &child_owners[child_turn];
+                    assert_eq!(stopped.owner_id, original.owner_id);
+                    assert_eq!(stopped.owner_generation, original.owner_generation);
+                    assert_eq!(stopped.status, TurnExecutionStatus::Interrupted);
+                    assert_eq!(
+                        pioneer_crud::load_agent_execution_resource_state(
+                            &db,
+                            payload["spawned_execution_id"].as_str().unwrap()
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                        "cancelled"
+                    );
+                    if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
+                        wait_for_cancelled_native_actor_cleanup(
+                            &processor.agent_manager,
+                            child_thread,
+                        )
+                        .await;
+                        assert_eq!(
+                            pioneer_entity::agent_running_permit::Entity::find_by_id(
+                                child_permits[child_turn].clone(),
+                            )
+                            .one(&db)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .status,
+                            "released"
+                        );
+                        assert_eq!(
+                            processor
+                                .thread_manager
+                                .turn_get(child_thread, child_turn)
+                                .await
+                                .unwrap()
+                                .1,
+                            store
+                                .get_turn(child_thread, child_turn)
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .1
+                        );
+                    }
+                }
+                if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
+                    assert_eq!(
+                        provider_cancelled.load(Ordering::SeqCst),
+                        children.len() as u64
+                    );
+                }
+                drop(prepared);
+            } else {
+                let payload = &children[0];
+                let child_thread = payload["dispatch"]["thread_id"].as_str().unwrap();
+                let child_turn = payload["dispatch"]["turn_id"].as_str().unwrap();
+                let child_execution = payload["spawned_execution_id"].as_str().unwrap();
+                let child = pioneer_crud::load_agent_execution(&db, child_execution)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    child.parent_execution_id.as_deref(),
+                    Some(response.execution_id.as_str())
+                );
+                assert!(child.parent_task_id.is_none());
+                let child_owner = store.get_turn_execution(child_turn).await.unwrap().unwrap();
+                processor.arm_completed_history_preparation_barrier(
+                    "__native_initial_control_before_registration__",
+                );
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap();
+                timeout(
+                    Duration::from_secs(10),
+                    processor.wait_for_completed_history_preparation_barrier(),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    store
+                        .get_turn_execution(child_turn)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .started_at
+                        .is_some()
+                );
+                let child_permit =
+                    pioneer_crud::load_agent_execution_resource_state(&db, child_execution)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .permit_id
+                        .expect("admitted child must own a permit");
+                let stop = tokio::spawn({
+                    let processor = processor.clone();
+                    async move {
+                        processor
+                            .process_request_for_connection(connection, &request)
+                            .await
+                    }
+                });
+                timeout(Duration::from_secs(10), async {
+                    loop {
+                        if matches!(
+                            processor
+                                .agent_manager
+                                .control_operation_status(
+                                    child_thread,
+                                    &pioneer_agent::AgentControlOperationId::CancelTurn {
+                                        turn_id: child_turn.into()
+                                    }
+                                )
+                                .await
+                                .unwrap(),
+                            Some(pioneer_agent::AgentControlOperationStatus::Applied { .. })
+                        ) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(3)).await;
+                tokio::task::yield_now().await;
+                assert!(processor.agent_manager.has_thread(child_thread).await);
+                assert!(!stop.is_finished());
+                tokio::time::resume();
+                processor.release_completed_history_preparation_barrier();
+                timeout(Duration::from_secs(10), stop)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .get_turn(child_thread, child_turn)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .status,
+                    TurnStatus::Interrupted
+                );
+                let stopped = store.get_turn_execution(child_turn).await.unwrap().unwrap();
+                assert_eq!(stopped.owner_id, child_owner.owner_id);
+                assert_eq!(stopped.owner_generation, child_owner.owner_generation);
+                assert_eq!(stopped.status, TurnExecutionStatus::Interrupted);
+                let child_resource =
+                    pioneer_crud::load_agent_execution_resource_state(&db, child_execution)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(child_resource.status, "cancelled");
+                assert_eq!(
+                    pioneer_crud::load_agent_execution(&db, child_execution)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "cancelled"
+                );
+                assert_eq!(
+                    pioneer_entity::agent_running_permit::Entity::find_by_id(child_permit)
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "released"
+                );
+                wait_for_cancelled_native_actor_cleanup(&processor.agent_manager, child_thread)
+                    .await;
+                drop(prepared); // the parent never activated
+            }
+        }
+        InitialStopPhase::ActorBeforeRegistration
+        | InitialStopPhase::RegistrationAfterControlAckWindow
+        | InitialStopPhase::CanonicalStorageUnavailable
+        | InitialStopPhase::RegistrationStorageUnavailable
+        | InitialStopPhase::RegistrationWriteStorageUnavailable
+        | InitialStopPhase::AcceptedProjectionPending
+        | InitialStopPhase::ProjectionStorageUnavailable => {
+            processor.arm_completed_history_preparation_barrier(
+                "__native_initial_control_before_registration__",
+            );
+            processor
+                .dispatch_prepared_api_provider_turn_start(prepared)
+                .await;
+            timeout(
+                Duration::from_secs(10),
+                processor.wait_for_completed_history_preparation_barrier(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                store
+                    .native_cancellation_context(turn)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                processor
+                    .agent_manager
+                    .turn_owner_waiting_for_cancellation_context(thread, turn)
+                    .await
+                    .is_some()
+            );
+            if matches!(phase, InitialStopPhase::AcceptedProjectionPending) {
+                store
+                    .accept_turn_event_before_projection_for_test(
+                        pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+                            pioneer_protocol::ItemCompletedNotification {
+                                workspace_id: workspace.clone(),
+                                thread_id: thread.into(),
+                                turn_id: turn.into(),
+                                item: pioneer_protocol::TurnItem::AgentMessage {
+                                    id: "pending-stop-predecessor".into(),
+                                    text: "prior durable item".into(),
+                                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                                    markdown: None,
+                                    markdown_version: None,
+                                },
+                            },
+                        ),
+                        now_timestamp_secs(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let stop = {
+                let processor = processor.clone();
+                tokio::spawn(async move {
+                    processor
+                        .process_request_for_connection(connection, &request)
+                        .await
+                })
+            };
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if matches!(
+                        processor
+                            .agent_manager
+                            .control_operation_status(
+                                thread,
+                                &pioneer_agent::AgentControlOperationId::CancelTurn {
+                                    turn_id: turn.into()
+                                }
+                            )
+                            .await
+                            .unwrap(),
+                        Some(pioneer_agent::AgentControlOperationStatus::Applied { .. })
+                    ) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                !stop.is_finished(),
+                "process admission must not acknowledge durable Stop"
+            );
+            if matches!(phase, InitialStopPhase::RegistrationAfterControlAckWindow) {
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(3)).await;
+                tokio::task::yield_now().await;
+                assert!(processor.agent_manager.has_thread(thread).await);
+                assert!(!stop.is_finished());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                tokio::time::resume();
+            }
+            if matches!(phase, InitialStopPhase::RegistrationWriteStorageUnavailable) {
+                // The guard can read storage; only the real immutable context
+                // INSERT fails after the Stop has been handed to the actor.
+                db.execute_unprepared(&format!("CREATE TRIGGER fail_initial_registration BEFORE INSERT ON native_cancellation_context WHEN NEW.turn_id='{turn}' BEGIN SELECT RAISE(ABORT,'fixture registration storage unavailable'); END"))
+                    .await.unwrap();
+                processor.arm_completed_history_preparation_barrier(
+                    "__initial_stop_registration_failed__",
+                );
+                processor.release_completed_history_preparation_barrier();
+                timeout(
+                    Duration::from_secs(10),
+                    processor.wait_for_completed_history_preparation_barrier(),
+                )
+                .await
+                .unwrap();
+                assert!(processor.agent_manager.has_thread(thread).await);
+                assert!(!stop.is_finished());
+                assert!(
+                    store
+                        .native_cancellation_context(turn)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(!store.native_turn_has_accepted_terminal(turn).await.unwrap());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                db.execute_unprepared("DROP TRIGGER fail_initial_registration")
+                    .await
+                    .unwrap();
+            }
+            if matches!(phase, InitialStopPhase::RegistrationStorageUnavailable) {
+                processor.arm_completed_history_preparation_barrier(
+                    "__native_initial_control_after_registration__",
+                );
+                processor.release_completed_history_preparation_barrier();
+                timeout(
+                    Duration::from_secs(10),
+                    processor.wait_for_completed_history_preparation_barrier(),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    store
+                        .native_cancellation_context(turn)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                // The next publication reads this table in the lease guard,
+                // before prepare_native_turn_control. Exercise that real Query
+                // failure, rather than waiting for the later registration hook.
+                db.execute_unprepared("ALTER TABLE native_cancellation_context RENAME TO unavailable_cancellation_context").await.unwrap();
+                processor.arm_completed_history_preparation_barrier(
+                    "__initial_stop_registration_guard_failed__",
+                );
+                processor.release_completed_history_preparation_barrier();
+                timeout(
+                    Duration::from_secs(10),
+                    processor.wait_for_completed_history_preparation_barrier(),
+                )
+                .await
+                .unwrap();
+                assert!(processor.agent_manager.has_thread(thread).await);
+                assert!(!stop.is_finished());
+                assert!(!store.native_turn_has_accepted_terminal(turn).await.unwrap());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                db.execute_unprepared("ALTER TABLE unavailable_cancellation_context RENAME TO native_cancellation_context").await.unwrap();
+            }
+            if matches!(phase, InitialStopPhase::CanonicalStorageUnavailable) {
+                // Registration can commit, but the actual canonical append fails.
+                // The control receipt must retain its owner through that failure.
+                db.execute_unprepared(&format!("CREATE TRIGGER fail_initial_stop BEFORE INSERT ON turn_event WHEN NEW.turn_id='{turn}' BEGIN SELECT RAISE(ABORT,'fixture terminal storage unavailable'); END"))
+                    .await.unwrap();
+                processor.arm_completed_history_preparation_barrier(
+                    "__initial_stop_terminal_commit_failed__",
+                );
+                processor.release_completed_history_preparation_barrier();
+                timeout(
+                    Duration::from_secs(10),
+                    processor.wait_for_completed_history_preparation_barrier(),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    store
+                        .native_cancellation_context(turn)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(!store.native_turn_has_accepted_terminal(turn).await.unwrap());
+                assert!(!stop.is_finished());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                db.execute_unprepared("DROP TRIGGER fail_initial_stop")
+                    .await
+                    .unwrap();
+            }
+            if matches!(
+                phase,
+                InitialStopPhase::AcceptedProjectionPending
+                    | InitialStopPhase::ProjectionStorageUnavailable
+            ) {
+                if matches!(phase, InitialStopPhase::ProjectionStorageUnavailable) {
+                    db.execute_unprepared("CREATE TRIGGER reject_owned_projection BEFORE UPDATE OF status ON turn WHEN NEW.status = 'interrupted' BEGIN SELECT RAISE(ABORT, 'fixture projection unavailable'); END").await.unwrap();
+                }
+                processor.arm_completed_history_preparation_barrier(
+                    "__initial_stop_terminal_commit_failed__",
+                );
+                processor.release_completed_history_preparation_barrier();
+                timeout(
+                    Duration::from_secs(10),
+                    processor.wait_for_completed_history_preparation_barrier(),
+                )
+                .await
+                .unwrap();
+                assert!(store.native_turn_has_accepted_terminal(turn).await.unwrap());
+                assert_eq!(
+                    store
+                        .get_turn(thread, turn)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .status,
+                    TurnStatus::InProgress
+                );
+                assert!(!stop.is_finished());
+                assert!(processor.agent_manager.has_thread(thread).await);
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                if matches!(phase, InitialStopPhase::ProjectionStorageUnavailable) {
+                    // Let the first real projector failure reach classification.
+                    // A permanent refusal loses the actor before this next retry.
+                    processor.arm_completed_history_preparation_barrier(
+                        "__initial_stop_terminal_completion_pending__",
+                    );
+                    processor.release_completed_history_preparation_barrier();
+                    timeout(
+                        Duration::from_secs(10),
+                        processor.wait_for_completed_history_preparation_barrier(),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!stop.is_finished());
+                    assert!(processor.agent_manager.has_thread(thread).await);
+                    assert_eq!(
+                        store
+                            .get_turn(thread, turn)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .1
+                            .status,
+                        TurnStatus::InProgress
+                    );
+                    db.execute_unprepared("DROP TRIGGER reject_owned_projection")
+                        .await
+                        .unwrap();
+                }
+                let replay = store
+                    .with_maintenance_access()
+                    .replay_due_turn_event_projections(now_timestamp_secs() + 120, 64)
+                    .await
+                    .unwrap();
+                assert!(replay.projected > 0);
+            }
+            processor.release_completed_history_preparation_barrier();
+            timeout(Duration::from_secs(10), stop)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        InitialStopPhase::RegistrationWinsEarlyCommit
+        | InitialStopPhase::ActorAppearsBeforeRegistration => {
+            let read = Arc::new(Notify::new());
+            let continue_commit = Arc::new(Notify::new());
+            *processor
+                .native_cancellation_materialization_barrier
+                .lock()
+                .await = Some((read.clone(), continue_commit.clone()));
+            let stop = {
+                let processor = processor.clone();
+                tokio::spawn(async move {
+                    processor
+                        .process_request_for_connection(connection, &request)
+                        .await
+                })
+            };
+            timeout(Duration::from_secs(10), read.notified())
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .native_cancellation_context(turn)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                processor
+                    .agent_manager
+                    .turn_owner_generation(thread, turn)
+                    .await
+                    .is_none()
+            );
+            let actor_appears = matches!(phase, InitialStopPhase::ActorAppearsBeforeRegistration);
+            processor.arm_completed_history_preparation_barrier(if actor_appears {
+                "__native_initial_control_before_registration__"
+            } else {
+                "__native_initial_control_after_registration__"
+            });
+            processor
+                .dispatch_prepared_api_provider_turn_start(prepared)
+                .await;
+            timeout(
+                Duration::from_secs(10),
+                processor.wait_for_completed_history_preparation_barrier(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                store
+                    .native_cancellation_context(turn)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                !actor_appears
+            );
+            assert!(
+                store
+                    .get_turn_execution(turn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .started_at
+                    .is_some()
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            continue_commit.notify_one();
+            if actor_appears {
+                timeout(Duration::from_secs(10), async {
+                    loop {
+                        if matches!(
+                            processor
+                                .agent_manager
+                                .control_operation_status(
+                                    thread,
+                                    &pioneer_agent::AgentControlOperationId::CancelTurn {
+                                        turn_id: turn.into()
+                                    }
+                                )
+                                .await
+                                .unwrap(),
+                            Some(pioneer_agent::AgentControlOperationStatus::Applied { .. })
+                        ) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(!stop.is_finished());
+                processor.release_completed_history_preparation_barrier();
+            }
+            timeout(Duration::from_secs(10), stop)
+                .await
+                .unwrap()
+                .unwrap();
+            // The same Stop committed with the real context before this ACK.
+            assert!(store.native_turn_has_accepted_terminal(turn).await.unwrap());
+            processor.release_completed_history_preparation_barrier();
+        }
+    }
+    let (reply, _) =
+        recv_response_and_notification_by_id_method(&mut rx, &cancel_id, events::TURN_FAILED).await;
+    let reply: TurnCancelResponse = serde_json::from_value(reply.result).unwrap();
+    assert_eq!(reply.turn.status, TurnStatus::Interrupted);
+    let terminal = store.get_turn(thread, turn).await.unwrap().unwrap().1;
+    assert_eq!(terminal, reply.turn);
+    assert_eq!(
+        processor
+            .thread_manager
+            .turn_get(thread, turn)
+            .await
+            .unwrap()
+            .1,
+        terminal
+    );
+    let stopped = store.get_turn_execution(turn).await.unwrap().unwrap();
+    assert_eq!(stopped.owner_id, owner.owner_id);
+    assert_eq!(stopped.owner_generation, owner.owner_generation);
+    assert_eq!(stopped.status, TurnExecutionStatus::Interrupted);
+    if !matches!(
+        phase,
+        InitialStopPhase::DirectChildBeforeRegistration
+            | InitialStopPhase::GraphFenceStorageUnavailable
+            | InitialStopPhase::NativeTaskBeforeRegistration
+            | InitialStopPhase::BeforeActorProjectionStorageUnavailable
+            | InitialStopPhase::GraphFenceProjectionUnavailable
+    ) {
+        assert!(
+            store
+                .native_cancellation_receipt_owned(turn, processor.turn_execution_owner_id.as_ref())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    let execution = pioneer_crud::load_agent_execution(&db, &response.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(execution.status, "cancelled");
+    let resource = pioneer_crud::load_agent_execution_resource_state(&db, &response.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resource.status, "cancelled");
+    let permit = pioneer_entity::agent_running_permit::Entity::find_by_id(permit_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(permit.status, "released");
+    wait_for_cancelled_native_actor_cleanup(&processor.agent_manager, thread).await;
+    let expected_calls = if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
+        2
+    } else {
+        0
+    };
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        expected_calls,
+        "confirmed Stop must fence delayed or repeated provider work"
+    );
+    let repeat_id = generate_test_request_id("initialstop", "repeat");
+    processor
+        .process_request_for_connection(
+            connection,
+            &json!({"jsonrpc":"2.0","id":repeat_id,"method":"turn/cancel",
+        "params":{"thread_id":thread,"turn_id":turn}})
+            .to_string(),
+        )
+        .await;
+    let repeat = recv_response_by_id(&mut rx, &repeat_id).await;
+    let repeat: TurnCancelResponse = serde_json::from_value(repeat.result).unwrap();
+    assert_eq!(repeat.turn, terminal);
+    assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
 }

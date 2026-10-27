@@ -943,9 +943,40 @@ async fn thread_scope_from_model<C: ConnectionTrait>(
     }))
 }
 
-/// One bounded page of executing tasks, using the same causal root and admission
-/// checks as `resolve_task_authorization_scope`. No run history or payload JSON
-/// is loaded. Membership facts are read in the same statement as the scope.
+/// Thin workspace discovery. The cursor is taken before scope filtering, so a
+/// page of inaccessible or malformed tasks cannot stop discovery prematurely.
+async fn list_running_task_ids<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    after_task_id: &str,
+) -> Result<Vec<String>> {
+    use sea_orm::sea_query::{Expr, ExprTrait, Order, Query};
+    let query = Query::select()
+        .distinct()
+        .column((task_run::Entity, task_run::Column::TaskId))
+        .from(task_run::Entity)
+        .cross_join(task::Entity.table_ref())
+        .and_where(
+            Expr::col((task::Entity, task::Column::Id))
+                .equals((task_run::Entity, task_run::Column::TaskId)),
+        )
+        .and_where(Expr::col((task::Entity, task::Column::WorkspaceId)).eq(workspace_id))
+        .and_where(
+            Expr::col((task_run::Entity, task_run::Column::Status)).is_in(["starting", "running"]),
+        )
+        .and_where(Expr::col((task_run::Entity, task_run::Column::TaskId)).gt(after_task_id))
+        .order_by((task_run::Entity, task_run::Column::TaskId), Order::Asc)
+        .limit(512)
+        .to_owned();
+    db.query_all(&query)
+        .await?
+        .into_iter()
+        .map(|row| row.try_get("", "task_id").map_err(Into::into))
+        .collect()
+}
+
+/// One discovery page, with scope lookup bounded independently of active-run
+/// density. Final TaskRead authorization remains the Gateway resolver's job.
 pub async fn list_running_task_scopes<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
@@ -953,7 +984,6 @@ pub async fn list_running_task_scopes<C: ConnectionTrait>(
     principal_id: &PrincipalId,
     after_task_id: &str,
 ) -> Result<RunningTaskScopePage> {
-    use sea_orm::{Statement, Value};
     if thread_ids.is_empty() {
         return Ok(RunningTaskScopePage::default());
     }
@@ -961,6 +991,47 @@ pub async fn list_running_task_scopes<C: ConnectionTrait>(
         thread_ids.len() <= 500,
         "task activity candidate batch exceeds tree limit"
     );
+    let ids = list_running_task_ids(db, workspace_id, after_task_id).await?;
+    let mut page = RunningTaskScopePage {
+        after_task_id: ids.last().cloned(),
+        scopes: Vec::new(),
+    };
+    for batch in ids.chunks(128) {
+        page.scopes.extend(
+            list_running_task_scopes_for_ids(db, workspace_id, thread_ids, principal_id, batch)
+                .await?
+                .scopes,
+        );
+    }
+    Ok(page)
+}
+
+/// One bounded page of executing tasks, using the same causal root and admission
+/// checks as `resolve_task_authorization_scope`. No run history or payload JSON
+/// is loaded. Membership facts are read in the same statement as the scope.
+async fn list_running_task_scopes_for_ids<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_ids: &[String],
+    principal_id: &PrincipalId,
+    task_ids: &[String],
+) -> Result<RunningTaskScopePage> {
+    use sea_orm::{Statement, Value};
+    if thread_ids.is_empty() || task_ids.is_empty() {
+        return Ok(RunningTaskScopePage::default());
+    }
+    anyhow::ensure!(
+        thread_ids.len() <= 500,
+        "task activity candidate batch exceeds tree limit"
+    );
+    // DISTINCT selects no run fields. Task/root/thread/turn IDs, lineage child
+    // and admission task are unique: at most one scope row per task. Thus all
+    // <=128 candidates fit LIMIT 128, even with several active runs per task.
+    anyhow::ensure!(
+        task_ids.len() <= 128,
+        "task scope lookup exceeds batch limit"
+    );
+    let task_placeholders = vec!["?"; task_ids.len()].join(",");
     let placeholders = vec!["?"; thread_ids.len()].join(",");
     let sql = format!(
         r#"
@@ -985,7 +1056,7 @@ LEFT JOIN thread_lineage l ON l.child_thread_id = c.id
 JOIN thread rt ON rt.id = CASE WHEN c.access_class = 'internal' THEN l.root_thread_id ELSE c.id END
               AND rt.workspace_id = t.workspace_id
 LEFT JOIN task_execution_admission a ON a.task_id = t.id
-WHERE tr.status IN ('starting', 'running') AND t.workspace_id = ? AND t.id > ?
+WHERE tr.status IN ('starting', 'running') AND t.workspace_id = ? AND t.id IN ({task_placeholders})
   AND rt.id IN ({placeholders}) AND rt.access_class IN ('private', 'workspace')
   AND c.access_class IN ('private', 'workspace', 'internal')
   AND (r.created_by_turn_id IS NULL OR ct.thread_id = c.id)
@@ -997,8 +1068,8 @@ ORDER BY t.id LIMIT 128
         principal_id.to_string().into(),
         principal_id.to_string().into(),
         workspace_id.to_owned().into(),
-        after_task_id.to_owned().into(),
     ];
+    values.extend(task_ids.iter().cloned().map(Into::into));
     values.extend(thread_ids.iter().cloned().map(Into::into));
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(

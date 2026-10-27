@@ -8,6 +8,7 @@ mod router;
 mod state;
 pub(crate) mod streams;
 mod views;
+mod webhooks;
 
 pub(crate) use router::gateway_router;
 pub(crate) use state::{GatewayHttpState, ReadinessDegradation, ReadinessState};

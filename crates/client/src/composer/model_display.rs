@@ -215,6 +215,11 @@ impl ClientCore {
         let store = self.composer_store.lock().expect("composer store poisoned");
         let id = &request.publication.identity;
         !store.suspended.contains(&id.thread_id)
+            && self.cli_catalog_matches_runtime_publication(
+                &request.publication.key.workspace_id,
+                Some(&request.publication.key.provider),
+                &Self::composer_runtime_rows(&store, &id.thread_id),
+            )
             && store.drafts.get(&id.thread_id).is_some_and(|p| {
                 p.draft_id() == id.draft_id
                     && p.domain().selected_provider.as_deref()
@@ -239,7 +244,13 @@ impl ClientCore {
         }
         let mut store = self.composer_store.lock().expect("composer store poisoned");
         let id = &request.publication.identity;
-        if store.suspended.contains(&id.thread_id) {
+        if store.suspended.contains(&id.thread_id)
+            || !self.cli_catalog_matches_runtime_publication(
+                &request.publication.key.workspace_id,
+                Some(&request.publication.key.provider),
+                &Self::composer_runtime_rows(&store, &id.thread_id),
+            )
+        {
             return;
         }
         let Some(current) = store
@@ -301,6 +312,28 @@ impl ClientCore {
         let mut next = (*current).clone();
         next.model_display = Some(display);
         self.publish_composer_model_display(&mut store, next);
+    }
+
+    pub(super) fn invalidate_composer_cli_model_display(
+        &self,
+        store: &mut super::store::ComposerStore,
+        thread: &str,
+    ) {
+        self.composer_models
+            .lock()
+            .expect("composer models poisoned")
+            .in_flight
+            .remove(thread);
+        if let Some(current) = store
+            .drafts
+            .get(thread)
+            .filter(|draft| draft.model_display.is_some())
+            .cloned()
+        {
+            let mut next = (*current).clone();
+            next.model_display = None;
+            self.publish_composer_model_display(store, next);
+        }
     }
 
     pub(super) fn cancel_composer_model_display(&self, thread: &str) {
@@ -542,6 +575,103 @@ mod tests {
             "capabilities": {"reasoning": {"supported": true, "effort_options": ["low", "high"]}}
         }]}))
         .unwrap()
+    }
+
+    #[test]
+    fn cli_catalog_change_refreshes_saved_display_and_rejects_its_previous_request() {
+        use pioneer_protocol::*;
+        let core = super::super::runtime_selection::tests::fixture();
+        core.transport_runtime()
+            .ws_command_sender()
+            .set_http_session_access_for_test(Some(crate::transport::http::GatewayHttpAccess {
+                gateway_base_url: GatewayBaseUrl::parse_presentation("https://example.test")
+                    .unwrap(),
+                gateway_id: GatewayId::new("GAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                session_id: AuthSessionId::new("SAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                generation: 1,
+                access_expires_at_unix: u64::MAX,
+                access_token: AuthSecretString::new("synthetic"),
+            }));
+        let (sender, receiver) = mpsc::sync_channel(64);
+        core.composer_models.lock().unwrap().sender = Some(sender);
+        core.provider_runtime_intent(crate::providers::runtime::ProviderRuntimeIntent::Refresh {
+            workspace_id: "ws".into(),
+        });
+        let mut runtime: RuntimeSummary = serde_json::from_value(serde_json::json!({
+            "runtime_id":"codex", "kind":"codex", "display_name":"Codex", "enabled":true,
+            "status":{"state":"ready"}, "models_refreshed_at_unix_ms":10,
+            "capabilities": pioneer_protocol::RuntimeCapabilities {
+                supports_threads: true,
+                supports_model_list: true,
+                ..Default::default()
+            }
+        }))
+        .unwrap();
+        let work = core.provider_runtime_request_for_test("ws").unwrap();
+        core.complete_provider_runtime_for_test(
+            work,
+            Ok(CLIRuntimeListResponse {
+                revision: 1,
+                runtimes: vec![runtime.clone()],
+            }),
+        );
+        let first = receive(&receiver);
+        let response = |name: &str| {
+            serde_json::from_value(serde_json::json!({
+            "provider":"cli_runtime:codex", "models":[{"id":"model","provider":"cli_runtime:codex","name":name,"limits":{},"capabilities":{}}]
+        })).unwrap()
+        };
+        core.complete_composer_model_display(first, Ok(response("Initial")));
+        let before = core.composer_snapshot("a").unwrap();
+        assert_eq!(
+            before.model_display().unwrap().label.as_deref(),
+            Some("Initial")
+        );
+        core.observe_composer_model_display("a", Some(before.draft_id()));
+        let stale = receive(&receiver);
+        runtime.models_refreshed_at_unix_ms = Some(20);
+        core.observe_provider_runtime_notification(&GatewayNotification::CLIRuntimeStatusChanged(
+            CLIRuntimeStatusChangedNotification {
+                workspace_id: "ws".into(),
+                revision: 2,
+                runtime: runtime.clone(),
+                removed: false,
+            },
+        ));
+        let current = receive(&receiver);
+        assert_ne!(stale.publication.identity, current.publication.identity);
+        core.complete_composer_model_display(stale, Ok(response("Obsolete")));
+        assert_eq!(
+            core.composer_snapshot("a")
+                .unwrap()
+                .model_display()
+                .unwrap()
+                .request,
+            ComposerModelDisplayRequestState::Loading
+        );
+        core.complete_composer_model_display(current, Ok(response("Updated")));
+        let updated = core.composer_snapshot("a").unwrap();
+        assert_eq!(
+            updated.model_display().unwrap().label.as_deref(),
+            Some("Updated")
+        );
+        assert_eq!(updated.domain(), before.domain());
+        runtime.status = RuntimeStatus::Error {
+            message: "diagnostic only".into(),
+        };
+        core.observe_provider_runtime_notification(&GatewayNotification::CLIRuntimeStatusChanged(
+            CLIRuntimeStatusChangedNotification {
+                workspace_id: "ws".into(),
+                revision: 3,
+                runtime,
+                removed: false,
+            },
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            core.composer_snapshot("a").unwrap().model_display(),
+            updated.model_display()
+        );
     }
 
     #[test]

@@ -91,6 +91,7 @@ impl CliMcpBridgeFacadeServer {
         projection_generation: CliMcpProjectionGeneration,
         projection: CliMcpFacadeProjection,
         limits: CliMcpFacadeLimits,
+        call_contract: super::facade::CliMcpCallContract,
     ) -> Result<(CliMcpBridgeFacadeHandle, Self), CliMcpFacadeConfigurationError> {
         let channel_capacity = limits
             .max_ledger_entries
@@ -104,6 +105,7 @@ impl CliMcpBridgeFacadeServer {
                 outbound: outbound_sender.clone(),
             }),
             limits.clone(),
+            call_contract,
         )?;
         let context = Arc::new(CliMcpBridgeFacadeContext {
             bound_grant: transport.bound_grant().clone(),
@@ -511,6 +513,7 @@ mod tests {
                 reservation.generation,
                 projection,
                 CliMcpFacadeLimits::default(),
+                super::super::facade::CliMcpCallContract::Codex,
             )
             .expect("server");
             let server = tokio::spawn(server.run());
@@ -570,7 +573,8 @@ mod tests {
                     "jsonrpc": "2.0", "id": 3, "method": "tools/call",
                     "params": {
                         "name": "echo", "arguments": {"value": 7},
-                        "_meta": {"progressToken": "progress-3"}
+                        "_meta": {"progressToken": "progress-3", "callId": "echo-3", "threadId": "native-thread",
+                            "x-codex-turn-metadata": {"thread_id": "native-thread", "turn_id": "native-turn"}}
                     }
                 }))
                 .await;
@@ -590,7 +594,10 @@ mod tests {
             provider
                 .send(json!({
                     "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-                    "params": {"name": "wait", "arguments": {}}
+                    "params": {"name": "wait", "arguments": {}, "_meta": {
+                        "callId": "wait-4", "threadId": "native-thread",
+                        "x-codex-turn-metadata": {"thread_id": "native-thread", "turn_id": "native-turn"}
+                    }}
                 }))
                 .await;
             wait_for_count(&invoker.wait_calls, 1).await;
@@ -745,12 +752,15 @@ mod tests {
             is_error: false,
             duration_ms: 3,
         });
-        let facade = CliMcpToolFacade::new(
+        let facade = CliMcpToolFacade::try_new(
             coordinator.clone(),
             invoker.clone(),
             facade_projection,
             Arc::new(super::super::facade::CliMcpNoopProgressSink),
-        );
+            CliMcpFacadeLimits::default(),
+            super::super::facade::CliMcpCallContract::Codex,
+        )
+        .expect("facade");
         let context = CliMcpFacadeRequestContext {
             bound_grant: bound,
             projection_generation: projection_reservation.generation,

@@ -692,6 +692,7 @@ impl OpenAiProvider {
         Ok(crate::ProviderStream {
             stream,
             diagnostics,
+            message_delivery: crate::ProviderMessageDelivery::default(),
         })
     }
 
@@ -2240,7 +2241,7 @@ mod tests {
     #[test]
     fn convert_messages_tool_attachment_splits_into_tool_and_user_messages() {
         let mut tool_message =
-            ChatMessage::tool_result("call_1", "computer_use", "{\"status\":\"ok\"}");
+            ChatMessage::tool_result("call_1", "cua_get_window_state", "{\"status\":\"ok\"}");
         tool_message.content_parts.push(MessageContentPart::image(MessageAttachment {
             mime_type: "image/png".to_owned(),
             name: Some("snapshot.png".to_owned()),
@@ -2268,7 +2269,10 @@ mod tests {
         assert_eq!(api_messages[0].role, "user");
         assert_eq!(api_messages[1].role, "tool");
         assert_eq!(api_messages[1].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(api_messages[1].name.as_deref(), Some("computer_use"));
+        assert_eq!(
+            api_messages[1].name.as_deref(),
+            Some("cua_get_window_state")
+        );
         assert_eq!(api_messages[2].role, "user");
         match api_messages[2].content.as_ref() {
             Some(ApiMessageContent::Parts(parts)) => {
@@ -2516,12 +2520,12 @@ mod html_preview_contract_tests {
             if replay {
                 request
                     .messages
-                    .push(ChatMessage::user("Explain the three captures"));
+                    .push(ChatMessage::user("Explain the six captures"));
             }
             let budget = scoped(state.clone(), provider.prepare_input_budget(request))
                 .await
                 .unwrap();
-            assert_eq!(budget.media.len(), 3);
+            assert_eq!(budget.media.len(), 6);
             assert!(budget.media.iter().all(|media| media.message == 3));
             assert_eq!(
                 budget
@@ -2529,7 +2533,7 @@ mod html_preview_contract_tests {
                     .iter()
                     .map(|media| media.part)
                     .collect::<Vec<_>>(),
-                vec![1, 3, 5]
+                vec![1, 3, 5, 7, 9, 11]
             );
             let mut prepared = scoped(
                 state.clone(),
@@ -2543,8 +2547,15 @@ mod html_preview_contract_tests {
             .await
             .unwrap();
             crate::tools::policy::prepare_history(provider.name(), &mut prepared.messages).unwrap();
-            assert_eq!(prepared.attachments.len(), 3);
-            for (attachment, width) in prepared.attachments.iter().zip([360, 768, 1024]) {
+            assert_eq!(prepared.attachments.len(), 6);
+            for (attachment, (appearance, width)) in prepared.attachments.iter().zip([
+                ("light", 360),
+                ("light", 768),
+                ("light", 1024),
+                ("dark", 360),
+                ("dark", 768),
+                ("dark", 1024),
+            ]) {
                 assert_eq!(attachment.message_index, 3);
                 assert_eq!(
                     attachment
@@ -2553,7 +2564,7 @@ mod html_preview_contract_tests {
                         .unwrap()
                         .artifact_version_id
                         .as_deref(),
-                    Some(format!("version-{width}").as_str())
+                    Some(format!("version-{appearance}-{width}").as_str())
                 );
             }
             let wire =
@@ -2580,7 +2591,7 @@ mod html_preview_contract_tests {
                     .contains("resource load error")
             );
             let parts = wire[3]["content"].as_array().unwrap();
-            assert_eq!(parts.iter().filter(|p| p["type"] == "image_url").count(), 3);
+            assert_eq!(parts.iter().filter(|p| p["type"] == "image_url").count(), 6);
             assert!(parts.iter().filter(|p| p["type"] == "image_url").all(|p| {
                 p["image_url"]["url"]
                     .as_str()
@@ -2588,8 +2599,10 @@ mod html_preview_contract_tests {
                     .starts_with("data:image/png;base64,")
             }));
             let caption = parts[0]["text"].as_str().unwrap();
-            for width in [360, 768, 1024] {
-                assert!(caption.contains(&format!("{width} CSS px")));
+            for appearance in ["light", "dark"] {
+                for width in [360, 768, 1024] {
+                    assert!(caption.contains(&format!("{appearance}, {width} CSS px")));
+                }
             }
         }
         assert_eq!(serde_json::to_value(&canonical.messages).unwrap(), before);

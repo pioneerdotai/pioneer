@@ -71,6 +71,50 @@ pub struct ToolRouter {
 }
 
 impl ToolRouter {
+    /// Resolve only configured function proxies, with the same two-edge limit
+    /// as the runtime bridge. Names and user payloads cannot establish origin.
+    pub fn computer_use_leaf<'a>(&'a self, name: &'a str) -> Option<&'a str> {
+        let mut current = name;
+        let mut visited = Vec::new();
+        for depth in 0..=2 {
+            let configured = self.specs.get(current)?;
+            if crate::is_computer_use_tool(current)
+                && configured.spec.permission_metadata.dynamic_skill.is_none()
+            {
+                return Some(current);
+            }
+            if depth == 2 || visited.contains(&current) {
+                return None;
+            }
+            visited.push(current);
+            let origin = configured.spec.permission_metadata.dynamic_skill.as_ref()?;
+            if origin.kind != crate::spec::DynamicSkillPermissionKind::FunctionProxy {
+                return None;
+            }
+            current = origin.target_tool.as_deref()?;
+        }
+        None
+    }
+
+    pub(crate) fn configured_proxy_origin(
+        &self,
+        name: &str,
+    ) -> Option<&crate::spec::DynamicSkillPermissionMetadata> {
+        self.computer_use_leaf(name)?;
+        let origin = self
+            .specs
+            .get(name)?
+            .spec
+            .permission_metadata
+            .dynamic_skill
+            .as_ref()?;
+        (origin.kind == crate::spec::DynamicSkillPermissionKind::FunctionProxy).then_some(origin)
+    }
+
+    pub fn classify_tool_error(&self, name: &str, error: &ToolError) -> crate::ToolOutcome {
+        crate::classifier::classify_tool_error(self.computer_use_leaf(name).unwrap_or(name), error)
+    }
+
     pub fn new(
         specs: Vec<ConfiguredToolSpec>,
         registry: ToolRegistry,
@@ -298,10 +342,21 @@ impl ToolRouter {
 
         let session_scope_key =
             Self::derive_session_scope_key(configured.spec.name.as_str(), &payload);
+        let recovery = if self.computer_use_leaf(&tool_name).is_some() {
+            ToolRecoveryMetadata {
+                retry_class: crate::ToolRetryClass::Never,
+                idempotency_mode: ToolIdempotencyMode::None,
+                max_attempts: 1,
+                can_resume: false,
+                max_wall_clock_secs: None,
+            }
+        } else {
+            configured.spec.recovery
+        };
         let idempotency_key = Self::derive_idempotency_key(
             configured.spec.name.as_str(),
             &payload,
-            configured.spec.recovery.idempotency_mode,
+            recovery.idempotency_mode,
             call_id.as_str(),
         );
 
@@ -312,7 +367,7 @@ impl ToolRouter {
             payload,
             execution_class: configured.execution_class,
             turn_item_execution_class: configured.spec.turn_item_execution_class,
-            recovery: configured.spec.recovery,
+            recovery,
             permission_metadata: configured.spec.permission_metadata,
             output_policy: configured.output_policy,
             output_projection: configured.output_projection,
@@ -576,10 +631,6 @@ impl ToolRouter {
             ToolPayload::LocalShell(LocalShellPayload::WriteStdin(args)) => {
                 Some(format!("shell:{}", args.session_id))
             }
-            ToolPayload::Function { arguments } if tool_name == "computer_use" => arguments
-                .get("session_id")
-                .and_then(JsonValue::as_u64)
-                .map(|id| format!("computer_use:{id}")),
             ToolPayload::Function { arguments } if tool_name == "download_url" => arguments
                 .get("destination")
                 .and_then(JsonValue::as_str)

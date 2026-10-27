@@ -125,8 +125,9 @@ pub(super) fn active_memory_decision_from_preflight_plan(
     deterministic: &DeterministicRecallContextSummary,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
     thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
-    plan: ActiveRecallPlan,
+    mut plan: ActiveRecallPlan,
 ) -> ActiveMemoryDecision {
+    let full_input_query = episodic_capabilities.full_input_query;
     let local = active_recall_local_planning_parts(
         context,
         input,
@@ -142,6 +143,12 @@ pub(super) fn active_memory_decision_from_preflight_plan(
             | ActiveMemoryDecisionReasonCode::ConfigDisabled
     ) {
         return normalize_active_recall_plan_for_input(local.local_plan, &local.planner_input);
+    }
+    if full_input_query {
+        // Native/CLI preflight can precede provider capability resolution.
+        // Full-input retrieval is host-owned (also excluded from provider
+        // planning above), so an older preflight plan must not suppress it.
+        plan.episodic = local.local_plan.episodic;
     }
     normalize_active_recall_plan_for_input(plan, &local.planner_input)
 }
@@ -466,6 +473,43 @@ mod active_recall_local_preflight_tests {
             prompt_context_chars: 0,
             source_ids: Vec::new(),
             diagnostics: vec!["current_thread_recall_available".to_owned()],
+        }
+    }
+
+    #[test]
+    fn full_input_recall_is_resolved_locally_after_preflight_and_respects_policy() {
+        let mut capabilities = current_thread_capabilities();
+        capabilities.full_input_query = true;
+        for (policy, should_run) in [
+            (MemoryTurnPolicy::normal_default_allow(), true),
+            (MemoryTurnPolicy::no_use(), false),
+        ] {
+            let decision = active_memory_decision_from_preflight_plan(
+                &test_context(None),
+                &test_input(),
+                &policy,
+                &MemoryActiveRecallConfig::default(),
+                &empty_deterministic(),
+                capabilities.clone(),
+                current_thread_summary(),
+                ActiveRecallPlan::skip(
+                    ActiveMemoryDecisionReasonCode::ProviderSkip,
+                    1.0,
+                    Vec::new(),
+                ),
+            );
+            assert_eq!(
+                decision.episodic.status == ActiveMemoryDecisionStatus::Run,
+                should_run
+            );
+            if should_run {
+                assert_eq!(decision.episodic.queries.len(), 1);
+                assert_eq!(
+                    decision.episodic.queries[0].mode,
+                    ActiveRecallMode::CurrentThread
+                );
+                assert!(decision.episodic.queries[0].query.is_none());
+            }
         }
     }
 

@@ -1,0 +1,286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentIdentityModelsToolResult",
+  "type": "object",
+  "properties": {
+    "eof": {
+      "type": "boolean"
+    },
+    "executors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentToolExecutorModels"
+      }
+    },
+    "fragments": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AgentCatalogFragment"
+      }
+    },
+    "identity": {
+      "description": "Present on its catalog segment; oversized headers use fragments.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentToolIdentityOption"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "identityId": {
+      "$ref": "#/$defs/AgentIdentityId"
+    },
+    "nextCursor": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "eof",
+    "executors",
+    "identityId"
+  ],
+  "$defs": {
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    },
+    "AgentToolBackendKind": {
+      "description": "Deliberately contains only a backend class.  Runtime instance IDs and\nprovider/model configuration remain server-side implementation details.",
+      "type": "string",
+      "enum": [
+        "api",
+        "cli",
+        "acp"
+      ]
+    },
+    "AgentToolExecutorModels": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "$ref": "#/$defs/AgentToolBackendKind"
+        },
+        "defaultModelId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentToolModelOption"
+          }
+        },
+        "providerId": {
+          "description": "The providerId accepted by launch.profile.kind=model. For a CLI this\nidentifies its configured instance, never a runtime session or secret.",
+          "type": "string"
+        },
+        "unavailableReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "providerId",
+        "displayName",
+        "backend",
+        "models"
+      ]
+    },
+    "AgentToolIdentityOption": {
+      "type": "object",
+      "properties": {
+        "avatarRevision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/AgentIdentityId"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "roleLabel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceKind": {
+          "$ref": "#/$defs/AgentIdentitySourceKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "displayName",
+        "nickname",
+        "sourceKind"
+      ]
+    },
+    "AgentToolModelOption": {
+      "type": "object",
+      "properties": {
+        "displayName": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "reasoning": {
+          "description": "None means unknown. An empty effort list does not prove lack of support.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderModelReasoningCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "displayName"
+      ]
+    },
+    "ProviderModelReasoningCapabilities": {
+      "type": "object",
+      "properties": {
+        "default_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort_options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mandatory": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReasoningCapabilitySource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "supported": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "supports_token_budget": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "ReasoningCapabilitySource": {
+      "type": "string",
+      "enum": [
+        "provider_metadata",
+        "cli_metadata",
+        "static_registry",
+        "config_override",
+        "unknown"
+      ]
+    },
+    "AgentCatalogFragment": {
+      "description": "Concatenate text in offset order and decode JSON to recover one catalog entry.",
+      "type": "object",
+      "properties": {
+        "collection": {
+          "type": "string"
+        },
+        "encoding": {
+          "type": "string"
+        },
+        "eof": {
+          "type": "boolean"
+        },
+        "index": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "modelIndex": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "nextOffset": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "offset": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "text": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "collection",
+        "encoding",
+        "eof",
+        "index",
+        "modelIndex",
+        "nextOffset",
+        "offset",
+        "text",
+        "version"
+      ]
+    }
+  }
+}

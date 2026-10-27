@@ -1,3 +1,4 @@
+use crate::session::SessionOutbound;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -114,6 +115,7 @@ pub async fn spawn_server(
         .local_addr()
         .context("failed to read bound gateway server address")?;
 
+    message_processor.set_gateway_listen_addr(local_addr);
     let state = GatewayHttpState::new(
         config,
         auth,
@@ -218,10 +220,12 @@ pub(crate) async fn run_normal_connection(
 ) -> Result<()> {
     let (mut ws_writer, mut ws_reader) = ws.split();
     let queue_capacity = config.gateway.outbound_queue_capacity.max(1);
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(queue_capacity);
+    let (outbound_tx, mut outbound_rx) =
+        mpsc::channel::<pioneer_observability::work::WorkItem<Message>>(queue_capacity);
 
+    let outbound_tx = SessionOutbound::observed(outbound_tx);
     let connection_id = session_manager
-        .register_connection(outbound_tx.clone(), principal)
+        .register_outbound_connection(outbound_tx.clone(), principal)
         .await?;
     let connection_setup = async {
         let connection_context = session_manager.connection_context(connection_id).await?;
@@ -275,7 +279,13 @@ pub(crate) async fn run_normal_connection(
     });
 
     let mut writer_task = tokio::spawn(async move {
-        while let Some(message) = outbound_rx.recv().await {
+        while let Some(item) = outbound_rx.recv().await {
+            let mut queue = item.queue.as_ref().map(|(q, _)| q.processing());
+            let (message, work) = item.received(
+                pioneer_observability::work::Boundary::EventLane,
+                pioneer_observability::work::WorkKind::Event,
+                pioneer_observability::work::ExecutorRole::Gateway,
+            );
             let startup_output = if let Message::Text(text) = &message {
                 if !pioneer_observability::turn_startup::active() {
                     None
@@ -312,10 +322,15 @@ pub(crate) async fn run_normal_connection(
                 )
             });
             let terminal = matches!(message, Message::Close(_));
-            ws_writer
-                .send(message)
-                .await
-                .context("websocket write failed")?;
+            work.scope_result(pioneer_observability::live::waiting(
+                pioneer_observability::live::WaitKind::Network,
+                ws_writer.send(message),
+            ))
+            .await
+            .context("websocket write failed")?;
+            if let Some(queue) = queue.as_mut() {
+                queue.processed();
+            }
             drop(startup_write);
             if let Some((key, output, outcome)) = startup_output {
                 if output.is_some() {
@@ -568,7 +583,7 @@ where
 
 async fn continue_after_message_processing(
     outcome: MessageProcessingOutcome,
-    outbound_tx: &mpsc::Sender<Message>,
+    outbound_tx: &SessionOutbound,
     writer_completion: &mut Option<WriterCompletion>,
 ) -> Result<bool> {
     match outcome {
@@ -607,7 +622,7 @@ pub(crate) async fn process_with_access_renewals<F>(
     sessions: &SessionManager,
     connection: &mut crate::request_context::ConnectionContext,
     renewal_tx: &watch::Sender<ConnectionAccessLease>,
-    outbound: &mpsc::Sender<Message>,
+    outbound: &SessionOutbound,
 ) -> bool
 where
     F: Future<Output = ()>,
@@ -664,7 +679,7 @@ async fn renew_normal_access(
     sessions: &SessionManager,
     connection: &mut crate::request_context::ConnectionContext,
     renewal_tx: &watch::Sender<ConnectionAccessLease>,
-    outbound: &mpsc::Sender<Message>,
+    outbound: &SessionOutbound,
 ) -> bool {
     let result = async {
         if request.jsonrpc != pioneer_protocol::JSONRPC_VERSION {
@@ -738,7 +753,7 @@ async fn renew_normal_access(
 }
 
 async fn enforce_access_lease(
-    outbound_tx: mpsc::Sender<Message>,
+    outbound_tx: SessionOutbound,
     refresh_leeway_seconds: u64,
     mut cancellation_rx: watch::Receiver<bool>,
     access_expired_tx: watch::Sender<bool>,
@@ -821,7 +836,7 @@ async fn normal_ingress_lease_failure(
         })
 }
 
-async fn send_close_bounded(sender: &mpsc::Sender<Message>, code: u16, reason: &'static str) {
+async fn send_close_bounded(sender: &SessionOutbound, code: u16, reason: &'static str) {
     if sender.capacity() == 0 {
         record_outbound_queue_saturation("close_waited");
     }
@@ -932,7 +947,7 @@ mod tests {
             Duration::from_secs(60),
         ));
         let task = tokio::spawn(enforce_access_lease(
-            outbound_tx,
+            outbound_tx.into(),
             30,
             cancel_rx,
             expired_tx,
@@ -956,7 +971,8 @@ mod tests {
             let (outbound_tx, _outbound_rx) = mpsc::channel(4);
             let (cancel_tx, cancel_rx) = watch::channel(false);
             let (expired_tx, expired_rx) = watch::channel(false);
-            let task = enforce_access_lease(outbound_tx, 0, cancel_rx, expired_tx, renewal_rx);
+            let task =
+                enforce_access_lease(outbound_tx.into(), 0, cancel_rx, expired_tx, renewal_rx);
             tokio::pin!(task);
             assert!(
                 task.as_mut().now_or_never().is_none(),

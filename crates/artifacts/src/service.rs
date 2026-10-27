@@ -429,11 +429,12 @@ impl ArtifactService {
                 Some("html_preview" | "html_render")
             )
             && request.metadata.get("htmlTool").is_some_and(|m| {
-                m["version"] == 1
-                    && ((request.created_by_actor_id.as_deref() == Some("html_preview")
-                        && m["publication"] == false)
-                        || (request.created_by_actor_id.as_deref() == Some("html_render")
-                            && m["publication"] == true))
+                ((request.created_by_actor_id.as_deref() == Some("html_preview")
+                    && matches!(m["version"].as_u64(), Some(1 | 2))
+                    && m["publication"] == false)
+                    || (request.created_by_actor_id.as_deref() == Some("html_render")
+                        && m["version"] == 1
+                        && m["publication"] == true))
                     && m["turnId"].is_string()
                     && m["callId"].is_string()
             }) {

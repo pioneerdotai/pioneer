@@ -104,6 +104,7 @@ struct Work {
     generation: u64,
     key: ProviderCollectionKey,
     models: bool,
+    refresh: bool,
 }
 #[derive(Default)]
 pub(crate) struct SettingsModelPickerController {
@@ -280,6 +281,7 @@ impl ClientCore {
                 generation: 1,
                 key: ProviderCollectionKey::catalog(workspace_id.clone()),
                 models: false,
+                refresh: true,
             });
             if let Some(provider) = selected {
                 work.push(model_work(&session, provider));
@@ -349,7 +351,18 @@ impl ClientCore {
                     }
                     next.selector.mark_providers_loading();
                     if session.runtime_demand {
+                        let changed = next.selector.selected_cli_catalog_changed(&runtimes);
                         next.selector.sync_cli_runtime_snapshot(runtimes);
+                        if changed {
+                            session.model_generation += 1;
+                            let provider = next.selector.preload_selected_provider_models();
+                            session.model_pending = provider.is_some();
+                            if let Some(provider) = provider {
+                                let mut models = model_work(session, provider);
+                                models.refresh = false;
+                                work.push(models);
+                            }
+                        }
                     }
                     session.provider_generation += 1;
                     session.provider_pending = true;
@@ -359,6 +372,7 @@ impl ClientCore {
                         generation: session.provider_generation,
                         key: ProviderCollectionKey::catalog(next.workspace_id.clone()),
                         models: false,
+                        refresh: true,
                     });
                 }
                 SettingsModelPickerIntent::RetryModels { .. } => {
@@ -487,7 +501,13 @@ impl ClientCore {
                     && s.value.owner_generation == work.owner
                     && !s.value.closed
                     && if work.models {
-                        s.model_pending && s.model_generation == work.generation
+                        s.model_pending
+                            && s.model_generation == work.generation
+                            && self.cli_catalog_matches_runtime_publication(
+                                &s.value.workspace_id,
+                                s.value.selector.selected_provider(),
+                                s.value.selector.cli_runtimes(),
+                            )
                     } else {
                         s.provider_pending && s.provider_generation == work.generation
                     }
@@ -533,7 +553,13 @@ impl ClientCore {
             return;
         }
         if work.models {
-            if !session.model_pending {
+            if !session.model_pending
+                || !self.cli_catalog_matches_runtime_publication(
+                    &session.value.workspace_id,
+                    session.value.selector.selected_provider(),
+                    session.value.selector.cli_runtimes(),
+                )
+            {
                 return;
             }
             session.model_pending = false;
@@ -657,17 +683,22 @@ impl ClientCore {
                         next.selector.selected_provider(),
                         next.selector.cli_runtimes(),
                     );
+                    let catalog_changed = next.selector.selected_cli_catalog_changed(&runtimes);
                     next.selector.sync_cli_runtime_snapshot(runtimes);
                     let ready = provider_ready_for_model_selector(
                         next.selector.selected_provider(),
                         next.selector.cli_runtimes(),
                     );
                     let mut work = None;
-                    if was_ready != ready {
+                    if was_ready != ready || catalog_changed {
                         session.model_generation += 1;
                         let provider = next.selector.preload_selected_provider_models();
                         session.model_pending = provider.is_some();
-                        work = provider.map(|provider| model_work(session, provider));
+                        work = provider.map(|provider| {
+                            let mut work = model_work(session, provider);
+                            work.refresh = false;
+                            work
+                        });
                     }
                     session.value = Arc::new(next);
                     self.publish_settings_value(scope(&value.picker_id), (*session.value).clone());
@@ -693,7 +724,8 @@ impl ClientCore {
         let mut changed = self.watch_publications();
         let task = std::thread::Builder::new().name("client-settings-model-picker".into()).spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("settings model picker runtime");
-            runtime.block_on(async {
+        let _runtime_observer=pioneer_observability::runtime::register(runtime.handle(),pioneer_observability::runtime::RuntimeRole::ClientHttp);
+            _runtime_observer.block_on(&runtime, async {
                 loop {
                     let work = tokio::select! {
                         result = changed.changed() => {
@@ -705,7 +737,7 @@ impl ClientCore {
                     };
                     let Some(core) = weak.upgrade() else { return; };
                     if !core.settings_model_picker_work_current(&work) { continue; }
-                    let read = core.read_provider_collection(work.key.clone(), true); drop(core);
+                    let read = core.read_provider_collection(work.key.clone(), work.refresh); drop(core);
                     let result = read.and_then(|read| read.wait_while(|| weak.upgrade().is_some_and(|core| core.settings_model_picker_work_current(&work)))).map_err(|error| pioneer_protocol::sanitize_runtime_diagnostic_line(&error.to_string()));
                     if let Some(core) = weak.upgrade() { core.complete_settings_model_picker(work, result); }
                 }
@@ -731,6 +763,7 @@ fn model_work(session: &Session, provider: String) -> Work {
         generation: session.model_generation,
         key: ProviderCollectionKey::models(session.value.workspace_id.clone(), provider, kind),
         models: true,
+        refresh: true,
     }
 }
 
@@ -995,6 +1028,123 @@ mod tests {
         core.reconcile_settings_model_pickers();
         assert!(core.settings_model_picker("picker").unwrap().closed);
     }
+    #[test]
+    fn settings_cli_catalog_arrival_and_replacement_refresh_without_accepting_late_work() {
+        use pioneer_protocol::*;
+        let (core, mut requests) = fixture();
+        core.settings_model_picker_intent(SettingsModelPickerIntent::Open {
+            picker_id: "picker".into(),
+            workspace_id: "workspace".into(),
+            mode: ProviderModelSelectorMode::Chat,
+            selection: ModelSelectorSelection {
+                provider: Some("cli_runtime:codex".into()),
+                model: Some("model".into()),
+                selected_reasoning_effort: None,
+            },
+        });
+        let _providers = requests.try_recv().unwrap();
+        let mut runtime: RuntimeSummary = serde_json::from_value(serde_json::json!({
+            "runtime_id":"codex", "kind":"codex", "display_name":"Codex", "enabled":true,
+            "status":{"state":"initializing"}, "capabilities": pioneer_protocol::RuntimeCapabilities {
+                supports_threads: true,
+                supports_model_list: true,
+                ..Default::default()
+            }
+        })).unwrap();
+        let work = core.provider_runtime_request_for_test("workspace").unwrap();
+        core.complete_provider_runtime_for_test(
+            work,
+            Ok(CLIRuntimeListResponse {
+                revision: 1,
+                runtimes: vec![runtime.clone()],
+            }),
+        );
+        core.reconcile_settings_model_pickers();
+        let empty = requests.try_recv().unwrap();
+        core.complete_settings_model_picker(
+            empty.clone(),
+            Ok(ProviderCollectionPublication::for_test(
+                empty.key,
+                vec![],
+                vec![],
+            )),
+        );
+        let publish = |runtime: RuntimeSummary, revision| {
+            core.observe_provider_runtime_notification(
+                &GatewayNotification::CLIRuntimeStatusChanged(
+                    CLIRuntimeStatusChangedNotification {
+                        workspace_id: "workspace".into(),
+                        revision,
+                        runtime,
+                        removed: false,
+                    },
+                ),
+            );
+            core.reconcile_settings_model_pickers();
+        };
+        let result = |work: &Work, name: &str| {
+            ProviderCollectionPublication::for_test(work.key.clone(), vec![], vec![
+            serde_json::from_value(serde_json::json!({"id":"model","provider":"cli_runtime:codex","name":name,"limits":{},"capabilities":{}})).unwrap()
+        ])
+        };
+        runtime.models_refreshed_at_unix_ms = Some(10);
+        publish(runtime.clone(), 2);
+        let first = requests
+            .try_recv()
+            .expect("first catalog must refresh the open settings picker");
+        assert!(!first.refresh);
+        core.complete_settings_model_picker(first.clone(), Ok(result(&first, "Initial")));
+        assert_eq!(
+            core.settings_model_picker("picker")
+                .unwrap()
+                .selector
+                .models()[0]
+                .name
+                .as_deref(),
+            Some("Initial")
+        );
+        runtime.models_refreshed_at_unix_ms = Some(20);
+        publish(runtime.clone(), 3);
+        let stale = requests.try_recv().unwrap();
+        runtime.home_path = Some("/replacement-source".into());
+        runtime.models_refreshed_at_unix_ms = None;
+        publish(runtime.clone(), 4);
+        let current = requests.try_recv().unwrap();
+        assert_ne!(stale.generation, current.generation);
+        core.complete_settings_model_picker(stale.clone(), Ok(result(&stale, "Obsolete")));
+        assert!(
+            core.settings_model_picker("picker")
+                .unwrap()
+                .selector
+                .models()
+                .is_empty()
+        );
+        core.complete_settings_model_picker(current.clone(), Ok(result(&current, "Current")));
+        let selected = core
+            .settings_model_picker("picker")
+            .unwrap()
+            .selector
+            .selection_parts();
+        assert_eq!(
+            selected,
+            (Some("cli_runtime:codex".into()), Some("model".into()))
+        );
+        runtime.status = RuntimeStatus::Error {
+            message: "diagnostic only".into(),
+        };
+        publish(runtime, 5);
+        assert!(requests.try_recv().is_err());
+        assert_eq!(
+            core.settings_model_picker("picker")
+                .unwrap()
+                .selector
+                .models()[0]
+                .name
+                .as_deref(),
+            Some("Current")
+        );
+    }
+
     #[test]
     fn runtime_becoming_ready_loads_selected_cli_models_once_and_unready_cancels_them() {
         let (core, mut requests) = fixture();

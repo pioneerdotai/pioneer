@@ -82,7 +82,7 @@ pub struct ProviderCatalogView {
 impl ProviderCatalogView {
     pub fn new(config: ProviderCatalogConfig, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let mount = NEXT_MOUNT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .expect("provider mount exhausted");
         cx.new(|cx| {
             let binding = ProviderBinding::new(config.registrar);

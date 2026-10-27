@@ -145,18 +145,52 @@ pub struct AgentExecutionProfileProjection {
     pub fingerprint: String,
 }
 
-/// Canonical exact reasoning selections that remain delegable by an admitted
-/// execution. Effort labels are backend-owned opaque values, so ordering them
-/// by presumed strength would be unsafe; the ceiling is an allow-set.
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReasoningCeiling {
-    pub allowed: Vec<TurnReasoningSelection>,
+/// Compare durable source membership, not a particular configuration snapshot.
+/// Workspace/source-id ownership is additionally checked against the identity
+/// repository at admission. CLI role_label records the runtime kind, so a
+/// different engine cannot be smuggled through an existing runtime instance.
+pub fn agent_identity_has_same_launch_source(
+    candidate: &AgentIdentityProjection,
+    ceiling: &AgentIdentityProjection,
+) -> bool {
+    candidate.id == ceiling.id
+        && candidate.source_kind == ceiling.source_kind
+        && match candidate.source_kind {
+            crate::AgentIdentitySourceKind::Ephemeral => candidate == ceiling,
+            crate::AgentIdentitySourceKind::CliRuntimeInstance => {
+                candidate.role_label == ceiling.role_label
+            }
+            crate::AgentIdentitySourceKind::NativeAgent => true,
+        }
 }
 
-/// Immutable upper bound for identities and execution profiles that an
-/// admitted AgentExecution may delegate to. Current source/policy state may
-/// narrow this set, but a later workspace catalog addition can never widen it.
+/// Real launch capabilities may only narrow across catalog generations. Profile
+/// ids, generations, labels and fingerprints identify snapshots, not authority.
+pub fn agent_execution_profile_is_no_wider(
+    candidate: &AgentExecutionProfileProjection,
+    ceiling: &AgentExecutionProfileProjection,
+) -> bool {
+    candidate.backend == ceiling.backend
+        && candidate.provider_id == ceiling.provider_id
+        && candidate.model_id == ceiling.model_id
+        && !candidate.compatible_agent_identity_ids.is_empty()
+        && candidate
+            .compatible_agent_identity_ids
+            .iter()
+            .all(|id| ceiling.compatible_agent_identity_ids.contains(id))
+        && candidate
+            .allowed_reasoning
+            .iter()
+            .all(|reasoning| ceiling.allowed_reasoning.contains(reasoning))
+        && candidate
+            .allowed_permission_profiles
+            .iter()
+            .all(|mode| ceiling.allowed_permission_profiles.contains(mode))
+}
+
+/// Immutable delegation boundary for identities and capabilities. Model catalogs
+/// are current metadata, not durable authority; each launch stores its exact
+/// execution profile separately.
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChildAgentLaunchGrantSet {
@@ -164,45 +198,36 @@ pub struct ChildAgentLaunchGrantSet {
     pub identities: Vec<AgentIdentityProjection>,
     pub allow_inherit_parent_identity: bool,
     pub allow_server_derived_ephemeral: bool,
-    pub profiles: Vec<AgentExecutionProfileProjection>,
     pub allow_inherit_parent_profile: bool,
     #[serde(default)]
     pub skill_ids: Vec<SkillId>,
     #[serde(default)]
     pub mcp_server_ids: Vec<String>,
     pub max_permission_profile: TurnPermissionProfileCap,
-    pub max_reasoning: ReasoningCeiling,
     pub fingerprint: String,
 }
 
 impl ChildAgentLaunchGrantSet {
     pub const VERSION: u32 = CHILD_LAUNCH_GRANT_VERSION_V2;
-    pub const MAX_IDENTITIES: usize = 128;
-    pub const MAX_PROFILES: usize = 256;
     pub const MAX_SKILLS: usize = 256;
     pub const MAX_MCP_SERVERS: usize = 256;
 
     pub fn new(
         mut identities: Vec<AgentIdentityProjection>,
-        mut profiles: Vec<AgentExecutionProfileProjection>,
     ) -> Result<Self, ChildAgentLaunchGrantSetError> {
         identities.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        profiles.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        validate_child_launch_grant_entries(&identities, &profiles)?;
-        let max_reasoning = reasoning_ceiling_for_profiles(&profiles);
+        validate_child_launch_grant_entries(&identities)?;
         let mut grant = Self {
             version: Self::VERSION,
             identities,
             allow_inherit_parent_identity: false,
             allow_server_derived_ephemeral: false,
-            profiles,
             allow_inherit_parent_profile: false,
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
             max_permission_profile: crate::task_permission_cap_for_mode(
                 TurnPermissionMode::Supervised,
             ),
-            max_reasoning,
             fingerprint: String::new(),
         };
         grant.fingerprint = child_launch_grant_fingerprint(&grant)?;
@@ -265,7 +290,7 @@ fn validate_child_launch_grant(
 fn validate_child_launch_grant_shape(
     grant: &ChildAgentLaunchGrantSet,
 ) -> Result<(), ChildAgentLaunchGrantSetError> {
-    validate_child_launch_grant_entries(&grant.identities, &grant.profiles)?;
+    validate_child_launch_grant_entries(&grant.identities)?;
     if grant.skill_ids.len() > ChildAgentLaunchGrantSet::MAX_SKILLS
         || grant.mcp_server_ids.len() > ChildAgentLaunchGrantSet::MAX_MCP_SERVERS
     {
@@ -289,9 +314,6 @@ fn validate_child_launch_grant_shape(
     {
         return Err(ChildAgentLaunchGrantSetError::InvalidCapability);
     }
-    if grant.max_reasoning != reasoning_ceiling_for_profiles(&grant.profiles) {
-        return Err(ChildAgentLaunchGrantSetError::InvalidProfile);
-    }
     Ok(())
 }
 
@@ -308,41 +330,17 @@ fn validate_child_launch_grant_v2(
     Ok(())
 }
 
-fn reasoning_ceiling_for_profiles(
-    profiles: &[AgentExecutionProfileProjection],
-) -> ReasoningCeiling {
-    let mut allowed = profiles
-        .iter()
-        .flat_map(|profile| profile.allowed_reasoning.iter().cloned())
-        .collect::<Vec<_>>();
-    allowed.sort_by(|left, right| left.effort.cmp(&right.effort));
-    allowed.dedup_by(|left, right| left.effort == right.effort);
-    ReasoningCeiling { allowed }
-}
-
 fn validate_child_launch_grant_entries(
     identities: &[AgentIdentityProjection],
-    profiles: &[AgentExecutionProfileProjection],
 ) -> Result<(), ChildAgentLaunchGrantSetError> {
     if identities.is_empty() {
         return Err(ChildAgentLaunchGrantSetError::EmptyIdentitySet);
-    }
-    if identities.len() > ChildAgentLaunchGrantSet::MAX_IDENTITIES
-        || profiles.len() > ChildAgentLaunchGrantSet::MAX_PROFILES
-    {
-        return Err(ChildAgentLaunchGrantSetError::CapacityExceeded);
     }
     if identities
         .windows(2)
         .any(|pair| pair[0].id.as_str() >= pair[1].id.as_str())
     {
         return Err(ChildAgentLaunchGrantSetError::DuplicateIdentity);
-    }
-    if profiles
-        .windows(2)
-        .any(|pair| pair[0].id.as_str() >= pair[1].id.as_str())
-    {
-        return Err(ChildAgentLaunchGrantSetError::DuplicateProfile);
     }
     if identities.iter().any(|identity| {
         identity.source_revision == 0
@@ -352,31 +350,60 @@ fn validate_child_launch_grant_entries(
     }) {
         return Err(ChildAgentLaunchGrantSetError::InvalidIdentity);
     }
-    let identity_ids = identities
-        .iter()
-        .map(|identity| &identity.id)
-        .collect::<std::collections::BTreeSet<_>>();
-    for profile in profiles {
-        if profile.catalog_generation == 0
-            || profile.policy_generation == 0
-            || profile.fingerprint.trim().is_empty()
-            || profile.provider_id.trim().is_empty()
-            || profile.model_id.trim().is_empty()
-            || profile.compatible_agent_identity_ids.is_empty()
-            || profile
-                .compatible_agent_identity_ids
-                .windows(2)
-                .any(|pair| pair[0].as_str() >= pair[1].as_str())
-        {
-            return Err(ChildAgentLaunchGrantSetError::InvalidProfile);
-        }
-        if profile
+    Ok(())
+}
+
+/// Validate the exact selected snapshot independently of the delegation boundary.
+/// Every compatible source must still belong to that boundary, including the
+/// registered backing identity of a server-derived CLI identity.
+pub fn validate_selected_agent_launch_profile(
+    identity: &AgentIdentityProjection,
+    profile: &AgentExecutionProfileProjection,
+    identities: &[AgentIdentityProjection],
+) -> Result<(), ChildAgentLaunchGrantSetError> {
+    if profile.catalog_generation == 0
+        || profile.policy_generation == 0
+        || profile.fingerprint.trim().is_empty()
+        || profile.provider_id.trim().is_empty()
+        || profile.model_id.trim().is_empty()
+        || profile.compatible_agent_identity_ids.is_empty()
+        || profile
+            .compatible_agent_identity_ids
+            .windows(2)
+            .any(|pair| pair[0].as_str() >= pair[1].as_str())
+    {
+        return Err(ChildAgentLaunchGrantSetError::InvalidProfile);
+    }
+    if !identities.contains(identity)
+        || !profile.compatible_agent_identity_ids.contains(&identity.id)
+        || profile
             .compatible_agent_identity_ids
             .iter()
-            .any(|identity_id| !identity_ids.contains(identity_id))
-        {
-            return Err(ChildAgentLaunchGrantSetError::ProfileOutsideIdentitySet);
+            .any(|id| !identities.iter().any(|candidate| &candidate.id == id))
+    {
+        return Err(ChildAgentLaunchGrantSetError::ProfileOutsideIdentitySet);
+    }
+    use crate::AgentIdentitySourceKind;
+    let compatible = match (&identity.source_kind, &profile.backend) {
+        (AgentIdentitySourceKind::NativeAgent, AgentExecutionProfileBackend::ApiProvider) => true,
+        (AgentIdentitySourceKind::Ephemeral, AgentExecutionProfileBackend::ApiProvider) => true,
+        (
+            AgentIdentitySourceKind::CliRuntimeInstance | AgentIdentitySourceKind::Ephemeral,
+            AgentExecutionProfileBackend::CliRuntime {
+                runtime_instance_id,
+            },
+        ) => {
+            !runtime_instance_id.trim().is_empty()
+                && profile.provider_id == format!("cli_runtime:{runtime_instance_id}")
+                && identities.iter().any(|source| {
+                    source.source_kind == AgentIdentitySourceKind::CliRuntimeInstance
+                        && profile.compatible_agent_identity_ids.contains(&source.id)
+                })
         }
+        _ => false,
+    };
+    if !compatible {
+        return Err(ChildAgentLaunchGrantSetError::InvalidProfile);
     }
     Ok(())
 }
@@ -390,21 +417,26 @@ fn child_launch_grant_fingerprint(
 const CHILD_LAUNCH_GRANT_VERSION_V1: u32 = 1;
 const CHILD_LAUNCH_GRANT_VERSION_V2: u32 = 2;
 
-// Versioned fingerprint projections are immutable. A semantic field addition
-// requires a new version, canonicalizer and adjacent migration step; editing a
-// released projection would invalidate durable grants again.
+// The current 0.65 format has no released persisted data. Keep its version;
+// authenticate the compact boundary without catalog metadata.
 fn child_launch_grant_v2_fingerprint(
     grant: &ChildAgentLaunchGrantSet,
 ) -> Result<String, ChildAgentLaunchGrantSetError> {
-    let value =
-        serde_json::to_value(grant).map_err(|_| ChildAgentLaunchGrantSetError::Serialization)?;
-    // Decode through the frozen V2 wire schema before hashing. Any future
-    // field added to the moving runtime type is rejected here and therefore
-    // requires V3 instead of silently changing the V2 fingerprint contract.
-    let wire = serde_json::from_value::<ChildLaunchGrantWire<PermissionPolicyV2Wire>>(value)
-        .map_err(|_| ChildAgentLaunchGrantSetError::Serialization)?;
-    child_launch_grant_wire_fingerprint(&wire, b"pioneer:agent-runtime:child-launch-grant:v2\0")
-        .map_err(|_| ChildAgentLaunchGrantSetError::Serialization)
+    let canonical = serde_json::to_vec(&(
+        grant.version,
+        &grant.identities,
+        grant.allow_inherit_parent_identity,
+        grant.allow_server_derived_ephemeral,
+        grant.allow_inherit_parent_profile,
+        &grant.skill_ids,
+        &grant.mcp_server_ids,
+        &grant.max_permission_profile,
+    ))
+    .map_err(|_| ChildAgentLaunchGrantSetError::Serialization)?;
+    let mut digest = Sha256::new();
+    digest.update(b"pioneer:agent-runtime:child-launch-grant:v2\0");
+    digest.update(canonical);
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn is_false(value: &bool) -> bool {
@@ -672,12 +704,20 @@ fn promote_child_launch_grant_v1_wire(
         .max_permission_profile
         .effective_policy
         .normalize_version_one_restrictions();
-    grant.version = CHILD_LAUNCH_GRANT_VERSION_V2;
-    grant.fingerprint = child_launch_grant_wire_fingerprint(
-        &grant,
-        b"pioneer:agent-runtime:child-launch-grant:v2\0",
-    )?;
-    serde_json::to_value(grant)
+    let mut value = serde_json::to_value(grant)
+        .map_err(|error| format!("could not encode migrated child launch grant: {error}"))?;
+    let object = value.as_object_mut().expect("grant wire is an object");
+    object.remove("profiles");
+    object.remove("maxReasoning");
+    object.insert("version".to_owned(), CHILD_LAUNCH_GRANT_VERSION_V2.into());
+    let mut current: ChildAgentLaunchGrantSet = serde_json::from_value(value)
+        .map_err(|error| format!("invalid migrated child launch grant: {error}"))?;
+    current.fingerprint = child_launch_grant_v2_fingerprint(&current)
+        .map_err(|error| format!("could not fingerprint child launch grant: {error:?}"))?;
+    current
+        .validate()
+        .map_err(|error| format!("invalid child launch grant: {error:?}"))?;
+    serde_json::to_value(current)
         .map_err(|error| format!("could not encode migrated child launch grant: {error}"))
 }
 
@@ -785,7 +825,14 @@ pub(crate) fn migrate_child_launch_grant_v1_to_v2(
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentExecutionProfileSelection {
     InheritParent,
-    Exact { profile_id: AgentExecutionProfileId },
+    Exact {
+        profile_id: AgentExecutionProfileId,
+    },
+    Model {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        model_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -930,23 +977,7 @@ mod tests {
             3,
             "generation-a",
         );
-        let profile = AgentExecutionProfileProjection {
-            id: profile_id("P00000000000000000003"),
-            compatible_agent_identity_ids: vec![identity.id.clone()],
-            backend: AgentExecutionProfileBackend::ApiProvider,
-            provider_id: "provider-opaque".to_owned(),
-            model_id: "model-opaque".to_owned(),
-            provider_display_name: "Provider".to_owned(),
-            model_display_name: "Model".to_owned(),
-            allowed_reasoning: vec![TurnReasoningSelection {
-                effort: "medium".to_owned(),
-            }],
-            allowed_permission_profiles: vec![TurnPermissionMode::FullAccess],
-            catalog_generation: 4,
-            policy_generation: 5,
-            fingerprint: "profile-fingerprint".to_owned(),
-        };
-        ChildAgentLaunchGrantSet::new(vec![identity], vec![profile]).unwrap()
+        ChildAgentLaunchGrantSet::new(vec![identity]).unwrap()
     }
 
     fn launch(profile: AgentExecutionProfileSelection) -> AgentLaunchSelection {
@@ -1181,28 +1212,80 @@ mod tests {
         assert!(grant.validate().is_ok());
         assert_eq!(
             grant.fingerprint,
-            "1620c8eca0ca3eace03dc7d614e3af348b2f77224cde1064bcf7f492c3177047"
+            "cdafe1ec7b698b312a327d4d7907f2c0c346cd8d859bcf54076f40a920c25953"
         );
-        assert_eq!(
-            grant.max_reasoning.allowed,
-            vec![TurnReasoningSelection {
-                effort: "medium".to_owned(),
-            }]
-        );
-
-        let mut tampered_reasoning = grant.clone();
-        tampered_reasoning.max_reasoning.allowed = vec![TurnReasoningSelection {
-            effort: "high".to_owned(),
-        }];
-        assert_eq!(
-            tampered_reasoning.validate(),
-            Err(ChildAgentLaunchGrantSetError::InvalidProfile)
-        );
-
+        let encoded = serde_json::to_value(&grant).unwrap();
+        assert!(encoded.get("profiles").is_none());
+        assert!(encoded.get("maxReasoning").is_none());
         let mut tampered = grant;
-        tampered.profiles[0].model_id = "other-model".to_owned();
+        tampered.identities[0].source_fingerprint = "other-source".to_owned();
         assert_eq!(
             tampered.validate(),
+            Err(ChildAgentLaunchGrantSetError::FingerprintMismatch)
+        );
+    }
+
+    #[test]
+    fn task_grant_validates_its_exact_profile_without_a_model_catalog() {
+        let seed = version_one_grant(true);
+        let grant = json!({
+            "kind": "resolved_task_launch",
+            "identity": seed["identities"][0],
+            "profile": seed["profiles"][0],
+            "role_key": "member", "agent_policy_generation": 1,
+            "allowed_actions": ["create_task"],
+            "agent_authorization_fingerprint": "a".repeat(64),
+            "child_launch_grant": child_grant(),
+        });
+        crate::migrate_task_derived_child_launch_grant_json_to_current(&grant.to_string()).unwrap();
+        for change in 0..7 {
+            let mut invalid = grant.clone();
+            match change {
+                0 => invalid["profile"]["catalogGeneration"] = json!(0),
+                1 => invalid["profile"]["policyGeneration"] = json!(0),
+                2 => invalid["profile"]["fingerprint"] = json!(""),
+                3 => invalid["profile"]["compatibleAgentIdentityIds"] = json!([]),
+                4 => {
+                    invalid["profile"]["compatibleAgentIdentityIds"] =
+                        json!(["A00000000000000000001", "A00000000000000000001"])
+                }
+                5 => {
+                    invalid["profile"]["compatibleAgentIdentityIds"] =
+                        json!(["A00000000000000000002"])
+                }
+                _ => {
+                    invalid["profile"]["backend"] =
+                        json!({"cli_runtime":{"runtime_instance_id":"codex"}});
+                    invalid["profile"]["providerId"] = json!("cli_runtime:codex");
+                }
+            }
+            assert!(
+                crate::migrate_task_derived_child_launch_grant_json_to_current(
+                    &invalid.to_string()
+                )
+                .is_err(),
+                "invalid exact profile {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn large_admitted_grants_round_trip_without_capacity_loss_or_widening() {
+        let identities = (0..140)
+            .map(|n| {
+                AgentIdentityProjection::pioneer(identity_id(&format!("A{n:020}")), 3, "source")
+            })
+            .collect::<Vec<_>>();
+        let admitted = ChildAgentLaunchGrantSet::new(identities).unwrap();
+        let stored = serde_json::to_string(&admitted).unwrap();
+        let restored: ChildAgentLaunchGrantSet = serde_json::from_str(&stored).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, admitted);
+        assert_eq!(restored.identities.len(), 140);
+        let mut widened = restored;
+        widened.identities.last_mut().unwrap().source_fingerprint = "not-admitted".into();
+        assert_eq!(
+            widened.validate(),
             Err(ChildAgentLaunchGrantSetError::FingerprintMismatch)
         );
     }
@@ -1390,6 +1473,22 @@ mod tests {
             crate::migrate_task_derived_child_launch_grant_json_to_current(&migrated)
                 .expect("current task child launch should be accepted");
         assert_eq!(migrated_again, migrated);
+        let crate::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
+            identity,
+            profile,
+            child_launch_grant,
+            ..
+        } = serde_json::from_str(&migrated).unwrap();
+        let mut current = identity.clone();
+        current.source_revision += 1;
+        current.source_fingerprint = "updated-connection".to_owned();
+        assert!(agent_identity_has_same_launch_source(&current, &identity));
+        validate_selected_agent_launch_profile(&identity, &profile, &child_launch_grant.identities)
+            .unwrap();
+        assert!(
+            child_launch_grant.validate().is_ok(),
+            "reading legacy allowances never rewrites their authenticated snapshot"
+        );
     }
 
     #[test]

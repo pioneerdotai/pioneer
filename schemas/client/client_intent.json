@@ -5216,6 +5216,7 @@
       "enum": [
         "openai",
         "openrouter",
+        "vercel-ai-gateway",
         "local"
       ]
     },
@@ -8097,6 +8098,22 @@
             "kind": {
               "type": "string",
               "const": "voice_enabled"
+            }
+          },
+          "required": [
+            "kind",
+            "enabled"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "const": "voice_transcribe_while_recording"
             }
           },
           "required": [

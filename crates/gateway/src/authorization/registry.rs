@@ -329,6 +329,7 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         NotFound,
         Mutation,
     ),
+    method_entry(WORKSPACE_PUSH, WorkspaceRead, Workspace, NotFound, Read),
     method_entry(THREAD_TREE, WorkspaceRead, Workspace, NotFound, Read),
     method_entry(THREAD_UPDATE, ThreadManage, Thread, NotFound, Mutation),
     method_entry(THREAD_MOVE, ThreadMove, Thread, NotFound, Management),
@@ -770,6 +771,7 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     method_entry(TASK_ACCEPT, TaskReview, Task, NotFound, Mutation),
     method_entry(TASK_REVISE, TaskReview, Task, NotFound, Mutation),
     method_entry(TASK_CANCEL, TaskCancel, Task, NotFound, Mutation),
+    method_entry(TASK_FINISH, TaskScheduleManage, Task, NotFound, Mutation),
     method_entry(
         TASK_RESCHEDULE,
         TaskScheduleManage,
@@ -1293,6 +1295,11 @@ mod tests {
             (
                 methods::TASK_ACCEPT,
                 ResourceAction::TaskReview,
+                ResourceResolverKind::Task,
+            ),
+            (
+                methods::TASK_FINISH,
+                ResourceAction::TaskScheduleManage,
                 ResourceResolverKind::Task,
             ),
         ] {

@@ -51,6 +51,7 @@ pub(crate) struct PreparedAgentAction {
     /// nor influence this value. Scheduled Tasks allocate their occurrence
     /// execution only when that occurrence is admitted.
     pub(crate) spawned_execution_id: Option<AgentExecutionId>,
+    pub(crate) independent_root: bool,
     pub(crate) idle_timeout_secs: i64,
     pub(crate) hard_timeout_secs: i64,
 }
@@ -118,7 +119,8 @@ impl CanonicalAgentActionService {
                 } => ResourceAction::TaskDetach,
                 AgentActionIntent::ControlTask {
                     control:
-                        pioneer_protocol::AgentTaskControl::Resume
+                        pioneer_protocol::AgentTaskControl::Finish
+                        | pioneer_protocol::AgentTaskControl::Resume
                         | pioneer_protocol::AgentTaskControl::Pause
                         | pioneer_protocol::AgentTaskControl::Update
                         | pioneer_protocol::AgentTaskControl::Reschedule,
@@ -142,6 +144,7 @@ impl CanonicalAgentActionService {
         attempt_generation: u64,
         current_policy_generation: u64,
         depth: u16,
+        independent_root: bool,
     ) -> Result<PreparedAgentAction, AgentActionServiceError> {
         if root.execution_generation == 0 || attempt_generation == 0 {
             return Err(AgentActionServiceError::NotAuthorized(
@@ -149,6 +152,9 @@ impl CanonicalAgentActionService {
             ));
         }
         let normalized = self.normalize(intent)?;
+        if independent_root && normalized.kind != AgentActionKind::StartAgent {
+            return Err(AgentActionServiceError::ResourceBoundary);
+        }
         if normalized.execution_id != root.execution_id {
             return Err(AgentActionServiceError::NotAuthorized(
                 "action execution does not match pinned execution",
@@ -226,6 +232,7 @@ impl CanonicalAgentActionService {
                             pioneer_protocol::AgentExecutionProfileSelection::InheritParent => {
                                 Some(&root.profile.id)
                             }
+                            pioneer_protocol::AgentExecutionProfileSelection::Model { .. } => None,
                         }
                     });
                     let routed_disclosure_class =
@@ -303,7 +310,15 @@ impl CanonicalAgentActionService {
         let spawned_execution_id = (normalized.kind == AgentActionKind::StartAgent)
             .then(|| execution_id_for_action(&normalized.action_id));
         let resource = if normalized.kind == AgentActionKind::StartAgent {
-            if depth == 0 || depth > policy.max_depth {
+            if (independent_root && depth != 0)
+                || (!independent_root && (depth == 0 || depth > policy.max_depth))
+                || (independent_root
+                    && !route.is_some_and(|route| {
+                        !route.same_capsule
+                            && route.destination_thread_id == route.destination_capsule_id
+                            && route.destination_capsule_id != root.home_root_thread_id
+                    }))
+            {
                 return Err(AgentActionServiceError::ResourceBoundary);
             }
             // This is only a deterministic write-set descriptor. Durable
@@ -311,7 +326,9 @@ impl CanonicalAgentActionService {
             // and queue admission inside its transaction. Keeping a second
             // mutable coordinator here could reject a valid action after a
             // restart or after a durable permit was released.
-            let child_branch_key = if root.execution_id == root.work_graph_root_execution_id {
+            let child_branch_key = if independent_root {
+                format!("root-start:{}", spawned_execution_id.as_ref().unwrap())
+            } else if root.execution_id == root.work_graph_root_execution_id {
                 format!(
                     "branch:{}",
                     spawned_execution_id
@@ -323,7 +340,11 @@ impl CanonicalAgentActionService {
             };
             Some(super::RunningPermit {
                 permit_id: 1,
-                root_execution_id: root.work_graph_root_execution_id.clone(),
+                root_execution_id: if independent_root {
+                    spawned_execution_id.clone().unwrap()
+                } else {
+                    root.work_graph_root_execution_id.clone()
+                },
                 execution_id: spawned_execution_id
                     .clone()
                     .expect("resource-consuming actions allocate a child execution"),
@@ -345,7 +366,11 @@ impl CanonicalAgentActionService {
             resource,
             request_fingerprint,
             actor_identity_id: envelope.identity_id.clone(),
-            root_execution_id: root.work_graph_root_execution_id.clone(),
+            root_execution_id: if independent_root {
+                spawned_execution_id.clone().unwrap()
+            } else {
+                root.work_graph_root_execution_id.clone()
+            },
             source_capsule_id: envelope.root_capsule_id.clone(),
             subject_role_key: envelope.role_key.clone(),
             policy_generation: envelope.policy_generation,
@@ -359,6 +384,7 @@ impl CanonicalAgentActionService {
             route: route.cloned(),
             routed_disclosure_class,
             spawned_execution_id,
+            independent_root,
             idle_timeout_secs,
             hard_timeout_secs,
         })

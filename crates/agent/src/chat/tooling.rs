@@ -1991,25 +1991,27 @@ mod tests {
     #[test]
     fn failed_tool_item_display_summary_is_bounded_by_policy() {
         let item = build_failed_tool_turn_item(
-            "call_computer_use".to_owned(),
-            "computer_use".to_owned(),
-            serde_json::json!({"action": "start"}).to_string(),
-            "computer_use app target not found ".repeat(300),
+            "call_cua_get_window_state".to_owned(),
+            "cua_get_window_state".to_owned(),
+            serde_json::json!({"pid":42,"window_id":9}).to_string(),
+            "CUA window target not found ".repeat(300),
             pioneer_tools::ToolOutcome::fatal(
                 pioneer_tools::ToolErrorClass::NotFound,
                 Some("target not found".to_owned()),
             ),
             None,
             TurnItemExecutionClass::Standard,
-            Some(ToolOutputPolicySnapshot::for_tool_name("computer_use")),
+            Some(ToolOutputPolicySnapshot::for_tool_name(
+                "cua_get_window_state",
+            )),
             None,
         );
 
         let TurnItem::DynamicToolCall { display, .. } = item else {
-            panic!("computer_use failure should be a dynamic tool call");
+            panic!("CUA failure should be a dynamic tool call");
         };
         let ToolDisplayPayload::Summary(summary) = display else {
-            panic!("computer_use failure should render a summary display");
+            panic!("CUA failure should render a summary display");
         };
         let visible_chars = summary.title.chars().count()
             + summary

@@ -169,6 +169,8 @@ select_model = "मॉडल चुनें"
 dialog_title = "Preflight मॉडल चुनें"
 
 [settings.voice_input]
+transcribe_while_recording = "रिकॉर्डिंग के दौरान ट्रांसक्राइब करें"
+transcribe_while_recording_description = "बंद होने पर, रिकॉर्डिंग समाप्त होने के बाद ट्रांसक्रिप्शन शुरू होगा।"
 label = "वॉइस इनपुट"
 description = "वॉइस संदेशों के लिए स्थानीय ट्रांसक्रिप्शन मॉडल का उपयोग करें।"
 no_model_selected = "कोई मॉडल नहीं चुना गया"

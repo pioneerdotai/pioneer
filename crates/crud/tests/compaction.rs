@@ -7005,9 +7005,77 @@ async fn legacy_task_snapshot_reference_is_bounded_scoped_and_revision_guarded()
     );
 }
 
+// These fixtures enter optional preparation through canonical root publication,
+// while retry/deadline tests below continue to own the durable worker contract.
+async fn start_history_check_root(store: &CrudStore) {
+    let mut thread = store.get_thread_model("thread").await.unwrap().unwrap();
+    thread.updated_at = 1;
+    let (_, mut turn) = store.get_turn("thread", "turn").await.unwrap().unwrap();
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn WHERE id='turn'")
+        .await
+        .unwrap();
+    // The serialized writer may have foreign_keys=OFF, as production does.
+    // Retire only this raw fixture's creation key before reusing its Turn id.
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM compaction_turn_creation WHERE turn_id='turn'")
+        .await
+        .unwrap();
+    turn.status = pioneer_protocol::TurnStatus::InProgress;
+    store
+        .materialize_turn_start(
+            &thread,
+            pioneer_protocol::SandboxMode::FullAccess,
+            &turn,
+            &[],
+            pioneer_protocol::PersistedActorRef::Principal(
+                pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+}
+
+async fn publish_history_check_root(store: &CrudStore) {
+    store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "root-answer".into(),
+                    text: "ready root answer".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let (_, mut turn) = store.get_turn("thread", "turn").await.unwrap().unwrap();
+    turn.status = pioneer_protocol::TurnStatus::Completed;
+    store
+        .materialize_turn_completed(
+            pioneer_protocol::TurnCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn completed_cli_check_is_atomic_bounded_and_captures_settings_once() {
     let store = store().await;
+    start_history_check_root(&store).await;
     let db = store.database_connection();
     db.execute_unprepared("INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,model,frozen_manifest_id) VALUES('turn','thread','thread','ws','claude','claude','native','running','sonnet',NULL)").await.unwrap();
     assert!(
@@ -7037,9 +7105,7 @@ async fn completed_cli_check_is_atomic_bounded_and_captures_settings_once() {
             .unwrap()
             .is_empty()
     );
-    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
-        .await
-        .unwrap();
+    publish_history_check_root(&store).await;
     let pending = store.compaction_pending_history_checks().await.unwrap();
     assert_eq!(pending.len(), 1);
     assert!(
@@ -8134,20 +8200,12 @@ async fn history_check_retries_are_durable_bounded_and_cas_protected() {
     use pioneer_entity::compaction_history_check as check;
     use sea_orm::EntityTrait;
     let store = store().await.with_maintenance_access();
-    store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
-        .await
-        .unwrap();
+    start_history_check_root(&store).await;
     store
         .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
         .await
         .unwrap();
-    store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
-        .await
-        .unwrap();
+    publish_history_check_root(&store).await;
     let mut now = 1000;
     for (failure, delay) in [60_000, 300_000, 900_000, 0].into_iter().enumerate() {
         let page = store.compaction_due_history_checks(now).await.unwrap();
@@ -8274,20 +8332,12 @@ async fn history_check_waits_do_not_spend_retries_and_stop_wins_over_stale_resul
     use pioneer_entity::compaction_history_check as check;
     use sea_orm::EntityTrait;
     let store = store().await.with_maintenance_access();
-    store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
-        .await
-        .unwrap();
+    start_history_check_root(&store).await;
     store
         .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
         .await
         .unwrap();
-    store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
-        .await
-        .unwrap();
+    publish_history_check_root(&store).await;
     let mut now = 0;
     for outcome in [
         O::Preparing,
@@ -8373,109 +8423,78 @@ async fn history_check_waits_do_not_spend_retries_and_stop_wins_over_stale_resul
 }
 
 #[tokio::test]
-async fn history_check_legacy_failures_are_reconciled_once_without_reviving_cancelled_jobs() {
-    use pioneer_crud::compaction::{HistoryCheckDiagnostic as D, HistoryCheckOutcome as O};
+async fn history_check_legacy_failures_remain_retained_without_optional_admission() {
+    use pioneer_entity::compaction_history_check as check;
+    use sea_orm::EntityTrait;
     let store = store().await.with_maintenance_access();
     let db = store.database_connection();
     db.execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
         .await
         .unwrap();
     store
-        .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
+        .compaction_enqueue_native_history_check("ws", "thread", "turn", "retained descriptor")
         .await
         .unwrap();
     db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
         .await
         .unwrap();
-    db.execute_unprepared("UPDATE compaction_history_check SET state='finished',outcome='failed' WHERE turn_id='turn'").await.unwrap();
-    let row = store
-        .compaction_due_history_checks(0)
-        .await
-        .unwrap()
-        .remove(0);
-    let claim = store
-        .compaction_claim_history_check("turn", row.revision, 0)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        serde_json::from_str::<D>(claim.diagnostic.as_ref().unwrap())
-            .unwrap()
-            .legacy_reason_unknown,
-        "legacy marker must survive a crash before the result is recorded"
-    );
-    let d = D {
-        legacy_reason_unknown: true,
-        ..D::new("budget", "history_fits", "No summary needed")
-    };
-    store
-        .compaction_record_history_result("turn", claim.revision, 0, O::Fits, &d, 0)
-        .await
-        .unwrap();
-    assert!(
-        store
-            .compaction_due_history_checks(i64::MAX)
+    for outcome in ["failed", "cancelled"] {
+        db.execute_unprepared(&format!("UPDATE compaction_history_check SET managed=0,state='finished',outcome='{outcome}' WHERE turn_id='turn'")).await.unwrap();
+        let before = check::Entity::find_by_id("turn")
+            .one(&db)
             .await
             .unwrap()
-            .is_empty()
-    );
-    db.execute_unprepared("UPDATE compaction_history_check SET managed=0,state='finished',outcome='cancelled' WHERE turn_id='turn'").await.unwrap();
-    assert!(
-        store
-            .compaction_due_history_checks(i64::MAX)
+            .unwrap();
+        assert!(
+            store
+                .compaction_due_history_checks(i64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .compaction_claim_history_check("turn", before.revision, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let after = check::Entity::find_by_id("turn")
+            .one(&db)
             .await
             .unwrap()
-            .is_empty()
-    );
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "policy upgrade must not spend or rewrite the legacy lifecycle budget"
+        );
+    }
 }
 
 #[tokio::test]
-async fn history_check_legacy_pages_discard_superseded_turns_and_make_progress() {
+async fn history_check_legacy_pages_do_not_reenter_optional_discovery() {
+    use pioneer_entity::compaction_history_check as check;
+    use sea_orm::EntityTrait;
     let store = store().await.with_maintenance_access();
     let db = store.database_connection();
     for n in 0..33 {
         db.execute_unprepared(&format!("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('legacy-{n:02}','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")).await.unwrap();
         db.execute_unprepared(&format!("INSERT INTO compaction_history_check(turn_id,state,outcome) VALUES ('legacy-{n:02}','finished','failed')")).await.unwrap();
     }
-    for expected in [16, 16, 1] {
-        let page = store.compaction_due_history_checks(0).await.unwrap();
-        assert_eq!(page.len(), expected);
-        for row in page {
-            let claim = store
-                .compaction_claim_history_check(&row.turn_id, row.revision, 0)
+    let before = check::Entity::find().all(&db).await.unwrap();
+    for _ in 0..2 {
+        assert!(
+            store
+                .compaction_due_history_checks(i64::MAX)
                 .await
-                .unwrap();
-            if row.turn_id == "legacy-32" {
-                let claim = claim.unwrap();
-                store
-                    .compaction_record_history_result(
-                        &row.turn_id,
-                        claim.revision,
-                        0,
-                        HistoryCheckOutcome::Failed,
-                        &HistoryCheckDiagnostic::new(
-                            "descriptor",
-                            "invalid_descriptor",
-                            "Malformed metadata quarantined",
-                        ),
-                        0,
-                    )
-                    .await
-                    .unwrap();
-            } else {
-                assert!(
-                    claim.is_none(),
-                    "newer turn must invalidate an old failed check"
-                );
-            }
-        }
+                .unwrap()
+                .is_empty()
+        );
     }
-    assert!(
-        store
-            .compaction_due_history_checks(i64::MAX)
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        check::Entity::find().all(&db).await.unwrap(),
+        before,
+        "discovery must leave legacy checks available to lifecycle inspection"
     );
 }
 

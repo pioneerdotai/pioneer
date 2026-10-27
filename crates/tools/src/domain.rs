@@ -15,6 +15,7 @@ pub const TASK_DOMAIN_TOOL_NAMES: &[&str] = &[
     "task_accept",
     "task_revise",
     "task_cancel",
+    "task_finish",
     "task_update",
     "task_detach",
     "task_list",
@@ -27,12 +28,17 @@ pub const ARTIFACT_DOMAIN_TOOL_NAMES: &[&str] =
     &["artifact_prepare", "artifact_register", "artifact_read"];
 pub const THREADS_DOMAIN_TOOL_NAMES: &[&str] = &[
     "threads_tools_result_read",
+    "threads_list",
+    "threads_history_read",
+    "threads_search",
+    "threads_children_list",
     "threads_start_options",
+    "threads_identity_models_list",
     "thread_message_send",
     "thread_create",
     "threads_turn_start",
 ];
-pub const COMPUTER_USE_DOMAIN_TOOL_NAMES: &[&str] = &["computer_use"];
+pub const COMPUTER_USE_DOMAIN_TOOL_NAMES: &[&str] = crate::handlers::computer_use::TOOL_NAMES;
 pub const REQUEST_TOOLS_REASON_MAX_CHARS: usize = 512;
 
 pub const REQUEST_TOOLS_DOMAIN_VALUES: &[&str] = &[
@@ -224,6 +230,7 @@ mod tests {
                 "task_accept",
                 "task_revise",
                 "task_cancel",
+                "task_finish",
                 "task_update",
                 "task_detach",
                 "task_list",
@@ -237,7 +244,12 @@ mod tests {
             BuiltinToolDomain::Threads.tool_names(),
             [
                 "threads_tools_result_read",
+                "threads_list",
+                "threads_history_read",
+                "threads_search",
+                "threads_children_list",
                 "threads_start_options",
+                "threads_identity_models_list",
                 "thread_message_send",
                 "thread_create",
                 "threads_turn_start",
@@ -246,10 +258,6 @@ mod tests {
         assert_eq!(
             BuiltinToolDomain::Artifact.tool_names(),
             ["artifact_prepare", "artifact_register", "artifact_read"]
-        );
-        assert_eq!(
-            BuiltinToolDomain::ComputerUse.tool_names(),
-            ["computer_use"]
         );
     }
 

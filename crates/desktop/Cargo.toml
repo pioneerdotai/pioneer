@@ -78,3 +78,8 @@ tokio-tungstenite.workspace = true
 available-locales = ["en", "ru", "zh", "hi", "es", "de", "fr", "jp"]
 default-locale = "en"
 load-path = "locales"
+
+[build-dependencies]
+sha2.workspace = true
+hex.workspace = true
+serde_json.workspace = true

@@ -1,3 +1,5 @@
+mod codex_retry_notice;
+pub use codex_retry_notice::{CodexRetryNoticeTarget, codex_retry_notice_item_id};
 mod frozen_lifetime;
 pub use frozen_lifetime::FrozenReadHold;
 mod tool_output;
@@ -29,7 +31,9 @@ pub use repositories::task_occurrence_reconcile::{
     TaskOccurrenceClaimFailure, TaskOccurrenceClaimFailurePhase, TaskOccurrenceClock,
     TaskOccurrenceReconcileCandidate, TaskOccurrenceReconcileClaim,
 };
+mod task_finish;
 mod task_terminal;
+mod task_webhook;
 pub use repositories::task_run_occurrence_reconcile::{
     OCCURRENCE_RECONCILE_BUDGET, OCCURRENCE_RECONCILE_INITIAL_BACKOFF_SECS,
     OCCURRENCE_RECONCILE_MAX_ATTEMPT_COUNT, OCCURRENCE_RECONCILE_MAX_BACKOFF_SECS,
@@ -39,12 +43,15 @@ pub use repositories::task_run_occurrence_reconcile::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use task_delivery_lifecycle::TaskDeliveryCommitTestKind;
-pub use task_delivery_lifecycle::{TaskDeliveryTransition, TaskDeliveryTransitionOutcome};
+pub use task_delivery_lifecycle::{
+    TaskCancellationRunsChanged, TaskDeliveryTransition, TaskDeliveryTransitionOutcome,
+};
 pub use task_run_occurrence::{TaskRunOccurrenceRepairPhase, TaskRunOccurrenceRepairReason};
 pub use task_terminal::{
     PreparedTaskTerminalTransition, TaskTerminalCommitOutcome, TaskTerminalCommitStatus,
     TaskTerminalConflict,
 };
+pub use task_webhook::TaskWebhookAdmissionSnapshot;
 mod task_projector;
 mod thread_episodic;
 pub mod thread_episodic_source;
@@ -73,38 +80,39 @@ pub use repositories::administrative_audit::{
     insert_administrative_audit_event,
 };
 pub use repositories::agent_domain::{
-    ACTIVE_AGENT_IDENTITY_CATALOG_LIMIT, AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS,
-    AGENT_ACTION_OUTBOX_MAX_ATTEMPTS, AgentActionInput, AgentActionLedgerCompactionSummary,
-    AgentActionOutboxClaimBatch, AgentActionTimelineProjection, AgentCommitInput,
-    AgentDelegationRouteInput, AgentExecutionAuthorProjection, AgentExecutionGrantInput,
-    AgentExecutionGraphCommitInput, AgentExecutionGraphCommitResult, AgentExecutionInput,
-    AgentIdentityInput, AgentQueueEntryInput, AgentResourceCommitInput, AgentResourceStateInput,
-    AgentThreadCreationCommitInput, AgentTurnResponseInput, AgentWorkGraphCancellationTarget,
-    AgentWorkGraphProjectionTarget, NativeAgentConfigInput, PresentationSnapshotInput,
-    PromotedAgentExecution, SOURCE_CLI_RUNTIME_INSTANCE, SOURCE_EPHEMERAL, SOURCE_NATIVE_AGENT,
-    TerminalTaskDeliveryCommitError, acquire_agent_running_permit,
-    agent_delegation_route_projection, agent_execution_grant_fingerprint,
-    agent_presentation_snapshot_from_rows, cancel_agent_work_graph, canonical_agent_id,
-    claim_actor_nickname, claim_agent_action_outbox, commit_agent_action,
-    commit_agent_delivery_action, commit_agent_execution_graph, commit_agent_thread_creation,
-    commit_native_agent_config_mutation, compact_terminal_agent_action_ledger,
-    defer_agent_action_outbox_for_permit, defer_agent_action_outbox_for_runtime,
-    enqueue_agent_execution, ensure_agent_identity, ensure_native_agent_config,
-    ensure_root_resource_scope, finalize_agent_execution, heartbeat_agent_execution,
-    insert_agent_action_idempotent, insert_agent_delegation_route, insert_agent_execution,
-    insert_agent_execution_grant, insert_agent_resource_state, insert_agent_turn_response,
-    insert_presentation_snapshot, list_active_agent_identities, list_agent_delegation_routes,
-    list_agent_delegation_routes_for_source, load_active_agent_identity,
-    load_active_agent_identity_by_source, load_agent_action, load_agent_action_outbox,
-    load_agent_action_receipt, load_agent_action_timeline_projections_for_targets,
-    load_agent_delegation_route, load_agent_execution, load_agent_execution_grant,
-    load_agent_execution_resource_state, load_agent_identity, load_agent_identity_by_source,
-    load_agent_presentation_snapshot, load_agent_turn_response,
-    load_agent_turn_responses_for_turns, load_agent_work_graph_projection_for_turn,
-    load_agent_work_graph_projection_target, load_current_agent_authors_for_executions,
-    load_current_agent_presentation_snapshot, load_native_agent_config,
-    load_native_agent_config_by_system_key, mark_agent_action_outbox_delivered,
-    mark_agent_action_outbox_failed, promote_queued_agent_executions,
+    AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS, AGENT_ACTION_OUTBOX_MAX_ATTEMPTS,
+    AGENT_START_RECONCILIATION_REQUIRED, AgentActionInput, AgentActionLedgerCompactionSummary,
+    AgentActionOutboxClaimBatch, AgentActionOutboxFailure, AgentActionTimelineProjection,
+    AgentCommitInput, AgentDelegationRouteInput, AgentExecutionAuthorProjection,
+    AgentExecutionGrantInput, AgentExecutionGraphCommitInput, AgentExecutionGraphCommitResult,
+    AgentExecutionInput, AgentIdentityInput, AgentQueueEntryInput, AgentResourceCommitInput,
+    AgentResourceStateInput, AgentThreadCreationCommitInput, AgentTurnResponseInput,
+    AgentWorkGraphCancellationTarget, AgentWorkGraphProjectionTarget, NativeAgentConfigInput,
+    PresentationSnapshotInput, PromotedAgentExecution, SOURCE_CLI_RUNTIME_INSTANCE,
+    SOURCE_EPHEMERAL, SOURCE_NATIVE_AGENT, TerminalTaskDeliveryCommitError,
+    acquire_agent_running_permit, agent_delegation_route_projection,
+    agent_execution_grant_fingerprint, agent_presentation_snapshot_from_rows,
+    cancel_agent_work_graph, canonical_agent_id, claim_actor_nickname, claim_agent_action_outbox,
+    commit_agent_action, commit_agent_delivery_action, commit_agent_execution_graph,
+    commit_agent_thread_creation, commit_native_agent_config_mutation,
+    compact_terminal_agent_action_ledger, defer_agent_action_outbox_for_permit,
+    defer_agent_action_outbox_for_runtime, enqueue_agent_execution, ensure_agent_identity,
+    ensure_native_agent_config, ensure_root_resource_scope, finalize_agent_execution,
+    heartbeat_agent_execution, insert_agent_action_idempotent, insert_agent_delegation_route,
+    insert_agent_execution, insert_agent_execution_grant, insert_agent_resource_state,
+    insert_agent_turn_response, insert_presentation_snapshot, list_active_agent_identities_page,
+    list_agent_delegation_routes, list_agent_delegation_routes_for_source,
+    load_active_agent_identity, load_active_agent_identity_by_source, load_agent_action,
+    load_agent_action_outbox, load_agent_action_receipt,
+    load_agent_action_timeline_projections_for_targets, load_agent_delegation_route,
+    load_agent_execution, load_agent_execution_grant, load_agent_execution_resource_state,
+    load_agent_identity, load_agent_identity_by_source, load_agent_presentation_snapshot,
+    load_agent_turn_response, load_agent_turn_responses_for_turns,
+    load_agent_work_graph_projection_for_turn, load_agent_work_graph_projection_target,
+    load_current_agent_authors_for_executions, load_current_agent_presentation_snapshot,
+    load_native_agent_config, load_native_agent_config_by_system_key,
+    mark_agent_action_outbox_delivered, mark_agent_action_outbox_failed,
+    mark_agent_action_outbox_failed_with_cause, promote_queued_agent_executions,
     record_agent_execution_progress, reopen_agent_execution_for_retry,
     revoke_agent_delegation_route, upgrade_agent_execution_grant_model_to_current, utc_now,
     wake_agent_action_outbox_for_execution,
@@ -212,9 +220,9 @@ pub use repositories::task_actor_contract::{
 };
 pub use repositories::task_completion_inbox::{
     TaskCompletionInboxAccess, TaskCompletionInboxRow, count_unread_task_completion_inbox,
-    find_task_completion_inbox_entry, list_task_completion_inbox,
-    mark_all_task_completion_inbox_read, mark_task_completion_inbox_read,
-    mark_viewed_task_completion_inbox_read,
+    find_task_completion_inbox_entry, find_unread_task_completion_inbox_entries,
+    list_task_completion_inbox, mark_all_task_completion_inbox_read,
+    mark_task_completion_inbox_read, mark_viewed_task_completion_inbox_read,
 };
 pub use repositories::thread::{
     ThreadManagementChange, advance_thread_read_cursor, find_thread_read_cursor,
@@ -1356,7 +1364,7 @@ pub use crate::repositories::execution_admission_lease::{
     ExecutionQuotaCeilings, NewExecutionAdmissionLease,
 };
 pub use crate::repositories::native_cancellation_context::{
-    NativeCancellationContext, NativeCancellationContextUnavailable,
+    NativeCancellationContext, NativeCancellationContextUnavailable, UnactivatedTurnPhaseChanged,
 };
 pub use crate::repositories::native_terminal_effect_outbox::{
     HandlerCheckpointInvalid, NativeTerminalEffectStats,
@@ -2076,6 +2084,8 @@ struct TurnEventProjectionContext {
     enqueue_optional_deliveries: bool,
     #[serde(skip)]
     native_cancellation: Option<PreparedNativeCancellation>,
+    #[serde(skip)]
+    unactivated_terminal: Option<TurnExecutionRecord>,
     #[serde(skip)]
     cancellation_actor_id: Option<String>,
 }
@@ -3567,8 +3577,15 @@ fn completed_message_turn_events(
             sandbox_mode: write.sandbox_mode,
             turn: write.started_turn.clone(),
             input: write.input.to_vec(),
+            // An agent-authored Message does not select or run a model. Preserve
+            // the destination's configuration, including an intentional None,
+            // so single-thread and list snapshots restore the same selection.
+            reasoning_effort: if matches!(&write.actor, PersistedActorRef::AgentExecution(_)) {
+                write.thread.reasoning_effort.clone()
+            } else {
+                None
+            },
             actor: Some(write.actor),
-            reasoning_effort: None,
             work_owner: Default::default(),
         }),
         TurnEventPayload::TurnCompleted(write.completed),
@@ -6202,6 +6219,14 @@ impl CrudStore {
                 .begin()
                 .await
                 .context("failed to begin CLI runtime initial attempt transaction")?;
+            anyhow::ensure!(
+                !turn_event_projection_stream_state::has_accepted_terminal(
+                    &transaction,
+                    &binding.turn_id
+                )
+                .await?,
+                "CLI initial attempt cannot activate an accepted terminal Turn"
+            );
             let existing_binding =
                 cli_runtime_binding::find_turn_binding(&transaction, binding.turn_id.as_str())
                     .await?;
@@ -11820,6 +11845,24 @@ impl CrudStore {
         .collect()
     }
 
+    pub async fn list_thread_episodic_capsules_for_workspace_after(
+        &self,
+        workspace_id: &str,
+        after: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicCapsuleRecord>> {
+        thread_episodic_repository::list_capsules_for_workspace_after(
+            &self.connection,
+            workspace_id,
+            after,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::thread_episodic::thread_episodic_capsule_record_from_model)
+        .collect()
+    }
+
     pub async fn list_recallable_thread_episodic_items_for_thread(
         &self,
         workspace_id: &str,
@@ -13836,17 +13879,35 @@ impl CrudStore {
             .response
             .as_ref()
             .context("agent Turn transaction requires an exact response binding")?;
-        if execution_graph
-            .child_execution
-            .parent_execution_id
-            .as_deref()
-            != Some(input_execution_id.as_str())
-            || execution_graph.child_execution.parent_thread_id.as_deref()
-                != Some(thread_model.id.as_str())
+        let response_execution = &execution_graph.child_execution;
+        let independent_root = response_execution.parent_execution_id.is_none()
+            && response_execution.id == response_execution.work_graph_root_execution_id
+            && execution_graph
+                .root_execution
+                .as_ref()
+                .is_some_and(|root| root.id == response_execution.id)
+            && response_execution.home_root_thread_id == thread_model.id;
+        let grant: serde_json::Value = serde_json::from_str(&execution_graph.grant.grant_json)?;
+        let input_bound = if independent_root {
+            grant
+                .get("source_execution_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(input_execution_id.as_str())
+                && grant
+                    .get("source_action_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(agent_action.action.id.as_str())
+        } else {
+            response_execution.parent_execution_id.as_deref() == Some(input_execution_id.as_str())
+        };
+        if !input_bound
+            || agent_action.action.execution_id != input_execution_id.as_str()
+            || agent_action.action.action_kind != "start_agent"
+            || response_execution.parent_thread_id.as_deref() != Some(thread_model.id.as_str())
             || graph_response.turn_id != turn_model.id
-            || graph_response.execution_id != execution_graph.child_execution.id
+            || graph_response.execution_id != response_execution.id
         {
-            bail!("agent Turn input/response actors differ from its execution graph");
+            bail!("agent Turn input/response actors differ from its execution graph and action");
         }
         let authority_envelope_json = authority_envelope_json.trim();
         if authority_envelope_json.is_empty() {
@@ -14352,6 +14413,31 @@ impl CrudStore {
                 unix_to_datetime(lease_until_unix),
             )
             .await
+        })
+        .await
+    }
+
+    /// Fence duplicate outbox activations using the starting receipt's timestamp.
+    /// This CAS precedes runtime registration, while canonical
+    /// terminal acceptance shares the same serialized writer.
+    pub async fn claim_unactivated_agent_turn(
+        &self,
+        expected: &TurnExecutionRecord,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            if turn_event_projection_stream_state::has_accepted_terminal(&tx, &expected.turn_id)
+                .await?
+            {
+                return Ok(false);
+            }
+            // Writer admission (and a storage retry) may outlive the lease.
+            // Read the clock in this attempt, after acquiring the writer and
+            // immediately before evaluating the activation fence.
+            let claimed =
+                repositories::turn_execution::claim_unactivated(&tx, expected, utc_now()).await?;
+            tx.commit().await?;
+            Ok(claimed)
         })
         .await
     }
@@ -16652,6 +16738,64 @@ impl CrudStore {
         .await
     }
 
+    /// Outbox replay may release only the exact terminal Turn generation it
+    /// observed. An explicit resume/recovery must not lose its new resources
+    /// to a delayed delivery ACK or failure-cleanup callback.
+    pub async fn finalize_terminal_agent_turn_owned(
+        &self,
+        expected: &TurnExecutionRecord,
+        execution_id: &str,
+        now: DateTimeWithTimeZone,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            let Some(current) = turn_execution::find(&tx, &expected.turn_id).await? else {
+                return Ok(false);
+            };
+            if current.owner_id != expected.owner_id
+                || current.owner_generation != expected.owner_generation
+                || current.thread_id != expected.thread_id
+                || current.workspace_id != expected.workspace_id
+                || !turn_event_projection_stream_state::has_accepted_terminal(
+                    &tx,
+                    &expected.turn_id,
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+            let (turn_status, graph_status) = match current.status {
+                TurnExecutionStatus::Completed => (TurnStatus::Completed, "completed"),
+                TurnExecutionStatus::Failed => (TurnStatus::Failed, "failed"),
+                TurnExecutionStatus::Interrupted => (TurnStatus::Interrupted, "cancelled"),
+                TurnExecutionStatus::Blocked => (TurnStatus::Blocked, "blocked"),
+                _ => return Ok(false),
+            };
+            let saved = turn::find_turn_by_thread_and_id(&tx, &current.thread_id, &current.turn_id)
+                .await?
+                .context("terminal Agent Turn disappeared")?;
+            let response =
+                repositories::agent_domain::load_agent_turn_response(&tx, &current.turn_id)
+                    .await?
+                    .context("terminal Agent Turn response disappeared")?;
+            if turn_status_from_db(&saved.status) != Some(turn_status)
+                || response.execution_id != execution_id
+            {
+                return Ok(false);
+            }
+            repositories::agent_domain::finalize_agent_execution(
+                &tx,
+                execution_id,
+                graph_status,
+                now,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        })
+        .await
+    }
+
     pub async fn cancel_agent_work_graph(
         &self,
         root_execution_id: &str,
@@ -17731,7 +17875,30 @@ impl CrudStore {
         claimed_at: i64,
     ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
         self.run_serialized_write(|| {
-            self.claim_task_run_for_dispatch_once(run_id.to_owned(), claimed_at)
+            self.claim_task_run_for_dispatch_once(run_id.to_owned(), claimed_at, None)
+        })
+        .await
+    }
+
+    /// Retry occurrence rebinding and admission share one writer boundary.
+    /// A finish can observe either the failed source or an admitted successor,
+    /// never a queued retry that has already stolen the source's occurrence.
+    pub async fn claim_task_retry_for_dispatch_with_event(
+        &self,
+        run_id: &str,
+        claimed_at: i64,
+        occurrence: pioneer_protocol::TaskOccurrenceContract,
+    ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
+        anyhow::ensure!(
+            occurrence.run_id == run_id,
+            "retry occurrence belongs to another run"
+        );
+        self.run_serialized_write(|| {
+            self.claim_task_run_for_dispatch_once(
+                run_id.to_owned(),
+                claimed_at,
+                Some(occurrence.clone()),
+            )
         })
         .await
     }
@@ -17740,12 +17907,16 @@ impl CrudStore {
         &self,
         run_id: String,
         claimed_at: i64,
+        retry_occurrence: Option<pioneer_protocol::TaskOccurrenceContract>,
     ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
         // Prepare serialization before reserving the writer. Task identity is
         // revalidated inside the atomic claim + durable fanout write set.
         let Some(candidate) = task_run::find_run_by_id(&self.connection, &run_id).await? else {
             return Ok(None);
         };
+        // The optional body can be large. Decode on the reader path, then
+        // compare its immutable serialized representation during the claim.
+        let trigger_input = optional_typed_json_from_db(candidate.trigger_input_json.clone())?;
         let prepared = self
             .prepare_task_events_for_write(vec![TaskEventPayload::RunStarting {
                 task_id: candidate.task_id.clone(),
@@ -17767,15 +17938,60 @@ impl CrudStore {
                 current.task_id == candidate.task_id,
                 "dispatch claim task identity changed"
             );
+            if task_repository::finish_requested(&transaction, &current.task_id).await? {
+                return Ok(None);
+            }
+            let Some(task) =
+                task_repository::find_task_by_id(&transaction, &current.task_id).await?
+            else {
+                return Ok(None);
+            };
+            if task_status_from_db(&task.status).is_none_or(|status| status.is_terminal()) {
+                return Ok(None);
+            }
+            let max_parallel_runs = optional_typed_json_from_db::<
+                pioneer_protocol::TaskConcurrencyPolicy,
+            >(task.concurrency_policy_json)?
+            .map(|policy| policy.max_parallel_runs)
+            .unwrap_or(1);
+            if !task_run::has_dispatch_capacity(
+                &transaction,
+                &current,
+                max_parallel_runs,
+                unix_to_datetime(claimed_at),
+            )
+            .await?
+            {
+                return Ok(None);
+            }
             let claimed = task_run::claim_run_for_dispatch(
                 &transaction,
                 run_id.as_str(),
                 unix_to_datetime(claimed_at),
             )
             .await?
-            .map(task_run_from_db_model)
+            .map(|mut model| {
+                anyhow::ensure!(
+                    model.trigger_input_json == candidate.trigger_input_json,
+                    "queued run input changed during claim"
+                );
+                model.trigger_input_json = None;
+                task_run_from_db_model(model)
+            })
             .transpose()?;
             let Some(run) = claimed else { return Ok(None) };
+            if let Some(occurrence) = retry_occurrence {
+                anyhow::ensure!(
+                    occurrence.task_id == current.task_id && current.retry_of_run_id.is_some(),
+                    "invalid retry admission"
+                );
+                task_actor_contract::upsert_task_occurrence_contract(
+                    &transaction,
+                    &occurrence,
+                    claimed_at,
+                )
+                .await?;
+            }
             let event = self
                 .append_task_events_in_connection(&transaction, prepared, claimed_at)
                 .await?
@@ -17785,11 +18001,14 @@ impl CrudStore {
         }
         .await;
         match result {
-            Ok(run) => {
+            Ok(mut run) => {
                 transaction
                     .commit()
                     .await
                     .context("failed to commit Task dispatch claim transaction")?;
+                if let Some((run, _)) = run.as_mut() {
+                    run.trigger_input = trigger_input;
+                }
                 Ok(run)
             }
             Err(error) => {
@@ -17860,6 +18079,13 @@ impl CrudStore {
                 .rollback()
                 .await
                 .context("failed to rollback non-startable task run started transaction")?;
+            return Ok(None);
+        }
+
+        if status == TaskRunStatus::Queued
+            && task_repository::finish_requested(&transaction, &run_model.task_id).await?
+        {
+            transaction.rollback().await?;
             return Ok(None);
         }
 
@@ -18180,6 +18406,27 @@ impl CrudStore {
         Ok(row.map(task_thread_lineage_from_db_model))
     }
 
+    /// Bounded direct edges for child listing and resumable subtree traversal.
+    /// Callers must authorize each child and guard cycles along the DFS path.
+    pub async fn list_thread_child_lineage_page(
+        &self,
+        parent_thread_id: &str,
+        after_child_thread_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<TaskThreadLineage>> {
+        let rows = thread_lineage::list_children_page(
+            &self.connection,
+            parent_thread_id,
+            after_child_thread_id,
+            limit,
+        )
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(task_thread_lineage_from_db_model)
+            .collect())
+    }
+
     pub async fn list_task_thread_lineage_for_parent(
         &self,
         parent_thread_id: &str,
@@ -18205,21 +18452,20 @@ impl CrudStore {
             .collect())
     }
 
-    pub async fn list_task_thread_lineage_by_root_thread_bounded(
+    pub async fn list_task_thread_lineage_by_root_thread_page(
         &self,
         root_thread_id: &str,
-        limit: u64,
+        after: Option<&str>,
     ) -> Result<Vec<TaskThreadLineage>> {
-        let rows = thread_lineage::list_lineage_by_root_thread_bounded(
+        Ok(thread_lineage::list_lineage_by_root_thread_page(
             &self.connection,
             root_thread_id,
-            limit,
+            after,
         )
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(task_thread_lineage_from_db_model)
-            .collect())
+        .await?
+        .into_iter()
+        .map(task_thread_lineage_from_db_model)
+        .collect())
     }
 
     pub async fn mark_thread_read(
@@ -20115,7 +20361,7 @@ impl CrudStore {
 
     pub async fn get_first_thread_user_text(&self, thread_id: &str) -> Result<Option<String>> {
         let Some(turn_model) =
-            turn::find_oldest_turn_for_thread(&self.connection, thread_id).await?
+            turn::find_oldest_user_conversation_turn(&self.connection, thread_id).await?
         else {
             return Ok(None);
         };
@@ -22919,6 +23165,22 @@ impl CrudStore {
         list_turn_work_items_page(&self.connection, turn_id, visibility, anchor, limit).await
     }
 
+    /// One addressed packet: canonical total and <=100 exact memberships share
+    /// one reader snapshot. Scheduling is inherited from this scoped store.
+    /// The snapshot is released before the caller transforms/serializes/fans out.
+    pub async fn task_completion_inbox_patch(
+        &self,
+        access: &TaskCompletionInboxAccess<'_>,
+        run_ids: &[String],
+    ) -> Result<(Vec<TaskCompletionInboxRow>, u64)> {
+        anyhow::ensure!(run_ids.len() <= 100, "inbox addressed batch exceeds limit");
+        let snapshot = self.connection.begin_read().await?;
+        let total = count_unread_task_completion_inbox(&snapshot, access).await?;
+        let entries = find_unread_task_completion_inbox_entries(&snapshot, access, run_ids).await?;
+        snapshot.commit().await?;
+        Ok((entries, total))
+    }
+
     pub async fn get_thread_sandbox_mode(&self, thread_id: &str) -> Result<Option<SandboxMode>> {
         policy::find_thread_sandbox_mode(&self.connection, thread_id).await
     }
@@ -23402,15 +23664,37 @@ impl CrudStore {
         )
         .await?;
         let mut threads = Vec::with_capacity(models.len());
+        let mut creator_executions = HashMap::new();
         for model in models {
+            if model.created_by_actor_kind.as_deref() == Some("agent_execution") {
+                creator_executions.insert(
+                    model.id.clone(),
+                    model
+                        .created_by_actor_id
+                        .clone()
+                        .context("agent-created thread has no creator execution")?,
+                );
+            }
             let Some(thread) = thread_from_db_model(model)? else {
                 continue;
             };
             threads.push(thread);
         }
-        self.attach_latest_thread_turn_snapshots(&mut threads)
+        self.attach_latest_thread_turn_snapshots(&mut threads, &creator_executions)
             .await?;
         Ok(threads)
+    }
+
+    /// Unfiltered storage candidates for authorized thread observation.
+    /// Does not hydrate turns or change read cursors/subscriptions.
+    pub async fn list_thread_read_candidates_page(
+        &self,
+        workspace_id: &str,
+        after_thread_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        thread::list_read_candidates_page(&self.connection, workspace_id, after_thread_id, limit)
+            .await
     }
 
     pub async fn list_threads_for_workspace(
@@ -23421,20 +23705,34 @@ impl CrudStore {
         let models =
             thread::list_threads_by_workspace(&self.connection, workspace_id, limit).await?;
         let mut threads = Vec::with_capacity(models.len());
+        let mut creator_executions = HashMap::new();
 
         for model in models {
+            if model.created_by_actor_kind.as_deref() == Some("agent_execution") {
+                creator_executions.insert(
+                    model.id.clone(),
+                    model
+                        .created_by_actor_id
+                        .clone()
+                        .context("agent-created thread has no creator execution")?,
+                );
+            }
             let Some(thread) = thread_from_db_model(model)? else {
                 continue;
             };
             threads.push(thread);
         }
 
-        self.attach_latest_thread_turn_snapshots(&mut threads)
+        self.attach_latest_thread_turn_snapshots(&mut threads, &creator_executions)
             .await?;
         Ok(threads)
     }
 
-    async fn attach_latest_thread_turn_snapshots(&self, threads: &mut [Thread]) -> Result<()> {
+    async fn attach_latest_thread_turn_snapshots(
+        &self,
+        threads: &mut [Thread],
+        creator_executions: &HashMap<String, String>,
+    ) -> Result<()> {
         for batch in threads.chunks_mut(turn::THREAD_TURN_SNAPSHOT_BATCH_SIZE) {
             let thread_ids = batch
                 .iter()
@@ -23459,11 +23757,30 @@ impl CrudStore {
                 .into_iter()
                 .map(|model| (model.thread_id.clone(), model))
                 .collect::<HashMap<_, _>>();
+            let empty_creator_ids = batch
+                .iter()
+                .filter(|thread| !latest.contains_key(&thread.id))
+                .filter_map(|thread| creator_executions.get(&thread.id).map(String::as_str))
+                .collect::<Vec<_>>();
+            let creator_reasoning = repositories::agent_domain::agent_thread_creator_reasoning(
+                &self.connection,
+                &empty_creator_ids,
+            )
+            .await?;
 
             // All DB capacity has been released. Attach in original list order
             // using the same snapshot conversion as the single-thread caller.
             for thread in batch {
                 let Some(model) = latest.remove(thread.id.as_str()) else {
+                    if let Some((workspace, reasoning)) = creator_executions
+                        .get(&thread.id)
+                        .and_then(|id| creator_reasoning.get(id))
+                    {
+                        if workspace != &thread.workspace_id {
+                            bail!("thread creator execution workspace differs");
+                        }
+                        thread.reasoning_effort = reasoning.clone();
+                    }
                     continue;
                 };
                 let reasoning_effort = if model.turn_kind == turn_kind_to_db(TurnKind::Conversation)
@@ -23485,6 +23802,11 @@ impl CrudStore {
         let Some(turn_model) =
             turn::find_latest_turn_for_thread(&self.connection, thread.id.as_str()).await?
         else {
+            thread.reasoning_effort = repositories::agent_domain::empty_agent_thread_reasoning(
+                &self.connection,
+                &thread.id,
+            )
+            .await?;
             return Ok(());
         };
 
@@ -27243,6 +27565,50 @@ impl CrudStore {
         owner_id: &str,
         cancellation_actor_id: Option<String>,
     ) -> Result<()> {
+        self.materialize_native_cancellation_with_generation(
+            event,
+            now_unix,
+            context,
+            preparation,
+            owner_id,
+            cancellation_actor_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn materialize_native_cancellation_owned_at_generation(
+        &self,
+        event: CanonicalTurnEventPayload,
+        now_unix: i64,
+        context: NativeCancellationContext,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        owner_id: &str,
+        cancellation_actor_id: Option<String>,
+        expected_generation: u64,
+    ) -> Result<()> {
+        self.materialize_native_cancellation_with_generation(
+            event,
+            now_unix,
+            context,
+            preparation,
+            owner_id,
+            cancellation_actor_id,
+            Some(expected_generation),
+        )
+        .await
+    }
+
+    async fn materialize_native_cancellation_with_generation(
+        &self,
+        event: CanonicalTurnEventPayload,
+        now_unix: i64,
+        context: NativeCancellationContext,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        owner_id: &str,
+        cancellation_actor_id: Option<String>,
+        expected_generation: Option<u64>,
+    ) -> Result<()> {
         anyhow::ensure!(
             matches!(&event, CanonicalTurnEventPayload::TurnFailed(n)
             if n.turn.status == pioneer_protocol::TurnStatus::Interrupted
@@ -27273,19 +27639,28 @@ impl CrudStore {
         let effects = native_terminal_effect_outbox::prepare_input(preparation)?;
         let revalidation =
             repositories::native_cancellation_context::prepare_revalidation(&context, owner_id);
-        self.materialize_turn_event_with_projection_context_and_owner(
+        let generation_guard = expected_generation.map(|generation| -> Result<_> {
+            Ok(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT 1 FROM turn_execution WHERE turn_id = ? AND owner_id = ? AND owner_generation = ?",
+                [context.preparation.turn_id.clone().into(), owner_id.to_owned().into(), i64::try_from(generation)?.into()],
+            ))
+        }).transpose()?;
+        self.materialize_turn_event_with_projection_context_and_guard(
             event,
             now_unix,
             TurnEventProjectionContext {
                 item_started_deadlines: None,
                 enqueue_optional_deliveries: true,
                 cancellation_actor_id,
+                unactivated_terminal: None,
                 native_cancellation: Some(PreparedNativeCancellation {
                     revalidation,
                     effects,
                 }),
             },
             Some(owner_id),
+            generation_guard,
         )
         .await
     }
@@ -29994,6 +30369,7 @@ impl CrudStore {
             item_started_deadlines,
             enqueue_optional_deliveries: false,
             native_cancellation: None,
+            unactivated_terminal: None,
             cancellation_actor_id: None,
         };
         self.materialize_turn_event_with_projection_context(
@@ -30059,8 +30435,139 @@ impl CrudStore {
                 enqueue_optional_deliveries: true,
                 cancellation_actor_id,
                 native_cancellation: None,
+                unactivated_terminal: None,
             },
             Some(execution_owner_id),
+        )
+        .await
+    }
+
+    /// Accepted-but-unactivated cancellation uses the same canonical event
+    /// pipeline. The writer revalidates ownership/generation and activation
+    /// evidence atomically with acceptance; no synthetic native context exists.
+    pub async fn materialize_unactivated_turn_cancellation_owned_as(
+        &self,
+        event: CanonicalTurnEventPayload,
+        event_timestamp_secs: i64,
+        expected: TurnExecutionRecord,
+        execution_owner_id: &str,
+        cancellation_actor_id: Option<String>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(&event, CanonicalTurnEventPayload::TurnFailed(n)
+            if n.turn.status == TurnStatus::Interrupted && n.turn.id == expected.turn_id
+                && n.thread_id == expected.thread_id && n.workspace_id == expected.workspace_id)
+                && expected.owner_id == execution_owner_id,
+            "unactivated cancellation differs from its accepted execution"
+        );
+        self.materialize_turn_event_with_projection_context_and_owner(
+            event,
+            event_timestamp_secs,
+            TurnEventProjectionContext {
+                enqueue_optional_deliveries: true,
+                cancellation_actor_id,
+                unactivated_terminal: Some(expected),
+                ..Default::default()
+            },
+            Some(execution_owner_id),
+        )
+        .await
+    }
+
+    /// Continue an early Stop after the initial CLI attempt won admission.
+    /// The caller holds the existing CLI transition gate through cleanup.
+    pub async fn materialize_cli_runtime_cancellation_owned_as(
+        &self,
+        notification: pioneer_protocol::TurnFailedNotification,
+        expected: &TurnExecutionRecord,
+        source: &CliRuntimeTurnTerminalGuard,
+        cancellation_actor_id: Option<String>,
+        now_unix: i64,
+    ) -> Result<()> {
+        let attempt = source
+            .attempt
+            .as_ref()
+            .context("CLI cancellation attempt is missing")?;
+        anyhow::ensure!(
+            expected.executor_kind == TurnExecutorKind::CliRuntime
+                && source.turn_status == TurnStatus::InProgress
+                && attempt.status.is_active()
+                && attempt.turn_id == expected.turn_id
+                && attempt.runtime_id == source.binding.runtime_id
+                && attempt.runtime_kind == source.binding.runtime_kind
+                && notification.turn.status == TurnStatus::Interrupted
+                && notification.turn.id == expected.turn_id
+                && notification.thread_id == expected.thread_id
+                && notification.workspace_id == expected.workspace_id
+                && source.binding.turn_id == expected.turn_id
+                && source.binding.thread_id == expected.thread_id
+                && source.binding.workspace_id == expected.workspace_id
+                && source.execution_owner.as_ref()
+                    == Some(&(expected.owner_id.clone(), expected.owner_generation)),
+            UnactivatedTurnPhaseChanged
+        );
+        // The canonical append pipeline accepts a Statement guard, evaluated
+        // inside its writer transaction. A prior repository read cannot fence
+        // an ownership transfer between gate acquisition and canonical append.
+        let guard = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT 1 FROM turn_execution e JOIN turn_cli_runtime_binding b ON b.turn_id = e.turn_id JOIN turn_cli_runtime_attempt a ON a.turn_id = e.turn_id WHERE e.turn_id = ? AND e.owner_id = ? AND e.owner_generation = ? AND e.thread_id = ? AND e.workspace_id = ? AND b.runtime_id = ? AND b.continuation_thread_id = ? AND a.id = ? AND a.status = ?",
+            [
+                expected.turn_id.clone().into(),
+                expected.owner_id.clone().into(),
+                i64::try_from(expected.owner_generation)?.into(),
+                expected.thread_id.clone().into(),
+                expected.workspace_id.clone().into(),
+                source.binding.runtime_id.clone().into(),
+                source.binding.continuation_thread_id.clone().into(),
+                attempt.id.clone().into(),
+                attempt.status.as_str().into(),
+            ],
+        );
+        self.materialize_turn_event_with_projection_context_and_guard(
+            CanonicalTurnEventPayload::TurnFailed(notification),
+            now_unix,
+            TurnEventProjectionContext {
+                enqueue_optional_deliveries: true,
+                cancellation_actor_id,
+                ..Default::default()
+            },
+            Some(&expected.owner_id),
+            Some(guard),
+        )
+        .await
+    }
+
+    /// Definitive pre-activation refusals use the canonical terminal pipeline
+    /// and the same owner/generation/activation fence as early cancellation.
+    pub async fn materialize_unactivated_turn_refusal_owned(
+        &self,
+        event: CanonicalTurnEventPayload,
+        event_timestamp_secs: i64,
+        expected: TurnExecutionRecord,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(&event,
+            CanonicalTurnEventPayload::TurnFailed(n) if n.turn.status == TurnStatus::Failed)
+                || matches!(&event, CanonicalTurnEventPayload::TurnBlocked(n) if n.turn.status == TurnStatus::Blocked),
+            "unactivated refusal requires a Failed or Blocked event"
+        );
+        anyhow::ensure!(
+            event.turn_id() == expected.turn_id
+                && event.thread_id() == expected.thread_id
+                && event.workspace_id() == expected.workspace_id,
+            "unactivated refusal differs from its execution scope"
+        );
+        let owner_id = expected.owner_id.clone();
+        self.materialize_turn_event_with_projection_context_and_owner(
+            event,
+            event_timestamp_secs,
+            TurnEventProjectionContext {
+                enqueue_optional_deliveries: true,
+                unactivated_terminal: Some(expected),
+                ..Default::default()
+            },
+            Some(&owner_id),
         )
         .await
     }
@@ -30081,6 +30588,7 @@ impl CrudStore {
                 enqueue_optional_deliveries: true,
                 cancellation_actor_id: None,
                 native_cancellation: None,
+                unactivated_terminal: None,
             },
             generate_id(DB_ID_LEN),
             unix_to_datetime(timestamp + 60),
@@ -30108,6 +30616,7 @@ impl CrudStore {
                 item_started_deadlines: None,
                 enqueue_optional_deliveries: true,
                 native_cancellation: None,
+                unactivated_terminal: None,
                 cancellation_actor_id: None,
             },
             generate_id(DB_ID_LEN),
@@ -30131,6 +30640,7 @@ impl CrudStore {
             item_started_deadlines,
             enqueue_optional_deliveries: true,
             native_cancellation: None,
+            unactivated_terminal: None,
             cancellation_actor_id: None,
         };
         self.materialize_turn_event_with_projection_context_and_owner(
@@ -30926,6 +31436,42 @@ impl CrudStore {
             );
         }
 
+        if let Some(expected) = projection_context.unactivated_terminal.as_ref()
+            && !turn_event::prepared_event_already_exists(&transaction, &event).await?
+        {
+            let current = turn_execution::find(&transaction, &expected.turn_id)
+                .await?
+                .context("unactivated terminal execution disappeared")?;
+            anyhow::ensure!(
+                current.owner_id == expected.owner_id
+                    && current.owner_generation == expected.owner_generation
+                    && current.thread_id == expected.thread_id
+                    && current.workspace_id == expected.workspace_id
+                    && matches!(
+                        current.status,
+                        TurnExecutionStatus::Starting
+                            | TurnExecutionStatus::Queued
+                            | TurnExecutionStatus::Running
+                    )
+                    && (current.started_at.is_none()
+                        || current.status == TurnExecutionStatus::Starting)
+                    && !repositories::native_cancellation_context::is_registered(
+                        &transaction,
+                        &expected.turn_id
+                    )
+                    .await?
+                    && cli_runtime_binding::latest_turn_attempt(&transaction, &expected.turn_id)
+                        .await?
+                        .is_none()
+                    && !turn_event_projection_stream_state::has_accepted_terminal(
+                        &transaction,
+                        &expected.turn_id
+                    )
+                    .await?,
+                UnactivatedTurnPhaseChanged
+            );
+        }
+
         let cancellation_turn_id = if let Some(cancellation) = native_cancellation {
             if !turn_event::prepared_event_already_exists(&transaction, &event).await? {
                 repositories::native_cancellation_context::revalidate(
@@ -31034,6 +31580,42 @@ impl CrudStore {
             return Err(error);
         }
         turn_event_projection_stream_state::accept_terminal(&transaction, &appended_event).await?;
+        if let Some(expected) = projection_context.unactivated_terminal.as_ref() {
+            let status = terminal_turn_execution_status_for_event(&appended_event.payload)
+                .context("unactivated terminal event has no terminal execution status")?;
+            let graph_status = match status {
+                TurnExecutionStatus::Interrupted => "cancelled",
+                TurnExecutionStatus::Blocked => "blocked",
+                TurnExecutionStatus::Failed => "failed",
+                _ => bail!("unsupported unactivated terminal event"),
+            };
+            turn_execution::mark_terminal(&transaction, &expected.turn_id, status, created_at)
+                .await?;
+            if let Some(response) = crate::repositories::agent_domain::load_agent_turn_response(
+                &transaction,
+                &expected.turn_id,
+            )
+            .await?
+            {
+                let execution = crate::repositories::agent_domain::load_agent_execution(
+                    &transaction,
+                    &response.execution_id,
+                )
+                .await?
+                .context("unactivated cancellation response execution disappeared")?;
+                // True Task occurrences retain their own candidate/run cleanup.
+                if execution.parent_task_id.is_none() {
+                    crate::repositories::agent_domain::finalize_agent_execution(
+                        &transaction,
+                        &response.execution_id,
+                        graph_status,
+                        created_at,
+                    )
+                    .await?;
+                }
+            }
+        }
+
         if let Err(error) = turn_event_delivery::insert_pending_for_event(
             &transaction,
             &appended_event,
@@ -32547,6 +33129,9 @@ impl CrudStore {
                 return Ok(Vec::new());
             }
 
+            if task_repository::finish_requested(&transaction, &trigger.task_id).await? {
+                return Ok(Vec::new());
+            }
             let appended_events = self
                 .append_task_events_in_connection(&transaction, events, now)
                 .await?;
@@ -32869,6 +33454,25 @@ impl CrudStore {
             } else {
                 event
             };
+            let needs_open_task = match event.payload() {
+                TaskEventPayload::RunCreated { .. }
+                | TaskEventPayload::RunRetryScheduled { .. }
+                | TaskEventPayload::TaskQueued { .. }
+                | TaskEventPayload::TriggerCreated { .. }
+                | TaskEventPayload::TaskUpdated { .. }
+                | TaskEventPayload::TaskResumed { .. }
+                | TaskEventPayload::TaskPaused { .. } => true,
+                TaskEventPayload::TaskDetached { task, .. } => task.finish_request().is_none(),
+                TaskEventPayload::TaskRescheduled { trigger, .. } => {
+                    trigger.status != TaskTriggerStatus::Cancelled
+                }
+                _ => false,
+            };
+            if needs_open_task
+                && task_repository::finish_requested(db, event.payload().task_id()).await?
+            {
+                anyhow::bail!("task_finish_requested: task cannot admit new work or be reopened");
+            }
             // Only state-independent work (validation, serialization and CPU
             // projection preparation) is performed before writer admission.
             // Database-dependent preparation is deliberately sequential here:
@@ -33512,6 +34116,7 @@ fn task_trigger_from_db_model(model: pioneer_entity::task_trigger::Model) -> Res
     );
 
     Ok(TaskTrigger {
+        webhook_secret_ref: model.webhook_secret_ref,
         id: model.id,
         task_id: model.task_id,
         status,
@@ -33530,6 +34135,7 @@ fn task_run_from_db_model(model: pioneer_entity::task_run::Model) -> Result<Task
         .with_context(|| format!("unknown task run executor kind `{}`", model.executor_kind))?;
 
     Ok(TaskRun {
+        trigger_input: optional_typed_json_from_db(model.trigger_input_json)?,
         id: model.id,
         task_id: model.task_id,
         trigger_id: model.trigger_id,
@@ -34581,6 +35187,9 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    mod saved_history_read;
+    mod task_webhook;
+    mod thread_read_pages;
     mod unread_start;
     use crate::{
         NewThreadEpisodicExclusionRecord, PROJECTION_META_STATUS_PENDING,
@@ -34697,7 +35306,7 @@ mod tests {
         ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait,
         QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, Statement, TransactionTrait,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -34812,7 +35421,8 @@ mod tests {
 
     // Some rollback guards exercise today's projector on a deliberately older
     // migration prefix. Add only its unrelated inbox runtime dependencies, not
-    // migration records or historical grants. Pure upgrade fixtures must not
+    // migration records or historical grants. Webhook input columns are also
+    // required by today's task entities. Pure upgrade fixtures must not
     // call this helper: they retain the exact historical schema under test.
     async fn add_inbox_runtime_fields_to_legacy_projector_fixture(store: &CrudStore) {
         use migration::{ColumnDef, SchemaManager, Table};
@@ -34833,6 +35443,22 @@ mod tests {
                 )
                 .await
                 .unwrap();
+        }
+        for (table, column) in [
+            ("task_trigger", "webhook_secret_ref"),
+            ("task_run", "trigger_input_json"),
+        ] {
+            if !schema.has_column(table, column).await.unwrap() {
+                schema
+                    .alter_table(
+                        Table::alter()
+                            .table(Alias::new(table))
+                            .add_column(ColumnDef::new(Alias::new(column)).text().null())
+                            .to_owned(),
+                    )
+                    .await
+                    .unwrap();
+            }
         }
         schema
             .alter_table(
@@ -46515,6 +47141,7 @@ mod tests {
                     "city".to_owned(),
                     TaskValue::String("Berlin".to_owned()),
                 )]))),
+                finish_request: None,
                 composer_work: None,
             }),
             result: None,
@@ -46528,6 +47155,7 @@ mod tests {
 
     fn sample_task_trigger(timestamp: i64) -> TaskTrigger {
         TaskTrigger {
+            webhook_secret_ref: None,
             id: "trg_00000000000000001".to_owned(),
             task_id: "task_0000000000000001".to_owned(),
             status: TaskTriggerStatus::Active,
@@ -46545,6 +47173,7 @@ mod tests {
 
     fn sample_task_run(timestamp: i64) -> TaskRun {
         TaskRun {
+            trigger_input: None,
             id: "run_00000000000000001".to_owned(),
             task_id: "task_0000000000000001".to_owned(),
             trigger_id: Some("trg_00000000000000001".to_owned()),
@@ -46736,8 +47365,22 @@ mod tests {
         .unwrap();
         assert_eq!(
             counter.load(Ordering::Relaxed),
-            1,
-            "one reader SELECT for the whole batch"
+            2,
+            "thin discovery and one bounded scope SELECT"
+        );
+        let filtered = list_running_task_scopes(
+            &store.connection,
+            "ws_task",
+            &["missing-thread".into()],
+            &principal,
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(filtered.scopes.is_empty());
+        assert_eq!(
+            filtered.after_task_id, page.after_task_id,
+            "discovery must progress even when every scope is filtered"
         );
         assert_eq!(page.scopes.len(), 1);
         assert_eq!(
@@ -49560,6 +50203,7 @@ mod tests {
             item_started_deadlines: None,
             enqueue_optional_deliveries: true,
             native_cancellation: None,
+            unactivated_terminal: None,
             cancellation_actor_id: Some("P00000000000000000001".into()),
         };
         // Stop the first producer at the real append/projection boundary.
@@ -57969,6 +58613,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_activation_claim_rechecks_lease_after_waiting_for_writer() {
+        use crate::{
+            NewTurnExecution, TurnExecutionStatus, TurnExecutorKind, repositories::turn_execution,
+            utc_now,
+        };
+
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_activation_lease",
+            "thr_activation_lease",
+            "turn_activation_lease",
+        )
+        .await;
+        let now = utc_now();
+        let owner = turn_execution::insert_immutable(
+            &store.connection,
+            NewTurnExecution {
+                turn_id: turn.id.clone(),
+                thread_id: thread.id,
+                workspace_id: thread.workspace_id,
+                executor_kind: TurnExecutorKind::ApiProvider,
+                executor_key: Some("openai".to_owned()),
+                status: TurnExecutionStatus::Starting,
+                owner_id: "activation-owner".to_owned(),
+                lease_until: now + chrono::Duration::seconds(2),
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        let writer = store.connection.begin().await.unwrap();
+        let mut claim = Box::pin(store.claim_unactivated_agent_turn(&owner));
+        // Use the existing queued-future synchronization pattern: first prove
+        // that activation is waiting for the occupied writer with a live lease.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(claim.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(utc_now() < owner.lease_until);
+        // Deliberately retain this fixture's writer across the lease boundary;
+        // the waiter must evaluate time only after that writer is released.
+        tokio::time::sleep(
+            (owner.lease_until - utc_now()).to_std().unwrap_or_default()
+                + std::time::Duration::from_millis(1),
+        )
+        .await;
+        writer.rollback().await.unwrap();
+        assert!(!claim.await.unwrap());
+        let unchanged = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.status, TurnExecutionStatus::Starting);
+        assert_eq!(unchanged.owner_generation, owner.owner_generation);
+        assert!(unchanged.started_at.is_none());
+
+        // An actually renewed lease can be claimed once; a duplicate claim
+        // still cannot reuse the starting receipt.
+        store
+            .heartbeat_turn_executions_owned_by("activation-owner", 2)
+            .await
+            .unwrap();
+        let renewed = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert!(store.claim_unactivated_agent_turn(&renewed).await.unwrap());
+        let activated = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert_eq!(activated.status, TurnExecutionStatus::Starting);
+        assert!(activated.started_at.is_some());
+        assert_eq!(activated.owner_generation, renewed.owner_generation);
+        assert!(!store.claim_unactivated_agent_turn(&renewed).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn turn_execution_security_snapshot_missing_old_row_returns_none() {
         let (store, _thread, turn) = test_store_with_started_turn(
             "ws_security_missing",
@@ -59231,7 +59944,7 @@ mod tests {
             let mut selected = selected.clone();
             async move {
                 store
-                    .attach_latest_thread_turn_snapshots(&mut selected)
+                    .attach_latest_thread_turn_snapshots(&mut selected, &HashMap::new())
                     .await
             }
         });
@@ -59288,7 +60001,7 @@ mod tests {
         reads.events.lock().unwrap().clear();
         tokio::time::timeout(
             Duration::from_secs(5),
-            critical.attach_latest_thread_turn_snapshots(&mut selected),
+            critical.attach_latest_thread_turn_snapshots(&mut selected, &HashMap::new()),
         )
         .await
         .expect("cancelled batch must not leak reader capacity")
@@ -60621,3 +61334,97 @@ pub use repositories::html_preview_retention::HtmlPreviewRetentionProgress;
 pub use repositories::html_preview_retention::archive_result as archive_html_preview_result;
 
 pub use repositories::html_preview_retention::HtmlPreviewArchiveWitness;
+
+pub use repositories::thread_history_read::{
+    SavedHistoryKey, SavedHistoryRow, SavedHistorySnapshot,
+};
+
+impl CrudStore {
+    pub async fn saved_history_snapshot(&self, thread_id: &str) -> Result<SavedHistorySnapshot> {
+        repositories::thread_history_read::snapshot(&self.connection, thread_id).await
+    }
+
+    pub async fn saved_history_page_at_snapshot(
+        &self,
+        thread_id: &str,
+        boundary: Option<&SavedHistoryKey>,
+        before: Option<&SavedHistoryKey>,
+        limit: u64,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<Vec<SavedHistoryRow>> {
+        repositories::thread_history_read::page(
+            &self.connection,
+            thread_id,
+            boundary,
+            before,
+            limit,
+            snapshot,
+        )
+        .await
+    }
+
+    /// Directional metadata-only keyset page within the frozen saved set.
+    pub async fn saved_history_page_direction_at_snapshot(
+        &self,
+        thread_id: &str,
+        boundary: Option<&SavedHistoryKey>,
+        position: Option<&SavedHistoryKey>,
+        inclusive: bool,
+        newer: bool,
+        limit: u64,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<Vec<SavedHistoryRow>> {
+        repositories::thread_history_read::page_direction(
+            &self.connection,
+            thread_id,
+            boundary,
+            position,
+            inclusive,
+            newer,
+            limit,
+            snapshot,
+        )
+        .await
+    }
+
+    pub async fn saved_history_anchor(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: Option<&str>,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<Option<SavedHistoryRow>> {
+        repositories::thread_history_read::anchor(
+            &self.connection,
+            thread_id,
+            turn_id,
+            item_id,
+            snapshot,
+        )
+        .await
+    }
+
+    pub async fn saved_history_revision_at_snapshot(
+        &self,
+        thread_id: &str,
+        boundary: &SavedHistoryKey,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<String> {
+        repositories::thread_history_read::revision(&self.connection, thread_id, boundary, snapshot)
+            .await
+    }
+
+    pub async fn saved_history_input(
+        &self,
+        turn_id: &str,
+        input_id: &str,
+    ) -> Result<Option<UserInput>> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        pioneer_entity::turn_input::Entity::find_by_id(input_id.to_owned())
+            .filter(pioneer_entity::turn_input::Column::TurnId.eq(turn_id))
+            .one(&self.connection)
+            .await?
+            .map(decode_turn_input_model)
+            .transpose()
+    }
+}

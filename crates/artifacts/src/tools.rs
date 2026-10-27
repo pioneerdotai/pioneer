@@ -999,7 +999,7 @@ async fn validate_prepared_source_content_match(
 
 async fn file_fingerprint(path: &Path) -> Result<Option<FileFingerprint>, ToolError> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    pioneer_observability::work::spawn_blocking(move || {
         let mut file = match open_regular_file(path.as_path()) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

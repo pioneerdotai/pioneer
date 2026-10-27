@@ -25,6 +25,7 @@ use tracing::{debug, error, warn};
 const ID_LEN: usize = 21;
 pub const TASK_EXECUTION_LEASE_SECONDS: i64 = 300;
 const TASK_SCHEDULER_MAX_SLEEP_SECONDS: u64 = 60;
+const TASK_FINISH_QUEUE_TASK_LIMIT: u64 = 64;
 
 /// Only schedule calculation failures can quarantine a Task. Storage and
 /// dispatch failures must retain their existing retry/recovery behavior.
@@ -144,6 +145,20 @@ impl TaskScheduler {
 
     pub async fn process_due_once(&self, now: i64) -> TaskRuntimeResult<usize> {
         let _guard = self.process_lock.lock().await;
+        // Recover a stop committed before queue disposal, without waiting for
+        // a retry's old ready_at. One bounded disposal quantum per Task keeps
+        // transactions small; any remaining queue is rediscovered next pass.
+        for task_id in self
+            .store
+            .list_task_finish_queue_candidates(TASK_FINISH_QUEUE_TASK_LIMIT)
+            .await?
+        {
+            let events = self
+                .store
+                .discard_finished_task_queue(&task_id, now)
+                .await?;
+            self.event_bus.publish_many(events).await;
+        }
         self.rebuild_due_queue(now).await?;
         let due = self.store.list_due_active_task_triggers(now).await?;
         let armed = self
@@ -536,6 +551,7 @@ impl TaskScheduler {
         let mut parent_run_id = task_response.runs.last().map(|run| run.id.clone());
         for _fire_at in fire_times {
             let run = TaskRun {
+                trigger_input: None,
                 id: generate_id(ID_LEN),
                 task_id: task_response.task.id.clone(),
                 trigger_id: Some(trigger.id.clone()),
@@ -563,11 +579,19 @@ impl TaskScheduler {
             });
             events.push(TaskEventPayload::RunCreated {
                 run: run.clone(),
-                agent_spec: task_response.agent_specs.last().cloned().map(|mut spec| {
-                    spec.run_id = Some(run.id.clone());
-                    spec.updated_at = now;
-                    spec
-                }),
+                agent_spec: task_response
+                    .agent_specs
+                    .iter()
+                    .rev()
+                    .find(|spec| spec.run_id.is_none())
+                    .or_else(|| task_response.agent_specs.last())
+                    .cloned()
+                    .map(|mut spec| {
+                        spec.id = generate_id(ID_LEN);
+                        spec.run_id = Some(run.id.clone());
+                        spec.updated_at = now;
+                        spec
+                    }),
             });
             parent_run_id = Some(run.id.clone());
             next_run_number = next_run_number
@@ -621,7 +645,12 @@ impl TaskScheduler {
         let created_count = runs.len();
         for run in runs {
             let _ = self
-                .dispatch_run(&self.store, task_response.task.workspace_id.clone(), run)
+                .dispatch_run(
+                    &self.store,
+                    task_response.task.workspace_id.clone(),
+                    run,
+                    None,
+                )
                 .await?;
         }
         Ok(created_count)
@@ -684,6 +713,7 @@ impl TaskScheduler {
             .transpose()?
             .unwrap_or(1);
         let run = TaskRun {
+            trigger_input: None,
             id: generate_id(ID_LEN),
             task_id: task_response.task.id.clone(),
             trigger_id: Some(trigger.id.clone()),
@@ -733,11 +763,19 @@ impl TaskScheduler {
             },
             TaskEventPayload::RunCreated {
                 run: run.clone(),
-                agent_spec: task_response.agent_specs.last().cloned().map(|mut spec| {
-                    spec.run_id = Some(run.id.clone());
-                    spec.updated_at = now;
-                    spec
-                }),
+                agent_spec: task_response
+                    .agent_specs
+                    .iter()
+                    .rev()
+                    .find(|spec| spec.run_id.is_none())
+                    .or_else(|| task_response.agent_specs.last())
+                    .cloned()
+                    .map(|mut spec| {
+                        spec.id = generate_id(ID_LEN);
+                        spec.run_id = Some(run.id.clone());
+                        spec.updated_at = now;
+                        spec
+                    }),
             },
             TaskEventPayload::TaskRescheduled {
                 task_id: task_response.task.id.clone(),
@@ -774,6 +812,14 @@ impl TaskScheduler {
         let Some(task_response) = self.store.get_task(run.task_id.as_str()).await? else {
             return Ok(false);
         };
+        if task_response.task.finish_request().is_some() {
+            let events = self
+                .store
+                .discard_finished_task_queue(&run.task_id, now)
+                .await?;
+            self.event_bus.publish_many(events).await;
+            return Ok(false);
+        }
         if is_terminal_task(task_response.task.status)
             || crate::service::is_terminal_run(run.status)
             || run.retry_of_run_id.is_none()
@@ -798,11 +844,13 @@ impl TaskScheduler {
             anyhow::anyhow!("invalid task occurrence retry transition: {error:?}")
         })?;
         occurrence.run_id = run.id.clone();
-        self.store
-            .upsert_task_occurrence_contract(&occurrence, now)
-            .await?;
-        self.dispatch_run(&self.store, task_response.task.workspace_id, run)
-            .await
+        self.dispatch_run(
+            &self.store,
+            task_response.task.workspace_id,
+            run,
+            Some(occurrence),
+        )
+        .await
     }
 
     async fn process_queued_run(
@@ -813,6 +861,13 @@ impl TaskScheduler {
         let Some(task_response) = store.get_task(run.task_id.as_str()).await? else {
             return Ok(false);
         };
+        if task_response.task.finish_request().is_some() {
+            let events = store
+                .discard_finished_task_queue(&run.task_id, now_timestamp_secs())
+                .await?;
+            self.event_bus.publish_many(events).await;
+            return Ok(false);
+        }
         if is_terminal_task(task_response.task.status)
             || crate::service::is_terminal_run(run.status)
         {
@@ -833,7 +888,7 @@ impl TaskScheduler {
                     run.id
                 )
             })?;
-        self.dispatch_run(store, task_response.task.workspace_id, run)
+        self.dispatch_run(store, task_response.task.workspace_id, run, None)
             .await
     }
 
@@ -848,13 +903,30 @@ impl TaskScheduler {
             .as_ref()
             .map(|policy| usize::try_from(policy.max_parallel_runs.max(1)).unwrap_or(1))
             .unwrap_or(1);
-        let active_without_queued = task_response
+        let Some(candidate) = task_response
             .runs
             .iter()
-            .filter(|run| !crate::service::is_terminal_run(run.status))
-            .filter(|run| run.id != queued_run_id)
+            .find(|run| run.id == queued_run_id)
+        else {
+            return false;
+        };
+        let now = now_timestamp_secs();
+        let occupied = task_response
+            .runs
+            .iter()
+            .filter(|run| {
+                !crate::service::is_terminal_run(run.status) && run.status != TaskRunStatus::Queued
+            })
             .count();
-        active_without_queued < max_parallel_runs
+        let earlier_ready = task_response
+            .runs
+            .iter()
+            .filter(|run| {
+                run.status == TaskRunStatus::Queued && run.run_number < candidate.run_number
+            })
+            .filter(|run| run.ready_at.is_none_or(|ready| ready <= now))
+            .count();
+        occupied.saturating_add(earlier_ready) < max_parallel_runs
     }
 
     async fn dispatch_run(
@@ -862,15 +934,22 @@ impl TaskScheduler {
         store: &Arc<CrudStore>,
         workspace_id: String,
         run: TaskRun,
+        retry_occurrence: Option<pioneer_protocol::TaskOccurrenceContract>,
     ) -> TaskRuntimeResult<bool> {
         let Some(executor) = self.executors.get(run.executor_kind).await else {
             return Ok(false);
         };
         let claimed_at = now_timestamp_secs();
-        let Some((run, claimed_event)) = store
-            .claim_task_run_for_dispatch_with_event(run.id.as_str(), claimed_at)
-            .await?
-        else {
+        let claim = if let Some(occurrence) = retry_occurrence {
+            store
+                .claim_task_retry_for_dispatch_with_event(&run.id, claimed_at, occurrence)
+                .await?
+        } else {
+            store
+                .claim_task_run_for_dispatch_with_event(&run.id, claimed_at)
+                .await?
+        };
+        let Some((run, claimed_event)) = claim else {
             debug!(
                 task_id = %run.task_id,
                 run_id = %run.id,

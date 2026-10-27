@@ -138,18 +138,33 @@ fn open_path(path: &Path) -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn spawn_open_path(path: &Path) -> anyhow::Result<()> {
-    Command::new("open").arg(path).spawn()?;
+    let child = Command::new("open").arg(path).spawn()?;
+    let _observation = pioneer_observability::resources::ChildRegistration::register(
+        Some(child.id()),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+        None,
+    );
     Ok(())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn spawn_open_path(path: &Path) -> anyhow::Result<()> {
-    Command::new("xdg-open").arg(path).spawn()?;
+    let child = Command::new("xdg-open").arg(path).spawn()?;
+    let _observation = pioneer_observability::resources::ChildRegistration::register(
+        Some(child.id()),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+        None,
+    );
     Ok(())
 }
 
 #[cfg(windows)]
 fn spawn_open_path(path: &Path) -> anyhow::Result<()> {
-    Command::new("explorer").arg(path).spawn()?;
+    let child = Command::new("explorer").arg(path).spawn()?;
+    let _observation = pioneer_observability::resources::ChildRegistration::register(
+        Some(child.id()),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+        None,
+    );
     Ok(())
 }

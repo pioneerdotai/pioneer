@@ -15,14 +15,19 @@ use pioneer_tools::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeToolFamily {
     Html,
+    ComputerUse,
     Tasks,
+    Threads,
 }
 
 impl NativeToolFamily {
     pub(crate) fn from_server_id(id: &str) -> Option<Self> {
         match id {
             pioneer_tools::html::HTML_SERVER_ID => Some(Self::Html),
+            #[cfg(feature = "computer-use")]
+            "pioneer-cua-688c5fd62a9f-v1" => Some(Self::ComputerUse),
             "pioneer-task-tools-v1" => Some(Self::Tasks),
+            "pioneer-thread-tools-v1" => Some(Self::Threads),
             _ => None,
         }
     }
@@ -30,14 +35,18 @@ impl NativeToolFamily {
     pub(crate) fn server_id(self) -> &'static str {
         match self {
             Self::Html => pioneer_tools::html::HTML_SERVER_ID,
+            Self::ComputerUse => "pioneer-cua-688c5fd62a9f-v1",
             Self::Tasks => "pioneer-task-tools-v1",
+            Self::Threads => "pioneer-thread-tools-v1",
         }
     }
 
     pub(crate) fn server_name(self) -> &'static str {
         match self {
             Self::Html => pioneer_tools::html::HTML_SERVER_NAME,
+            Self::ComputerUse => "pioneer_cua",
             Self::Tasks => "pioneer_tasks",
+            Self::Threads => "pioneer_threads",
         }
     }
 
@@ -47,9 +56,50 @@ impl NativeToolFamily {
 
     fn catalog(self) -> &'static [ConfiguredToolSpec] {
         static HTML: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
+        #[cfg(feature = "computer-use")]
+        static CUA: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
+        static THREADS: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
         static TASKS: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
         match self {
             Self::Html => HTML.get_or_init(pioneer_tools::html::html_tool_specs),
+            #[cfg(feature = "computer-use")]
+            Self::ComputerUse => CUA.get_or_init(pioneer_tools::computer_use_tool_specs),
+            #[cfg(not(feature = "computer-use"))]
+            Self::ComputerUse => &[],
+            Self::Threads => THREADS.get_or_init(|| {
+                let mut specs = crate::message::thread_read_tools::thread_read_tool_specs();
+                specs.extend(crate::message::thread_search_tools::thread_search_tool_specs());
+                specs.extend(crate::message::thread_tool_results::thread_result_tool_specs());
+                let capabilities = [
+                    pioneer_protocol::AgentToolCapability::ChildStart,
+                    pioneer_protocol::AgentToolCapability::ThreadCreate,
+                    pioneer_protocol::AgentToolCapability::MessageCreate,
+                ]
+                .into_iter()
+                .collect();
+                // Share the protocol definitions without embedding execution
+                // facts in the fixed catalog.
+                let entry = pioneer_protocol::agent_identity_models_catalog_entry();
+                let mut entries = vec![entry];
+                entries.extend(pioneer_protocol::project_agent_model_tool_catalog(
+                    &capabilities,
+                    None,
+                ));
+                entries.push(pioneer_protocol::agent_turn_start_catalog_entry());
+                specs.extend(entries.into_iter().map(|entry| {
+                    ConfiguredToolSpec::new(
+                        ToolSpec::new(
+                            entry.name.as_str(),
+                            entry.description,
+                            entry.parameters,
+                            PayloadKind::Function,
+                        ),
+                        ExecutionClass::Shared,
+                        dynamic_unknown_output_policy(),
+                    )
+                }));
+                specs
+            }),
             Self::Tasks => TASKS.get_or_init(|| {
                 let mut specs = crate::task_tools::task_tool_specs();
                 let options = pioneer_protocol::agent_start_options_catalog_entry();
@@ -68,15 +118,57 @@ impl NativeToolFamily {
         }
     }
 
+    // Creation has two existing workspace-scoped variants. Catalog projection
+    // accepts either; the handler rechecks the exact server-issued option.
+    pub(crate) fn actions(
+        self,
+        name: &str,
+    ) -> Result<Vec<ResourceAction>, pioneer_tools::ToolError> {
+        if self == Self::Threads && name == "thread_create" {
+            Ok(vec![
+                ResourceAction::ThreadCreatePrivate,
+                ResourceAction::ThreadCreateWorkspace,
+            ])
+        } else {
+            self.action(name).map(|action| vec![action])
+        }
+    }
+
     pub(crate) fn action(self, name: &str) -> Result<ResourceAction, pioneer_tools::ToolError> {
         match self {
             Self::Html => Ok(ResourceAction::McpUse),
+            Self::ComputerUse if pioneer_tools::is_computer_use_tool(name) => {
+                Ok(ResourceAction::McpUse)
+            }
+            Self::ComputerUse => Err(pioneer_tools::ToolError::NotFound(
+                "unknown computer-use operation".into(),
+            )),
+            Self::Threads
+                if self.is_thread_reader(name) || name == "threads_identity_models_list" =>
+            {
+                Ok(ResourceAction::ThreadRead)
+            }
+            Self::Threads => match name {
+                "thread_message_send" => Ok(ResourceAction::MessageCreate),
+                "thread_create" => Ok(ResourceAction::ThreadCreateWorkspace),
+                "threads_turn_start" => Ok(ResourceAction::AgentTurnStart),
+                _ => Err(pioneer_tools::ToolError::NotFound(
+                    "unknown threads tool".to_owned(),
+                )),
+            },
             // Reading the already capability-filtered launch catalog is not a
             // child-start mutation. ChildStart belongs to the Agent action
             // envelope, not the Turn execution's resource-action grant.
             Self::Tasks if name == "threads_start_options" => Ok(ResourceAction::ThreadRead),
             Self::Tasks => crate::task_tools::task_tool_resource_action(name),
         }
+    }
+
+    pub(crate) fn is_thread_reader(self, name: &str) -> bool {
+        self == Self::Threads
+            && (crate::message::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(&name)
+                || name == "threads_tools_result_read"
+                || name == "threads_search")
     }
 
     pub(crate) fn timeout_ms(self, name: &str) -> u64 {
@@ -91,6 +183,23 @@ impl NativeToolFamily {
     }
 }
 
+// A frozen binding identifies the immutable schema, not the latest catalog.
+// Keep its description too: exact_definition controls the unprefixed callable.
+fn legacy_html_preview_spec() -> &'static ToolSpec {
+    static LEGACY: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
+    LEGACY.get_or_init(|| {
+        let definition = pioneer_tools::html::legacy_preview_definition();
+        ToolSpec::new(
+            pioneer_tools::html::HTML_PREVIEW,
+            definition["description"]
+                .as_str()
+                .expect("recorded description"),
+            definition["inputSchema"].clone(),
+            PayloadKind::Function,
+        )
+    })
+}
+
 pub(crate) fn exact_definition(tool: &ResolvedMcpTurnTool) -> Option<NativeToolFamily> {
     let family = NativeToolFamily::from_server_id(&tool.server_installation_id)?;
     (tool.server_name == family.server_name()
@@ -99,11 +208,15 @@ pub(crate) fn exact_definition(tool: &ResolvedMcpTurnTool) -> Option<NativeToolF
         && tool.runtime_generation == 1
         && tool.timeout_ms == family.timeout_ms(&tool.raw_tool_name)
         && tool.annotations.is_none()
-        && family.catalog().iter().any(|spec| {
+        && (family.catalog().iter().any(|spec| {
             spec.spec.name == tool.raw_tool_name
                 && spec.spec.parameters == tool.input_schema
                 && tool.description.as_deref() == Some(spec.spec.description.as_str())
-        }))
+        }) || (family == NativeToolFamily::Html
+            && tool.raw_tool_name == pioneer_tools::html::HTML_PREVIEW
+            && legacy_html_preview_spec().parameters == tool.input_schema
+            && tool.description.as_deref()
+                == Some(legacy_html_preview_spec().description.as_str()))))
     .then_some(family)
 }
 
@@ -114,6 +227,14 @@ pub(crate) fn requires_extended_provider_deadline(tool: &ResolvedMcpTurnTool) ->
 pub(crate) fn is_task_operation(tool: &ResolvedMcpTurnTool) -> bool {
     exact_definition(tool) == Some(NativeToolFamily::Tasks)
         && tool.raw_tool_name != "threads_start_options"
+}
+
+/// Domain membership is independent of the frozen transport family. The shared
+/// options tool alone is not evidence of available Threads operations.
+pub(crate) fn is_threads_operation(tool: &ResolvedMcpTurnTool) -> bool {
+    exact_definition(tool).is_some()
+        && tool.raw_tool_name != "threads_start_options"
+        && pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&tool.raw_tool_name.as_str())
 }
 
 pub(crate) fn projection_allowance(
@@ -141,15 +262,28 @@ pub(crate) fn current_identity(
     };
     let family =
         NativeToolFamily::from_server_id(&binding.server_installation_id).ok_or_else(drift)?;
-    let spec = family
+    let mut spec = family
         .catalog()
         .iter()
         .find(|spec| spec.spec.name == binding.raw_tool_name)
         .ok_or_else(drift)?
         .spec
         .clone();
-    let (schema, fingerprint, _) =
+    let (mut schema, mut fingerprint, _) =
         canonical_schema_identity(&spec.parameters).map_err(|_| drift())?;
+    if binding.canonical_schema_fingerprint != fingerprint
+        && family == NativeToolFamily::Html
+        && binding.raw_tool_name == pioneer_tools::html::HTML_PREVIEW
+    {
+        let legacy = legacy_html_preview_spec();
+        let (legacy_schema, legacy_fingerprint, _) =
+            canonical_schema_identity(&legacy.parameters).map_err(|_| drift())?;
+        if binding.canonical_schema_fingerprint == legacy_fingerprint {
+            spec = legacy.clone();
+            schema = legacy_schema;
+            fingerprint = legacy_fingerprint;
+        }
+    }
     if workspace_id.is_empty()
         || binding.server_name != family.server_name()
         || binding.catalog_version != family.server_id()
@@ -207,28 +341,71 @@ pub(crate) async fn materialize_task_tools(
     processor: std::sync::Arc<crate::message::MessageProcessor>,
     context: pioneer_agent::TurnToolContext,
 ) -> Result<Vec<pioneer_tools::ToolExtensionBundle>, String> {
+    materialize_task_tools_internal(processor, context, false)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn materialize_task_tools_with_proof(
+    processor: std::sync::Arc<crate::message::MessageProcessor>,
+    context: pioneer_agent::TurnToolContext,
+) -> anyhow::Result<Vec<pioneer_tools::ToolExtensionBundle>> {
+    materialize_task_tools_internal(processor, context, true).await
+}
+
+async fn materialize_task_tools_internal(
+    processor: std::sync::Arc<crate::message::MessageProcessor>,
+    context: pioneer_agent::TurnToolContext,
+    retain_proof_errors: bool,
+) -> anyhow::Result<Vec<pioneer_tools::ToolExtensionBundle>> {
     use pioneer_agent::TaskToolProvider;
-    let mut actions =
-        crate::message::agent_action_tools::materialize(processor.clone(), context.clone()).await?;
+    let mut actions = if retain_proof_errors {
+        crate::message::agent_action_tools::materialize_with_proof(
+            processor.clone(),
+            context.clone(),
+        )
+        .await?
+    } else {
+        crate::message::agent_action_tools::materialize(processor.clone(), context.clone())
+            .await
+            .map_err(anyhow::Error::msg)?
+    };
     for bundle in &mut actions.bundles {
-        bundle
-            .specs
-            .retain(|spec| spec.spec.name == "threads_start_options");
+        bundle.specs.retain(|spec| {
+            pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&spec.spec.name.as_str())
+        });
         bundle
             .handlers
-            .retain(|(name, _)| name == "threads_start_options");
+            .retain(|(name, _)| pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&name.as_str()));
     }
     let provider =
         crate::task_tools::GatewayTaskToolProvider::for_cli(std::sync::Arc::downgrade(&processor));
-    let tasks = provider
-        .materialize_task_tools(pioneer_agent::TaskTurnContext {
-            workspace_id: context.workspace_id,
-            thread_id: context.thread_id,
-            turn_id: context.turn_id,
-        })
-        .await?;
+    let task_context = pioneer_agent::TaskTurnContext {
+        workspace_id: context.workspace_id,
+        thread_id: context.thread_id,
+        turn_id: context.turn_id,
+    };
+    let tasks = if retain_proof_errors {
+        provider.materialize_cli_task_tools(task_context).await?
+    } else {
+        provider
+            .materialize_task_tools(task_context)
+            .await
+            .map_err(anyhow::Error::msg)?
+    };
     actions.bundles.extend(tasks.bundles);
     Ok(actions.bundles)
+}
+
+pub(crate) fn materialize_thread_tools(
+    processor: std::sync::Arc<crate::message::MessageProcessor>,
+    context: pioneer_agent::TurnToolContext,
+) -> Vec<pioneer_tools::ToolExtensionBundle> {
+    vec![
+        processor.thread_read_tools(context.clone()),
+        processor.thread_search_tools(context.clone()),
+        processor.thread_result_tools(context),
+    ]
 }
 
 #[cfg(test)]
@@ -236,6 +413,22 @@ mod tests {
     use super::*;
     use crate::turn_mcp::{McpSelectionReason, ResolvedMcpTurnProjection};
     use serde_json::json;
+
+    #[test]
+    fn search_is_a_thread_reader_with_a_bounded_page_and_unbounded_query_schema() {
+        let spec = NativeToolFamily::Threads
+            .definitions()
+            .into_iter()
+            .find(|spec| spec.spec.name == "threads_search")
+            .unwrap();
+        assert_eq!(
+            NativeToolFamily::Threads.action("threads_search").unwrap(),
+            ResourceAction::ThreadRead
+        );
+        let properties = &spec.spec.parameters["properties"];
+        assert_eq!(properties["limit"]["maximum"], 100);
+        assert!(properties["query"].get("maxLength").is_none());
+    }
 
     #[test]
     fn every_provider_preserves_native_catalog_with_full_external_allowance() {
@@ -264,15 +457,20 @@ mod tests {
                     capability_id: None,
                 });
             }
-            let definitions = [NativeToolFamily::Html, NativeToolFamily::Tasks]
-                .into_iter()
-                .flat_map(|family| {
-                    family
-                        .definitions()
-                        .into_iter()
-                        .map(move |spec| (family, spec))
-                })
-                .collect::<Vec<_>>();
+            let definitions = [
+                NativeToolFamily::Html,
+                NativeToolFamily::ComputerUse,
+                NativeToolFamily::Tasks,
+                NativeToolFamily::Threads,
+            ]
+            .into_iter()
+            .flat_map(|family| {
+                family
+                    .definitions()
+                    .into_iter()
+                    .map(move |spec| (family, spec))
+            })
+            .collect::<Vec<_>>();
             let native_count = definitions.len();
             let projection = projection.with_native_tools(definitions, limits).unwrap();
             assert!(
@@ -325,7 +523,12 @@ mod tests {
                 opencode.facade_projection(budget).unwrap().tools().len(),
                 external + native_count
             );
-            for family in [NativeToolFamily::Html, NativeToolFamily::Tasks] {
+            for family in [
+                NativeToolFamily::Html,
+                NativeToolFamily::ComputerUse,
+                NativeToolFamily::Tasks,
+                NativeToolFamily::Threads,
+            ] {
                 for definition in family.definitions() {
                     let actual = projection
                         .tools

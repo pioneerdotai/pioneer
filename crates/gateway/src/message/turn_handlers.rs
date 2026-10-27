@@ -824,6 +824,7 @@ pub(super) enum TurnStartSuccessResponse {
         continuation_thread_id: String,
         context_thread_id: String,
         agent_author: pioneer_protocol::TurnAuthorSnapshot,
+        admitted_outcome: Option<Box<crate::thread::TurnStartOutcome>>,
         completion: std::sync::Arc<
             std::sync::Mutex<
                 Option<
@@ -1991,6 +1992,60 @@ impl MessageProcessor {
             };
             let materialized_phase =
                 message_future(scope_current_stage(Stage::ComposerMaterialize, async {
+                    // Capture the native Agent-skill allowance when the Task is
+                    // admitted. The message-only parent owns no runtime pins;
+                    // later executions may only narrow this saved skill set.
+                    let overlay = if !matches!(
+                        launch.execution_backend.as_ref(),
+                        Some(AgentExecutionBackend::CLIAgentRuntime { .. })
+                            | Some(AgentExecutionBackend::ACPAgentRuntime { .. })
+                    ) && self.native_api_provider_supports_agent_skill_overlay(
+                        &thread.workspace_id,
+                        &outcome.materialization.thread.model_provider,
+                    ) {
+                        if execution_admission.uses_scoped_collaboration_policy() {
+                            match self
+                                .load_agent_skill_overlay_for_scoped_turn(
+                                    execution_admission.initiating_principal_id(),
+                                    &thread.workspace_id,
+                                    &turn_id,
+                                )
+                                .await
+                            {
+                                Ok(overlay) => overlay,
+                                Err(error) => {
+                                    self.thread_manager
+                                        .rollback_turn_start(outcome.rollback_context.clone())
+                                        .await;
+                                    self.send_turn_start_failure(
+                                        connection_id,
+                                        request_id.clone(),
+                                        &success_response,
+                                        &thread.id,
+                                        &turn_id,
+                                        TurnStartFailure::unavailable(format!(
+                                            "Agent skill allowance is unavailable: {error:#}"
+                                        )),
+                                    )
+                                    .await;
+                                    return None;
+                                }
+                            }
+                        } else {
+                            self.load_agent_skill_overlay_for_new_native_turn(
+                                &thread.workspace_id,
+                                &turn_id,
+                            )
+                            .await
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let grant_capabilities =
+                        crate::authorization::execution_grant_capabilities_with_agent_skills(
+                            outcome.materialization.capabilities.as_slice(),
+                            overlay.into_iter().map(|entry| entry.skill_id),
+                        );
                     if let Err(message) = self
                         .admit_composite_execution_request(
                             &mut execution_admission,
@@ -2001,7 +2056,7 @@ impl MessageProcessor {
                             outcome.materialization.thread.model_provider.as_str(),
                             outcome.materialization.thread.model.as_str(),
                             &launch,
-                            outcome.materialization.capabilities.as_slice(),
+                            grant_capabilities.as_slice(),
                         )
                         .await
                     {
@@ -2240,6 +2295,7 @@ impl MessageProcessor {
                     metadata: Some(pioneer_protocol::TaskMetadata {
                         labels: vec!["composer".to_owned()],
                         data: None,
+                        finish_request: None,
                         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch.clone())),
                     }),
                 };
@@ -2347,8 +2403,7 @@ impl MessageProcessor {
                             thread.workspace_id.as_str(),
                             identity,
                             profile,
-                            task_model_provider.as_str(),
-                            outcome.materialization.thread.model.as_str(),
+                            &task_execution_context,
                             true,
                             child_skill_ids,
                             task_execution_context
@@ -2498,8 +2553,15 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+            // This only acknowledges Composer admission. Recovery belongs to
+            // successful delivery from its hidden execution thread.
             if !self
-                .complete_turn(thread.id.clone(), launch.turn_id.clone(), None)
+                .complete_turn_with_title_recovery(
+                    thread.id.clone(),
+                    launch.turn_id.clone(),
+                    None,
+                    false,
+                )
                 .await
             {
                 self.mark_turn_blocked(
@@ -2880,6 +2942,7 @@ impl MessageProcessor {
                     security_params.agent_launch.as_ref(),
                     security_params.execution_backend.as_ref(),
                     None,
+                    effective_reasoning_effort.as_deref(),
                 )
                 .await
                 .map_err(|error| {
@@ -3327,12 +3390,13 @@ impl MessageProcessor {
         params: &TurnStartParams,
         outcome: crate::thread::TurnStartOutcome,
         authority: &crate::authorization::ExecutionAuthorizationContext,
-    ) -> Result<PreparedApiProviderTurnStart, String> {
+    ) -> anyhow::Result<PreparedApiProviderTurnStart> {
+        use pioneer_crud::AgentActionOutboxFailure as Failure;
         if !matches!(
             &params.execution_backend,
             Some(pioneer_protocol::AgentExecutionBackend::ApiProvider { .. })
         ) {
-            return Err("committed API child has a non-API execution backend".to_owned());
+            return Err(Failure::InvalidStart.into());
         }
         let effective_reasoning_effort = self
             .resolve_turn_reasoning_effort(
@@ -3343,35 +3407,34 @@ impl MessageProcessor {
                 outcome.materialization.thread.model.as_str(),
                 requested_reasoning_effort(params).as_deref(),
             )
-            .await?;
+            .await
+            .map_err(|_| Failure::PreparationUnavailable)?;
         let skill_catalog = self
             .validate_turn_skill_capabilities(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.materialization.capabilities.as_slice(),
             )
             .await
-            .map_err(|error| error.diagnostic)?;
+            .map_err(|_| Failure::PreparationUnavailable)?;
         let execution_security_snapshot = self
             .crud_store
             .get_turn_execution_security_snapshot(outcome.started_notification.turn.id.as_str())
-            .await
-            .map_err(|error| format!("failed to load committed security snapshot: {error:#}"))?
-            .ok_or_else(|| "committed Agent Turn has no security snapshot".to_owned())?
+            .await?
+            .ok_or(Failure::InvalidStart)?
             .snapshot;
         if execution_security_snapshot.permission_profile
             != outcome.materialization.turn.permission_profile
         {
-            return Err(
-                "committed Agent Turn security snapshot differs from its permission profile"
-                    .to_owned(),
-            );
+            return Err(Failure::InvalidStart.into());
         }
         if authority.workspace_id() != outcome.started_notification.workspace_id {
-            return Err("committed Agent Turn authority differs from its workspace".to_owned());
+            return Err(Failure::InvalidStart.into());
         }
         self.register_execution_lease(outcome.started_notification.turn.id.as_str())
             .await
-            .map_err(|error| format!("failed to register execution lease: {error:#}"))?;
+            .map_err(|error| {
+                super::agent_action_tools::agent_start_proof_error(error, Failure::AuthorityDenied)
+            })?;
 
         self.ensure_hook_runtime_with_run_store().await;
         self.agent_manager
@@ -3379,11 +3442,9 @@ impl MessageProcessor {
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.workspace_id.as_str(),
             )
-            .await
-            .map_err(|error| format!("failed to prepare agent thread runtime: {error}"))?;
+            .await?;
         self.ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
-            .await
-            .map_err(|error| format!("failed to activate durable listener: {error:#}"))?;
+            .await?;
         let prepared_history = self
             .load_prepared_conversation_history_for_workspace(
                 outcome.started_notification.workspace_id.as_str(),
@@ -3391,15 +3452,12 @@ impl MessageProcessor {
                 outcome.started_notification.turn.id.as_str(),
             )
             .await
-            .map_err(|_| {
-                "Conversation history is unavailable; turn preparation paused".to_owned()
-            })?;
+            .context("committed Agent conversation history is unavailable")?;
         let history = prepared_history.messages.clone();
         let workspace_skill_policies = self
             .crud_store
             .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
-            .await
-            .map_err(|error| format!("failed to load workspace skill policies: {error:#}"))?
+            .await?
             .into_iter()
             .map(|record| {
                 (
@@ -3416,16 +3474,14 @@ impl MessageProcessor {
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.materialization.input.as_slice(),
             )
-            .await
-            .map_err(|error| format!("failed to resolve artifact input: {error:#}"))?;
+            .await?;
         let runtime_environment = self
             .create_artifact_output_environment(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
             )
-            .await
-            .map_err(|error| format!("failed to prepare artifact output: {error:#}"))?
+            .await?
             .into_iter()
             .collect::<HashMap<_, _>>();
         let mut agent_skill_overlay = Vec::new();
@@ -3447,11 +3503,10 @@ impl MessageProcessor {
             &mut agent_skill_overlay,
             Some(&prepared_history),
         )
-        .await
-        .map_err(|error| format!("failed to persist child runtime snapshot: {error:#}"))?;
+        .await?;
         let permission_profile = self
             .materialized_turn_permission_profile(&outcome.materialization.turn)
-            .map_err(|error| format!("failed to resolve permission profile: {error:#}"))?;
+            .map_err(|_| Failure::InvalidStart)?;
 
         Ok(PreparedApiProviderTurnStart {
             outcome,
@@ -3499,6 +3554,16 @@ impl MessageProcessor {
         failure: impl Into<TurnStartFailure>,
     ) {
         let failure = failure.into();
+        if matches!(
+            success_response,
+            TurnStartSuccessResponse::DurableAgent { .. }
+        ) && failure.task_failure.is_some()
+        {
+            // This completion is internal to the committed outbox. Preserve the
+            // typed infrastructure cause; public JSON is not an execution proof.
+            success_response.complete_task(Err(anyhow::Error::new(failure.task_failure.unwrap())));
+            return;
+        }
         let (public_error, task_failure) = if success_response.is_task() {
             let (public_error, task_failure) = failure.into_task_failure();
             (public_error, Some(task_failure))
@@ -3618,6 +3683,7 @@ impl MessageProcessor {
     pub(super) async fn prepare_committed_agent_cli_runtime_turn(
         &self,
         params: TurnStartParams,
+        admitted_outcome: crate::thread::TurnStartOutcome,
         runtime_id: String,
         runtime_kind: CLIAgentRuntimeKind,
         permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
@@ -3650,6 +3716,7 @@ impl MessageProcessor {
             continuation_thread_id,
             context_thread_id,
             agent_author,
+            admitted_outcome: Some(Box::new(admitted_outcome)),
             completion: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
         };
         self.turn_start_cli_runtime(
@@ -3856,24 +3923,111 @@ impl MessageProcessor {
             return Ok(definitions);
         }
         let binding = self.agent_action_binding(&params.turn_id).await;
-        for spec in NativeToolFamily::Tasks.definitions() {
-            let action = NativeToolFamily::Tasks.action(&spec.spec.name)?;
+        let permission_cap = match authority {
+            TurnExecutionAuthority::Fresh(admission) => admission.permission_profile_cap(),
+            TurnExecutionAuthority::Durable { context, .. } => context.permission_profile_cap(),
+        };
+        let permission = pioneer_protocol::task_permission_cap_snapshot(permission_cap);
+
+        // Freeze the same passive CUA catalog that native/provider tools use.
+        // Runtime ComputerUse approval still evaluates every complete call.
+        #[cfg(feature = "computer-use")]
+        if permission.effective_policy.computer_use != pioneer_protocol::PermissionBehavior::Deny {
             let allowed = match authority {
                 TurnExecutionAuthority::Fresh(admission) => {
                     admission
-                        .project_root_action(self.crud_store.as_ref(), action)
+                        .project_root_action(
+                            self.crud_store.as_ref(),
+                            crate::authorization::ResourceAction::McpUse,
+                        )
                         .await?
                 }
-                TurnExecutionAuthority::Durable { context, .. } => context.grants_action(action),
+                TurnExecutionAuthority::Durable { context, .. } => {
+                    context.grants_action(crate::authorization::ResourceAction::McpUse)
+                }
             };
+            if allowed {
+                definitions.extend(
+                    NativeToolFamily::ComputerUse
+                        .definitions()
+                        .into_iter()
+                        .filter(|spec| {
+                            (!(permission.effective_policy.allowed_tools_restricted
+                                || !permission.effective_policy.allowed_tools.is_empty())
+                                || permission
+                                    .effective_policy
+                                    .allowed_tools
+                                    .contains(&spec.spec.name))
+                                && !permission
+                                    .effective_policy
+                                    .denied_tools
+                                    .contains(&spec.spec.name)
+                        })
+                        .map(|spec| (NativeToolFamily::ComputerUse, spec)),
+                );
+            }
+        }
+
+        for (family, spec) in [NativeToolFamily::Tasks, NativeToolFamily::Threads]
+            .into_iter()
+            .flat_map(|family| {
+                family
+                    .definitions()
+                    .into_iter()
+                    .map(move |spec| (family, spec))
+            })
+        {
+            let thread_reader = family.is_thread_reader(&spec.spec.name);
+            if pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&spec.spec.name.as_str())
+                && (permission
+                    .effective_policy
+                    .denied_tools
+                    .iter()
+                    .any(|name| name.trim().eq_ignore_ascii_case(&spec.spec.name))
+                    || ((permission.effective_policy.allowed_tools_restricted
+                        || !permission.effective_policy.allowed_tools.is_empty())
+                        && !permission
+                            .effective_policy
+                            .allowed_tools
+                            .iter()
+                            .any(|name| name.trim().eq_ignore_ascii_case(&spec.spec.name))))
+            {
+                continue;
+            }
+            let mut allowed = false;
+            for action in family.actions(&spec.spec.name)? {
+                allowed |= match authority {
+                    TurnExecutionAuthority::Fresh(admission) => {
+                        admission
+                            .project_root_action(self.crud_store.as_ref(), action)
+                            .await?
+                    }
+                    TurnExecutionAuthority::Durable { context, .. } => {
+                        context.grants_action(action)
+                    }
+                };
+            }
             if !allowed {
                 continue;
             }
             if let Some(binding) = binding.as_ref() {
-                let visible = if spec.spec.name == "threads_start_options" {
+                let visible = if thread_reader {
+                    true
+                } else if matches!(
+                    spec.spec.name.as_str(),
+                    "threads_start_options" | "threads_identity_models_list" | "threads_turn_start"
+                ) {
                     binding
                         .capabilities
                         .contains(&pioneer_protocol::AgentToolCapability::ChildStart)
+                } else if spec.spec.name == "thread_create" {
+                    binding
+                        .capabilities
+                        .contains(&pioneer_protocol::AgentToolCapability::ThreadCreate)
+                } else if spec.spec.name == "thread_message_send" {
+                    binding
+                        .capabilities
+                        .contains(&pioneer_protocol::AgentToolCapability::MessageCreate)
                 } else {
                     crate::task_tools::agent_bound_task_tool_visible(
                         &spec.spec.name,
@@ -3884,7 +4038,7 @@ impl MessageProcessor {
                     continue;
                 }
             }
-            definitions.push((NativeToolFamily::Tasks, spec));
+            definitions.push((family, spec));
         }
         Ok(definitions)
     }
@@ -3897,30 +4051,46 @@ impl MessageProcessor {
         codex: &mut Option<crate::cli_runtime::codex_mcp::CodexMcpSessionLaunchProjection>,
         claude: &mut Option<crate::cli_runtime::claude_mcp::ClaudeMcpSessionLaunchProjection>,
         opencode: &mut Option<crate::cli_runtime::opencode_mcp::OpenCodeMcpSessionLaunchProjection>,
+        committed_agent: bool,
     ) -> anyhow::Result<()> {
         use crate::turn_mcp::native_tools::NativeToolFamily;
         // Reconcile the preliminary catalog against the exact admitted identity
         // before freezing it. Registration does not widen Agent capabilities.
         if let Some(projection) = plan.mcp_projection.as_mut()
             && projection.tools.iter().any(|tool| {
-                NativeToolFamily::from_server_id(&tool.server_installation_id)
-                    == Some(NativeToolFamily::Tasks)
+                NativeToolFamily::from_server_id(&tool.server_installation_id).is_some_and(
+                    |family| {
+                        matches!(family, NativeToolFamily::Tasks | NativeToolFamily::Threads)
+                            && !family.is_thread_reader(&tool.raw_tool_name)
+                    },
+                )
             })
         {
-            let permitted = crate::turn_mcp::native_tools::materialize_task_tools(
-                Arc::new(self.clone()),
-                context,
-            )
-            .await
-            .map_err(anyhow::Error::msg)?
+            let permitted = if committed_agent {
+                crate::turn_mcp::native_tools::materialize_task_tools_with_proof(
+                    Arc::new(self.clone()),
+                    context,
+                )
+                .await?
+            } else {
+                crate::turn_mcp::native_tools::materialize_task_tools(
+                    Arc::new(self.clone()),
+                    context,
+                )
+                .await
+                .map_err(anyhow::Error::msg)?
+            }
             .into_iter()
             .flat_map(|bundle| bundle.specs.into_iter().map(|spec| spec.spec.name))
             .collect::<std::collections::HashSet<_>>();
             let previous_hash = projection.manifest_hash.clone();
             projection.tools.retain(|tool| {
-                NativeToolFamily::from_server_id(&tool.server_installation_id)
-                    != Some(NativeToolFamily::Tasks)
-                    || permitted.contains(&tool.raw_tool_name)
+                !NativeToolFamily::from_server_id(&tool.server_installation_id).is_some_and(
+                    |family| {
+                        matches!(family, NativeToolFamily::Tasks | NativeToolFamily::Threads)
+                            && !family.is_thread_reader(&tool.raw_tool_name)
+                    },
+                ) || permitted.contains(&tool.raw_tool_name)
             });
             let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
             let mut limits = crate::turn_mcp::McpProjectionLimits {
@@ -3979,6 +4149,7 @@ impl MessageProcessor {
             plan.skill_install_plans
                 .retain(|plan| !omitted.contains(&plan.skill_id));
         }
+        crate::cli_runtime::skills::reconcile_implicit_threads_skill(plan);
         Ok(())
     }
 
@@ -4015,38 +4186,29 @@ impl MessageProcessor {
                     let injected = self.task_cli_readiness_failure.lock().unwrap().take();
                     injected.map_or(readiness, Err)
                 };
-                readiness
-                    .map_err(|error| {
-                        TurnStartFailure::internal_typed(
-                            pioneer_tasks::TaskStartStage::CliAdmission,
-                            error.context("failed to load CLI runtime readiness snapshot"),
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        TurnStartFailure::internal(format!(
-                            "CLI runtime `{runtime_id}` is absent from the readiness snapshot"
-                        ))
-                        .with_task_reason(pioneer_tasks::TaskStartReason::ReadinessSnapshotMissing)
-                    })?
+                readiness.map_err(|error| {
+                    TurnStartFailure::internal_typed(
+                        pioneer_tasks::TaskStartStage::CliAdmission,
+                        error.context("failed to load CLI runtime readiness snapshot"),
+                    )
+                })?
             };
-            let readiness_summary = readiness_snapshot.summary;
-            let max_input_tokens = readiness_snapshot.models.as_ref().and_then(|snapshot| {
-                let selected_model = params.model.as_deref().unwrap_or(thread.model.as_str());
-                snapshot
-                    .result
-                    .models
-                    .iter()
-                    .find(|model| model.id == selected_model)
-                    .and_then(|model| model.max_input_tokens)
-            });
-            let cached_mcp_readiness = readiness_snapshot.mcp_readiness;
-            if !matches!(readiness_summary.status, RuntimeStatus::Ready) {
-                return Err(TurnStartFailure::invalid_input(format!(
-                    "CLI runtime `{runtime_id}` is not ready: {}",
-                    cli_runtime_unavailable_reason(&readiness_summary.status)
-                ))
-                .with_task_reason(pioneer_tasks::TaskStartReason::RuntimeNotReady));
-            }
+            // Discovery metadata is optional and never grants execution rights.
+            // Admission uses the configured backend and current authorization;
+            // technical MCP evidence is acquired below for this launch.
+            let max_input_tokens = readiness_snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.summary.kind == runtime_kind)
+                .and_then(|snapshot| snapshot.models.as_ref())
+                .and_then(|snapshot| {
+                    let selected_model = params.model.as_deref().unwrap_or(thread.model.as_str());
+                    snapshot
+                        .result
+                        .models
+                        .iter()
+                        .find(|model| model.id == selected_model)
+                        .and_then(|model| model.max_input_tokens)
+                });
 
             let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
             let mut projection_limits = crate::turn_mcp::McpProjectionLimits {
@@ -4136,8 +4298,27 @@ impl MessageProcessor {
                         .iter()
                         .any(crate::turn_mcp::native_tools::is_task_operation)
                 });
+            let include_html = combined_preflight_input
+                .mcp_projection
+                .as_ref()
+                .is_some_and(|projection| {
+                    projection.tools.iter().any(|tool| {
+                        tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID
+                    })
+                });
+            let include_threads = combined_preflight_input
+                .mcp_projection
+                .as_ref()
+                .is_some_and(|projection| {
+                    projection
+                        .tools
+                        .iter()
+                        .any(crate::turn_mcp::native_tools::is_threads_operation)
+                });
             let (skill_install_plans, resolved_skill_bindings) = if attachments.is_empty()
                 && !include_task_orchestration
+                && !include_threads
+                && !include_html
             {
                 (Vec::new(), Vec::new())
             } else {
@@ -4149,6 +4330,8 @@ impl MessageProcessor {
                         attachments,
                         &projected_mcp_availability,
                         include_task_orchestration,
+                        include_threads,
+                        include_html,
                     ),
                 )
                 .await
@@ -4267,6 +4450,32 @@ impl MessageProcessor {
                     || !projection.tools.is_empty()
                     || runtime_kind == CLIAgentRuntimeKind::Claude;
                 if has_mcp_projection {
+                    let proxy_url = self
+                        .prepare_cli_runtime_proxy_url(thread.workspace_id.as_str(), runtime_id)
+                        .await
+                        .map_err(|error| {
+                            TurnStartFailure::internal(format!(
+                                "failed to load CLI runtime proxy configuration: {error:#}"
+                            ))
+                        })?;
+                    let readiness = self
+                        .cli_runtime_mcp_readiness_for_instance(
+                            runtime_config,
+                            readiness_snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.summary.version.as_deref()),
+                            proxy_url.as_deref(),
+                        )
+                        .await;
+                    let runtime_snapshot_current = self
+                        .load_cli_runtime_instances()
+                        .map_err(|error| {
+                            TurnStartFailure::internal(format!(
+                                "failed to revalidate CLI runtime configuration: {error:#}"
+                            ))
+                        })?
+                        .iter()
+                        .any(|current| current == runtime_config);
                     let validation =
                         crate::cli_mcp_client_validation::validate_cli_mcp_client_request_durably(
                             &self.crud_store,
@@ -4280,10 +4489,8 @@ impl MessageProcessor {
                                 target: cli_mcp_client_target(runtime_kind),
                                 has_mcp_projection,
                                 provider_claim_matches,
-                                runtime_snapshot_current: true,
-                                runtime_supports_mcp_tools: readiness_summary
-                                    .capabilities
-                                    .supports_mcp_tools,
+                                runtime_snapshot_current,
+                                runtime_supports_mcp_tools: readiness.supported,
                                 projection_workspace_matches: projection.workspace_id
                                     == thread.workspace_id,
                                 explicit_capabilities_resolved:
@@ -4295,10 +4502,11 @@ impl MessageProcessor {
                         )
                         .await;
                     if let Err(rejection) = validation {
-                        let diagnostic = readiness_summary
-                            .diagnostics
-                            .iter()
-                            .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
+                        let diagnostic = readiness.diagnostics.iter().find(|diagnostic| {
+                            !readiness.supported
+                                && diagnostic.code.starts_with("cli_runtime.mcp.")
+                                && diagnostic.code != "cli_runtime.mcp.ready"
+                        });
                         let code = diagnostic
                             .map(|diagnostic| diagnostic.code.as_str())
                             .unwrap_or_else(|| rejection.code.as_str());
@@ -4316,11 +4524,6 @@ impl MessageProcessor {
                         );
                         return Err(TurnStartFailure::internal(format!("{code}: {message}")));
                     }
-                    let readiness = cached_mcp_readiness.clone().ok_or_else(|| {
-                        TurnStartFailure::unavailable(
-                            "cli_runtime.mcp.readiness_unavailable: Gateway MCP readiness snapshot is not available",
-                        )
-                    })?;
                     if !readiness.supported {
                         let diagnostic = readiness
                             .diagnostics
@@ -4375,6 +4578,20 @@ impl MessageProcessor {
                     }
                 }
             }
+            if !self
+                .load_cli_runtime_instances()
+                .map_err(|error| {
+                    TurnStartFailure::internal(format!(
+                        "failed to revalidate CLI runtime configuration: {error:#}"
+                    ))
+                })?
+                .iter()
+                .any(|current| current == runtime_config)
+            {
+                return Err(TurnStartFailure::invalid_input(
+                    "CLI runtime configuration changed during preparation; submit again",
+                ));
+            }
             Ok(PreparedCliRuntimeCombinedPreflight {
                 plan,
                 codex_mcp_launch_projection,
@@ -4419,13 +4636,6 @@ impl MessageProcessor {
                     crate::authorization::ExecutionAdmissionEntryPoint::AgentTurnStart
                 }
             };
-            let already_materialized = matches!(
-                &success_response,
-                TurnStartSuccessResponse::Task {
-                    admitted_outcome: Some(_),
-                    ..
-                }
-            );
             let response_turn_id = params.turn_id.clone();
             pioneer_observability::turn_startup::set_runtime(
                 &response_turn_id,
@@ -4451,6 +4661,26 @@ impl MessageProcessor {
                     .await;
                 }};
             }
+
+            if matches!(
+                &success_response,
+                TurnStartSuccessResponse::DurableAgent {
+                    admitted_outcome: None,
+                    ..
+                }
+            ) {
+                send_turn_start_failure!(TurnStartFailure::internal(
+                    "committed Agent CLI preparation requires its admitted outcome",
+                ));
+                return;
+            }
+            let already_materialized = matches!(
+                &success_response,
+                TurnStartSuccessResponse::Task {
+                    admitted_outcome: Some(_),
+                    ..
+                } | TurnStartSuccessResponse::DurableAgent { .. }
+            );
 
             let authority_matches_response = matches!(
                 (&success_response, &execution_authority),
@@ -4744,6 +4974,10 @@ impl MessageProcessor {
                     }
                 }
             }
+            #[cfg(test)]
+            self.completed_history_preparation_barrier.wait_if_armed(
+                "__cli_before_transition__", &self.cli_history_shutdown,
+            ).await;
             let transition_mutex = self.cli_runtime_session_transition_mutex(&session_key).await;
             let _transition = scope_current_stage(Stage::CliTransitionWait, transition_mutex.lock()).await;
             // Session ownership serializes both provider use and continuity
@@ -5741,7 +5975,8 @@ impl MessageProcessor {
                 }
             };
             let admitted_outcome = match &mut success_response {
-                TurnStartSuccessResponse::Task { admitted_outcome, .. } => admitted_outcome.take(),
+                TurnStartSuccessResponse::Task { admitted_outcome, .. }
+                | TurnStartSuccessResponse::DurableAgent { admitted_outcome, .. } => admitted_outcome.take(),
                 _ => None,
             };
             let outcome_result = if let Some(outcome) = admitted_outcome {
@@ -5990,6 +6225,7 @@ impl MessageProcessor {
                         security_params.agent_launch.as_ref(),
                         security_params.execution_backend.as_ref(),
                         None,
+                        effective_cli_runtime_effort.as_deref(),
                     )
                     .await
                     {
@@ -6017,7 +6253,7 @@ impl MessageProcessor {
                 .as_ref()
                 .map(|prepared| prepared.graph.clone());
             let materialization_result = if already_materialized {
-                // The shared Task admission already committed input, authority,
+                // Canonical admission already committed input, authority,
                 // security and execution atomically before exposing the child.
                 Ok(Ok(None))
             } else {
@@ -6100,10 +6336,23 @@ impl MessageProcessor {
             }
             self.complete_runtime_draft_materialization(execution_authority.source())
                 .await;
+            #[cfg(test)]
+            if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. }) {
+                self.completed_history_preparation_barrier.wait_if_armed(
+                    "__cli_agent_before_lease_proof__", &tokio_util::sync::CancellationToken::new(),
+                ).await;
+            }
             if let Err(error) = self
                 .register_execution_lease(outcome.started_notification.turn.id.as_str())
                 .await
             {
+                if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. })
+                    && super::agent_action_tools::agent_start_has_storage_failure(&error) {
+                    send_turn_start_failure!(TurnStartFailure::internal_typed(
+                        pioneer_tasks::TaskStartStage::CliPreparation, error,
+                    ));
+                    return None;
+                }
                 let message = format!("failed to register execution lease: {error:#}");
                 self.mark_turn_blocked(
                     outcome.started_notification.thread_id.clone(),
@@ -6157,7 +6406,19 @@ impl MessageProcessor {
                     thread_id: outcome.started_notification.thread_id.clone(), turn_id: outcome.started_notification.turn.id.clone(),
                 }, runtime_kind, &mut combined_preflight, &mut codex_mcp_launch_projection,
                 &mut claude_mcp_launch_projection, &mut opencode_mcp_launch_projection,
+                matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. }),
             ).await {
+                #[cfg(test)]
+                self.completed_history_preparation_barrier.wait_if_armed(
+                    "__cli_agent_catalog_proof_failed__", &tokio_util::sync::CancellationToken::new(),
+                ).await;
+                if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. })
+                    && super::agent_action_tools::agent_start_has_storage_failure(&error) {
+                    send_turn_start_failure!(TurnStartFailure::internal_typed(
+                        pioneer_tasks::TaskStartStage::CliPreparation, error,
+                    ));
+                    return None;
+                }
                 let message = format!("failed to finalize native CLI tool projection: {error:#}");
                 self.mark_turn_blocked(outcome.started_notification.thread_id.clone(), outcome.started_notification.turn.id.clone(), message.clone()).await;
                 send_turn_start_failure!(TurnStartFailure::internal(message));
@@ -6620,6 +6881,12 @@ impl MessageProcessor {
                 ));
                 return;
             }
+            #[cfg(test)]
+            if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. }) {
+                self.completed_history_preparation_barrier.wait_if_armed(
+                    "__cli_agent_before_context_proof__", &tokio_util::sync::CancellationToken::new(),
+                ).await;
+            }
             let execution_authorization_context = match self
                 .load_turn_execution_authorization_context(
                     outcome.started_notification.turn.id.as_str(),
@@ -6628,6 +6895,14 @@ impl MessageProcessor {
             {
                 Ok(context) => context,
                 Err(error) => {
+                    if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. })
+                        && super::agent_action_tools::agent_start_has_storage_failure(&error) {
+                        send_turn_start_failure!(TurnStartFailure::internal_typed(
+                            pioneer_tasks::TaskStartStage::CliPreparation, error,
+                        ));
+                        return;
+                    }
+
                     self.mark_turn_blocked(
                         outcome.started_notification.thread_id.clone(),
                         outcome.started_notification.turn.id.clone(),
@@ -6979,6 +7254,9 @@ impl MessageProcessor {
                     return;
                 }
             };
+            #[cfg(test)]
+            self.completed_history_preparation_barrier.wait_if_armed(
+                "__cli_before_initial_binding__", &tokio_util::sync::CancellationToken::new()).await;
             if let Err(error) = self
                 .persist_cli_runtime_input_mapping_if_thread_bound(
                     runtime_id.as_str(),
@@ -7002,6 +7280,9 @@ impl MessageProcessor {
                 ));
                 return;
             }
+            #[cfg(test)]
+            self.completed_history_preparation_barrier.wait_if_armed(
+                "__cli_after_initial_binding__", &tokio_util::sync::CancellationToken::new()).await;
             // Sent mapping is now the durable root; provider awaits need no temporary pin.
             drop(cli_basis_hold);
             let native_turn_input = match serde_json::to_value(&input_mapping.input) {
@@ -7140,6 +7421,7 @@ impl MessageProcessor {
             self.retain_cli_runtime_session_turn_lease(
                 pioneer_turn_id.as_str(),
                 session_turn_lease,
+                session_handle,
             )
             .await;
             if matches!(
@@ -9080,6 +9362,147 @@ impl MessageProcessor {
         mutexes.entry(key.clone()).or_default().lease.clone()
     }
 
+    pub(crate) fn spawn_cli_runtime_idle_cleanup(
+        &self,
+        scope: &crate::post_startup::PostStartupScope,
+    ) {
+        if self.cli_runtime_manager.is_none() {
+            return;
+        }
+        let processor = self.clone();
+        let cancellation = scope.cancellation();
+        scope.spawn(async move {
+            let period = std::time::Duration::from_secs(60);
+            let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return,
+                    _ = ticks.tick() => {}
+                }
+                // Deliberately outside select: shutdown joins a close already
+                // in progress, including its bridge/generation cleanup.
+                processor
+                    .close_idle_cli_runtime_sessions(&cancellation)
+                    .await;
+            }
+        });
+    }
+
+    pub(super) async fn close_idle_cli_runtime_sessions(
+        &self,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> usize {
+        let Some(manager) = self.cli_runtime_manager.as_ref() else {
+            return 0;
+        };
+        let store = self.crud_store.with_maintenance_access();
+        let mut closed = 0;
+        let mut activity_lookup_failures = 0;
+        let mut close_failures = 0;
+        for instance in manager.idle_codex_sessions().await {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let key = instance.key();
+            // Admission takes this gate before selecting/using a process and
+            // holds it through preparation/start; recovery/terminal effects
+            // share it. Do not take the Turn lease here: ordinary admission
+            // uses try_lock and would mistake cleanup for an active Turn.
+            // Its retained handle plus the durable check protect silent Turns
+            // between transitions. A new admission waits at this gate and then
+            // resolves its continuation through the normal acquisition path.
+            let transition = self.cli_runtime_session_transition_mutex(key).await;
+            let Ok(_transition) = transition.try_lock() else {
+                continue;
+            };
+            // A recovered execution may have no in-memory retained lease.
+            // Starting/running is conservatively busy even if its last event
+            // is old or its native turn ID has not been assigned yet. This is
+            // a bounded read; no DB capacity survives into process I/O.
+            let activity = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => break,
+                result = store.list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+                    workspace_id: Some(key.workspace_id.clone()),
+                    runtime_id: Some(key.runtime_id.clone()),
+                    continuation_thread_id: Some(key.thread_id.clone()),
+                    statuses: vec![
+                        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+                            .to_owned(),
+                        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+                            .to_owned(),
+                    ],
+                    limit: Some(1),
+                    ..Default::default()
+                }) => result,
+            };
+            match activity {
+                Ok(active) if active.is_empty() => {}
+                Ok(_) => continue,
+                Err(_) => {
+                    activity_lookup_failures += 1;
+                    continue;
+                }
+            }
+            // Unbound native activity and outstanding response lanes are also
+            // uncertainty, never evidence of idle. Match the continuation key,
+            // not a hidden execution thread or a native turn ID.
+            let pending_key_matches = |pending: &super::CLIRuntimePendingTurnEventKey| {
+                pending.workspace_id == key.workspace_id
+                    && pending.runtime_id == key.runtime_id
+                    && pending.thread_id == key.thread_id
+            };
+            let pending_events = self
+                .cli_runtime_pending_turn_events
+                .lock()
+                .await
+                .keys()
+                .any(pending_key_matches);
+            if pending_events {
+                continue;
+            }
+            let pending_requests = self
+                .cli_runtime_pending_turn_server_requests
+                .lock()
+                .await
+                .keys()
+                .any(pending_key_matches);
+            if pending_requests {
+                continue;
+            }
+            let response_lanes = self
+                .cli_runtime_machine_requests
+                .lock()
+                .await
+                .by_lane
+                .keys()
+                .any(|lane| lane.instance.key() == key);
+            if response_lanes {
+                continue;
+            }
+            if cancellation.is_cancelled() {
+                break;
+            }
+            match manager.close_idle_codex_session(&instance).await {
+                Ok(true) => closed += 1,
+                Ok(false) => {}
+                Err(_) => close_failures += 1,
+            }
+        }
+        if activity_lookup_failures > 0 {
+            warn!(
+                activity_lookup_failures,
+                "Codex idle cleanup skipped candidates with unknown activity"
+            );
+        }
+        if close_failures > 0 {
+            warn!(close_failures, "failed to close idle Codex sessions");
+        }
+        closed
+    }
+
     // Unlike the retained Turn lease, this gate covers one transition, including
     // its external terminal effects. Recovery of the same Turn uses it too.
     pub(super) async fn cli_runtime_session_transition_mutex(
@@ -9156,11 +9579,12 @@ impl MessageProcessor {
         &self,
         turn_id: &str,
         lease: tokio::sync::OwnedMutexGuard<()>,
+        session: crate::cli_runtime::manager::CLIAgentRuntimeSessionHandle,
     ) {
         self.cli_runtime_session_turn_leases
             .lock()
             .await
-            .insert(turn_id.to_owned(), lease);
+            .insert(turn_id.to_owned(), (lease, session));
     }
 
     pub(crate) async fn release_cli_runtime_session_turn_lease(&self, turn_id: &str) {
@@ -9291,6 +9715,36 @@ impl MessageProcessor {
             artifact_output_root.as_path(),
         );
         Ok(())
+    }
+
+    pub(super) async fn resume_blocked_turn_control(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        recovery_job_id: Option<&str>,
+        now_unix: i64,
+    ) -> anyhow::Result<Option<pioneer_crud::RecoveryJobRecord>> {
+        self.thread_manager
+            .resume_blocked_turn_with_projection(workspace_id, thread_id, turn_id, async {
+                let job = self
+                    .recovery_coordinator
+                    .resume_blocked_turn(thread_id, turn_id, recovery_job_id, now_unix)
+                    .await?;
+                let turn = if job.is_some() {
+                    let (workspace, turn) = self
+                        .crud_store
+                        .get_turn(thread_id, turn_id)
+                        .await?
+                        .context("resumed Turn is missing")?;
+                    anyhow::ensure!(workspace == workspace_id, "resumed Turn workspace changed");
+                    Some(turn)
+                } else {
+                    None
+                };
+                Ok((job, turn))
+            })
+            .await
     }
 
     pub(crate) async fn load_turn_execution_authorization_context(
@@ -9550,6 +10004,9 @@ impl MessageProcessor {
                 result = &mut cancelled => Err(result.err().unwrap_or_else(|| anyhow::anyhow!("CLI history monitor ended unexpectedly"))),
                 _ = &mut deadline => anyhow::bail!("CLI history preparation exceeded the turn deadline"),
                 prepared = async {
+                    let _conversation_lease = self.acquire_composer_history_priority(
+                        &history_store, workspace_id, thread_id, active_turn_id, &self.cli_history_shutdown,
+                    ).await?;
                     let mut prepared = self.capture_running_context_basis_prepared(
                         &history_store, workspace_id, thread_id, active_turn_id, Some(active_turn_id),
                     ).await?;
@@ -9688,6 +10145,7 @@ impl MessageProcessor {
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     Some(accepted),
                     cli_cwd,
+                    None,
                     &mut diagnostic,
                 );
                 tokio::pin!(work);
@@ -10374,6 +10832,21 @@ impl MessageProcessor {
         outcome: &crate::thread::TurnStartOutcome,
         user_message_capability_attachments: &[pioneer_protocol::UserMessageAttachment],
     ) -> bool {
+        // Use the committed/materialized visibility before adding dirty IDs:
+        // hidden execution children are not members of the canonical sidebar.
+        // Their timeline still publishes below; Run lifecycle owns root activity.
+        let sidebar_visible = outcome.materialization.thread.sidebar_visibility
+            == pioneer_protocol::ThreadSidebarVisibility::Visible;
+        if sidebar_visible {
+            self.dirty_push(
+                &outcome.started_notification.workspace_id,
+                Some(&outcome.started_notification.thread_id),
+                None,
+                None,
+                false,
+                None,
+            );
+        }
         // Detached Composer published this lifecycle before Task creation.
         if !outcome
             .materialization
@@ -10405,8 +10878,13 @@ impl MessageProcessor {
             outcome.started_notification_connection_ids.clone(),
         )
         .await;
-        self.notify_thread_tree_changed(outcome.started_notification.workspace_id.clone())
+        if sidebar_visible {
+            self.notify_thread_unread_legacy(
+                &outcome.started_notification.workspace_id,
+                &outcome.started_notification.thread_id,
+            )
             .await;
+        }
 
         // Spawn background title generation on first turn (fire-and-forget) only for user-origin threads.
         if outcome.materialization.thread.name.is_none()
@@ -10582,6 +11060,22 @@ impl MessageProcessor {
             return;
         }
 
+        let cancel_owner = match self.crud_store.get_turn_execution(&turn_id).await {
+            Ok(owner) => owner,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    public_turn_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
+                        format!("failed to read cancellation ownership: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         let cancel_intent_key = (thread_id.clone(), turn_id.clone());
         let reason = self
             .user_turn_cancel_intents
@@ -10674,10 +11168,14 @@ impl MessageProcessor {
                 .await
             {
                 if let Some((workspace_id, turn)) = self
-                    .thread_manager
-                    .turn_get(thread_id.as_str(), turn_id.as_str())
+                    .projected_terminal_cancel_outcome(
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        cancel_owner.as_ref(),
+                    )
                     .await
-                    .filter(|(_, turn)| turn.status != TurnStatus::InProgress)
+                    .ok()
+                    .flatten()
                 {
                     self.release_user_turn_cancel_intent(&cancel_intent_key)
                         .await;
@@ -10755,15 +11253,18 @@ impl MessageProcessor {
             self.release_user_turn_cancel_intent(&cancel_intent_key)
                 .await;
             // Cancellation races with fail-closed admission/runtime paths.
-            // If that path already committed a terminal state, cancellation
-            // has reached its intended durable outcome and is idempotently
-            // successful. Only an absent or still-running Turn is a
-            // persistence failure.
+            // A competing projected terminal outcome can settle this request.
+            // Interrupted still requires the cancellation completion checks;
+            // its provisional memory state alone cannot acknowledge Stop.
             if let Some((workspace_id, turn)) = self
-                .thread_manager
-                .turn_get(thread_id.as_str(), turn_id.as_str())
+                .projected_terminal_cancel_outcome(
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    cancel_owner.as_ref(),
+                )
                 .await
-                .filter(|(_, turn)| turn.status != TurnStatus::InProgress)
+                .ok()
+                .flatten()
             {
                 self.send_turn_cancel_response(
                     connection_id,
@@ -11126,8 +11627,8 @@ impl MessageProcessor {
                     }
                 };
                 let resumed_job = match self
-                    .recovery_coordinator
-                    .resume_blocked_turn(
+                    .resume_blocked_turn_control(
+                        &workspace_id,
                         thread_id.as_str(),
                         turn_id.as_str(),
                         recovery_job_id.as_deref(),
@@ -11795,9 +12296,7 @@ impl MessageProcessor {
                 return None;
             }
         };
-        if runtime_snapshot.summary.kind != runtime_kind
-            || !matches!(runtime_snapshot.summary.status, RuntimeStatus::Ready)
-        {
+        if runtime_snapshot.summary.kind != runtime_kind || !runtime_snapshot.summary.enabled {
             debug!(
                 workspace_id,
                 runtime_id,
@@ -12061,7 +12560,7 @@ fn normalized_reasoning_effort_for_comparison(value: &str) -> String {
     reasoning_effort_comparison_key(value)
 }
 
-fn provider_model_from_runtime_model_for_reasoning_lookup(
+pub(super) fn provider_model_from_runtime_model_for_reasoning_lookup(
     provider_key: &str,
     model: RuntimeModelInfo,
 ) -> ProviderModelInfo {
@@ -12257,20 +12756,6 @@ fn cli_runtime_binding_timestamp() -> sea_orm::entity::prelude::DateTimeWithTime
         .timestamp_opt(now_timestamp_secs(), 0)
         .single()
         .expect("current timestamp should be valid")
-}
-
-fn cli_runtime_unavailable_reason(status: &RuntimeStatus) -> &'static str {
-    match status {
-        RuntimeStatus::Disabled => "runtime is disabled",
-        RuntimeStatus::MissingBinary { .. } => "runtime binary is unavailable",
-        RuntimeStatus::SpawnFailed { .. } => "runtime failed to start",
-        RuntimeStatus::Initializing => "Gateway readiness check is still running",
-        RuntimeStatus::NeedsAuth => "runtime authentication is required",
-        RuntimeStatus::Ready => "runtime is ready",
-        RuntimeStatus::Degraded { .. } => "runtime readiness is degraded",
-        RuntimeStatus::UnsupportedVersion { .. } => "runtime version is unsupported",
-        RuntimeStatus::Error { .. } => "runtime readiness check failed",
-    }
 }
 
 #[cfg(test)]

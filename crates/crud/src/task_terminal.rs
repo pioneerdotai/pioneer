@@ -37,6 +37,24 @@ impl std::fmt::Display for TaskTerminalConflict {
 }
 impl std::error::Error for TaskTerminalConflict {}
 
+#[derive(Debug)]
+struct FinishTerminalRace;
+impl std::fmt::Display for FinishTerminalRace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("finish admission or sibling outcome changed during terminal preparation")
+    }
+}
+impl std::error::Error for FinishTerminalRace {}
+
+#[derive(Debug)]
+struct WebhookProgressTerminalRace;
+impl std::fmt::Display for WebhookProgressTerminalRace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("webhook queue or sibling activity changed during terminal preparation")
+    }
+}
+impl std::error::Error for WebhookProgressTerminalRace {}
+
 fn conflict<T>(reason: &'static str) -> Result<T> {
     Err(TaskTerminalConflict(reason).into())
 }
@@ -52,6 +70,8 @@ struct TerminalState {
     actor: TaskActorContract,
     occurrence: TaskOccurrenceContract,
     execution_fence: Option<(String, Option<i64>)>,
+    finish_first_run: Option<i64>,
+    finish_runs: Option<crate::task_finish::FinishRuns>,
 }
 
 /// Opaque, bounded preparation. It carries the facts read on the reader path;
@@ -105,6 +125,15 @@ pub struct TaskTerminalCommitOutcome {
 
 impl CrudStore {
     pub async fn prepare_task_terminal_transition(
+        &self,
+        terminal: TaskEventPayload,
+    ) -> Result<PreparedTaskTerminalTransition> {
+        // Terminal orchestration is also polled from nested Gateway failure
+        // paths. Keep its database futures out of the caller's future frame.
+        Box::pin(self.prepare_task_terminal_transition_inner(terminal)).await
+    }
+
+    async fn prepare_task_terminal_transition_inner(
         &self,
         terminal: TaskEventPayload,
     ) -> Result<PreparedTaskTerminalTransition> {
@@ -176,6 +205,7 @@ impl CrudStore {
         let suppressed =
             response.task.status.is_terminal() && !response.runs[0].status.is_terminal();
         let retry_scheduled = !suppressed
+            && state.finish_first_run.is_none()
             && matches!(terminal, TaskEventPayload::RunFailed { .. })
             && prepare_retry(
                 &response,
@@ -188,15 +218,22 @@ impl CrudStore {
         let implicit_result = result.is_none();
         let implicit_error = error.is_none();
         if !retry_scheduled && !suppressed {
-            if response
-                .task
-                .lifecycle_policy
+            let finishing = state.finish_first_run.is_some();
+            let finish_ready = state
+                .finish_runs
                 .as_ref()
-                .map(|p| p.completion)
-                .unwrap_or(TaskCompletionBehavior::CompleteOnTerminalRun)
-                == TaskCompletionBehavior::CompleteOnTerminalRun
+                .is_some_and(|runs| runs.active.is_none());
+            if finish_ready
+                || (!finishing
+                    && response
+                        .task
+                        .lifecycle_policy
+                        .as_ref()
+                        .map(|p| p.completion)
+                        .unwrap_or(TaskCompletionBehavior::CompleteOnTerminalRun)
+                        == TaskCompletionBehavior::CompleteOnTerminalRun)
             {
-                events.push(match &terminal {
+                let outcome = match &terminal {
                     TaskEventPayload::RunCompleted {
                         task_id, result, ..
                     } => TaskEventPayload::TaskCompleted {
@@ -226,9 +263,35 @@ impl CrudStore {
                         completed_at: at,
                     },
                     _ => unreachable!(),
-                });
-            } else if let Some(mut trigger) = response.triggers.first().cloned() {
-                trigger.updated_at = at;
+                };
+                // A successful last sibling cannot erase an earlier real
+                // failure, rejection, or cancellation from the draining set.
+                let prior_failure = state
+                    .finish_runs
+                    .as_ref()
+                    .and_then(|runs| runs.outcome.as_ref())
+                    .filter(|run| run.status != "succeeded");
+                events.push(
+                    if finishing
+                        && matches!(terminal, TaskEventPayload::RunCompleted { .. })
+                        && prior_failure.is_some()
+                    {
+                        crate::task_finish::outcome_event(&state.task.id, prior_failure, at)?
+                    } else {
+                        outcome
+                    },
+                );
+            } else if !finishing && let Some(mut trigger) = response.triggers.first().cloned() {
+                // A webhook's trigger facts describe admission, not completion.
+                // Keep them stable while parallel runs independently terminalize;
+                // the refresh event still updates aggregate status on the writer
+                // after the last live sibling ends. All snapshot fences remain.
+                if !matches!(&trigger.spec, pioneer_protocol::TaskTriggerSpec::External {
+                    source, event_type: None, filter: None
+                } if source == "webhook")
+                {
+                    trigger.updated_at = at;
+                }
                 events.push(TaskEventPayload::TaskRescheduled {
                     task_id: response.task.id.clone(),
                     trigger,
@@ -303,8 +366,56 @@ impl CrudStore {
         &self,
         prepared: PreparedTaskTerminalTransition,
     ) -> Result<TaskTerminalCommitOutcome> {
-        self.run_serialized_write(|| self.commit_task_terminal_transition_once(prepared.clone()))
-            .await
+        // Finish reconciliation includes both commit and fresh preparation;
+        // heap-allocate that state machine on ordinary Gateway worker stacks.
+        Box::pin(self.commit_task_terminal_transition_inner(prepared)).await
+    }
+
+    async fn commit_task_terminal_transition_inner(
+        &self,
+        prepared: PreparedTaskTerminalTransition,
+    ) -> Result<TaskTerminalCommitOutcome> {
+        let fence = prepared.state.execution_fence.clone();
+        let terminal = prepared.terminal.clone();
+        let mut prepared = prepared;
+        for _ in 0..16 {
+            match self
+                .run_serialized_write(|| {
+                    self.commit_task_terminal_transition_once(prepared.clone())
+                })
+                .await
+            {
+                Err(error) if error.downcast_ref::<FinishTerminalRace>().is_some() => {
+                    prepared = self
+                        .prepare_task_terminal_transition(terminal.clone())
+                        .await?;
+                    if prepared.state.execution_fence != fence {
+                        return conflict("execution fence changed while reconciling finish");
+                    }
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<WebhookProgressTerminalRace>()
+                        .is_some() =>
+                {
+                    let refreshed = self
+                        .prepare_task_terminal_transition(terminal.clone())
+                        .await?;
+                    // The reader may race again after the rejected writer. Do
+                    // not adopt a changed policy, run/occurrence, resume, actor
+                    // or attempt merely because preparation was repeated.
+                    validate_terminal_policy(&prepared.state, &refreshed.state)?;
+                    if !same_after_webhook_progress(&prepared.state, &refreshed.state) {
+                        return conflict(
+                            "protected terminal facts changed while reloading webhook progress",
+                        );
+                    }
+                    prepared = refreshed;
+                }
+                outcome => return outcome,
+            }
+        }
+        conflict("finish or webhook progress changed repeatedly")
     }
 
     async fn commit_task_terminal_transition_once(
@@ -496,12 +607,99 @@ impl CrudStore {
         }
         task_actor_contract::finalize_task_occurrence(
             db,
-            &prepared.state.run.id,
+            &prepared.state.occurrence.run_id,
             occurrence_status,
             prepared.terminal_reason.clone(),
             at,
         )
         .await
+    }
+
+    pub(crate) async fn settle_finished_retry_in_connection<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        mut prepared: PreparedTaskTerminalTransition,
+    ) -> Result<(Vec<AppendedTaskEvent>, Option<String>)> {
+        let current =
+            load_terminal_state(db, &prepared.state.task.id, &prepared.state.run.id).await?;
+        validate_terminal_policy(&prepared.state, &current)?;
+        if current.finish_first_run.is_none()
+            || !matches!(current.run.status.as_str(), "failed" | "cancelled")
+            || current.run.error_json != prepared.error_json
+            || current.run.result_json != prepared.result_json
+        {
+            return conflict("stopped retry source outcome changed");
+        }
+        let retry = task_run::find_retry_successor(db, &current.run.id)
+            .await?
+            .context("stopped retry successor disappeared")?;
+        if retry.task_id != current.task.id
+            || retry.status != "cancelled"
+            || retry.started_at.is_some()
+        {
+            return conflict("retry successor was not discarded before starting");
+        }
+        let retry = task_run_from_db_model(retry)?;
+        if retry.error.as_ref().map(|e| e.message.as_str())
+            != Some("task finished before this run started")
+        {
+            return conflict("retry successor was cancelled for another reason");
+        }
+        let at = current
+            .run
+            .completed_at
+            .context("failed source has no completion time")?
+            .timestamp();
+        let queued = task_event::find_queued_delivery_for_run(
+            db,
+            &current.run.id,
+            current.occurrence.retry_attempt,
+        )
+        .await?;
+        let mut events = Vec::new();
+        let delivery_id = match (queued, prepared.delivery.take()) {
+            (Some(event), Some(candidate)) => {
+                let persisted = task_delivery::find_delivery_by_key(db, candidate.delivery_key())
+                    .await?
+                    .ok_or(TaskTerminalConflict(
+                        "different stopped retry delivery destination",
+                    ))?;
+                if event.idempotency_key.as_deref()
+                    != Some(format!("delivery:{}:queued", persisted.id).as_str())
+                {
+                    return conflict("stopped retry delivery identity changed");
+                }
+                let persisted = task_delivery::resolve_queue_replay(persisted, candidate).context(
+                    TaskTerminalConflict("different stopped retry delivery facts"),
+                )?;
+                let authority =
+                    crate::task_projector::prepare_task_delivery_authority(db, &persisted).await?;
+                task_actor_contract::validate_delivery_authority_replay(db, &authority).await?;
+                Some(persisted.id)
+            }
+            (None, Some(_)) => {
+                let delivery_events = prepared
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        matches!(event.payload(), TaskEventPayload::DeliveryQueued { .. })
+                    })
+                    .cloned()
+                    .collect();
+                events = self
+                    .append_task_events_in_connection(db, delivery_events, at)
+                    .await?;
+                events.iter().find_map(|event| match &event.payload {
+                    TaskEventPayload::DeliveryQueued { delivery } => Some(delivery.id.clone()),
+                    _ => None,
+                })
+            }
+            (None, None) => None,
+            _ => return conflict("different stopped retry delivery plan"),
+        };
+        self.finalize_task_terminal_in_connection(db, &prepared, at)
+            .await?;
+        Ok((events, delivery_id))
     }
 
     async fn commit_task_terminal_in_connection<C: ConnectionTrait + Sync>(
@@ -515,9 +713,43 @@ impl CrudStore {
         let current =
             load_terminal_state(db, &prepared.state.task.id, &prepared.state.run.id).await?;
         validate_terminal_policy(&prepared.state, &current)?;
+        if prepared.state.finish_first_run != current.finish_first_run
+            || (current.finish_first_run.is_some()
+                && prepared.state.finish_runs != current.finish_runs)
+        {
+            return Err(FinishTerminalRace.into());
+        }
         let run_terminal = task_run_status_from_db(&current.run.status)
             .context("invalid terminal run status")?
             .is_terminal();
+        if run_terminal
+            && current.finish_first_run.is_some()
+            && matches!(current.run.status.as_str(), "failed" | "cancelled")
+            && let Some(retry) = task_run::find_retry_successor(db, &current.run.id).await?
+            && retry.status == "cancelled"
+            && retry.started_at.is_none()
+            && task_run_from_db_model(retry)?
+                .error
+                .as_ref()
+                .map(|e| e.message.as_str())
+                == Some("task finished before this run started")
+        {
+            let completed_at = current
+                .run
+                .completed_at
+                .context("failed source has no completion time")?
+                .timestamp();
+            let (events, delivery_id) = self
+                .settle_finished_retry_in_connection(db, prepared)
+                .await?;
+            return Ok(TaskTerminalCommitOutcome {
+                status: TaskTerminalCommitStatus::Applied,
+                events,
+                completed_at,
+                delivery_id,
+                retry_scheduled: false,
+            });
+        }
         if run_terminal {
             let expected_status = match prepared.terminal {
                 TaskEventPayload::RunCompleted { .. } => "succeeded",
@@ -627,6 +859,11 @@ impl CrudStore {
             });
         }
         if !same_transition_state(&prepared.state, &current) {
+            if same_after_webhook_progress(&prepared.state, &current)
+                && webhook_progress_is_proven(db, &prepared.state, &current).await?
+            {
+                return Err(WebhookProgressTerminalRace.into());
+            }
             return conflict("transition facts changed during preparation");
         }
         let delivery_id = if let Some(delivery) =
@@ -687,6 +924,13 @@ async fn load_terminal_state<C: ConnectionTrait>(
     task_id: &str,
     run_id: &str,
 ) -> Result<TerminalState> {
+    // Capture the queue watermark before mutable aggregate/trigger facts. On
+    // the preparation reader these are separate reads: an admission between
+    // them must still count as queue growth at the final writer comparison.
+    let latest_run_number = task_run::find_latest_numbered_run(db, task_id)
+        .await?
+        .map(|r| r.run_number)
+        .unwrap_or(0);
     let task = task_repository::find_task_by_id(db, task_id)
         .await?
         .context("terminal Task disappeared")?;
@@ -700,10 +944,6 @@ async fn load_terminal_state<C: ConnectionTrait>(
         Some(id) => task_trigger::find_trigger_by_id(db, id).await?,
         None => None,
     };
-    let latest_run_number = task_run::find_latest_numbered_run(db, task_id)
-        .await?
-        .map(|r| r.run_number)
-        .unwrap_or(0);
     let agent_spec = task_agent_spec::find_terminal_agent_spec(db, task_id, run_id).await?;
     let locks = task_write_lock::list_terminal_locks_by_run(db, run_id).await?;
     let actor = task_actor_contract::find_task_actor_contract(db, task_id)
@@ -722,14 +962,25 @@ async fn load_terminal_state<C: ConnectionTrait>(
         }
         None => None,
     };
-    let mut occurrence = task_actor_contract::find_task_occurrence_by_run_id(db, run_id)
-        .await?
-        .context("terminal Task run has no occurrence")?;
+    let mut occurrence = task_actor_contract::task_occurrence_contract_from_model(
+        task_actor_contract::find_terminal_occurrence_row(db, run_id)
+            .await?
+            .context("terminal Task run has no occurrence")?,
+    )?;
     // Progress/finalization are not frozen routing or fencing inputs.
     occurrence.status = TaskOccurrenceStatus::Running;
     occurrence.terminal_reason = None;
     occurrence.queue_position = None;
+    let finish_first_run = task_repository::finish_first_run(db, task_id).await?;
+    let finish_runs = match finish_first_run {
+        Some(first) => {
+            Some(crate::task_finish::finish_runs(db, task_id, first, Some(run_id)).await?)
+        }
+        None => None,
+    };
     Ok(TerminalState {
+        finish_first_run,
+        finish_runs,
         task,
         run,
         trigger,
@@ -770,7 +1021,109 @@ fn same_transition_state(expected: &TerminalState, current: &TerminalState) -> b
     current.run.lock_expires_at = None;
     expected.run.updated_at = current.run.updated_at;
     expected.task.updated_at = current.task.updated_at;
+    if current.finish_first_run.is_some()
+        && task_status_from_db(&expected.task.status).is_some_and(|status| !status.is_terminal())
+        && task_status_from_db(&current.task.status).is_some_and(|status| !status.is_terminal())
+    {
+        // A sibling entering review changes only the task's aggregate activity
+        // label; the exact run, policy and execution fence remain authoritative.
+        expected.task.status = current.task.status.clone();
+    }
     expected == current
+}
+
+/// Permit only webhook queue growth and the sibling activity labels below. The
+/// existing snapshot comparison still owns every other field, including the
+/// source run, frozen spec/occurrence, locks, task revision and attempt fence.
+fn same_after_webhook_progress(expected: &TerminalState, current: &TerminalState) -> bool {
+    let queue_grew = current.latest_run_number > expected.latest_run_number;
+    let sibling_activity =
+        matches!(
+            expected.task.status.as_str(),
+            "queued" | "running" | "waiting_review"
+        ) && matches!(current.task.status.as_str(), "running" | "waiting_review");
+    if current.latest_run_number < expected.latest_run_number
+        || current.finish_first_run != expected.finish_first_run
+        || !(current.task.status == expected.task.status
+            || (queue_grew && current.task.status == "queued")
+            || sibling_activity)
+    {
+        return false;
+    }
+    let (Some(before), Some(after)) = (&expected.trigger, &current.trigger) else {
+        return false;
+    };
+    // Match the exact durable webhook spec without decoding a body or allowing
+    // pause/resume/reschedule/cancellation to masquerade as queue growth.
+    let Ok(pioneer_protocol::TaskTriggerSpec::External {
+        source,
+        event_type: None,
+        filter: None,
+    }) = serde_json::from_str::<pioneer_protocol::TaskTriggerSpec>(&before.spec_json)
+    else {
+        return false;
+    };
+    if source != "webhook"
+        || before.status != "active"
+        || after.status != "active"
+        || before.webhook_secret_ref.is_none()
+        || before.next_fire_at.is_some()
+        || after.next_fire_at.is_some()
+        || after.last_fire_at.is_none()
+        || after.last_fire_at < before.last_fire_at
+        || after.updated_at < before.updated_at
+    {
+        return false;
+    }
+    let mut normalized = expected.clone();
+    normalized.latest_run_number = current.latest_run_number;
+    normalized.task.status = current.task.status.clone();
+    if queue_grew {
+        let trigger = normalized.trigger.as_mut().expect("checked trigger");
+        trigger.last_fire_at = after.last_fire_at;
+        trigger.updated_at = after.updated_at;
+    }
+    same_transition_state(&normalized, current)
+}
+
+/// These bounded proofs are read in the same writer snapshot as the protected
+/// comparison, before any terminal projection. They do not deserialize bodies.
+async fn webhook_progress_is_proven<C: ConnectionTrait>(
+    db: &C,
+    expected: &TerminalState,
+    current: &TerminalState,
+) -> Result<bool> {
+    let trigger_id = &current
+        .trigger
+        .as_ref()
+        .expect("validated webhook trigger")
+        .id;
+    let queue_grew = current.latest_run_number > expected.latest_run_number;
+    if queue_grew
+        && !task_run::is_webhook_queue_run(
+            db,
+            &current.task.id,
+            trigger_id,
+            &current.run.id,
+            current.latest_run_number,
+        )
+        .await?
+    {
+        return Ok(false);
+    }
+    if current.task.status != expected.task.status
+        && !(queue_grew && current.task.status == "queued")
+    {
+        return task_run::has_webhook_sibling_activity(
+            db,
+            &current.task.id,
+            trigger_id,
+            &current.run.id,
+            &current.task.status,
+        )
+        .await;
+    }
+    Ok(true)
 }
 
 fn terminal_facts(
@@ -878,6 +1231,7 @@ fn prepare_retry(
     let delay_seconds = retry_delay_seconds(policy, next_attempt)?;
     let ready_at = completed_at.saturating_add(delay_seconds);
     let retry_run = TaskRun {
+        trigger_input: failed_run.trigger_input.clone(),
         id: generate_id(ID_LEN),
         task_id: task_response.task.id.clone(),
         trigger_id: failed_run.trigger_id.clone(),
@@ -913,6 +1267,7 @@ fn prepare_retry(
         })
         .cloned()
         .map(|mut spec| {
+            spec.id = generate_id(ID_LEN);
             spec.run_id = Some(retry_run.id.clone());
             spec.updated_at = completed_at;
             spec

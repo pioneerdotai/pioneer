@@ -1175,7 +1175,7 @@ pub(super) async fn owned_fs<T: Send + 'static>(
         bail!("skills watcher stopped");
     }
     // Always join. Selecting cancellation against this join would detach FS work.
-    let result = tokio::task::spawn_blocking(work)
+    let result = pioneer_observability::work::spawn_blocking(work)
         .await
         .context("skills FS job panicked")?;
     result
@@ -1200,6 +1200,7 @@ impl MessageProcessor {
         let handle = tokio::spawn(async move {
             crate::database::attribution::scope_database_workload_result(
                 pioneer_observability::DatabaseWorkload::SkillsWatch,
+                pioneer_observability::DatabaseOperationSite::SkillsWatch,
                 run(this, worker_stop).map(Ok::<_, anyhow::Error>),
             )
             .await
@@ -1700,7 +1701,7 @@ async fn run_with_signals(
     while signals.cleanup_claims() {
         tokio::task::yield_now().await;
     }
-    let _ = tokio::task::spawn_blocking(move || drop(native)).await;
+    let _ = pioneer_observability::work::spawn_blocking(move || drop(native)).await;
     // Cancellation stops after the owned quantum. Exact durable markers let the
     // next worker reclaim staging; shutdown must neither erase an uncertain
     // backup nor recursively drain arbitrarily large garbage before returning.

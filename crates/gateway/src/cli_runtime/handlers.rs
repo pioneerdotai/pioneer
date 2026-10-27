@@ -229,7 +229,7 @@ fn collaborator_safe_runtime_diagnostics(
 }
 
 fn cli_runtime_ready_for_model_discovery(runtime: &RuntimeSummary) -> bool {
-    runtime.enabled && matches!(runtime.status, RuntimeStatus::Ready)
+    runtime.enabled
 }
 
 pub(super) struct CliTaskFinalizationState {
@@ -622,6 +622,29 @@ impl MessageProcessor {
         .await;
     }
 
+    /// Cache-only view shared with identity model discovery. This never probes
+    /// or starts a CLI process; the Gateway readiness owner supplies the data.
+    pub(crate) async fn cli_launch_models_catalog(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> anyhow::Result<Vec<pioneer_protocol::RuntimeModelInfo>> {
+        let snapshot = self
+            .cli_runtime_probe_snapshot(workspace_id, runtime_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("CLI model catalog is unavailable"))?;
+        if !cli_runtime_ready_for_model_discovery(&snapshot.summary) {
+            anyhow::bail!("CLI model catalog is unavailable");
+        }
+        let models = snapshot
+            .models
+            .ok_or_else(|| anyhow::anyhow!("CLI model catalog is unavailable"))?;
+        if models.result.models.is_empty() {
+            anyhow::bail!("CLI model catalog is unavailable");
+        }
+        Ok(models.result.models)
+    }
+
     pub(super) async fn cli_runtime_list_models(
         &self,
         request_context: &RequestContext,
@@ -697,22 +720,27 @@ impl MessageProcessor {
         // Model discovery is part of the Gateway-owned readiness probe. This
         // endpoint must remain a cache read so any number of clients share the
         // same bounded process/network work.
-        let Some(model_snapshot) = runtime_snapshot.models else {
-            self.send_error(
-                connection_id,
-                cli_runtime_discovery_error(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!(
-                        "CLI runtime `{}` model catalog is not ready",
-                        params.runtime_id
-                    ),
-                ),
-            )
-            .await;
-            return;
+        let (mut model_list, refreshed_at_unix_ms) = match runtime_snapshot.models {
+            Some(snapshot) => (snapshot.result, Some(snapshot.refreshed_at_unix_ms)),
+            None => (
+                RuntimeModelListResult {
+                    models: Vec::new(),
+                    diagnostics: vec![RuntimeDiagnostic {
+                        level: RuntimeDiagnosticLevel::Warning,
+                        code: "cli_runtime.model_catalog_unavailable".into(),
+                        message: "No applicable model catalog is available for this runtime".into(),
+                    }],
+                    error_message: None,
+                },
+                None,
+            ),
         };
-        let mut model_list = model_snapshot.result;
+        // An empty catalog with no refresh timestamp explicitly replaces rows
+        // from an invalidated source. A transport error would leave those old
+        // client rows intact. Neither response establishes execution readiness.
+        model_list
+            .diagnostics
+            .extend(runtime_snapshot.summary.diagnostics);
         if Self::uses_collaborator_cli_disclosure(request_context) {
             model_list.diagnostics = collaborator_safe_runtime_diagnostics(model_list.diagnostics);
             if model_list.error_message.is_some() {
@@ -754,7 +782,7 @@ impl MessageProcessor {
                 runtime_id: params.runtime_id,
                 models: model_list.models,
                 diagnostics: model_list.diagnostics,
-                refreshed_at_unix_ms: Some(model_snapshot.refreshed_at_unix_ms),
+                refreshed_at_unix_ms,
             },
         )
         .await;
@@ -3328,11 +3356,8 @@ impl MessageProcessor {
             params: None,
             raw: json!({"id": native_request_id, "method": method}),
         };
-        let responder = CLIAgentRuntimeMachineRequestResponder::new(
-            handle.instance().clone(),
-            native_request_id,
-            handle.session(),
-        );
+        let responder =
+            CLIAgentRuntimeMachineRequestResponder::from_handle(handle.clone(), native_request_id);
         self.register_cli_runtime_machine_request(handle.instance(), &request, responder, opened)
             .await;
         if self
@@ -3422,7 +3447,18 @@ impl MessageProcessor {
             );
         }
         if let Some(receivers) = codex_receivers {
-            self.spawn_codex_event_pumps(instance.clone(), session, receivers, debug_native_events);
+            let idle_retirement = if let Some(manager) = self.cli_runtime_manager.as_ref() {
+                manager.idle_retirement_signal(instance).await
+            } else {
+                None
+            };
+            self.spawn_codex_event_pumps(
+                instance.clone(),
+                session,
+                receivers,
+                debug_native_events,
+                idle_retirement,
+            );
         }
     }
 
@@ -3479,7 +3515,7 @@ impl MessageProcessor {
         hub: std::sync::Weak<ExecutionEventHub>,
         mut durable_receiver: pioneer_runtime_events::DurableEventReceiver,
         mut snapshot_receiver: pioneer_runtime_events::SnapshotEventReceiver,
-        mut live_receiver: tokio::sync::broadcast::Receiver<AgentProgressEvent>,
+        mut live_receiver: pioneer_runtime_events::ProgressEventReceiver,
     ) {
         let processor = self.clone();
         tokio::spawn(async move {
@@ -3501,7 +3537,7 @@ impl MessageProcessor {
                                         .await
                                     {
                                         if AssertUnwindSafe(
-                                            listener_processor.handle_snapshot_agent_event(event),
+                                            snapshot_receiver.pending_work().scope(listener_processor.handle_snapshot_agent_event(event)),
                                         )
                                         .catch_unwind()
                                         .await
@@ -3532,7 +3568,7 @@ impl MessageProcessor {
                                         .await
                                     {
                                         if AssertUnwindSafe(
-                                            listener_processor.handle_progress_agent_event(event),
+                                            live_receiver.pending_work().scope(listener_processor.handle_progress_agent_event(event)),
                                         )
                                         .catch_unwind()
                                         .await
@@ -3581,7 +3617,7 @@ impl MessageProcessor {
                                         .await
                                     {
                                         match AssertUnwindSafe(
-                                            commit_processor.commit_durable_agent_event_with_cli_blocked_guard(event, durable_receiver.cli_blocked_guard().cloned(), durable_receiver.turn_transition().cloned()),
+                                            durable_receiver.pending_work().scope_result(commit_processor.commit_durable_agent_event_with_cli_blocked_guard(event, durable_receiver.cli_blocked_guard().cloned(), durable_receiver.turn_transition().cloned())),
                                         )
                                         .catch_unwind()
                                         .await
@@ -3761,15 +3797,21 @@ impl MessageProcessor {
             let key = instance.key();
             let mut events = receivers.events;
             let runtime_kind = receivers.runtime_kind;
-            while let Some(mut event) = events.recv().await {
+            while let Some(item) = events.recv().await {
+                let (mut event, work) = item.received(
+                    pioneer_observability::work::Boundary::EventLane,
+                    pioneer_observability::work::WorkKind::Event,
+                    pioneer_observability::work::ExecutorRole::Event,
+                );
+                work.scope(async {
                 if !processor.cli_runtime_instance_is_current(&instance).await {
                     processor.audit_stale_cli_runtime_process_activity(&instance, "event");
-                    continue;
+                    return;
                 }
                 if runtime_kind == "opencode" {
                     if let Err(error) = session.enrich_runtime_event(&mut event) {
                         warn!(error = %error, "rejected invalid OpenCode native MCP lifecycle event");
-                        continue;
+                        return;
                     }
                 }
                 if cli_runtime_event_requires_native_journal(&event) {
@@ -3783,6 +3825,8 @@ impl MessageProcessor {
                         .await;
                 }
                 processor.handle_cli_runtime_event(&instance, event).await;
+
+                }).await;
             }
             debug!(
                 workspace_id = key.workspace_id.as_str(),
@@ -3808,6 +3852,7 @@ impl MessageProcessor {
         session: Arc<dyn CLIAgentRuntimeSession>,
         receivers: CLIAgentRuntimeCodexEventReceivers,
         debug_native_events: bool,
+        idle_retirement: Option<tokio_util::sync::CancellationToken>,
     ) {
         let options = RuntimeEventMappingOptions {
             include_redacted_native_payload: debug_native_events,
@@ -3819,43 +3864,51 @@ impl MessageProcessor {
         tokio::spawn(async move {
             let notification_key = notification_instance.key();
             let mut notifications = receivers.notifications;
-            while let Some(notification) = notifications.recv().await {
-                if !notification_processor
-                    .cli_runtime_instance_is_current(&notification_instance)
-                    .await
-                {
-                    notification_processor.audit_stale_cli_runtime_process_activity(
-                        &notification_instance,
-                        "notification",
-                    );
-                    continue;
-                }
-                let mut event = map_codex_notification_event(&notification, options);
-                if let Err(error) = notification_session.enrich_runtime_event(&mut event) {
-                    warn!(
-                        workspace_id = notification_key.workspace_id.as_str(),
-                        runtime_id = notification_key.runtime_id.as_str(),
-                        thread_id = notification_key.thread_id.as_str(),
-                        method = notification.method.as_str(),
-                        error = %format!("{error:#}"),
-                        "rejected invalid Codex native MCP lifecycle event"
-                    );
-                    continue;
-                }
-                if cli_runtime_event_requires_native_journal(&event) {
-                    notification_processor
-                        .persist_codex_native_transport_event(
+            while let Some(item) = notifications.recv().await {
+                let (notification, work) = item.received(
+                    pioneer_observability::work::Boundary::EventLane,
+                    pioneer_observability::work::WorkKind::Event,
+                    pioneer_observability::work::ExecutorRole::Event,
+                );
+                work.scope(async {
+                    if !notification_processor
+                        .cli_runtime_instance_is_current(&notification_instance)
+                        .await
+                    {
+                        notification_processor.audit_stale_cli_runtime_process_activity(
                             &notification_instance,
                             "notification",
-                            notification.method.as_str(),
-                            notification.params.as_ref(),
-                            debug_native_events,
-                        )
+                        );
+                        return;
+                    }
+                    let mut event = map_codex_notification_event(&notification, options);
+                    if let Err(error) = notification_session.enrich_runtime_event(&mut event) {
+                        warn!(
+                            workspace_id = notification_key.workspace_id.as_str(),
+                            runtime_id = notification_key.runtime_id.as_str(),
+                            thread_id = notification_key.thread_id.as_str(),
+                            method = notification.method.as_str(),
+                            error = %format!("{error:#}"),
+                            "rejected invalid Codex native MCP lifecycle event"
+                        );
+                        return;
+                    }
+                    if cli_runtime_event_requires_native_journal(&event) {
+                        notification_processor
+                            .persist_codex_native_transport_event(
+                                &notification_instance,
+                                "notification",
+                                notification.method.as_str(),
+                                notification.params.as_ref(),
+                                debug_native_events,
+                            )
+                            .await;
+                    }
+                    notification_processor
+                        .handle_cli_runtime_timeline_event(&notification_instance, event)
                         .await;
-                }
-                notification_processor
-                    .handle_cli_runtime_timeline_event(&notification_instance, event)
-                    .await;
+                })
+                .await;
             }
             debug!(
                 workspace_id = notification_key.workspace_id.as_str(),
@@ -3882,11 +3935,29 @@ impl MessageProcessor {
             while let Some(request) = server_requests.recv().await {
                 let native_request_id = serde_json::to_value(&request.id)
                     .unwrap_or_else(|_| JsonValue::String(request.id.to_string()));
-                let responder = CLIAgentRuntimeMachineRequestResponder::new(
-                    request_instance.clone(),
-                    native_request_id,
-                    session.clone(),
-                );
+                // Acquire a handle under the manager registry lock before any
+                // await that uses this response lane. A pump itself holds only
+                // the raw session Arc so it never pins an otherwise idle process.
+                let current = if let Some(manager) = request_processor.cli_runtime_manager.as_ref()
+                {
+                    manager
+                        .existing_session(&request_key)
+                        .await
+                        .filter(|handle| handle.instance() == &request_instance)
+                } else {
+                    None
+                };
+                let responder = if let Some(handle) = current {
+                    CLIAgentRuntimeMachineRequestResponder::from_handle(handle, native_request_id)
+                } else {
+                    // Stale requests still receive an origin-bound rejection;
+                    // they must never acquire a replacement generation's pin.
+                    CLIAgentRuntimeMachineRequestResponder::new(
+                        request_instance.clone(),
+                        native_request_id,
+                        session.clone(),
+                    )
+                };
                 if !request_processor
                     .cli_runtime_instance_is_current(&request_instance)
                     .await
@@ -3948,6 +4019,12 @@ impl MessageProcessor {
                 if diagnostic.kind
                     == pioneer_cli_agent_runtime::codex::CodexJsonlRpcClientDiagnosticKind::SessionRecoveryRequired
                 {
+                    // Idle eviction is a deliberate generation close. A late
+                    // diagnostic must not recover a subsequently admitted Turn
+                    // while its replacement process has not been published yet.
+                    if idle_retirement.as_ref().is_some_and(|signal| signal.is_cancelled()) {
+                        continue;
+                    }
                     warn!(
                         workspace_id = diagnostic_key.workspace_id.as_str(),
                         runtime_id = diagnostic_key.runtime_id.as_str(),
@@ -3960,6 +4037,7 @@ impl MessageProcessor {
                         .enqueue_codex_transport_session_recovery(
                             &diagnostic_instance,
                             diagnostic.message.as_str(),
+                            idle_retirement.as_ref(),
                         )
                         .await;
                     continue;
@@ -3991,10 +4069,22 @@ impl MessageProcessor {
         &self,
         instance: &CliSessionInstanceId,
         reason: &str,
+        idle_retirement: Option<&tokio_util::sync::CancellationToken>,
     ) {
-        if let Some(manager) = self.cli_runtime_manager.as_ref()
-            && let Some(current) = manager.existing_session(instance.key()).await
-            && current.instance() != instance
+        // Pin a still-current transport while reading/reporting its activity.
+        // If idle retirement won the registry race, its exact-generation signal
+        // remains available after removal. Ordinary EOF recovery is unchanged.
+        let session_use = if let Some(manager) = self.cli_runtime_manager.as_ref() {
+            manager.existing_session(instance.key()).await
+        } else {
+            None
+        };
+        if idle_retirement.is_some_and(|signal| signal.is_cancelled()) {
+            return;
+        }
+        if session_use
+            .as_ref()
+            .is_some_and(|current| current.instance() != instance)
         {
             self.audit_stale_cli_runtime_process_activity(instance, "transport_recovery");
             return;
@@ -5490,6 +5580,60 @@ impl MessageProcessor {
         event: RuntimeEvent,
         retained: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> bool {
+        if matches!(&event, RuntimeEvent::TurnRetrying(_)) && turn_binding.runtime_kind == "codex" {
+            // Fence native-attempt replacement through the durable ACK, using
+            // the same session transition as admission/recovery/Stop. Do not
+            // transfer ownership to recovery for this informational event.
+            let Ok(Some(selected)) = self
+                .crud_store
+                .cli_runtime_turn_terminal_guard_by_id(&turn_binding.turn_id)
+                .await
+            else {
+                return false;
+            };
+            let transition = match retained {
+                Some(transition) => transition.clone(),
+                None => Arc::new(
+                    self.cli_runtime_session_transition_mutex(instance.key())
+                        .await
+                        .lock_owned()
+                        .await,
+                ),
+            };
+            let Ok(Some(current)) = self
+                .crud_store
+                .cli_runtime_turn_terminal_guard_by_id(&turn_binding.turn_id)
+                .await
+            else {
+                return false;
+            };
+            let Some(attempt) = current.attempt.as_ref() else {
+                return false;
+            };
+            let current_native_turn = current
+                .segment
+                .as_ref()
+                .map(|segment| segment.native_turn_id.as_str())
+                .or(attempt.native_turn_id.as_deref());
+            if !selected.same_execution_after_admission(&current)
+                || current.turn_status != TurnStatus::InProgress
+                || !attempt.status.is_active()
+                || attempt.runtime_kind != "codex"
+                || cli_runtime_native_turn_id_for_event(&event).is_none()
+                || cli_runtime_native_turn_id_for_event(&event) != current_native_turn
+            {
+                return false;
+            }
+            return self
+                .process_bound_cli_runtime_event_inner(
+                    instance,
+                    current.binding,
+                    event,
+                    Some(&transition),
+                    None,
+                )
+                .await;
+        }
         if cli_runtime_turn_status_for_terminal_event(&event).is_none() {
             return self
                 .process_bound_cli_runtime_event_inner(instance, turn_binding, event, None, None)
@@ -6414,6 +6558,10 @@ impl MessageProcessor {
             thread_id: turn_binding.thread_id.clone(),
             turn_id: turn_binding.turn_id.clone(),
             recovery: recovery.clone(),
+            codex_retry_attempt_id: (turn_binding.runtime_kind == "codex"
+                && matches!(&event, RuntimeEvent::TurnRetrying(_)))
+            .then(|| turn_attempt.map(|attempt| attempt.id.clone()))
+            .flatten(),
         };
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {
@@ -7074,6 +7222,7 @@ impl MessageProcessor {
             thread_id: binding.thread_id.clone(),
             turn_id: binding.turn_id.clone(),
             recovery: None,
+            codex_retry_attempt_id: None,
         };
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {
@@ -8930,11 +9079,8 @@ impl MessageProcessor {
         };
         let native_request_id = serde_json::to_value(&request.id)
             .unwrap_or_else(|_| JsonValue::String(request.id.to_string()));
-        let responder = CLIAgentRuntimeMachineRequestResponder::new(
-            handle.instance().clone(),
-            native_request_id,
-            handle.session(),
-        );
+        let responder =
+            CLIAgentRuntimeMachineRequestResponder::from_handle(handle.clone(), native_request_id);
         self.handle_cli_runtime_codex_server_request_with_responder(
             handle.instance(),
             request,
@@ -11253,6 +11399,10 @@ impl MessageProcessor {
                 }
             };
         let native_request_id = cli_runtime_native_request_id_json_from_record(request)?;
+        // The response lane may be removed before the final interrupt/effects.
+        // Keep its exact current generation pinned through the whole operation,
+        // even if the Turn completes concurrently. Never pin a replacement.
+        let mut _codex_request_use = None;
         let response_session = if request.runtime_kind == "codex" {
             let Some(pending) = self
                 .cli_runtime_machine_request(request.request_id.as_str())
@@ -11263,6 +11413,7 @@ impl MessageProcessor {
                     request.request_id
                 );
             };
+            _codex_request_use = Some(pending.responder.clone());
             if pending.responder.native_request_id() != &native_request_id {
                 let _ = self
                     .take_cli_runtime_machine_request(request.request_id.as_str())
@@ -11652,6 +11803,59 @@ impl MessageProcessor {
         }
     }
 
+    /// Technical MCP admission is independent of account/model diagnostics.
+    /// This path rechecks the current executable/cache key and launch contract;
+    /// it never trusts a supported flag from an older readiness snapshot.
+    pub(super) async fn cli_runtime_mcp_readiness_for_instance(
+        &self,
+        instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+        provider_version: Option<&str>,
+        proxy_url: Option<&str>,
+    ) -> pioneer_protocol::CliMcpAdapterReadiness {
+        #[cfg(test)]
+        if let Some(readiness) = self.cli_mcp_readiness_override_for_tests(match instance.kind {
+            GatewayCliAgentRuntimeKindConfig::Codex => CLIAgentRuntimeKind::Codex,
+            GatewayCliAgentRuntimeKindConfig::Claude => CLIAgentRuntimeKind::Claude,
+            GatewayCliAgentRuntimeKindConfig::OpenCode => CLIAgentRuntimeKind::OpenCode,
+        }) {
+            return readiness;
+        }
+        let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
+        match instance.kind {
+            GatewayCliAgentRuntimeKindConfig::Codex => {
+                crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
+                    instance,
+                    self.artifact_runtime_home.as_path(),
+                    provider_version,
+                    proxy_url,
+                    max_tools,
+                    max_schema_bytes,
+                )
+                .await
+            }
+            GatewayCliAgentRuntimeKindConfig::Claude => {
+                crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
+                    instance,
+                    self.artifact_runtime_home.as_path(),
+                    provider_version,
+                    proxy_url,
+                    max_tools,
+                    max_schema_bytes,
+                )
+                .await
+            }
+            GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                crate::cli_runtime::mcp::readiness::opencode_mcp_readiness_for_instance(
+                    instance,
+                    provider_version,
+                    max_tools,
+                    max_schema_bytes,
+                )
+                .await
+            }
+        }
+    }
+
     pub(super) async fn cli_runtime_live_summary_from_instance_with_trace(
         &self,
         workspace_id: &str,
@@ -11704,7 +11908,6 @@ impl MessageProcessor {
                 }
                 // Account identity and models belong to this same probe session.
                 let account = probe.account_probe_snapshot();
-                let normal_runtime_ready = account.status == CodexAccountProbeStatus::Ready;
                 let provider_version = account.version.clone();
                 let mut summary = apply_codex_account_probe_to_summary(summary, account);
                 let result = runtime_model_list_from_codex_probe(probe, &instance.custom_models);
@@ -11714,46 +11917,23 @@ impl MessageProcessor {
                     stage.succeed();
                 }
                 models = Some(result);
-                let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
-                #[cfg(test)]
-                let readiness_override = self.cli_mcp_readiness_override_for_tests(
-                    pioneer_protocol::CLIAgentRuntimeKind::Codex,
-                );
-                #[cfg(not(test))]
-                let readiness_override: Option<
-                    pioneer_protocol::CliMcpAdapterReadiness,
-                > = None;
-                let readiness = match readiness_override {
-                    Some(readiness) => readiness,
-                    None => {
-                        let mcp_stage = refresh_trace.map(|trace| {
-                            trace.runtime_stage(
-                                GatewayProviderWarmupStage::RuntimeMcpReadiness,
-                                runtime_kind,
-                            )
-                        });
-                        let readiness =
-                            crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
-                                &instance,
-                                self.artifact_runtime_home.as_path(),
-                                normal_runtime_ready,
-                                provider_version.as_deref(),
-                                proxy_url.as_deref(),
-                                max_tools,
-                                max_schema_bytes,
-                            )
-                            .await;
-                        if let Some(stage) = mcp_stage {
-                            stage.succeed();
-                        }
-                        readiness
-                    }
-                };
-                let policy = CliRuntimeCapabilityPolicy::from_readiness(
-                    true,
-                    normal_runtime_ready,
-                    Some(&readiness),
-                );
+                let mcp_stage = refresh_trace.map(|trace| {
+                    trace.runtime_stage(
+                        GatewayProviderWarmupStage::RuntimeMcpReadiness,
+                        runtime_kind,
+                    )
+                });
+                let readiness = self
+                    .cli_runtime_mcp_readiness_for_instance(
+                        &instance,
+                        provider_version.as_deref(),
+                        proxy_url.as_deref(),
+                    )
+                    .await;
+                if let Some(stage) = mcp_stage {
+                    stage.succeed();
+                }
+                let policy = CliRuntimeCapabilityPolicy::from_readiness(true, Some(&readiness));
                 summary.capabilities =
                     cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
                 summary.diagnostics.extend(readiness.diagnostics.clone());
@@ -11776,49 +11956,25 @@ impl MessageProcessor {
                 if let Some(stage) = account_stage {
                     stage.succeed();
                 }
-                let normal_runtime_ready = probe.status == ClaudeAccountProbeStatus::Ready;
                 let provider_version = probe.version.clone();
                 let mut summary = apply_claude_account_probe_to_summary(summary, probe);
-                let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
-                #[cfg(test)]
-                let readiness_override = self.cli_mcp_readiness_override_for_tests(
-                    pioneer_protocol::CLIAgentRuntimeKind::Claude,
-                );
-                #[cfg(not(test))]
-                let readiness_override: Option<
-                    pioneer_protocol::CliMcpAdapterReadiness,
-                > = None;
-                let readiness = match readiness_override {
-                    Some(readiness) => readiness,
-                    None => {
-                        let mcp_stage = refresh_trace.map(|trace| {
-                            trace.runtime_stage(
-                                GatewayProviderWarmupStage::RuntimeMcpReadiness,
-                                runtime_kind,
-                            )
-                        });
-                        let readiness =
-                            crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
-                                &instance,
-                                self.artifact_runtime_home.as_path(),
-                                normal_runtime_ready,
-                                provider_version.as_deref(),
-                                proxy_url.as_deref(),
-                                max_tools,
-                                max_schema_bytes,
-                            )
-                            .await;
-                        if let Some(stage) = mcp_stage {
-                            stage.succeed();
-                        }
-                        readiness
-                    }
-                };
-                let policy = CliRuntimeCapabilityPolicy::from_readiness(
-                    true,
-                    normal_runtime_ready,
-                    Some(&readiness),
-                );
+                let mcp_stage = refresh_trace.map(|trace| {
+                    trace.runtime_stage(
+                        GatewayProviderWarmupStage::RuntimeMcpReadiness,
+                        runtime_kind,
+                    )
+                });
+                let readiness = self
+                    .cli_runtime_mcp_readiness_for_instance(
+                        &instance,
+                        provider_version.as_deref(),
+                        proxy_url.as_deref(),
+                    )
+                    .await;
+                if let Some(stage) = mcp_stage {
+                    stage.succeed();
+                }
+                let policy = CliRuntimeCapabilityPolicy::from_readiness(true, Some(&readiness));
                 summary.capabilities =
                     cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
                 summary.diagnostics.extend(readiness.diagnostics.clone());
@@ -11843,7 +11999,6 @@ impl MessageProcessor {
                 if let Some(stage) = account_stage {
                     stage.succeed();
                 }
-                let normal_runtime_ready = probe.status == OpenCodeProbeStatus::Ready;
                 let provider_version = probe.version.clone();
                 // The account probe already fetched this catalog from its owned server.
                 // Pass it through live readiness so warmup does not launch serve again.
@@ -11856,43 +12011,23 @@ impl MessageProcessor {
                 }
                 models = Some(result);
                 let mut summary = apply_opencode_probe_to_summary(summary, probe);
-                let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
-                #[cfg(test)]
-                let readiness_override = self.cli_mcp_readiness_override_for_tests(
-                    pioneer_protocol::CLIAgentRuntimeKind::OpenCode,
-                );
-                #[cfg(not(test))]
-                let readiness_override: Option<
-                    pioneer_protocol::CliMcpAdapterReadiness,
-                > = None;
-                let readiness = match readiness_override {
-                    Some(readiness) => readiness,
-                    None => {
-                        let mcp_stage = refresh_trace.map(|trace| {
-                            trace.runtime_stage(
-                                GatewayProviderWarmupStage::RuntimeMcpReadiness,
-                                runtime_kind,
-                            )
-                        });
-                        let readiness = crate::cli_runtime::mcp::readiness::opencode_mcp_readiness_for_instance(
-                            &instance,
-                            normal_runtime_ready,
-                            provider_version.as_deref(),
-                            max_tools,
-                            max_schema_bytes,
-                        )
-                        .await;
-                        if let Some(stage) = mcp_stage {
-                            stage.succeed();
-                        }
-                        readiness
-                    }
-                };
-                let policy = CliRuntimeCapabilityPolicy::from_readiness(
-                    true,
-                    normal_runtime_ready,
-                    Some(&readiness),
-                );
+                let mcp_stage = refresh_trace.map(|trace| {
+                    trace.runtime_stage(
+                        GatewayProviderWarmupStage::RuntimeMcpReadiness,
+                        runtime_kind,
+                    )
+                });
+                let readiness = self
+                    .cli_runtime_mcp_readiness_for_instance(
+                        &instance,
+                        provider_version.as_deref(),
+                        proxy_url.as_deref(),
+                    )
+                    .await;
+                if let Some(stage) = mcp_stage {
+                    stage.succeed();
+                }
+                let policy = CliRuntimeCapabilityPolicy::from_readiness(true, Some(&readiness));
                 summary.capabilities =
                     cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
                 summary.diagnostics.extend(readiness.diagnostics.clone());
@@ -14641,7 +14776,7 @@ mod tests {
     }
 
     #[test]
-    fn model_discovery_requires_authoritative_ready_snapshot() {
+    fn cached_model_discovery_is_independent_of_probe_status() {
         let mut runtime = cli_runtime_summary_from_instance(effective_instance("codex", true));
         runtime.status = RuntimeStatus::Ready;
         assert!(cli_runtime_ready_for_model_discovery(&runtime));
@@ -14649,7 +14784,7 @@ mod tests {
         runtime.status = RuntimeStatus::Degraded {
             message: "probe degraded".to_owned(),
         };
-        assert!(!cli_runtime_ready_for_model_discovery(&runtime));
+        assert!(cli_runtime_ready_for_model_discovery(&runtime));
 
         runtime.status = RuntimeStatus::Ready;
         runtime.enabled = false;

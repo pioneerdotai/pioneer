@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub(crate) const CODEX_MCP_LOCAL_PROBE_CONTRACT_VERSION: u32 = 2;
 
@@ -42,16 +42,8 @@ impl CliRuntimeCapabilityPolicy {
 
     pub(crate) fn from_readiness(
         supports_skills: bool,
-        normal_runtime_ready: bool,
         readiness: Option<&CliMcpAdapterReadiness>,
     ) -> Self {
-        if !normal_runtime_ready {
-            return Self::unsupported(
-                supports_skills,
-                "cli_runtime.mcp.runtime_not_ready",
-                "The CLI runtime is not ready for MCP tools",
-            );
-        }
         let Some(readiness) = readiness else {
             return Self::phase_zero(supports_skills);
         };
@@ -270,7 +262,6 @@ impl CodexMcpLocalAttestation {
 #[derive(Debug, Clone)]
 pub(crate) struct CodexMcpReadinessInput<'a> {
     pub(crate) runtime_enabled: bool,
-    pub(crate) normal_runtime_ready: bool,
     pub(crate) platform_ipc_available: bool,
     pub(crate) facade_supervisor_healthy: bool,
     pub(crate) max_tools: usize,
@@ -296,13 +287,6 @@ pub(crate) fn evaluate_codex_mcp_readiness(
             RuntimeDiagnosticLevel::Info,
             "cli_runtime.mcp.runtime_not_ready",
             "The Codex runtime is disabled",
-        ));
-    }
-    if !input.normal_runtime_ready {
-        diagnostics.push(diagnostic(
-            RuntimeDiagnosticLevel::Warning,
-            "cli_runtime.mcp.runtime_not_ready",
-            "The Codex runtime is not ready for MCP tools",
         ));
     }
     if !input.platform_ipc_available {
@@ -341,7 +325,6 @@ pub(crate) fn evaluate_codex_mcp_readiness(
     }
 
     let supported = input.runtime_enabled
-        && input.normal_runtime_ready
         && input.platform_ipc_available
         && input.facade_supervisor_healthy
         && local.is_some_and(CodexMcpLocalAttestation::all_probes_passed);
@@ -374,9 +357,99 @@ pub(crate) fn evaluate_codex_mcp_readiness(
     }
 }
 
+/// The technical probes have their own slots: background warmup already holds
+/// a different permit and turn preflight must not acquire that permit again.
+/// No path holding a technical slot waits for a background warmup slot.
+fn local_mcp_probe_slots() -> &'static Arc<tokio::sync::Semaphore> {
+    static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
+}
+
+/// Coalesce only concurrent checks of one exact executable/contract identity.
+/// OnceCell releases initialization on cancellation. Weak entries let failed
+/// results disappear after the current callers finish, without caching failure
+/// forever or detaching work from its caller's timeout/cancellation scope.
+struct LocalMcpProbeFlights<K, V> {
+    slots: Arc<tokio::sync::Semaphore>,
+    entries: Mutex<HashMap<K, Weak<tokio::sync::OnceCell<Option<V>>>>>,
+}
+impl<K, V> Default for LocalMcpProbeFlights<K, V> {
+    fn default() -> Self {
+        Self {
+            slots: local_mcp_probe_slots().clone(),
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+}
+impl<K: Eq + std::hash::Hash, V: Clone> LocalMcpProbeFlights<K, V> {
+    async fn run<F>(
+        &self,
+        identity: K,
+        probe: impl FnOnce(tokio::sync::OwnedSemaphorePermit) -> F,
+    ) -> Option<V>
+    where
+        F: std::future::Future<Output = Option<V>>,
+    {
+        let cell = {
+            let mut entries = self.entries.lock().expect("MCP probe flights poisoned");
+            entries.retain(|_, entry| entry.strong_count() > 0);
+            if let Some(cell) = entries.get(&identity).and_then(Weak::upgrade) {
+                cell
+            } else {
+                let cell = Arc::new(tokio::sync::OnceCell::new());
+                entries.insert(identity, Arc::downgrade(&cell));
+                cell
+            }
+        };
+        cell.get_or_init(|| async {
+            let slot = self.slots.clone().acquire_owned().await.ok()?;
+            probe(slot).await
+        })
+        .await
+        .clone()
+    }
+}
+
+/// OpenCode hashes in spawn_blocking, which cannot be cancelled once running.
+/// Keep its shared cell inside that work so cancellation of an async waiter
+/// cannot start a second hash of the same identity.
+#[derive(Default)]
+struct OpenCodeMcpFingerprintFlights {
+    entries: Mutex<HashMap<CodexExecutableCacheIdentity, Weak<OnceLock<Option<(String, String)>>>>>,
+}
+impl OpenCodeMcpFingerprintFlights {
+    async fn run(
+        &self,
+        identity: CodexExecutableCacheIdentity,
+        probe: impl FnOnce() -> Option<(String, String)> + Send + 'static,
+    ) -> Option<(String, String)> {
+        let cell = {
+            let mut entries = self.entries.lock().expect("OpenCode MCP flights poisoned");
+            entries.retain(|_, entry| entry.strong_count() > 0);
+            entries
+                .get(&identity)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let cell = Arc::new(OnceLock::new());
+                    entries.insert(identity, Arc::downgrade(&cell));
+                    cell
+                })
+        };
+        let slot = local_mcp_probe_slots().clone().acquire_owned().await.ok()?;
+        pioneer_observability::work::spawn_blocking(move || {
+            let _slot = slot;
+            cell.get_or_init(probe).clone()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct CodexMcpReadinessCache {
     entries: Mutex<HashMap<CodexExecutableCacheIdentity, CodexMcpLocalAttestation>>,
+    flights: LocalMcpProbeFlights<CodexExecutableCacheIdentity, CodexMcpLocalAttestation>,
 }
 
 impl CodexMcpReadinessCache {
@@ -396,6 +469,34 @@ impl CodexMcpReadinessCache {
             .lock()
             .expect("Codex MCP readiness cache should not be poisoned")
             .insert(attestation.executable.cache_identity.clone(), attestation);
+    }
+
+    async fn get_or_probe<F>(
+        &self,
+        identity: CodexExecutableCacheIdentity,
+        probe: impl FnOnce(tokio::sync::OwnedSemaphorePermit) -> F,
+    ) -> Option<CodexMcpLocalAttestation>
+    where
+        F: std::future::Future<Output = Option<CodexMcpLocalAttestation>>,
+    {
+        if let Some(cached) = self.get(&identity) {
+            return Some(cached);
+        }
+        self.flights
+            .run(identity.clone(), |slot| async move {
+                if let Some(cached) = self.get(&identity) {
+                    return Some(cached);
+                }
+                let attestation = probe(slot).await?;
+                if attestation.executable.cache_identity != identity {
+                    return None;
+                }
+                if attestation.all_probes_passed() {
+                    self.insert(attestation.clone());
+                }
+                Some(attestation)
+            })
+            .await
     }
 
     #[cfg(test)]
@@ -459,20 +560,21 @@ fn global_codex_mcp_readiness_cache() -> &'static CodexMcpReadinessCache {
 }
 
 /// One production readiness path shared by catalog refresh and turn preflight.
-/// It performs no model request and enables MCP automatically after exact local checks.
+/// It performs no account/model request. Exact executable and local protocol
+/// checks establish support independently of background account diagnostics.
+/// Release strings are diagnostic metadata; binary and contract identities are
+/// the cache keys, so an absent account response cannot change a launch contract.
 pub(crate) async fn codex_mcp_readiness_for_instance(
     instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
     runtime_home: &Path,
-    normal_runtime_ready: bool,
     provider_version: Option<&str>,
     proxy_url: Option<&str>,
     max_tools: usize,
     max_schema_bytes: usize,
 ) -> CliMcpAdapterReadiness {
-    if !instance.enabled || !normal_runtime_ready {
+    if !instance.enabled {
         return evaluate_codex_mcp_readiness(CodexMcpReadinessInput {
             runtime_enabled: instance.enabled,
-            normal_runtime_ready,
             platform_ipc_available: cfg!(any(unix, windows)),
             facade_supervisor_healthy: true,
             max_tools,
@@ -484,21 +586,22 @@ pub(crate) async fn codex_mcp_readiness_for_instance(
     let local = build_or_load_codex_local_attestation(
         instance,
         runtime_home,
-        provider_version.unwrap_or_default(),
+        "",
         proxy_url,
         max_tools,
         max_schema_bytes,
     )
     .await;
-    evaluate_codex_mcp_readiness(CodexMcpReadinessInput {
+    let mut readiness = evaluate_codex_mcp_readiness(CodexMcpReadinessInput {
         runtime_enabled: instance.enabled,
-        normal_runtime_ready,
         platform_ipc_available: cfg!(any(unix, windows)),
         facade_supervisor_healthy: true,
         max_tools,
         max_schema_bytes,
         local_attestation: local.as_ref(),
-    })
+    });
+    readiness.provider_version = provider_version.map(str::to_owned);
+    readiness
 }
 
 async fn build_or_load_codex_local_attestation(
@@ -520,7 +623,44 @@ async fn build_or_load_codex_local_attestation(
     if let Some(cached) = global_codex_mcp_readiness_cache().get(&cache_identity) {
         return Some(cached);
     }
-    let executable = attest_codex_executable_identity(cache_identity).ok()?;
+    let probe_identity = cache_identity.clone();
+    let result = global_codex_mcp_readiness_cache()
+        .get_or_probe(cache_identity.clone(), |slot| async move {
+            let _slot = slot;
+            probe_codex_local_attestation(
+                instance,
+                runtime_home,
+                proxy_url,
+                max_tools,
+                max_schema_bytes,
+                probe_identity,
+            )
+            .await
+        })
+        .await;
+    // The executable/helper contract can change while this caller waits for
+    // another probe or a slot. Never return its predecessor's confirmation.
+    let current_contract =
+        codex_mcp_probe_contract_hash_for_instance(instance, max_tools, max_schema_bytes).ok()?;
+    let current_identity =
+        codex_executable_cache_identity(&instance.binary_path, provider_version, &current_contract)
+            .ok()?;
+    (current_identity == cache_identity)
+        .then_some(result)
+        .flatten()
+}
+
+async fn probe_codex_local_attestation(
+    instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    runtime_home: &Path,
+    proxy_url: Option<&str>,
+    max_tools: usize,
+    max_schema_bytes: usize,
+    cache_identity: CodexExecutableCacheIdentity,
+) -> Option<CodexMcpLocalAttestation> {
+    let contract_hash = cache_identity.probe_contract_hash.clone();
+    let provider_version = cache_identity.provider_version.as_str();
+    let executable = attest_codex_executable_identity(cache_identity.clone()).ok()?;
     let provider_probe = crate::cli_runtime::codex_session::run_codex_mcp_local_provider_probe(
         instance,
         runtime_home,
@@ -630,8 +770,13 @@ async fn build_or_load_codex_local_attestation(
         probes,
     )
     .ok()?;
-    if attestation.all_probes_passed() {
-        global_codex_mcp_readiness_cache().insert(attestation.clone());
+    let current_contract =
+        codex_mcp_probe_contract_hash_for_instance(instance, max_tools, max_schema_bytes).ok()?;
+    let current_identity =
+        codex_executable_cache_identity(&instance.binary_path, provider_version, &current_contract)
+            .ok()?;
+    if current_identity != cache_identity {
+        return None;
     }
     Some(attestation)
 }
@@ -805,7 +950,6 @@ impl ClaudeMcpLocalAttestation {
 
 pub(crate) struct ClaudeMcpReadinessInput<'a> {
     pub(crate) runtime_enabled: bool,
-    pub(crate) normal_runtime_ready: bool,
     pub(crate) platform_ipc_available: bool,
     pub(crate) facade_supervisor_healthy: bool,
     pub(crate) max_tools: usize,
@@ -823,13 +967,6 @@ pub(crate) fn evaluate_claude_mcp_readiness(
             RuntimeDiagnosticLevel::Info,
             "cli_runtime.mcp.runtime_not_ready",
             "The Claude runtime is disabled",
-        ));
-    }
-    if !input.normal_runtime_ready {
-        diagnostics.push(diagnostic(
-            RuntimeDiagnosticLevel::Warning,
-            "cli_runtime.mcp.runtime_not_ready",
-            "The Claude runtime is not ready for MCP tools",
         ));
     }
     if !input.platform_ipc_available || !input.facade_supervisor_healthy {
@@ -860,7 +997,6 @@ pub(crate) fn evaluate_claude_mcp_readiness(
         }
     }
     let supported = input.runtime_enabled
-        && input.normal_runtime_ready
         && input.platform_ipc_available
         && input.facade_supervisor_healthy
         && local.is_some_and(ClaudeMcpLocalAttestation::all_probes_passed);
@@ -902,6 +1038,7 @@ pub(crate) fn evaluate_claude_mcp_readiness(
 #[derive(Default)]
 pub(crate) struct ClaudeMcpReadinessCache {
     entries: Mutex<HashMap<ClaudeExecutableCacheIdentity, ClaudeMcpLocalAttestation>>,
+    flights: LocalMcpProbeFlights<ClaudeExecutableCacheIdentity, ClaudeMcpLocalAttestation>,
 }
 
 impl ClaudeMcpReadinessCache {
@@ -918,6 +1055,34 @@ impl ClaudeMcpReadinessCache {
             .lock()
             .expect("Claude MCP readiness cache should not be poisoned")
             .insert(attestation.executable.cache_identity.clone(), attestation);
+    }
+
+    async fn get_or_probe<F>(
+        &self,
+        identity: ClaudeExecutableCacheIdentity,
+        probe: impl FnOnce(tokio::sync::OwnedSemaphorePermit) -> F,
+    ) -> Option<ClaudeMcpLocalAttestation>
+    where
+        F: std::future::Future<Output = Option<ClaudeMcpLocalAttestation>>,
+    {
+        if let Some(cached) = self.get(&identity) {
+            return Some(cached);
+        }
+        self.flights
+            .run(identity.clone(), |slot| async move {
+                if let Some(cached) = self.get(&identity) {
+                    return Some(cached);
+                }
+                let attestation = probe(slot).await?;
+                if attestation.executable.cache_identity != identity {
+                    return None;
+                }
+                if attestation.all_probes_passed() {
+                    self.insert(attestation.clone());
+                }
+                Some(attestation)
+            })
+            .await
     }
 
     #[cfg(test)]
@@ -983,16 +1148,14 @@ fn global_claude_mcp_readiness_cache() -> &'static ClaudeMcpReadinessCache {
 pub(crate) async fn claude_mcp_readiness_for_instance(
     instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
     runtime_home: &Path,
-    normal_runtime_ready: bool,
     provider_version: Option<&str>,
     proxy_url: Option<&str>,
     max_tools: usize,
     max_schema_bytes: usize,
 ) -> CliMcpAdapterReadiness {
-    if !instance.enabled || !normal_runtime_ready {
+    if !instance.enabled {
         return evaluate_claude_mcp_readiness(ClaudeMcpReadinessInput {
             runtime_enabled: instance.enabled,
-            normal_runtime_ready,
             platform_ipc_available: cfg!(any(unix, windows)),
             facade_supervisor_healthy: true,
             max_tools,
@@ -1000,22 +1163,17 @@ pub(crate) async fn claude_mcp_readiness_for_instance(
             local_attestation: None,
         });
     }
-    let local = build_or_load_claude_local_attestation(
-        instance,
-        runtime_home,
-        provider_version.unwrap_or_default(),
-        proxy_url,
-    )
-    .await;
-    evaluate_claude_mcp_readiness(ClaudeMcpReadinessInput {
+    let local = build_or_load_claude_local_attestation(instance, runtime_home, "", proxy_url).await;
+    let mut readiness = evaluate_claude_mcp_readiness(ClaudeMcpReadinessInput {
         runtime_enabled: instance.enabled,
-        normal_runtime_ready,
         platform_ipc_available: cfg!(any(unix, windows)),
         facade_supervisor_healthy: true,
         max_tools,
         max_schema_bytes,
         local_attestation: local.as_ref(),
-    })
+    });
+    readiness.provider_version = provider_version.map(str::to_owned);
+    readiness
 }
 
 async fn build_or_load_claude_local_attestation(
@@ -1034,7 +1192,36 @@ async fn build_or_load_claude_local_attestation(
     if let Some(cached) = global_claude_mcp_readiness_cache().get(&cache_identity) {
         return Some(cached);
     }
-    let executable = attest_claude_executable_identity(cache_identity).ok()?;
+    let probe_identity = cache_identity.clone();
+    let result = global_claude_mcp_readiness_cache()
+        .get_or_probe(cache_identity.clone(), |slot| async move {
+            let _slot = slot;
+            probe_claude_local_attestation(instance, runtime_home, proxy_url, probe_identity).await
+        })
+        .await;
+    // The executable/helper contract can change while this caller waits for
+    // another probe or a slot. Never return its predecessor's confirmation.
+    let current_contract = claude_mcp_probe_contract_hash_for_instance(instance).ok()?;
+    let current_identity = claude_executable_cache_identity(
+        &instance.binary_path,
+        provider_version,
+        &current_contract,
+    )
+    .ok()?;
+    (current_identity == cache_identity)
+        .then_some(result)
+        .flatten()
+}
+
+async fn probe_claude_local_attestation(
+    instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    runtime_home: &Path,
+    proxy_url: Option<&str>,
+    cache_identity: ClaudeExecutableCacheIdentity,
+) -> Option<ClaudeMcpLocalAttestation> {
+    let contract_hash = cache_identity.probe_contract_hash.clone();
+    let provider_version = cache_identity.provider_version.as_str();
+    let executable = attest_claude_executable_identity(cache_identity.clone()).ok()?;
     let wait = std::time::Duration::from_millis(instance.startup_probe_timeout_ms.max(1));
     let help = probe_claude_help_contract(executable.cache_identity.realpath.as_path(), wait).await;
     let provider_probe = crate::cli_runtime::claude_session::run_claude_mcp_local_provider_probe(
@@ -1149,19 +1336,24 @@ async fn build_or_load_claude_local_attestation(
         probes,
     )
     .ok()?;
-    if attestation.all_probes_passed() {
-        global_claude_mcp_readiness_cache().insert(attestation.clone());
+    let current_contract = claude_mcp_probe_contract_hash_for_instance(instance).ok()?;
+    let current_identity = claude_executable_cache_identity(
+        &instance.binary_path,
+        provider_version,
+        &current_contract,
+    )
+    .ok()?;
+    if current_identity != cache_identity {
+        return None;
     }
     Some(attestation)
 }
 
-/// OpenCode's authenticated server is already exercised by the account probe.
-/// MCP readiness additionally pins the exact executable and adapter contract;
+/// OpenCode MCP readiness pins the exact executable and adapter contract;
 /// session startup then verifies dynamic MCP registration and the private
 /// helper list barrier before admitting a turn.
 pub(crate) async fn opencode_mcp_readiness_for_instance(
     instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
-    normal_runtime_ready: bool,
     provider_version: Option<&str>,
     max_tools: usize,
     max_schema_bytes: usize,
@@ -1172,13 +1364,6 @@ pub(crate) async fn opencode_mcp_readiness_for_instance(
             RuntimeDiagnosticLevel::Info,
             "cli_runtime.mcp.runtime_not_ready",
             "The OpenCode runtime is disabled",
-        ));
-    }
-    if !normal_runtime_ready {
-        diagnostics.push(diagnostic(
-            RuntimeDiagnosticLevel::Warning,
-            "cli_runtime.mcp.runtime_not_ready",
-            "The OpenCode runtime is not ready for MCP tools",
         ));
     }
     if !cfg!(any(unix, windows)) {
@@ -1192,34 +1377,45 @@ pub(crate) async fn opencode_mcp_readiness_for_instance(
     let version = provider_version
         .map(str::trim)
         .filter(|version| !version.is_empty());
-    let configured_binary = instance.binary_path.clone();
-    let version_for_attestation = version.map(str::to_owned);
-    let fingerprints = if instance.enabled && normal_runtime_ready {
-        tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
-            opencode_executable_fingerprints(&configured_binary, version_for_attestation.as_deref())
-        })
-        .await
-        .ok()
-        .and_then(Result::ok)
+    let fingerprints = if instance.enabled {
+        let contract =
+            crate::cli_runtime::opencode_session::opencode_provider_contract_fingerprint();
+        let identity = codex_executable_cache_identity(&instance.binary_path, "", &contract).ok();
+        if let Some(identity) = identity {
+            static FLIGHTS: OnceLock<OpenCodeMcpFingerprintFlights> = OnceLock::new();
+            let configured_binary = instance.binary_path.clone();
+            let result = FLIGHTS
+                .get_or_init(OpenCodeMcpFingerprintFlights::default)
+                .run(identity.clone(), move || {
+                    opencode_executable_fingerprints(&configured_binary, None).ok()
+                })
+                .await;
+            let current =
+                codex_executable_cache_identity(&instance.binary_path, "", &contract).ok();
+            if current.as_ref() == Some(&identity) {
+                result
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     } else {
         None
     };
-    if fingerprints.is_none() && instance.enabled && normal_runtime_ready {
+    if fingerprints.is_none() && instance.enabled {
         diagnostics.push(diagnostic(
             RuntimeDiagnosticLevel::Error,
             "cli_runtime.mcp.provider_probe_failed",
             "OpenCode executable attestation is unavailable",
         ));
     }
-    let supported = instance.enabled
-        && normal_runtime_ready
-        && cfg!(any(unix, windows))
-        && fingerprints.is_some();
+    let supported = instance.enabled && cfg!(any(unix, windows)) && fingerprints.is_some();
     if supported {
         diagnostics.push(diagnostic(
             RuntimeDiagnosticLevel::Info,
             "cli_runtime.mcp.ready",
-            "OpenCode MCP tools passed authenticated server and executable readiness checks",
+            "OpenCode MCP executable and adapter contract are available; session barriers remain required",
         ));
     }
     let (contract_fingerprint, local_executable_fingerprint) = fingerprints.unwrap_or_default();
@@ -1351,13 +1547,283 @@ mod tests {
     fn input(local: Option<&CodexMcpLocalAttestation>) -> CodexMcpReadinessInput<'_> {
         CodexMcpReadinessInput {
             runtime_enabled: true,
-            normal_runtime_ready: true,
             platform_ipc_available: true,
             facade_supervisor_healthy: true,
             max_tools: 128,
             max_schema_bytes: 1_048_576,
             local_attestation: local,
         }
+    }
+
+    #[tokio::test]
+    async fn technical_cache_coalesces_success_failure_and_releases_cancelled_leaders() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        macro_rules! verify_cache {
+            ($cache:ident, $fixture:ident) => {{
+                for fail in [false, true] {
+                    let cache = $cache {
+                        flights: LocalMcpProbeFlights { slots: Arc::new(tokio::sync::Semaphore::new(2)), ..Default::default() },
+                        ..Default::default()
+                    };
+                    let local = $fixture('1');
+                    let id = local.executable.cache_identity.clone();
+                    let calls = AtomicUsize::new(0);
+                    let (release, wait) = tokio::sync::oneshot::channel();
+                    let mut background = Box::pin(cache.get_or_probe(id.clone(), |slot| async {
+                        let _slot = slot;
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        wait.await.unwrap();
+                        if fail { None } else { Some(local.clone()) }
+                    }));
+                    let mut preflight = Box::pin(cache.get_or_probe(id.clone(), |slot| async {
+                        let _slot = slot;
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Some(local.clone())
+                    }));
+                    assert!(futures_util::poll!(background.as_mut()).is_pending());
+                    assert!(futures_util::poll!(preflight.as_mut()).is_pending());
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    release.send(()).unwrap();
+                    let (a, b) = tokio::join!(background, preflight);
+                    assert_eq!(a, b);
+                    assert_eq!(a.is_none(), fail);
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(cache.get(&id).is_none(), fail);
+                    let recovered = cache.get_or_probe(id.clone(), |slot| async {
+                        let _slot = slot;
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Some(local.clone())
+                    }).await;
+                    assert!(recovered.is_some());
+                    assert_eq!(calls.load(Ordering::SeqCst), if fail { 2 } else { 1 });
+                    let mut changed = id.clone();
+                    changed.probe_contract_hash = "b".repeat(64);
+                    assert!(cache.get_or_probe(changed, |slot| async {
+                        let _slot = slot;
+                        Some(local.clone()) // A foreign result must not be published for the new key.
+                    }).await.is_none());
+                }
+                let cache = $cache {
+                    flights: LocalMcpProbeFlights { slots: Arc::new(tokio::sync::Semaphore::new(2)), ..Default::default() },
+                    ..Default::default()
+                };
+                let local = $fixture('1');
+                let id = local.executable.cache_identity.clone();
+                let calls = AtomicUsize::new(0);
+                let mut cancelled = Box::pin(cache.get_or_probe(id.clone(), |slot| async {
+                    let _slot = slot;
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending().await
+                }));
+                let mut survivor = Box::pin(cache.get_or_probe(id, |slot| async {
+                    let _slot = slot;
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Some(local.clone())
+                }));
+                assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+                assert!(futures_util::poll!(survivor.as_mut()).is_pending());
+                drop(cancelled);
+                assert!(tokio::time::timeout(std::time::Duration::from_secs(1), survivor).await
+                    .expect("cancellation must release initialization").is_some());
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            }};
+        }
+        verify_cache!(CodexMcpReadinessCache, local_attestation);
+        verify_cache!(ClaudeMcpReadinessCache, claude_local_attestation);
+    }
+
+    #[tokio::test]
+    async fn technical_probe_slots_bound_distinct_identities_and_recover_on_cancellation() {
+        let flights = LocalMcpProbeFlights::<u8, u8> {
+            slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            ..Default::default()
+        };
+        let (a_tx, a_rx) = tokio::sync::oneshot::channel::<()>();
+        let (b_tx, b_rx) = tokio::sync::oneshot::channel::<()>();
+        let (c_tx, c_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut a = Box::pin(flights.run(1, |slot| async move {
+            let _slot = slot;
+            a_rx.await.ok()?;
+            Some(1)
+        }));
+        let mut b = Box::pin(flights.run(2, |slot| async move {
+            let _slot = slot;
+            b_rx.await.ok()?;
+            Some(2)
+        }));
+        let mut c = Box::pin(flights.run(3, |slot| async move {
+            let _slot = slot;
+            c_rx.await.ok()?;
+            Some(3)
+        }));
+        assert!(futures_util::poll!(a.as_mut()).is_pending());
+        assert!(futures_util::poll!(b.as_mut()).is_pending());
+        assert!(futures_util::poll!(c.as_mut()).is_pending());
+        assert_eq!(flights.slots.available_permits(), 0);
+        // c has not consumed its receiver yet: even a released barrier cannot finish it without a slot.
+        c_tx.send(()).unwrap();
+        assert!(futures_util::poll!(c.as_mut()).is_pending());
+        drop(a);
+        assert_eq!(c.await, Some(3));
+        b_tx.send(()).unwrap();
+        assert_eq!(b.await, Some(2));
+        assert!(a_tx.send(()).is_err());
+        assert_eq!(flights.slots.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn opencode_hash_remains_shared_when_its_async_leader_is_cancelled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let flights = OpenCodeMcpFingerprintFlights::default();
+        let id = local_attestation('1').executable.cache_identity;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let first_calls = calls.clone();
+        let mut leader = Box::pin(flights.run(id.clone(), move || {
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+            Some(("current".into(), "binary".into()))
+        }));
+        assert!(futures_util::poll!(leader.as_mut()).is_pending());
+        ready.await.unwrap();
+        drop(leader);
+        let second_calls = calls.clone();
+        let mut survivor = Box::pin(flights.run(id.clone(), move || {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            Some(("wrong".into(), "duplicate".into()))
+        }));
+        assert!(futures_util::poll!(survivor.as_mut()).is_pending());
+        release.send(()).unwrap();
+        assert_eq!(survivor.await, Some(("current".into(), "binary".into())));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let mut changed = id;
+        changed.probe_contract_hash = "c".repeat(64);
+        assert_eq!(
+            flights
+                .run(changed, || Some(("new".into(), "contract".into())))
+                .await,
+            Some(("new".into(), "contract".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn account_version_failure_cannot_change_a_current_technical_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("synthetic-cli");
+        std::fs::write(&binary, b"fixture, never executed").unwrap();
+        let mut instance = runtime_instance();
+        instance.binary_path = binary.to_string_lossy().into_owned();
+        instance.home_path = temp.path().to_string_lossy().into_owned();
+        let codex_contract =
+            codex_mcp_probe_contract_hash_for_instance(&instance, 128, 1_048_576).unwrap();
+        let mut codex = local_attestation('1');
+        codex.executable = attest_codex_executable_identity(
+            codex_executable_cache_identity(&instance.binary_path, "", &codex_contract).unwrap(),
+        )
+        .unwrap();
+        let codex = CodexMcpLocalAttestation::build(
+            codex.executable,
+            codex.adapter_contract_fingerprint,
+            codex.isolation_contract_fingerprint,
+            codex.schema_contract_fingerprint,
+            codex.bridge_contract_fingerprint,
+            codex.probes,
+        )
+        .unwrap();
+        global_codex_mcp_readiness_cache().insert(codex);
+        let ready = codex_mcp_readiness_for_instance(
+            &instance,
+            temp.path(),
+            Some("reported-version"),
+            None,
+            128,
+            1_048_576,
+        )
+        .await;
+        let unavailable_account =
+            codex_mcp_readiness_for_instance(&instance, temp.path(), None, None, 128, 1_048_576)
+                .await;
+        assert!(ready.supported && unavailable_account.supported);
+        assert_eq!(
+            ready.contract_fingerprint,
+            unavailable_account.contract_fingerprint
+        );
+        assert_eq!(
+            ready.local_executable_fingerprint,
+            unavailable_account.local_executable_fingerprint
+        );
+
+        instance.kind = GatewayCliAgentRuntimeKindConfig::Claude;
+        let claude_contract = claude_mcp_probe_contract_hash_for_instance(&instance).unwrap();
+        let mut claude = claude_local_attestation('2');
+        claude.executable = attest_claude_executable_identity(
+            claude_executable_cache_identity(&instance.binary_path, "", &claude_contract).unwrap(),
+        )
+        .unwrap();
+        let claude = ClaudeMcpLocalAttestation::build(
+            claude.executable,
+            claude.adapter_contract_fingerprint,
+            claude.isolation_contract_fingerprint,
+            claude.schema_contract_fingerprint,
+            claude.bridge_contract_fingerprint,
+            claude.continuation_contract_fingerprint,
+            claude.probes,
+        )
+        .unwrap();
+        global_claude_mcp_readiness_cache().insert(claude);
+        let ready = claude_mcp_readiness_for_instance(
+            &instance,
+            temp.path(),
+            Some("reported-version"),
+            None,
+            128,
+            1_048_576,
+        )
+        .await;
+        let unavailable_account =
+            claude_mcp_readiness_for_instance(&instance, temp.path(), None, None, 128, 1_048_576)
+                .await;
+        assert!(ready.supported && unavailable_account.supported);
+        assert_eq!(
+            ready.contract_fingerprint,
+            unavailable_account.contract_fingerprint
+        );
+        assert_eq!(
+            ready.local_executable_fingerprint,
+            unavailable_account.local_executable_fingerprint
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_technical_identity_requires_the_current_binary_independently_of_account() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("synthetic-opencode");
+        std::fs::write(&binary, b"fixture, never executed").unwrap();
+        let mut instance = runtime_instance();
+        instance.kind = GatewayCliAgentRuntimeKindConfig::OpenCode;
+        instance.binary_path = binary.to_string_lossy().into_owned();
+        let first =
+            opencode_mcp_readiness_for_instance(&instance, Some("version"), 128, 1_048_576).await;
+        let no_account = opencode_mcp_readiness_for_instance(&instance, None, 128, 1_048_576).await;
+        assert_eq!(first.supported, cfg!(any(unix, windows)));
+        assert_eq!(first.contract_fingerprint, no_account.contract_fingerprint);
+        std::fs::write(&binary, b"different binary contents").unwrap();
+        let changed = opencode_mcp_readiness_for_instance(&instance, None, 128, 1_048_576).await;
+        assert_ne!(first.contract_fingerprint, changed.contract_fingerprint);
+        std::fs::remove_file(&binary).unwrap();
+        assert!(
+            !opencode_mcp_readiness_for_instance(&instance, None, 128, 1_048_576)
+                .await
+                .supported
+        );
+        instance.enabled = false;
+        assert!(
+            !opencode_mcp_readiness_for_instance(&instance, None, 128, 1_048_576)
+                .await
+                .supported
+        );
     }
 
     #[test]
@@ -1378,7 +1844,7 @@ mod tests {
         let readiness = evaluate_codex_mcp_readiness(input(Some(&local)));
         assert!(readiness.supported);
         assert!(readiness.strict_isolation);
-        let policy = CliRuntimeCapabilityPolicy::from_readiness(true, true, Some(&readiness));
+        let policy = CliRuntimeCapabilityPolicy::from_readiness(true, Some(&readiness));
         assert!(policy.supports_mcp_tools());
     }
 
@@ -1499,7 +1965,6 @@ mod tests {
     fn claude_input(local: Option<&ClaudeMcpLocalAttestation>) -> ClaudeMcpReadinessInput<'_> {
         ClaudeMcpReadinessInput {
             runtime_enabled: true,
-            normal_runtime_ready: true,
             platform_ipc_available: true,
             facade_supervisor_healthy: true,
             max_tools: 128,

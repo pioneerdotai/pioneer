@@ -215,6 +215,9 @@
         }
       ]
     },
+    "GatewayBaseUrl": {
+      "type": "string"
+    },
     "GatewayCliRuntimeInstanceSettings": {
       "type": "object",
       "properties": {
@@ -624,6 +627,17 @@
             "null"
           ]
         },
+        "public_base_url": {
+          "description": "Present only for the currently authenticated relay connection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayBaseUrl"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "state": {
           "$ref": "#/$defs/GatewayRemoteAccessState",
           "default": "disabled"
@@ -882,7 +896,8 @@
             "runtime": {
               "effective_enabled": false,
               "phase": "disabled"
-            }
+            },
+            "transcribe_while_recording": true
           }
         }
       },
@@ -1249,6 +1264,7 @@
       "enum": [
         "openai",
         "openrouter",
+        "vercel-ai-gateway",
         "local"
       ]
     },
@@ -1488,6 +1504,10 @@
             "effective_enabled": false,
             "phase": "disabled"
           }
+        },
+        "transcribe_while_recording": {
+          "type": "boolean",
+          "default": true
         }
       }
     },
@@ -1518,6 +1538,12 @@
         },
         "retry_install": {
           "type": "boolean"
+        },
+        "transcribe_while_recording": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       }
     },

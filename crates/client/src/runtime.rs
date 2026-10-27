@@ -171,11 +171,11 @@ impl ClientRuntime {
     pub(crate) fn close_test_ingress(&self) {
         self.ws_client.close_test_events();
     }
-    pub fn recv_ws_event(&self) -> Option<GatewayWsEvent> {
+    pub fn recv_ws_event(&self) -> Option<pioneer_observability::work::WorkItem<GatewayWsEvent>> {
         self.ws_client.recv_event()
     }
 
-    pub fn drain_ws_events(&self) -> Vec<GatewayWsEvent> {
+    pub fn drain_ws_events(&self) -> Vec<pioneer_observability::work::WorkItem<GatewayWsEvent>> {
         self.ws_client.drain_events()
     }
 }
@@ -268,7 +268,8 @@ pub fn reduce_gateway_notification(
     context: ClientRuntimeNotificationContext<'_>,
 ) -> Option<ClientRuntimeNotification> {
     match notification {
-        GatewayNotification::McpOAuthChanged(_) => None,
+        // Scoped push is applied by ClientCore before the legacy shell reducer.
+        GatewayNotification::WorkspacePush(_) | GatewayNotification::McpOAuthChanged(_) => None,
         GatewayNotification::AccessChanged(notification) => {
             Some(ClientRuntimeNotification::AccessChanged(notification))
         }
@@ -1101,6 +1102,7 @@ mod tests {
         let notification = GatewayNotification::GatewayRemoteAccessStatusChanged(
             GatewayRemoteAccessStatusChangedNotification {
                 status: GatewayRemoteAccessStatusSnapshot {
+                    public_base_url: None,
                     state: GatewayRemoteAccessState::Failed,
                     error_kind: Some(GatewayRemoteAccessErrorKind::RelayConnectFailed),
                     message: Some("failed to connect".to_owned()),
@@ -1175,6 +1177,7 @@ mod tests {
         let expected = GatewayVoiceInputStatusChangedNotification {
             settings: GatewayVoiceInputSettings {
                 enabled: true,
+                transcribe_while_recording: false,
                 provider: Some(GatewayVoiceInputProvider::Local),
                 model: Some("parakeet-tdt-0.6b-v3".to_owned()),
                 runtime: GatewayVoiceInputRuntimeSnapshot {

@@ -44,6 +44,7 @@ pub(crate) struct ChildAgentLaunchGrant {
     pub(crate) root_execution_id: AgentExecutionId,
     pub(crate) home_root_thread_id: String,
     pub(crate) depth: u16,
+    pub(crate) independent_root: bool,
     pub(crate) branch_key: String,
     pub(crate) envelope: AgentSecurityEnvelope,
     pub(crate) route: Option<AgentRouteFacts>,
@@ -76,6 +77,11 @@ fn select_identity(
     match selection {
         AgentIdentitySelection::InheritParent if options.inherit_parent_agent_available => {
             inherited_identity
+                .and_then(|inherited| {
+                    options.agents.iter().find(|current| {
+                        pioneer_protocol::agent_identity_has_same_launch_source(current, inherited)
+                    })
+                })
                 .cloned()
                 .ok_or(ExecutionMaterializationError::MissingIdentity)
         }
@@ -120,9 +126,39 @@ fn select_profile(
         pioneer_protocol::AgentExecutionProfileSelection::InheritParent
             if options.inherit_parent_profile_available =>
         {
-            inherited_profile
-                .cloned()
-                .ok_or(ExecutionMaterializationError::MissingProfile)?
+            let inherited =
+                inherited_profile.ok_or(ExecutionMaterializationError::MissingProfile)?;
+            if let Some(profile) = options
+                .profiles
+                .iter()
+                .filter(|current| {
+                    (current.id == inherited.id
+                        || (current.backend == inherited.backend
+                            && current.provider_id == inherited.provider_id
+                            && current.model_id == inherited.model_id))
+                        && (identity.source_kind == AgentIdentitySourceKind::Ephemeral
+                            || current.compatible_agent_identity_ids.contains(&identity.id))
+                })
+                .min_by_key(|current| current.id != inherited.id)
+            {
+                profile.clone()
+            } else {
+                // Changing identity must never carry a model from an unrelated
+                // executor. A unique compatible choice is the only safe default.
+                let mut compatible = options
+                    .profiles
+                    .iter()
+                    .filter(|profile| profile.compatible_agent_identity_ids.contains(&identity.id));
+                let profile = compatible
+                    .next()
+                    .ok_or(ExecutionMaterializationError::MissingProfile)?;
+                if compatible.next().is_some() {
+                    return Err(ExecutionMaterializationError::InvalidLaunchSelection(
+                        "identity requires an explicit model; inspect threads_identity_models_list",
+                    ));
+                }
+                profile.clone()
+            }
         }
         pioneer_protocol::AgentExecutionProfileSelection::InheritParent => {
             return Err(ExecutionMaterializationError::MissingProfile);
@@ -133,6 +169,33 @@ fn select_profile(
             .find(|profile| &profile.id == profile_id)
             .cloned()
             .ok_or(ExecutionMaterializationError::MissingProfile)?,
+        pioneer_protocol::AgentExecutionProfileSelection::Model {
+            provider_id,
+            model_id,
+        } => {
+            let inherited_provider = inherited_profile
+                .filter(|profile| profile.compatible_agent_identity_ids.contains(&identity.id))
+                .map(|profile| profile.provider_id.as_str());
+            let selected_provider = provider_id.as_deref().or(inherited_provider);
+            let mut candidates = options.profiles.iter().filter(|profile| {
+                (profile.compatible_agent_identity_ids.contains(&identity.id)
+                    || (identity.source_kind == AgentIdentitySourceKind::Ephemeral
+                        && options.agents.iter().any(|source| {
+                            profile.compatible_agent_identity_ids.contains(&source.id)
+                        })))
+                    && profile.model_id == *model_id
+                    && selected_provider.is_none_or(|provider| profile.provider_id == provider)
+            });
+            let profile = candidates
+                .next()
+                .ok_or(ExecutionMaterializationError::MissingProfile)?;
+            if candidates.next().is_some() {
+                return Err(ExecutionMaterializationError::InvalidLaunchSelection(
+                    "model requires an explicit providerId",
+                ));
+            }
+            profile.clone()
+        }
     };
     if identity.source_kind != AgentIdentitySourceKind::Ephemeral
         && !selected
@@ -162,6 +225,16 @@ fn select_profile(
         (AgentIdentitySourceKind::CliRuntimeInstance, _) => {
             return Err(ExecutionMaterializationError::CliRuntimeMismatch);
         }
+    }
+    if selection
+        .execution
+        .reasoning
+        .as_ref()
+        .is_some_and(|reasoning| !selected.allowed_reasoning.contains(reasoning))
+    {
+        return Err(ExecutionMaterializationError::InvalidLaunchSelection(
+            "reasoning is not available for the selected model",
+        ));
     }
     Ok(selected)
 }
@@ -267,6 +340,7 @@ pub(crate) fn derive_child_launch_grant(
     target: AgentStartTarget,
     route: Option<AgentRouteFacts>,
     depth: u16,
+    independent_root: bool,
     branch_key: impl Into<String>,
     policy: &AgentWorkResourcePolicy,
     registry: RoleDefinitionRegistry,
@@ -274,7 +348,15 @@ pub(crate) fn derive_child_launch_grant(
     if options.generation_fingerprint != parent.options_generation_fingerprint {
         return Err(ExecutionMaterializationError::PolicyGenerationStale);
     }
-    if depth == 0 || depth > policy.max_depth {
+    if (independent_root && depth != 0)
+        || (!independent_root && (depth == 0 || depth > policy.max_depth))
+        || (independent_root
+            && !route.as_ref().is_some_and(|route| {
+                !route.same_capsule
+                    && route.destination_thread_id == route.destination_capsule_id
+                    && route.destination_capsule_id != parent.home_root_thread_id
+            }))
+    {
         return Err(ExecutionMaterializationError::BoundaryExceeded);
     }
     if !parent.envelope.allows(ResourceAction::ChildStart) {
@@ -283,7 +365,9 @@ pub(crate) fn derive_child_launch_grant(
         ));
     }
     let identity = match &selection.agent {
-        AgentIdentitySelection::InheritParent => parent.identity.clone(),
+        AgentIdentitySelection::InheritParent => {
+            select_identity(&selection.agent, options, Some(&parent.identity))?
+        }
         AgentIdentitySelection::ServerDerivedEphemeral { .. } => {
             resolve_ephemeral_agent_launch_selection(
                 selection,
@@ -343,40 +427,35 @@ pub(crate) fn derive_child_launch_grant(
     {
         child_identities.push(identity.clone());
     }
-    let mut child_profiles = options.profiles.clone();
-    if let Some(candidate) = child_profiles
-        .iter_mut()
-        .find(|candidate| candidate.id == profile.id)
-    {
-        *candidate = profile.clone();
-    } else {
-        child_profiles.push(profile.clone());
-    }
-    let child_launch_ceiling =
-        pioneer_protocol::ChildAgentLaunchGrantSet::new(child_identities, child_profiles)
-            .and_then(|grant| {
-                grant.with_policy(
-                    options.inherit_parent_agent_available,
-                    options.derived_ephemeral_available,
-                    options.inherit_parent_profile_available,
-                    options.allowed_skill_ids.clone(),
-                    options.allowed_mcp_server_ids.clone(),
-                    options.max_permission_profile.clone(),
-                )
-            })
-            .map_err(|_| {
-                ExecutionMaterializationError::InvalidLaunchSelection(
-                    "child launch grant ceiling is invalid",
-                )
-            })?;
+    let child_launch_ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(child_identities)
+        .and_then(|grant| {
+            grant.with_policy(
+                options.inherit_parent_agent_available,
+                options.derived_ephemeral_available,
+                options.inherit_parent_profile_available,
+                options.allowed_skill_ids.clone(),
+                options.allowed_mcp_server_ids.clone(),
+                options.max_permission_profile.clone(),
+            )
+        })
+        .map_err(|_| {
+            ExecutionMaterializationError::InvalidLaunchSelection(
+                "child launch grant ceiling is invalid",
+            )
+        })?;
     Ok(ChildAgentLaunchGrant {
+        root_execution_id: if independent_root {
+            execution_id.clone()
+        } else {
+            parent.work_graph_root_execution_id.clone()
+        },
         execution_id,
         parent_execution_id: parent.execution_id.clone(),
         identity,
         profile,
-        root_execution_id: parent.work_graph_root_execution_id.clone(),
         home_root_thread_id: child_home_root_thread_id,
         depth,
+        independent_root,
         branch_key: branch_key.into(),
         envelope,
         route,
@@ -396,6 +475,7 @@ pub(crate) fn materialize_child_agent_start(
     options: &AgentStartOptionsProjection,
     route: Option<AgentRouteFacts>,
     depth: u16,
+    independent_root: bool,
     branch_key: &str,
     policy: &AgentWorkResourcePolicy,
     registry: RoleDefinitionRegistry,
@@ -409,6 +489,7 @@ pub(crate) fn materialize_child_agent_start(
         intent.target.clone(),
         route,
         depth,
+        independent_root,
         branch_key.to_owned(),
         policy,
         registry,
@@ -623,6 +704,119 @@ mod tests {
     }
 
     #[test]
+    fn explicit_models_resolve_within_identity_and_model_reasoning_grants() {
+        let api = identity(
+            "A12345678901234567890",
+            AgentIdentitySourceKind::NativeAgent,
+        );
+        let cli = identity(
+            "A12345678901234567891",
+            AgentIdentitySourceKind::CliRuntimeInstance,
+        );
+        let mut original = profile("P12345678901234567890", &api);
+        original.allowed_reasoning = vec![pioneer_protocol::TurnReasoningSelection {
+            effort: "low".into(),
+        }];
+        let mut other = profile("P12345678901234567891", &api);
+        other.model_id = "other-model".into();
+        other.allowed_reasoning = vec![pioneer_protocol::TurnReasoningSelection {
+            effort: "high".into(),
+        }];
+        let mut cli_profile = profile("P12345678901234567892", &cli);
+        cli_profile.backend = AgentExecutionProfileBackend::CliRuntime {
+            runtime_instance_id: "configured-cli".into(),
+        };
+        cli_profile.provider_id = "cli_runtime:configured-cli".into();
+        cli_profile.model_id = "cli-model".into();
+        cli_profile.allowed_reasoning = vec![pioneer_protocol::TurnReasoningSelection {
+            effort: "runtime-effort".into(),
+        }];
+        let options = AgentStartOptionsProjection {
+            agents: vec![api.clone(), cli.clone()],
+            profiles: vec![original.clone(), other.clone(), cli_profile.clone()],
+            inherit_parent_agent_available: true,
+            inherit_parent_profile_available: true,
+            derived_ephemeral_available: false,
+            allowed_skill_ids: vec![],
+            allowed_mcp_server_ids: vec![],
+            max_permission_profile: pioneer_protocol::task_permission_cap_for_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+            ),
+            generation_fingerprint: "selection-options".into(),
+        };
+        for (identity, selected, effort) in [
+            (&api, &other, "high"),
+            (&cli, &cli_profile, "runtime-effort"),
+        ] {
+            let mut launch = selection();
+            launch.agent = AgentIdentitySelection::Exact {
+                agent_identity_id: identity.id.clone(),
+            };
+            launch.execution.profile = AgentExecutionProfileSelection::Model {
+                provider_id: Some(selected.provider_id.clone()),
+                model_id: selected.model_id.clone(),
+            };
+            launch.execution.reasoning = Some(pioneer_protocol::TurnReasoningSelection {
+                effort: effort.into(),
+            });
+            let resolved =
+                resolve_agent_launch_selection(&launch, &options, Some(&api), Some(&original))
+                    .unwrap();
+            assert_eq!(resolved, (identity.clone(), selected.clone()));
+            launch.execution.reasoning = Some(pioneer_protocol::TurnReasoningSelection {
+                effort: "unsupported".into(),
+            });
+            assert!(
+                resolve_agent_launch_selection(&launch, &options, Some(&api), Some(&original))
+                    .is_err()
+            );
+            launch.execution.reasoning = None;
+            launch.execution.profile = AgentExecutionProfileSelection::Model {
+                provider_id: Some("unavailable-executor".into()),
+                model_id: selected.model_id.clone(),
+            };
+            assert!(
+                resolve_agent_launch_selection(&launch, &options, Some(&api), Some(&original))
+                    .is_err()
+            );
+            launch.execution.profile = AgentExecutionProfileSelection::Model {
+                provider_id: None,
+                model_id: "unavailable-model".into(),
+            };
+            assert!(
+                resolve_agent_launch_selection(&launch, &options, Some(&api), Some(&original))
+                    .is_err()
+            );
+        }
+        let mut launch = selection();
+        launch.agent = AgentIdentitySelection::Exact {
+            agent_identity_id: cli.id.clone(),
+        };
+        launch.execution.profile = AgentExecutionProfileSelection::InheritParent;
+        assert_eq!(
+            resolve_agent_launch_selection(&launch, &options, Some(&api), Some(&original))
+                .unwrap()
+                .1,
+            cli_profile
+        );
+        let mut ambiguous = options.clone();
+        let mut another_cli = cli_profile.clone();
+        another_cli.id = AgentExecutionProfileId::new("P12345678901234567893").unwrap();
+        another_cli.model_id = "another-cli-model".into();
+        ambiguous.profiles.push(another_cli);
+        assert!(
+            resolve_agent_launch_selection(&launch, &ambiguous, Some(&api), Some(&original))
+                .is_err()
+        );
+        launch.agent = AgentIdentitySelection::Exact {
+            agent_identity_id: AgentIdentityId::new("A12345678901234567899").unwrap(),
+        };
+        assert!(
+            resolve_agent_launch_selection(&launch, &options, Some(&api), Some(&original)).is_err()
+        );
+    }
+
+    #[test]
     fn ephemeral_child_replaces_the_same_profile_projection_without_duplicate_ids() {
         let root_identity = identity(
             "A12345678901234567890",
@@ -676,6 +870,7 @@ mod tests {
             AgentStartTarget::CurrentThread,
             None,
             1,
+            false,
             "branch-ephemeral",
             &AgentWorkResourcePolicy::default(),
             RoleDefinitionRegistry::new(),
@@ -683,11 +878,87 @@ mod tests {
         .unwrap();
 
         child.child_launch_ceiling.validate().unwrap();
-        assert_eq!(child.child_launch_ceiling.profiles.len(), 1);
         assert!(
-            child.child_launch_ceiling.profiles[0]
+            child
+                .profile
                 .compatible_agent_identity_ids
                 .contains(&child.identity.id)
+        );
+    }
+
+    #[test]
+    fn inherited_child_resolves_current_source_without_mutating_parent_snapshot() {
+        let original = identity(
+            "A12345678901234567890",
+            AgentIdentitySourceKind::NativeAgent,
+        );
+        let profile = profile("P12345678901234567890", &original);
+        let mut options = AgentStartOptionsProjection {
+            agents: vec![original.clone()],
+            profiles: vec![profile.clone()],
+            inherit_parent_agent_available: true,
+            derived_ephemeral_available: false,
+            inherit_parent_profile_available: true,
+            allowed_skill_ids: Vec::new(),
+            allowed_mcp_server_ids: Vec::new(),
+            max_permission_profile: pioneer_protocol::task_permission_cap_for_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+            ),
+            generation_fingerprint: "generation".to_owned(),
+        };
+        let parent = materialize_root_execution(
+            &selection(),
+            &options,
+            "thread-root",
+            "thread_agent",
+            1,
+            RoleDefinitionRegistry::new(),
+        )
+        .unwrap();
+        let mut current = original.clone();
+        current.source_revision = 9;
+        current.source_fingerprint = "current-settings".to_owned();
+        options.agents = vec![current.clone()];
+        let mut equivalent = profile.clone();
+        equivalent.id = AgentExecutionProfileId::new("P12345678901234567889").unwrap();
+        options.profiles.insert(0, equivalent);
+        let mut inherited = selection();
+        inherited.agent = AgentIdentitySelection::InheritParent;
+        inherited.execution.profile = AgentExecutionProfileSelection::InheritParent;
+        let child = derive_child_launch_grant(
+            &parent,
+            AgentExecutionId::new("E12345678901234567891").unwrap(),
+            &inherited,
+            &options,
+            AgentStartTarget::CurrentThread,
+            None,
+            1,
+            false,
+            "branch",
+            &AgentWorkResourcePolicy::default(),
+            RoleDefinitionRegistry::new(),
+        )
+        .unwrap();
+        assert_eq!(child.identity, current);
+        assert_eq!(child.profile, profile);
+        assert_eq!(parent.identity, original);
+        child.child_launch_ceiling.validate().unwrap();
+        options.agents.clear();
+        assert!(
+            derive_child_launch_grant(
+                &parent,
+                AgentExecutionId::new("E12345678901234567891").unwrap(),
+                &inherited,
+                &options,
+                AgentStartTarget::CurrentThread,
+                None,
+                1,
+                false,
+                "branch",
+                &AgentWorkResourcePolicy::default(),
+                RoleDefinitionRegistry::new(),
+            )
+            .is_err()
         );
     }
 }

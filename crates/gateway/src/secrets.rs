@@ -933,6 +933,26 @@ impl GatewaySecrets {
             .context("failed to list secrets from keystore")
     }
 
+    /// Reuses the auth-key initialization lock to make retries and concurrent
+    /// Gateway processes converge on one secret for the stable creation ref.
+    /// This happens before the task write transaction; a failed task creation
+    /// leaves reusable keystore material rather than rotating the endpoint.
+    pub(crate) fn ensure_task_webhook_secret(&self, secret_ref: &str) -> Result<()> {
+        self.load_or_create_auth_key(
+            SecretId::task_webhook_secret(secret_ref)?,
+            SecretKind::TaskWebhookSecret,
+            "Task webhook secret",
+            32,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn get_task_webhook_secret(&self, secret_ref: &str) -> Result<Option<String>> {
+        self.store
+            .get_string(&SecretId::task_webhook_secret(secret_ref)?)
+            .context("failed to read task webhook secret")
+    }
+
     pub(crate) fn get_remote_access_secret(&self, ref_id: &str) -> Result<Option<String>> {
         let id = SecretId::gateway_remote_access_secret(ref_id)
             .context("invalid gateway remote access secret ref id")?;
@@ -1180,6 +1200,55 @@ mod tests {
         sync::{Arc, Barrier},
         thread,
     };
+
+    #[test]
+    fn task_webhook_secret_survives_failed_creation_retries_and_keystore_reopen() {
+        let home = tempfile::tempdir().unwrap();
+        let secrets = GatewaySecrets::open(home.path()).unwrap();
+        let secret_ref = "stable-webhook-creation-ref";
+        assert!(
+            secrets
+                .get_task_webhook_secret(secret_ref)
+                .unwrap()
+                .is_none()
+        );
+        secrets.ensure_task_webhook_secret(secret_ref).unwrap();
+        let original = secrets
+            .get_task_webhook_secret(secret_ref)
+            .unwrap()
+            .unwrap();
+        // A task DB failure does not rotate the already provisioned credential.
+        secrets.ensure_task_webhook_secret(secret_ref).unwrap();
+        drop(secrets);
+        let reopened = GatewaySecrets::open(home.path()).unwrap();
+        reopened.ensure_task_webhook_secret(secret_ref).unwrap();
+        assert_eq!(
+            reopened
+                .get_task_webhook_secret(secret_ref)
+                .unwrap()
+                .as_deref(),
+            Some(original.as_str())
+        );
+        assert_eq!(original.len(), 64);
+        reopened
+            .ensure_task_webhook_secret("another-trigger-ref")
+            .unwrap();
+        assert_ne!(
+            reopened
+                .get_task_webhook_secret("another-trigger-ref")
+                .unwrap()
+                .as_deref(),
+            Some(original.as_str())
+        );
+        assert_eq!(
+            reopened
+                .store
+                .list(SecretFilter::Kind(SecretKind::TaskWebhookSecret))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
 
     #[test]
     fn auth_key_domains_are_distinct_redacted_and_restart_stable() {

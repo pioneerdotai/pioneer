@@ -1,8 +1,26 @@
+#[cfg(unix)]
+#[path = "tests/title_recovery.rs"]
+mod title_recovery;
+
+#[path = "tests/root_conversation_compaction.rs"]
+mod root_conversation_compaction;
+
+#[path = "tests/scoped_push.rs"]
+mod scoped_push;
+
+#[path = "tests/scoped_push_client.rs"]
+mod scoped_push_client;
+
+#[path = "tests/cli_provider_probe_isolation.rs"]
+mod cli_provider_probe_isolation;
+
 #[path = "tests/cli_task_tools.rs"]
 mod cli_task_tools;
 
 #[path = "tests/cli_runtime_active_bindings.rs"]
 mod cli_runtime_active_bindings;
+#[path = "tests/cli_runtime_idle_cleanup.rs"]
+mod cli_runtime_idle_cleanup;
 
 #[cfg(unix)]
 #[path = "tests/opencode_startup.rs"]
@@ -37,6 +55,14 @@ mod memory_post_turn_response;
 
 #[path = "tests/task_capsule.rs"]
 mod task_capsule;
+
+#[path = "tests/task_launch_continuity.rs"]
+mod task_launch_continuity;
+#[path = "tests/task_webhooks.rs"]
+mod task_webhooks;
+
+#[path = "tests/thread_launch_choices.rs"]
+mod thread_launch_choices;
 
 #[path = "tests/reconciliation_workers.rs"]
 mod reconciliation_workers;
@@ -214,7 +240,7 @@ use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -252,7 +278,7 @@ async fn assert_admitted_turn_owner(processor: &MessageProcessor, thread_id: &st
     );
 }
 
-async fn registered_request_context(
+pub(super) async fn registered_request_context(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
     canonical_method: &'static str,
@@ -338,7 +364,7 @@ async fn persist_test_execution_authorization_context(
     .await;
 }
 
-async fn persist_test_execution_authorization_context_for_principal(
+pub(super) async fn persist_test_execution_authorization_context_for_principal(
     processor: &MessageProcessor,
     principal: &crate::auth::AuthenticatedSessionPrincipal,
     workspace_id: &str,
@@ -471,6 +497,54 @@ async fn ensure_test_superuser_execution_turn(
             turn_id,
         )
         .await;
+    }
+    if processor
+        .crud_store
+        .get_turn_runtime_snapshot(turn_id)
+        .await
+        .unwrap()
+        .is_none()
+    {
+        let thread = processor
+            .crud_store
+            .get_thread_model(thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let history = processor
+            .load_prepared_conversation_history_for_workspace(workspace_id, thread_id, turn_id)
+            .await
+            .expect("test runtime snapshot should retain the accepted history");
+        let now = pioneer_crud::utc_now();
+        processor
+            .crud_store
+            .upsert_turn_runtime_snapshot_with_source_epochs(
+                pioneer_crud::NewTurnRuntimeSnapshot {
+                    turn_id: turn_id.into(),
+                    thread_id: thread_id.into(),
+                    workspace_id: workspace_id.into(),
+                    mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
+                    model: thread.model,
+                    provider_name: thread.model_provider,
+                    reasoning_effort: thread.reasoning_effort,
+                    agent_skill_versions_json: None,
+                    hook_runtime_context_json: serde_json::to_string(
+                        &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                    )
+                    .unwrap(),
+                    workspace_skill_policies_json: "[]".into(),
+                    input_json: "[]".into(),
+                    capabilities_json: "[]".into(),
+                    resolved_artifacts_json: "[]".into(),
+                    runtime_environment_json: "{}".into(),
+                    history_json: serde_json::to_string(&history.descriptor).unwrap(),
+                    created_at: now,
+                    updated_at: now,
+                },
+                &history.source_epochs,
+            )
+            .await
+            .unwrap();
     }
 }
 
@@ -701,6 +775,7 @@ struct RecordingCliRuntimeSession {
     thread_resumes: TokioMutex<Vec<(String, CLIAgentRuntimeThreadOpenParams)>>,
     turn_starts: TokioMutex<Vec<CLIAgentRuntimeTurnStartParams>>,
     turn_start_pause: TokioMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    next_turn_start_error: TokioMutex<Option<String>>,
     provider_history: TokioMutex<HashMap<String, Vec<String>>>,
     provider_boundaries: TokioMutex<HashMap<(String, String), usize>>,
     claude_record_boundaries: TokioMutex<HashMap<uuid::Uuid, (String, usize)>>,
@@ -735,6 +810,9 @@ struct RecordingCliRuntimeSession {
     fail_next_resume: TokioMutex<bool>,
     goal_clears: TokioMutex<Vec<String>>,
     closes: AtomicUsize,
+    close_pause: TokioMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    fail_next_close: AtomicBool,
+    interrupt_pause: TokioMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     factory_starts: AtomicUsize,
     event_log: TokioMutex<Option<Arc<TokioMutex<Vec<String>>>>>,
 }
@@ -846,6 +924,13 @@ impl RecordingCliRuntimeSession {
 impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
     async fn close(&self) -> anyhow::Result<()> {
         self.closes.fetch_add(1, Ordering::SeqCst);
+        if let Some((entered, release)) = self.close_pause.lock().await.take() {
+            entered.notify_one();
+            release.notified().await;
+        }
+        if self.fail_next_close.swap(false, Ordering::SeqCst) {
+            anyhow::bail!("injected close failure");
+        }
         Ok(())
     }
 
@@ -929,6 +1014,9 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
             .or_default()
             .push(format!("user:{}", params.input));
         self.turn_starts.lock().await.push(params.clone());
+        if let Some(error) = self.next_turn_start_error.lock().await.take() {
+            anyhow::bail!(error);
+        }
         let native_turn_id = self
             .next_native_turn_id
             .lock()
@@ -1052,6 +1140,10 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         native_thread_id: Option<&str>,
         native_turn_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        if let Some((entered, release)) = self.interrupt_pause.lock().await.take() {
+            entered.notify_one();
+            release.notified().await;
+        }
         self.interrupts.lock().await.push((
             native_thread_id.map(str::to_owned),
             native_turn_id.map(str::to_owned),
@@ -1536,6 +1628,7 @@ fn codex_readiness_shares_one_account_read_and_process_and_preserves_auth_failur
             let processor = &harness.processor;
             let temp = tempfile::tempdir().unwrap();
             let script = temp.path().join("fake-codex");
+            std::fs::write(temp.path().join("probe-response"), response).unwrap();
             std::fs::write(&script, format!(r#"#!/bin/sh
 cd "$(dirname "$0")" || exit 1
 printf '%s\n' started >> probe-starts
@@ -1546,7 +1639,8 @@ printf '%s\n' '{{"id":0,"result":{{"userAgent":"codex/1.2.3 test"}}}}'
 read initialized
 read account
 printf '%s\n' "$account" >> probe-requests
-printf '%s\n' '{response}'
+cat probe-response
+printf '\n'
 while read line; do
   printf '%s\n' "$line" >> probe-requests
   case "$line" in
@@ -1621,10 +1715,43 @@ done
                 );
                 assert!(probe.summary.capabilities.supports_mcp_tools);
                 assert!(probe.mcp_readiness.is_some());
+                // Reconcile without configuration invalidation. The same
+                // account source now fails independently of the working runtime.
+                std::fs::write(temp.path().join("probe-response"),
+                    r#"{"id":1,"error":{"code":-32603,"message":"workspace routing discovery failed"}}"#).unwrap();
+                processor
+                    .reconcile_cli_readiness_for_tests(&harness.workspace_id)
+                    .await
+                    .unwrap();
+                let failed = processor
+                    .cli_runtime_probe_snapshot(&harness.workspace_id, "codex")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    failed.summary.status,
+                    pioneer_protocol::RuntimeStatus::Error { .. }
+                ));
+                assert_eq!(failed.models.unwrap().result.models[0].id, "test-model");
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("probe-starts"))
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("probe-requests"))
+                        .unwrap()
+                        .matches("model/list")
+                        .count(),
+                    1
+                );
             } else {
                 assert!(!requests.contains("model/list"));
                 assert!(probe.models.is_none());
-                assert!(!probe.summary.capabilities.supports_mcp_tools);
+                // The fake technical attestation is independent of account diagnostics.
+                assert!(probe.summary.capabilities.supports_mcp_tools);
                 assert!(!probe.summary.diagnostics.is_empty());
             }
         }
@@ -2078,7 +2205,10 @@ async fn setup_cli_runtime_skill_preflight_harness(
     for entry in
         crate::system_skills::bundled_system_skill_catalog_entries(&harness.system_root).unwrap()
     {
-        if matches!(entry.slug.as_str(), "tasks" | "subagents") {
+        if matches!(
+            entry.slug.as_str(),
+            "tasks" | "subagents" | "html" | "threads"
+        ) {
             let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../resources/skills/pioneer")
                 .join(&entry.slug);
@@ -2107,6 +2237,8 @@ fn cli_runtime_turn_start_request_with_capabilities(
     ))
     .unwrap();
     request["params"]["capabilities"] = JsonValue::Array(capabilities);
+    serde_json::from_value::<pioneer_protocol::JsonRpcRequest>(request.clone())
+        .expect("CLI turn/start fixture must match the JSON-RPC envelope, including request ID");
     serde_json::from_value::<pioneer_protocol::TurnStartParams>(request["params"].clone())
         .expect("proposal 51 turn/start fixture must match protocol");
     request.to_string()
@@ -2417,6 +2549,25 @@ async fn capability_persistence_order_impl() {
             .await
             .expect("committed MCP capability event should arrive")
             .expect("committed lane should stay open");
+        // This unrestricted turn admits the Threads catalog alongside the
+        // default HTML and task tools, plus CUA when this build enables it.
+        let thread_actions = [
+            "threads_identity_models_list",
+            "thread_create",
+            "thread_message_send",
+            "threads_turn_start",
+        ];
+        let expected_mcp_bindings =
+            2 + if cfg!(feature = "computer-use") {
+                pioneer_protocol::CUA_TOOL_NAMES.len()
+            } else {
+                0
+            } + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                .definitions()
+                .len()
+                + crate::turn_mcp::native_tools::NativeToolFamily::Threads
+                    .definitions()
+                    .len();
         assert!(matches!(
             committed_capabilities,
             AgentDurableEvent::TurnCapabilitiesResolved {
@@ -2428,9 +2579,10 @@ async fn capability_persistence_order_impl() {
             } if committed_turn_id == turn_id
                 && accepted.is_empty()
                 && rejected.is_empty()
-                && mcp_bindings.len() == 2 + crate::turn_mcp::native_tools::NativeToolFamily::Tasks.definitions().len()
+                && mcp_bindings.len() == expected_mcp_bindings
                 && mcp_bindings.iter().all(|binding| crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id).is_some())
                 && mcp_bindings.iter().any(|binding| binding.raw_tool_name == "task_wait")
+                && thread_actions.iter().all(|name| mcp_bindings.iter().any(|binding| binding.raw_tool_name == *name))
         ));
         let committed_skills = timeout(Duration::from_secs(1), committed_rx.recv())
             .await
@@ -2442,7 +2594,10 @@ async fn capability_persistence_order_impl() {
                 turn_id: committed_turn_id,
                 bindings,
                 ..
-            } if committed_turn_id == turn_id && bindings.len() == 4
+            } if committed_turn_id == turn_id && bindings.len() == 6
+                && bindings.iter().filter(|binding| binding.source_kind == "system").count() == 4
+                && bindings.iter().any(|binding| binding.source_kind == "system" && binding.skill_slug == "html")
+                && bindings.iter().any(|binding| binding.source_kind == "system" && binding.skill_slug == "threads")
         ));
         if matches!(
             runtime_kind,
@@ -2455,7 +2610,12 @@ async fn capability_persistence_order_impl() {
                     item["type"] == "skill"
                         && !matches!(
                             item["name"].as_str(),
-                            Some("pioneer-system-tasks" | "pioneer-system-subagents")
+                            Some(
+                                "pioneer-system-tasks"
+                                    | "pioneer-system-subagents"
+                                    | "pioneer-system-html"
+                                    | "pioneer-system-threads"
+                            )
                         )
                 })
                 .cloned()
@@ -2605,7 +2765,7 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
 
         let first_receipt_bytes = first_receipt_snapshot.unwrap();
         let first_receipt = pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
-        assert_eq!(first_receipt.entries.len(), 3);
+        assert_eq!(first_receipt.entries.len(), 5);
         assert_eq!(first_receipt.entries[0].skill_id, lifecycle_id);
         assert_eq!(first_receipt.entries[0].owner.as_deref(), Some("tests"));
         assert_eq!(first_receipt.entries[0].slug, "lifecycle");
@@ -2697,22 +2857,55 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
             .process_request_for_connection(harness.connection_id, &zero_request)
             .await;
         wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 4).await;
-        assert!(
-            harness
-                .crud_store
-                .find_turn_skill_bindings(&zero_turn)
-                .await
-                .expect("must read zero-skill CLI runtime turn bindings")
-                .iter()
-                .all(|binding| binding.source_kind == "system"
-                    && matches!(binding.skill_slug.as_str(), "tasks" | "subagents"))
-        );
+        let zero_bindings = harness
+            .crud_store
+            .find_turn_skill_bindings(&zero_turn)
+            .await
+            .expect("must read zero-skill CLI runtime turn bindings");
+        assert_eq!(zero_bindings.len(), 4);
+        for slug in ["tasks", "subagents", "html", "threads"] {
+            assert!(
+                zero_bindings
+                    .iter()
+                    .any(|binding| binding.source_kind == "system"
+                        && binding.skill_owner.as_deref() == Some("pioneer")
+                        && binding.skill_slug == slug)
+            );
+        }
         assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_after_update);
         assert_eq!(
             std::fs::read(destination.join("SKILL.md")).unwrap(),
             destination_after_update
         );
     }
+}
+
+#[test]
+fn cli_html_skill_resolves_without_task_tools_or_explicit_attachments() {
+    run_standard_stack_message_test("HTML-only CLI skill resolution", async {
+        let harness =
+            setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
+        let resolved = harness
+            .processor
+            .resolve_cli_runtime_skill_attachments(
+                &harness.workspace_id,
+                &[],
+                &pioneer_agent::AgentMcpAvailability::default(),
+                false,
+                false,
+                true,
+            )
+            .await
+            .expect("HTML tools alone must require the bundled HTML skill");
+        assert_eq!(resolved.len(), 1);
+        let identity = &resolved[0].definition.identity;
+        assert_eq!(
+            identity.source_kind,
+            pioneer_skills::SkillSourceKind::System
+        );
+        assert_eq!(identity.owner.as_deref(), Some("pioneer"));
+        assert_eq!(identity.slug, "html");
+    });
 }
 
 #[test]
@@ -3602,7 +3795,7 @@ impl pioneer_tasks::TaskExecutor for FailingSystemExecutor {
     }
 }
 
-fn test_provider() -> Arc<pioneer_provider::ProviderRegistry> {
+pub(super) fn test_provider() -> Arc<pioneer_provider::ProviderRegistry> {
     Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(EchoProvider::new()),
@@ -3824,6 +4017,27 @@ impl Provider for DelayedProvider {
             transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
+    }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
+        Ok(vec![pioneer_protocol::ProviderModelInfo {
+            id: "test-model".to_owned(),
+            name: Some("Delayed fixture model".to_owned()),
+            description: None,
+            created: None,
+            provider: "openai".to_owned(),
+            owned_by: None,
+            limits: Default::default(),
+            capabilities: pioneer_protocol::ProviderModelCapabilities {
+                tool_calling: Some(false),
+                ..Default::default()
+            },
+            transcription: None,
+            pricing: None,
+            active: Some(true),
+            family: None,
+            lifecycle_status: None,
+        }])
     }
 
     async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
@@ -5656,37 +5870,46 @@ impl DirectAgentSandboxProvider {
     }
 }
 
-fn find_current_agent_target_option(value: &JsonValue) -> Option<String> {
+fn find_agent_option(value: &JsonValue, field: &str, label: Option<&str>) -> Option<String> {
     match value {
         JsonValue::Object(object) => {
-            if let Some(options) = object
-                .get("targetOptions")
-                .or_else(|| object.get("target_options"))
-                .and_then(JsonValue::as_array)
+            if let Some(options) = object.get(field).and_then(JsonValue::as_array)
                 && let Some(id) = options.iter().find_map(|option| {
-                    let label = option.get("label").and_then(JsonValue::as_str)?;
-                    (label == "Current thread")
+                    let actual = option.get("label").and_then(JsonValue::as_str)?;
+                    let selected = label.map_or(
+                        actual != "Current thread" && actual != "Current collaboration",
+                        |label| actual == label,
+                    );
+                    selected
                         .then(|| option.get("id").and_then(JsonValue::as_str))
                         .flatten()
                 })
             {
                 return Some(id.to_owned());
             }
-            object.values().find_map(find_current_agent_target_option)
+            object
+                .values()
+                .find_map(|value| find_agent_option(value, field, label))
         }
-        JsonValue::Array(values) => values.iter().find_map(find_current_agent_target_option),
+        JsonValue::Array(values) => values
+            .iter()
+            .find_map(|value| find_agent_option(value, field, label)),
         JsonValue::String(encoded) => serde_json::from_str::<JsonValue>(encoded)
             .ok()
             .as_ref()
-            .and_then(find_current_agent_target_option),
+            .and_then(|value| find_agent_option(value, field, label)),
         _ => None,
     }
 }
 
-fn current_agent_target_option_from_request(request: &ChatRequest) -> Option<String> {
+fn agent_option_from_request(
+    request: &ChatRequest,
+    field: &str,
+    label: Option<&str>,
+) -> Option<String> {
     for message in request.messages.iter().rev() {
         if let Ok(value) = serde_json::from_str::<JsonValue>(message.content.as_str())
-            && let Some(id) = find_current_agent_target_option(&value)
+            && let Some(id) = find_agent_option(&value, field, label)
         {
             return Some(id);
         }
@@ -5694,7 +5917,7 @@ fn current_agent_target_option_from_request(request: &ChatRequest) -> Option<Str
             let mut values = serde_json::Deserializer::from_str(&message.content[index..])
                 .into_iter::<JsonValue>();
             if let Some(Ok(value)) = values.next()
-                && let Some(id) = find_current_agent_target_option(&value)
+                && let Some(id) = find_agent_option(&value, field, label)
             {
                 return Some(id);
             }
@@ -6760,6 +6983,7 @@ impl Provider for DirectAgentSandboxProvider {
             } else {
                 test_turn_preflight_response_with_visible_tools(&[
                     "threads_start_options",
+                    "thread_create",
                     "threads_turn_start",
                 ])
             });
@@ -6805,13 +7029,34 @@ impl Provider for DirectAgentSandboxProvider {
                 }],
             },
             1 => {
-                let target_option_id = current_agent_target_option_from_request(&request)
+                let option = agent_option_from_request(
+                    &request,
+                    "threadCreationOptions",
+                    Some("Current collaboration"),
+                )
+                .expect("parent options must allow an internal child thread");
+                ChatResponse {
+                    messages: Vec::new(),
+                    text: String::new(),
+                    usage: None,
+                    reasoning_content: None,
+                    provider_replay_state: None,
+                    termination: pioneer_provider::ProviderTermination::ToolCalls,
+                    tool_calls: vec![ProviderToolCall {
+                        id: "call_direct_agent_create".to_owned(),
+                        name: "thread_create".to_owned(),
+                        arguments: json!({"optionId":option}).to_string(),
+                    }],
+                }
+            }
+            2 => {
+                let target_option_id = agent_option_from_request(&request, "targetOptions", None)
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "threads_start_options output did not contain a current-thread target: {:#?}",
-                            request.messages
-                        )
-                    })?;
+                    anyhow::anyhow!(
+                        "thread_create output did not contain a child-thread target: {:#?}",
+                        request.messages
+                    )
+                })?;
                 ChatResponse {
                     messages: Vec::new(),
                     text: String::new(),
@@ -6857,7 +7102,7 @@ impl Provider for DirectAgentSandboxProvider {
     }
 }
 
-fn test_gateway_secrets() -> Arc<GatewaySecrets> {
+pub(super) fn test_gateway_secrets() -> Arc<GatewaySecrets> {
     Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())))
 }
 
@@ -8129,6 +8374,7 @@ fn detached_cli_task_create_params(
     params.metadata = Some(pioneer_protocol::TaskMetadata {
         labels: vec!["native-cli-runtime".to_owned()],
         data: None,
+        finish_request: None,
         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(
             pioneer_protocol::TurnStartParams {
                 agent_delegation_routes: Vec::new(),
@@ -8479,45 +8725,36 @@ async fn exact_cli_task_launch_for_test(
 ) -> anyhow::Result<pioneer_protocol::AgentLaunchSelection> {
     sync_test_cli_runtime_identities(processor).await?;
 
-    let (_, default_launch) = super::agent_action_tools::resolve_workspace_task_launch(
+    let runtime = processor
+        .load_cli_runtime_instances()?
+        .into_iter()
+        .find(|runtime| runtime.id == runtime_id && runtime.enabled)
+        .context("test CLI runtime missing")?;
+    let runtime_kind = match runtime.kind {
+        pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => {
+            pioneer_protocol::CLIAgentRuntimeKind::Codex
+        }
+        pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
+            pioneer_protocol::CLIAgentRuntimeKind::Claude
+        }
+        pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode => {
+            pioneer_protocol::CLIAgentRuntimeKind::OpenCode
+        }
+    };
+    let (_, resolved) = super::agent_action_tools::resolve_workspace_task_launch(
         processor,
         workspace_id,
         default_provider,
         default_model,
         None,
-        None,
+        Some(&pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime {
+            runtime_id: runtime_id.to_owned(),
+            runtime_kind,
+        }),
         "test-cli-task-launch-catalog",
     )
     .await?;
-    let (default_identity, default_profile) =
-        default_launch.context("test workspace Pioneer launch projection is missing")?;
-    let (identities, profiles) = super::agent_action_tools::current_workspace_launch_catalog(
-        processor,
-        workspace_id,
-        &default_identity,
-        &default_profile,
-        default_provider,
-        default_model,
-    )
-    .await?;
-    let profile = profiles
-        .into_iter()
-        .find(|profile| {
-            matches!(
-                &profile.backend,
-                pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
-                    runtime_instance_id,
-                } if runtime_instance_id == runtime_id
-            )
-        })
-        .with_context(|| format!("test CLI runtime `{runtime_id}` has no exact launch profile"))?;
-    let identity = identities
-        .into_iter()
-        .find(|identity| {
-            identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
-                && profile.compatible_agent_identity_ids.contains(&identity.id)
-        })
-        .with_context(|| format!("test CLI runtime `{runtime_id}` has no exact Agent identity"))?;
+    let (identity, profile) = resolved.context("test CLI launch projection missing")?;
     Ok(pioneer_protocol::AgentLaunchSelection {
         agent: pioneer_protocol::AgentIdentitySelection::Exact {
             agent_identity_id: identity.id,
@@ -8594,6 +8831,13 @@ async fn create_task_for_test(
         );
     }
     let mut context = processor.task_create_context_for_params(&params).await?;
+    if crate::task_tools::is_webhook_trigger(&params.trigger.spec) {
+        let secret_ref = pioneer_protocol::generate_id(21);
+        processor
+            .gateway_secrets
+            .ensure_task_webhook_secret(&secret_ref)?;
+        context.webhook_secret_ref = Some(secret_ref);
+    }
     let principal = authenticated_test_superuser();
     context.actor_id = Some(principal.principal_id.to_string());
     if params.executor_kind == pioneer_protocol::TaskExecutorKind::Agent {
@@ -8688,8 +8932,7 @@ async fn create_task_for_test(
                     params.workspace_id.as_str(),
                     identity,
                     profile,
-                    task_model_provider.as_str(),
-                    task_model.as_str(),
+                    &admitted,
                     true,
                     child_skill_ids,
                     admitted.granted_mcp_server_capability_ids().to_vec(),
@@ -9139,7 +9382,7 @@ pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
         },
         computer_use: ComputerUseToolsConfig {
             runtime_home_dir: std::env::temp_dir().join("pioneer-gateway-message-tests"),
-            artifacts_subdir: "tools/computer_use".to_owned(),
+
             ..ComputerUseToolsConfig::default()
         },
         skills: SkillsLoopConfig {
@@ -9627,6 +9870,7 @@ struct ProgressDeltaHarness {
     processor: MessageProcessor,
     crud_store: Arc<CrudStore>,
     rx: Option<mpsc::Receiver<Message>>,
+    connection_id: Option<ConnectionId>,
     workspace_id: String,
     thread_id: String,
     turn_id: String,
@@ -9658,7 +9902,7 @@ async fn setup_progress_delta_harness(
     let turn_id = generate_test_request_id("turn", case_id);
     let item_id = item.item_id().to_owned();
 
-    let rx = if subscribe {
+    let (connection_id, rx) = if subscribe {
         let (tx, rx) = mpsc::channel(16);
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -9685,9 +9929,9 @@ async fn setup_progress_delta_harness(
             )
             .await
             .expect("thread/start should seed subscribed thread");
-        Some(rx)
+        (Some(connection_id), Some(rx))
     } else {
-        None
+        (None, None)
     };
 
     let thread = pioneer_protocol::Thread {
@@ -9742,23 +9986,25 @@ async fn setup_progress_delta_harness(
         turn_id.as_str(),
     )
     .await;
-    crud_store
-        .materialize_item_started(
-            ItemStartedNotification {
-                workspace_id: workspace_id.clone(),
-                thread_id: thread_id.clone(),
-                turn_id: turn_id.clone(),
-                item,
-            },
-            2,
-        )
-        .await
-        .expect("item/started should materialize");
+    assert!(
+        processor
+            .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                notification: ItemStartedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item,
+                },
+            })
+            .await,
+        "item/started should commit through the Gateway lifecycle"
+    );
 
     ProgressDeltaHarness {
         processor,
         crud_store,
         rx,
+        connection_id,
         workspace_id,
         thread_id,
         turn_id,
@@ -9883,72 +10129,1248 @@ fn web_fetch_item(item_id: &str) -> TurnItem {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn assistant_progress_delta_is_live_only_and_completed_item_is_durable() {
-    let mut harness = setup_progress_delta_harness(
-        "agent_msg",
-        TurnItem::AgentMessage {
-            id: "item_progress_agent_msg".to_owned(),
-            text: String::new(),
+#[tokio::test]
+async fn service_items_cannot_gain_markdown_from_stream_or_payload() {
+    let mut harness =
+        setup_progress_delta_harness("markdown_denied", command_execution_item("denied"), true)
+            .await;
+    let mut items = vec![context_compaction_item("denied_system")];
+    // These are real protocol tool variants with their existing default fields.
+    for kind in [
+        "commandExecution",
+        "fileChange",
+        "webSearch",
+        "webFetch",
+        "download",
+        "dynamicToolCall",
+    ] {
+        let mut value = serde_json::to_value(command_execution_item(kind)).unwrap();
+        value["type"] = json!(kind);
+        items.push(serde_json::from_value::<TurnItem>(value).unwrap());
+    }
+    items.push(TurnItem::Task {
+        item: TaskTurnItem {
+            id: "denied_task".into(),
+            task_id: "task_denied".into(),
+            created_by_turn_id: None,
+            run_id: None,
+            parent_task_id: None,
+            root_task_id: None,
+            title: "**service**".into(),
+            status: TaskStatus::Running,
+            attachment: TaskAttachmentMode::Attached,
+            trigger_kind: TaskTriggerKind::Immediate,
+            executor_kind: TaskExecutorKind::Agent,
+            child_thread_id: None,
+            child_turn_id: None,
+            agent_role: None,
+            depth: 0,
+            max_depth: 3,
+            next_fire_at: None,
+            progress_preview: None,
+            result_preview: None,
+            error_preview: None,
+            started_at: None,
+            created_at: 1,
+            updated_at: 1,
+        },
+    });
+    for item in items {
+        let item_type = item.item_type();
+        harness.item_id = item.item_id().to_owned();
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                    notification: ItemStartedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: harness.thread_id.clone(),
+                        turn_id: harness.turn_id.clone(),
+                        item,
+                    },
+                })
+                .await
+        );
+        let streams = if item_type == TurnItemType::CommandExecution {
+            vec![
+                Some(ItemDeltaStream::Generic),
+                None,
+                Some(ItemDeltaStream::AgentMessage),
+            ]
+        } else {
+            vec![Some(ItemDeltaStream::Generic)]
+        };
+        for stream in streams {
+            let mut notification = progress_delta_notification(
+                &harness,
+                "# **not prose** 🦀",
+                ItemDeltaStream::Generic,
+            );
+            notification.stream = stream;
+            notification.payload =
+                Some(json!({"runtimeDeltaKind":"agent_message", "type":"agentMessage"}));
+            harness
+                .processor
+                .handle_progress_agent_event(AgentProgressEvent::ItemDelta { notification })
+                .await;
+            let live = recv_notification_by_method(
+                harness.rx.as_mut().unwrap(),
+                events::ITEM_AGENT_MESSAGE_DELTA,
+            )
+            .await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            assert_eq!(live.delta, "# **not prose** 🦀");
+            assert_eq!(live.stream, stream);
+            assert!(
+                live.markdown.is_none() && live.markdown_version.is_none(),
+                "{item_type:?}"
+            );
+            assert!(
+                harness
+                    .processor
+                    .agent_message_buffers
+                    .lock()
+                    .await
+                    .is_empty(),
+                "{item_type:?}"
+            );
+        }
+    }
+    assert_eq!(
+        harness
+            .processor
+            .markdown_delta_parse_count
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        harness
+            .processor
+            .progress_item_type_lookup_count
+            .load(Ordering::Relaxed),
+        0,
+        "started cache is reused, including for heartbeat; no fallback SQL on a cache hit"
+    );
+}
+
+#[tokio::test]
+async fn unknown_and_late_resolved_items_keep_raw_delta_until_a_full_snapshot() {
+    let mut harness =
+        setup_progress_delta_harness("markdown_late", command_execution_item("known_tool"), true)
+            .await;
+    harness.item_id = "late_message".into();
+    for stream in [Some(ItemDeltaStream::Generic), None] {
+        let mut notification = progress_delta_notification(
+            &harness,
+            "# missing prefix\n```\n",
+            ItemDeltaStream::Generic,
+        );
+        notification.stream = stream;
+        harness
+            .processor
+            .handle_progress_agent_event(AgentProgressEvent::ItemDelta { notification })
+            .await;
+        let live = recv_notification_by_method(
+            harness.rx.as_mut().unwrap(),
+            events::ITEM_AGENT_MESSAGE_DELTA,
+        )
+        .await;
+        let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+        assert_eq!(live.delta, "# missing prefix\n```\n");
+        assert!(live.markdown.is_none() && live.markdown_version.is_none());
+    }
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    // Existing bounded DB fallback can discover a type without a live prefix.
+    let snapshot = ItemStartedNotification {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item: TurnItem::AgentMessage {
+            id: harness.item_id.clone(),
+            text: "# recovered\n```\n".into(),
             phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },
-        true,
-    )
-    .await;
-
+    };
+    harness
+        .crud_store
+        .materialize_item_started(snapshot.clone(), now_timestamp_secs())
+        .await
+        .unwrap();
+    let previous_lookups = harness
+        .processor
+        .progress_item_type_lookup_count
+        .load(Ordering::Relaxed);
+    harness
+        .processor
+        .progress_items
+        .lock()
+        .await
+        .forget_turn(&harness.turn_id);
     harness
         .processor
         .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
             notification: progress_delta_notification(
                 &harness,
-                "hel",
+                "tail 🦀",
                 ItemDeltaStream::AgentMessage,
             ),
         })
         .await;
-
     let live = recv_notification_by_method(
-        harness.rx.as_mut().expect("live receiver should exist"),
+        harness.rx.as_mut().unwrap(),
         events::ITEM_AGENT_MESSAGE_DELTA,
     )
     .await;
-    let live_payload: ItemDeltaNotification =
-        serde_json::from_value(live.params.expect("delta params expected"))
-            .expect("live item delta payload should decode");
-    assert_eq!(live_payload.delta, "hel");
-
-    let payloads = turn_item_payloads(&harness).await;
-    assert_no_persisted_item_delta(payloads.as_slice());
-
+    let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+    assert_eq!(live.delta, "tail 🦀");
+    assert!(live.markdown.is_none() && live.markdown_version.is_none());
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        harness
+            .processor
+            .markdown_delta_parse_count
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        harness
+            .processor
+            .progress_item_type_lookup_count
+            .load(Ordering::Relaxed),
+        previous_lookups + 1,
+        "one existing fallback resolves the late type without recovering a prefix"
+    );
+    assert!(
+        harness
+            .processor
+            .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                notification: snapshot
+            })
+            .await
+    );
     harness
         .processor
-        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
-            notification: ItemCompletedNotification {
-                workspace_id: harness.workspace_id.clone(),
-                thread_id: harness.thread_id.clone(),
-                turn_id: harness.turn_id.clone(),
-                item: TurnItem::AgentMessage {
-                    id: harness.item_id.clone(),
-                    text: "hello".to_owned(),
-                    phase: Default::default(),
-                    markdown: None,
-                    markdown_version: None,
-                },
-            },
+        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+            notification: progress_delta_notification(
+                &harness,
+                "full tail 🦀\n```",
+                ItemDeltaStream::AgentMessage,
+            ),
         })
         .await;
+    let live = recv_notification_by_method(
+        harness.rx.as_mut().unwrap(),
+        events::ITEM_AGENT_MESSAGE_DELTA,
+    )
+    .await;
+    let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+    assert_eq!(
+        live.markdown,
+        Some(super::markdown::parse_markdown_document(
+            "# recovered\n```\nfull tail 🦀\n```"
+        ))
+    );
+}
 
-    let payloads = turn_item_payloads(&harness).await;
-    assert_no_persisted_item_delta(payloads.as_slice());
-    assert!(payloads.iter().any(|payload| matches!(
-        payload,
+#[test]
+fn replay_markdown_requires_an_allowed_snapshot_and_preserves_its_full_source() {
+    let snapshot = |item: TurnItem, updated: bool| {
+        if updated {
+            TurnItemEventPayload::ItemUpdated {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item,
+            }
+        } else {
+            TurnItemEventPayload::ItemStarted {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item,
+            }
+        }
+    };
+    let message = |text: &str| TurnItem::AgentMessage {
+        id: "message".into(),
+        text: text.into(),
+        phase: Default::default(),
+        markdown: None,
+        markdown_version: None,
+    };
+    let delta =
+        |item_id: &str, text: &str, turn: &str, preview: bool| TurnItemEventPayload::ItemDelta {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: turn.into(),
+            item_id: item_id.into(),
+            delta: text.into(),
+            stream: None,
+            payload: preview.then(|| json!({"runtimeDeltaKind":"provider_message_preview"})),
+            markdown: None,
+            markdown_version: None,
+        };
+    let mut events = vec![
+        snapshot(command_execution_item("tool"), false),
+        delta("tool", "# **tool** 🦀", "turn", false),
+        delta("unknown", "# unknown", "turn", false),
+        delta("message", "lost prefix", "turn", false),
+        snapshot(message("# Начало\r\n```\r\n"), false),
+        delta("message", "stale preview", "turn", true),
+        delta("message", "краб ", "turn", false),
+        delta("message", "🦀\r\n```", "turn", false),
+        delta("message", "other execution", "other-turn", false),
+        snapshot(message("**snapshot"), true),
+        delta("message", " 🦀**", "turn", false),
         TurnItemEventPayload::ItemCompleted {
-            item: TurnItem::AgentMessage { id, text, .. },
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: message("# Final authoritative"),
+        },
+        delta("message", "after completion", "turn", false),
+        snapshot(message("old source"), false),
+        snapshot(command_execution_item("message"), true),
+        delta("message", "denied replacement", "turn", false),
+        snapshot(
+            TurnItem::Reasoning {
+                id: "reasoning".into(),
+                summary: vec!["**мысль".into()],
+                content: vec![],
+            },
+            false,
+        ),
+        delta("reasoning", " 🦀**", "turn", false),
+        snapshot(
+            TurnItem::UserMessage {
+                id: "user".into(),
+                text: "# пользователь\r\n".into(),
+                attachments: vec![],
+            },
+            false,
+        ),
+        delta("user", "🦀", "turn", false),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, payload)| pioneer_protocol::TurnItemEvent {
+        sequence: index as i64,
+        created_at: 1,
+        payload,
+    })
+    .collect::<Vec<_>>();
+    MessageProcessor::enrich_turn_item_events_markdown(&mut events);
+    for index in [1, 2, 3, 5, 8, 12, 15] {
+        let TurnItemEventPayload::ItemDelta {
+            markdown,
+            markdown_version,
             ..
-        } if id == &harness.item_id && text == "hello"
-    )));
+        } = &events[index].payload
+        else {
+            panic!("delta")
+        };
+        assert!(
+            markdown.is_none() && markdown_version.is_none(),
+            "event {index}"
+        );
+    }
+    for (index, source) in [
+        (6, "# Начало\r\n```\r\nкраб "),
+        (7, "# Начало\r\n```\r\nкраб 🦀\r\n```"),
+        (10, "**snapshot 🦀**"),
+        (17, "**мысль 🦀**"),
+        (19, "# пользователь\r\n🦀"),
+    ] {
+        let TurnItemEventPayload::ItemDelta {
+            markdown,
+            markdown_version,
+            ..
+        } = &events[index].payload
+        else {
+            panic!("delta")
+        };
+        assert_eq!(
+            markdown.as_ref(),
+            Some(&super::markdown::parse_markdown_document(source)),
+            "event {index}"
+        );
+        assert_eq!(
+            *markdown_version,
+            Some(pioneer_protocol::MARKDOWN_AST_VERSION)
+        );
+    }
+    let TurnItemEventPayload::ItemCompleted {
+        item: TurnItem::AgentMessage { markdown, .. },
+        ..
+    } = &events[11].payload
+    else {
+        panic!("final message")
+    };
+    assert_eq!(
+        markdown.as_ref(),
+        Some(&super::markdown::parse_markdown_document(
+            "# Final authoritative"
+        ))
+    );
+}
+
+#[tokio::test]
+async fn markdown_lifecycle_replaces_denied_items_and_isolates_turns_and_missing_prefixes() {
+    let harness = setup_progress_delta_harness(
+        "markdown_lifecycle",
+        TurnItem::AgentMessage {
+            id: "message".into(),
+            text: "old prefix".into(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+        false,
+    )
+    .await;
+    let mut delta = progress_delta_notification(&harness, "missing", ItemDeltaStream::Generic);
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, None)
+        .await;
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    delta.delta = "tail".into();
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
+        .await;
+    assert!(
+        delta.markdown.is_none(),
+        "lost classification invalidates the entire prefix"
+    );
+    let mut start = ItemStartedNotification {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item: TurnItem::AgentMessage {
+            id: harness.item_id.clone(),
+            text: "replacement".into(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+    };
+    harness
+        .processor
+        .enrich_item_started_markdown(&mut start)
+        .await;
+    start.item = command_execution_item(&harness.item_id);
+    harness
+        .processor
+        .enrich_item_started_markdown(&mut start)
+        .await;
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    start.turn_id = "another-turn".into();
+    start.item = TurnItem::AgentMessage {
+        id: harness.item_id.clone(),
+        text: "# new\r\n".into(),
+        phase: Default::default(),
+        markdown: None,
+        markdown_version: None,
+    };
+    harness
+        .processor
+        .enrich_item_started_markdown(&mut start)
+        .await;
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
+        .await;
+    assert!(
+        delta.markdown.is_none(),
+        "previous turn cannot append into the replacement"
+    );
+    let mut completed = ItemCompletedNotification {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item: start.item.clone(),
+    };
+    harness
+        .processor
+        .enrich_item_completed_markdown(&mut completed)
+        .await;
+    assert_eq!(
+        harness.processor.agent_message_buffers.lock().await.len(),
+        1,
+        "old completion cannot remove the replacement turn"
+    );
+    delta.turn_id = start.turn_id;
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
+        .await;
+    assert_eq!(
+        delta.markdown,
+        Some(super::markdown::parse_markdown_document("# new\r\ntail"))
+    );
+    harness
+        .processor
+        .teardown_agent_thread(&harness.thread_id)
+        .await;
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    delta.markdown = None;
+    delta.markdown_version = None;
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
+        .await;
+    assert!(
+        delta.markdown.is_none(),
+        "teardown cannot be followed by a tail-only buffer"
+    );
+}
+
+#[tokio::test]
+async fn gateway_missing_prefix_fallback_replaces_stale_client_markdown_and_recovers() {
+    use pioneer_client::core::{ClientCore, ClientScope};
+    use pioneer_client::timeline::item_presentation::TimelineItemPresentation;
+    use pioneer_client::timeline::semantic::TopLevelPageMergeMode;
+    use pioneer_protocol::{AgentMessagePhase, GatewayNotification};
+    use std::num::NonZeroUsize;
+
+    fn selected(
+        core: &Arc<ClientCore>,
+        thread: &str,
+        turn: &str,
+        id: &str,
+    ) -> (TimelineItemPresentation, TurnItem) {
+        core.set_thread_turn_work_expanded(thread, turn, true);
+        // Public shell subscription materializes the current presentation even
+        // without a background presentation worker in this fixture.
+        let _lease = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: thread.into(),
+            },
+            NonZeroUsize::new(8).unwrap(),
+        );
+        let snapshot = core
+            .thread_presentation_snapshot(thread)
+            .unwrap()
+            .timeline();
+        let row = snapshot
+            .rows()
+            .iter()
+            .find(|row| row.item().is_some_and(|item| item.id == id))
+            .expect("message row must be visible");
+        (
+            row.content().unwrap().clone(),
+            row.item().unwrap().item.clone(),
+        )
+    }
+    fn assert_reasoning_body(item: &TurnItem, expected: &str) {
+        if let TurnItem::Reasoning {
+            summary, content, ..
+        } = item
+        {
+            // Desktop builds its body from this actual row payload, not from
+            // TimelineItemPresentation.text (which prefers content alone).
+            assert_eq!(
+                pioneer_client::timeline::labels::reasoning_text(summary, content, ""),
+                expected,
+            );
+        }
+    }
+    fn projected(
+        core: &ClientCore,
+        thread: &str,
+        id: &str,
+    ) -> pioneer_client::conversation::ItemView {
+        core.thread_coordinator_snapshot(thread)
+            .unwrap()
+            .conversation
+            .projection()
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .unwrap()
+            .clone()
+    }
+    async fn send(harness: &mut ProgressDeltaHarness, text: &str) -> ItemDeltaNotification {
+        harness
+            .processor
+            .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                notification: progress_delta_notification(
+                    harness,
+                    text,
+                    ItemDeltaStream::AgentMessage,
+                ),
+            })
+            .await;
+        let live = recv_notification_by_method(
+            harness.rx.as_mut().unwrap(),
+            events::ITEM_AGENT_MESSAGE_DELTA,
+        )
+        .await;
+        serde_json::from_value(live.params.unwrap()).unwrap()
+    }
+
+    // Distinct storage/lifecycle risks: top-level final, work-item commentary,
+    // and Reasoning's existing AST-free semantic representation.
+    let cases: &[(
+        &str,
+        AgentMessagePhase,
+        Option<&[&str]>,
+        &[&str],
+        &str,
+        &str,
+    )] = &[
+        (
+            "fallback_final",
+            AgentMessagePhase::FinalAnswer,
+            None,
+            &[],
+            "**head**",
+            "**head**",
+        ),
+        (
+            "fallback_commentary",
+            AgentMessagePhase::Commentary,
+            None,
+            &[],
+            "**head**",
+            "**head**",
+        ),
+        (
+            "fallback_reasoning_content",
+            AgentMessagePhase::FinalAnswer,
+            Some(&[]),
+            &["**head**"],
+            "**head**",
+            "**head**",
+        ),
+        (
+            "fallback_reasoning_summary",
+            AgentMessagePhase::FinalAnswer,
+            Some(&["**head**", "prefix 🧠"]),
+            &[],
+            "**head**\nprefix 🧠",
+            "**head**\nprefix 🧠",
+        ),
+        (
+            "fallback_reasoning_both",
+            AgentMessagePhase::FinalAnswer,
+            Some(&["summary one", "summary two"]),
+            &["**head**", "independent 🧠"],
+            "**head**\nindependent 🧠",
+            "summary one\nsummary two\n\n**head**\nindependent 🧠",
+        ),
+    ];
+    for &(case, phase, summary, content, head, body) in cases {
+        let reasoning = summary.is_some();
+        let item = if let Some(summary) = summary {
+            TurnItem::Reasoning {
+                id: "message".into(),
+                summary: summary.iter().map(|part| (*part).into()).collect(),
+                content: content.iter().map(|part| (*part).into()).collect(),
+            }
+        } else {
+            TurnItem::AgentMessage {
+                id: "message".into(),
+                text: head.into(),
+                phase,
+                markdown: None,
+                markdown_version: None,
+            }
+        };
+        let mut harness = setup_progress_delta_harness(case, item, true).await;
+        let core = Arc::new(ClientCore::new());
+        let thread = harness
+            .processor
+            .thread_manager
+            .thread_get(&harness.thread_id)
+            .await
+            .unwrap();
+        core.upsert_thread(thread.clone());
+        let started = turn_item_payloads(&harness)
+            .await
+            .into_iter()
+            .find_map(|payload| match payload {
+                TurnItemEventPayload::ItemStarted { item, .. }
+                    if item.item_id() == harness.item_id =>
+                {
+                    Some(item)
+                }
+                _ => None,
+            })
+            .unwrap();
+        core.apply_thread_notification(GatewayNotification::ItemStarted(ItemStartedNotification {
+            workspace_id: harness.workspace_id.clone(),
+            thread_id: harness.thread_id.clone(),
+            turn_id: harness.turn_id.clone(),
+            item: started,
+        }));
+        let (started_content, started_item) = selected(
+            &core,
+            &harness.thread_id,
+            &harness.turn_id,
+            &harness.item_id,
+        );
+        assert_eq!(started_content.text, head);
+        assert_reasoning_body(&started_item, body);
+        if reasoning {
+            let initial = send(&mut harness, " warm").await;
+            assert!(initial.markdown.is_some());
+            core.apply_thread_notification(GatewayNotification::ItemDelta(initial));
+        }
+        let head = if reasoning {
+            format!("{head} warm")
+        } else {
+            head.into()
+        };
+        let body = if reasoning {
+            format!("{body} warm")
+        } else {
+            body.into()
+        };
+        let initial = projected(&core, &harness.thread_id, &harness.item_id);
+        assert!(
+            initial.partial_markdown.is_some(),
+            "the old AST must exist before fallback"
+        );
+        if let TurnItem::AgentMessage { markdown, .. } = &initial.item {
+            assert!(
+                markdown.is_some(),
+                "the payload fallback must also be populated"
+            );
+        }
+        let (before, before_item) = selected(
+            &core,
+            &harness.thread_id,
+            &harness.turn_id,
+            &harness.item_id,
+        );
+        assert_eq!(before.text, head);
+        assert_reasoning_body(&before_item, &body);
+        assert_eq!(before.markdown.is_some(), !reasoning);
+        assert_eq!(before.markdown_presentation.is_some(), !reasoning);
+
+        // Restore the final-answer row through the actual persisted history page
+        // producer and public client page boundary, without a new live ItemStarted.
+        let restored = if !reasoning && phase == AgentMessagePhase::FinalAnswer {
+            let request_id = generate_test_request_id("fallback", "history");
+            harness.processor.process_request_for_connection(harness.connection_id.unwrap(), &json!({
+                "jsonrpc":"2.0", "id":request_id, "method":"thread/timeline/page",
+                "params":{"threadId":harness.thread_id, "anchor":{"kind":"newest"}, "limit":10}
+            }).to_string()).await;
+            let response = recv_response_by_id(harness.rx.as_mut().unwrap(), &request_id).await;
+            let page: pioneer_protocol::ThreadTimelinePageResponse =
+                serde_json::from_value(response.result).unwrap();
+            let restored = Arc::new(ClientCore::new());
+            restored.upsert_thread(thread);
+            assert!(restored.apply_thread_timeline_page(page, TopLevelPageMergeMode::Reset));
+            let (old, _) = selected(
+                &restored,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            assert!(old.markdown.is_some() && old.markdown_presentation.is_some());
+            assert_eq!(old.text, head);
+            Some(restored)
+        } else {
+            None
+        };
+
+        let mut preview = progress_delta_notification(&harness, " draft", ItemDeltaStream::Generic);
+        preview.payload = Some(json!({"runtimeDeltaKind":"provider_message_preview"}));
+        harness
+            .processor
+            .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                notification: preview,
+            })
+            .await;
+        let preview = recv_notification_by_method(
+            harness.rx.as_mut().unwrap(),
+            events::ITEM_AGENT_MESSAGE_DELTA,
+        )
+        .await;
+        let preview: ItemDeltaNotification =
+            serde_json::from_value(preview.params.unwrap()).unwrap();
+        assert!(preview.markdown.is_none());
+        for consumer in std::iter::once(&core).chain(restored.iter()) {
+            let (before_preview, before_preview_item) = selected(
+                consumer,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            consumer.apply_thread_notification(GatewayNotification::ItemDelta(preview.clone()));
+            let (after_preview, after_preview_item) = selected(
+                consumer,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            assert_eq!(after_preview.text, before_preview.text);
+            assert_eq!(after_preview_item, before_preview_item);
+            assert_reasoning_body(&after_preview_item, &body);
+            assert_eq!(after_preview.markdown, before_preview.markdown);
+            assert_eq!(
+                after_preview.markdown_presentation,
+                before_preview.markdown_presentation
+            );
+        }
+        assert_eq!(
+            projected(&core, &harness.thread_id, &harness.item_id),
+            initial
+        );
+
+        // Real teardown removes the server's canonical prefix while its existing
+        // trusted type cache/turn guard can still deliver the next raw fragment.
+        harness
+            .processor
+            .teardown_agent_thread(&harness.thread_id)
+            .await;
+        let parse_count = harness
+            .processor
+            .markdown_delta_parse_count
+            .load(Ordering::Relaxed);
+        let fallback = send(&mut harness, " tail 🦀\r\n").await;
+        assert!(fallback.markdown.is_none() && fallback.markdown_version.is_none());
+        assert!(
+            harness
+                .processor
+                .agent_message_buffers
+                .lock()
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            harness
+                .processor
+                .markdown_delta_parse_count
+                .load(Ordering::Relaxed),
+            parse_count
+        );
+        let full = format!("{head} tail 🦀\r\n");
+        for consumer in std::iter::once(&core).chain(restored.iter()) {
+            consumer.apply_thread_notification(GatewayNotification::ItemDelta(fallback.clone()));
+            let (raw, raw_item) = selected(
+                consumer,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            assert_eq!(
+                raw.text, full,
+                "the received tail must be selected for display"
+            );
+            assert!(raw.markdown.is_none() && raw.markdown_presentation.is_none());
+            assert_reasoning_body(&raw_item, &format!("{body} tail 🦀\r\n"));
+        }
+        let raw = projected(&core, &harness.thread_id, &harness.item_id);
+        assert_eq!(raw.partial_text, full);
+        assert!(raw.partial_markdown.is_none() && raw.final_markdown.is_none());
+        if let TurnItem::AgentMessage {
+            markdown,
+            markdown_version,
+            ..
+        } = raw.item
+        {
+            assert!(
+                markdown.is_none() && markdown_version.is_none(),
+                "payload cannot resurrect the old AST"
+            );
+        }
+
+        // Only after proving the fallback, give Gateway a new full authoritative
+        // prefix. Do not send this started event to the existing clients.
+        let recovered = if reasoning {
+            TurnItem::Reasoning {
+                id: harness.item_id.clone(),
+                summary: vec![],
+                content: vec![full.clone()],
+            }
+        } else {
+            TurnItem::AgentMessage {
+                id: harness.item_id.clone(),
+                text: full.clone(),
+                phase,
+                markdown: None,
+                markdown_version: None,
+            }
+        };
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                    notification: ItemStartedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: harness.thread_id.clone(),
+                        turn_id: harness.turn_id.clone(),
+                        item: recovered,
+                    },
+                })
+                .await
+        );
+        let fresh = send(&mut harness, "**again**").await;
+        let recovered_text = format!("{full}**again**");
+        let recovered_ast = super::markdown::parse_markdown_document(&recovered_text);
+        assert_eq!(fresh.markdown, Some(recovered_ast.clone()));
+        for consumer in std::iter::once(&core).chain(restored.iter()) {
+            consumer.apply_thread_notification(GatewayNotification::ItemDelta(fresh.clone()));
+            let (content, content_item) = selected(
+                consumer,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            assert_eq!(content.text, recovered_text);
+            assert_reasoning_body(&content_item, &format!("{body} tail 🦀\r\n**again**"));
+            if !reasoning {
+                assert_eq!(content.markdown, Some(recovered_ast.clone()));
+                assert!(content.markdown_presentation.is_some());
+            }
+        }
+        assert_eq!(
+            projected(&core, &harness.thread_id, &harness.item_id).partial_markdown,
+            Some(recovered_ast)
+        );
+
+        let final_text = if reasoning {
+            recovered_text.as_str()
+        } else {
+            "# authoritative final"
+        };
+        let final_item = if reasoning {
+            TurnItem::Reasoning {
+                id: harness.item_id.clone(),
+                summary: vec!["authoritative summary".into(), "final detail".into()],
+                content: vec![final_text.into()],
+            }
+        } else {
+            TurnItem::AgentMessage {
+                id: harness.item_id.clone(),
+                text: final_text.into(),
+                phase,
+                markdown: None,
+                markdown_version: None,
+            }
+        };
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
+                    notification: ItemCompletedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: harness.thread_id.clone(),
+                        turn_id: harness.turn_id.clone(),
+                        item: final_item,
+                    },
+                })
+                .await
+        );
+        let completed = turn_item_payloads(&harness)
+            .await
+            .into_iter()
+            .find_map(|payload| match payload {
+                TurnItemEventPayload::ItemCompleted { item, .. }
+                    if item.item_id() == harness.item_id =>
+                {
+                    Some(item)
+                }
+                _ => None,
+            })
+            .unwrap();
+        for consumer in std::iter::once(&core).chain(restored.iter()) {
+            consumer.apply_thread_notification(GatewayNotification::ItemCompleted(
+                ItemCompletedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: harness.thread_id.clone(),
+                    turn_id: harness.turn_id.clone(),
+                    item: completed.clone(),
+                },
+            ));
+        }
+        let (terminal_content, terminal_item) = selected(
+            &core,
+            &harness.thread_id,
+            &harness.turn_id,
+            &harness.item_id,
+        );
+        assert_eq!(terminal_content.text, final_text);
+        assert!(!terminal_content.streaming);
+        if reasoning {
+            assert_eq!(
+                terminal_item, completed,
+                "terminal summary/content must be authoritative"
+            );
+        }
+        assert_reasoning_body(
+            &terminal_item,
+            &format!("authoritative summary\nfinal detail\n\n{final_text}"),
+        );
+        let terminal = projected(&core, &harness.thread_id, &harness.item_id);
+        let late = send(&mut harness, " late raw").await;
+        // A previously valid AST-bearing fragment may also arrive after completion.
+        for late in [late, fresh] {
+            for consumer in std::iter::once(&core).chain(restored.iter()) {
+                consumer.apply_thread_notification(GatewayNotification::ItemDelta(late.clone()));
+                let (content, content_item) = selected(
+                    consumer,
+                    &harness.thread_id,
+                    &harness.turn_id,
+                    &harness.item_id,
+                );
+                assert_eq!(content.text, final_text);
+                assert!(!content.streaming);
+                assert_eq!(
+                    content_item, terminal_item,
+                    "late delta cannot change terminal fields"
+                );
+                assert_reasoning_body(
+                    &content_item,
+                    &format!("authoritative summary\nfinal detail\n\n{final_text}"),
+                );
+                if !reasoning {
+                    assert_eq!(
+                        content.markdown,
+                        Some(super::markdown::parse_markdown_document(final_text))
+                    );
+                    assert!(content.markdown_presentation.is_some());
+                }
+            }
+            let after = projected(&core, &harness.thread_id, &harness.item_id);
+            assert_eq!(after.final_text, terminal.final_text);
+            assert_eq!(after.final_markdown, terminal.final_markdown);
+            assert_eq!(after.partial_markdown, terminal.partial_markdown);
+            assert_eq!(after.item, terminal.item);
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_preview_deltas_do_not_pollute_canonical_markdown_or_retain_a_draft_buffer() {
+    let harness = setup_progress_delta_harness(
+        "provider_preview",
+        TurnItem::Reasoning {
+            id: "thinking_preview".into(),
+            summary: vec![],
+            content: vec![],
+        },
+        false,
+    )
+    .await;
+    let mut preview = progress_delta_notification(&harness, "working", ItemDeltaStream::Generic);
+    preview.item_id = "provider_preview".into();
+    preview.payload = Some(json!({"runtimeDeltaKind":"provider_message_preview"}));
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut preview, Some(TurnItemType::AgentMessage))
+        .await;
+    assert!(preview.markdown.is_none());
+    assert!(preview.markdown_version.is_none());
+    assert_eq!(
+        harness.processor.agent_message_buffers.lock().await.len(),
+        1
+    );
+    let mut resolved = ItemStartedNotification {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item: TurnItem::AgentMessage {
+            id: "provider_preview".into(),
+            text: "working".into(),
+            phase: pioneer_protocol::AgentMessagePhase::Commentary,
+            markdown: None,
+            markdown_version: None,
+        },
+    };
+    harness
+        .processor
+        .enrich_item_started_markdown(&mut resolved)
+        .await;
+    preview.delta = "stale preview".into();
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut preview, Some(TurnItemType::AgentMessage))
+        .await;
+    assert!(preview.markdown.is_none());
+    let mut delta = progress_delta_notification(&harness, " more", ItemDeltaStream::AgentMessage);
+    delta.item_id = "provider_preview".into();
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
+        .await;
+    assert_eq!(
+        delta.markdown,
+        Some(pioneer_protocol::MarkdownDocument::from_plain_text(
+            "working more"
+        ))
+    );
+    assert_eq!(
+        harness.processor.agent_message_buffers.lock().await.len(),
+        2
+    );
+    let mut completed = ItemCompletedNotification {
+        workspace_id: resolved.workspace_id,
+        thread_id: resolved.thread_id,
+        turn_id: resolved.turn_id,
+        item: resolved.item,
+    };
+    harness
+        .processor
+        .enrich_item_completed_markdown(&mut completed)
+        .await;
+    harness
+        .processor
+        .teardown_agent_thread(&harness.thread_id)
+        .await;
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assistant_progress_delta_is_live_only_and_completed_item_is_durable() {
+    for (case, phase) in [
+        (
+            "agent_final",
+            pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        ),
+        (
+            "agent_commentary",
+            pioneer_protocol::AgentMessagePhase::Commentary,
+        ),
+    ] {
+        let prefix = "# Привет\r\n\r\n```rust\r\n";
+        let mut harness = setup_progress_delta_harness(
+            case,
+            TurnItem::AgentMessage {
+                id: "item_progress_agent_msg".to_owned(),
+                text: prefix.to_owned(),
+                phase,
+                markdown: None,
+                markdown_version: None,
+            },
+            true,
+        )
+        .await;
+        let mut full = prefix.to_owned();
+        for fragment in ["let краб = ", "\"🦀\";\r\n", "```\r\n\r\n**готово**"] {
+            full.push_str(fragment);
+            harness
+                .processor
+                .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                    notification: progress_delta_notification(
+                        &harness,
+                        fragment,
+                        ItemDeltaStream::AgentMessage,
+                    ),
+                })
+                .await;
+            let live = recv_notification_by_method(
+                harness.rx.as_mut().unwrap(),
+                events::ITEM_AGENT_MESSAGE_DELTA,
+            )
+            .await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            assert_eq!(live.delta, fragment);
+            assert_eq!(
+                live.markdown,
+                Some(super::markdown::parse_markdown_document(&full))
+            );
+            assert_eq!(
+                live.markdown_version,
+                Some(pioneer_protocol::MARKDOWN_AST_VERSION)
+            );
+        }
+        assert_eq!(
+            harness
+                .processor
+                .markdown_delta_parse_count
+                .load(Ordering::Relaxed),
+            3
+        );
+        let payloads = turn_item_payloads(&harness).await;
+        assert_no_persisted_item_delta(&payloads);
+        // The final snapshot deliberately differs from the streaming prefix.
+        let final_text = "# Итог\r\n\r\n[результат](https://example.com) 🦀";
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
+                    notification: ItemCompletedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: harness.thread_id.clone(),
+                        turn_id: harness.turn_id.clone(),
+                        item: TurnItem::AgentMessage {
+                            id: harness.item_id.clone(),
+                            text: final_text.to_owned(),
+                            phase,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                })
+                .await
+        );
+        let payloads = turn_item_payloads(&harness).await;
+        assert_no_persisted_item_delta(&payloads);
+        assert!(payloads.iter().any(|payload| matches!(payload,
+            TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::AgentMessage { id, text, phase: actual_phase, markdown: Some(document), markdown_version: Some(version) }, ..
+            } if id == &harness.item_id && text == final_text && *actual_phase == phase
+                && document == &super::markdown::parse_markdown_document(final_text)
+                && *version == pioneer_protocol::MARKDOWN_AST_VERSION
+        )));
+        assert!(
+            harness
+                .processor
+                .agent_message_buffers
+                .lock()
+                .await
+                .is_empty()
+        );
+    }
 }
 
 #[tokio::test]
@@ -10123,6 +11545,15 @@ async fn retiring_progress_state_drops_the_item_cache_and_execution_lease() {
         .await;
 
     assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+
+    assert!(
         !harness
             .processor
             .execution_leases
@@ -10142,90 +11573,228 @@ async fn retiring_progress_state_drops_the_item_cache_and_execution_lease() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reasoning_progress_delta_is_live_only_by_default() {
-    let harness = setup_progress_delta_harness(
-        "reasoning",
-        TurnItem::Reasoning {
-            id: "item_progress_reasoning".to_owned(),
-            summary: Vec::new(),
-            content: Vec::new(),
-        },
-        false,
-    )
-    .await;
-
-    harness
-        .processor
-        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
-            notification: progress_delta_notification(
-                &harness,
-                "thinking",
-                ItemDeltaStream::Generic,
-            ),
-        })
-        .await;
-
-    let payloads = turn_item_payloads(&harness).await;
-    assert_no_persisted_item_delta(payloads.as_slice());
+async fn reasoning_and_user_progress_preserve_existing_content_and_heartbeat() {
+    for (case, item, prefix) in [
+        (
+            "reasoning",
+            TurnItem::Reasoning {
+                id: "allowed".into(),
+                summary: vec!["unused summary".into()],
+                content: vec!["# Мысль".into(), "**открыто".into()],
+            },
+            "# Мысль\n**открыто",
+        ),
+        (
+            "user",
+            TurnItem::UserMessage {
+                id: "allowed".into(),
+                text: "# Пользователь\r\n**открыто".into(),
+                attachments: vec![],
+            },
+            "# Пользователь\r\n**открыто",
+        ),
+    ] {
+        let original = item.clone();
+        let mut harness = setup_progress_delta_harness(case, item, true).await;
+        // Make the existing delta heartbeat due without sleeping.
+        let key = super::ProgressItemKey {
+            turn_id: harness.turn_id.clone(),
+            item_id: harness.item_id.clone(),
+        };
+        harness
+            .processor
+            .progress_items
+            .lock()
+            .await
+            .items
+            .get_mut(&key)
+            .unwrap()
+            .last_persisted_heartbeat_at = None;
+        let mut full = prefix.to_owned();
+        for fragment in [" 🦀", "**\r\n"] {
+            full.push_str(fragment);
+            harness
+                .processor
+                .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                    notification: progress_delta_notification(
+                        &harness,
+                        fragment,
+                        ItemDeltaStream::Generic,
+                    ),
+                })
+                .await;
+            let live = recv_notification_by_method(
+                harness.rx.as_mut().unwrap(),
+                events::ITEM_AGENT_MESSAGE_DELTA,
+            )
+            .await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            assert_eq!(
+                live.markdown,
+                Some(super::markdown::parse_markdown_document(&full))
+            );
+        }
+        assert_eq!(
+            harness
+                .processor
+                .progress_item_type_lookup_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        {
+            let progress = harness.processor.progress_items.lock().await;
+            let state = progress.items.get(&key).unwrap();
+            assert!(state.last_persisted_heartbeat_at.is_some());
+            assert!(
+                state.pending_heartbeat_claim.is_none(),
+                "delta heartbeat completed successfully"
+            );
+        }
+        let attempts = harness
+            .crud_store
+            .list_running_turn_item_attempts_for_turn(&harness.turn_id)
+            .await
+            .unwrap();
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| attempt.item_id == harness.item_id
+                    && attempt.last_heartbeat_at_unix.is_some())
+        );
+        let payloads = turn_item_payloads(&harness).await;
+        assert_no_persisted_item_delta(&payloads);
+        assert!(
+            payloads.iter().any(|payload| matches!(payload,
+                TurnItemEventPayload::ItemStarted { item, .. } if item == &original
+            )),
+            "Reasoning/UserMessage snapshot representation stays unchanged"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn command_output_is_persisted_before_ack_and_survives_live_progress_cleanup() {
-    let harness = setup_progress_delta_harness(
+    let mut harness = setup_progress_delta_harness(
         "stdout",
         command_execution_item("item_progress_stdout"),
-        false,
+        true,
     )
     .await;
-    let notification = progress_delta_notification(&harness, "chunk\n", ItemDeltaStream::Stdout);
-    for _ in 0..2 {
-        assert!(
-            harness
-                .processor
-                .handle_durable_agent_event(AgentDurableEvent::ToolOutputRecorded {
-                    id: "test-output-1".into(),
-                    notification: notification.clone(),
-                })
+    let chunks = [
+        "# tool output\r\n```rust\r\n".repeat(700),
+        "**строка 🦀** | [file](https://example.com)\n".repeat(700),
+        "```\n- [x] finished\n".repeat(700),
+    ];
+    for (index, chunk) in chunks.iter().enumerate() {
+        let mut notification =
+            progress_delta_notification(&harness, chunk, ItemDeltaStream::Stdout);
+        notification.payload =
+            Some(json!({"runtimeDeltaKind":"command_output", "observation":{"eventSeq":index}}));
+        for _ in 0..2 {
+            assert!(
+                harness
+                    .processor
+                    .handle_durable_agent_event(AgentDurableEvent::ToolOutputRecorded {
+                        id: format!("test-output-{index}"),
+                        notification: notification.clone(),
+                    })
+                    .await,
+                "ACK only after raw output is saved"
+            );
+            let rows = harness
+                .crud_store
+                .tool_output_page(
+                    &harness.workspace_id,
+                    &harness.thread_id,
+                    &harness.turn_id,
+                    &harness.item_id,
+                    0,
+                )
                 .await
-        );
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                index + 1,
+                "replayed event IDs remain idempotent"
+            );
+            for (ordinal, (_, row)) in rows.iter().enumerate() {
+                assert_eq!(row.id, format!("test-output-{ordinal}"));
+                assert_eq!(row.text, chunks[ordinal]);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(row.metadata.as_ref().unwrap())
+                        .unwrap(),
+                    json!({"runtimeDeltaKind":"command_output", "observation":{"eventSeq":ordinal}})
+                );
+            }
+            assert!(rows.windows(2).all(|pair| pair[0].0 < pair[1].0));
+            let live = recv_notification_by_method(
+                harness.rx.as_mut().unwrap(),
+                events::ITEM_COMMAND_EXECUTION_OUTPUT_DELTA,
+            )
+            .await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            assert_eq!(live.delta, *chunk);
+            assert_eq!(live.stream, notification.stream);
+            assert_eq!(live.payload, notification.payload);
+            assert!(live.markdown.is_none() && live.markdown_version.is_none());
+            assert!(
+                harness
+                    .processor
+                    .agent_message_buffers
+                    .lock()
+                    .await
+                    .is_empty()
+            );
+            assert_eq!(
+                harness
+                    .processor
+                    .markdown_delta_parse_count
+                    .load(Ordering::Relaxed),
+                0
+            );
+        }
     }
     harness
         .processor
-        .retire_execution_progress_state(harness.turn_id.as_str())
+        .retire_execution_progress_state(&harness.turn_id)
         .await;
-    let rows = harness
-        .processor
-        .crud_store
-        .tool_output_page(
-            &notification.workspace_id,
-            &notification.thread_id,
-            &notification.turn_id,
-            &notification.item_id,
-            0,
-        )
-        .await
+    let mut params = pioneer_protocol::ThreadToolResultReadParams {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item_id: harness.item_id.clone(),
+        output_log: true,
+        cursor: None,
+        max_tokens: None,
+        max_bytes: Some(4096),
+    };
+    let mut raw = String::new();
+    let mut eof = false;
+    for _ in 0..256 {
+        let page = harness
+            .processor
+            .read_thread_tool_result(params.clone())
+            .await
+            .unwrap();
+        raw.push_str(&page.text);
+        if page.eof {
+            eof = true;
+            break;
+        }
+        params.cursor = page.next;
+        assert!(params.cursor.is_some());
+    }
+    assert!(eof);
+    let values = serde_json::Deserializer::from_str(&raw)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].1.text, "chunk\n");
-    let page = harness
-        .processor
-        .read_thread_tool_result(pioneer_protocol::ThreadToolResultReadParams {
-            workspace_id: notification.workspace_id.clone(),
-            thread_id: notification.thread_id.clone(),
-            turn_id: notification.turn_id.clone(),
-            item_id: notification.item_id.clone(),
-            output_log: true,
-            cursor: None,
-            max_tokens: None,
-            max_bytes: None,
-        })
-        .await
-        .unwrap();
-    let value: serde_json::Value = serde_json::from_str(&page.text).unwrap();
-    assert_eq!(value["text"], "chunk\n");
-    assert_eq!(value["stream"], "stdout");
-    assert!(page.eof);
-    let mut invalid = notification;
+    assert_eq!(values.len(), chunks.len());
+    for (value, chunk) in values.iter().zip(&chunks) {
+        assert_eq!(value["text"], *chunk);
+        assert_eq!(value["stream"], "stdout");
+    }
+    let mut invalid = progress_delta_notification(&harness, "rejected", ItemDeltaStream::Stdout);
     invalid.workspace_id = "wrong-workspace".into();
     assert!(
         !harness
@@ -10236,6 +11805,18 @@ async fn command_output_is_persisted_before_ack_and_survives_live_progress_clean
             })
             .await
     );
+    let rows = harness
+        .crud_store
+        .tool_output_page(
+            &harness.workspace_id,
+            &harness.thread_id,
+            &harness.turn_id,
+            &harness.item_id,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), chunks.len());
 }
 
 #[tokio::test]
@@ -10734,7 +12315,7 @@ async fn title_generation_retries_after_transient_failure() {
         preview_author: None,
         mode: pioneer_protocol::ThreadMode::Agent,
         model: "test-model".to_owned(),
-        model_provider: "openai".to_owned(),
+        model_provider: "cli_runtime:codex".to_owned(),
         reasoning_effort: None,
         created_at: 1,
         updated_at: 1,
@@ -14720,7 +16301,7 @@ macro_rules! owned_voice_ingress_test {
             // and connection-cleanup frames on the libtest thread.
             run_standard_stack_message_test(
                 stringify!($name),
-                owned_voice_ingress_case($terminal, $action, false),
+                owned_voice_ingress_case($terminal, $action, false, false),
             );
         }
     };
@@ -14729,11 +16310,81 @@ macro_rules! owned_voice_ingress_test {
         fn $name() {
             run_standard_stack_message_test(
                 stringify!($name),
-                owned_voice_ingress_case($terminal, $action, true),
+                owned_voice_ingress_case($terminal, $action, true, false),
+            );
+        }
+    };
+    ($name:ident, $terminal:literal, $action:literal, buffered) => {
+        #[test]
+        fn $name() {
+            run_standard_stack_message_test(
+                stringify!($name),
+                owned_voice_ingress_case($terminal, $action, true, true),
             );
         }
     };
 }
+
+owned_voice_ingress_test!(
+    owned_voice_buffered_full_recording_one_authorized_turn,
+    "buffered_long",
+    "winner",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_cancel_during_inference,
+    "transcript",
+    "cancel",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_disconnect_during_inference,
+    "transcript",
+    "disconnect",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_revocation_during_inference,
+    "transcript",
+    "revocation",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_shutdown_during_inference,
+    "transcript",
+    "shutdown",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_empty_transcript,
+    "no_speech",
+    "winner",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_native_error_no_partial_turn,
+    "runtime_error",
+    "winner",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_silence_no_inference_or_turn,
+    "silence",
+    "winner",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_incremental_session_pins_mode_and_peer_next_session_buffers,
+    "transcript",
+    "mode_switch",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_session_pins_mode_and_peer_next_session_is_incremental,
+    "transcript",
+    "mode_switch",
+    buffered
+);
 
 owned_voice_ingress_test!(
     owned_voice_incremental_inference_before_commit_and_backlog,
@@ -14895,6 +16546,7 @@ fn owned_voice_ingress_case(
     terminal: &'static str,
     action: &'static str,
     early: bool,
+    buffered: bool,
 ) -> MessageFuture<'static, ()> {
     message_future(async move {
         use crate::voice::transcription::{VoiceTranscriptionErrorKind, transcription_error};
@@ -14909,9 +16561,13 @@ fn owned_voice_ingress_case(
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let release = PendingVoiceRelease(gate.clone());
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (calls_tx, mut calls_rx) = tokio::sync::mpsc::unbounded_channel();
         let entered_tx = std::sync::Mutex::new(Some(entered_tx));
         let captured = Arc::new(std::sync::Mutex::new(Vec::<Vec<f32>>::new()));
         let worker_captured = captured.clone();
+        // Every case owns its settings file. Persist through the production
+        // settings mutation below; never use a test-only mode override.
+        let runtime_home = tempfile::tempdir().unwrap();
         let mut processor = MessageProcessor::new(
             Arc::new(ThreadManager::new("test-model", "openai")),
             test_provider(),
@@ -14922,6 +16578,7 @@ fn owned_voice_ingress_case(
             test_summary_config(),
             test_tool_loop_config(),
         )
+        .with_runtime_home_for_tests(runtime_home.path().to_path_buf())
         .with_voice_input_supervisor(ready_gateway_voice_supervisor_for_model(
             "unused native stub",
             if early {
@@ -14944,6 +16601,7 @@ fn owned_voice_ingress_case(
                 calls.push(buffer.flattened_samples());
                 calls.len()
             };
+            let _ = calls_tx.send(call_count);
             // Observe the production blocking scope before installing anything
             // in the fake. This must come from the actual request dispatcher.
             if let Some(sender) = entered_tx.lock().unwrap().take() {
@@ -14997,13 +16655,60 @@ fn owned_voice_ingress_case(
                 "no_speech" => Ok("  ".to_owned()),
                 // Context changes the hypothesis across the old 3 s cut. The
                 // final assertion must observe the correction, never append it.
-                _ if early && buffer.speech_samples() <= 48000 => {
+                _ if early && !buffered && buffer.speech_samples() <= 48000 => {
                     Ok("incorrect early boundary".to_owned())
                 }
                 _ => Ok("controlled transcript".to_owned()),
             }
         }));
         let processor = Arc::new(processor);
+        let mode_context =
+            registered_request_context(&processor, connection_id, "settings/update").await;
+        let generation = processor
+            .voice_input_supervisor
+            .as_ref()
+            .unwrap()
+            .generation();
+        let snapshot = processor
+            .update_gateway_settings(
+                &mode_context,
+                pioneer_protocol::GatewaySettingsUpdate {
+                    voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                        enabled: Some(true),
+                        provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
+                        model: Some(Some(
+                            if early {
+                                "moonshine-base"
+                            } else {
+                                "parakeet-tdt-0.6b-v3"
+                            }
+                            .to_owned(),
+                        )),
+                        transcribe_while_recording: Some(!buffered),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.voice_input.transcribe_while_recording, !buffered);
+        assert!(snapshot.voice_input.enabled);
+        assert!(
+            processor
+                .voice_input_supervisor
+                .as_ref()
+                .unwrap()
+                .has_loaded_engine()
+        );
+        assert_eq!(
+            processor
+                .voice_input_supervisor
+                .as_ref()
+                .unwrap()
+                .generation(),
+            generation
+        );
         // Revocation cases materialize thread_membership, whose CHECK requires
         // a 21-character alphanumeric ID even though thread/start accepts more.
         let thread_id = "T00000000000000000116";
@@ -15088,7 +16793,7 @@ fn owned_voice_ingress_case(
                         &session.session_id,
                         sequence,
                         if early { 1600 } else { 960 },
-                        12000,
+                        if terminal == "silence" { 0 } else { 12000 },
                     ),
                 )
                 .await
@@ -15096,14 +16801,21 @@ fn owned_voice_ingress_case(
             let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
         }
         if early {
-            let key = tokio::time::timeout(Duration::from_secs(5), entered_rx.take().unwrap())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                key, None,
-                "pre-Commit inference must not be charged to turn startup"
-            );
+            if buffered {
+                assert!(
+                    captured.lock().unwrap().is_empty(),
+                    "buffered must not call ASR before Commit"
+                );
+            } else {
+                let key = tokio::time::timeout(Duration::from_secs(5), entered_rx.take().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    key, None,
+                    "pre-Commit inference must not be charged to turn startup"
+                );
+            }
             assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
             assert_eq!(
                 processor
@@ -15116,7 +16828,7 @@ fn owned_voice_ingress_case(
             // Duplicate accepted sequence is ACKed without replay. Keep a full
             // second source span and a seven-sample tail behind native work.
             let last_sequence = match terminal {
-                "long_context" | "long_tail_error" => 200,
+                "long_context" | "long_tail_error" | "buffered_long" => 200,
                 "closed_13" => 129,
                 "closed_17" => 169,
                 _ => 60,
@@ -15129,7 +16841,9 @@ fn owned_voice_ingress_case(
                 } else {
                     1600
                 };
-                let amplitude = if sequence == 29 {
+                let amplitude = if terminal == "silence" {
+                    0
+                } else if sequence == 29 {
                     12000
                 } else if sequence == last_sequence {
                     3000
@@ -15147,6 +16861,69 @@ fn owned_voice_ingress_case(
                     .unwrap();
                 let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
             }
+            if buffered {
+                assert!(
+                    captured.lock().unwrap().is_empty(),
+                    "full buffered backlog must stay untranscribed before Commit"
+                );
+                assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
+            }
+        }
+        if action == "mode_switch" {
+            let update_id = generate_test_request_id("voice", "switch_active_mode");
+            processor
+                .clone()
+                .process_owned_request(
+                    foreign_context.clone(),
+                    json!({
+                        "jsonrpc":"2.0", "id":update_id, "method":"settings/update",
+                        "params":{"update":{"voice_input":{"transcribe_while_recording":buffered}}}
+                    })
+                    .to_string(),
+                )
+                .await;
+            let response = recv_response_by_id(&mut foreign_rx, &update_id).await;
+            let response: pioneer_protocol::GatewaySettingsUpdateResponse =
+                serde_json::from_value(response.result).unwrap();
+            assert_eq!(
+                response.settings.voice_input.transcribe_while_recording,
+                buffered
+            );
+            assert!(response.settings.voice_input.enabled);
+            assert_eq!(
+                response.settings.voice_input.model.as_deref(),
+                Some("moonshine-base")
+            );
+            let notification =
+                recv_notification_by_method(&mut rx, events::GATEWAY_VOICE_INPUT_STATUS_CHANGED)
+                    .await;
+            let notification: pioneer_protocol::GatewayVoiceInputStatusChangedNotification =
+                serde_json::from_value(notification.params.unwrap()).unwrap();
+            assert_eq!(notification.settings.transcribe_while_recording, buffered);
+            assert_eq!(
+                processor
+                    .voice_input_supervisor
+                    .as_ref()
+                    .unwrap()
+                    .generation(),
+                generation
+            );
+            assert!(
+                processor
+                    .voice_input_supervisor
+                    .as_ref()
+                    .unwrap()
+                    .has_loaded_engine()
+            );
+            assert_eq!(
+                processor
+                    .voice_sessions
+                    .lookup_session(&session.session_id, connection_id)
+                    .unwrap()
+                    .state,
+                crate::voice::session_store::GatewayVoiceSessionState::Recording
+            );
+            assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
         }
         if early && action == "winner" && terminal == "transcript" {
             let occupied: Vec<_> = (1..=3)
@@ -15185,6 +16962,13 @@ fn owned_voice_ingress_case(
             .await
             .unwrap()
             .expect("voice target history must exist");
+        assert!(
+            before.events.iter().all(|event| !matches!(
+                &event.payload,
+                pioneer_protocol::ThreadHistoryEventPayload::TurnStarted { .. }
+            )),
+            "no user turn may be created before Commit, including under another ID"
+        );
         let before_events = serde_json::to_value(&before.events).unwrap();
         let finalize = json!({"jsonrpc":"2.0","id":finalize_id,"method":"voice/session/finalize","params":{
             "session_id":session.session_id,"context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":turn_id}
@@ -15195,6 +16979,7 @@ fn owned_voice_ingress_case(
             Some(turn_id.to_owned())
         };
         let request = &finalize;
+        let mut completed_result = None;
         assert_eq!(
             pioneer_observability::turn_startup::request_key(&request["params"]),
             expected_startup_key
@@ -15213,9 +16998,22 @@ fn owned_voice_ingress_case(
             )
             .await
             .expect("reader must return at ACK while transcriber remains pending");
-            let ack = recv_response_by_id(&mut rx, finalize_id.as_str()).await;
+            let ack = if terminal == "silence" {
+                // No fake native gate exists for silence. Collect both so an
+                // immediate terminal result cannot be discarded by an ACK helper.
+                let (ack, result) = recv_response_and_notification_by_id_method(
+                    &mut rx,
+                    finalize_id.as_str(),
+                    events::VOICE_SESSION_RESULT,
+                )
+                .await;
+                completed_result = Some(result);
+                ack
+            } else {
+                recv_response_by_id(&mut rx, finalize_id.as_str()).await
+            };
             assert_eq!(ack.result["status"], json!("transcribing"));
-            if let Some(entered_rx) = entered_rx {
+            if let Some(entered_rx) = entered_rx.filter(|_| terminal != "silence") {
                 let worker_startup_key = tokio::time::timeout(Duration::from_secs(5), entered_rx)
                     .await
                     .unwrap()
@@ -15224,13 +17022,15 @@ fn owned_voice_ingress_case(
             }
             // Same owner repeated finalize is bounded/rejected; another connection
             // cannot claim the authenticated owner's session (connection_id retained).
-            let mut repeated_finalize = finalize.clone();
-            repeated_finalize["id"] = json!(repeat_id);
-            processor
-                .clone()
-                .process_owned_request(context.clone(), repeated_finalize.to_string())
-                .await;
-            let _ = recv_error_by_id(&mut rx, repeat_id.as_str()).await;
+            if terminal != "silence" {
+                let mut repeated_finalize = finalize.clone();
+                repeated_finalize["id"] = json!(repeat_id);
+                processor
+                    .clone()
+                    .process_owned_request(context.clone(), repeated_finalize.to_string())
+                    .await;
+                let _ = recv_error_by_id(&mut rx, repeat_id.as_str()).await;
+            }
         }
         let mut cancel = json!({"jsonrpc":"2.0","id":foreign_request_id,"method":"voice/session/cancel","params":{"session_id":session.session_id}});
         processor
@@ -15239,6 +17039,18 @@ fn owned_voice_ingress_case(
             .await;
         let _ = recv_error_by_id(&mut foreign_rx, foreign_request_id.as_str()).await;
         assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
+        let other_capacity: Vec<_> = if matches!(action, "winner" | "mode_switch") {
+            Vec::new()
+        } else {
+            (1..=3)
+                .map(|offset| {
+                    processor
+                        .voice_finalizations
+                        .reserve(u64::MAX - offset)
+                        .unwrap()
+                })
+                .collect()
+        };
         if action.starts_with("cancel") {
             cancel["id"] = json!(cancel_id);
             tokio::time::timeout(
@@ -15312,7 +17124,7 @@ fn owned_voice_ingress_case(
         } else {
             None
         };
-        if action != "winner" {
+        if !matches!(action, "winner" | "mode_switch") {
             assert!(
                 processor
                     .voice_finalizations
@@ -15322,6 +17134,10 @@ fn owned_voice_ingress_case(
             );
             assert!(processor.voice_finalizations.has_active_work());
             assert!(!processor.voice_finalizations.tasks.is_empty());
+            assert!(
+                processor.voice_finalizations.reserve(foreign_id).is_none(),
+                "all native slots remain occupied while cancelled inference is blocked"
+            );
         }
         if terminal == "generation_change" {
             // The next contextual call must use the recording's admitted
@@ -15341,6 +17157,7 @@ fn owned_voice_ingress_case(
                 .unwrap();
         }
         release.release();
+        drop(other_capacity);
         // Closing the tracker enables waiting for completion; it does
         // not cancel the pipeline or forbid spawning by itself. Await exact worker completion, no sleeps.
         processor.voice_finalizations.tasks.close();
@@ -15359,8 +17176,31 @@ fn owned_voice_ingress_case(
         assert!(!processor.voice_finalizations.has_active_work());
         {
             let calls = captured.lock().unwrap();
-            if early
-                && action == "winner"
+            if buffered {
+                if terminal == "silence" {
+                    assert!(
+                        calls.is_empty(),
+                        "silent buffered input must never enter ASR"
+                    );
+                } else {
+                    let mut source = vec![12000.0 / 32768.0; 48000];
+                    source.extend(vec![
+                        6000.0 / 32768.0;
+                        if terminal == "buffered_long" {
+                            272000
+                        } else {
+                            48000
+                        }
+                    ]);
+                    source.extend([3000.0 / 32768.0; 7]);
+                    assert_eq!(
+                        *calls,
+                        vec![source],
+                        "one full prepared PCM call, including final residual"
+                    );
+                }
+            } else if early
+                && matches!(action, "winner" | "mode_switch")
                 && matches!(terminal, "transcript" | "no_speech" | "tail_error")
             {
                 assert_eq!(
@@ -15422,31 +17262,86 @@ fn owned_voice_ingress_case(
                 );
             }
         }
-        if action == "winner" {
-            let event = recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
+        if matches!(action, "winner" | "mode_switch") {
+            let event = if let Some(result) = completed_result {
+                result
+            } else if action == "mode_switch" {
+                // Provider completion and voice publication may race; preserve
+                // both before starting another voice turn on the same thread.
+                let mut result = None;
+                let mut turn_completed = false;
+                while result.is_none() || !turn_completed {
+                    let event = recv_next_notification(&mut rx).await;
+                    if event.method == events::VOICE_SESSION_RESULT {
+                        assert!(
+                            result.replace(event).is_none(),
+                            "one first-session terminal result"
+                        );
+                    } else if event.method == events::TURN_COMPLETED {
+                        turn_completed = true;
+                    }
+                }
+                result.unwrap()
+            } else {
+                recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await
+            };
             let result: VoiceSessionResultNotification =
                 serde_json::from_value(event.params.unwrap()).unwrap();
             let expected = match terminal {
-                "transcript" | "long_context" | "closed_13" | "closed_17" => {
+                "transcript" | "long_context" | "closed_13" | "closed_17" | "buffered_long" => {
                     VoiceSessionOutcome::TurnStarted
                 }
-                "no_speech" => VoiceSessionOutcome::NoSpeech,
+                "no_speech" | "silence" => VoiceSessionOutcome::NoSpeech,
                 _ => VoiceSessionOutcome::Failed,
             };
             assert_eq!(result.outcome, expected);
+            assert_eq!(result.session_id, session.session_id);
+            if matches!(expected, VoiceSessionOutcome::TurnStarted) {
+                assert_eq!(result.turn_id.as_deref(), Some(turn_id));
+            }
             assert_eq!(
                 crud.get_turn(thread_id, turn_id).await.unwrap().is_some(),
                 matches!(
                     terminal,
-                    "transcript" | "long_context" | "closed_13" | "closed_17"
+                    "transcript" | "long_context" | "closed_13" | "closed_17" | "buffered_long"
                 )
             );
-            if early && matches!(terminal, "transcript" | "closed_13" | "closed_17") {
+            if !matches!(expected, VoiceSessionOutcome::TurnStarted) {
+                let after = crud
+                    .get_thread_history(thread_id, Some(64))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&after.events).unwrap(),
+                    before_events,
+                    "silent, empty and failed inference must not commit any partial user input"
+                );
+            }
+            if early
+                && matches!(
+                    terminal,
+                    "transcript" | "closed_13" | "closed_17" | "buffered_long"
+                )
+            {
                 let history = crud
                     .get_thread_history(thread_id, Some(64))
                     .await
                     .unwrap()
                     .unwrap();
+                assert_eq!(
+                    history
+                        .events
+                        .iter()
+                        .filter(|event| matches!(
+                            &event.payload,
+                            pioneer_protocol::ThreadHistoryEventPayload::TurnStarted { turn, .. }
+                                if turn.id == turn_id
+                        ))
+                        .count(),
+                    1,
+                    "one authorized user turn for the committed recording"
+                );
                 let history = serde_json::to_string(&history.events).unwrap();
                 assert!(history.contains("controlled transcript"));
                 assert!(!history.contains("incorrect early boundary"));
@@ -15463,12 +17358,166 @@ fn owned_voice_ingress_case(
                 assert!(!history.contains("incorrect early boundary"));
                 assert!(!history.contains("Да, да. Да, да."));
             }
+            // Worker/finalizer completion is joined above. Inspect queued
+            // terminal events before another response helper can consume them.
+            while let Ok(message) = rx.try_recv() {
+                if let Message::Text(text) = message {
+                    let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                    assert_ne!(
+                        value.get("method").and_then(JsonValue::as_str),
+                        Some(events::VOICE_SESSION_RESULT),
+                        "one terminal result per Commit"
+                    );
+                }
+            }
             cancel["id"] = json!(late_cancel_id);
             processor
                 .clone()
                 .process_owned_request(context, cancel.to_string())
                 .await;
             let _ = recv_error_by_id(&mut rx, late_cancel_id.as_str()).await;
+            if action == "mode_switch" {
+                while calls_rx.try_recv().is_ok() {}
+                let prior_calls = captured.lock().unwrap().len();
+                assert_eq!(prior_calls, if buffered { 1 } else { 2 });
+                subscribe_test_connection_to_materialized_thread(
+                    &processor,
+                    foreign_id,
+                    &workspace_id,
+                    thread_id,
+                )
+                .await;
+                let next_turn = "turn_voice_mode_peer_next";
+                let next_start = generate_test_request_id("voice", "peer_next_start");
+                let next_session = start_test_voice_session(
+                    &processor,
+                    foreign_id,
+                    &mut foreign_rx,
+                    &workspace_id,
+                    thread_id,
+                    next_turn,
+                    &next_start,
+                )
+                .await;
+                for sequence in 0..40 {
+                    processor
+                        .process_binary_frame_for_connection(
+                            foreign_id,
+                            &voice_test_frame(&next_session.session_id, sequence, 1600, 9000),
+                        )
+                        .await
+                        .unwrap();
+                    let _ =
+                        recv_notification_by_method(&mut foreign_rx, events::VOICE_CHUNK_ACK).await;
+                }
+                assert!(crud.get_turn(thread_id, next_turn).await.unwrap().is_none());
+                let peer_context = processor
+                    .session_manager
+                    .connection_context(foreign_id)
+                    .await
+                    .unwrap();
+                if buffered {
+                    // First session was buffered; the peer now uses incremental
+                    // and must actually call ASR while its input remains open.
+                    tokio::time::timeout(Duration::from_secs(5), calls_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(captured.lock().unwrap().len() > prior_calls);
+                    let cancel_id = generate_test_request_id("voice", "peer_next_cancel");
+                    processor
+                        .clone()
+                        .process_owned_request(
+                            peer_context,
+                            json!({
+                                "jsonrpc":"2.0", "id":cancel_id, "method":"voice/session/cancel",
+                                "params":{"session_id":next_session.session_id}
+                            })
+                            .to_string(),
+                        )
+                        .await;
+                    let (response, result) = recv_response_and_notification_by_id_method(
+                        &mut foreign_rx,
+                        &cancel_id,
+                        events::VOICE_SESSION_RESULT,
+                    )
+                    .await;
+                    assert_eq!(response.result["cancelled"], json!(true));
+                    let result: VoiceSessionResultNotification =
+                        serde_json::from_value(result.params.unwrap()).unwrap();
+                    assert_eq!(result.outcome, VoiceSessionOutcome::Cancelled);
+                    assert_eq!(result.session_id, next_session.session_id);
+                    assert!(crud.get_turn(thread_id, next_turn).await.unwrap().is_none());
+                } else {
+                    // First session was incremental; the peer now buffers its
+                    // entire recording, with no local/client mode override.
+                    assert_eq!(captured.lock().unwrap().len(), prior_calls);
+                    let finalize_id = generate_test_request_id("voice", "peer_next_finalize");
+                    processor.clone().process_owned_request(peer_context, json!({
+                        "jsonrpc":"2.0", "id":finalize_id, "method":"voice/session/finalize",
+                        "params":{"session_id":next_session.session_id,
+                            "context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":next_turn}}
+                    }).to_string()).await;
+                    let (ack, result) = recv_response_and_notification_by_id_method(
+                        &mut foreign_rx,
+                        &finalize_id,
+                        events::VOICE_SESSION_RESULT,
+                    )
+                    .await;
+                    assert_eq!(ack.result["status"], json!("transcribing"));
+                    let result: VoiceSessionResultNotification =
+                        serde_json::from_value(result.params.unwrap()).unwrap();
+                    assert_eq!(result.outcome, VoiceSessionOutcome::TurnStarted);
+                    assert_eq!(result.session_id, next_session.session_id);
+                    assert_eq!(result.turn_id.as_deref(), Some(next_turn));
+                    assert!(crud.get_turn(thread_id, next_turn).await.unwrap().is_some());
+                    let history = crud
+                        .get_thread_history(thread_id, Some(64))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(history.events.iter().filter(|event| matches!(
+                        &event.payload,
+                        pioneer_protocol::ThreadHistoryEventPayload::TurnStarted { turn, .. }
+                            if turn.id == next_turn
+                    )).count(), 1);
+                    let calls = captured.lock().unwrap();
+                    assert_eq!(calls.len(), prior_calls + 1);
+                    assert_eq!(calls.last().unwrap(), &vec![9000.0 / 32768.0; 64000]);
+                }
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    processor.voice_finalizations.tasks.wait(),
+                )
+                .await
+                .unwrap();
+                assert!(!processor.voice_finalizations.has_active_work());
+                assert_eq!(
+                    processor
+                        .voice_input_supervisor
+                        .as_ref()
+                        .unwrap()
+                        .generation(),
+                    generation
+                );
+                assert!(
+                    processor
+                        .voice_input_supervisor
+                        .as_ref()
+                        .unwrap()
+                        .has_loaded_engine()
+                );
+                while let Ok(message) = foreign_rx.try_recv() {
+                    if let Message::Text(text) = message {
+                        let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                        assert_ne!(
+                            value.get("method").and_then(JsonValue::as_str),
+                            Some(events::VOICE_SESSION_RESULT),
+                            "one peer-session terminal result"
+                        );
+                    }
+                }
+            }
         } else {
             assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
             let after = crud
@@ -16754,6 +18803,26 @@ async fn voice_session_requires_ready_for_every_non_ready_phase() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn voice_input_status_notification_reports_transitions_and_coalesces_progress() {
+    let runtime_home = unique_temp_dir("voice_mode_status_publication");
+    std::fs::create_dir_all(&runtime_home).unwrap();
+    let config = crate::isolated_test_app_config().unwrap();
+    let settings_path = runtime_home.join(&config.gateway.settings_file_name);
+    let mut persisted = crate::settings::load_or_create_gateway_settings(
+        &settings_path,
+        config.gateway.settings_version,
+        &config.gateway.settings_file_name,
+    )
+    .unwrap();
+    persisted
+        .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+            voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                transcribe_while_recording: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    crate::settings::save_gateway_settings(&settings_path, &persisted).unwrap();
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let _connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -16770,7 +18839,8 @@ async fn voice_input_status_notification_reports_transitions_and_coalesces_progr
             test_summary_config(),
             test_tool_loop_config(),
         )
-        .with_voice_input_supervisor(supervisor.clone()),
+        .with_voice_input_supervisor(supervisor.clone())
+        .with_runtime_home_for_tests(runtime_home.clone()),
     );
     processor.start_voice_input_status_notifications();
 
@@ -16789,6 +18859,7 @@ async fn voice_input_status_notification_reports_transitions_and_coalesces_progr
     let missing: pioneer_protocol::GatewayVoiceInputStatusChangedNotification =
         serde_json::from_value(missing.params.expect("missing notification params"))
             .expect("missing notification payload");
+    assert!(!missing.settings.transcribe_while_recording);
     assert_eq!(
         missing.settings.runtime.phase,
         pioneer_protocol::GatewayVoiceInputRuntimePhase::Missing
@@ -16817,8 +18888,10 @@ async fn voice_input_status_notification_reports_transitions_and_coalesces_progr
     let progress: pioneer_protocol::GatewayVoiceInputStatusChangedNotification =
         serde_json::from_value(progress.params.expect("progress notification params"))
             .expect("progress notification payload");
+    assert!(!progress.settings.transcribe_while_recording);
     assert_eq!(progress.settings.runtime.downloaded_bytes, Some(3));
     assert_eq!(progress.settings.runtime.total_bytes, Some(10));
+    let _ = std::fs::remove_dir_all(runtime_home);
 }
 
 async fn start_test_voice_session(
@@ -16861,11 +18934,15 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let (peer_tx, mut peer_rx) = mpsc::channel(32);
+    let _peer = register_authenticated_test_connection(session_manager.as_ref(), peer_tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
+    let supervisor = test_gateway_voice_supervisor();
+    let engine_generation = supervisor.generation();
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -16876,7 +18953,8 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
         test_summary_config(),
         test_tool_loop_config(),
     )
-    .with_runtime_home_for_tests(runtime_home.clone());
+    .with_runtime_home_for_tests(runtime_home.clone())
+    .with_voice_input_supervisor(supervisor.clone());
     processor
         .voice_sessions
         .create_session(
@@ -16948,6 +19026,42 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
                 .and_then(JsonValue::as_str),
             Some("voice_reconfiguration_busy")
         );
+        let mode_request_id = generate_test_request_id("voice_mode", state);
+        let transcribe_while_recording = state == "finalizing";
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0", "id": mode_request_id,
+                    "method": "settings/update",
+                    "params": { "update": { "voice_input": {
+                    "transcribe_while_recording": transcribe_while_recording
+                    } } }
+                })
+                .to_string(),
+            )
+            .await;
+        let response = recv_response_by_id(&mut rx, &mode_request_id).await;
+        let response: pioneer_protocol::GatewaySettingsUpdateResponse =
+            serde_json::from_value(response.result).unwrap();
+        assert_eq!(
+            response.settings.voice_input.transcribe_while_recording,
+            transcribe_while_recording
+        );
+        assert!(!response.settings.voice_input.enabled);
+        assert_eq!(response.settings.voice_input.model, None);
+        assert_eq!(supervisor.generation(), engine_generation);
+        assert!(processor.voice_sessions.has_active_sessions().unwrap());
+        if state == "recording" {
+            let peer = recv_notification_by_method(
+                &mut peer_rx,
+                events::GATEWAY_VOICE_INPUT_STATUS_CHANGED,
+            )
+            .await;
+            let peer: pioneer_protocol::GatewayVoiceInputStatusChangedNotification =
+                serde_json::from_value(peer.params.unwrap()).unwrap();
+            assert!(!peer.settings.transcribe_while_recording);
+        }
     }
 
     let unrelated_request_id = generate_test_request_id("voicebusy", "unrelated");
@@ -17032,7 +19146,65 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
         serde_json::from_value(response.result).expect("settings update response");
     assert!(payload.settings.voice_input.enabled);
     assert_eq!(payload.settings.voice_input.model.as_deref(), Some("small"));
+    assert!(!payload.settings.voice_input.transcribe_while_recording);
 
+    let _ = std::fs::remove_dir_all(runtime_home);
+}
+
+#[tokio::test]
+async fn voice_mode_save_failure_preserves_persistence_and_does_not_notify_peers() {
+    let runtime_home = unique_temp_dir("voice_mode_save_failure");
+    std::fs::create_dir_all(&runtime_home).unwrap();
+    let (tx, mut rx) = mpsc::channel(32);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let (workspaces, crud, _) = setup_workspace_manager().await;
+    let supervisor = test_gateway_voice_supervisor();
+    let generation = supervisor.generation();
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        sessions,
+        workspaces,
+        crud,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    )
+    .with_runtime_home_for_tests(runtime_home.clone())
+    .with_voice_input_supervisor(supervisor.clone());
+    let context = registered_request_context(&processor, connection, "settings/update").await;
+    let config = crate::isolated_test_app_config().unwrap();
+    let path = runtime_home.join(&config.gateway.settings_file_name);
+    crate::settings::load_or_create_gateway_settings(
+        &path,
+        config.gateway.settings_version,
+        &config.gateway.settings_file_name,
+    )
+    .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let result = processor
+        .update_gateway_settings_with_saver(
+            &context,
+            pioneer_protocol::GatewaySettingsUpdate {
+                voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                    transcribe_while_recording: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            |_, _| anyhow::bail!("injected mode save failure"),
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(supervisor.generation(), generation);
+    while let Ok(message) = rx.try_recv() {
+        if let Message::Text(text) = message {
+            let value: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
+            assert_ne!(value["method"], events::GATEWAY_VOICE_INPUT_STATUS_CHANGED);
+        }
+    }
     let _ = std::fs::remove_dir_all(runtime_home);
 }
 
@@ -17071,6 +19243,7 @@ async fn voice_settings_disable_removes_model_files_and_preserves_selection() {
                 provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
                 model: Some(Some(entry.id.to_owned())),
                 retry_install: false,
+                transcribe_while_recording: None,
             }),
             ..pioneer_protocol::GatewaySettingsUpdate::default()
         })
@@ -17193,6 +19366,7 @@ async fn voice_settings_two_client_race_serializes_to_one_consistent_outcome() {
                 provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
                 model: Some(Some("parakeet-tdt-0.6b-v3".to_owned())),
                 retry_install: false,
+                transcribe_while_recording: None,
             }),
             ..pioneer_protocol::GatewaySettingsUpdate::default()
         })
@@ -20820,6 +22994,16 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
         Some("turn_parent_task_test"),
         "immediate attached subagent should stay under the live parent turn"
     );
+    task_launch_continuity::assert_materialized_child_security(
+        &processor,
+        &run,
+        &lineage,
+        "turn_parent_task_test",
+        crate::turn_security::TurnSecurityResolverExecutionBackend::NativeApiProvider {
+            provider: "openai".to_owned(),
+        },
+    )
+    .await;
     let binding = crud_store
         .get_task_run_primary_thread_binding(run.id.as_str())
         .await
@@ -21115,6 +23299,10 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
         workspace_manager,
         crud_store.clone(),
     );
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_task_bridge().await;
 
     let mut params = test_task_create_params(
@@ -23186,6 +25374,7 @@ fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_co
         "recovered hidden Task preflight ordering",
         recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
             TaskAttachmentMode::Detached,
+            false,
         ),
     );
 }
@@ -23196,12 +25385,25 @@ fn compaction_attached_task_restores_its_frozen_basis_without_changing_hook_scop
         "attached Task frozen basis and recovery",
         recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
             TaskAttachmentMode::Attached,
+            false,
+        ),
+    );
+}
+
+#[test]
+fn recovered_task_public_stop_preserves_prompt_manifest_and_canonical_identity() {
+    run_standard_stack_message_test(
+        "recovered Task Stop before prompt compilation",
+        recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+            TaskAttachmentMode::Detached,
+            true,
         ),
     );
 }
 
 async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
     attachment: TaskAttachmentMode,
+    stop_before_prompt: bool,
 ) {
     let initial_provider = Arc::new(HangingChildProvider::new());
     let initial_provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
@@ -23341,6 +25543,15 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         initial_provider.child_main_call_count() > 0,
         "initial child task provider should be hanging in the main child request"
     );
+    let saved_manifest = crud_store
+        .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .prompt_manifest
+        .expect("the first model call must persist a prompt manifest");
+    assert!(!saved_manifest.section_ids.is_empty());
     let child_snapshot = crud_store
         .get_turn_runtime_snapshot(&lineage.child_turn_id)
         .await
@@ -23581,11 +25792,151 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         test_tool_loop_config(),
     ));
     recovery_processor.bind_task_bridge().await;
+    if stop_before_prompt {
+        recovery_processor
+            .arm_completed_history_preparation_barrier("__native_recovery_before_control_ack__");
+    }
     recovery_processor
         .task_runtime
         .start()
         .await
         .expect("startup recovery should run");
+
+    if stop_before_prompt {
+        timeout(
+            Duration::from_secs(10),
+            recovery_processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .unwrap();
+        let restored = recovery_processor
+            .thread_manager
+            .turn_get(&lineage.child_thread_id, &lineage.child_turn_id)
+            .await
+            .unwrap()
+            .1;
+        assert_eq!(restored.status, TurnStatus::InProgress);
+        assert!(
+            restored.prompt_manifest.is_none(),
+            "the production thread snapshot intentionally omits the manifest"
+        );
+        assert_eq!(
+            crud_store
+                .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .prompt_manifest
+                .as_ref(),
+            Some(&saved_manifest),
+        );
+        assert!(recovery_provider.snapshot_requests().is_empty());
+        let (tx, mut rx) = mpsc::channel(256);
+        let connection =
+            register_authenticated_test_connection(recovery_processor.session_manager.as_ref(), tx)
+                .await;
+        assert!(
+            recovery_processor
+                .thread_manager
+                .subscribe_connection(&lineage.child_thread_id, connection)
+                .await
+        );
+        let mut terminal_events = None;
+        for delivery in ["first", "repeat"] {
+            let id = generate_test_request_id("taskstop", delivery);
+            recovery_processor
+                .process_request_for_connection(
+                    connection,
+                    &json!({"jsonrpc":"2.0", "id":id, "method":"turn/cancel",
+                    "params":{"thread_id":lineage.child_thread_id,
+                        "turn_id":lineage.child_turn_id}})
+                    .to_string(),
+                )
+                .await;
+            let reply = recv_response_by_id(&mut rx, &id).await;
+            let reply: TurnCancelResponse = serde_json::from_value(reply.result).unwrap();
+            assert_eq!(reply.turn.status, TurnStatus::Interrupted);
+            let persisted = crud_store
+                .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1;
+            assert_eq!(persisted.prompt_manifest.as_ref(), Some(&saved_manifest));
+            assert_eq!(
+                recovery_processor
+                    .thread_manager
+                    .turn_get(&lineage.child_thread_id, &lineage.child_turn_id)
+                    .await
+                    .unwrap()
+                    .1,
+                persisted
+            );
+            let accepted = crud_store
+                .native_cancellation_accepted_notification_owned(
+                    &lineage.child_turn_id,
+                    recovery_processor.turn_execution_owner_id.as_ref(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                accepted.turn.prompt_manifest.is_none(),
+                "hydration must not rewrite the original canonical payload"
+            );
+            let events = pioneer_entity::turn_event::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event::Column::TurnId.eq(lineage.child_turn_id.clone()),
+                )
+                .filter(pioneer_entity::turn_event::Column::EventType.eq(events::TURN_FAILED))
+                .all(&crud_store.database_connection())
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            if let Some(first) = terminal_events.as_ref() {
+                assert_eq!(
+                    &events, first,
+                    "repeat Stop must retain the exact canonical ID, payload and idempotency key"
+                );
+            } else {
+                terminal_events = Some(events);
+            }
+        }
+        recovery_processor.release_completed_history_preparation_barrier();
+        wait_for_cancelled_native_actor_cleanup(
+            &recovery_processor.agent_manager,
+            &lineage.child_thread_id,
+        )
+        .await;
+        assert_eq!(
+            crud_store
+                .get_task_run(&run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskRunStatus::Cancelled
+        );
+        assert!(
+            recovery_provider.snapshot_requests().is_empty(),
+            "recovery Stop must not compile another model request"
+        );
+        assert_eq!(initial_provider.child_main_call_count(), 1);
+        assert_eq!(
+            pioneer_entity::turn_event::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event::Column::TurnId.eq(lineage.child_turn_id.clone())
+                )
+                .filter(pioneer_entity::turn_event::Column::EventType.eq(events::TURN_FAILED))
+                .all(&crud_store.database_connection())
+                .await
+                .unwrap(),
+            terminal_events.unwrap(),
+            "actor cleanup must retain the same accepted terminal event"
+        );
+        return;
+    }
 
     let mut recovered_task_status = crud_store
         .get_task(response.task.id.as_str())
@@ -24629,6 +26980,16 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
         lineage.created_by_turn_id.as_deref(),
         Some(creation_turn_id)
     );
+    task_launch_continuity::assert_materialized_child_security(
+        &processor,
+        run,
+        &lineage,
+        run.id.as_str(),
+        crate::turn_security::TurnSecurityResolverExecutionBackend::NativeApiProvider {
+            provider: "openai".to_owned(),
+        },
+    )
+    .await;
     let occurrence_actor = turn::Entity::find_by_id(run.id.as_str())
         .one(&crud_store.database_connection())
         .await
@@ -24773,7 +27134,8 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
             r#"<task_result>{{"summary":"immediate background result","data":{{"rawText":"{}"}}}}</task_result>"#,
             "🧪".repeat(60_000)
         ))
-        .with_first_delay(Duration::from_millis(250)),
+        .with_first_delay(Duration::from_millis(250))
+        .with_valid_summary_completion(),
     );
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -25077,15 +27439,51 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     processor
         .set_thread_episodic_ingestor_for_test(delivery_ingestor.clone())
         .await;
+    // Occupy optional preparation with a published user root, independently
+    // of the detached occurrence whose delivery/order/provenance we observe.
+    let history = Phase13CompactionHarness {
+        processor: processor.clone(),
+        crud_store: crud_store.clone(),
+        workspace_id: workspace_id.clone(),
+    };
+    let history_thread = "thr_delivery_background_root";
+    let history_turn = "turn_delivery_background_root";
+    let history_at = super::now_timestamp_secs();
+    crate::compaction::load_test_catalog();
+    root_conversation_compaction::human_input(
+        &history,
+        history_thread,
+        history_turn,
+        history_at,
+        "background root question",
+    )
+    .await;
+    root_conversation_compaction::answer(
+        &history,
+        history_thread,
+        history_turn,
+        history_at,
+        // Exceed the context budget with dense tokens, rather than megabytes
+        // of low-density text that require many incremental fragment fits.
+        // The spaces keep tokenizer pieces bounded as well.
+        &"🧪 ".repeat(60_000),
+    )
+    .await;
     let pending = crud_store
         .compaction_pending_history_checks()
         .await
-        .expect("Native completion intent should be queryable before worker admission");
+        .expect("published root work should be discoverable before worker admission");
     assert!(
         pending
             .iter()
-            .any(|check| check.turn_id == lineage.child_turn_id),
-        "Native child completion must expose its intent before delivery"
+            .any(|check| { check.thread_id == history_thread && check.turn_id == history_turn }),
+        "the actual ready root answer must enqueue background preparation"
+    );
+    assert!(
+        pending.iter().all(|check| {
+            check.thread_id != lineage.child_thread_id && check.turn_id != lineage.child_turn_id
+        }),
+        "retained child results must not become optional conversation warming"
     );
     let before_delivery = processor
         .task_runtime
@@ -25110,7 +27508,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     let summary_calls = provider.call_count();
     match barrier {
         CompletedHistoryDeliveryBarrier::Preparation => {
-            processor.arm_completed_history_preparation_barrier(&lineage.child_turn_id)
+            processor.arm_completed_history_preparation_barrier(history_turn)
         }
         CompletedHistoryDeliveryBarrier::Summarizer => {
             provider.pause_first.store(true, Ordering::SeqCst)
@@ -25119,21 +27517,50 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     processor
         .poll_completed_history_checks()
         .await
-        .expect("Native history worker should start");
+        .expect("published root history worker should start");
     match barrier {
         CompletedHistoryDeliveryBarrier::Preparation => timeout(
             Duration::from_secs(10),
             processor.wait_for_completed_history_preparation_barrier(),
         )
         .await
-        .expect("Native worker must reach the preparation barrier"),
+        .expect("root worker must reach the preparation barrier"),
         CompletedHistoryDeliveryBarrier::Summarizer => timeout(Duration::from_secs(10), async {
-            while provider.call_count() == summary_calls {
+            // The first whole-unit portion may contain only the short question.
+            while provider.call_count() == summary_calls
+                || !provider
+                    .snapshot_requests()
+                    .iter()
+                    .skip(summary_calls)
+                    .any(|request| {
+                        request.messages.first().is_some_and(|message| {
+                            message.content == pioneer_compaction::summary::INSTRUCTIONS
+                        }) && request
+                            .messages
+                            .iter()
+                            .skip(1)
+                            .any(|message| message.content.contains("background root question"))
+                    })
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("Native summarizer must reach the provider barrier"),
+        .expect("root summarizer must reach the provider barrier"),
+    }
+
+    {
+        let jobs = processor.completed_history_checks.lock().await;
+        let root_job = jobs
+            .get(&(workspace_id.clone(), history_thread.to_owned()))
+            .expect("the published root must own the blocked preparation");
+        assert!(
+            root_job
+                .handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished()),
+            "delivery must overlap occupied background preparation"
+        );
     }
 
     processor
@@ -25189,7 +27616,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         }
         CompletedHistoryDeliveryBarrier::Summarizer => provider.release_paused_call(),
     }
-    timeout(Duration::from_secs(30), async {
+    let settled = timeout(Duration::from_secs(30), async {
         loop {
             let finished = processor
                 .completed_history_checks
@@ -25207,8 +27634,36 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
             sleep(Duration::from_millis(25)).await;
         }
     })
-    .await
-    .expect("released Native history worker should finish");
+    .await;
+    if settled.is_err() {
+        let operations = pioneer_entity::compaction_operation::Entity::find()
+            .all(&crud_store.database_connection())
+            .await
+            .unwrap();
+        let progress: Vec<_> = operations
+            .iter()
+            .map(|operation| {
+                (
+                    &operation.status,
+                    operation.attempts,
+                    operation.next_portion,
+                    &operation.outcome,
+                )
+            })
+            .collect();
+        eprintln!(
+            "Native history operations: {progress:?}; provider calls: {}",
+            provider.call_count()
+        );
+    }
+    assert!(
+        settled.is_ok(),
+        "released Native history worker should finish; barrier: {barrier:?}; checks: {:?}",
+        pioneer_entity::compaction_history_check::Entity::find()
+            .all(&crud_store.database_connection())
+            .await
+            .unwrap()
+    );
     processor.poll_completed_history_checks().await.unwrap();
     assert_eq!(
         deliveries.deliveries[0].delivered_turn_id.as_deref(),
@@ -25660,6 +28115,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
     params.metadata = Some(pioneer_protocol::TaskMetadata {
         labels: vec!["composer-work".to_owned()],
         data: None,
+        finish_request: None,
         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(exact_launch.clone())),
     });
 
@@ -25979,8 +28435,8 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                     .list_turn_skill_bindings(&lineage.child_turn_id)
                     .await
                     .unwrap();
-                assert_eq!(bindings.len(), skill_ids.len() + 2);
-                for slug in ["tasks", "subagents"] {
+                assert_eq!(bindings.len(), skill_ids.len() + 4);
+                for slug in ["tasks", "subagents", "html", "threads"] {
                     assert!(bindings.iter().any(|binding| {
                         binding.source_kind == "system"
                             && binding.skill_owner.as_deref() == Some("pioneer")
@@ -26549,6 +29005,8 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                     runtime_id: Some(runtime_id.to_owned()),
                     session_generation: Some(session_generation),
                     provider_call_id: format!("provider-call-{runtime_id}"),
+                    native_call: None,
+                    admission_deadline: None,
                     canonical_callable_name: projected_tool.canonical_callable_name,
                     arguments: json!({"message": format!("{runtime_id} MCP authorization")}),
                     origin: crate::turn_mcp::invoker::TurnMcpInvocationOrigin::CliFacade,
@@ -30349,6 +32807,26 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             Some(run.id.as_str()),
             "the child security snapshot must inherit through the durable Task occurrence anchor"
         );
+        task_launch_continuity::assert_materialized_child_security(
+            &processor,
+            &run,
+            &lineage,
+            run.id.as_str(),
+            match runtime_kind {
+                CLIAgentRuntimeKind::Codex => {
+                    crate::turn_security::TurnSecurityResolverExecutionBackend::CodexCli {
+                        runtime_id: runtime_id.to_owned(),
+                    }
+                }
+                CLIAgentRuntimeKind::Claude => {
+                    crate::turn_security::TurnSecurityResolverExecutionBackend::ClaudeCli {
+                        runtime_id: runtime_id.to_owned(),
+                    }
+                }
+                CLIAgentRuntimeKind::OpenCode => unreachable!(),
+            },
+        )
+        .await;
         assert_eq!(
             security.backend.execution_backend,
             match runtime_kind {
@@ -33589,7 +36067,12 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
         .collect::<Vec<_>>();
     assert_eq!(
         skill_names,
-        vec!["pioneer-system-tasks", "pioneer-system-subagents"]
+        vec![
+            "pioneer-system-tasks",
+            "pioneer-system-subagents",
+            "pioneer-system-html",
+            "pioneer-system-threads"
+        ]
     );
     let adapter_messages = adapter_input
         .iter()
@@ -34285,6 +36768,7 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     params.metadata = Some(pioneer_protocol::TaskMetadata {
         labels: vec!["prompt-parity".to_owned()],
         data: None,
+        finish_request: None,
         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(exact_launch)),
     });
 
@@ -34712,6 +37196,7 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     params.metadata = Some(pioneer_protocol::TaskMetadata {
         labels: vec!["full-prompt-parity".to_owned()],
         data: None,
+        finish_request: None,
         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(task_launch)),
     });
 
@@ -35375,11 +37860,11 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
         r#"<task_result>{"summary":"nested work completed"}</task_result>"#,
     ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "nested",
+        "openai",
         provider.clone(),
     ));
     let session_manager = Arc::new(SessionManager::new());
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "nested"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     // This scenario intentionally drives three concurrent Agent Turns. A
     // pooled `sqlite::memory:` URL can open isolated per-connection databases
     // under that load, so use one unique file-backed database for the exact
@@ -35410,6 +37895,10 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
             crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
         )))
         .await;
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_task_bridge().await;
 
     let root_thread_id = "thread_nested_permission_root";
@@ -35425,7 +37914,7 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
         .agent_spec
         .as_mut()
         .expect("root agent spec should exist")
-        .model_provider = Some("nested".to_owned());
+        .model_provider = Some("openai".to_owned());
     let root = create_task_for_test(&processor, root_params)
         .await
         .expect("root task should start");
@@ -36171,13 +38660,13 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         destination.display().to_string(),
     ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "direct-agent-sandbox",
+        "openai",
         provider.clone(),
     ));
     let (tx, mut rx) = mpsc::channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "direct-agent-sandbox"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
@@ -36192,6 +38681,10 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_agent_tool_bridges().await;
 
     let thread_id = "thread_direct_agent_permission";
@@ -36204,7 +38697,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         thread_id,
         root_turn_id,
         "Agent",
-        "direct-agent-sandbox",
+        "openai",
     )
     .await;
 
@@ -36226,6 +38719,34 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         sleep(Duration::from_millis(25)).await;
     }
     if !child_dispatched {
+        let db = crud_store.database_connection();
+        let outbox_rows = pioneer_entity::agent_action_outbox::Entity::find()
+            .all(&db)
+            .await
+            .expect("direct Agent outbox diagnostics should load");
+        for row in &outbox_rows {
+            let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
+            if let Some(child_turn_id) = payload["dispatch"]["turn_id"].as_str() {
+                let owner = crud_store.get_turn_execution(child_turn_id).await;
+                let snapshot = crud_store.get_turn_runtime_snapshot(child_turn_id).await;
+                let authority = processor
+                    .load_turn_execution_authorization_context(child_turn_id)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}"));
+                let execution_id = payload["spawned_execution_id"].as_str().unwrap();
+                let resource =
+                    pioneer_crud::load_agent_execution_resource_state(&db, execution_id).await;
+                eprintln!(
+                    "direct Agent dispatch diagnostics: status={}, attempts={}, last_error={:?}, next_attempt_at={:?}, child_turn_id={child_turn_id}, owner={owner:?}, snapshot_present={:?}, authority={authority:?}, resource={resource:?}",
+                    row.status,
+                    row.attempts,
+                    row.last_error,
+                    row.next_attempt_at,
+                    snapshot.as_ref().map(|snapshot| snapshot.is_some()),
+                );
+            }
+        }
         let root_turn = crud_store
             .get_turn(thread_id, root_turn_id)
             .await
@@ -36247,12 +38768,19 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         .expect("direct Agent child permission request should be present");
     assert_eq!(opened_request["tool_name"], json!("exec_command"));
     assert_eq!(opened_request["action"], json!("shell_command"));
-    assert_eq!(opened_request["thread_id"], json!(thread_id));
+    let child_thread_id = opened_request["thread_id"].as_str().unwrap().to_owned();
+    assert_ne!(child_thread_id, thread_id);
+    let lineage = crud_store
+        .get_task_thread_lineage(&child_thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lineage.root_thread_id, thread_id);
     let child_turn_id = opened_request["turn_id"]
         .as_str()
         .expect("direct Agent child turn id should be present")
         .to_owned();
-    assert_admitted_turn_owner(&processor, thread_id, &child_turn_id).await;
+    assert_admitted_turn_owner(&processor, &child_thread_id, &child_turn_id).await;
     assert_ne!(child_turn_id, root_turn_id);
     let permission_request_id = opened_request["request_id"]
         .as_str()
@@ -36320,7 +38848,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
     let expected_artifact_root = pioneer_artifacts::artifact_output_dir_path(
         processor.artifact_runtime_home.join("artifacts").as_path(),
         workspace_id.as_str(),
-        thread_id,
+        child_thread_id.as_str(),
         child_turn_id.as_str(),
     )
     .expect("direct Agent child artifact root should resolve");
@@ -36355,7 +38883,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
     assert!(permission_records[0].status.is_terminal());
 
     let child_events = crud_store
-        .get_turn_item_events(thread_id, child_turn_id.as_str())
+        .get_turn_item_events(&child_thread_id, child_turn_id.as_str())
         .await
         .expect("direct Agent child event stream should load")
         .expect("direct Agent child event stream should exist");
@@ -36780,6 +39308,11 @@ async fn task_create_inherits_exact_turn_capabilities_for_attached_and_backgroun
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     )
     .await;
+    harness
+        .processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(harness.workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
     let skill_id = seed_test_skill_installation(
@@ -37020,7 +39553,7 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let child_title = "Idempotent delegated task";
     let task_arguments = json!({
@@ -37047,7 +39580,7 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         "parent observed child result",
     ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "parent",
+        "openai",
         provider.clone(),
     ));
     provider_registry
@@ -37063,6 +39596,10 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_agent_tool_bridges().await;
     processor
         .start_resilience_workers()
@@ -37077,7 +39614,7 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         "thr_task_tool_idempotency",
         "turn_task_tool_idempotency",
         "Agent",
-        "parent",
+        "openai",
     )
     .await;
     let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
@@ -38224,11 +40761,11 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-        let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+        let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
         let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
         let provider = Arc::new(GuardAwareProvider::new());
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-            "parent",
+            "openai",
             provider.clone(),
         ));
         provider_registry
@@ -38250,6 +40787,10 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             test_summary_config(),
             test_tool_loop_config(),
         ));
+        processor
+            .gateway_secrets
+            .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+            .expect("fixture provider should be configured");
         processor.bind_task_bridge().await;
 
         start_thread_and_turn(
@@ -38260,7 +40801,7 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             "thr_task_guard_parent",
             "turn_task_guard_parent",
             "Agent",
-            "parent",
+            "openai",
         )
         .await;
         let mut observed_notifications = Vec::new();
@@ -38494,11 +41035,11 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider = Arc::new(CreateThenHangProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "parent",
+        "openai",
         provider.clone(),
     ));
     let processor = Arc::new(MessageProcessor::new(
@@ -38511,6 +41052,10 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_task_bridge().await;
 
     let thread_id = "thr_task_anchor_progress";
@@ -38523,7 +41068,7 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         thread_id,
         turn_id,
         "Agent",
-        "parent",
+        "openai",
     )
     .await;
 
@@ -38571,6 +41116,75 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         Some(lineage.child_turn_id.as_str())
     );
 
+    // Exercise the real child lineage/resolver and parent subscription path.
+    wait_for_thread_manager_turn_status(
+        &processor.thread_manager,
+        &lineage.child_thread_id,
+        &lineage.child_turn_id,
+        TurnStatus::InProgress,
+    )
+    .await;
+    let reasoning_id = "task_child_reasoning";
+    assert!(
+        processor
+            .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                notification: ItemStartedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: lineage.child_thread_id.clone(),
+                    turn_id: lineage.child_turn_id.clone(),
+                    item: TurnItem::Reasoning {
+                        id: reasoning_id.into(),
+                        summary: vec!["**проверка".into()],
+                        content: vec![],
+                    },
+                },
+            })
+            .await
+    );
+    let previous_lookups = processor
+        .progress_item_type_lookup_count
+        .load(Ordering::Relaxed);
+    processor
+        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+            notification: ItemDeltaNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                item_id: reasoning_id.into(),
+                delta: " 🦀**".into(),
+                stream: Some(ItemDeltaStream::Generic),
+                payload: None,
+                markdown: None,
+                markdown_version: None,
+            },
+        })
+        .await;
+    let forwarded = timeout(Duration::from_secs(2), async {
+        loop {
+            let live = recv_notification_by_method(&mut rx, events::ITEM_AGENT_MESSAGE_DELTA).await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            if live.item_id == reasoning_id {
+                break live;
+            }
+        }
+    })
+    .await
+    .expect("child reasoning must reach the parent subscriber");
+    assert_eq!(forwarded.thread_id, thread_id);
+    assert_eq!(forwarded.turn_id, turn_id);
+    assert_eq!(forwarded.delta, " 🦀**");
+    assert_eq!(
+        forwarded.markdown,
+        Some(super::markdown::parse_markdown_document("**проверка 🦀**"))
+    );
+    assert_eq!(
+        processor
+            .progress_item_type_lookup_count
+            .load(Ordering::Relaxed),
+        previous_lookups,
+        "forwarding reuses the started item type cache"
+    );
+
     processor
         .agent_manager
         .cancel_turn(thread_id, turn_id, "test cleanup")
@@ -38582,11 +41196,11 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider = Arc::new(CreateThenHangProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "parent",
+        "openai",
         provider.clone(),
     ));
     provider_registry
@@ -38608,6 +41222,10 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_task_bridge().await;
 
     start_thread_and_turn(
@@ -38618,7 +41236,7 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         "thr_task_cancel_parent",
         "turn_task_cancel_parent",
         "Agent",
-        "parent",
+        "openai",
     )
     .await;
 
@@ -41908,6 +44526,14 @@ async fn setup_execution_window_terminal_turn(
     thread_id: &str,
     turn_id: &str,
 ) -> (MessageProcessor, Arc<CrudStore>, String) {
+    setup_execution_window_terminal_turn_with_input(thread_id, turn_id, &[]).await
+}
+
+async fn setup_execution_window_terminal_turn_with_input(
+    thread_id: &str,
+    turn_id: &str,
+    input: &[UserInput],
+) -> (MessageProcessor, Arc<CrudStore>, String) {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
@@ -41944,13 +44570,20 @@ async fn setup_execution_window_terminal_turn(
         )
         .await
         .expect("thread should start");
-    thread_manager
-        .system_turn_start_with_permission_profile(
+    let author = super::message_turn::resolve_turn_author_snapshot(
+        crud_store.as_ref(),
+        &pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let turn_start = thread_manager
+        .agent_turn_start_with_permission_profile(
             pioneer_protocol::TurnStartParams {
                 agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
-                input: Vec::new(),
+                input: input.to_vec(),
                 capabilities: Vec::new(),
                 model: None,
                 model_provider: None,
@@ -41967,6 +44600,7 @@ async fn setup_execution_window_terminal_turn(
             pioneer_protocol::system_turn_permission_profile_snapshot(
                 pioneer_protocol::TurnPermissionMode::FullAccess,
             ),
+            author,
         )
         .await
         .expect("turn should start in thread manager");
@@ -41974,22 +44608,8 @@ async fn setup_execution_window_terminal_turn(
         .materialize_turn_start(
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
-            &Turn {
-                id: turn_id.to_owned(),
-                status: TurnStatus::InProgress,
-                turn_kind: Default::default(),
-                origin: Default::default(),
-                mode: Default::default(),
-                author: None,
-                reply_to_turn_id: None,
-                mentions: Vec::new(),
-                message_revision: 0,
-                message_deleted: false,
-                error: None,
-                prompt_manifest: None,
-                permission_profile: default_test_permission_profile(),
-            },
-            &[],
+            &turn_start.materialization.turn,
+            input,
             pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
         )
         .await
@@ -42430,6 +45050,7 @@ async fn terminal_turn_interruption_closes_running_execution_window() {
             turn_id: turn_id.to_owned(),
             reason: "user cancelled".to_owned(),
             recovery: None,
+            cancellation_owner: None,
         })
         .await;
 
@@ -46601,6 +49222,23 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
         })
         .expect("native Agent work must execute in an exact Composer child")
         .clone();
+    let admission = harness
+        .crud_store
+        .get_task_execution_admission(&native_task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let saved_authority =
+        crate::authorization::ExecutionAuthorizationContext::load_for_task_admission(
+            harness.crud_store.as_ref(),
+            &admission,
+        )
+        .await
+        .unwrap();
+    assert!(
+        saved_authority.granted_skill_ids().contains(&skill_id_text),
+        "the Agent skill must already belong to the saved Task allowance"
+    );
     let native_run_id =
         wait_for_task_run_id(harness.crud_store.clone(), native_task.id.as_str()).await;
     let native_child =
@@ -48694,6 +51332,7 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
         .enqueue_codex_transport_session_recovery(
             handle.instance(),
             "oversized frame exceeded the finite spool budget",
+            None,
         )
         .await;
     cli_manager
@@ -50483,6 +53122,26 @@ async fn cli_runtime_terminal_attempt_fences_late_native_events() {
             }),
         )
         .await;
+
+    processor
+        .handle_cli_runtime_timeline_event(
+            &key,
+            RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+                native_thread_id: Some(native_thread_id.into()),
+                native_turn_id: Some(native_turn_id.into()),
+                message: "late retry".into(),
+                code: None,
+                native: None,
+            }),
+        )
+        .await;
+    assert!(
+        crud_store
+            .list_turn_items_by_type(turn_id, "system_event")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     assert!(
         crud_store
@@ -58191,8 +60850,15 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
     // Cancellation is the control-plane operation under test. Seed an admitted,
     // durable in-progress Turn directly so the assertion does not depend on the
     // separate launch-admission surface (which has its own exhaustive tests).
+    let actor = pioneer_protocol::PersistedActorRef::Principal(
+        authenticated_test_superuser().principal_id.clone(),
+    );
+    let author =
+        super::message_turn::resolve_turn_author_snapshot(crud_store_for_assert.as_ref(), &actor)
+            .await
+            .unwrap();
     let turn_outcome = thread_manager_for_assert
-        .turn_start(
+        .turn_start_with_user_metadata(
             connection_id,
             pioneer_protocol::TurnStartParams {
                 agent_delegation_routes: Vec::new(),
@@ -58217,6 +60883,8 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 permission_profile: None,
                 cli_runtime_options: None,
             },
+            author,
+            Vec::new(),
         )
         .await
         .expect("turn cancellation fixture should seed an in-progress Turn");
@@ -58606,10 +61274,11 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
         .expect("interrupted turn should be persisted");
     assert_eq!(persisted_turn.status, TurnStatus::Interrupted);
     assert_eq!(persisted_turn.error.as_deref(), Some("user clicked stop"));
-    // Aggregate reads synthesize the legacy author from the persisted initiator.
-    // The accepted canonical notification must still deliver its exact Turn.
-    assert!(persisted_turn.author.is_some());
-    assert!(failed.turn.author.is_none());
+    // Admission stored an explicit author. Cancellation must retain that exact
+    // author in both its canonical notification and the persisted projection.
+    assert_eq!(failed.turn.author, turn_outcome.materialization.turn.author);
+    assert!(failed.turn.author.is_some());
+    assert_eq!(persisted_turn, failed.turn);
     assert_eq!(
         thread_manager_for_assert
             .turn_get("thr_000000000000000022", "turn_000000000000000022")
@@ -61713,6 +64382,762 @@ async fn semantic_timeline_rejects_excessive_limits_before_payload_growth() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_thread() {
+    use pioneer_client::{
+        core::ClientCore,
+        timeline::{
+            semantic::{TopLevelPageMergeMode, flatten_thread_semantic_timeline},
+            semantic_render::render_semantic_timeline_rows,
+        },
+    };
+    use sea_orm::ActiveModelTrait;
+
+    for (runtime_id, kind) in [
+        ("codex", CLIAgentRuntimeKind::Codex),
+        ("opencode", CLIAgentRuntimeKind::OpenCode),
+    ] {
+        // The harness thread is the visible parent. Never subscribe it to the child.
+        // Membership rows require a 21-character alphanumeric thread ID.
+        let mut harness = setup_live_semantic_timeline_harness_with_thread_id(
+            &format!("retry_{runtime_id}"),
+            generate_test_request_id("retrythread", runtime_id),
+        )
+        .await;
+        let cli = Arc::new(RecordingCliRuntimeSession::default());
+        cli.set_next_native_turn_id("retry_native_turn").await;
+        cli.enable_projected_mcp_metadata(harness.processor.crud_store.clone())
+            .await;
+        harness.processor = with_enabled_test_cli_runtime_catalog(
+            harness
+                .processor
+                .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli.clone()))
+                .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(kind)),
+        );
+        let processor = Arc::new(harness.processor.clone());
+        let store = processor.crud_store.clone();
+        sync_test_cli_runtime_identities(&processor).await.unwrap();
+        processor
+            .mark_cli_runtimes_ready_for_tests(&harness.workspace_id)
+            .await
+            .unwrap();
+        processor.bind_task_bridge().await;
+        processor.start_task_event_listener().await;
+        let mut parent: pioneer_entity::thread::ActiveModel = store
+            .get_thread_by_id(&harness.thread_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        parent.access_class = Set("private".into());
+        parent.update(&store.database_connection()).await.unwrap();
+        let params = detached_cli_task_create_params(
+            &harness.workspace_id,
+            &harness.thread_id,
+            &harness.turn_id,
+            runtime_id,
+            kind,
+            "gpt-5",
+            "retry notice presentation",
+        );
+        let (run, child) = drain_test_notifications_while(&mut harness.rx, async {
+            let response = create_task_for_test(&processor, params).await.unwrap();
+            let run = response.run.unwrap();
+            let child = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
+            assert_eq!(wait_for_cli_runtime_turn_starts(&cli, 1).await.len(), 1);
+            assert_eq!(
+                wait_for_run_status(store.clone(), &run.id, TaskRunStatus::Running).await,
+                TaskRunStatus::Running
+            );
+            (run, child)
+        })
+        .await;
+        assert!(
+            processor
+                .thread_manager
+                .subscribed_connections(&child.child_thread_id)
+                .await
+                .is_empty()
+        );
+        let source = store
+            .get_thread_by_id(&child.child_thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.access_class, "internal");
+        assert_eq!(source.sidebar_visibility, "hidden");
+        let binding = store
+            .get_cli_runtime_turn_binding(&child.child_turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let key = CLIAgentRuntimeSessionKey::new(
+            &harness.workspace_id,
+            runtime_id,
+            &binding.continuation_thread_id,
+        )
+        .unwrap();
+        let session = processor
+            .cli_runtime_manager
+            .as_ref()
+            .unwrap()
+            .existing_session(&key)
+            .await
+            .unwrap();
+        let instance = session.instance().clone();
+        let native_turn = binding.native_turn_id.clone().unwrap();
+        let retry = |message: &str| {
+            RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+                native_thread_id: Some(binding.native_thread_id.clone()),
+                native_turn_id: Some(native_turn.clone()),
+                message: message.into(),
+                code: None,
+                native: None,
+            })
+        };
+        // Finish startup fanout before observing the notice, so a delayed
+        // TaskRunStarted invalidation cannot satisfy the retry-delivery assertion.
+        timeout(
+            Duration::from_secs(10),
+            drain_test_notifications_while(&mut harness.rx, async {
+                loop {
+                    let fanout = processor.task_event_fanout_quantum().await.unwrap();
+                    assert_eq!(fanout.errors, 0);
+                    if fanout.pending != Some(true) {
+                        break;
+                    }
+                }
+                processor
+                    .process_due_native_turn_event_deliveries(now_timestamp_secs(), 128)
+                    .await
+                    .unwrap();
+                while processor
+                    .native_turn_event_delivery_kick_running
+                    .load(Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let initial = request_live_thread_timeline_page(&mut harness, "retry-before").await;
+        let core = ClientCore::new();
+        core.upsert_thread(
+            store
+                .get_thread_model(&harness.thread_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        core.activate_thread(Some(&harness.thread_id), Some(&harness.workspace_id));
+        core.apply_thread_timeline_page(initial, TopLevelPageMergeMode::Reset);
+
+        // A formerly admitted private-thread collaborator retains a stale local
+        // subscription, but membership revocation must fence both push and reload.
+        materialize_test_member_collaborator(
+            store.as_ref(),
+            &harness.workspace_id,
+            &harness.thread_id,
+        )
+        .await;
+        let (member_tx, mut member_rx) = mpsc::channel(64);
+        let member = processor
+            .session_manager
+            .register_connection(member_tx, authenticated_test_member_collaborator())
+            .await
+            .unwrap();
+        processor
+            .session_manager
+            .set_connection_workspace(member, Some(harness.workspace_id.clone()))
+            .await;
+        assert!(
+            processor
+                .thread_manager
+                .subscribe_connection(&harness.thread_id, member)
+                .await
+        );
+        let admitted_id = generate_test_request_id("retry", "member-before-revoke");
+        processor
+            .process_request_for_connection(
+                member,
+                &json!({
+                    "jsonrpc":"2.0", "id":admitted_id, "method":"thread/timeline/page",
+                    "params":{"threadId":harness.thread_id,"anchor":{"kind":"newest"}}
+                })
+                .to_string(),
+            )
+            .await;
+        let _admitted = recv_response_by_id(&mut member_rx, &admitted_id).await;
+        pioneer_entity::thread_membership::Entity::delete_many()
+            .filter(pioneer_entity::thread_membership::Column::ThreadId.eq(&harness.thread_id))
+            .filter(
+                pioneer_entity::thread_membership::Column::PrincipalId
+                    .eq(TEST_COLLABORATOR_PRINCIPAL_ID),
+            )
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+        while harness.rx.try_recv().is_ok() {}
+        for message in [
+            "Reconnecting... 1/5",
+            "different temporary failure",
+            "Reconnecting... 1/5",
+        ] {
+            processor
+                .handle_cli_runtime_timeline_event(&instance, retry(message))
+                .await;
+        }
+        let notices = store
+            .list_turn_items_by_type(&child.child_turn_id, "system_event")
+            .await
+            .unwrap();
+        let notices: Vec<_> = notices.into_iter().filter(|item| matches!(item, TurnItem::SystemEvent {code:Some(code),..} if code=="codex_request_retried")).collect();
+        if kind == CLIAgentRuntimeKind::OpenCode {
+            assert!(notices.is_empty());
+            continue;
+        }
+        assert_eq!(notices.len(), 1);
+        let notice_id = notices[0].item_id().to_owned();
+        let target = store
+            .codex_retry_notice_target(&child.child_thread_id, &child.child_turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // The card was read before a concurrent Task progress update. Mutable
+        // presentation fields must not invalidate its verified execution links.
+        let mut newer_task = target.task.clone();
+        newer_task.status = TaskStatus::Waiting;
+        newer_task.progress_preview = Some("newer progress".into());
+        newer_task.updated_at += 1;
+        store
+            .materialize_item_updated(
+                ItemUpdatedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: harness.thread_id.clone(),
+                    turn_id: target.turn_id.clone(),
+                    item: TurnItem::Task {
+                        item: newer_task.clone(),
+                    },
+                },
+                newer_task.updated_at,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .codex_retry_notices_for_task(
+                    &target.workspace_id,
+                    &target.thread_id,
+                    &target.turn_id,
+                    &target.task
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut wrong_link = target.task.clone();
+        wrong_link.run_id = Some("unrelated-run".into());
+        assert!(
+            store
+                .codex_retry_notices_for_task(
+                    &target.workspace_id,
+                    &target.thread_id,
+                    &target.turn_id,
+                    &wrong_link
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let block_id = pioneer_crud::detached_task_run_block_id(&target.turn_id, &target.task.id);
+        let changed = timeout(Duration::from_secs(10), async {
+            loop {
+                let packet = recv_notification_by_method(
+                    &mut harness.rx,
+                    events::THREAD_TIMELINE_BLOCKS_CHANGED,
+                )
+                .await;
+                let changed: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
+                    serde_json::from_value(packet.params.unwrap()).unwrap();
+                if changed.changed_block_ids.contains(&block_id) {
+                    break changed;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(changed.thread_id, harness.thread_id);
+        assert!(core.apply_thread_notification(
+            pioneer_protocol::GatewayNotification::ThreadTimelineBlocksChanged(changed)
+        ));
+        assert!(
+            core.thread_semantic_snapshot(&harness.thread_id)
+                .thread(&harness.thread_id)
+                .unwrap()
+                .top_level
+                .stale_block_ids()
+                .contains(&block_id.as_str())
+        );
+        assert!(
+            core.thread_semantic_snapshot(&child.child_thread_id)
+                .thread(&child.child_thread_id)
+                .is_none()
+        );
+        let page = request_live_thread_timeline_page(&mut harness, "retry-after").await;
+        core.apply_thread_timeline_page(page.clone(), TopLevelPageMergeMode::Merge);
+        let viewing_thread = harness.thread_id.clone();
+        let assert_visible = |client: &ClientCore| {
+            let state = client.thread_semantic_snapshot(&viewing_thread);
+            let rows = flatten_thread_semantic_timeline(state.thread(&viewing_thread).unwrap());
+            let rendered = render_semantic_timeline_rows(&rows.rows, Default::default());
+            let shown: Vec<_> = rendered.projection.items.iter().filter(|item| matches!(&item.item,TurnItem::SystemEvent{code:Some(code),..} if code=="codex_request_retried")).collect();
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].id, notice_id);
+            assert_eq!(shown[0].turn_id, child.child_turn_id);
+            assert_eq!(
+                shown[0]
+                    .timeline_origin
+                    .as_ref()
+                    .unwrap()
+                    .child_thread_id
+                    .as_deref(),
+                Some(child.child_thread_id.as_str())
+            );
+        };
+        assert_visible(&core);
+        // A fresh client opens only the main thread from durable history.
+        let restored = ClientCore::new();
+        restored.upsert_thread(
+            store
+                .get_thread_model(&harness.thread_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let reloaded = request_live_thread_timeline_page(&mut harness, "retry-reloaded").await;
+        restored.apply_thread_timeline_page(reloaded, TopLevelPageMergeMode::Reset);
+        assert_visible(&restored);
+        let canonical = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(&child.child_turn_id))
+            .filter(pioneer_entity::turn_event::Column::EventType.eq(events::ITEM_COMPLETED))
+            .all(&store.database_connection())
+            .await
+            .unwrap();
+        assert_eq!(
+            canonical
+                .iter()
+                .filter(|event| event.payload.contains("codex_request_retried"))
+                .count(),
+            1
+        );
+        assert!(store.list_turn_items_by_type(&run.id, "system_event").await.unwrap().iter().all(|item| !matches!(item,TurnItem::SystemEvent{code:Some(code),..} if code=="codex_request_retried")));
+        while let Ok(packet) = member_rx.try_recv() {
+            let Message::Text(packet) = packet else {
+                continue;
+            };
+            let packet: JsonValue = serde_json::from_str(packet.as_str()).unwrap();
+            assert_ne!(
+                packet.get("method").and_then(JsonValue::as_str),
+                Some(events::THREAD_TIMELINE_BLOCKS_CHANGED)
+            );
+        }
+        let id = generate_test_request_id("retry", "revoked");
+        processor.process_request_for_connection(member, &json!({"jsonrpc":"2.0","id":id,"method":"thread/timeline/page","params":{"threadId":harness.thread_id,"anchor":{"kind":"newest"}}}).to_string()).await;
+        let rejected = recv_jsonrpc_payload_by_id(&mut member_rx, &id).await;
+        let rejected: JsonValue = serde_json::from_str(&rejected).unwrap();
+        assert!(rejected.get("error").is_some());
+        assert!(!rejected.to_string().contains("codex_request_retried"));
+
+        // This reader can read the parent but its registered role specifically
+        // lacks ChildObserve. Unlike revoking the parent, this must return a
+        // successful Task card with an authorized empty notice list.
+        materialize_test_member_collaborator(
+            store.as_ref(),
+            &harness.workspace_id,
+            &harness.thread_id,
+        )
+        .await;
+        let mut restricted = (*authenticated_test_member_collaborator()).clone();
+        restricted.role_key = Some(RoleKey::new("synthetic_executor").unwrap());
+        let mut principal: pioneer_entity::gateway_principal::ActiveModel =
+            pioneer_entity::gateway_principal::Entity::find_by_id(TEST_COLLABORATOR_PRINCIPAL_ID)
+                .one(&store.database_connection())
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        principal.role_key = Set(Some("synthetic_executor".into()));
+        principal
+            .update(&store.database_connection())
+            .await
+            .unwrap();
+        let policy = crate::authorization::AuthorizationService::new();
+        use crate::authorization::ResourceAction;
+        assert!(
+            policy
+                .authorize_action(
+                    restricted.kind,
+                    restricted.role_key.as_ref(),
+                    ResourceAction::ThreadRead
+                )
+                .permits_resource_resolution()
+        );
+        assert!(
+            !policy
+                .authorize_action(
+                    restricted.kind,
+                    restricted.role_key.as_ref(),
+                    ResourceAction::ChildObserve
+                )
+                .permits_resource_resolution()
+        );
+        let (restricted_tx, mut restricted_rx) = mpsc::channel(64);
+        let restricted_connection = processor
+            .session_manager
+            .register_connection(restricted_tx, Arc::new(restricted))
+            .await
+            .unwrap();
+        processor
+            .session_manager
+            .set_connection_workspace(restricted_connection, Some(harness.workspace_id.clone()))
+            .await;
+        let id = generate_test_request_id("retry", "child-observe-denied");
+        processor
+            .process_request_for_connection(
+                restricted_connection,
+                &json!({"jsonrpc":"2.0","id":id,"method":"thread/timeline/page",
+                "params":{"threadId":harness.thread_id,"anchor":{"kind":"newest"}}})
+                .to_string(),
+            )
+            .await;
+        let response = recv_jsonrpc_payload_by_id(&mut restricted_rx, &id).await;
+        let response: JsonValue = serde_json::from_str(&response).unwrap();
+        assert!(
+            response.get("error").is_none(),
+            "parent ThreadRead must succeed: {response}"
+        );
+        let empty_page: pioneer_protocol::ThreadTimelinePageResponse =
+            serde_json::from_value(response["result"].clone()).unwrap();
+        assert!(empty_page.blocks.iter().any(|block| block.block_id == block_id
+            && matches!(&block.kind, pioneer_protocol::TimelineBlockKind::DetachedTaskRun { codex_retry_notices, .. } if codex_retry_notices.is_empty())));
+
+        // Feed the real Gateway result through the production request worker.
+        // A live Task update after its baseline was captured must retain fresh
+        // status/progress while still applying the ChildObserve denial.
+        struct AuthorizedPageTransport<'a> {
+            core: &'a ClientCore,
+            page: pioneer_protocol::ThreadTimelinePageResponse,
+            live: pioneer_protocol::ItemUpdatedNotification,
+            sent: std::cell::Cell<bool>,
+        }
+        impl pioneer_client::rpc::JsonRpcRequestTransport for AuthorizedPageTransport<'_> {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                _: String,
+                response: pioneer_client::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                if !self.sent.replace(true) {
+                    self.core.apply_thread_notification(
+                        pioneer_protocol::GatewayNotification::ItemUpdated(self.live.clone()),
+                    );
+                }
+                response
+                    .send(Ok(serde_json::to_value(&self.page).unwrap()))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        use pioneer_client::timeline::semantic::{
+            SemanticTimelineRequestAction, SemanticTimelineRequestKey,
+        };
+        let request = core
+            .begin_thread_semantic_request(SemanticTimelineRequestAction::ThreadTimelinePage {
+                key: SemanticTimelineRequestKey::ThreadNewest {
+                    thread_id: harness.thread_id.clone(),
+                },
+                params: pioneer_protocol::ThreadTimelinePageParams {
+                    thread_id: harness.thread_id.clone(),
+                    anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                    limit: Some(12),
+                },
+            })
+            .unwrap();
+        let mut fresh_task = newer_task.clone();
+        fresh_task.status = TaskStatus::Running;
+        fresh_task.progress_preview = Some("live progress during authorized read".into());
+        fresh_task.updated_at += 100;
+        let transport = AuthorizedPageTransport {
+            core: &core,
+            page: empty_page,
+            live: ItemUpdatedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: harness.thread_id.clone(),
+                turn_id: target.turn_id.clone(),
+                item: TurnItem::Task {
+                    item: fresh_task.clone(),
+                },
+            },
+            sent: std::cell::Cell::new(false),
+        };
+        core.execute_thread_semantic_request(&transport, request);
+        assert!(transport.sent.get());
+        let state = core.thread_semantic_snapshot(&harness.thread_id);
+        let timeline = &state.thread(&harness.thread_id).unwrap().top_level;
+        assert_eq!(
+            timeline.request_status,
+            pioneer_client::timeline::semantic::TimelineRequestStatus::Ready
+        );
+        let card = timeline.block(&block_id).unwrap();
+        assert!(
+            matches!(&card.kind, pioneer_protocol::TimelineBlockKind::DetachedTaskRun { task, codex_retry_notices, .. }
+            if task == &fresh_task && codex_retry_notices.is_empty())
+        );
+
+        // Cross the identity batch boundary without loading unrelated technical
+        // history. The current active attempt stays the latest durable attempt.
+        let attempt = pioneer_entity::turn_cli_runtime_attempt::Entity::find()
+            .filter(
+                pioneer_entity::turn_cli_runtime_attempt::Column::TurnId.eq(&child.child_turn_id),
+            )
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active: pioneer_entity::turn_cli_runtime_attempt::ActiveModel =
+            attempt.clone().into();
+        active.attempt_index = Set(65);
+        active.update(&store.database_connection()).await.unwrap();
+        for index in 1..=64 {
+            let mut historical: pioneer_entity::turn_cli_runtime_attempt::ActiveModel =
+                attempt.clone().into();
+            historical.id = Set(format!("retry-history-{index}"));
+            historical.attempt_index = Set(index);
+            historical.native_turn_id = Set(Some(format!("retry-history-native-{index}")));
+            historical.status = Set("completed".into());
+            historical
+                .insert(&store.database_connection())
+                .await
+                .unwrap();
+        }
+        let history_id =
+            pioneer_crud::codex_retry_notice_item_id(&child.child_turn_id, "retry-history-1");
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: child.child_thread_id.clone(),
+                    turn_id: child.child_turn_id.clone(),
+                    item: TurnItem::SystemEvent {
+                        id: history_id.clone(),
+                        level: pioneer_protocol::SystemEventLevel::Warning,
+                        message: "Codex reported a request retry after a temporary failure.".into(),
+                        code: Some("codex_request_retried".into()),
+                        details: None,
+                    },
+                },
+                now_timestamp_secs(),
+            )
+            .await
+            .unwrap();
+        let notice_row = pioneer_entity::turn_item::Entity::find()
+            .filter(pioneer_entity::turn_item::Column::TurnId.eq(&child.child_turn_id))
+            .filter(pioneer_entity::turn_item::Column::ItemId.eq(&notice_id))
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut unrelated: pioneer_entity::turn_item::ActiveModel = notice_row.clone().into();
+        unrelated.id = Set("unrelated-corrupt-system-event".into());
+        unrelated.item_id = Set("unrelated-corrupt-system-event".into());
+        unrelated.payload = Set("{corrupt unrelated technical event".into());
+        unrelated
+            .insert(&store.database_connection())
+            .await
+            .unwrap();
+        let read = store
+            .codex_retry_notices_for_task(
+                &target.workspace_id,
+                &target.thread_id,
+                &target.turn_id,
+                &target.task,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.len(), 2);
+        assert!(read.iter().any(|notice| notice.item_id == notice_id));
+        assert!(read.iter().any(|notice| notice.item_id == history_id));
+        let original_payload = notice_row.payload.clone();
+        let mut corrupt: pioneer_entity::turn_item::ActiveModel = notice_row.clone().into();
+        corrupt.payload = Set("{corrupt requested retry notice".into());
+        corrupt.update(&store.database_connection()).await.unwrap();
+        assert!(
+            store
+                .codex_retry_notices_for_task(
+                    &target.workspace_id,
+                    &target.thread_id,
+                    &target.turn_id,
+                    &target.task
+                )
+                .await
+                .is_err()
+        );
+        let mut restore: pioneer_entity::turn_item::ActiveModel = notice_row.into();
+        restore.payload = Set(original_payload);
+        restore.update(&store.database_connection()).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_retry_notice_storage_failure_preserves_native_execution_and_rejects_commit() {
+    use crate::cli_runtime::session_instance::CliSessionInstanceOrigin;
+    let harness = setup_live_semantic_timeline_harness("retry_storage_failure").await;
+    let processor = &harness.processor;
+    let store = processor.crud_store.clone();
+    let now = chrono::Utc::now().fixed_offset();
+    seed_running_cli_runtime_binding(
+        store.as_ref(),
+        NewCliRuntimeTurnBinding {
+            turn_id: harness.turn_id.clone(),
+            thread_id: harness.thread_id.clone(),
+            continuation_thread_id: harness.thread_id.clone(),
+            workspace_id: harness.workspace_id.clone(),
+            runtime_id: "codex".into(),
+            runtime_kind: "codex".into(),
+            native_thread_id: "retry_storage_thread".into(),
+            native_turn_id: Some("retry_storage_turn".into()),
+            request_id: None,
+            status: "running".into(),
+            model: None,
+            cwd: None,
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".into(),
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await;
+    let attempt = store
+        .latest_cli_runtime_turn_attempt(&harness.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let key =
+        CLIAgentRuntimeSessionKey::new(&harness.workspace_id, "codex", &harness.thread_id).unwrap();
+    store.database_connection().execute_unprepared(
+        "CREATE TRIGGER reject_codex_retry_notice BEFORE INSERT ON turn_event \
+         WHEN NEW.event_type='item/completed' AND json_extract(NEW.payload,'$.payload.item.code')='codex_request_retried' \
+         BEGIN SELECT RAISE(ABORT,'injected retry notice storage failure'); END;"
+    ).await.unwrap();
+    processor
+        .handle_cli_runtime_timeline_event(
+            &key,
+            RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+                native_thread_id: Some("retry_storage_thread".into()),
+                native_turn_id: Some("retry_storage_turn".into()),
+                message: "temporary failure".into(),
+                code: None,
+                native: None,
+            }),
+        )
+        .await;
+    let transition = processor.cli_runtime_session_transition_mutex(&key).await;
+    let released = timeout(Duration::from_secs(1), transition.lock_owned())
+        .await
+        .expect("failed notice must release native transition");
+    drop(released);
+    let projection = crate::cli_runtime::projector::project_cli_runtime_event(
+        &crate::cli_runtime::projector::CLIRuntimeProjectorContext {
+            workspace_id: harness.workspace_id.clone(),
+            thread_id: harness.thread_id.clone(),
+            turn_id: harness.turn_id.clone(),
+            recovery: None,
+            codex_retry_attempt_id: Some(attempt.id.clone()),
+        },
+        &RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+            native_thread_id: Some("retry_storage_thread".into()),
+            native_turn_id: Some("retry_storage_turn".into()),
+            message: "same retry".into(),
+            code: None,
+            native: None,
+        }),
+    );
+    let event = projection.durable.into_iter().next().unwrap();
+    let result = processor
+        .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), event.clone())
+        .await;
+    match result {
+        Err(pioneer_runtime_events::ExecutionEventHubError::CommitRejected(rejection)) => {
+            assert_eq!(rejection.code(), "projection_failed");
+        }
+        other => panic!("expected storage projection rejection, got {other:?}"),
+    }
+    assert!(
+        store
+            .list_turn_items_by_type(&harness.turn_id, "system_event")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_turn(&harness.thread_id, &harness.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding(&harness.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_attempt(&attempt.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        attempt.status
+    );
+    assert!(attempt.status.is_active());
+    assert!(
+        pioneer_entity::recovery_job::Entity::find()
+            .filter(pioneer_entity::recovery_job::Column::TurnId.eq(&harness.turn_id))
+            .all(&store.database_connection())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER reject_codex_retry_notice")
+        .await
+        .unwrap();
+    processor
+        .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), event)
+        .await
+        .expect("same valid attempt must ACK after removing the INSERT fault");
+    let saved = store
+        .list_turn_items_by_type(&harness.turn_id, "system_event")
+        .await
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert!(
+        matches!(&saved[0], TurnItem::SystemEvent { code: Some(code), .. } if code == "codex_request_retried")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_semantic_timeline_projects_running_item_without_backfill() {
     let mut harness = setup_live_semantic_timeline_harness("running").await;
     let item_id = "semantic_live_running_cmd";
@@ -62721,6 +66146,17 @@ async fn setup_semantic_timeline_query_harness_inner(
 }
 
 async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTimelineHarness {
+    setup_live_semantic_timeline_harness_with_thread_id(
+        case_id,
+        format!("thr_semantic_live_{case_id}"),
+    )
+    .await
+}
+
+async fn setup_live_semantic_timeline_harness_with_thread_id(
+    case_id: &str,
+    thread_id: String,
+) -> LiveSemanticTimelineHarness {
     let (tx, rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -62729,7 +66165,6 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
-    let thread_id = format!("thr_semantic_live_{case_id}");
     let turn_id = format!("turn_semantic_live_{case_id}");
 
     let thread_start = thread_manager
@@ -72398,7 +75833,7 @@ async fn setup_workspace_manager_with_connection(
     (workspace_manager, crud_store, workspace_id)
 }
 
-async fn setup_workspace_message_processor() -> (
+pub(super) async fn setup_workspace_message_processor() -> (
     MessageProcessor,
     Arc<SessionManager>,
     crate::session::ConnectionId,
@@ -72862,6 +76297,7 @@ async fn completed_command_history_fits_real_background_preflight_after_projecti
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut diagnostic,
     )
     .await
@@ -72970,6 +76406,7 @@ async fn genuinely_large_command_history_compacts_through_real_background_prefli
         0,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         None,
         &mut diagnostic,
@@ -78368,43 +81805,6 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
             .is_empty(),
         "an unfinished turn intent must not be executable"
     );
-    let completion = harness
-        .crud_store
-        .database_connection()
-        .begin()
-        .await
-        .unwrap();
-    turn::Entity::update_many()
-        .col_expr(turn::Column::Status, Expr::value("completed"))
-        .filter(turn::Column::Id.eq(turn))
-        .exec(&completion)
-        .await
-        .unwrap();
-    let visible_inside_completion = completion
-        .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
-            format!(
-                "SELECT count(*) AS n FROM compaction_history_check h JOIN turn t ON t.id=h.turn_id WHERE h.turn_id='{turn}' AND t.status='completed' AND h.state='pending'"
-            ),
-        ))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        visible_inside_completion.try_get::<i64>("", "n").unwrap(),
-        1,
-        "the pre-registered intent becomes eligible in the completion transaction"
-    );
-    completion.rollback().await.unwrap();
-    assert!(
-        harness
-            .crud_store
-            .compaction_pending_history_checks()
-            .await
-            .unwrap()
-            .is_empty(),
-        "rolling completion back must keep the intent unavailable to the worker"
-    );
     let mut foreign = context.clone();
     foreign.workspace_id = "foreign-workspace".into();
     assert!(
@@ -78416,6 +81816,25 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
         "idempotency must not bypass workspace/thread/turn validation"
     );
 
+    harness
+        .crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: "native-intent-published-answer".into(),
+                    text: "Ready answer".into(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
     let mut completed = harness
         .crud_store
         .get_turn(thread, turn)
@@ -78444,7 +81863,7 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
     assert_eq!(
         due.len(),
         1,
-        "durable completion must activate the pre-registered intent"
+        "canonical ready publication must expose the pre-registered root work"
     );
     let descriptor: serde_json::Value =
         serde_json::from_str(due[0].descriptor.as_deref().unwrap()).unwrap();
@@ -78793,8 +82212,8 @@ async fn history_intents_are_per_execution_turn_for_followups_nested_and_cli() {
     );
     assert_eq!(
         row.try_get::<i64>("", "cli").unwrap(),
-        1,
-        "CLI completion must keep using its existing trigger registration"
+        0,
+        "CLI completion without a published answer must not register hypothetical continuation work"
     );
 }
 
@@ -79026,6 +82445,7 @@ async fn production_background_preflight_ignores_technical_noise_but_budgets_rea
                 fixed_input_tokens,
                 None,
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
                 None,
                 None,
                 &mut diagnostic,
@@ -79582,6 +83002,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut baseline,
     )
     .await
@@ -79691,6 +83112,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut fitting,
     )
     .await
@@ -79721,6 +83143,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         fixed,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         None,
         &mut overflowing,
@@ -79774,24 +83197,19 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
         let thread_id = "creation-order";
         let historical_turn = "creation-history";
         let current_turn = "creation-current";
-        for (turn_id, input) in [
-            (historical_turn, "initial input"),
-            (current_turn, "current input marker"),
-        ] {
-            store
-                .materialize_turn_start(
-                    &phase_13_test_thread(workspace, thread_id, phase_13_now_secs()),
-                    SandboxMode::FullAccess,
-                    &phase_13_turn(turn_id, TurnStatus::InProgress),
-                    &[UserInput::Text {
-                        text: input.into(),
-                        text_elements: vec![],
-                    }],
-                    pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
-                )
-                .await
-                .unwrap();
-        }
+        store
+            .materialize_turn_start(
+                &phase_13_test_thread(workspace, thread_id, phase_13_now_secs()),
+                SandboxMode::FullAccess,
+                &phase_13_turn(historical_turn, TurnStatus::InProgress),
+                &[UserInput::Text {
+                    text: "initial input".into(),
+                    text_elements: vec![],
+                }],
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+            )
+            .await
+            .unwrap();
         let call = ChatMessage::assistant_tool_calls(
             Some("call order marker"),
             vec![ProviderToolCall {
@@ -79908,6 +83326,22 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                 &phase_13_turn("creation-middle", TurnStatus::InProgress),
                 &[UserInput::Text {
                     text: format!("middle order marker {}", "middle detail ".repeat(12_000)),
+                    text_elements: vec![],
+                }],
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+            )
+            .await
+            .unwrap();
+        // Accept the current request last: a later principal input would
+        // correctly Stop it. Saved source times below still interleave its
+        // input with the historical round and middle turn.
+        store
+            .materialize_turn_start(
+                &phase_13_test_thread(workspace, thread_id, phase_13_now_secs()),
+                SandboxMode::FullAccess,
+                &phase_13_turn(current_turn, TurnStatus::InProgress),
+                &[UserInput::Text {
+                    text: "current input marker".into(),
                     text_elements: vec![],
                 }],
                 pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
@@ -80354,6 +83788,27 @@ async fn check_completed_history(
             native_owner_context = Some(native_context);
         }
     }
+    // Optional preparation now follows a published human answer, rather than
+    // execution completion alone. Keep the existing lifecycle/recovery proof.
+    harness
+        .crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: format!("{turn}-published-answer"),
+                    text: "Ready answer".into(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
     let mut completed = harness
         .crud_store
         .get_turn(thread, turn)
@@ -80766,6 +84221,27 @@ async fn compaction_history_waits_for_changed_settings_without_spending_provider
         &"completed work ".repeat(80_000),
     )
     .await;
+    // Optional preparation now follows a published human answer, rather than
+    // execution completion alone. Keep the existing lifecycle/recovery proof.
+    harness
+        .crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: format!("{turn}-published-answer"),
+                    text: "Ready answer".into(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
     let mut completed = harness
         .crud_store
         .get_turn(thread, turn)
@@ -81059,6 +84535,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut fitting,
     )
     .await
@@ -81088,6 +84565,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         fixed,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         None,
         &mut compacted,
@@ -81387,6 +84865,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
             None,
+            None,
             &mut diagnostic,
         )
         .await
@@ -81445,6 +84924,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
         compaction_fixed,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         None,
         &mut diagnostic,
@@ -83812,8 +87292,17 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
             // Cancellation is the control-plane operation under test. Seed an admitted,
             // durable in-progress Turn directly so the assertion does not depend on the
             // separate launch-admission surface (which has its own exhaustive tests).
+            let actor = pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            );
+            let author = super::message_turn::resolve_turn_author_snapshot(
+                crud_store_for_assert.as_ref(),
+                &actor,
+            )
+            .await
+            .unwrap();
             let turn_outcome = thread_manager_for_assert
-                .turn_start(
+                .turn_start_with_user_metadata(
                     connection_id,
                     pioneer_protocol::TurnStartParams {
                         agent_delegation_routes: Vec::new(),
@@ -83838,6 +87327,8 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
                         permission_profile: None,
                         cli_runtime_options: None,
                     },
+                    author,
+                    Vec::new(),
                 )
                 .await
                 .expect("turn cancellation fixture should seed an in-progress Turn");
@@ -84521,4 +88012,127 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
             retained.cache_write_input_tokens
         );
     }
+}
+
+#[tokio::test]
+async fn neutral_provider_preparation_and_delivery_survive_registry_and_journal() {
+    use pioneer_provider::{ProviderMessageDelivery, ProviderStream};
+    struct ConnectionFactsProvider(std::sync::atomic::AtomicBool);
+    #[async_trait::async_trait]
+    impl Provider for ConnectionFactsProvider {
+        fn name(&self) -> &str {
+            "connection-facts-provider"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: true,
+                tool_calling: self.0.load(std::sync::atomic::Ordering::SeqCst),
+                ..Default::default()
+            }
+        }
+        async fn prepare_model(&self, _: &str) -> anyhow::Result<()> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn chat(
+            &self,
+            _: pioneer_provider::ChatRequest,
+        ) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            panic!("the stream path must be preserved")
+        }
+        async fn stream_chat(
+            &self,
+            _: pioneer_provider::ChatRequest,
+        ) -> anyhow::Result<
+            futures_util::stream::BoxStream<'static, anyhow::Result<pioneer_provider::StreamChunk>>,
+        > {
+            panic!("diagnostic stream must not fall back to stream_chat")
+        }
+        async fn stream_chat_with_diagnostics(
+            &self,
+            _: pioneer_provider::ChatRequest,
+        ) -> anyhow::Result<ProviderStream> {
+            assert!(self.0.load(std::sync::atomic::Ordering::SeqCst));
+            let mut response = ProviderStream::new(Box::pin(futures_util::stream::iter(vec![
+                Ok(pioneer_provider::StreamChunk::delta("prepared connection")),
+                Ok(pioneer_provider::StreamChunk::final_chunk_with(
+                    pioneer_provider::ProviderTermination::Complete,
+                )),
+            ])));
+            response.message_delivery = ProviderMessageDelivery::Provisional;
+            Ok(response)
+        }
+    }
+    let (_, store, workspace_id) = setup_workspace_manager().await;
+    let inner = Arc::new(ConnectionFactsProvider(std::sync::atomic::AtomicBool::new(
+        false,
+    )));
+    let registry =
+        pioneer_provider::ProviderRegistry::with_provider("connection-facts-provider", inner);
+    let authority = registry.get_or_create("connection-facts-provider").unwrap();
+    let provider =
+        crate::usage_journal::observe(authority, store.as_ref(), &workspace_id, "summary", "owner");
+    assert!(!provider.capabilities().tool_calling);
+    provider.prepare_model("private/model").await.unwrap();
+    assert!(provider.capabilities().tool_calling);
+    let response = provider
+        .stream_chat_with_diagnostics(pioneer_provider::ChatRequest {
+            model: "private/model".into(),
+            messages: vec![pioneer_provider::ChatMessage::user("hello")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        response.message_delivery,
+        ProviderMessageDelivery::Provisional
+    );
+    let chunks = response.stream.collect::<Vec<_>>().await;
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].as_ref().unwrap().delta, "prepared connection");
+    assert!(chunks[1].as_ref().unwrap().is_final);
+}
+
+#[tokio::test]
+async fn task_webhook_url_uses_actual_bind_and_rejects_persisted_disconnected_relay_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = crate::isolated_test_app_config().unwrap();
+    let settings_path = directory.path().join(&config.gateway.settings_file_name);
+    let mut settings = crate::settings::load_or_create_gateway_settings(
+        &settings_path,
+        config.gateway.settings_version,
+        &config.gateway.settings_file_name,
+    )
+    .unwrap();
+    settings.set_remote_access_public_base_url(Some(
+        pioneer_protocol::GatewayBaseUrl::parse_presentation("https://obsolete.example/old-key")
+            .unwrap(),
+    ));
+    crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
+    let supervisor = Arc::new(
+        pioneer_tunnel::RemoteAccessSupervisor::new(directory.path(), config.gateway.remote_access)
+            .unwrap(),
+    );
+    let (processor, _) = fanout_test_processor().await;
+    let processor = Arc::try_unwrap(processor)
+        .unwrap_or_else(|_| panic!("fixture should have a single processor owner"))
+        .with_runtime_home_for_tests(directory.path().to_path_buf())
+        .with_remote_access_supervisor(supervisor);
+    processor.set_gateway_listen_addr("[::1]:41234".parse().unwrap());
+    let (base, scope) = processor.task_webhook_base_url().await.unwrap();
+    assert_eq!(base.as_str(), "http://[::1]:41234/");
+    assert_eq!(scope, "loopback");
+    processor
+        .persist_current_remote_access_public_base_url()
+        .await
+        .unwrap();
+    let persisted = std::fs::read_to_string(&settings_path).unwrap();
+    assert!(!persisted.contains("public_base_url"));
+    assert!(!persisted.contains("obsolete.example"));
 }

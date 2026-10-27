@@ -169,6 +169,8 @@ select_model = "Sélectionner un modèle"
 dialog_title = "Sélectionner le modèle de preflight"
 
 [settings.voice_input]
+transcribe_while_recording = "Transcrire pendant l’enregistrement"
+transcribe_while_recording_description = "Si désactivé, la transcription commencera à la fin de l’enregistrement."
 label = "Saisie vocale"
 description = "Utiliser un modèle de transcription local pour les messages vocaux."
 no_model_selected = "Aucun modèle sélectionné"

@@ -41,7 +41,7 @@ use pioneer_skills::{
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock, broadcast, mpsc, oneshot};
@@ -1882,9 +1882,13 @@ impl AgentControlAck {
     }
 }
 
+#[cfg(test)]
+static TURN_OBSERVATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug)]
 enum AgentCommand {
     StartTurn {
+        work: pioneer_observability::work::WorkCarrier,
         turn_id: String,
         mode: ThreadMode,
         hook_runtime_context: AgentTurnHookRuntimeContext,
@@ -1922,6 +1926,9 @@ enum AgentCommand {
     CancelTurn {
         turn_id: String,
         reason: String,
+        expected_run_id: Option<u64>,
+        completion_ack: Option<oneshot::Sender<()>>,
+        cancellation_owner: Option<(String, u64)>,
         ack: AgentControlAck,
     },
     ObserveTurn {
@@ -1929,10 +1936,12 @@ enum AgentCommand {
         ack: oneshot::Sender<Result<Option<ExecutionTurnObservation>, AgentControlError>>,
     },
     StartRecoveryAttempt {
+        work: pioneer_observability::work::WorkCarrier,
         request: RecoveryAttemptRequest,
         ack: AgentControlAck,
     },
     StartRestoredRecoveryTurn {
+        work: pioneer_observability::work::WorkCarrier,
         turn_request: RestoredRecoveryTurnRequest,
         recovery_request: RecoveryAttemptRequest,
         ack: AgentControlAck,
@@ -2165,6 +2174,22 @@ async fn dispatch_cancel_turn_command(
     // behind an error which claims that the command was never accepted.
     outcomes.mark_enqueued(&operation_id, actor_generation);
     if let Some(control) = control {
+        if let AgentCommand::CancelTurn {
+            expected_run_id: Some(run_id),
+            cancellation_owner: Some(owner),
+            ..
+        } = &command
+            && control.initial_cancellation_registration
+            && control.run_id == *run_id
+        {
+            // Mailbox admission is guaranteed. Retain this exact handoff across
+            // registration ACK; its flag is not a proof of cancellation ownership.
+            control
+                .initial_cancellation_owner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert_with(|| owner.clone());
+        }
         control.cancel_all_attempts();
     }
     permit.send(command);
@@ -2205,6 +2230,9 @@ struct TurnExecutionControl {
     command_tx: mpsc::Sender<AgentCommand>,
     run_id: u64,
     durable_cancellation: Arc<StdRwLock<Option<DurableCancellationObservation>>>,
+    cancellation_context_registered: Arc<AtomicBool>,
+    initial_cancellation_registration: bool,
+    initial_cancellation_owner: Arc<StdRwLock<Option<(String, u64)>>>,
     restored_recovery: Option<(String, pioneer_protocol::RecoveryAttemptContext)>,
 }
 
@@ -2229,6 +2257,9 @@ impl TurnExecutionControl {
             command_tx,
             run_id,
             durable_cancellation: Arc::new(StdRwLock::new(None)),
+            cancellation_context_registered: Arc::new(AtomicBool::new(false)),
+            initial_cancellation_registration: false,
+            initial_cancellation_owner: Arc::new(StdRwLock::new(None)),
             restored_recovery: None,
         }
     }
@@ -3608,6 +3639,15 @@ impl AgentManager {
         }
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = AgentCommand::StartTurn {
+            // Capture before mailbox ownership changes; the actor does not
+            // inherit the caller's poll-local context.
+            work: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::MessageFreshTask,
+                pioneer_observability::work::WorkKind::RpcTurn,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::Gateway,
+            )
+            .queued(),
             turn_id: turn_id.to_owned(),
             mode,
             hook_runtime_context,
@@ -3649,7 +3689,7 @@ impl AgentManager {
     pub async fn subscribe_progress(
         &self,
         thread_id: &str,
-    ) -> Option<broadcast::Receiver<AgentProgressEvent>> {
+    ) -> Option<pioneer_runtime_events::ProgressEventReceiver> {
         let state = self.state.read().await;
         state
             .threads
@@ -3818,9 +3858,9 @@ impl AgentManager {
         self.finish_control_dispatch(thread_id, result).await
     }
 
-    /// Called only after the controller confirmed canonical cancellation and its
-    /// obligations. Bind that observation to the exact actor generation and run;
-    /// a cancellation token alone is never a durable receipt.
+    /// Called after canonical acceptance with durable cancellation obligations.
+    /// Projection and cleanup still own completion. Bind this observation to the
+    /// exact actor generation and run; a token alone is never a durable receipt.
     pub async fn observe_durable_cancellation(
         &self,
         receipt: pioneer_protocol::NativeDurableCancellationReceipt,
@@ -3863,14 +3903,64 @@ impl AgentManager {
         turn_id: &str,
         reason: &str,
     ) -> Result<(), AgentControlError> {
-        let (command_tx, control_plane, actor_generation, outcomes) = {
+        self.cancel_turn_owned(thread_id, turn_id, reason, None, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Continue a Stop across initial admission only for the observed actor.
+    /// True confirms canonical completion; false is only a cached process ACK.
+    pub async fn cancel_turn_for_generation(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        reason: &str,
+        generation: u64,
+        run_id: u64,
+        cancellation_owner: (String, u64),
+    ) -> Result<bool, AgentControlError> {
+        self.cancel_turn_owned(
+            thread_id,
+            turn_id,
+            reason,
+            Some((generation, run_id)),
+            Some(cancellation_owner),
+        )
+        .await
+    }
+
+    async fn cancel_turn_owned(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        reason: &str,
+        expected_generation: Option<(u64, u64)>,
+        cancellation_owner: Option<(String, u64)>,
+    ) -> Result<bool, AgentControlError> {
+        let (command_tx, control, actor_generation, outcomes) = {
             let state = self.state.read().await;
             let Some(thread) = state.threads.get(thread_id) else {
                 return Err(AgentControlError::ThreadNotFound);
             };
+            if let Some((expected, _)) = expected_generation
+                && expected != thread.generation
+            {
+                return Err(AgentControlError::StaleGeneration {
+                    expected,
+                    actual: thread.generation,
+                });
+            }
+            let control = thread.control_plane.execution_for(turn_id);
+            if let Some((_, expected_run)) = expected_generation
+                && control
+                    .as_ref()
+                    .is_none_or(|control| control.run_id != expected_run)
+            {
+                return Err(AgentControlError::TurnMismatch);
+            }
             (
                 thread.command_tx.clone(),
-                thread.control_plane.clone(),
+                control,
                 thread.generation,
                 thread.control_outcomes.clone(),
             )
@@ -3886,15 +3976,24 @@ impl AgentManager {
             )
             .await?
         {
-            return outcome;
+            return outcome.map(|_| false);
         }
         let (ack_tx, ack_rx) = oneshot::channel();
 
-        let control = control_plane.execution_for(turn_id);
-
+        let (completion_tx, completion_rx) = if expected_generation.is_some() {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let command = AgentCommand::CancelTurn {
             turn_id: turn_id.to_owned(),
             reason: reason.to_owned(),
+            expected_run_id: expected_generation
+                .map(|(_, run_id)| run_id)
+                .or_else(|| control.as_ref().map(|control| control.run_id)),
+            completion_ack: completion_tx,
+            cancellation_owner,
             ack: AgentControlAck {
                 sender: ack_tx,
                 operation_id: operation_id.clone(),
@@ -3914,7 +4013,19 @@ impl AgentManager {
             self.control_plane_config,
         )
         .await;
-        self.finish_control_dispatch(thread_id, result).await
+        self.finish_control_dispatch(thread_id, result).await?;
+        // Process ACK keeps its short deadline. Only the actor's completion
+        // receipt proves canonical acceptance, resource cleanup and memory sync.
+        // A cached process ACK above must never be upgraded to that proof.
+        let canonical_accepted = completion_rx.is_some();
+        if let Some(completion_rx) = completion_rx {
+            completion_rx.await.map_err(|_| {
+                AgentControlError::Internal(
+                    "initial cancellation owner stopped before terminal acceptance".to_owned(),
+                )
+            })?;
+        }
+        Ok(canonical_accepted)
     }
 
     pub async fn observe_turn(
@@ -3997,6 +4108,53 @@ impl AgentManager {
         let thread = state.threads.get(thread_id)?;
         (thread.control_plane.active_turn_id().as_deref() == Some(turn_id))
             .then_some(thread.generation)
+    }
+
+    /// Exact actor still waiting for the immutable cancellation registration
+    /// ACK. Process StartTurn ACK alone does not admit provider/tool work.
+    pub async fn turn_owner_waiting_for_cancellation_context(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Option<(u64, u64)> {
+        let state = self.state.read().await;
+        let thread = state.threads.get(thread_id)?;
+        let control = thread.control_plane.execution_for(turn_id)?;
+        (control.initial_cancellation_registration
+            && !control
+                .cancellation_context_registered
+                .load(Ordering::Acquire))
+        .then_some((thread.generation, control.run_id))
+    }
+
+    /// A queued initial Stop remains owned by this exact actor/run even after
+    /// registration ACK. This is control handoff proof, never canonical success.
+    pub async fn initial_cancellation_handoff(
+        &self,
+        preparation: &pioneer_protocol::NativeTerminalEffectPreparation,
+    ) -> Option<(u64, u64, String, u64)> {
+        let state = self.state.read().await;
+        let thread = state.threads.get(&preparation.thread_id)?;
+        if thread.workspace_id != preparation.workspace_id {
+            return None;
+        }
+        let control = thread.control_plane.execution_for(&preparation.turn_id)?;
+        if !control.initial_cancellation_registration
+            || !control.turn_cancellation_token.is_cancelled()
+            || preparation.batch_id
+                != format!(
+                    "{}:terminal-effects:{}:{}",
+                    preparation.turn_id, control.run_id, preparation.runtime_generation
+                )
+        {
+            return None;
+        }
+        let owner = control
+            .initial_cancellation_owner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        Some((thread.generation, control.run_id, owner.0, owner.1))
     }
 
     /// Identity of the restored actor waiting at the durable pre-start boundary.
@@ -4140,6 +4298,21 @@ impl AgentManager {
         }
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = AgentCommand::StartRecoveryAttempt {
+            // Capture before mailbox ownership changes; the actor does not
+            // inherit the caller's poll-local context.
+            // Tool-attempt recovery resumes the existing turn executor and
+            // creates no fresh turn; only a turn restart owns a queued lease.
+            work: if request.item_type.is_tool_item() {
+                pioneer_observability::work::WorkCarrier::default()
+            } else {
+                pioneer_observability::work::WorkCarrier::child(
+                    pioneer_observability::work::Boundary::MessageFreshTask,
+                    pioneer_observability::work::WorkKind::RpcTurn,
+                    pioneer_observability::work::Trigger::Event,
+                    pioneer_observability::work::ExecutorRole::Gateway,
+                )
+                .queued()
+            },
             request,
             ack: AgentControlAck {
                 sender: ack_tx,
@@ -4199,6 +4372,15 @@ impl AgentManager {
         }
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = AgentCommand::StartRestoredRecoveryTurn {
+            // Capture before mailbox ownership changes; the actor does not
+            // inherit the caller's poll-local context.
+            work: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::MessageFreshTask,
+                pioneer_observability::work::WorkKind::RpcTurn,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::Gateway,
+            )
+            .queued(),
             turn_request,
             recovery_request,
             ack: AgentControlAck {
@@ -4779,6 +4961,9 @@ mod event_class_tests {
         let command = AgentCommand::CancelTurn {
             turn_id: "turn_control_full".to_owned(),
             reason: "cancel".to_owned(),
+            expected_run_id: None,
+            completion_ack: None,
+            cancellation_owner: None,
             ack: AgentControlAck {
                 sender: ack_tx,
                 operation_id: operation_id.clone(),
@@ -4836,6 +5021,9 @@ mod event_class_tests {
         let command = AgentCommand::CancelTurn {
             turn_id: "turn_control_late_ack".to_owned(),
             reason: "cancel".to_owned(),
+            expected_run_id: None,
+            completion_ack: None,
+            cancellation_owner: None,
             ack: AgentControlAck {
                 sender: ack_tx,
                 operation_id: operation_id.clone(),
@@ -4913,6 +5101,9 @@ mod event_class_tests {
         let command = AgentCommand::CancelTurn {
             turn_id: "turn_control_rejected".to_owned(),
             reason: "cancel".to_owned(),
+            expected_run_id: None,
+            completion_ack: None,
+            cancellation_owner: None,
             ack: AgentControlAck {
                 sender: ack_tx,
                 operation_id: operation_id.clone(),

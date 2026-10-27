@@ -22,21 +22,31 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
+pub use telemetry::stop_local_observers;
 mod database_workload;
 mod desktop_gateway;
+pub mod diagnostics;
+pub mod identity;
+pub mod live;
 mod metrics;
 mod operations;
 mod patch_telemetry;
 mod performance;
 #[cfg(feature = "qualification-diagnostics")]
 mod qualification_diagnostics;
+pub mod query_cpu;
+pub mod queues;
+pub mod resources;
+pub mod runtime;
 mod startup;
+pub mod symbols;
 mod telemetry;
 pub mod turn_startup;
+pub mod work;
 
 pub use database_workload::{
-    DatabaseQueryKind, DatabaseWorkload, DatabaseWorkloadContext, DatabaseWorkloadOutcome,
-    DatabaseWorkloadTrace,
+    DatabaseOperationSite, DatabaseQueryKind, DatabaseWorkload, DatabaseWorkloadContext,
+    DatabaseWorkloadOutcome, DatabaseWorkloadTrace,
 };
 pub use desktop_gateway::{DesktopGatewayLifecycleOperation, DesktopGatewayLifecycleTrace};
 pub use metrics::{
@@ -214,7 +224,8 @@ where
 {
     let filter = Targets::new()
         .with_default(LevelFilter::INFO)
-        .with_target("rmcp::service", LevelFilter::WARN);
+        .with_target("rmcp::service", LevelFilter::WARN)
+        .with_target(query_cpu::TARGET, LevelFilter::OFF);
     // The OTLP crate deliberately keeps the concrete reqwest failure at DEBUG
     // and returns a redacted `network error` to the SDK. Send only that target
     // through the Sentry mapper so the first outage event has a useful DNS,
@@ -235,6 +246,9 @@ where
         database_metrics_target_enabled(metadata.target(), telemetry_enabled())
     });
     let subscriber = tracing_subscriber::registry()
+        .with(query_cpu::QueryCpuLayer.with_filter(filter_fn(|metadata| {
+            metadata.is_span() && query_cpu::target_enabled(metadata.target())
+        })))
         .with(metrics::DatabasePoolAcquireMetricsLayer.with_filter(database_metrics_filter))
         .with(format_layer);
 
@@ -363,7 +377,11 @@ fn set_telemetry_gate(enabled: bool) {
     let next = (generation << 1) | u64::from(enabled);
     TELEMETRY_CONSENT.store(next, Ordering::Release);
     if !enabled {
+        query_cpu::close_on_opt_out();
         turn_startup::discard_on_opt_out();
+        resources::discard(generation);
+        live::discard(generation);
+        runtime::discard();
     }
 }
 
@@ -371,7 +389,10 @@ pub fn telemetry_enabled() -> bool {
     TELEMETRY_CONSENT.load(Ordering::Acquire) & 1 == 1
 }
 
-pub(crate) fn telemetry_consent_snapshot() -> (bool, u64) {
+/// Atomic recording gate and generation for native owner snapshots. Consumers
+/// must fence this same generation at mutation/delivery; observing it is not a
+/// lock or authorization to transmit after a later consent change.
+pub fn telemetry_consent_snapshot() -> (bool, u64) {
     let state = TELEMETRY_CONSENT.load(Ordering::Acquire);
     (state & 1 == 1, state >> 1)
 }
@@ -1415,4 +1436,13 @@ mod tests {
             Some("HttpClient.ExportStarted"),
         ));
     }
+}
+
+// Sampling/capture emission is infrequent. Serialize ONLY its SDK recording
+// against consent transitions, never poll/query/channel hot paths or FS/tool IO.
+pub(crate) fn record_in_epoch<T>(epoch: u64, callback: impl FnOnce() -> T) -> Option<T> {
+    let _transition = TELEMETRY_CONSENT_TRANSITION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    telemetry_sample_allowed(Some(epoch)).then(callback)
 }

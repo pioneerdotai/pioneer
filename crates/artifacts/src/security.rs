@@ -92,13 +92,14 @@ pub async fn read_validated_local_file(
         requested_path.to_path_buf()
     };
     let diagnostic_path = requested_path.to_path_buf();
-    let file = tokio::task::spawn_blocking(move || open_regular_file(open_path.as_path()))
-        .await
-        .map_err(|error| ArtifactError::LocalPathReadFailed {
-            path: diagnostic_path.clone(),
-            source: io::Error::other(format!("secure artifact open worker failed: {error}")),
-        })?
-        .map_err(|source| secure_local_path_open_error(diagnostic_path.as_path(), source))?;
+    let file =
+        pioneer_observability::work::spawn_blocking(move || open_regular_file(open_path.as_path()))
+            .await
+            .map_err(|error| ArtifactError::LocalPathReadFailed {
+                path: diagnostic_path.clone(),
+                source: io::Error::other(format!("secure artifact open worker failed: {error}")),
+            })?
+            .map_err(|source| secure_local_path_open_error(diagnostic_path.as_path(), source))?;
     let metadata = file
         .metadata()
         .map_err(|source| ArtifactError::LocalPathReadFailed {

@@ -107,7 +107,30 @@ impl RemoteAccessSupervisor {
     }
 
     pub fn status_snapshot(&self) -> GatewayRemoteAccessStatusSnapshot {
-        self.status_tx.borrow().clone()
+        let state = self.state.try_lock();
+        let mut status = self.status_tx.borrow().clone();
+        // apply/shutdown hold this lock until the previous owned client is joined.
+        // A cached Connected event must never expose an old key's public URL then.
+        if state.map_or(true, |state| {
+            state.shutdown_tx.as_ref().is_some_and(|tx| *tx.borrow())
+        }) {
+            status.public_base_url = None;
+        }
+        status
+    }
+
+    /// Inspect authenticated metadata while excluding key changes and shutdown.
+    /// The callback must remain synchronous and short (settings persistence only).
+    pub async fn with_current_status<T>(
+        &self,
+        inspect: impl FnOnce(&GatewayRemoteAccessStatusSnapshot) -> T,
+    ) -> T {
+        let state = self.state.lock().await;
+        let mut status = self.status_tx.borrow().clone();
+        if state.shutdown_tx.as_ref().is_some_and(|tx| *tx.borrow()) {
+            status.public_base_url = None;
+        }
+        inspect(&status)
     }
 
     pub fn subscribe_status(&self) -> watch::Receiver<GatewayRemoteAccessStatusSnapshot> {
@@ -545,15 +568,33 @@ fn publish_rathole_event(
                     Some("connecting to remote access relay".to_owned()),
                 );
             }
-            RatholeClientEvent::ControlChannelConnected { .. } => {
+            RatholeClientEvent::ControlChannelConnected {
+                public_base_url, ..
+            } => {
+                let public_base_url = public_base_url
+                    .filter(|value| value.starts_with("https://"))
+                    .and_then(|value| {
+                        pioneer_protocol::GatewayBaseUrl::parse_presentation(&value).ok()
+                    });
+                let Some(public_base_url) = public_base_url else {
+                    state.terminal_failure = true;
+                    publish_status(
+                        status_tx,
+                        GatewayRemoteAccessState::Failed,
+                        Some(GatewayRemoteAccessErrorKind::InvalidSettings),
+                        Some("relay did not provide a valid public URL".to_owned()),
+                    );
+                    return;
+                };
                 state.connected_once = true;
                 state.suppress_connecting_status = false;
-                publish_status(
-                    status_tx,
+                let mut status = status_snapshot(
                     GatewayRemoteAccessState::Connected,
                     None,
                     Some("remote access tunnel is connected".to_owned()),
                 );
+                status.public_base_url = Some(public_base_url);
+                status_tx.send_replace(status);
             }
             RatholeClientEvent::ControlChannelReconnecting { error, .. } => {
                 let status = if state.connected_once {
@@ -623,6 +664,7 @@ fn status_snapshot(
         state,
         error_kind,
         message,
+        public_base_url: None,
         updated_at_unix: unix_timestamp_secs()
             .ok()
             .and_then(|value| i64::try_from(value).ok()),
@@ -867,6 +909,7 @@ mod tests {
         publish_rathole_event(
             &status_tx,
             RatholeEvent::Client(RatholeClientEvent::ControlChannelConnected {
+                public_base_url: Some("https://gateway.example/prefix".to_owned()),
                 service_name: "pioneer_gateway".to_owned(),
             }),
             &mut event_state,
@@ -914,6 +957,7 @@ mod tests {
         publish_rathole_event(
             &status_tx,
             RatholeEvent::Client(RatholeClientEvent::ControlChannelConnected {
+                public_base_url: Some("https://gateway.example/prefix".to_owned()),
                 service_name: "pioneer_gateway".to_owned(),
             }),
             &mut event_state,
@@ -969,6 +1013,7 @@ mod tests {
                     service_name: "old".to_owned(),
                 },
                 RatholeClientEvent::ControlChannelConnected {
+                    public_base_url: Some("https://gateway.example/prefix".to_owned()),
                     service_name: "old".to_owned(),
                 },
             ] {
@@ -1017,7 +1062,15 @@ mod tests {
                     None,
                     None,
                 );
-                let old_status = supervisor.status_snapshot();
+                supervisor.status_tx.send_modify(|status| {
+                    status.public_base_url = Some(
+                        pioneer_protocol::GatewayBaseUrl::parse_presentation(
+                            "https://old-key.example/",
+                        )
+                        .unwrap(),
+                    );
+                });
+                let mut old_status = supervisor.status_snapshot();
                 let old_task = tokio::spawn(async move {
                     wait_for_shutdown(&mut shutdown_rx).await;
                     stopping_tx.send(()).unwrap();
@@ -1054,7 +1107,14 @@ mod tests {
                     assert!(*state.shutdown_tx.as_ref().unwrap().borrow());
                     assert_eq!(state.generation, 2);
                 }
+                old_status.public_base_url = None;
                 assert_eq!(supervisor.status_snapshot(), old_status);
+                assert!(
+                    supervisor
+                        .with_current_status(|status| status.public_base_url.clone())
+                        .await
+                        .is_none()
+                );
 
                 // Both supported followups must wait, retaining ownership of the same old task.
                 let mut followup = Box::pin(async {
@@ -1106,7 +1166,7 @@ mod tests {
                 let (mut peer, _) = listener.accept().await.unwrap();
                 let mut hello = [0; 37];
                 peer.read_exact(&mut hello).await.unwrap();
-                assert_eq!(&hello[..5], &[0, 0, 0, 0, 1]);
+                assert_eq!(&hello[..5], &[0, 0, 0, 0, 2]);
                 peer.write_all(&hello).await.unwrap();
                 let mut proof = [0; 32];
                 peer.read_exact(&mut proof).await.unwrap();
@@ -1142,5 +1202,65 @@ mod tests {
         })
         .await
         .expect("canceled apply or its followup failed to complete");
+    }
+
+    #[test]
+    fn authenticated_public_url_clears_on_disconnect_and_invalid_metadata_never_connects() {
+        let (tx, _rx) = watch::channel(GatewayRemoteAccessStatusSnapshot::default());
+        let mut state = RatholeEventState::default();
+        publish_rathole_event(
+            &tx,
+            RatholeEvent::Client(RatholeClientEvent::ControlChannelConnected {
+                service_name: "pioneer_gateway".to_owned(),
+                public_base_url: Some("https://[2001:db8::1]:8443/pioneer/".to_owned()),
+            }),
+            &mut state,
+        );
+        assert_eq!(
+            tx.borrow().public_base_url.as_ref().unwrap().as_str(),
+            "https://[2001:db8::1]:8443/pioneer/"
+        );
+        publish_rathole_event(
+            &tx,
+            RatholeEvent::Client(RatholeClientEvent::ControlChannelReconnecting {
+                service_name: "pioneer_gateway".to_owned(),
+                error: "network interrupted".to_owned(),
+                retry_after_millis: 1,
+            }),
+            &mut state,
+        );
+        assert!(tx.borrow().public_base_url.is_none());
+        for value in [
+            None,
+            Some("https://0.0.0.0/".to_owned()),
+            Some("host:2333".to_owned()),
+        ] {
+            let mut state = RatholeEventState::default();
+            publish_rathole_event(
+                &tx,
+                RatholeEvent::Client(RatholeClientEvent::ControlChannelConnected {
+                    service_name: "pioneer_gateway".to_owned(),
+                    public_base_url: value,
+                }),
+                &mut state,
+            );
+            assert_eq!(tx.borrow().state, GatewayRemoteAccessState::Failed);
+            assert!(tx.borrow().public_base_url.is_none());
+            assert!(state.terminal_failure);
+        }
+    }
+
+    #[test]
+    fn remote_addr_normalization_keeps_host_port_endpoint() {
+        assert_eq!(
+            normalize_rathole_remote_addr("relay-eu-west-1.getpioneer.dev:2333")
+                .expect("normalize"),
+            "relay-eu-west-1.getpioneer.dev:2333"
+        );
+        assert_eq!(
+            normalize_rathole_remote_addr("127.0.0.1:2333").expect("normalize"),
+            "127.0.0.1:2333"
+        );
+        assert!(normalize_rathole_remote_addr("https://getpioneer.dev").is_err());
     }
 }

@@ -4457,6 +4457,34 @@ pub struct ToolRecoveryView {
     pub continuation: Option<JsonValue>,
 }
 
+pub const CUA_TOOL_NAMES: &[&str] = &[
+    "cua_click",
+    "cua_clipboard_read",
+    "cua_clipboard_write",
+    "cua_drag",
+    "cua_get_cursor_position",
+    "cua_get_desktop_state",
+    "cua_get_screen_size",
+    "cua_get_window_state",
+    "cua_hotkey",
+    "cua_invoke_menu",
+    "cua_list_apps",
+    "cua_list_windows",
+    "cua_press_key",
+    "cua_scroll",
+    "cua_set_window_frame",
+    "cua_type_text",
+    "cua_verify_state",
+    "cua_get_browser_state",
+    "cua_browser_prepare",
+    "cua_browser_navigate",
+    "cua_browser_click",
+    "cua_browser_type",
+    "cua_browser_select",
+    "cua_browser_dialog",
+    "cua_browser_set_input_files",
+];
+
 impl ToolOutputPolicySnapshot {
     pub fn for_tool_name(tool_name: &str) -> Self {
         match tool_name {
@@ -4464,7 +4492,7 @@ impl ToolOutputPolicySnapshot {
             "web_fetch" => web_fetch_output_policy_snapshot(),
             "web_search" => web_search_output_policy_snapshot(),
             "download_url" | "download" => download_output_policy_snapshot(),
-            "computer_use" => computer_use_output_policy_snapshot(),
+            name if CUA_TOOL_NAMES.contains(&name) => computer_use_output_policy_snapshot(),
             "html_preview" | "html_render" => html_output_policy_snapshot(),
             "artifact_prepare" | "artifact_register" | "read_file" | "read_skill" | "list_dir"
             | "grep_files" | "apply_patch" | "tool_search" | "tool_suggest" => {
@@ -4480,7 +4508,7 @@ impl ToolOutputPolicySnapshot {
             "web_fetch" => web_fetch_output_policy_snapshot(),
             "web_search" => web_search_output_policy_snapshot(),
             "download_url" | "download" => download_output_policy_snapshot(),
-            "computer_use" => computer_use_output_policy_snapshot(),
+            name if CUA_TOOL_NAMES.contains(&name) => computer_use_output_policy_snapshot(),
             "html_preview" | "html_render" => html_output_policy_snapshot(),
             "artifact_prepare" | "artifact_register" | "read_file" | "list_dir" | "grep_files"
             | "apply_patch" | "tool_search" | "tool_suggest" => {
@@ -4491,7 +4519,7 @@ impl ToolOutputPolicySnapshot {
     }
 }
 
-const DEFAULT_LLM_MAX_BYTES: usize = 2 * 1024 * 1024;
+pub const TOOL_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_SUMMARY_CHARS: usize = 2_000;
 const DEFAULT_SHELL_CHUNK_BYTES: usize = 64 * 1024;
 const DEFAULT_SHELL_TOTAL_BYTES: usize = 4 * 1024 * 1024;
@@ -4499,7 +4527,7 @@ const DEFAULT_DIAGNOSTIC_CHARS: usize = 4_000;
 
 fn retained_llm_policy() -> LlmRetentionPolicy {
     LlmRetentionPolicy::UntilTurnTerminal {
-        max_bytes: DEFAULT_LLM_MAX_BYTES,
+        max_bytes: TOOL_RESPONSE_MAX_BYTES,
     }
 }
 
@@ -4516,7 +4544,7 @@ fn evidence_recovery_policy(diagnostic_excerpt: DiagnosticExcerptPolicy) -> Reco
 fn shell_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Full {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Full {
@@ -4538,7 +4566,7 @@ fn shell_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn model_only_metadata_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Full {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4553,7 +4581,7 @@ fn model_only_metadata_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn web_fetch_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Full {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4568,7 +4596,7 @@ fn web_fetch_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn web_search_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4585,7 +4613,7 @@ fn web_search_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn download_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4600,7 +4628,7 @@ fn download_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn computer_use_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4615,7 +4643,7 @@ fn computer_use_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn external_runtime_tool_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4628,14 +4656,14 @@ fn external_runtime_tool_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 }
 
 fn html_output_policy_snapshot() -> ToolOutputPolicySnapshot {
-    // Three bounded diagnostic sets plus exact screenshot references. Actual PNG
+    // Six bounded diagnostic sets plus exact screenshot references. Actual PNG
     // bytes travel as media parts, never in timeline/storage JSON.
     let mut policy = dynamic_unknown_output_policy_snapshot();
     policy.llm = LlmOutputPolicy::Structured {
-        max_bytes: 96 * 1024,
+        max_bytes: 192 * 1024,
     };
     policy.llm_retention = LlmRetentionPolicy::UntilTurnTerminal {
-        max_bytes: 96 * 1024,
+        max_bytes: 192 * 1024,
     };
     policy
 }
@@ -4643,7 +4671,7 @@ fn html_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn dynamic_unknown_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::MetadataOnly,

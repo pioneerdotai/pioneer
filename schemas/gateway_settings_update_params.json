@@ -568,6 +568,7 @@
       "enum": [
         "openai",
         "openrouter",
+        "vercel-ai-gateway",
         "local"
       ]
     },
@@ -649,6 +650,12 @@
         },
         "retry_install": {
           "type": "boolean"
+        },
+        "transcribe_while_recording": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       }
     },
