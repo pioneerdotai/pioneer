@@ -6925,6 +6925,13 @@ impl MessageProcessor {
             .reconcile_prepared_turn_finalizations(limit, now_unix)
             .await?;
         for committed in &summary.committed {
+            if !committed.already_committed {
+                self.recover_completed_turn_title(
+                    committed.turn_completed.thread_id.clone(),
+                    &committed.turn_completed.turn,
+                )
+                .await;
+            }
             let turn_id = committed.turn_completed.turn.id.as_str();
             self.thread_manager
                 .commit_terminal_turn(
@@ -8353,6 +8360,17 @@ impl MessageProcessor {
         turn_id: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     ) -> bool {
+        self.complete_turn_with_title_recovery(thread_id, turn_id, recovery, true)
+            .await
+    }
+
+    pub(super) async fn complete_turn_with_title_recovery(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+        recover_title: bool,
+    ) -> bool {
         let terminal_actor_generation = self
             .agent_manager
             .turn_owner_generation(thread_id.as_str(), turn_id.as_str())
@@ -8482,6 +8500,10 @@ impl MessageProcessor {
                 .await;
                 return false;
             }
+        }
+        if recover_title {
+            self.recover_completed_turn_title(thread_id.clone(), &turn_completed.turn)
+                .await;
         }
         self.finalize_agent_execution_for_turn(&turn_completed.turn, "completed")
             .await;
@@ -8926,6 +8948,10 @@ impl MessageProcessor {
             );
             return false;
         }
+        if !committed.already_committed {
+            self.recover_completed_turn_title(thread_id.clone(), &committed.turn_completed.turn)
+                .await;
+        }
         self.record_final_assistant_text_for_item(&committed.final_item)
             .await;
         self.kick_native_turn_event_deliveries();
@@ -8933,7 +8959,8 @@ impl MessageProcessor {
         // Reuse terminal cleanup/recovery/task reconciliation. Its canonical
         // TurnCompleted write is now an exact idempotent replay of the already
         // committed terminal half of the finalization transaction.
-        self.complete_turn(thread_id, turn_id, recovery).await
+        self.complete_turn_with_title_recovery(thread_id, turn_id, recovery, false)
+            .await
     }
 
     pub(super) async fn mark_turn_blocked(
@@ -10576,18 +10603,54 @@ impl MessageProcessor {
     ) {
         let processor = self.clone();
         tokio::spawn(async move {
-            if !processor.try_acquire_title_job(thread_id.as_str()).await {
-                debug!(
-                    thread_id = thread_id.as_str(),
-                    "thread title job is already active; trigger coalesced"
+            if processor.try_acquire_title_job(&thread_id).await {
+                processor.spawn_owned_thread_title_task(
+                    thread_id,
+                    current_turn_first_user_text,
+                    None,
                 );
-                return;
             }
+        });
+    }
 
+    pub(super) async fn recover_thread_title(&self, thread_id: String) {
+        // Consume the ticket at the completion boundary. An active job drops
+        // the trigger; only the original full input survives a deferred attempt.
+        let user_text = {
+            let mut runtime = self.title_job_runtime.lock().await;
+            let Some(ThreadTitleJobState::AwaitingSuccessfulTurn(text)) = runtime.get(&thread_id)
+            else {
+                return;
+            };
+            let text = Arc::clone(text);
+            runtime.insert(thread_id.clone(), ThreadTitleJobState::Pending);
+            text
+        };
+        self.spawn_owned_thread_title_task(thread_id, None, Some(user_text));
+    }
+
+    async fn recover_completed_turn_title(&self, thread_id: String, turn: &pioneer_protocol::Turn) {
+        if turn.status == TurnStatus::Completed
+            && turn.origin == pioneer_protocol::TurnOrigin::User
+            && turn.turn_kind == pioneer_protocol::TurnKind::Conversation
+        {
+            self.recover_thread_title(thread_id).await;
+        }
+    }
+
+    fn spawn_owned_thread_title_task(
+        &self,
+        thread_id: String,
+        current_turn_first_user_text: Option<String>,
+        recovery_source: Option<Arc<str>>,
+    ) {
+        let processor = self.clone();
+        tokio::spawn(async move {
             if let Err(error) = processor
                 .run_initial_thread_title_task(
                     thread_id.as_str(),
                     current_turn_first_user_text.as_deref(),
+                    recovery_source.as_deref(),
                 )
                 .await
             {
@@ -10599,7 +10662,10 @@ impl MessageProcessor {
                 processor
                     .record_title_job_state(
                         thread_id.as_str(),
-                        ThreadTitleJobState::FailedNonRetriable,
+                        recovery_source.map_or(
+                            ThreadTitleJobState::FailedNonRetriable,
+                            ThreadTitleJobState::DeferredUntilSuccessfulTurn,
+                        ),
                         TITLE_JOB_MAX_ATTEMPTS,
                     )
                     .await;
@@ -10611,9 +10677,7 @@ impl MessageProcessor {
 
     async fn try_acquire_title_job(&self, thread_id: &str) -> bool {
         let mut runtime = self.title_job_runtime.lock().await;
-        if let Some(state) = runtime.get(thread_id).copied()
-            && state.is_active()
-        {
+        if runtime.contains_key(thread_id) {
             return false;
         }
         runtime.insert(thread_id.to_owned(), ThreadTitleJobState::Pending);
@@ -10621,7 +10685,15 @@ impl MessageProcessor {
     }
 
     async fn release_title_job(&self, thread_id: &str) {
-        self.title_job_runtime.lock().await.remove(thread_id);
+        let mut runtime = self.title_job_runtime.lock().await;
+        if let Some(ThreadTitleJobState::DeferredUntilSuccessfulTurn(text)) =
+            runtime.remove(thread_id)
+        {
+            runtime.insert(
+                thread_id.to_owned(),
+                ThreadTitleJobState::AwaitingSuccessfulTurn(text),
+            );
+        }
     }
 
     async fn record_title_job_state(
@@ -10657,6 +10729,7 @@ impl MessageProcessor {
         &self,
         thread_id: &str,
         current_turn_first_user_text: Option<&str>,
+        recovery_source: Option<&str>,
     ) -> Result<()> {
         self.record_title_job_state(thread_id, ThreadTitleJobState::Pending, 0)
             .await;
@@ -10673,26 +10746,33 @@ impl MessageProcessor {
             pioneer_protocol::ThreadOriginKind::User
                 | pioneer_protocol::ThreadOriginKind::Collaborative
                 | pioneer_protocol::ThreadOriginKind::DirectMessage
-        ) || background
-            .get_task_thread_lineage(thread_id)
-            .await?
-            .is_some()
+        ) || thread.sidebar_visibility == pioneer_protocol::ThreadSidebarVisibility::Hidden
+            || background
+                .get_task_thread_lineage(thread_id)
+                .await?
+                .is_some()
         {
             self.record_title_job_state(thread_id, ThreadTitleJobState::Succeeded, 0)
                 .await;
             return Ok(());
         }
 
-        let user_text = match background.get_first_thread_user_text(thread_id).await {
-            Ok(Some(text)) => Some(text),
-            Ok(None) => current_turn_first_user_text.map(str::to_owned),
-            Err(error) => {
-                warn!(
-                    thread_id,
-                    error = %format!("{error:#}"),
-                    "failed to resolve first thread user text for title generation"
-                );
-                current_turn_first_user_text.map(str::to_owned)
+        let user_text = if let Some(source) = recovery_source {
+            // The history may start with attachments, or have changed since
+            // the deadline. Reuse the exact trusted text from that title job.
+            Some(source.to_owned())
+        } else {
+            match background.get_first_thread_user_text(thread_id).await {
+                Ok(Some(text)) => Some(text),
+                Ok(None) => current_turn_first_user_text.map(str::to_owned),
+                Err(error) => {
+                    warn!(
+                        thread_id,
+                        error = %format!("{error:#}"),
+                        "failed to resolve first thread user text for title generation"
+                    );
+                    current_turn_first_user_text.map(str::to_owned)
+                }
             }
         };
 
@@ -10751,6 +10831,27 @@ impl MessageProcessor {
                     return Ok(());
                 }
                 Err(error) => {
+                    if error
+                        .downcast_ref::<pioneer_cli_agent_runtime::service::CodexServiceDeadline>()
+                        .is_some()
+                    {
+                        // Only the selected Codex title service emits this type.
+                        // Release ownership before exposing a recovery ticket.
+                        warn!(
+                            thread_id,
+                            attempt,
+                            "Codex title deadline exhausted; waiting for a successful user turn"
+                        );
+                        self.record_title_job_state(
+                            thread_id,
+                            ThreadTitleJobState::DeferredUntilSuccessfulTurn(
+                                user_text.as_str().into(),
+                            ),
+                            attempt,
+                        )
+                        .await;
+                        return Ok(());
+                    }
                     if attempt >= TITLE_JOB_MAX_ATTEMPTS {
                         warn!(
                             thread_id,

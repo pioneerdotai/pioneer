@@ -1,3 +1,7 @@
+#[cfg(unix)]
+#[path = "tests/title_recovery.rs"]
+mod title_recovery;
+
 #[path = "tests/root_conversation_compaction.rs"]
 mod root_conversation_compaction;
 
@@ -11068,7 +11072,7 @@ async fn title_generation_retries_after_transient_failure() {
         preview_author: None,
         mode: pioneer_protocol::ThreadMode::Agent,
         model: "test-model".to_owned(),
-        model_provider: "openai".to_owned(),
+        model_provider: "cli_runtime:codex".to_owned(),
         reasoning_effort: None,
         created_at: 1,
         updated_at: 1,
@@ -42489,6 +42493,14 @@ async fn setup_execution_window_terminal_turn(
     thread_id: &str,
     turn_id: &str,
 ) -> (MessageProcessor, Arc<CrudStore>, String) {
+    setup_execution_window_terminal_turn_with_input(thread_id, turn_id, &[]).await
+}
+
+async fn setup_execution_window_terminal_turn_with_input(
+    thread_id: &str,
+    turn_id: &str,
+    input: &[UserInput],
+) -> (MessageProcessor, Arc<CrudStore>, String) {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
@@ -42525,13 +42537,20 @@ async fn setup_execution_window_terminal_turn(
         )
         .await
         .expect("thread should start");
-    thread_manager
-        .system_turn_start_with_permission_profile(
+    let author = super::message_turn::resolve_turn_author_snapshot(
+        crud_store.as_ref(),
+        &pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let turn_start = thread_manager
+        .agent_turn_start_with_permission_profile(
             pioneer_protocol::TurnStartParams {
                 agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
-                input: Vec::new(),
+                input: input.to_vec(),
                 capabilities: Vec::new(),
                 model: None,
                 model_provider: None,
@@ -42548,6 +42567,7 @@ async fn setup_execution_window_terminal_turn(
             pioneer_protocol::system_turn_permission_profile_snapshot(
                 pioneer_protocol::TurnPermissionMode::FullAccess,
             ),
+            author,
         )
         .await
         .expect("turn should start in thread manager");
@@ -42555,22 +42575,8 @@ async fn setup_execution_window_terminal_turn(
         .materialize_turn_start(
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
-            &Turn {
-                id: turn_id.to_owned(),
-                status: TurnStatus::InProgress,
-                turn_kind: Default::default(),
-                origin: Default::default(),
-                mode: Default::default(),
-                author: None,
-                reply_to_turn_id: None,
-                mentions: Vec::new(),
-                message_revision: 0,
-                message_deleted: false,
-                error: None,
-                prompt_manifest: None,
-                permission_profile: default_test_permission_profile(),
-            },
-            &[],
+            &turn_start.materialization.turn,
+            input,
             pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
         )
         .await

@@ -20274,7 +20274,7 @@ impl CrudStore {
 
     pub async fn get_first_thread_user_text(&self, thread_id: &str) -> Result<Option<String>> {
         let Some(turn_model) =
-            turn::find_oldest_turn_for_thread(&self.connection, thread_id).await?
+            turn::find_oldest_user_conversation_turn(&self.connection, thread_id).await?
         else {
             return Ok(None);
         };

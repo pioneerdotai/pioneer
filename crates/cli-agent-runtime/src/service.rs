@@ -13,6 +13,17 @@ impl std::fmt::Display for ServiceFailure {
 }
 impl std::error::Error for ServiceFailure {}
 
+/// The isolated Codex process exhausted its end-to-end service budget.
+/// Callers may choose their own retry policy without parsing error messages.
+#[derive(Debug)]
+pub struct CodexServiceDeadline;
+impl std::fmt::Display for CodexServiceDeadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Codex service deadline exceeded")
+    }
+}
+impl std::error::Error for CodexServiceDeadline {}
+
 /// Safe stage context survives anyhow propagation without persisting raw errors.
 #[derive(Debug)]
 pub struct ServiceStage(pub &'static str);

@@ -547,19 +547,17 @@ async fn sleep_after_transient_storage_poll_failure(transient_storage_poll_faile
     true
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ThreadTitleJobState {
     Pending,
     Running,
     Succeeded,
     FailedRetriable,
     FailedNonRetriable,
-}
-
-impl ThreadTitleJobState {
-    const fn is_active(self) -> bool {
-        matches!(self, Self::Pending | Self::Running | Self::FailedRetriable)
-    }
+    // Retain the original user text only while waiting for recovery. This is
+    // not name provenance or a queue of completion triggers.
+    DeferredUntilSuccessfulTurn(Arc<str>),
+    AwaitingSuccessfulTurn(Arc<str>),
 }
 
 #[derive(Clone)]
