@@ -36,8 +36,6 @@ pub use read::{
     ReadPage, ReadRequest,
 };
 pub(crate) use secure_fs::StagedFile;
-#[cfg(feature = "computer-use")]
-pub(crate) use secure_fs::ensure_parent_directories;
 pub use snapshot::{
     SnapshotEncoding, SnapshotError, SnapshotErrorCode, SnapshotLimits, SnapshotLineEnding,
     SnapshotLineEndings, SnapshotStorage, TextSnapshot, open_directory, open_regular_file,

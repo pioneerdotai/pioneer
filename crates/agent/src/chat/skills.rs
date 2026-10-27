@@ -558,6 +558,7 @@ mod tests {
                 enabled,
                 false,
                 true,
+                false,
                 continuing,
                 Some("root"),
                 "root",

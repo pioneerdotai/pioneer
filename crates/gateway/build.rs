@@ -1,3 +1,5 @@
+mod build_support;
+
 use pioneer_protocol::SkillId;
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -40,6 +42,7 @@ struct BundledFile {
 }
 
 fn main() {
+    build_support::macos_link_inputs();
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is missing"));
     let repo_root = manifest_dir

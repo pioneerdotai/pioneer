@@ -221,18 +221,9 @@ async fn invoke_hidden_agent_action(
 async fn committed_push_client_fixture(hidden_cli_start: bool) {
     let stage = std::cell::Cell::new("workspace setup");
     tokio::time::timeout(Duration::from_secs(30), async {
-        // Task startup and push recovery can use different pool connections.
-        // Keep their schema and workspace in the same file-backed database.
-        let database_temp = tempfile::tempdir().expect("scoped push database directory");
-        let database_url = format!(
-            "sqlite://{}?mode=rwc",
-            database_temp.path().join("scoped-push.sqlite3").display()
-        );
-        let connection = Database::connect(database_url)
-            .await
-            .expect("scoped push database connection");
-        let (workspaces, store, workspace) =
-            setup_workspace_manager_with_connection(connection).await;
+        // Push scope cancellation can replace a pooled connection; keep the
+        // schema on disk and exercise the Gateway's separate reader/writer pools.
+        let (_directory, workspaces, store, workspace) = setup_pooled_file_workspace_manager().await;
         prepare_post_access_unread_fixture(&store, &workspace).await;
         let sessions = Arc::new(SessionManager::new());
         let (source_tx, mut source_wire_rx) = mpsc::channel(128);

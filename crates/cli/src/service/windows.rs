@@ -32,8 +32,9 @@ pub fn start_gateway_service(
         $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         $action = New-ScheduledTaskAction -Execute 'powershell' -Argument $actionArgs
         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
         $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
-        Register-ScheduledTask -TaskName '{task_name_escaped}' -Action $action -Trigger $trigger -Settings $settings -Description 'Persistent Pioneer gateway service' -User $user -RunLevel Limited -Force | Out-Null
+        Register-ScheduledTask -TaskName '{task_name_escaped}' -Action $action -Trigger $trigger -Settings $settings -Description 'Persistent Pioneer gateway service' -Principal $principal -Force | Out-Null
         Start-ScheduledTask -TaskName '{task_name_escaped}'"#
         ))
     })?;

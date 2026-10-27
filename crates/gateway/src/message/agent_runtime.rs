@@ -9553,6 +9553,10 @@ impl MessageProcessor {
         turn: &pioneer_protocol::Turn,
         terminal_status: &str,
     ) {
+        // The committed turn terminal boundary revokes computer-use authority
+        // even if a cancelled provider/proxy future still retains tool handles.
+        self.mcp_service
+            .cancel_turn_mcp_invocations(turn.id.as_str());
         self.retire_execution_progress_state(turn.id.as_str()).await;
         let database = self.crud_store.database_connection();
         let responding_execution_id =
