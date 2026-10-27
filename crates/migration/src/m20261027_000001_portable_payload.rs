@@ -38,7 +38,9 @@ impl MigrationTrait for Migration {
                 .col(big_integer("original_chars").check(Expr::cust(
                     "original_chars>=0 AND original_chars<=original_bytes",
                 )))
-                .col(text("sha256").check(Expr::cust("length(sha256)=64")))
+                .col(binary("sha256").check(Expr::cust(
+                    "typeof(sha256)='blob' AND (length(sha256)=32 OR (retired=1 AND length(sha256)=0))",
+                )))
                 .col(integer("raw").check(Expr::col("raw").is_in([0, 1])))
                 .col(
                     integer("retired")

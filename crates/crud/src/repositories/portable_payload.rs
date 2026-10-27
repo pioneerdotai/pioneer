@@ -26,7 +26,9 @@ const BLOCK: usize = 64 * 1024;
 // blocks, invalidate its digest durably: a capture that lost the source-to-hold
 // race must retry its source, never decode a partially reclaimed value. Holds
 // acquired before reclamation prevent this transition altogether.
-const RECLAIMING_SHA256: &str = "----------------------------------------------------------------";
+const RECLAIMING_SHA256: &[u8] = &[];
+const PAYLOAD_ID_LEN: usize = 12;
+const RESERVATION_ATTEMPTS: u8 = 8;
 
 type PayloadGates = Mutex<BTreeMap<String, Weak<RwLock<()>>>>;
 fn payload_gates() -> &'static PayloadGates {
@@ -53,7 +55,7 @@ fn release_payload_gate(id: &str) {
     }
 }
 
-/// Memory-only protection of an immutable UUID payload. It owns no database
+/// Memory-only protection of an immutable payload reference. It owns no database
 /// handle, transaction, stream, scheduling permit or background work.
 #[derive(Clone)]
 pub struct PayloadReadHold(Arc<PayloadReadLease>);
@@ -72,8 +74,11 @@ impl PayloadReadHold {
     /// A reader losing the gap to cleanup must retry the entire source fetch.
     pub(crate) fn capture(id: &str, family: Family) -> Result<Self> {
         let guard = payload_gate(id).try_read_owned().map_err(|_| {
-            observe::hold_rejected(family.observed());
-            PreflightRace
+            let error = anyhow::Error::new(PreflightRace);
+            match observe::hold_rejected(family.observed()) {
+                Some(receipt) => error.context(receipt),
+                None => error,
+            }
         })?;
         Ok(Self(Arc::new(PayloadReadLease {
             id: id.to_owned(),
@@ -338,7 +343,7 @@ struct Preparation {
     shape: Option<u8>,
 }
 struct Prepared {
-    _read_hold: PayloadReadHold,
+    _read_hold: Option<PayloadReadHold>,
     header: value::Model,
     blocks: Vec<block::Model>,
     next: i64,
@@ -346,6 +351,7 @@ struct Prepared {
     encoded_bytes: usize,
     finalized: bool,
     installed: bool,
+    reservation_attempts: u8,
     projection: Option<String>,
 }
 
@@ -418,7 +424,7 @@ impl PortablePayloadProgress {
         .await?;
         if let Some(row) = row {
             self.after[family as usize] = Some(row.owner.clone());
-            let payload_id = uuid::Uuid::new_v4().to_string();
+            let payload_id = pioneer_protocol::generate_id(PAYLOAD_ID_LEN);
             self.pending = Some(Preparation {
                 family,
                 owner: row.owner,
@@ -434,13 +440,13 @@ impl PortablePayloadProgress {
                 json_projection: (family == Family::CliMapping)
                     .then(super::portable_payload_json::Projection::default),
                 prepared: Prepared {
-                    _read_hold: PayloadReadHold::capture(&payload_id, family)?,
+                    _read_hold: Some(PayloadReadHold::capture(&payload_id, family)?),
                     header: value::Model {
                         id: payload_id,
                         family: family.name().into(),
                         original_bytes: row.bytes,
                         original_chars: 0,
-                        sha256: "0".repeat(64),
+                        sha256: vec![0; 32],
                         raw: 1,
                         retired: 1,
                         dictionary_id: None,
@@ -451,6 +457,7 @@ impl PortablePayloadProgress {
                     encoded_bytes: 0,
                     finalized: false,
                     installed: false,
+                    reservation_attempts: 0,
                     projection: None,
                 },
                 dictionary: None,
@@ -468,21 +475,49 @@ impl Preparation {
     async fn step(&mut self, store: &CrudStore) -> Result<bool> {
         let prepared = &mut self.prepared;
         if !prepared.installed {
-            let _phase = observe::stage(observe::Stage::Publish);
-            store
-                .run_background_database_quantum(|| async {
-                    value::Entity::insert(prepared.header.clone().into_active_model())
-                        .on_conflict(
-                            OnConflict::column(value::Column::Id)
-                                .do_nothing()
-                                .to_owned(),
+            ensure!(
+                prepared._read_hold.is_some(),
+                "portable payload reservation hold missing"
+            );
+            ensure!(
+                prepared.reservation_attempts < RESERVATION_ATTEMPTS,
+                "portable payload reservation attempts exhausted"
+            );
+            prepared.reservation_attempts += 1;
+            let affected = {
+                let _phase = observe::stage(observe::Stage::Publish);
+                store
+                    .run_background_database_quantum(|| async {
+                        Ok(
+                            value::Entity::insert(prepared.header.clone().into_active_model())
+                                .on_conflict(
+                                    OnConflict::column(value::Column::Id)
+                                        .do_nothing()
+                                        .to_owned(),
+                                )
+                                .exec_without_returning(&store.connection)
+                                .await?,
                         )
-                        .exec_without_returning(&store.connection)
-                        .await?;
-                    Ok(())
-                })
-                .await?;
-            prepared.installed = true;
+                    })
+                    .await?
+            };
+            match affected {
+                1 => prepared.installed = true,
+                0 => {
+                    // A targeted conflict never establishes ownership, even if
+                    // every header field matches. Drop the foreign-ID hold now.
+                    prepared._read_hold.take();
+                    ensure!(
+                        prepared.reservation_attempts < RESERVATION_ATTEMPTS,
+                        "portable payload reservation attempts exhausted"
+                    );
+                    let id = pioneer_protocol::generate_id(PAYLOAD_ID_LEN);
+                    let hold = PayloadReadHold::capture(&id, self.family)?;
+                    prepared.header.id = id;
+                    prepared._read_hold = Some(hold);
+                }
+                _ => anyhow::bail!("portable payload reservation affected invalid row count"),
+            }
             return Ok(false);
         }
         // At most sixteen encoded blocks (about 1 MiB), never a full value.
@@ -665,7 +700,7 @@ impl Preparation {
             let raw = prepared.encoded_bytes >= self.size || self.size == 0 || unsupported;
             prepared.header.raw = i32::from(raw);
             prepared.header.original_chars = self.chars;
-            prepared.header.sha256 = hex::encode(self.digest.clone().finalize());
+            prepared.header.sha256 = self.digest.clone().finalize().to_vec();
             prepared.header.dictionary_id = if raw {
                 None
             } else {
@@ -830,7 +865,10 @@ async fn cleanup(store: &CrudStore, after: Option<&str>) -> Result<(bool, Option
         // Revalidate after discovery. Live/staging publication has its own
         // read hold, so it cannot overlap this exclusive deletion quantum.
         let marked = value::Entity::update_many()
-            .col_expr(value::Column::Sha256, Expr::value(RECLAIMING_SHA256))
+            .col_expr(
+                value::Column::Sha256,
+                Expr::value(RECLAIMING_SHA256.to_vec()),
+            )
             .filter(value::Column::Id.eq(&id))
             .filter(value::Column::Retired.eq(1))
             .exec(&store.connection)
@@ -900,9 +938,7 @@ async fn read_header(
             && row.original_chars <= row.original_bytes
             && row.original_bytes <= row.original_chars.saturating_mul(4)
             && matches!(row.raw, 0 | 1)
-            && row.sha256.len() == 64
-            && (row.sha256.bytes().all(|b| b.is_ascii_hexdigit())
-                || (row.retired == 1 && row.sha256 == RECLAIMING_SHA256))
+            && (row.sha256.len() == 32 || (row.retired == 1 && row.sha256 == RECLAIMING_SHA256))
             && ((row.raw == 1 && row.dictionary_id.is_none())
                 || (row.raw == 0 && row.original_bytes > 0 && row.dictionary_id.is_some())),
         "portable payload header invalid"
@@ -984,7 +1020,7 @@ async fn hydrate_header_inner(
         ensure!(
             plain.len() as i64 == meta.original_bytes
                 && plain.chars().count() as i64 == meta.original_chars
-                && hex::encode(Sha256::digest(plain.as_bytes())) == meta.sha256,
+                && Sha256::digest(plain.as_bytes()).as_slice() == meta.sha256.as_slice(),
             "portable raw payload mismatch"
         );
         observe::outcome(observe::Outcome::Raw);
@@ -1002,7 +1038,7 @@ async fn hydrate_header_inner(
     }
     let _verify = observe::stage(observe::Stage::VerifyAssemble);
     ensure!(
-        bytes.len() == size && hex::encode(Sha256::digest(&bytes)) == meta.sha256,
+        bytes.len() == size && Sha256::digest(&bytes).as_slice() == meta.sha256.as_slice(),
         "portable payload original digest mismatch"
     );
     let text = String::from_utf8(bytes)?;
@@ -1335,6 +1371,61 @@ impl std::fmt::Display for PreflightRace {
 }
 impl std::error::Error for PreflightRace {}
 
+/// A caller-local claim survives an awaited rollback/cancellation. Declare
+/// before resource-owning locals/futures so its Drop follows their release.
+#[derive(Default)]
+pub(crate) struct DeferredHoldRejection(Option<observe::HoldRejectionRecord>);
+impl DeferredHoldRejection {
+    fn claim(error: &anyhow::Error) -> Self {
+        Self(
+            error
+                .downcast_ref::<observe::HoldRejection>()
+                .and_then(observe::HoldRejection::take),
+        )
+    }
+    pub(crate) fn capture<T>(&mut self, result: &Result<T>) {
+        if self.0.is_none() {
+            if let Err(error) = result {
+                *self = Self::claim(error);
+            }
+        }
+    }
+}
+impl Drop for DeferredHoldRejection {
+    fn drop(&mut self) {
+        if let Some(record) = self.0.take() {
+            record.record();
+        }
+    }
+}
+/// Existing error arms intentionally ignore rollback failure and return the
+/// original error. Keep that policy and the refusal through a cancelled await:
+/// rollback owns the transaction until it finishes/drops, then this guard records.
+pub(crate) async fn rollback_with_hold_refusal(
+    transaction: pioneer_sqlite::SqliteTransaction,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let refusal = DeferredHoldRejection::claim(&error);
+    let _ = transaction.rollback().await;
+    drop(refusal);
+    error
+}
+
+/// Existing CRUD retry attempts own their DB futures. Destroy the complete
+/// operation before recording; do this inside the attempt's WorkCarrier so
+/// its original work token is still active. Includes the final failed attempt.
+pub(crate) async fn after_database_owners<T>(
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let mut future = Box::pin(future);
+    let result = future.as_mut().await;
+    drop(future);
+    let mut refusal = DeferredHoldRejection::default();
+    refusal.capture(&result);
+    drop(refusal);
+    result
+}
+
 async fn publish(
     store: &CrudStore,
     family: Family,
@@ -1490,8 +1581,49 @@ mod tests {
     use super::*;
     use pioneer_observability::{live, work};
 
-    #[test]
-    fn initial_capture_rejection_is_observable_without_a_hydration_scope() {
+    #[derive(Default)]
+    struct ReleaseObserver {
+        token: std::sync::atomic::AtomicU64,
+        released: std::sync::atomic::AtomicUsize,
+        eager: std::sync::atomic::AtomicBool,
+    }
+    impl pioneer_sqlite::SqliteWriteObserver for ReleaseObserver {
+        fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+            use std::sync::atomic::Ordering::SeqCst;
+            if matches!(event, pioneer_sqlite::SqliteWriteEvent::Released { .. }) {
+                let token = self.token.load(SeqCst);
+                if let Some(snapshot) = live::snapshot() {
+                    self.eager.fetch_or(
+                        snapshot.active.iter().any(|w| {
+                            w.context.token == token && w.portable_hold_rejection.is_some()
+                        }),
+                        SeqCst,
+                    );
+                }
+                self.released.fetch_add(1, SeqCst);
+            }
+        }
+    }
+    fn caller() -> work::WorkCarrier {
+        work::WorkCarrier::independent(
+            work::Boundary::Rpc,
+            work::WorkKind::RpcRead,
+            work::Trigger::Rpc,
+            work::ExecutorRole::Gateway,
+        )
+    }
+    fn refusal_receipts(token: u64) -> usize {
+        live::snapshot().unwrap().journal.iter().filter(|r| matches!(
+            &r.payload, live::JournalPayload::Work(w)
+                if w.context.token == token && !matches!(w.state, live::WorkState::Terminal(_))
+                    && w.portable_hold_rejection == Some(observe::Family::TaskEvent)
+                    && w.portable_payload.is_none()
+        )).count()
+    }
+
+    #[tokio::test]
+    async fn initial_capture_rejection_records_only_after_transaction_release() {
+        use std::sync::atomic::Ordering::SeqCst;
         struct Reset(bool);
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -1500,36 +1632,477 @@ mod tests {
         }
         let _reset = Reset(pioneer_observability::telemetry_enabled());
         pioneer_observability::set_telemetry_enabled(true);
-        let caller = work::WorkCarrier::independent(
-            work::Boundary::Rpc,
-            work::WorkKind::RpcRead,
-            work::Trigger::Rpc,
-            work::ExecutorRole::Gateway,
+        let observer = Arc::new(ReleaseObserver::default());
+        let writer = pioneer_sqlite::SqliteWriteExecutor::with_observer(
+            sea_orm::Database::connect("sqlite::memory:").await.unwrap(),
+            observer.clone(),
         );
-        let token = caller.context().unwrap().token;
+        let reader = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        reader
+            .execute_unprepared("PRAGMA query_only=ON")
+            .await
+            .unwrap();
+        let db = pioneer_sqlite::SqliteDatabase::from_executor(reader, writer).maintenance();
         let id = uuid::Uuid::new_v4().to_string();
         let cleanup = PayloadCleanupHold::try_acquire(&id).unwrap();
-        caller.run(|| {
-            let error = PayloadReadHold::capture(&id, Family::TaskEvent).unwrap_err();
+        // Exercise both implicit transaction Drop and the actual explicit rollback
+        // boundary. The latter flush runs under a different caller context.
+        for explicit_rollback in [false, true] {
+            let owner = caller();
+            let token = owner.context().unwrap().token;
+            observer.token.store(token, SeqCst);
+            let result: Result<()> = owner
+                .scope_result(after_database_owners(async {
+                    let transaction = db.begin().await?;
+                    let error = PayloadReadHold::capture(&id, Family::TaskEvent).unwrap_err();
+                    assert!(error.downcast_ref::<PreflightRace>().is_some());
+                    assert_eq!(refusal_receipts(token), 0);
+                    if explicit_rollback {
+                        let other = caller();
+                        let other_token = other.context().unwrap().token;
+                        let error = other
+                            .scope(async { rollback_with_hold_refusal(transaction, error).await })
+                            .await;
+                        assert_eq!(refusal_receipts(other_token), 0);
+                        Err(error)
+                    } else {
+                        // No receipt Drop may run before the transaction's Drop.
+                        Err(error)
+                    }
+                }))
+                .await;
+            let error = result.unwrap_err();
             assert!(error.downcast_ref::<PreflightRace>().is_some());
-            let snapshot = live::snapshot().unwrap();
-            let owner = snapshot.active.iter().find(|w| w.context.token == token).unwrap();
-            assert_eq!(owner.portable_hold_rejection, Some(observe::Family::TaskEvent));
-            assert!(owner.portable_payload.is_none()); // no fictitious full-read operation
-            let receipts = snapshot.journal.iter().filter(|r| matches!(
-                &r.payload, live::JournalPayload::Work(w)
-                    if w.context.token == token && w.portable_hold_rejection == Some(observe::Family::TaskEvent)
-            )).count();
-            assert_eq!(receipts, 1);
-            drop(cleanup);
-            let _hold = PayloadReadHold::capture(&id, Family::TaskEvent).unwrap();
-            // Successful capture neither adds a refusal nor starts hydration work.
-            let after = live::snapshot().unwrap();
-            assert_eq!(after.journal.iter().filter(|r| matches!(
-                &r.payload, live::JournalPayload::Work(w)
-                    if w.context.token == token && w.portable_hold_rejection == Some(observe::Family::TaskEvent)
-            )).count(), receipts);
-            assert!(after.active.iter().find(|w| w.context.token == token).unwrap().portable_payload.is_none());
-        });
+            assert!(
+                error
+                    .downcast_ref::<observe::HoldRejection>()
+                    .unwrap()
+                    .take()
+                    .is_none()
+            );
+            assert_eq!(refusal_receipts(token), 1); // outer retry boundary did not double count
+        }
+        assert_eq!(observer.released.load(SeqCst), 2);
+        assert!(!observer.eager.load(SeqCst));
+
+        // Cancellation destroys DB owners before a previously claimed receipt;
+        // the owner is still live when its cancellation detail is recorded.
+        let owner = caller();
+        let token = owner.context().unwrap().token;
+        observer.token.store(token, SeqCst);
+        let (ready, reached) = tokio::sync::oneshot::channel();
+        let mut operation = Box::pin(owner.scope_result(after_database_owners(async {
+            let mut deferred = DeferredHoldRejection::default();
+            let _transaction = db.begin().await?;
+            let result = PayloadReadHold::capture(&id, Family::TaskEvent);
+            deferred.capture(&result);
+            assert_eq!(refusal_receipts(token), 0);
+            ready.send(()).unwrap();
+            std::future::pending::<Result<()>>().await
+        })));
+        tokio::select! {
+            _ = &mut operation => panic!("cancellation fixture completed"),
+            _ = reached => {}
+        }
+        drop(operation);
+        assert_eq!(refusal_receipts(token), 1);
+        assert!(!observer.eager.load(SeqCst));
+        assert_eq!(observer.released.load(SeqCst), 3);
+
+        // Capture epoch is retained across a consent cycle, not reconstructed at flush.
+        let owner = caller();
+        let token = owner.context().unwrap().token;
+        observer.token.store(token, SeqCst);
+        let _: Result<()> = owner
+            .scope_result(after_database_owners(async {
+                let _transaction = db.begin().await?;
+                let error = PayloadReadHold::capture(&id, Family::TaskEvent).unwrap_err();
+                pioneer_observability::set_telemetry_enabled(false);
+                pioneer_observability::set_telemetry_enabled(true);
+                Err(error)
+            }))
+            .await;
+        assert_eq!(refusal_receipts(token), 0);
+        let fresh = caller();
+        let fresh_token = fresh.context().unwrap().token;
+        observer.token.store(fresh_token, SeqCst);
+        let _: Result<()> = fresh
+            .scope_result(after_database_owners(async {
+                let _transaction = db.begin().await?;
+                Err(PayloadReadHold::capture(&id, Family::TaskEvent).unwrap_err())
+            }))
+            .await;
+        assert_eq!(refusal_receipts(fresh_token), 1);
+        drop(cleanup);
+        let _hold = PayloadReadHold::capture(&id, Family::TaskEvent).unwrap();
+        assert_eq!(refusal_receipts(fresh_token), 1);
+        assert!(db.reader_query_only_enabled().await.unwrap());
+    }
+
+    async fn reservation_fixture() -> (tempfile::TempDir, CrudStore) {
+        use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
+        use sea_orm::{ConnectOptions, Database};
+        pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("portable.sqlite");
+        let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
+        options.max_connections(1).min_connections(1);
+        let connection = Database::connect(options).await.unwrap();
+        let writer = SqliteWriteExecutor::new(connection.clone());
+        let maintenance = SqliteDatabase::from_executor(connection, writer.clone()).maintenance();
+        maintenance
+            .execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
+        maintenance
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        writer
+            .run_migrations::<migration::Migrator>(SqliteWriteClass::Maintenance, None)
+            .await
+            .unwrap();
+        let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
+        options.max_connections(1).min_connections(1);
+        let reader = Database::connect(options).await.unwrap();
+        reader
+            .execute_unprepared("PRAGMA query_only=ON")
+            .await
+            .unwrap();
+        let store =
+            CrudStore::new(SqliteDatabase::from_executor(reader, writer)).with_maintenance_access();
+        for sql in [
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1)",
+            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        ] {
+            store.connection.execute_unprepared(sql).await.unwrap();
+        }
+        (dir, store)
+    }
+    async fn pending_preparation(progress: &mut PortablePayloadProgress, store: &CrudStore) {
+        for _ in 0..30 {
+            progress.quantum(store).await.unwrap();
+            if progress.pending.is_some() {
+                return;
+            }
+        }
+        panic!("legacy source was not discovered");
+    }
+    fn collide_with(progress: &mut PortablePayloadProgress, id: &str) {
+        let pending = progress.pending.as_mut().unwrap();
+        assert!(!pending.prepared.installed);
+        pending.prepared._read_hold.take();
+        pending.prepared.header.id = id.to_owned();
+        pending.prepared._read_hold = Some(PayloadReadHold::capture(id, pending.family).unwrap());
+    }
+
+    #[tokio::test]
+    async fn reservation_collision_retries_own_blocks_and_abandons_unconfirmed_candidates() {
+        let (_dir, store) = reservation_fixture().await;
+        let output = pioneer_protocol::ItemDeltaNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item_id: "reservation".into(),
+            delta: "collision bytes 🦀\n".repeat(4000),
+            stream: None,
+            payload: None,
+            markdown: None,
+            markdown_version: None,
+        };
+        store.record_tool_output("original", &output).await.unwrap();
+        // Existing legacy TEXT can exceed today's delta limit. Keep the real
+        // source/progress path and force >16 blocks for bounded reclamation.
+        let legacy = output.delta.repeat(20);
+        pioneer_entity::tool_output_chunk::Entity::update_many()
+            .col_expr(
+                pioneer_entity::tool_output_chunk::Column::Text,
+                Expr::value(legacy.clone()),
+            )
+            .filter(pioneer_entity::tool_output_chunk::Column::Id.eq("original"))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        let mut progress = PortablePayloadProgress::default();
+        pending_preparation(&mut progress, &store).await;
+        let foreign_id = "AAAAAAAAAAAA";
+        collide_with(&mut progress, foreign_id);
+        // Matching family/size/placeholder digest must never imply ownership.
+        let foreign = progress.pending.as_ref().unwrap().prepared.header.clone();
+        let foreign_hold = PayloadReadHold::capture(foreign_id, Family::ToolText).unwrap();
+        value::Entity::insert(foreign.clone().into_active_model())
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        let foreign_block = block::Model {
+            payload_id: foreign_id.into(),
+            ordinal: 0,
+            byte_offset: 0,
+            char_offset: 0,
+            original_bytes: 1,
+            original_chars: 1,
+            data: vec![42; 78],
+        };
+        block::Entity::insert(foreign_block.clone().into_active_model())
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        progress.quantum(&store).await.unwrap(); // actual conflicting INSERT
+        let pending = progress.pending.as_ref().unwrap();
+        assert_eq!(pending.offset, 0);
+        assert!(!pending.prepared.installed);
+        assert!(pending.prepared.blocks.is_empty());
+        let reserved = pending.prepared.header.id.clone();
+        assert_ne!(reserved, foreign_id);
+        assert_eq!(reserved.len(), 12);
+        assert!(reserved.bytes().all(|b| b.is_ascii_alphanumeric()));
+        progress.quantum(&store).await.unwrap();
+        assert!(progress.pending.as_ref().unwrap().prepared.installed);
+        // Retry the same successfully written block batch, as after an ambiguous
+        // batch result. Confirmed reservation must retain the same payload ID.
+        for _ in 0..40 {
+            let p = progress.pending.as_ref().unwrap();
+            if p.prepared.blocks.len() == 16 {
+                break;
+            }
+            progress.quantum(&store).await.unwrap();
+        }
+        let batch = progress.pending.as_ref().unwrap().prepared.blocks.clone();
+        assert!(!batch.is_empty());
+        progress.quantum(&store).await.unwrap();
+        progress.pending.as_mut().unwrap().prepared.blocks = batch.clone();
+        progress.quantum(&store).await.unwrap();
+        assert_eq!(
+            progress.pending.as_ref().unwrap().prepared.header.id,
+            reserved
+        );
+        let blocks = block::Entity::find()
+            .filter(block::Column::PayloadId.eq(&reserved))
+            .order_by_asc(block::Column::Ordinal)
+            .all(&store.connection)
+            .await
+            .unwrap();
+        assert_eq!(blocks, batch);
+        for _ in 0..100 {
+            progress.quantum(&store).await.unwrap();
+        }
+        let rows = store
+            .tool_output_page("ws", "thread", "turn", "reservation", 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.text, legacy);
+        assert_eq!(
+            value::Entity::find_by_id(foreign_id)
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap(),
+            foreign
+        );
+        assert_eq!(
+            block::Entity::find_by_id((foreign_id.to_owned(), 0))
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap(),
+            foreign_block
+        );
+
+        let captured = header(&store.connection, &reserved, Family::ToolText)
+            .await
+            .unwrap();
+        assert_eq!(captured.sha256.len(), 32);
+        value::Entity::update_many()
+            .col_expr(value::Column::Sha256, Expr::value(vec![0_u8; 32]))
+            .filter(value::Column::Id.eq(&reserved))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        let corrupt = header(&store.connection, &reserved, Family::ToolText)
+            .await
+            .unwrap();
+        assert!(
+            hydrate_header(&store.connection, &corrupt, String::new())
+                .await
+                .is_err()
+        );
+        drop(corrupt);
+        value::Entity::update_many()
+            .col_expr(value::Column::Sha256, Expr::value(captured.sha256.clone()))
+            .filter(value::Column::Id.eq(&reserved))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        pioneer_entity::tool_output_chunk::Entity::delete_by_id("original")
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .run_background_database_quantum(|| cleanup(&store, None))
+                .await
+                .unwrap()
+                .0
+        );
+        assert_eq!(
+            hydrate_header(&store.connection, &captured, String::new())
+                .await
+                .unwrap(),
+            legacy
+        );
+        drop(captured);
+        assert!(
+            store
+                .run_background_database_quantum(|| cleanup(&store, None))
+                .await
+                .unwrap()
+                .0
+        );
+        let reclaiming = value::Entity::find_by_id(&reserved)
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reclaiming.retired, 1);
+        assert!(reclaiming.sha256.is_empty());
+        assert!(
+            !block::Entity::find()
+                .filter(block::Column::PayloadId.eq(&reserved))
+                .all(&store.connection)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let error = header(&store.connection, &reserved, Family::ToolText)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.downcast_ref::<PreflightRace>().is_some());
+        for _ in 0..4 {
+            store
+                .run_background_database_quantum(|| cleanup(&store, None))
+                .await
+                .unwrap();
+        }
+        assert!(
+            value::Entity::find_by_id(&reserved)
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Old UUID-shaped references remain readable; only newly allocated IDs
+        // change. SHA-256("abc") is an independent published fixture.
+        let old_id = "00000000-0000-4000-8000-000000000001";
+        value::Entity::insert(
+            value::Model {
+                id: old_id.into(),
+                family: Family::ToolText.name().into(),
+                original_bytes: 3,
+                original_chars: 3,
+                sha256: hex::decode(
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                )
+                .unwrap(),
+                raw: 1,
+                retired: 0,
+                dictionary_id: None,
+            }
+            .into_active_model(),
+        )
+        .exec(&store.connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            hydrate(
+                &store.connection,
+                Family::ToolText,
+                Some(old_id),
+                "abc".into()
+            )
+            .await
+            .unwrap(),
+            "abc"
+        );
+        value::Entity::delete_by_id(old_id)
+            .exec(&store.connection)
+            .await
+            .unwrap();
+
+        store
+            .record_tool_output("exhausted", &output)
+            .await
+            .unwrap();
+        pending_preparation(&mut progress, &store).await;
+        collide_with(&mut progress, foreign_id);
+        progress
+            .pending
+            .as_mut()
+            .unwrap()
+            .prepared
+            .reservation_attempts = RESERVATION_ATTEMPTS - 1;
+        assert!(progress.quantum(&store).await.is_err());
+        assert!(progress.pending.is_none());
+        let source = pioneer_entity::tool_output_chunk::Entity::find_by_id("exhausted")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(source.text_payload_id.is_none());
+        assert_eq!(source.text, output.delta);
+        assert_eq!(
+            value::Entity::find_by_id(foreign_id)
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap(),
+            foreign
+        );
+
+        // Cancellation while reservation waits for the existing writer leaves
+        // the source untouched and must not claim somebody else's header.
+        let mut cancelled = PortablePayloadProgress::default();
+        pending_preparation(&mut cancelled, &store).await;
+        let candidate = cancelled
+            .pending
+            .as_ref()
+            .unwrap()
+            .prepared
+            .header
+            .id
+            .clone();
+        let transaction = store.connection.begin().await.unwrap();
+        let mut future = Box::pin(cancelled.quantum(&store));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(future.as_mut(), &mut cx).is_pending());
+        drop(future);
+        transaction.rollback().await.unwrap();
+        drop(cancelled);
+        assert!(
+            value::Entity::find_by_id(candidate)
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let source = pioneer_entity::tool_output_chunk::Entity::find_by_id("exhausted")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(source.text_payload_id.is_none());
+        assert_eq!(source.text, output.delta);
+        assert_eq!(
+            block::Entity::find_by_id((foreign_id.to_owned(), 0))
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap(),
+            foreign_block
+        );
+        drop(foreign_hold);
     }
 }

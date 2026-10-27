@@ -164,7 +164,7 @@ pub struct PreparedFrozenImport {
 struct AcceptedImportBasis {
     turn: String,
     history_json: String,
-    history_sha256: String,
+    history_sha256: Vec<u8>,
     history_bytes: i64,
     manifest: String,
     digest: String,
@@ -757,7 +757,7 @@ async fn prepare_accepted_import(
         accepted_basis: Some(AcceptedImportBasis {
             turn: turn.into(),
             // Hash original bytes before entering any writer transaction.
-            history_sha256: hex::encode(Sha256::digest(basis.history_json.as_bytes())),
+            history_sha256: Sha256::digest(basis.history_json.as_bytes()).to_vec(),
             history_bytes: i64::try_from(basis.history_json.len())?,
             history_json: basis.history_json,
             manifest: descriptor.manifest_id,

@@ -681,6 +681,47 @@ async fn portable_tool_storage_survives_staging_restart_and_preserves_retry_and_
     assert_eq!(rows[0].1.text, "");
     assert_eq!(rows[0].1.metadata, None);
     assert_eq!(scalar(&reopened,"SELECT p.raw n FROM tool_output_chunk c JOIN portable_payload p ON p.id=c.text_payload_id WHERE c.id='later'").await,1);
+    // The on-disk type and exact empty digest are independent of the encoder.
+    assert_eq!(scalar(&reopened,"SELECT count(*) n FROM portable_payload WHERE typeof(sha256)<>'blob' OR length(sha256)<>32").await, 0);
+    let empty_digest =
+        hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap();
+    let digest: Vec<u8> = reopened.database_connection().query_one_raw(Statement::from_string(DbBackend::Sqlite,
+        "SELECT sha256 FROM portable_payload WHERE id=(SELECT text_payload_id FROM tool_output_chunk WHERE id='later')"))
+        .await.unwrap().unwrap().try_get("", "sha256").unwrap();
+    assert_eq!(digest, empty_digest);
+    for invalid in [
+        sea_orm::Value::from("0".repeat(64)), // TEXT is not a binary checksum
+        sea_orm::Value::from(vec![0_u8; 31]),
+        sea_orm::Value::from(vec![0_u8; 33]),
+        sea_orm::Value::from(vec![b'0'; 64]), // ASCII hex in a BLOB is also rejected
+        sea_orm::Value::from(Vec::<u8>::new()), // marker cannot be live
+    ] {
+        assert!(reopened.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "UPDATE portable_payload SET sha256=? WHERE id=(SELECT text_payload_id FROM tool_output_chunk WHERE id='later')",
+            [invalid])).await.is_err());
+    }
+    // A wrong, full-sized digest satisfies the schema but must fail hydration.
+    reopened.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "UPDATE portable_payload SET sha256=? WHERE id=(SELECT text_payload_id FROM tool_output_chunk WHERE id='later')",
+        [vec![0_u8; 32].into()])).await.unwrap();
+    assert!(
+        reopened
+            .tool_output_page("ws", "thread", "turn", "portable", after.last().unwrap().0)
+            .await
+            .is_err()
+    );
+    reopened.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "UPDATE portable_payload SET sha256=? WHERE id=(SELECT text_payload_id FROM tool_output_chunk WHERE id='later')",
+        [empty_digest.into()])).await.unwrap();
+    assert_eq!(
+        reopened
+            .tool_output_page("ws", "thread", "turn", "portable", after.last().unwrap().0)
+            .await
+            .unwrap()[0]
+            .1
+            .text,
+        ""
+    );
     reopened
         .database_connection()
         .execute_unprepared("DELETE FROM tool_output_chunk WHERE item_id='portable'")

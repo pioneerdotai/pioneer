@@ -304,7 +304,7 @@ async fn hydrate_record_inner(
     if let Some(digest) = original_digest {
         use sha2::{Digest, Sha256};
         anyhow::ensure!(
-            hex::encode(Sha256::digest(&bytes)) == digest,
+            Sha256::digest(&bytes).as_slice() == digest.as_slice(),
             "Task snapshot digest mismatch"
         );
     }

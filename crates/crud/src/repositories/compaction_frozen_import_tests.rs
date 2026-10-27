@@ -269,7 +269,7 @@ async fn prepared(store: &CrudStore, manifest: &str, source: SourceRef) -> Prepa
         accepted_basis: Some(AcceptedImportBasis {
             turn: "child-turn".into(),
             history_json: history_json.into(),
-            history_sha256: hex::encode(Sha256::digest(history_json.as_bytes())),
+            history_sha256: Sha256::digest(history_json.as_bytes()).to_vec(),
             history_bytes: i64::try_from(history_json.len()).unwrap(),
             manifest: manifest.into(),
             digest: format!("digest-{manifest}"),

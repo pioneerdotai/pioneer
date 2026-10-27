@@ -4977,7 +4977,7 @@ impl CrudStore {
         Fut: Future<Output = Result<T>>,
     {
         retry_with_backoff(
-            || operation(),
+            || repositories::portable_payload::after_database_owners(operation()),
             |error| {
                 is_anyhow_sqlite_lock(error)
                     || task_event::is_idempotency_preflight_race(error)
@@ -7746,8 +7746,11 @@ impl CrudStore {
                 .project_cli_runtime_pending_request(&transaction, &record)
                 .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -7774,8 +7777,11 @@ impl CrudStore {
                 .project_cli_runtime_pending_request(&transaction, &record)
                 .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -7819,8 +7825,11 @@ impl CrudStore {
                 .project_cli_runtime_pending_request(&transaction, &record)
                 .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -8000,8 +8009,11 @@ impl CrudStore {
                     .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -8032,8 +8044,11 @@ impl CrudStore {
                     .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -8064,8 +8079,11 @@ impl CrudStore {
                     .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -8101,8 +8119,11 @@ impl CrudStore {
                     .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -8138,8 +8159,11 @@ impl CrudStore {
                     .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -15186,10 +15210,11 @@ impl CrudStore {
                         .context(NativeFinalizationPhase::WriterCommit)?;
                     Ok(outcome)
                 }
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    Err(error)
-                }
+                Err(error) => Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await),
             }
         })
         .await
@@ -15346,8 +15371,7 @@ impl CrudStore {
                         .await
                         .context("failed to commit item snapshot update transaction"),
                     Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
+                        Err(repositories::portable_payload::rollback_with_hold_refusal(transaction, error).await)
                     }
                 }
             }
@@ -19078,10 +19102,11 @@ impl CrudStore {
                     .context("failed to commit Turn message edit transaction")?;
                 Ok(event)
             }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
+            Err(error) => Err(repositories::portable_payload::rollback_with_hold_refusal(
+                transaction,
+                error,
+            )
+            .await),
         }
     }
 
@@ -19285,10 +19310,11 @@ impl CrudStore {
                     .context("failed to commit Turn message delete transaction")?;
                 Ok(result)
             }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
+            Err(error) => Err(repositories::portable_payload::rollback_with_hold_refusal(
+                transaction,
+                error,
+            )
+            .await),
         }
     }
 
@@ -29748,8 +29774,7 @@ impl CrudStore {
                     Ok(RecoveryTerminalizationApplyOutcome::Applied(applied))
                 }
                 Err(error) => {
-                    let _ = transaction.rollback().await;
-                    Err(error)
+                    Err(repositories::portable_payload::rollback_with_hold_refusal(transaction, error).await)
                 }
             }
         })
@@ -31332,8 +31357,11 @@ impl CrudStore {
                 )
                 .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
         }
 
@@ -32026,8 +32054,11 @@ impl CrudStore {
             .await
             .context("failed to project turn event to semantic timeline")
         {
-            let _ = transaction.rollback().await;
-            return Err(error);
+            return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                transaction,
+                error,
+            )
+            .await);
         }
 
         let projected = match turn_event_projection_state::mark_projected_claimed(
@@ -33176,10 +33207,11 @@ impl CrudStore {
                     .context("failed to commit atomic Task creation transaction")?;
                 Ok(materialize_task_events(appended_events))
             }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
+            Err(error) => Err(repositories::portable_payload::rollback_with_hold_refusal(
+                transaction,
+                error,
+            )
+            .await),
         }
     }
 
@@ -33889,7 +33921,7 @@ impl CrudStore {
         // future; it may perform reader work and retry backoff.
         let mut operation = operation;
         retry_with_backoff(
-            || operation(),
+            || repositories::portable_payload::after_database_owners(operation()),
             |error| {
                 is_anyhow_sqlite_lock(error)
                     || task_event::is_idempotency_preflight_race(error)

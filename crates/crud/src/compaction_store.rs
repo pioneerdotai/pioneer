@@ -673,11 +673,13 @@ impl CrudStore {
         timestamp_secs: i64,
     ) -> Result<bool> {
         let maintenance = self.with_maintenance_access();
-        repositories::compaction::lifecycle::repair_lifecycle(
-            &maintenance,
-            prepared,
-            event,
-            timestamp_secs,
+        repositories::portable_payload::after_database_owners(
+            repositories::compaction::lifecycle::repair_lifecycle(
+                &maintenance,
+                prepared,
+                event,
+                timestamp_secs,
+            ),
         )
         .await
     }
@@ -1298,12 +1300,14 @@ impl CrudStore {
         event: CanonicalTurnEventPayload,
         timestamp_secs: i64,
     ) -> Result<()> {
-        repositories::compaction::lifecycle::compaction_materialize_lifecycle(
-            self,
-            operation,
-            generation,
-            event,
-            timestamp_secs,
+        repositories::portable_payload::after_database_owners(
+            repositories::compaction::lifecycle::compaction_materialize_lifecycle(
+                self,
+                operation,
+                generation,
+                event,
+                timestamp_secs,
+            ),
         )
         .await
     }

@@ -13,8 +13,8 @@ pub struct Model {
     pub family: String,
     pub original_bytes: i64,
     pub original_chars: i64,
-    #[sea_orm(column_type = "Text")]
-    pub sha256: String,
+    #[sea_orm(column_type = "Binary(1)")]
+    pub sha256: Vec<u8>,
     pub raw: i32,
     pub retired: i32,
     #[sea_orm(column_type = "Text", nullable)]

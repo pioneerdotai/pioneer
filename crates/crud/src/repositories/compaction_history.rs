@@ -1485,7 +1485,7 @@ async fn compaction_task_basis_snapshot_inner(
     if let Some(expected) = original_digest {
         use sha2::{Digest, Sha256};
         ensure!(
-            hex::encode(Sha256::digest(&bytes)) == expected,
+            Sha256::digest(&bytes).as_slice() == expected.as_slice(),
             "accepted Task basis digest mismatch"
         );
     }

@@ -373,27 +373,70 @@ pub fn outcome(outcome: Outcome) {
         s.record_outcome(outcome);
     }
 }
-/// A known hold refusal before hydration has an owner. Successful captures do
-/// nothing. An already scoped refusal is accounted once as that operation's
-/// stale outcome; otherwise record a separate rejection, never a full read.
-pub fn hold_rejected(family: Family) {
-    if let Some(state) = current() {
-        state.record_outcome(Outcome::Stale);
-        return;
+/// Captured refusal data; no live registry/SDK access while a DB owner lives.
+/// The error retains this context until a released CRUD attempt claims it.
+pub struct HoldRejection {
+    record: HoldRejectionRecord,
+    claimed: AtomicBool,
+}
+impl std::fmt::Debug for HoldRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HoldRejection")
+            .field("family", &self.record.family)
+            .finish_non_exhaustive()
     }
-    let (enabled, epoch) = crate::telemetry_consent_snapshot();
-    if !enabled {
-        return;
+}
+impl std::fmt::Display for HoldRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("portable backing hold refused")
     }
-    if let Some(metrics) = crate::telemetry::state().and_then(|s| s.gateway_metrics.as_ref()) {
-        if crate::telemetry_sample_allowed(Some(epoch)) {
+}
+impl HoldRejection {
+    pub fn take(&self) -> Option<HoldRejectionRecord> {
+        (!self.claimed.swap(true, Ordering::Relaxed)).then(|| HoldRejectionRecord {
+            family: self.record.family,
+            context: self.record.context,
+            epoch: self.record.epoch,
+        })
+    }
+}
+pub struct HoldRejectionRecord {
+    family: Family,
+    context: Option<work::WorkContext>,
+    epoch: u64,
+}
+impl HoldRejectionRecord {
+    /// Call only after operation/transaction owners have been destroyed. Uses
+    /// original context and epoch, never the context at this later flush site.
+    pub fn record(self) {
+        if !crate::telemetry_sample_allowed(Some(self.epoch)) {
+            return;
+        }
+        if let Some(metrics) = crate::telemetry::state().and_then(|s| s.gateway_metrics.as_ref()) {
             metrics
                 .portable_payload
                 .hold_rejections
-                .add(1, &[KeyValue::new("family", family.as_str())]);
+                .add(1, &[KeyValue::new("family", self.family.as_str())]);
         }
+        live::portable_hold_rejected(self.context, self.family);
     }
-    live::portable_hold_rejected(work::current(), family);
+}
+/// Already scoped refusals only mutate their bounded atomic aggregate. An
+/// unscoped refusal returns a typed receipt; capture never records it eagerly.
+pub fn hold_rejected(family: Family) -> Option<HoldRejection> {
+    if let Some(state) = current() {
+        state.record_outcome(Outcome::Stale);
+        return None;
+    }
+    let (enabled, epoch) = crate::telemetry_consent_snapshot();
+    enabled.then(|| HoldRejection {
+        record: HoldRejectionRecord {
+            family,
+            context: work::current(),
+            epoch,
+        },
+        claimed: AtomicBool::new(false),
+    })
 }
 pub fn bytes(kind: ByteKind, count: u64) {
     if let Some(s) = current() {
@@ -1084,7 +1127,7 @@ mod tests {
                     .load(Ordering::Relaxed),
                 u64::MAX
             );
-            hold_rejected(Family::TaskEvent);
+            assert!(hold_rejected(Family::TaskEvent).is_none());
             Err::<(), ()>(())
         }));
         assert_eq!(poll(future.as_mut()), Poll::Ready(Err(())));
