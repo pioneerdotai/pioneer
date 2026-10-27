@@ -16427,6 +16427,13 @@ impl crate::voice::supervisor::VoiceModelInstaller for TestGatewayVoiceInstaller
 struct TestGatewayVoiceEngineLoader;
 
 impl crate::voice::supervisor::VoiceEngineLoader for TestGatewayVoiceEngineLoader {
+    fn prepare_vad(
+        &self,
+        _: &tokio_util::sync::CancellationToken,
+    ) -> std::result::Result<(), crate::voice::transcription::VoiceTranscriptionError> {
+        Ok(()) // Deterministic lifecycle fixture; no native model operations.
+    }
+
     fn load(
         &self,
         _entry: &crate::voice::model_catalog::VoiceModelCatalogEntry,
@@ -16443,7 +16450,7 @@ impl crate::voice::supervisor::VoiceEngineLoader for TestGatewayVoiceEngineLoade
 }
 
 // Regression harness uses the real owned-request dispatcher on one connection.
-// Only the speech transcriber is replaced; VAD/session/claim/admission stay real.
+// ASR and detector are deterministic fixtures; smoothing/session/claim/admission stay real.
 struct PendingVoiceRelease(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
 impl PendingVoiceRelease {
     fn release(&self) {

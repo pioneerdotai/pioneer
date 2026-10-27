@@ -7,6 +7,7 @@ use super::transcription::{VoiceTranscriptionErrorKind, transcription_error};
 use super::{
     finalization::{VoiceFinalizationLease, VoiceFinalizations},
     session_buffer::{GatewayVoiceSessionBufferStore, VoiceChunkIngestError},
+    silero::create_voice_detector,
     supervisor::VoiceInputSupervisor,
     transcription::{
         PreparedSpeechBuffer, VoiceSpeechHypothesis, VoiceSpeechTranscriber, VoiceTranscript,
@@ -14,7 +15,7 @@ use super::{
         VoiceTranscriptionNoSpeechReason, VoiceTranscriptionStrategy,
     },
     vad::{
-        EnergyVoiceActivityDetector, SmoothedVadFrame, SmoothedVoiceVad, VOICE_VAD_FRAME_SAMPLES,
+        SmoothedVadFrame, SmoothedVoiceVad, VOICE_VAD_FRAME_SAMPLES, VoiceActivityDetector,
         VoiceSpeechSegment, VoiceVadConfig,
     },
 };
@@ -35,7 +36,6 @@ const LEFT_CONTEXT_SAMPLES: usize = REFRESH_SAMPLES / 2;
 const MAX_ALIGNMENT_UNITS: usize = 2048;
 const MAX_CONTEXT_ANCHOR_BYTES: usize = 256;
 const MAX_SPEECH_WINDOW_SAMPLES: usize = 6 * REFRESH_SAMPLES;
-const ENERGY_VAD_THRESHOLD_FLOOR: f32 = 0.02;
 // transcribe-rs 0.3.12 onnx/moonshine/model.rs::generate rejects audio shorter
 // than 0.1 s at 16 kHz. This applies to Pioneer's moonshine-base adapter only;
 // other engines keep their existing input and inference parameters.
@@ -104,6 +104,41 @@ pub(crate) fn start(
     transcriber: SessionSpeechTranscriber,
     transcribe_while_recording: bool,
 ) -> Result<(), VoiceChunkIngestError> {
+    #[cfg(test)]
+    if transcriber.fake.is_some() {
+        return start_with_detector(
+            store,
+            session_id,
+            format,
+            workers,
+            lease,
+            transcriber,
+            transcribe_while_recording,
+            |_| super::vad::EnergyVoiceActivityDetector::new(0.02),
+        );
+    }
+    start_with_detector(
+        store,
+        session_id,
+        format,
+        workers,
+        lease,
+        transcriber,
+        transcribe_while_recording,
+        create_voice_detector,
+    )
+}
+
+fn start_with_detector<D: VoiceActivityDetector + Send + 'static>(
+    store: GatewayVoiceSessionBufferStore,
+    session_id: String,
+    format: VoiceAudioFormat,
+    workers: &VoiceFinalizations,
+    lease: VoiceFinalizationLease,
+    transcriber: SessionSpeechTranscriber,
+    transcribe_while_recording: bool,
+    make_detector: impl FnOnce(&CancellationToken) -> anyhow::Result<D> + Send + 'static,
+) -> Result<(), VoiceChunkIngestError> {
     let cancellation = transcriber.cancellation.clone();
     let (sender, receiver) = oneshot::channel();
     store.start_processing(session_id.clone(), format, cancellation.clone(), receiver)?;
@@ -124,6 +159,12 @@ pub(crate) fn start(
         .tasks
         .spawn_blocking(pioneer_observability::work::blocking(move || {
             let outcome = catch_unwind(AssertUnwindSafe(|| {
+                ensure_active(&cancellation)?;
+                // One Session per recording, built on this blocking worker,
+                // never in ingress or under the shared session-store lock.
+                let detector = make_detector(&cancellation)
+                    .map_err(|_| worker_error("failed to initialize required Silero VAD"))?;
+                ensure_active(&cancellation)?;
                 if transcribe_while_recording {
                     process(
                         &store,
@@ -131,6 +172,7 @@ pub(crate) fn start(
                         &cancellation,
                         &transcriber,
                         transcriber.is_moonshine_base,
+                        detector,
                     )
                 } else {
                     process_buffered(
@@ -139,6 +181,7 @@ pub(crate) fn start(
                         &cancellation,
                         &transcriber,
                         transcriber.is_moonshine_base,
+                        detector,
                     )
                 }
             }))
@@ -152,12 +195,13 @@ pub(crate) fn start(
 // Whole-session preparation uses the same VAD filtering and final-onset
 // handling as incremental, but never invokes its bounded-window/text planner.
 // All accepted chunks transfer out of the inbox only after Commit.
-fn process_buffered(
+fn process_buffered<D: VoiceActivityDetector>(
     store: &GatewayVoiceSessionBufferStore,
     session_id: &str,
     cancellation: &CancellationToken,
     transcriber: &impl VoiceSpeechTranscriber,
     is_moonshine_base: bool,
+    detector: D,
 ) -> Result<GatewayVoiceSessionPipelineOutcome, VoiceError> {
     ensure_active(cancellation)?;
     let chunks = store
@@ -166,8 +210,6 @@ fn process_buffered(
     ensure_active(cancellation)?;
     let key = store.processing_startup_key(session_id);
     pioneer_observability::turn_startup::scope_sync(key, || {
-        let detector = EnergyVoiceActivityDetector::new(ENERGY_VAD_THRESHOLD_FLOOR)
-            .map_err(|_| worker_error("failed to initialize voice VAD"))?;
         let mut vad = SmoothedVoiceVad::new(detector, VoiceVadConfig::default())
             .map_err(|_| worker_error("failed to initialize voice VAD"))?;
         let mut signal = SignalAccumulator::default();
@@ -195,16 +237,18 @@ fn process_buffered(
                     pending.push(sample);
                     if pending.len() == VOICE_VAD_FRAME_SAMPLES {
                         ensure_active(cancellation)?;
-                        if let SmoothedVadFrame::Speech(samples) = vad
+                        let classified = vad
                             .push_incremental_frame(&pending)
-                            .map_err(|_| worker_error("failed to segment voice audio"))?
-                        {
+                            .map_err(|_| worker_error("failed to segment voice audio"))?;
+                        ensure_active(cancellation)?;
+                        if let SmoothedVadFrame::Speech(samples) = classified {
                             speech.extend(samples);
                         }
                         pending.clear();
                     }
                 }
             }
+            ensure_active(cancellation)?;
             speech.extend(
                 vad.finish_incremental_tail(&pending)
                     .map_err(|_| worker_error("failed to segment final voice audio"))?,
@@ -269,14 +313,16 @@ fn process_buffered(
     })
 }
 
-fn process(
+fn process<D: VoiceActivityDetector>(
     store: &GatewayVoiceSessionBufferStore,
     session_id: &str,
     cancellation: &CancellationToken,
     transcriber: &impl VoiceSpeechTranscriber,
     is_moonshine_base: bool,
+    detector: D,
 ) -> Result<GatewayVoiceSessionPipelineOutcome, VoiceError> {
-    let mut state = IncrementalSpeech::new(is_moonshine_base)?;
+    ensure_active(cancellation)?;
+    let mut state = IncrementalSpeech::new(is_moonshine_base, detector)?;
     loop {
         ensure_active(cancellation)?;
         let Some(chunk) = store
@@ -298,6 +344,7 @@ fn process(
                     state.vad.push_incremental_frame(&state.pending)
                 })
                 .map_err(|_| worker_error("failed to segment voice audio"))?;
+                ensure_active(cancellation)?;
                 state.pending.clear();
                 match classified {
                     SmoothedVadFrame::Speech(samples) => state.accept_speech(
@@ -332,6 +379,7 @@ fn process(
         state.vad.finish_incremental_tail(&state.pending)
     })
     .map_err(|_| worker_error("failed to segment final voice audio"))?;
+    ensure_active(cancellation)?;
     state.accept_speech(&tail, store, session_id, cancellation, transcriber)?;
     state.flush(store, session_id, cancellation, transcriber)?;
     let signal_stats = state.signal.finish();
@@ -363,9 +411,9 @@ fn process(
     })
 }
 
-struct IncrementalSpeech {
+struct IncrementalSpeech<D> {
     is_moonshine_base: bool,
-    vad: SmoothedVoiceVad<EnergyVoiceActivityDetector>,
+    vad: SmoothedVoiceVad<D>,
     pending: Vec<f32>,
     speech: Vec<f32>,
     window_start_sample: usize, // cursor in the unique VAD-emitted speech stream
@@ -382,10 +430,8 @@ struct IncrementalSpeech {
     next_refresh_samples: usize,
     signal: SignalAccumulator,
 }
-impl IncrementalSpeech {
-    fn new(is_moonshine_base: bool) -> Result<Self, VoiceError> {
-        let detector = EnergyVoiceActivityDetector::new(ENERGY_VAD_THRESHOLD_FLOOR)
-            .map_err(|_| worker_error("failed to initialize voice VAD"))?;
+impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
+    fn new(is_moonshine_base: bool, detector: D) -> Result<Self, VoiceError> {
         Ok(Self {
             is_moonshine_base,
             vad: SmoothedVoiceVad::new(detector, VoiceVadConfig::default())
@@ -1042,6 +1088,44 @@ mod tests {
     use pioneer_protocol::{VoiceAudioEncoding, VoiceChunkFrameHeader};
     use std::sync::Mutex;
 
+    fn test_detector() -> super::super::vad::EnergyVoiceActivityDetector {
+        super::super::vad::EnergyVoiceActivityDetector::new(0.02).unwrap()
+    }
+
+    fn process(
+        store: &GatewayVoiceSessionBufferStore,
+        session_id: &str,
+        cancellation: &CancellationToken,
+        transcriber: &impl VoiceSpeechTranscriber,
+        is_moonshine_base: bool,
+    ) -> Result<GatewayVoiceSessionPipelineOutcome, VoiceError> {
+        super::process(
+            store,
+            session_id,
+            cancellation,
+            transcriber,
+            is_moonshine_base,
+            test_detector(),
+        )
+    }
+
+    fn process_buffered(
+        store: &GatewayVoiceSessionBufferStore,
+        session_id: &str,
+        cancellation: &CancellationToken,
+        transcriber: &impl VoiceSpeechTranscriber,
+        is_moonshine_base: bool,
+    ) -> Result<GatewayVoiceSessionPipelineOutcome, VoiceError> {
+        super::process_buffered(
+            store,
+            session_id,
+            cancellation,
+            transcriber,
+            is_moonshine_base,
+            test_detector(),
+        )
+    }
+
     struct HypothesisTranscriber<F>(F);
     impl<F> VoiceSpeechTranscriber for HypothesisTranscriber<F>
     where
@@ -1062,7 +1146,8 @@ mod tests {
         }
     }
 
-    // Feed the production processor with real PCM normalization and segmentation.
+    // Feed the production processor with real PCM normalization and smoothing.
+    // The deterministic energy fixture proves framing/lifecycle, not Silero quality.
     // Closed input makes this synchronous fixture deterministic; the ingress
     // regression separately proves inference occurs while input is still open.
     fn partitioned(
@@ -1539,7 +1624,7 @@ mod tests {
             }
             .to_owned())
         }));
-        let mut state = IncrementalSpeech::new(false).unwrap();
+        let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
         state
             .accept_speech(
                 &vec![0.5; REFRESH_SAMPLES],
@@ -1590,7 +1675,7 @@ mod tests {
             }
             .to_owned())
         }));
-        let mut state = IncrementalSpeech::new(false).unwrap();
+        let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
         state
             .accept_speech(&[0.5; 7], &store, "session", &token, &fake)
             .unwrap();
@@ -2231,7 +2316,7 @@ mod tests {
         });
         let store = open_store();
         let token = CancellationToken::new();
-        let mut state = IncrementalSpeech::new(false).unwrap();
+        let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
         state.speech = source[..MAX_SPEECH_WINDOW_SAMPLES]
             .iter()
             .map(|s| f32::from(*s) / 32768.0)
@@ -2404,7 +2489,7 @@ mod tests {
         // the early hypothesis changes words, not just punctuation/case.
         let store = open_store();
         let token = CancellationToken::new();
-        let mut state = IncrementalSpeech::new(false).unwrap();
+        let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
         state
             .accept_speech(
                 &normalized[..REFRESH_SAMPLES],
@@ -2503,7 +2588,7 @@ mod tests {
                 ]),
             })
         });
-        let mut state = IncrementalSpeech::new(false).unwrap();
+        let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
         state.speech.extend(vec![0.5; MAX_SPEECH_WINDOW_SAMPLES]);
         state.speech_samples = state.speech.len();
         state
@@ -2555,7 +2640,7 @@ mod tests {
         });
         let store = open_store();
         let token = CancellationToken::new();
-        let mut state = IncrementalSpeech::new(false).unwrap();
+        let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
         state.speech.extend(vec![0.5; MAX_SPEECH_WINDOW_SAMPLES]);
         state.speech_samples = state.speech.len();
         state
@@ -2620,7 +2705,7 @@ mod tests {
             }
             Ok("слово".to_owned())
         }));
-        let mut state = IncrementalSpeech::new(false).unwrap();
+        let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
         // Skip previews so cancellation occurs specifically in the first probe.
         state.speech = vec![0.5; MAX_SPEECH_WINDOW_SAMPLES];
         state.speech_samples = state.speech.len();
@@ -2799,7 +2884,7 @@ mod tests {
 
     #[test]
     fn voice_incremental_short_onset_and_subframe_recordings_are_preserved() {
-        for count in [1, 479, 480, 487, 959, 960, 967] {
+        for count in [1, 137, 479, 480, 487, 959, 960, 967] {
             let audio = vec![12000; count];
             let (result, calls) = partitioned(&audio, 317);
             assert!(matches!(
@@ -2906,17 +2991,147 @@ mod tests {
 
     #[test]
     fn voice_incremental_next_onset_does_not_replay_previous_hangover() {
-        let mut audio = vec![12000; 960];
-        audio.extend(vec![0; 16 * VOICE_VAD_FRAME_SAMPLES]);
-        audio.extend(vec![6000; 967]);
-        let (_, calls) = partitioned(&audio, 317);
-        assert_eq!(calls.len(), 2);
-        assert_eq!(
-            calls.concat(),
-            audio
-                .iter()
-                .map(|s| f32::from(*s) / 32768.0)
-                .collect::<Vec<_>>()
-        );
+        for buffered in [false, true] {
+            for remainder in [0, 1, 137, 479] {
+                let mut audio = vec![12000; 960];
+                audio.extend(vec![0; 16 * VOICE_VAD_FRAME_SAMPLES]);
+                // Only one complete frame in the final onset. Commit must
+                // recover it, with or without a short remainder.
+                audio.extend(vec![6000; VOICE_VAD_FRAME_SAMPLES + remainder]);
+                let expected: Vec<_> = audio.iter().map(|s| f32::from(*s) / 32768.0).collect();
+                for packet in [1, 137, 479, 1600] {
+                    let calls = Arc::new(Mutex::new(Vec::new()));
+                    let captured = calls.clone();
+                    let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
+                        captured.lock().unwrap().push(buffer.flattened_samples());
+                        Ok("speech".to_owned())
+                    }));
+                    let outcome =
+                        closed_input_mode(&audio, packet, false, &fake, buffered).unwrap();
+                    let calls = calls.lock().unwrap();
+                    assert_eq!(calls.len(), if buffered { 1 } else { 2 });
+                    assert_eq!(calls.concat(), expected);
+                    let GatewayVoiceSessionPipelineOutcome::Transcript {
+                        transcript,
+                        signal_stats,
+                    } = outcome
+                    else {
+                        panic!("final onset expected");
+                    };
+                    assert_eq!(transcript.diagnostics.speech_samples, audio.len());
+                    assert_eq!(transcript.diagnostics.total_samples, audio.len());
+                    assert_eq!(signal_stats.total_samples, audio.len());
+                    assert_eq!(signal_stats.non_zero_samples, 1440 + remainder);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn detector_cancel_or_failure_retains_lease_until_return_and_publishes_no_transcript() {
+        use super::super::supervisor::{EagerVoiceEngineLoader, FilesystemVoiceModelInstaller};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct BlockingDetector {
+            entered: tokio::sync::mpsc::UnboundedSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            fail: bool,
+        }
+        impl VoiceActivityDetector for BlockingDetector {
+            fn speech_probability(&mut self, frame: &[f32]) -> anyhow::Result<f32> {
+                assert_eq!(frame.len(), VOICE_VAD_FRAME_SAMPLES);
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+                if self.fail {
+                    anyhow::bail!("detector failed");
+                }
+                Ok(0.9)
+            }
+        }
+        for buffered in [false, true] {
+            // Cancellation during synchronous inference cannot abort it. A
+            // native error without cancellation must also fail closed.
+            for cancel in [false, true] {
+                let store = GatewayVoiceSessionBufferStore::default();
+                let workers = VoiceFinalizations::default();
+                let lease = workers.reserve(1).unwrap();
+                let other_leases: Vec<_> = (2..=4).map(|id| workers.reserve(id).unwrap()).collect();
+                let cancellation = CancellationToken::new();
+                let supervisor = Arc::new(VoiceInputSupervisor::new(
+                    Arc::new(FilesystemVoiceModelInstaller::new(
+                        crate::isolated_test_app_config().unwrap(),
+                        std::path::PathBuf::new(),
+                    )),
+                    Arc::new(EagerVoiceEngineLoader),
+                ));
+                let asr_calls = Arc::new(AtomicUsize::new(0));
+                let worker_asr_calls = asr_calls.clone();
+                let transcriber = SessionSpeechTranscriber {
+                    supervisor,
+                    generation: 0,
+                    is_moonshine_base: false,
+                    cancellation: cancellation.clone(),
+                    fake: Some(Arc::new(move |_| {
+                        worker_asr_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok("unexpected ASR result".to_owned())
+                    })),
+                };
+                let (entered, mut receive) = tokio::sync::mpsc::unbounded_channel();
+                let (release, released) = std::sync::mpsc::channel();
+                start_with_detector(
+                    store.clone(),
+                    "session".to_owned(),
+                    VoiceAudioFormat::pioneer_streaming_target(),
+                    &workers,
+                    lease,
+                    transcriber,
+                    !buffered,
+                    move |_| {
+                        Ok(BlockingDetector {
+                            entered,
+                            release: released,
+                            fail: !cancel,
+                        })
+                    },
+                )
+                .unwrap();
+                append_test_packet(&store, "session", 0, &[12000; 960]);
+                let completion = store.finish_processing("session").unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), receive.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(workers.reserve(1).is_none());
+                assert!(workers.reserve(5).is_none());
+                if cancel {
+                    store.remove_session("session").unwrap();
+                    assert!(cancellation.is_cancelled());
+                    drop(completion);
+                    assert!(workers.reserve(1).is_none());
+                    release.send(()).unwrap();
+                } else {
+                    release.send(()).unwrap();
+                    let result = completion.await.unwrap();
+                    assert!(matches!(
+                        result.outcome,
+                        Err(VoiceError {
+                            kind: VoiceErrorKind::TranscriptionFailed,
+                            ..
+                        })
+                    ));
+                    // Publication still owns capacity until its completion is dropped.
+                    assert!(workers.reserve(1).is_none());
+                    drop(result.lease);
+                }
+                drop(other_leases);
+                workers.tasks.close();
+                tokio::time::timeout(std::time::Duration::from_secs(5), workers.tasks.wait())
+                    .await
+                    .unwrap();
+                assert_eq!(asr_calls.load(Ordering::SeqCst), 0);
+                assert!(!workers.has_active_work());
+                assert!(workers.reserve(1).is_some());
+                assert!(receive.try_recv().is_err());
+            }
+        }
     }
 }

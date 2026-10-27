@@ -1637,6 +1637,13 @@ mod runtime_tests {
     struct StartupProbeEngineLoader;
 
     impl VoiceEngineLoader for StartupProbeEngineLoader {
+        fn prepare_vad(
+            &self,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> std::result::Result<(), VoiceTranscriptionError> {
+            Ok(()) // Deterministic lifecycle fixture; no native model operations.
+        }
+
         fn load(
             &self,
             _entry: &VoiceModelCatalogEntry,
