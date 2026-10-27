@@ -2,6 +2,7 @@
 //! immutable actor facts and the task revision/trigger/next run number; mutable
 //! facts are compared again inside the serialized writer before any projection.
 use crate::repositories::{task, task_actor_contract, task_agent_spec, task_run, task_trigger};
+use crate::task_events::materialize_task_events;
 use crate::{
     AppendedTaskEvent, CrudStore, task_agent_spec_from_db_model, task_from_db_model,
     task_trigger_from_db_model,
@@ -180,7 +181,7 @@ impl CrudStore {
                         .commit()
                         .await
                         .context("failed to commit webhook admission")?;
-                    Ok(value)
+                    Ok(value.map(materialize_task_events))
                 }
                 Err(error) => {
                     let _ = transaction.rollback().await;

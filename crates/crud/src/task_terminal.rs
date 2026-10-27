@@ -8,6 +8,7 @@ use crate::repositories::{
     task as task_repository, task_actor_contract, task_agent_spec, task_delivery, task_event,
     task_run, task_run_execution, task_trigger, task_write_lock,
 };
+use crate::task_events::{DeferredAppendedTaskEvent, materialize_task_events};
 use crate::util::unix_to_datetime;
 use crate::{
     AppendedTaskEvent, CrudStore, load_agent_execution_resource_state,
@@ -118,6 +119,15 @@ pub enum TaskTerminalCommitStatus {
 pub struct TaskTerminalCommitOutcome {
     pub status: TaskTerminalCommitStatus,
     pub events: Vec<AppendedTaskEvent>,
+    pub completed_at: i64,
+    pub delivery_id: Option<String>,
+    pub retry_scheduled: bool,
+}
+
+#[derive(Debug)]
+struct DeferredTaskTerminalCommitOutcome {
+    pub status: TaskTerminalCommitStatus,
+    pub events: Vec<DeferredAppendedTaskEvent>,
     pub completed_at: i64,
     pub delivery_id: Option<String>,
     pub retry_scheduled: bool,
@@ -434,7 +444,13 @@ impl CrudStore {
         match outcome {
             Ok(outcome) => {
                 tx.commit().await?;
-                Ok(outcome)
+                Ok(TaskTerminalCommitOutcome {
+                    status: outcome.status,
+                    events: materialize_task_events(outcome.events),
+                    completed_at: outcome.completed_at,
+                    delivery_id: outcome.delivery_id,
+                    retry_scheduled: outcome.retry_scheduled,
+                })
             }
             Err(error) => {
                 let _ = tx.rollback().await;
@@ -622,7 +638,7 @@ impl CrudStore {
         &self,
         db: &C,
         mut prepared: PreparedTaskTerminalTransition,
-    ) -> Result<(Vec<AppendedTaskEvent>, Option<String>)> {
+    ) -> Result<(Vec<DeferredAppendedTaskEvent>, Option<String>)> {
         let current =
             load_terminal_state(db, &prepared.state.task.id, &prepared.state.run.id).await?;
         validate_terminal_policy(&prepared.state, &current)?;
@@ -690,10 +706,12 @@ impl CrudStore {
                 events = self
                     .append_task_events_in_connection(db, delivery_events, at)
                     .await?;
-                events.iter().find_map(|event| match &event.payload {
-                    TaskEventPayload::DeliveryQueued { delivery } => Some(delivery.id.clone()),
-                    _ => None,
-                })
+                events
+                    .iter()
+                    .find_map(|event| match event.payload.as_ref() {
+                        TaskEventPayload::DeliveryQueued { delivery } => Some(delivery.id.clone()),
+                        _ => None,
+                    })
             }
             (None, None) => None,
             _ => return conflict("different stopped retry delivery plan"),
@@ -707,7 +725,7 @@ impl CrudStore {
         &self,
         db: &C,
         mut prepared: PreparedTaskTerminalTransition,
-    ) -> Result<TaskTerminalCommitOutcome> {
+    ) -> Result<DeferredTaskTerminalCommitOutcome> {
         // These exact, bounded reads happen BEFORE RunCompleted/Failed/etc.
         // Serialization, random identity allocation and retry calculation have
         // already finished. No provider work or notification runs in this scope.
@@ -743,7 +761,7 @@ impl CrudStore {
             let (events, delivery_id) = self
                 .settle_finished_retry_in_connection(db, prepared)
                 .await?;
-            return Ok(TaskTerminalCommitOutcome {
+            return Ok(DeferredTaskTerminalCommitOutcome {
                 status: TaskTerminalCommitStatus::Applied,
                 events,
                 completed_at,
@@ -826,7 +844,7 @@ impl CrudStore {
                 self.finalize_task_terminal_in_connection(db, &prepared, completed_at)
                     .await?;
             }
-            return Ok(TaskTerminalCommitOutcome {
+            return Ok(DeferredTaskTerminalCommitOutcome {
                 status: TaskTerminalCommitStatus::Replayed,
                 events: Vec::new(),
                 completed_at,
@@ -851,7 +869,7 @@ impl CrudStore {
             let events = self
                 .append_task_events_in_connection(db, events, prepared.at)
                 .await?;
-            return Ok(TaskTerminalCommitOutcome {
+            return Ok(DeferredTaskTerminalCommitOutcome {
                 status: TaskTerminalCommitStatus::TaskAlreadyTerminal,
                 events,
                 completed_at: prepared.at,
@@ -910,7 +928,7 @@ impl CrudStore {
             self.finalize_task_terminal_in_connection(db, &prepared, prepared.at)
                 .await?;
         }
-        Ok(TaskTerminalCommitOutcome {
+        Ok(DeferredTaskTerminalCommitOutcome {
             status: TaskTerminalCommitStatus::Applied,
             events,
             completed_at: prepared.at,

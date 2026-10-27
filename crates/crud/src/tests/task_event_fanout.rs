@@ -169,15 +169,19 @@ async fn compressed_duplicate_append_preserves_winner_reservation_and_later_inse
     .unwrap()
     .unwrap();
     assert_eq!(header.raw, 0, "fixture must actually be compressed");
-    let event = store
-        .append_task_event(payload.clone(), task.created_at + 1)
+    // Both persisted replays share proof payloads during writer admission.
+    let replays = store
+        .append_task_events(vec![payload.clone(), payload.clone()], task.created_at + 1)
         .await
         .unwrap();
-    assert!(!event.append_status.is_inserted());
-    assert_eq!(event.id, original.id);
-    assert_eq!(event.sequence, original.sequence);
-    assert_eq!(event.created_at, original.created_at);
-    assert_eq!(event.payload, payload);
+    assert_eq!(replays.len(), 2);
+    for event in replays {
+        assert!(!event.append_status.is_inserted());
+        assert_eq!(event.id, original.id);
+        assert_eq!(event.sequence, original.sequence);
+        assert_eq!(event.created_at, original.created_at);
+        assert_eq!(event.payload, payload);
+    }
     assert_eq!(row(&store, &task.id).await.unwrap(), before);
 
     let later_message = "new event after completed pass 界🙂".repeat(4096);
@@ -229,7 +233,7 @@ async fn atomic_cancelled_replays_keep_first_uncommitted_payload_and_sequence() 
     let before = row(&store, &task.id).await.unwrap();
     let original = TaskEventPayload::TaskCancelled {
         task_id: task.id.clone(),
-        reason: Some("first cancellation".into()),
+        reason: Some("first cancellation 界🙂\n".repeat(16384)),
         completed_at: task.created_at + 1,
     };
     let retry = TaskEventPayload::TaskCancelled {
@@ -237,20 +241,27 @@ async fn atomic_cancelled_replays_keep_first_uncommitted_payload_and_sequence() 
         reason: Some("replayed cancellation".into()),
         completed_at: task.created_at + 2,
     };
-    // Neither cancellation exists during reader preflight. The second append
-    // must accept the first uncommitted winner without replaying the batch.
+    // No cancellation exists during reader preflight. Three equivalent inputs
+    // exercise a shared large candidate, retaining the first semantic winner.
     let events = store
-        .append_task_events(vec![original.clone(), retry], task.created_at + 2)
+        .append_task_events(
+            vec![original.clone(), retry.clone(), retry],
+            task.created_at + 2,
+        )
         .await
         .unwrap();
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     assert!(events[0].append_status.is_inserted());
     assert!(!events[1].append_status.is_inserted());
+    assert!(!events[2].append_status.is_inserted());
     assert_eq!(events[0].id, events[1].id);
+    assert_eq!(events[0].id, events[2].id);
     assert_eq!(events[0].sequence, before.newest_sequence + 1);
     assert_eq!(events[1].sequence, events[0].sequence);
+    assert_eq!(events[2].sequence, events[0].sequence);
     assert_eq!(events[0].payload, original);
     assert_eq!(events[1].payload, original);
+    assert_eq!(events[2].payload, original);
     let pending = row(&store, &task.id).await.unwrap();
     assert_eq!(pending.generation, before.generation + 1);
     assert_eq!(pending.first_sequence, before.first_sequence);

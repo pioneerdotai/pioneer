@@ -14,7 +14,9 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
+use crate::task_events::{
+    AppendedTaskEvent, DeferredAppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload,
+};
 
 const DB_ID_LEN: usize = 21;
 
@@ -372,14 +374,16 @@ pub async fn append_event(
     let mut prepared = PreparedTaskEvent::prepare(payload.clone())?;
     prepared.idempotency_key = idempotency_key.map(str::to_owned);
     let prepared = prepared.preflight_idempotency(db).await?;
-    append_prepared_event(db, prepared, created_at).await
+    Ok(append_prepared_event(db, prepared, created_at)
+        .await?
+        .into_owned())
 }
 
-pub async fn append_prepared_event<C: ConnectionTrait>(
+pub(crate) async fn append_prepared_event<C: ConnectionTrait>(
     db: &C,
     prepared: PreparedTaskEvent,
     created_at: DateTimeWithTimeZone,
-) -> Result<AppendedTaskEvent> {
+) -> Result<DeferredAppendedTaskEvent> {
     append_prepared_event_with_batch(
         db,
         prepared,
@@ -394,7 +398,7 @@ pub(crate) async fn append_prepared_event_with_batch<C: ConnectionTrait>(
     mut prepared: PreparedTaskEvent,
     created_at: DateTimeWithTimeZone,
     batch: &mut TaskEventBatchIdentities,
-) -> Result<AppendedTaskEvent> {
+) -> Result<DeferredAppendedTaskEvent> {
     // Keep database-dependent key selection sequential: event N sees event N-1.
     if prepared.idempotency_key == prepared.payload.idempotency_key() {
         prepared.idempotency_key = terminal_idempotency_key(db, &prepared.payload).await?;
@@ -421,7 +425,7 @@ async fn append_prepared_event_inner<C: ConnectionTrait>(
     mut prepared: PreparedTaskEvent,
     created_at: DateTimeWithTimeZone,
     batch: &TaskEventBatchIdentities,
-) -> Result<AppendedTaskEvent> {
+) -> Result<DeferredAppendedTaskEvent> {
     if let Some(idempotency_key) = prepared.idempotency_key.as_deref()
         && let Some(existing) =
             find_event_by_idempotency_key(db, &prepared.task_id, idempotency_key).await?
@@ -501,7 +505,7 @@ async fn append_prepared_event_inner<C: ConnectionTrait>(
         return Err(error).context("failed to append task event");
     }
 
-    Ok(AppendedTaskEvent {
+    Ok(DeferredAppendedTaskEvent {
         id,
         task_id,
         run_id,
@@ -510,7 +514,7 @@ async fn append_prepared_event_inner<C: ConnectionTrait>(
         sequence,
         event_type,
         idempotency_key,
-        payload,
+        payload: Arc::new(payload),
         workspace_id: None,
         root_task_id: None,
         parent_task_id: None,
@@ -561,7 +565,7 @@ fn existing_event_outcome_after_preflight(
     model: task_event::Model,
     preflight: Option<SemanticallyMatchingExistingTaskEvent>,
     idempotency_key: &str,
-) -> Result<AppendedTaskEvent> {
+) -> Result<DeferredAppendedTaskEvent> {
     let Some(preflight) = preflight else {
         // The metadata-only writer never parses an unexpected raw/legacy body.
         return Err(TaskEventIdempotencyPreflightRace {
@@ -576,20 +580,18 @@ fn existing_event_outcome_after_preflight(
     );
     Ok(appended_task_event_from_known_payload(
         model,
-        // Unique single-event preflight moves the owned value without a copy.
-        // Shared batch proofs materialize only the selected returned winner;
-        // no parsing, decompression or N-squared preparation occurs here.
-        Arc::unwrap_or_clone(preflight.payload),
+        // The caller materializes this winner only after releasing its writer.
+        preflight.payload,
         TaskEventAppendStatus::AlreadyExists,
     ))
 }
 
 fn appended_task_event_from_known_payload(
     model: task_event::Model,
-    payload: TaskEventPayload,
+    payload: Arc<TaskEventPayload>,
     append_status: TaskEventAppendStatus,
-) -> AppendedTaskEvent {
-    AppendedTaskEvent {
+) -> DeferredAppendedTaskEvent {
+    DeferredAppendedTaskEvent {
         id: model.id,
         task_id: model.task_id,
         run_id: model.run_id,

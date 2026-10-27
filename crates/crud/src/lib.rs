@@ -1670,6 +1670,7 @@ fn terminal_turn_execution_status_for_event(
     }
 }
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
+use crate::task_events::{DeferredAppendedTaskEvent, materialize_task_events};
 use crate::task_projector::TaskProjector;
 pub use crate::timeline_projection::{
     ProjectionPlacement, ProjectionVisibility, TurnItemProjectionClassification,
@@ -16408,7 +16409,8 @@ impl CrudStore {
         for row in rows {
             let mut event =
                 task_event::appended_task_event_from_model(row, TaskEventAppendStatus::Inserted)?;
-            hydrate_task_event_metadata(&self.connection, &mut event).await?;
+            (event.workspace_id, event.root_task_id, event.parent_task_id) =
+                load_task_event_metadata(&self.connection, &event.task_id).await?;
             events.push(event);
         }
 
@@ -18250,7 +18252,7 @@ impl CrudStore {
                 if let Some((run, _)) = run.as_mut() {
                     run.trigger_input = trigger_input;
                 }
-                Ok(run)
+                Ok(run.map(|(run, event)| (run, event.into_owned())))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -18354,20 +18356,27 @@ impl CrudStore {
             }
         }
 
-        if let Err(error) = hydrate_task_event_metadata(&transaction, &mut appended_event)
+        (
+            appended_event.workspace_id,
+            appended_event.root_task_id,
+            appended_event.parent_task_id,
+        ) = match load_task_event_metadata(&transaction, &appended_event.task_id)
             .await
             .context("failed to hydrate task run started event metadata")
         {
-            let _ = transaction.rollback().await;
-            return Err(error);
-        }
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
 
         transaction
             .commit()
             .await
             .context("failed to commit task run started transaction")?;
 
-        Ok(Some(appended_event))
+        Ok(Some(appended_event.into_owned()))
     }
 
     pub async fn list_task_runs_by_status(
@@ -32785,6 +32794,7 @@ impl CrudStore {
 
         appended_events
             .pop()
+            .map(DeferredAppendedTaskEvent::into_owned)
             .context("single Task event materialization returned no event")
     }
 
@@ -32821,7 +32831,7 @@ impl CrudStore {
                 .commit()
                 .await
                 .context("failed to commit task event batch materialization transaction")?;
-            appended_events.extend(chunk_events);
+            appended_events.extend(materialize_task_events(chunk_events));
         }
 
         Ok(appended_events)
@@ -32853,7 +32863,7 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit Task action materialization transaction")?;
-                Ok(appended)
+                Ok(materialize_task_events(appended))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -32977,7 +32987,7 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit Task creation admission transaction")?;
-                Ok(appended_events)
+                Ok(materialize_task_events(appended_events))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -33013,7 +33023,7 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit blocked Task readmission transaction")?;
-                Ok(appended_events)
+                Ok(materialize_task_events(appended_events))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -33050,7 +33060,7 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit Task action readmission transaction")?;
-                Ok(appended)
+                Ok(materialize_task_events(appended))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -33161,7 +33171,7 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit atomic Task creation transaction")?;
-                Ok(appended_events)
+                Ok(materialize_task_events(appended_events))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -33325,13 +33335,13 @@ impl CrudStore {
                 Vec::new()
             };
 
-            Ok(Some(DueTaskTriggerReconciliation {
+            Ok(Some((
                 task_id,
-                trigger_id: trigger.id,
+                trigger.id,
                 task_status,
                 trigger_status,
                 appended_events,
-            }))
+            )))
         }
         .await;
 
@@ -33341,7 +33351,17 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit due Task trigger reconciliation transaction")?;
-                Ok(outcome)
+                Ok(outcome.map(
+                    |(task_id, trigger_id, task_status, trigger_status, events)| {
+                        DueTaskTriggerReconciliation {
+                            task_id,
+                            trigger_id,
+                            task_status,
+                            trigger_status,
+                            appended_events: materialize_task_events(events),
+                        }
+                    },
+                ))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -33431,7 +33451,7 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit due task trigger materialization transaction")?;
-                Ok(appended_events)
+                Ok(materialize_task_events(appended_events))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -33696,7 +33716,7 @@ impl CrudStore {
         db: &C,
         events: Vec<task_event::PreparedTaskEvent>,
         event_timestamp_secs: i64,
-    ) -> Result<Vec<AppendedTaskEvent>> {
+    ) -> Result<Vec<DeferredAppendedTaskEvent>> {
         self.append_task_events_in_connection_with_delivery_policy(
             db,
             events,
@@ -33711,7 +33731,7 @@ impl CrudStore {
         db: &C,
         events: Vec<task_event::PreparedTaskEvent>,
         at: i64,
-    ) -> Result<Vec<AppendedTaskEvent>> {
+    ) -> Result<Vec<DeferredAppendedTaskEvent>> {
         self.append_task_events_in_connection_with_delivery_policy(db, events, at, true)
             .await
     }
@@ -33722,7 +33742,7 @@ impl CrudStore {
         events: Vec<task_event::PreparedTaskEvent>,
         event_timestamp_secs: i64,
         delivery_cancellation: bool,
-    ) -> Result<Vec<AppendedTaskEvent>> {
+    ) -> Result<Vec<DeferredAppendedTaskEvent>> {
         let created_at = unix_to_datetime(event_timestamp_secs);
         let mut appended_events = Vec::with_capacity(events.len());
         let mut batch_run_turns = HashMap::<String, PreparedLegacyTaskRunTurn>::new();
@@ -33816,7 +33836,7 @@ impl CrudStore {
                     .await
                     .context("failed to project task event to read models")?;
                 if matches!(
-                    &appended_event.payload,
+                    appended_event.payload.as_ref(),
                     TaskEventPayload::TaskCompleted { .. }
                         | TaskEventPayload::TaskFailed { .. }
                         | TaskEventPayload::TaskBlocked { .. }
@@ -33842,7 +33862,11 @@ impl CrudStore {
                 .context("failed to initialize task event fanout cursor")?;
             }
 
-            hydrate_task_event_metadata(db, &mut appended_event)
+            (
+                appended_event.workspace_id,
+                appended_event.root_task_id,
+                appended_event.parent_task_id,
+            ) = load_task_event_metadata(db, &appended_event.task_id)
                 .await
                 .context("failed to hydrate task event metadata")?;
             appended_events.push(appended_event);
@@ -34381,16 +34405,18 @@ async fn task_finalization_revision_for_connection<C: ConnectionTrait>(
     })
 }
 
-async fn hydrate_task_event_metadata<C: ConnectionTrait>(
+async fn load_task_event_metadata<C: ConnectionTrait>(
     db: &C,
-    event: &mut AppendedTaskEvent,
-) -> Result<()> {
-    if let Some(task) = task_repository::find_task_by_id(db, event.task_id.as_str()).await? {
-        event.workspace_id = Some(task.workspace_id);
-        event.root_task_id = task.root_task_id;
-        event.parent_task_id = task.parent_task_id;
-    }
-    Ok(())
+    task_id: &str,
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    Ok(match task_repository::find_task_by_id(db, task_id).await? {
+        Some(task) => (
+            Some(task.workspace_id),
+            task.root_task_id,
+            task.parent_task_id,
+        ),
+        None => (None, None, None),
+    })
 }
 
 fn task_trigger_from_db_model(model: pioneer_entity::task_trigger::Model) -> Result<TaskTrigger> {
