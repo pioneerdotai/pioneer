@@ -8,6 +8,49 @@ use pioneer_client::{
 };
 
 #[test]
+fn voice_mode_intent_json_dispatch_owns_the_shared_voice_page() {
+    use pioneer_client::settings::runtime::{SettingsPage, SettingsPagePublication};
+    let core = pioneer_client::catalog_test_support::settings_model_picker_client();
+    let runtime = ClientFfiRuntime {
+        core: core.clone(),
+        config: Default::default(),
+        client_subscriptions: Default::default(),
+        observed_scopes: Default::default(),
+        diagnostics: Default::default(),
+        avatar_cache: Default::default(),
+    };
+    runtime.initialize(r#"{"platform":"ios"}"#).unwrap();
+    runtime
+        .client_intent_dispatch(
+            r#"{
+        "schema_version": 1,
+        "intent": {
+            "kind": "settings",
+            "intent": { "kind": "voice_transcribe_while_recording", "enabled": false }
+        }
+    }"#,
+        )
+        .expect("existing dispatch accepts the shared mode intent");
+    let voice = core
+        .snapshot(&ClientScope::SettingsPage {
+            page: SettingsPage::Voice,
+        })
+        .unwrap()
+        .typed::<SettingsPagePublication>()
+        .unwrap();
+    assert!(voice.payload().pending);
+    let general = core
+        .snapshot(&ClientScope::SettingsPage {
+            page: SettingsPage::General,
+        })
+        .unwrap()
+        .typed::<SettingsPagePublication>()
+        .unwrap();
+    assert!(!general.payload().pending);
+    core.shutdown();
+}
+
+#[test]
 fn independent_direct_and_ffi_profile_replay_preserves_owner_and_page_isolation() {
     for platform in ["ios", "android"] {
         let direct = pioneer_client::catalog_test_support::settings_model_picker_client();

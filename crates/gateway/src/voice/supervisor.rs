@@ -536,10 +536,16 @@ impl VoiceInputSupervisor {
         let startup_transcribe = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::VoiceTranscribe,
         );
-        let result = catch_unwind(AssertUnwindSafe(|| engine.transcribe_hypothesis(buffer)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            engine.transcribe_hypothesis(buffer, session.map(|(_, token)| token))
+        }));
         drop(startup_transcribe);
         match result {
-            Ok(Ok(transcript)) => Ok(transcript),
+            Ok(Ok(Some(transcript))) => Ok(transcript),
+            Ok(Ok(None)) => Err(super::transcription::transcription_error(
+                super::transcription::VoiceTranscriptionErrorKind::ModelUnavailable,
+                "voice session was cancelled before native inference",
+            )),
             Ok(Err(error)) => {
                 let message = bounded_voice_supervisor_error(error.message.clone());
                 inner.loaded_engine = None;
@@ -807,6 +813,10 @@ impl VoiceInputSupervisorState {
             provider: self.desired.provider,
             model: self.desired.model.clone(),
             runtime: self.runtime.clone(),
+            // Session policy comes from persisted settings at admission; this
+            // readiness owner inherits the protocol default until the gateway
+            // overlays saved policy on its published snapshot.
+            ..GatewayVoiceInputSettings::default()
         }
     }
 
@@ -2040,6 +2050,27 @@ mod tests {
                 .text,
             "accepted"
         );
+
+        // The parent holds the engine mutex when cancelling. The worker signals
+        // before method entry, so it may not yet be waiting for that mutex.
+        // Both possible orderings must reject the request and retain the engine.
+        let token = CancellationToken::new();
+        std::thread::scope(|scope| {
+            let guard = supervisor.lock_inner();
+            let (waiting, reached) = std::sync::mpsc::channel();
+            let worker_token = token.clone();
+            let supervisor = &supervisor;
+            let buffer = &buffer;
+            let worker = scope.spawn(move || {
+                waiting.send(()).unwrap();
+                supervisor.transcribe_for_session(buffer, applied.generation, &worker_token)
+            });
+            reached.recv().unwrap();
+            token.cancel();
+            drop(guard);
+            assert!(worker.join().unwrap().is_err());
+        });
+        assert!(supervisor.has_loaded_engine());
     }
 
     #[test]

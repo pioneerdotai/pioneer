@@ -82,8 +82,15 @@ impl LoadedVoiceEngine {
     pub(crate) fn transcribe_hypothesis(
         &mut self,
         buffer: &PreparedSpeechBuffer,
-    ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        cancellation: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Option<VoiceSpeechHypothesis>, VoiceTranscriptionError> {
         let input = PreparedVoiceEngineInput::from_buffer(buffer)?;
+        // Preparing a full buffered recording can take time. Recheck after that
+        // allocation/validation, directly before entering the selected adapter.
+        // None is cancellation, distinct from an actual engine failure.
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            return Ok(None);
+        }
         match self {
             Self::Whisper(model) => transcribe_whisper(model, &input),
             Self::Parakeet(model) => transcribe_parakeet(model, &input),
@@ -98,6 +105,7 @@ impl LoadedVoiceEngine {
             #[cfg(test)]
             Self::TestHypothesis(hypothesis) => Ok(hypothesis.clone()),
         }
+        .map(Some)
     }
 
     #[cfg(test)]
@@ -692,6 +700,38 @@ mod tests {
     use super::super::vad::VoiceSpeechSegment;
     use super::*;
     use pioneer_config::AppConfig;
+
+    #[test]
+    fn pre_cancelled_call_returns_none_and_engine_remains_usable() {
+        let mut engine = LoadedVoiceEngine::test_stub_with_transcript("accepted");
+        let buffer = PreparedSpeechBuffer {
+            sample_rate_hz: 16000,
+            total_samples: 960,
+            segments: vec![VoiceSpeechSegment {
+                start_sample: 0,
+                end_sample: 960,
+                samples: vec![0.5; 960],
+            }],
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+        // Cancellation precedes the call; this does not exercise cancellation
+        // during input preparation or any supervisor state transition.
+        token.cancel();
+        assert!(
+            engine
+                .transcribe_hypothesis(&buffer, Some(&token))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            engine
+                .transcribe_hypothesis(&buffer, None)
+                .unwrap()
+                .unwrap()
+                .text,
+            "accepted"
+        );
+    }
 
     #[test]
     fn auxiliary_asr_params_match_pinned_sdk_buffered_transcription_defaults() {

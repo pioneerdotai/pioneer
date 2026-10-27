@@ -1206,6 +1206,7 @@ mod tests {
         let expected = GatewayVoiceInputStatusChangedNotification {
             settings: GatewayVoiceInputSettings {
                 enabled: true,
+                transcribe_while_recording: false,
                 provider: Some(GatewayVoiceInputProvider::Local),
                 model: Some("parakeet-tdt-0.6b-v3".to_owned()),
                 runtime: GatewayVoiceInputRuntimeSnapshot {

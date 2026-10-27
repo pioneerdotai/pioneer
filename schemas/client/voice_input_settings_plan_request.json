@@ -104,6 +104,10 @@
             "effective_enabled": false,
             "phase": "disabled"
           }
+        },
+        "transcribe_while_recording": {
+          "type": "boolean",
+          "default": true
         }
       }
     },
@@ -131,6 +135,22 @@
           },
           "required": [
             "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "const": "set_transcribe_while_recording"
+            }
+          },
+          "required": [
+            "kind",
+            "enabled"
           ]
         },
         {
