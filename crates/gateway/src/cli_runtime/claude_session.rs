@@ -4140,6 +4140,7 @@ pub(crate) mod tests {
                 thread_id: "t".into(),
                 turn_id: "u".into(),
                 recovery: None,
+                codex_retry_attempt_id: None,
             },
             &RuntimeEvent::ItemCompleted(item.clone()),
         );
@@ -4175,6 +4176,7 @@ pub(crate) mod tests {
             thread_id: "t".into(),
             turn_id: "u".into(),
             recovery: None,
+            codex_retry_attempt_id: None,
         };
         for (success, text) in [(true, "ok\n"), (false, "shell failed\n")] {
             let e = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
@@ -4925,6 +4927,7 @@ done
                     thread_id: "thread".into(),
                     turn_id: "turn".into(),
                     recovery: None,
+                    codex_retry_attempt_id: None,
                 },
                 &event,
             );
@@ -5014,6 +5017,7 @@ done
             thread_id: "thread".to_owned(),
             turn_id: "turn".to_owned(),
             recovery: None,
+            codex_retry_attempt_id: None,
         };
         let projected_start = project_cli_runtime_event(&projector_context, &started[0]);
         let projected_terminal = project_cli_runtime_event(&projector_context, &completed[0]);

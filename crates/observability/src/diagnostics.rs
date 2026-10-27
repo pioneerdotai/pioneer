@@ -178,7 +178,7 @@ impl DiagnosticOwner {
      Ok((mut stream,peer))=>{if !peer.ip().is_loopback(){continue;}let result=read_request(&mut stream, &server_stop);match result{
       Ok(request)=>{match authorize(&server_descriptor,&request){Ok(epoch)=>{
        if matches!(request.command,Command::Snapshot){let _=respond(&mut stream,&server_stop,snapshot(&server_descriptor,module.clone(),&stack_logging,epoch).and_then(|s|Ok(serde_json::to_value(s)?)));}
-       else if matches!(request.command,Command::Cancel){let active=control.active.load(Ordering::Acquire);if active{control.cancelled.store(true,Ordering::Release);}let _=respond(&mut stream,&server_stop,Ok(serde_json::json!({"cancel_requested":active,"scope":"only owned native profiler/bundle job; target application is not signalled"})));}
+       else if matches!(request.command,Command::Cancel){let active=control.active.load(Ordering::Acquire);if active{control.cancelled.store(true,Ordering::Release);}let _=respond(&mut stream,&server_stop,Ok(serde_json::json!({"cancel_requested":active,"scope":"only owned SQL/native capture/bundle job; target application is not signalled"})));}
        else if control.active.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err(){let _=respond(&mut stream,&server_stop,Err(anyhow::anyhow!("capture_busy")));}
        else {control.cancelled.store(false,Ordering::Release);match tx.try_send((stream,request)){Ok(())=>{},Err(error)=>{control.active.store(false,Ordering::Release);let (mut stream,_)=match error {std::sync::mpsc::TrySendError::Full(value)|std::sync::mpsc::TrySendError::Disconnected(value)=>value};let _=respond(&mut stream,&server_stop,Err(anyhow::anyhow!("capture_busy")));}}}
       },Err(error)=>{let _=respond(&mut stream,&server_stop,Err(error));}}}
@@ -438,25 +438,28 @@ fn read_descriptor(path: &Path) -> Result<TargetDescriptor> {
     let bytes = storage::read_bounded(path, 32 * 1024)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
+fn reply_timeout(command: &Command) -> Duration {
+    Duration::from_secs(match command {
+        Command::Snapshot | Command::Cancel => 2,
+        // SQL-only: at most 60 s collection, then existing bounded sidecar,
+        // inventory/manifest and response work. No native finish allowance.
+        Command::Capture(config) if config.mode == CaptureMode::SqlCpu => 120,
+        Command::Capture(config)
+            if cfg!(target_os = "macos")
+                && matches!(config.mode, CaptureMode::Cpu | CaptureMode::Allocations) =>
+        {
+            60 + capture::XCTRACE_FINISH_ALLOWANCE_SECONDS + 30
+        }
+        _ => 120,
+    })
+}
 fn request(
     descriptor: &TargetDescriptor,
     epoch: Option<u64>,
     command: Command,
 ) -> Result<serde_json::Value> {
     let mut stream = TcpStream::connect_timeout(&descriptor.endpoint, Duration::from_secs(2))?;
-    let reply_seconds = match &command {
-        Command::Snapshot | Command::Cancel => 2,
-        Command::Capture(config)
-            if cfg!(target_os = "macos")
-                && matches!(config.mode, CaptureMode::Cpu | CaptureMode::Allocations) =>
-        {
-            // Up to 60 s recording, the native finish allowance, and 30 s for
-            // version/module checks, forced-stop grace, inventory and reply.
-            60 + capture::XCTRACE_FINISH_ALLOWANCE_SECONDS + 30
-        }
-        _ => 120,
-    };
-    stream.set_read_timeout(Some(Duration::from_secs(reply_seconds)))?;
+    stream.set_read_timeout(Some(reply_timeout(&command)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut bytes = serde_json::to_vec(&Request {
         token: descriptor.token.clone(),
@@ -640,7 +643,7 @@ fn selected_trace_ids(target: &TargetSnapshot) -> Vec<String> {
     result.into_iter().collect()
 }
 pub fn capabilities() -> serde_json::Value {
-    serde_json::json!({"schema_version":1,"cpu":{"macos":"xctrace Time Profiler, developer tools + task attach permission; signed package may deny attach; template-controlled frequency, lost samples unknown","linux":"perf record cpu-clock, strict 19..199 Hz, dwarf 16KiB, perf_event permissions; kernel/tool feature validation at invocation","windows":"not implemented; resource snapshots and live bundles supported"},"memory":{"macos":{"allocation_churn":"xctrace Allocations from attach onward; no earlier history","allocation_history":"malloc_history -allEvents; explicit bounded launch-memory with NoCompact only","live_allocations":"malloc_history -allBySize; compare captures; allocation stack is not retainer","vm":"vmmap -summary native/mmap/VM; no complete GPU or Rust retain graph"},"linux":"pmap -x VM; allocation history/live heap unavailable without allocator/tool instrumentation, not inferred from RSS","windows":"native memory profile adapter unavailable"},"bounds":{"active_work":512,"queues":128,"queue_age_records_per_queue":0,"queue_oldest_source":"native owner head only; unverified channel order unavailable","request_total_deadline_ms":500,"response_total_deadline_ms":2000,"io_stop_check_slice_ms":50,"journal_records":4096,"journal_retained_bytes":2097152,"journal_age_ms":120000,"profile_retained_bytes":134217728,"store_count":16,"store_bytes":536870912,"store_age_days":7,"capture_concurrency":1,"capture_seconds_max":60},"uncertainty":"native-tool output volume polled each 100ms; temporary overshoot possible; no measured overhead claim"})
+    serde_json::json!({"schema_version":1,"sql_cpu":{"mode":"sql_cpu","target":"owner parent Gateway only; no child","duration_seconds":"1..60, default 10","frequency":"not applicable","native_profile":"not_requested","scope":"observed instrumented SQL command CPU; full local sql-cpu.json and short manifest summary"},"cpu":{"macos":"xctrace Time Profiler, developer tools + task attach permission; signed package may deny attach; template-controlled frequency, lost samples unknown","linux":"perf record cpu-clock, strict 19..199 Hz, dwarf 16KiB, perf_event permissions; kernel/tool feature validation at invocation","windows":"not implemented; resource snapshots and live bundles supported"},"memory":{"macos":{"allocation_churn":"xctrace Allocations from attach onward; no earlier history","allocation_history":"malloc_history -allEvents; explicit bounded launch-memory with NoCompact only","live_allocations":"malloc_history -allBySize; compare captures; allocation stack is not retainer","vm":"vmmap -summary native/mmap/VM; no complete GPU or Rust retain graph"},"linux":"pmap -x VM; allocation history/live heap unavailable without allocator/tool instrumentation, not inferred from RSS","windows":"native memory profile adapter unavailable"},"bounds":{"active_work":512,"queues":128,"queue_age_records_per_queue":0,"queue_oldest_source":"native owner head only; unverified channel order unavailable","request_total_deadline_ms":500,"response_total_deadline_ms":2000,"io_stop_check_slice_ms":50,"journal_records":4096,"journal_retained_bytes":2097152,"journal_age_ms":120000,"profile_retained_bytes":134217728,"store_count":16,"store_bytes":536870912,"store_age_days":7,"capture_concurrency":1,"capture_seconds_max":60},"uncertainty":"native-tool output volume polled each 100ms; temporary overshoot possible; no measured overhead claim"})
 }
 
 /// Single lifecycle consumer called by Gateway and Desktop after runtime home
@@ -679,6 +682,88 @@ mod tests {
             module_status: "not_recorded".into(),
             module: None,
         }
+    }
+    #[test]
+    fn sql_capture_wire_dispatch_owner_gate_readers_and_reply_budget() {
+        let _telemetry = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
+        let _session = crate::query_cpu::tests::SERIAL.lock().unwrap();
+        let old = crate::telemetry_enabled();
+        crate::set_telemetry_enabled(true);
+        let temp = tempfile::tempdir().unwrap();
+        let mut owner = DiagnosticOwner::start(temp.path(), "gateway").unwrap();
+        let descriptor = read_descriptor(&owner.descriptor).unwrap();
+        let config = CaptureRequest {
+            mode: CaptureMode::SqlCpu,
+            seconds: 2,
+            frequency_hz: 0,
+            child_generation: None,
+        };
+        let wire = serde_json::to_value(Command::Capture(config.clone())).unwrap();
+        assert_eq!(wire["command"], "capture");
+        assert_eq!(wire["mode"], "sql_cpu");
+        assert_eq!(
+            reply_timeout(&Command::Capture(CaptureRequest {
+                seconds: 60,
+                ..config.clone()
+            })),
+            Duration::from_secs(120)
+        );
+        // A rejected job releases the real owner gate, allowing the next request.
+        assert!(
+            capture_target(
+                &descriptor,
+                CaptureRequest {
+                    seconds: 0,
+                    ..config.clone()
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("duration")
+        );
+        let manifest = std::thread::scope(|scope| {
+            let client = scope.spawn(|| capture_target(&descriptor, config.clone()).unwrap());
+            crate::query_cpu::tests::wait_for_capture();
+            let busy = capture_target(&descriptor, config.clone()).unwrap_err();
+            assert!(busy.to_string().contains("capture_busy"));
+            crate::query_cpu::tests::capture_command(17, true);
+            client.join().unwrap()
+        });
+        assert_eq!(manifest.status, "completed");
+        assert_eq!(
+            manifest.sql_cpu.as_ref().unwrap()["aggregation"]["accounted"]["completed_calls"],
+            1
+        );
+        let root = temp.path().join("diagnostics");
+        let snapshot = inspect_target(&descriptor).unwrap();
+        let references = profile_references(&root, &snapshot).unwrap();
+        assert_eq!(references.len(), 1);
+        assert!(!references[0].profile_data_present);
+        assert_eq!(references[0].status, "completed");
+        let sidecar_path = root
+            .join(&manifest.local_reference)
+            .parent()
+            .unwrap()
+            .join("sql-cpu.json");
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &storage::read_bounded(&sidecar_path, storage::SQL_CPU_BYTES).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            sidecar["sql_cpu"]["groups"][0]["fingerprint"],
+            "0000000000000011"
+        );
+        assert_eq!(sidecar["native_profile_status"], "not_requested");
+        let bundle = bundle_target(&descriptor).unwrap();
+        assert!(
+            bundle["missing_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "no_existing_profile_in_this_run_and_epoch")
+        );
+        owner.shutdown();
+        crate::set_telemetry_enabled(old);
     }
     #[test]
     fn offline_bundle_distinguishes_failed_attempts_partial_profiles_and_epoch() {

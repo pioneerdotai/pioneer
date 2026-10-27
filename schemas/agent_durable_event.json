@@ -654,6 +654,25 @@
     {
       "type": "object",
       "properties": {
+        "cancellation_owner": {
+          "description": "Initial native Stop retains its durable completion owner until ACK.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          ]
+        },
         "kind": {
           "type": "string",
           "const": "turn_interrupted"

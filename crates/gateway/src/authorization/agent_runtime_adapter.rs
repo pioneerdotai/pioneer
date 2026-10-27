@@ -525,6 +525,32 @@ impl BoundAgentActionAdapter {
         &mut self,
         intent: &AgentActionIntent,
     ) -> Result<PreparedAgentAction, AgentToolAdapterError> {
+        self.prepare_with_placement(intent, false)
+    }
+
+    /// The destination shape is read by the server, never supplied by a tool
+    /// argument. A visible root is independent only through its exact route to
+    /// another capsule; routed internal threads remain ordinary children.
+    pub(crate) fn prepare_start_agent(
+        &mut self,
+        intent: &AgentActionIntent,
+        destination_is_visible_root: bool,
+    ) -> Result<PreparedAgentAction, AgentToolAdapterError> {
+        let independent_root = destination_is_visible_root
+            && matches!(intent, AgentActionIntent::StartAgent { .. })
+            && self.route_for_intent(intent)?.is_some_and(|route| {
+                !route.same_capsule
+                    && route.destination_thread_id == route.destination_capsule_id
+                    && route.destination_capsule_id != self.root.home_root_thread_id
+            });
+        self.prepare_with_placement(intent, independent_root)
+    }
+
+    fn prepare_with_placement(
+        &mut self,
+        intent: &AgentActionIntent,
+        independent_root: bool,
+    ) -> Result<PreparedAgentAction, AgentToolAdapterError> {
         let route = self.route_for_intent(intent)?.cloned();
         let same_capsule_thread_ids = self
             .same_capsule_targets
@@ -543,7 +569,12 @@ impl BoundAgentActionAdapter {
                 self.branch_key.clone(),
                 self.attempt_generation,
                 self.current_policy_generation,
-                self.depth.saturating_add(1),
+                if independent_root {
+                    0
+                } else {
+                    self.depth.saturating_add(1)
+                },
+                independent_root,
             )
             .map_err(AgentToolAdapterError::from)?;
         prepared.execution_grant_fingerprint = self.execution_grant_fingerprint.clone();
@@ -628,7 +659,12 @@ impl BoundAgentActionAdapter {
             start,
             &self.start_options,
             prepared.route.clone(),
-            self.depth.saturating_add(1),
+            if prepared.independent_root {
+                0
+            } else {
+                self.depth.saturating_add(1)
+            },
+            prepared.independent_root,
             branch_key,
             &self.policy,
             RoleDefinitionRegistry::new(),
@@ -768,6 +804,28 @@ impl BoundAgentActionAdapter {
             }
         };
         Ok(Some(intent))
+    }
+
+    pub(crate) fn restrict_thread_creation_options(
+        &self,
+        options: &mut AgentToolOptionsProjection,
+        private: bool,
+        workspace: bool,
+    ) {
+        options.thread_creation_options.retain(|option| {
+            (private
+                && option.id
+                    == thread_creation_option_id(
+                        &self.root,
+                        &AgentThreadAudienceTemplate::HomeCapsule,
+                    ))
+                || (workspace
+                    && option.id
+                        == thread_creation_option_id(
+                            &self.root,
+                            &AgentThreadAudienceTemplate::RootDelegation,
+                        ))
+        });
     }
 
     fn resolve_thread_creation_option(
@@ -1413,10 +1471,13 @@ fn populate_binding_options(
             label: "Approved routed destination".to_owned(),
         }));
     if capabilities.contains(&AgentToolCapability::ThreadCreate) {
-        let mut audiences = vec![(
-            AgentThreadAudienceTemplate::HomeCapsule,
-            "Current collaboration",
-        )];
+        let mut audiences = Vec::new();
+        if root.envelope.allows(ResourceAction::ThreadCreatePrivate) {
+            audiences.push((
+                AgentThreadAudienceTemplate::HomeCapsule,
+                "Current collaboration",
+            ));
+        }
         if root.envelope.allows(ResourceAction::ThreadCreateWorkspace) {
             audiences.push((
                 AgentThreadAudienceTemplate::RootDelegation,
@@ -1462,6 +1523,9 @@ fn task_agent_capabilities(envelope: &AgentSecurityEnvelope) -> BTreeSet<AgentTo
     .into_iter()
     .filter_map(|(capability, action)| envelope.allows(action).then_some(capability))
     .collect::<BTreeSet<_>>();
+    if envelope.allows(ResourceAction::ThreadCreateWorkspace) {
+        capabilities.insert(AgentToolCapability::ThreadCreate);
+    }
     if envelope.allows(ResourceAction::ChildStart)
         && envelope.allows(ResourceAction::AgentTurnStart)
     {

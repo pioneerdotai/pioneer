@@ -423,6 +423,10 @@ impl Session {
         ACTIVE.store(true, Ordering::Release);
         Some(Self { state })
     }
+    /// The capture owner uses the collector's original deadline, never a second window.
+    pub(crate) fn deadline(&self) -> Instant {
+        self.state.deadline
+    }
     pub fn finish(self) -> Snapshot {
         // seal is also called by opt-out/Drop: it only freezes the table. Copy
         // and rank here, on the existing diagnostic owner, outside its mutex.
@@ -1103,17 +1107,71 @@ pub(crate) mod aggregation_fixtures {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Barrier;
     use tracing_subscriber::{filter::filter_fn, layer::SubscriberExt};
 
     // Own the global capture slot only for these collector boundary tests.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    pub(crate) static SERIAL: Mutex<()> = Mutex::new(());
     fn dispatch() -> tracing::Dispatch {
         tracing::Dispatch::new(tracing_subscriber::registry().with(
             QueryCpuLayer.with_filter(filter_fn(|m| m.is_span() && target_enabled(m.target()))),
         ))
+    }
+
+    // Shared with diagnostics owner-path regressions. Real scope/callback and
+    // named SQLite-worker span boundaries; no SQL connections or fabricated totals.
+    pub(crate) fn capture_command(fingerprint: u64, measured: bool) {
+        capture_scope(Some(fingerprint), measured, None);
+    }
+    pub(crate) fn capture_control() {
+        capture_scope(None, false, Some("begin"));
+    }
+    fn capture_scope(fingerprint: Option<u64>, measured: bool, control: Option<&'static str>) {
+        let dispatch = dispatch();
+        tracing::dispatcher::with_default(&dispatch, || {
+            let trace = crate::DatabaseWorkloadTrace::start_at(
+                crate::DatabaseWorkload::TimelinePage,
+                crate::DatabaseOperationSite::TimelinePage,
+            );
+            let carrier = crate::work::capture().with_database(trace.context());
+            let _work = carrier.enter();
+            let scope = control.map_or_else(QueryScope::new, QueryScope::control);
+            if measured {
+                if let Some(span) = scope.span.clone() {
+                    let worker_dispatch = dispatch.clone();
+                    std::thread::Builder::new()
+                        .name("pioneer-sqlite-reader-capture-test".into())
+                        .spawn(move || {
+                            tracing::dispatcher::with_default(&worker_dispatch, || {
+                                let _entered = span.enter();
+                                std::hint::black_box(17_u64.wrapping_mul(23));
+                            })
+                        })
+                        .unwrap()
+                        .join()
+                        .unwrap();
+                }
+            }
+            {
+                let _entered = scope.enter();
+                record_fingerprint(fingerprint);
+            }
+            scope.finish(true);
+            drop(scope);
+            trace.finish_success();
+        });
+    }
+    pub(crate) fn wait_for_capture() -> Instant {
+        let timeout = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(session) = lock(slot()).as_ref().and_then(Weak::upgrade) {
+                return session.deadline;
+            }
+            assert!(Instant::now() < timeout, "capture Session did not start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn assert_balance(snapshot: &Snapshot) {

@@ -460,6 +460,17 @@ pub(super) async fn run_agent_loop(
     }
 
     while let Some(command) = command_rx.recv().await {
+        let command = match command {
+            AgentCommand::CancelTurn {
+                expected_run_id: Some(expected),
+                ack,
+                ..
+            } if active_turn_run_id != Some(expected) => {
+                let _ = ack.send(Err(super::AgentControlError::TurnMismatch));
+                continue;
+            }
+            command => command,
+        };
         // Retain the completed turn's Stop fence without owning background
         // preparation. Durable registration already happened before provider
         // execution and the Gateway worker owns all later work.
@@ -597,7 +608,9 @@ pub(super) async fn run_agent_loop(
                 last_turn_observation = None;
                 let task_recovery = None;
 
-                let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
+                let mut turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
+                turn_control.initial_cancellation_registration =
+                    turn_request.execution_window_index == 1;
                 active_turn_control = Some(turn_control.clone());
                 control_plane.activate(turn_id.clone(), run_id, turn_control.clone());
 
@@ -1144,6 +1157,9 @@ pub(super) async fn run_agent_loop(
             AgentCommand::CancelTurn {
                 turn_id,
                 reason,
+                expected_run_id: _,
+                completion_ack,
+                cancellation_owner,
                 ack,
             } => {
                 if let Some(outcome) = ack.completed() {
@@ -1170,11 +1186,13 @@ pub(super) async fn run_agent_loop(
                     control.cancel_all_attempts();
                 }
 
-                // The caller is acknowledging process-control admission, not
-                // waiting for a second terminal lifecycle publication. The
-                // Gateway has already committed Interrupted before issuing
-                // this command, while the actor must remain free to finish
-                // cooperative shutdown and its durable terminal obligations.
+                let durable_cancellation = active_turn_control
+                    .as_ref()
+                    .is_some_and(|control| control.has_durable_cancellation(&turn_id));
+                // ACK only process admission of the accepted control command.
+                // Both ordinary Task cancellation and generation-bound Gateway
+                // Stop leave durable publication with this actor. Only the
+                // separate completion receipt confirms canonical completion.
                 let _ = ack.send(Ok(()));
 
                 if let Some(task) = active_turn_task.take() {
@@ -1184,9 +1202,6 @@ pub(super) async fn run_agent_loop(
                 let runtime_snapshot = active_runtime_snapshot.clone();
                 let recovery = active_recovery.clone();
                 let reason_for_dispatch = reason.clone();
-                let durable_cancellation = active_turn_control
-                    .as_ref()
-                    .is_some_and(|control| control.has_durable_cancellation(&turn_id));
                 if !durable_cancellation {
                     // A direct caller may cancel during the initial registration
                     // ACK. Finish registration from the captured turn context;
@@ -1230,11 +1245,17 @@ pub(super) async fn run_agent_loop(
                                     .is_some_and(|r| r.execution_window_index == 1),
                         }
                     );
+                }
+                if !durable_cancellation || cancellation_owner.is_some() {
+                    // The actor keeps the existing durable publication obligation
+                    // after process ACK, through registration and canonical acceptance.
+                    // A generation-bound Stop carries the exact Gateway owner fence.
                     commit_terminal_or_stop!(AgentDurableEvent::TurnInterrupted {
                         thread_id: thread_id.clone(),
                         turn_id: turn_id.clone(),
                         reason,
                         recovery,
+                        cancellation_owner,
                     },);
                 }
                 record_turn_observation!(
@@ -1244,6 +1265,9 @@ pub(super) async fn run_agent_loop(
                         message: Some(reason_for_dispatch),
                     },
                 );
+                if let Some(completion_ack) = completion_ack {
+                    let _ = completion_ack.send(());
+                }
                 clear_active_turn_control!();
                 active_turn_request = None;
                 active_recovery = None;
@@ -1757,7 +1781,11 @@ fn spawn_turn_task(
             )
             .await
             {
-                LoopDurableCommitOutcome::Committed => {}
+                LoopDurableCommitOutcome::Committed => {
+                    turn_control
+                        .cancellation_context_registered
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
                 LoopDurableCommitOutcome::PermanentRejection { .. } => {
                     let _ = command_tx
                         .send(AgentCommand::DurableStartRejected {

@@ -2837,7 +2837,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(tasks.len(), cards);
         if cards == 1 {
-            let TimelineBlockKind::DetachedTaskRun { task, author } = &tasks[0].kind else {
+            let TimelineBlockKind::DetachedTaskRun { task, author, .. } = &tasks[0].kind else {
                 unreachable!()
             };
             assert_eq!(task.task_id, "task");
@@ -3583,6 +3583,7 @@ mod tests {
         };
         canonical_run_block(
             TimelineBlockKind::DetachedTaskRun {
+                codex_retry_notices: Vec::new(),
                 task: item,
                 author: None,
             },
@@ -11347,7 +11348,7 @@ impl ClientCore {
                     if let Some(walk) = &request.reconciliation {
                         // Preserve blocks changed since this operation began, including
                         // same-millisecond live updates and explicit live removals.
-                        page.blocks.retain(|incoming| {
+                        page.blocks.retain_mut(|incoming| {
                             let cached = store
                                 .semantic
                                 .thread(&request.id)
@@ -11356,7 +11357,22 @@ impl ClientCore {
                                 .baseline
                                 .thread(&request.id)
                                 .and_then(|thread| thread.top_level.block(&incoming.block_id));
-                            cached == baseline || cached == Some(incoming)
+                            if cached == baseline || cached == Some(&*incoming) {
+                                return true;
+                            }
+                            // A live removal remains authoritative. For an existing
+                            // Task, retain fresh fields but apply the reauthorized list.
+                            if baseline.is_some()
+                                && let Some(merged) = cached.and_then(|cached| {
+                                    crate::timeline::semantic::merge_fetched_codex_retry_notices(
+                                        cached, incoming,
+                                    )
+                                })
+                            {
+                                *incoming = merged;
+                                return true;
+                            }
+                            false
                         });
                     }
                     let refresh_status = preserve_refresh_status.then(|| {

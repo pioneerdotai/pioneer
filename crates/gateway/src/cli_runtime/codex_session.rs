@@ -1865,22 +1865,26 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
             );
         }
         let mut process = self.process.lock().await;
-        let _ = process.terminate_with_grace(self.shutdown_grace).await?;
+        let process_result = process.terminate_with_grace(self.shutdown_grace).await;
         drop(process);
         let overlay = self
             .generation_overlay
             .lock()
             .expect("Codex generation overlay mutex should not be poisoned")
             .clone();
-        if let Some(overlay) = overlay {
+        // A termination/reaping error must not skip generation resource
+        // cleanup. The bridge is already fail-closed for this generation.
+        let overlay_result = overlay.map_or(Ok(()), |overlay| {
             cleanup_codex_generation_overlay(&overlay)
                 .map_err(|error| anyhow!("failed to clean up Codex generation overlay: {error}"))?;
             self.generation_overlay
                 .lock()
                 .expect("Codex generation overlay mutex should not be poisoned")
                 .take();
-        }
-        Ok(())
+            Ok(())
+        });
+        process_result?;
+        overlay_result
     }
 
     fn take_codex_event_receivers(&self) -> Option<CLIAgentRuntimeCodexEventReceivers> {

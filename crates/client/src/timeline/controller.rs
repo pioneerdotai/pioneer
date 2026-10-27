@@ -915,7 +915,11 @@ mod tests {
             sort_key: "key".into(),
             started_at_unix_ms: None,
             updated_at_unix_ms: None,
-            kind: pioneer_protocol::TimelineBlockKind::DetachedTaskRun { task, author: None },
+            kind: pioneer_protocol::TimelineBlockKind::DetachedTaskRun {
+                task,
+                author: None,
+                codex_retry_notices: Vec::new(),
+            },
         };
         let id = Id::TopLevelBlock {
             block_id: "block".into(),

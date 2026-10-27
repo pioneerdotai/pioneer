@@ -18,6 +18,17 @@ impl std::fmt::Display for NativeCancellationContextUnavailable {
 }
 impl std::error::Error for NativeCancellationContextUnavailable {}
 
+/// An early Stop must re-observe the same execution before using an activated
+/// runtime's immutable context. This never authorizes a different generation.
+#[derive(Debug)]
+pub struct UnactivatedTurnPhaseChanged;
+impl std::fmt::Display for UnactivatedTurnPhaseChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unactivated terminal lost its owner, generation or activation fence")
+    }
+}
+impl std::error::Error for UnactivatedTurnPhaseChanged {}
+
 #[derive(Clone, Debug)]
 pub struct NativeCancellationContext {
     pub preparation: NativeTerminalEffectPreparation,
@@ -51,6 +62,16 @@ pub fn prepare_registration(
         created_at: Set(now),
         ..Default::default()
     })
+}
+
+pub async fn is_registered<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<bool> {
+    Ok(context::Entity::find_by_id(turn_id.to_owned())
+        .select_only()
+        .column(context::Column::TurnId)
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_some())
 }
 
 pub async fn load<C: ConnectionTrait>(

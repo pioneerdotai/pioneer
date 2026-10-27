@@ -80,6 +80,7 @@ impl MessageProcessor {
         principal: &crate::auth::AuthenticatedSessionPrincipal,
         preferred_root_thread_id: Option<&str>,
         task_id: &str,
+        source_actions: Option<&std::collections::BTreeSet<ResourceAction>>,
     ) -> anyhow::Result<Option<pioneer_tasks::TaskExecutionAdmissionSeed>> {
         let response = self
             .crud_store
@@ -95,6 +96,7 @@ impl MessageProcessor {
             principal,
             preferred_root_thread_id,
             &response,
+            source_actions,
         )
         .await
         .map(Some)
@@ -105,6 +107,7 @@ impl MessageProcessor {
         principal: &crate::auth::AuthenticatedSessionPrincipal,
         preferred_root_thread_id: Option<&str>,
         response: &pioneer_protocol::TaskGetResponse,
+        source_actions: Option<&std::collections::BTreeSet<ResourceAction>>,
     ) -> anyhow::Result<pioneer_tasks::TaskExecutionAdmissionSeed> {
         if response.task.executor_kind != pioneer_protocol::TaskExecutorKind::Agent {
             anyhow::bail!(
@@ -209,10 +212,15 @@ impl MessageProcessor {
             .rev()
             .find(|spec| spec.run_id.is_none())
             .and_then(|spec| spec.permission_cap.as_ref());
-        let context =
+        let mut context =
             crate::authorization::ExecutionAdmissionService::new(self.crud_store.as_ref().clone())
                 .admit_context(principal, revision, &request, requested_permission_cap)
                 .await?;
+        // Only a new legacy seed inherits this agent caller's ceiling. The
+        // persisted branch above must preserve its original immutable JSON.
+        if let Some(actions) = source_actions {
+            context.constrain_thread_creation_grants(actions);
+        }
         let seed = pioneer_tasks::TaskExecutionAdmissionSeed {
             workspace_id: context.workspace_id().to_owned(),
             root_thread_id: context.root_thread_id().to_owned(),
@@ -1917,6 +1925,7 @@ impl MessageProcessor {
                 request_context.principal(),
                 authorized_task.and_then(|proof| proof.root_thread_id()),
                 params.task_id.as_str(),
+                None,
             )
             .await
         {

@@ -13,8 +13,17 @@ enum ChoiceCatalogResponse {
     Unavailable,
 }
 
+#[derive(Default)]
+struct ChoiceRuntimeProbe {
+    main_calls: AtomicUsize,
+    main_started: Notify,
+    release_main: Notify,
+    hold_main: std::sync::atomic::AtomicBool,
+}
+
 struct ChoiceModelsProvider {
     name: &'static str,
+    probe: Arc<ChoiceRuntimeProbe>,
     response: Arc<std::sync::RwLock<ChoiceCatalogResponse>>,
     inner: PromptParityCaptureProvider,
     extra_models: Arc<std::sync::atomic::AtomicUsize>,
@@ -29,13 +38,30 @@ impl Provider for ChoiceModelsProvider {
         self.inner.capabilities()
     }
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        if matches!(
+            prompt_parity_request_kind(&request),
+            Some(PromptParityRequestKind::Main)
+        ) {
+            self.probe.main_calls.fetch_add(1, Ordering::SeqCst);
+            self.probe.main_started.notify_one();
+            if self.probe.hold_main.load(Ordering::SeqCst) {
+                self.probe.release_main.notified().await;
+            }
+        }
         self.inner.chat(request).await
     }
     async fn stream_chat(
         &self,
         request: ChatRequest,
     ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
-        self.inner.stream_chat(request).await
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
+        ])
+        .boxed())
     }
     async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
         self.catalog_calls
@@ -105,11 +131,56 @@ async fn fixture_with_parent(
     TurnToolContext,
     pioneer_agent::TurnToolMaterialization,
 ) {
+    fixture_with_probe(
+        extra_models,
+        catalog_calls,
+        response,
+        cli_parent,
+        Default::default(),
+    )
+    .await
+}
+
+async fn fixture_with_probe(
+    extra_models: Arc<std::sync::atomic::AtomicUsize>,
+    catalog_calls: Arc<std::sync::atomic::AtomicUsize>,
+    response: Arc<std::sync::RwLock<ChoiceCatalogResponse>>,
+    cli_parent: bool,
+    probe: Arc<ChoiceRuntimeProbe>,
+) -> (
+    Arc<MessageProcessor>,
+    TurnToolContext,
+    pioneer_agent::TurnToolMaterialization,
+) {
+    fixture_with_principal_probe(
+        extra_models,
+        catalog_calls,
+        response,
+        cli_parent,
+        probe,
+        false,
+    )
+    .await
+}
+
+async fn fixture_with_principal_probe(
+    extra_models: Arc<std::sync::atomic::AtomicUsize>,
+    catalog_calls: Arc<std::sync::atomic::AtomicUsize>,
+    response: Arc<std::sync::RwLock<ChoiceCatalogResponse>>,
+    cli_parent: bool,
+    probe: Arc<ChoiceRuntimeProbe>,
+    member: bool,
+) -> (
+    Arc<MessageProcessor>,
+    TurnToolContext,
+    pioneer_agent::TurnToolMaterialization,
+) {
     let (workspaces, store, workspace) = setup_workspace_manager().await;
     let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(ChoiceModelsProvider {
             name: "openai",
+            probe,
             response,
             inner: PromptParityCaptureProvider::with_visible_tools(vec![]),
             extra_models,
@@ -135,9 +206,9 @@ async fn fixture_with_parent(
     } else {
         processor
     });
-    let context = TurnToolContext {
+    let mut context = TurnToolContext {
         workspace_id: workspace.clone(),
-        thread_id: "choices-root".into(),
+        thread_id: "C00000000000000000001".into(),
         turn_id: "choices-parent".into(),
     };
     ensure_test_superuser_execution_turn(
@@ -147,49 +218,153 @@ async fn fixture_with_parent(
         &context.turn_id,
     )
     .await;
-    if cli_parent {
-        sync_test_cli_runtime_identities(&processor).await.unwrap();
-        persist_test_cli_execution_authorization_context(
-            processor.crud_store.as_ref(),
-            &workspace,
-            &context.thread_id,
-            &context.turn_id,
-            "codex",
-            "codex",
-        )
-        .await;
-    } else {
-        let mut authority = processor
-            .load_turn_execution_authorization_context(&context.turn_id)
-            .await
-            .unwrap();
-        authority.bind_test_provider_authority(
-            "openai",
-            "gpt-5.4",
-            processor
-                .provider_registry
-                .authority_fingerprint_for_workspace(&workspace, "openai")
-                .unwrap()
-                .as_str(),
+    let mut principal = (*authenticated_test_superuser()).clone();
+    let mut permission = default_test_permission_profile();
+    if member {
+        const MEMBER: &str = "P0000000000000000000M";
+        principal.principal_id = pioneer_protocol::PrincipalId::new(MEMBER).unwrap();
+        principal.kind = pioneer_protocol::PrincipalKind::User;
+        principal.role_key = Some(pioneer_protocol::RoleKey::member());
+        permission = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+            pioneer_protocol::TurnPermissionMode::Supervised,
+            pioneer_protocol::TurnPermissionProfileSource::Composer,
         );
+        processor.crud_store.database_connection().execute_unprepared(&format!(
+            "INSERT INTO gateway_principal(id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,created_at,updated_at) \
+             VALUES('{MEMBER}','{}','user','member','active','Threads Member','threads-member','threads-member',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+             INSERT INTO workspace_membership(principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at) \
+             VALUES('{MEMBER}','{workspace}','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+             INSERT INTO thread_membership(thread_id,principal_id,added_by_actor_kind,created_at,updated_at) \
+             VALUES('{}','{MEMBER}','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            crate::session::test_support::TEST_GATEWAY_ID, context.thread_id)).await.unwrap();
+        let mut old_turn = processor
+            .crud_store
+            .get_turn(&context.thread_id, &context.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        old_turn.status = TurnStatus::Completed;
         processor
             .crud_store
-            .set_turn_execution_authorization_context(
-                &context.turn_id,
-                &authority.to_persisted_json().unwrap(),
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(
+                    pioneer_protocol::TurnCompletedNotification {
+                        workspace_id: workspace.clone(),
+                        thread_id: context.thread_id.clone(),
+                        turn: old_turn.clone(),
+                    },
+                ),
+                now_timestamp_secs(),
+                None,
+            )
+            .await
+            .unwrap();
+        context.turn_id = "choices-member-parent".into();
+        let mut turn = old_turn;
+        turn.id = context.turn_id.clone();
+        turn.status = TurnStatus::InProgress;
+        turn.permission_profile = permission.clone();
+        turn.author = crate::message::message_turn::resolve_turn_author_snapshot(
+            processor.crud_store.as_ref(),
+            &pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+        )
+        .await
+        .unwrap();
+        let thread = processor
+            .crud_store
+            .get_thread_model(&context.thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        processor
+            .crud_store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
             )
             .await
             .unwrap();
     }
+    if cli_parent {
+        sync_test_cli_runtime_identities(&processor).await.unwrap();
+    }
+    let provider = if cli_parent {
+        "cli_runtime:codex"
+    } else {
+        "openai"
+    };
+    let model = if cli_parent { "test-model" } else { "gpt-5.4" };
+    let backend = if cli_parent {
+        AgentExecutionBackend::CLIAgentRuntime {
+            runtime_id: "codex".into(),
+            runtime_kind: CLIAgentRuntimeKind::Codex,
+        }
+    } else {
+        AgentExecutionBackend::ApiProvider {
+            provider: "openai".into(),
+        }
+    };
+    let params: TurnStartParams = serde_json::from_value(json!({
+        "thread_id":context.thread_id, "turn_id":context.turn_id, "input":[],
+        "model":model, "model_provider":provider, "execution_backend":backend,
+    }))
+    .unwrap();
+    let request = crate::authorization::ExecutionAdmissionRequest::for_turn(
+        crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+        crate::authorization::ResourceAction::AgentTurnStart,
+        Vec::new(),
+        &workspace,
+        &context.thread_id,
+        provider,
+        model,
+        &params,
+        &[],
+        if cli_parent {
+            None
+        } else {
+            Some(
+                processor
+                    .provider_registry
+                    .authority_fingerprint_for_workspace(&workspace, "openai")
+                    .unwrap()
+                    .as_str()
+                    .to_owned(),
+            )
+        },
+    )
+    .unwrap();
+    let authority =
+        crate::authorization::ExecutionAdmissionService::new(processor.crud_store.as_ref().clone())
+            .admit_context(
+                &principal,
+                processor.current_authorization_revision().await.unwrap(),
+                &request,
+                Some(&pioneer_protocol::task_permission_cap_from_snapshot(
+                    &permission,
+                )),
+            )
+            .await
+            .unwrap();
     processor
         .crud_store
-        .set_turn_execution_security_snapshot(
+        .set_turn_execution_authorization_context(
             &context.turn_id,
-            &pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
-                "/tmp/project",
-                pioneer_crud::utc_now().timestamp_millis(),
-            ),
+            &authority.to_persisted_json().unwrap(),
         )
+        .await
+        .unwrap();
+    let mut security = pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+        "/tmp/project",
+        pioneer_crud::utc_now().timestamp_millis(),
+    );
+    security.permission_profile = permission;
+    processor
+        .crud_store
+        .set_turn_execution_security_snapshot(&context.turn_id, &security)
         .await
         .unwrap();
     let now = pioneer_crud::utc_now();
@@ -265,6 +440,19 @@ async fn fixture_with_parent(
         .await
         .unwrap();
     }
+    // These scenarios start from an active foreground source, not only its
+    // persisted authorization/snapshot. Restore the actual source Turn too.
+    let source = processor
+        .crud_store
+        .get_thread_model(&context.thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(source, Some(SandboxMode::FullAccess))
+        .await
+        .unwrap();
     let tools = processor
         .materialize_agent_action_tools(context.clone())
         .await
@@ -311,7 +499,7 @@ async fn invoke_with_mutation(
     Ok(output.raw_json())
 }
 
-async fn call(
+pub(super) async fn call(
     tools: &pioneer_agent::TurnToolMaterialization,
     name: &str,
     id: &str,
@@ -486,6 +674,80 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     assert_eq!(start.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(start.model_provider.as_deref(), Some("openai"));
     assert_eq!(start.reasoning.as_ref().unwrap().effort, "high");
+    let response = pioneer_crud::load_agent_turn_response(&db, &start.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let execution = pioneer_crud::load_agent_execution(&db, &response.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted["spawned_execution_id"], execution.id);
+    assert_eq!(execution.work_graph_root_execution_id, execution.id);
+    assert_ne!(execution.id, facts.execution_id.as_str());
+    assert!(execution.parent_execution_id.is_none());
+    assert!(execution.parent_task_id.is_none());
+    assert_eq!(execution.home_root_thread_id, thread_id);
+    assert_eq!(execution.execution_generation, 1);
+    let (_, turn) = processor
+        .crud_store
+        .get_turn(thread_id, &start.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        turn.author.unwrap().actor,
+        pioneer_protocol::PersistedActorRef::AgentExecution(facts.execution_id.clone())
+    );
+    let receipt = pioneer_crud::load_agent_action_receipt(&db, &outbox.action_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        receipt.actor_id.as_deref(),
+        Some(facts.execution_id.as_str())
+    );
+    assert_eq!(outbox.owner_execution_id, facts.execution_id.as_str());
+    let grant = pioneer_crud::load_agent_execution_grant(&db, &execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(grant.parent_execution_id.is_none());
+    let provenance: serde_json::Value = serde_json::from_str(&grant.grant_json).unwrap();
+    assert_eq!(
+        provenance["source_execution_id"],
+        facts.execution_id.as_str()
+    );
+    assert_eq!(provenance["source_action_id"], outbox.action_id);
+    assert_eq!(provenance["turn_id"], start.turn_id);
+    let parent_authority = processor
+        .load_turn_execution_authorization_context(&context.turn_id)
+        .await
+        .unwrap();
+    let authority = processor
+        .load_turn_execution_authorization_context(&start.turn_id)
+        .await
+        .unwrap();
+    assert_eq!(authority.root_thread_id(), thread_id);
+    assert_eq!(
+        authority.initiating_principal_id(),
+        parent_authority.initiating_principal_id()
+    );
+    assert!(
+        authority
+            .granted_action_names()
+            .iter()
+            .all(|action| { parent_authority.granted_action_names().contains(action) })
+    );
+    assert!(
+        processor
+            .crud_store
+            .get_turn_runtime_snapshot(&start.turn_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "canonical root provenance must validate before first runtime preparation"
+    );
     let before = outbox.payload_json;
     let replay = call(&tools, "threads_turn_start", "start-visible", arguments).await;
     assert_eq!(replay["outcome"], "agent_action_already_committed");
@@ -497,6 +759,76 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     .unwrap()
     .unwrap();
     assert_eq!(after.payload_json, before);
+    assert_eq!(
+        pioneer_crud::load_agent_execution_grant(&db, &execution.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        grant,
+        "replay preserves the independent root's immutable provenance"
+    );
+    // Restore the still-runnable Turn with newer composer settings, as after
+    // reconnecting before the committed outbox prepares its pinned launch.
+    let rehydration_manager = ThreadManager::new("composer-model", "openai");
+    let mut restored_thread = processor
+        .thread_manager
+        .thread_get(thread_id)
+        .await
+        .unwrap();
+    restored_thread.model = "gpt-5.4-catalog-other".into();
+    restored_thread.reasoning_effort = Some("low".into());
+    rehydration_manager
+        .system_thread_restore_persisted(restored_thread, Some(SandboxMode::FullAccess))
+        .await
+        .unwrap();
+    // Dispatch of the earlier queued Turn must keep its pinned launch even
+    // after the same destination acquires different composer settings.
+    assert_eq!(
+        rehydration_manager
+            .thread_get(thread_id)
+            .await
+            .unwrap()
+            .model,
+        "gpt-5.4-catalog-other"
+    );
+    let input = processor
+        .crud_store
+        .get_turn_inputs(&start.turn_id)
+        .await
+        .unwrap();
+    let rehydrated = rehydration_manager
+        .rehydrate_committed_agent_turn(&start, input)
+        .await
+        .unwrap();
+    assert_eq!(rehydrated.materialization.thread.model, "gpt-5.4");
+    assert_eq!(rehydrated.materialization.thread.model_provider, "openai");
+    assert_eq!(
+        rehydrated
+            .materialization
+            .thread
+            .reasoning_effort
+            .as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        rehydration_manager
+            .thread_get(thread_id)
+            .await
+            .unwrap()
+            .model,
+        "gpt-5.4-catalog-other",
+        "rehydration must not overwrite current composer settings"
+    );
+
+    assert!(
+        processor
+            .mark_turn_interrupted(
+                start.thread_id.clone(),
+                start.turn_id.clone(),
+                "Finish the first accepted launch before the explicit launch".into(),
+            )
+            .await
+    );
     call(
         &tools,
         "threads_turn_start",
@@ -504,7 +836,7 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         json!({
             "targetOptionId": target.id, "input": [{"type":"text", "text":"Use another model"}],
             "launch": {"profile":{"kind":"model", "providerId":"openai", "modelId":"gpt-5.4-catalog-other"},
-                "reasoning":{"effort":"high"}, "permissionProfile":{"mode":"full_access"}}
+                "reasoning":{"effort":"low"}, "permissionProfile":{"mode":"full_access"}}
         }),
     )
     .await;
@@ -519,7 +851,69 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     let explicit: TurnStartParams =
         serde_json::from_value(explicit["dispatch"]["params"].clone()).unwrap();
     assert_eq!(explicit.model.as_deref(), Some("gpt-5.4-catalog-other"));
-    assert_eq!(explicit.reasoning.unwrap().effort, "high");
+    assert_eq!(explicit.reasoning.unwrap().effort, "low");
+
+    // A home-capsule destination still admits a real child of the source.
+    let home_creation = binding
+        .options
+        .thread_creation_options
+        .iter()
+        .find(|option| option.label == "Current collaboration")
+        .unwrap();
+    let home = call(
+        &tools,
+        "thread_create",
+        "create-home-child",
+        json!({"optionId": home_creation.id}),
+    )
+    .await;
+    let home_targets: Vec<pioneer_protocol::AgentToolTargetOption> =
+        serde_json::from_value(home["targetOptions"].clone()).unwrap();
+    let home_target = home_targets
+        .iter()
+        .find(|option| !targets.iter().any(|old| old.id == option.id))
+        .unwrap();
+    call(
+        &tools,
+        "threads_turn_start",
+        "start-home-child",
+        json!({
+            "targetOptionId": home_target.id,
+            "input": [{"type":"text", "text":"Internal child"}],
+            "launch":{"permissionProfile":{"mode":"full_access"}}
+        }),
+    )
+    .await;
+    let home_outbox = pioneer_crud::load_agent_action_outbox(
+        &db,
+        crate::authorization::action_id_for_call("start-home-child").as_str(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let home: serde_json::Value = serde_json::from_str(&home_outbox.payload_json).unwrap();
+    let home_execution =
+        pioneer_crud::load_agent_execution(&db, home["spawned_execution_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        home_execution.parent_execution_id.as_deref(),
+        Some(facts.execution_id.as_str())
+    );
+    assert_eq!(
+        home_execution.work_graph_root_execution_id,
+        facts.root_execution_id.as_str()
+    );
+    assert_eq!(home_execution.home_root_thread_id, context.thread_id);
+    assert_eq!(
+        u64::try_from(home_execution.execution_generation).unwrap(),
+        facts.execution_generation + 1
+    );
+    processor
+        .load_turn_execution_authorization_context(home["dispatch"]["turn_id"].as_str().unwrap())
+        .await
+        .unwrap();
 }
 
 async fn api_choice_models(ids: &[&str]) -> Vec<pioneer_protocol::ProviderModelInfo> {
@@ -562,6 +956,362 @@ async fn delegated_launch_target(
 }
 
 #[tokio::test]
+async fn source_at_max_depth_can_start_only_an_independent_root() {
+    use sea_orm::PaginatorTrait;
+    let (processor, mut context, mut tools) = fixture().await;
+    // This fixture seeds the parent directly in CRUD. Restore its Turn before
+    // exercising the same in-memory terminal lifecycle as subsequent children.
+    let parent_thread = processor
+        .crud_store
+        .get_thread_model(&context.thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(parent_thread, Some(SandboxMode::FullAccess))
+        .await
+        .unwrap();
+    let db = processor.crud_store.database_connection();
+    let graph_root = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap()
+        .adapter
+        .lock()
+        .await
+        .persistence_facts()
+        .root_execution_id;
+    let max_depth = crate::authorization::AgentWorkResourcePolicy::default().max_depth;
+    // Build real, consistent ancestry through canonical tool admissions. Finish
+    // each previous owner after its child is committed so concurrency capacity
+    // cannot become the reason the final depth check rejects a launch.
+    for depth in 1..=max_depth {
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let facts = binding.adapter.lock().await.persistence_facts();
+        // Keep each active ancestor in its own hidden destination. Starting
+        // another foreground Turn in the visible source is correctly refused.
+        let creation = binding
+            .options
+            .thread_creation_options
+            .iter()
+            .find(|option| option.label == "Current collaboration")
+            .unwrap();
+        let created = call(
+            &tools,
+            "thread_create",
+            &format!("depth-thread-{depth}"),
+            json!({"optionId":creation.id}),
+        )
+        .await;
+        let targets: Vec<pioneer_protocol::AgentToolTargetOption> =
+            serde_json::from_value(created["targetOptions"].clone()).unwrap();
+        let current = targets
+            .iter()
+            .find(|option| {
+                !binding
+                    .options
+                    .target_options
+                    .iter()
+                    .any(|old| old.id == option.id)
+            })
+            .unwrap();
+        let call_id = format!("depth-source-{depth}");
+        call(
+            &tools,
+            "threads_turn_start",
+            &call_id,
+            json!({
+                "targetOptionId":current.id,
+                "input":[{"type":"text", "text":"Continue in the same work graph"}],
+                "launch":{"useDefaultReasoning":true,"permissionProfile":{"mode":"full_access"}}
+            }),
+        )
+        .await;
+        let outbox = pioneer_crud::load_agent_action_outbox(
+            &db,
+            crate::authorization::action_id_for_call(&call_id).as_str(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json).unwrap();
+        assert_eq!(payload["dispatch"]["depth"], depth);
+        let mut previous = processor
+            .crud_store
+            .get_turn(&context.thread_id, &context.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        previous.status = TurnStatus::Completed;
+        processor
+            .crud_store
+            .materialize_turn_completed(
+                pioneer_protocol::TurnCompletedNotification {
+                    workspace_id: context.workspace_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    turn: previous.clone(),
+                },
+                now_timestamp_secs(),
+            )
+            .await
+            .unwrap();
+        processor
+            .thread_manager
+            .commit_terminal_turn(&context.thread_id, &previous)
+            .await
+            .unwrap();
+        processor
+            .crud_store
+            .finalize_agent_execution(
+                facts.execution_id.as_str(),
+                "completed",
+                pioneer_crud::utc_now(),
+            )
+            .await
+            .unwrap();
+        context.thread_id = payload["dispatch"]["thread_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        context.turn_id = payload["dispatch"]["turn_id"].as_str().unwrap().to_owned();
+        if depth == max_depth {
+            // Canonical admission alone has no runtime snapshot. Prepare the
+            // source before it invokes thread_create, as a running agent would.
+            let params: TurnStartParams =
+                serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+            let input = processor
+                .crud_store
+                .get_turn_inputs(&context.turn_id)
+                .await
+                .unwrap();
+            let outcome = processor
+                .thread_manager
+                .rehydrate_committed_agent_turn(&params, input)
+                .await
+                .unwrap();
+            let authority = processor
+                .load_turn_execution_authorization_context(&context.turn_id)
+                .await
+                .unwrap();
+            processor
+                .prepare_committed_agent_api_turn(&params, outcome, &authority)
+                .await
+                .unwrap();
+        } else {
+            // This admission-depth fixture has no provider dispatch. Seed the
+            // child's runtime input just as fixture() seeds the first source;
+            // thread_create requires a source snapshot matching its pinned profile.
+            let child_params: TurnStartParams =
+                serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+            let now = pioneer_crud::utc_now();
+            processor
+                .crud_store
+                .upsert_turn_runtime_snapshot(pioneer_crud::NewTurnRuntimeSnapshot {
+                    turn_id: context.turn_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    workspace_id: context.workspace_id.clone(),
+                    mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
+                    model: child_params.model.clone().unwrap(),
+                    provider_name: child_params.model_provider.clone().unwrap(),
+                    reasoning_effort: child_params
+                        .reasoning
+                        .as_ref()
+                        .map(|value| value.effort.clone()),
+                    agent_skill_versions_json: None,
+                    hook_runtime_context_json: serde_json::to_string(
+                        &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                    )
+                    .unwrap(),
+                    workspace_skill_policies_json: "[]".into(),
+                    input_json: serde_json::to_string(&child_params.input).unwrap(),
+                    capabilities_json: serde_json::to_string(&child_params.capabilities).unwrap(),
+                    resolved_artifacts_json: "[]".into(),
+                    runtime_environment_json: "{}".into(),
+                    history_json: "[]".into(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .unwrap();
+        }
+        tools = processor
+            .materialize_agent_action_tools(context.clone())
+            .await
+            .unwrap();
+    }
+    let binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let source = binding.adapter.lock().await.persistence_facts();
+    assert_eq!(source.root_execution_id, graph_root);
+    assert_eq!(source.execution_generation, u64::from(max_depth) + 1);
+    let target = delegated_launch_target(&tools, &binding.options).await;
+    call(
+        &tools,
+        "threads_turn_start",
+        "depth-independent-root",
+        json!({
+            "targetOptionId":target.id,
+            "input":[{"type":"text","text":"Start a new independent graph"}],
+            "launch":{"useDefaultReasoning":true,"permissionProfile":{"mode":"full_access"}}
+        }),
+    )
+    .await;
+    let outbox = pioneer_crud::load_agent_action_outbox(
+        &db,
+        crate::authorization::action_id_for_call("depth-independent-root").as_str(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json).unwrap();
+    let execution =
+        pioneer_crud::load_agent_execution(&db, payload["spawned_execution_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(payload["dispatch"]["depth"], 0);
+    assert!(execution.parent_execution_id.is_none());
+    assert_eq!(execution.work_graph_root_execution_id, execution.id);
+    assert_ne!(
+        execution.work_graph_root_execution_id,
+        source.root_execution_id.as_str()
+    );
+    assert_eq!(execution.execution_generation, 1);
+    assert!(
+        pioneer_entity::agent_work_resource_scope::Entity::find_by_id(execution.id.clone())
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let grant = pioneer_crud::load_agent_execution_grant(&db, &execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let grant: serde_json::Value = serde_json::from_str(&grant.grant_json).unwrap();
+    assert_eq!(grant["source_execution_id"], source.execution_id.as_str());
+    assert_eq!(grant["source_action_id"], outbox.action_id);
+    let (_, root_turn) = processor
+        .crud_store
+        .get_turn(
+            execution.parent_thread_id.as_ref().unwrap(),
+            payload["dispatch"]["turn_id"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        root_turn.author.unwrap().actor,
+        pioneer_protocol::PersistedActorRef::AgentExecution(source.execution_id.clone())
+    );
+
+    let home_creation = binding
+        .options
+        .thread_creation_options
+        .iter()
+        .find(|option| option.label == "Current collaboration")
+        .unwrap();
+    let home = call(
+        &tools,
+        "thread_create",
+        "depth-home-thread",
+        json!({"optionId":home_creation.id}),
+    )
+    .await;
+    let home_targets: Vec<pioneer_protocol::AgentToolTargetOption> =
+        serde_json::from_value(home["targetOptions"].clone()).unwrap();
+    let refreshed = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let home_target = home_targets
+        .iter()
+        .find(|option| {
+            !binding
+                .options
+                .target_options
+                .iter()
+                .any(|old| old.id == option.id)
+                && option.id != target.id
+        })
+        .unwrap();
+    // The new home target is resolved by its opaque option and durable lineage,
+    // and still consumes the source graph's next depth.
+    assert!(
+        refreshed
+            .options
+            .target_options
+            .iter()
+            .any(|option| option.id == home_target.id)
+    );
+    let nodes = pioneer_entity::agent_execution::Entity::find()
+        .count(&db)
+        .await
+        .unwrap();
+    let turns = pioneer_entity::turn::Entity::find()
+        .count(&db)
+        .await
+        .unwrap();
+    let denied = invoke_with_mutation(
+        &tools,
+        "threads_turn_start",
+        "depth-home-denied",
+        json!({
+            "targetOptionId":home_target.id,
+            "input":[{"type":"text","text":"This child exceeds the source depth"}],
+            "launch":{"useDefaultReasoning":true,"permissionProfile":{"mode":"full_access"}}
+        }),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(&denied, Err(pioneer_tools::ToolError::ExecutionFailed(message))
+        if message == pioneer_protocol::AgentPublicOutcome::AgentWorkGraphLimitExceeded.as_str()),
+        "home child must fail at its depth limit: {denied:?}"
+    );
+    let denied_action = crate::authorization::action_id_for_call("depth-home-denied");
+    assert!(
+        pioneer_crud::load_agent_action(&db, denied_action.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        pioneer_crud::load_agent_action_receipt(&db, denied_action.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        pioneer_crud::load_agent_action_outbox(&db, denied_action.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        pioneer_entity::agent_execution::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
+        nodes
+    );
+    assert_eq!(
+        pioneer_entity::turn::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
+        turns
+    );
+}
+
+#[tokio::test]
 async fn cli_parent_selects_only_unambiguous_api_choices_for_threads_and_tasks() {
     use pioneer_agent::TaskToolProvider;
     for (model_selected, model_ids, second_provider, allowed) in [
@@ -595,6 +1345,7 @@ async fn cli_parent_selects_only_unambiguous_api_choices_for_threads_and_tasks()
                     "anthropic",
                     Arc::new(ChoiceModelsProvider {
                         name: "anthropic",
+                        probe: Default::default(),
                         response: response.clone(),
                         inner: PromptParityCaptureProvider::with_visible_tools(vec![]),
                         extra_models: Default::default(),
@@ -1625,5 +2376,943 @@ async fn webhook_task_tools_create_get_and_replay_require_current_task_read() {
         )
         .await;
         assert_eq!(restored["webhookUrl"], replay["webhookUrl"]);
+    }
+}
+
+// This crosses real action admission, canonical persistence, outbox dispatch,
+// native preparation and the recording provider. It never launches a process.
+#[tokio::test]
+async fn delegated_root_first_dispatch_replay_and_stop_have_an_independent_owner() {
+    use sea_orm::{ActiveModelTrait, Set};
+    for source_terminal in ["completed", "cancelled"] {
+        let probe = Arc::new(ChoiceRuntimeProbe::default());
+        probe.hold_main.store(true, Ordering::SeqCst);
+        let (processor, context, tools) = fixture_with_probe(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            false,
+            probe.clone(),
+        )
+        .await;
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let source = binding.adapter.lock().await.persistence_facts();
+        let target = delegated_launch_target(&tools, &binding.options).await;
+        call(
+            &tools,
+            "threads_turn_start",
+            "independent-first",
+            json!({
+                "targetOptionId":target.id, "input":[{"type":"text","text":"Run independently"}],
+            }),
+        )
+        .await;
+        let db = processor.crud_store.database_connection();
+        let action = crate::authorization::action_id_for_call("independent-first");
+        let outbox = pioneer_crud::load_agent_action_outbox(&db, action.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json).unwrap();
+        let params: TurnStartParams =
+            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        let execution_id = payload["spawned_execution_id"].as_str().unwrap();
+        let execution = pioneer_crud::load_agent_execution(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(execution.parent_execution_id.is_none());
+        assert_eq!(execution.work_graph_root_execution_id, execution.id);
+        assert_ne!(
+            execution.work_graph_root_execution_id,
+            source.root_execution_id.as_str()
+        );
+        assert_eq!(execution.home_root_thread_id, params.thread_id);
+        assert!(
+            processor
+                .crud_store
+                .get_task_thread_lineage(&params.thread_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (_, accepted) = processor
+            .crud_store
+            .get_turn(&params.thread_id, &params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            accepted.author.as_ref().unwrap().actor,
+            pioneer_protocol::PersistedActorRef::AgentExecution(source.execution_id.clone())
+        );
+        assert!(matches!(
+            processor
+                .agent_manager
+                .observe_turn(&params.thread_id, &params.turn_id)
+                .await,
+            Err(pioneer_agent::AgentControlError::ThreadNotFound)
+        ));
+        assert!(
+            processor
+                .crud_store
+                .get_turn_runtime_snapshot(&params.turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Terminating the source graph before delivery cannot cancel the new root.
+        let (_, parent) = processor
+            .crud_store
+            .get_turn(&context.thread_id, &context.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if source_terminal == "completed" {
+            processor
+                .crud_store
+                .finalize_agent_execution(
+                    source.execution_id.as_str(),
+                    "completed",
+                    pioneer_crud::utc_now(),
+                )
+                .await
+                .unwrap();
+        } else {
+            assert!(
+                processor
+                    .cancel_root_agent_work_graph_for_turn(
+                        &context.thread_id,
+                        &parent,
+                        "source stopped"
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        let result =
+            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                .await
+                .unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        timeout(Duration::from_secs(5), probe.main_started.notified())
+            .await
+            .unwrap();
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 1);
+        let runtime = processor
+            .crud_store
+            .get_turn_runtime_snapshot(&params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                runtime.provider_name.as_str(),
+                runtime.model.as_str(),
+                runtime.reasoning_effort.as_deref()
+            ),
+            ("openai", "gpt-5.4", Some("high"))
+        );
+
+        // Restore the pending ACK exactly as after a lost delivery acknowledgement.
+        let mut pending: pioneer_entity::agent_action_outbox::ActiveModel =
+            pioneer_crud::load_agent_action_outbox(&db, action.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        pending.status = Set("pending".into());
+        pending.delivered_at = Set(None);
+        pending.next_attempt_at = Set(None);
+        pending.update(&db).await.unwrap();
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+            .await
+            .unwrap();
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            processor
+                .cancel_root_agent_work_graph_for_turn(
+                    &params.thread_id,
+                    &accepted,
+                    "destination stopped"
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            processor
+                .mark_turn_interrupted(
+                    params.thread_id.clone(),
+                    params.turn_id.clone(),
+                    "destination stopped".into()
+                )
+                .await
+        );
+        assert!(
+            processor
+                .mark_turn_interrupted(
+                    params.thread_id.clone(),
+                    params.turn_id.clone(),
+                    "repeat Stop".into()
+                )
+                .await
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_execution(&db, execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_execution(&db, source.execution_id.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            source_terminal
+        );
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+            .await
+            .unwrap();
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 1);
+        probe.release_main.notify_waiters();
+    }
+}
+
+// The fixture's source execution has no model actor. Complete its canonical
+// foreground Turn while retaining the source ledger for saved action delivery.
+async fn finish_choice_source_foreground(
+    processor: &Arc<MessageProcessor>,
+    context: &TurnToolContext,
+) {
+    let (_, mut turn) = processor
+        .crud_store
+        .get_turn(&context.thread_id, &context.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    turn.status = TurnStatus::Completed;
+    processor
+        .crud_store
+        .materialize_native_agent_turn_event(
+            pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(
+                pioneer_protocol::TurnCompletedNotification {
+                    workspace_id: context.workspace_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    turn: turn.clone(),
+                },
+            ),
+            now_timestamp_secs(),
+            None,
+        )
+        .await
+        .unwrap();
+    processor
+        .thread_manager
+        .commit_terminal_turn(&context.thread_id, &turn)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn delegated_root_foreground_admission_rejects_competing_start_without_persisting_it() {
+    use sea_orm::PaginatorTrait;
+    for target_label in [
+        "New delegated root",
+        "Current thread",
+        "Current collaboration",
+    ] {
+        let (processor, context, tools) = fixture().await;
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let target = if target_label == "New delegated root" {
+            delegated_launch_target(&tools, &binding.options).await
+        } else {
+            // Both own-root routes must refuse while the source owns foreground.
+            let target = binding
+                .options
+                .target_options
+                .iter()
+                .find(|target| target.label == target_label)
+                .unwrap()
+                .clone();
+            let busy = invoke_with_mutation(
+                &tools,
+                "threads_turn_start",
+                "own-root-busy",
+                json!({"targetOptionId":target.id,"input":[{"type":"text","text":"Busy root"}]}),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(busy, Err(pioneer_tools::ToolError::ExecutionFailed(code)) if code == "agent_action_conflict")
+            );
+            assert!(
+                pioneer_crud::load_agent_action_outbox(
+                    &processor.crud_store.database_connection(),
+                    crate::authorization::action_id_for_call("own-root-busy").as_str()
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            finish_choice_source_foreground(&processor, &context).await;
+            target
+        };
+        let arguments = json!({"targetOptionId":target.id,"input":[{"type":"text","text":"One foreground owner"}]});
+        let (first, second) = tokio::join!(
+            invoke_with_mutation(
+                &tools,
+                "threads_turn_start",
+                "foreground-a",
+                arguments.clone(),
+                None
+            ),
+            invoke_with_mutation(
+                &tools,
+                "threads_turn_start",
+                "foreground-b",
+                arguments,
+                None
+            ),
+        );
+        assert_ne!(
+            first.is_ok(),
+            second.is_ok(),
+            "one foreground start must be refused"
+        );
+        let rejection = first
+            .as_ref()
+            .err()
+            .or_else(|| second.as_ref().err())
+            .unwrap();
+        assert!(
+            matches!(rejection, pioneer_tools::ToolError::ExecutionFailed(code) if code == "agent_action_conflict")
+        );
+        let db = processor.crud_store.database_connection();
+        let mut accepted = Vec::new();
+        for id in ["foreground-a", "foreground-b"] {
+            if let Some(row) = pioneer_crud::load_agent_action_outbox(
+                &db,
+                crate::authorization::action_id_for_call(id).as_str(),
+            )
+            .await
+            .unwrap()
+            {
+                accepted.push(row);
+            }
+        }
+        assert_eq!(
+            accepted.len(),
+            1,
+            "refusal cannot leave a second durable launch"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&accepted[0].payload_json).unwrap();
+        let params: TurnStartParams =
+            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        assert_eq!(
+            pioneer_entity::turn::Entity::find()
+                .filter(pioneer_entity::turn::Column::ThreadId.eq(params.thread_id.clone()))
+                .filter(pioneer_entity::turn::Column::Status.eq("in_progress"))
+                .count(&db)
+                .await
+                .unwrap(),
+            1,
+            "the full saved timeline must have exactly one foreground owner"
+        );
+        let source = binding.adapter.lock().await.persistence_facts();
+        let (_, accepted_turn) = processor
+            .crud_store
+            .get_turn(&params.thread_id, &params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if target_label == "New delegated root" {
+            assert!(
+                processor
+                    .cancel_root_agent_work_graph_for_turn(
+                        &params.thread_id,
+                        &accepted_turn,
+                        "Stop new root"
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(
+            processor
+                .mark_turn_interrupted(
+                    params.thread_id.clone(),
+                    params.turn_id.clone(),
+                    "Stop before activation".into()
+                )
+                .await
+        );
+        let stopped = processor
+            .crud_store
+            .get_turn(&params.thread_id, &params.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(stopped.status, TurnStatus::Interrupted);
+        assert!(
+            processor
+                .crud_store
+                .native_cancellation_context(&params.turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_execution(
+                &db,
+                payload["spawned_execution_id"].as_str().unwrap()
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+            "cancelled"
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_execution(&db, source.execution_id.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+            .await
+            .unwrap();
+        assert!(
+            processor
+                .crud_store
+                .get_turn_runtime_snapshot(&params.turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            processor
+                .agent_manager
+                .observe_turn(&params.thread_id, &params.turn_id)
+                .await,
+            Err(pioneer_agent::AgentControlError::ThreadNotFound)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn queued_internal_thread_stop_releases_only_its_child_resources_before_dispatch() {
+    use sea_orm::{ActiveModelTrait, Set};
+    let probe = Arc::new(ChoiceRuntimeProbe::default());
+    let (processor, context, tools) = fixture_with_probe(
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        false,
+        probe.clone(),
+    )
+    .await;
+    let binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let source = binding.adapter.lock().await.persistence_facts();
+    let db = processor.crud_store.database_connection();
+    let mut scope: pioneer_entity::agent_work_resource_scope::ActiveModel =
+        pioneer_entity::agent_work_resource_scope::Entity::find_by_id(
+            source.root_execution_id.as_str(),
+        )
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    scope.max_concurrency = Set(1);
+    scope.update(&db).await.unwrap();
+    let creation = binding
+        .options
+        .thread_creation_options
+        .iter()
+        .find(|option| option.label == "Current collaboration")
+        .unwrap();
+    let created = call(
+        &tools,
+        "thread_create",
+        "queued-thread",
+        json!({"optionId":creation.id}),
+    )
+    .await;
+    let target = created["targetOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| {
+            !binding
+                .options
+                .target_options
+                .iter()
+                .any(|old| old.id == option["id"].as_str().unwrap())
+        })
+        .unwrap()["id"]
+        .clone();
+    call(
+        &tools,
+        "threads_turn_start",
+        "queued-child",
+        json!({"targetOptionId":target,"input":[{"type":"text","text":"Wait for capacity"}]}),
+    )
+    .await;
+    let row = pioneer_crud::load_agent_action_outbox(
+        &db,
+        crate::authorization::action_id_for_call("queued-child").as_str(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+    let params: TurnStartParams =
+        serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+    let child_id = payload["spawned_execution_id"].as_str().unwrap();
+    let child = pioneer_crud::load_agent_execution(&db, child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        child.parent_execution_id.as_deref(),
+        Some(source.execution_id.as_str())
+    );
+    assert_eq!(
+        child.work_graph_root_execution_id,
+        source.root_execution_id.as_str()
+    );
+    assert_eq!(
+        pioneer_crud::load_agent_execution_resource_state(&db, child_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "queued"
+    );
+    assert!(
+        processor
+            .mark_turn_interrupted(
+                params.thread_id.clone(),
+                params.turn_id.clone(),
+                "Stop while queued".into()
+            )
+            .await
+    );
+    assert_eq!(
+        pioneer_crud::load_agent_execution_resource_state(&db, child_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+    assert_eq!(
+        pioneer_crud::load_agent_execution(&db, source.execution_id.as_str())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
+    crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+        .await
+        .unwrap();
+    assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_shared_handler() {
+    let (processor, context, tools) = fixture_with_principal_probe(
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        false,
+        Default::default(),
+        true,
+    )
+    .await;
+    let binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let authority = processor
+        .load_turn_execution_authorization_context(&context.turn_id)
+        .await
+        .unwrap();
+    for (index, label) in ["Current collaboration", "New delegated root"]
+        .into_iter()
+        .enumerate()
+    {
+        // Model an older admission with exactly one creation grant. Current
+        // Member rights and the Agent envelope still allow both variants.
+        let excluded_action = if index == 0 {
+            crate::authorization::ResourceAction::ThreadCreateWorkspace
+        } else {
+            crate::authorization::ResourceAction::ThreadCreatePrivate
+        };
+        let mut limited: serde_json::Value =
+            serde_json::from_str(&authority.to_persisted_json().unwrap()).unwrap();
+        limited["grant_manifest"]["actions"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|action| action.as_str() != Some(excluded_action.safe_name()));
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(&context.turn_id, &limited.to_string())
+            .await
+            .unwrap();
+        // Restore the lease from the modeled admission too; its immutable
+        // action set must agree with the persisted context in each case.
+        processor
+            .register_execution_lease(&context.turn_id)
+            .await
+            .unwrap();
+        let options = call(
+            &tools,
+            "threads_start_options",
+            &format!("member-options-{index}"),
+            json!({}),
+        )
+        .await;
+        let creation_options = options["threadCreationOptions"].as_array().unwrap();
+        assert_eq!(creation_options.len(), 1);
+        assert_eq!(creation_options[0]["label"], label);
+        let excluded_option = binding
+            .options
+            .thread_creation_options
+            .iter()
+            .find(|option| option.label != label)
+            .unwrap();
+        let denied_call = format!("member-excluded-create-{index}");
+        let denied = invoke_with_mutation(
+            &tools,
+            "thread_create",
+            &denied_call,
+            json!({"optionId":excluded_option.id}),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            denied,
+            pioneer_tools::ToolError::InvalidArguments(ref reason)
+                if reason == "agent_action_not_allowed"
+        ));
+        assert!(
+            pioneer_crud::load_agent_action_outbox(
+                &processor.crud_store.database_connection(),
+                crate::authorization::action_id_for_call(&denied_call).as_str(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let option = binding
+            .options
+            .thread_creation_options
+            .iter()
+            .find(|option| option.label == label)
+            .unwrap();
+        let result = call(
+            &tools,
+            "thread_create",
+            &format!("member-create-{index}"),
+            json!({"optionId":option.id}),
+        )
+        .await;
+        assert_eq!(result["status"], "accepted");
+        let database = processor.crud_store.database_connection();
+        let action_id = crate::authorization::action_id_for_call(&format!("member-create-{index}"));
+        let receipt = pioneer_crud::load_agent_action_receipt(&database, action_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        let outbox = pioneer_crud::load_agent_action_outbox(&database, action_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["receiptId"], receipt.id);
+        assert_eq!(result["outboxId"], outbox.id);
+        let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json).unwrap();
+        assert!(
+            processor
+                .crud_store
+                .get_thread_model(payload["created_thread_id"].as_str().unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    processor
+        .crud_store
+        .set_turn_execution_authorization_context(
+            &context.turn_id,
+            &authority.to_persisted_json().unwrap(),
+        )
+        .await
+        .unwrap();
+    processor
+        .register_execution_lease(&context.turn_id)
+        .await
+        .unwrap();
+    assert!(
+        invoke_with_mutation(
+            &tools,
+            "thread_create",
+            "member-invalid-option",
+            json!({"optionId":"O00000000000000000000"}),
+            None
+        )
+        .await
+        .is_err()
+    );
+    let option = binding.options.thread_creation_options[0].id.clone();
+    processor.crud_store.database_connection().execute_unprepared(&format!(
+        "DELETE FROM workspace_membership WHERE principal_id='P0000000000000000000M' AND workspace_id='{}'", context.workspace_id,
+    )).await.unwrap();
+    assert!(
+        invoke_with_mutation(
+            &tools,
+            "thread_create",
+            "member-revoked-create",
+            json!({"optionId":option}),
+            None
+        )
+        .await
+        .is_err()
+    );
+    let db = processor.crud_store.database_connection();
+    assert!(
+        pioneer_crud::load_agent_action_outbox(
+            &db,
+            crate::authorization::action_id_for_call("member-revoked-create").as_str()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(authority.grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate));
+    assert!(authority.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace));
+}
+
+#[tokio::test]
+async fn recovery_terminalization_cannot_apply_blocked_over_a_resumed_generation() {
+    for resume_first in [true, false] {
+        let probe = Arc::new(ChoiceRuntimeProbe::default());
+        let (processor, context, tools) = fixture_with_probe(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            false,
+            probe.clone(),
+        )
+        .await;
+        processor.bind_agent_tool_bridges().await;
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let target = delegated_launch_target(&tools, &binding.options).await;
+        call(
+        &tools,
+        "threads_turn_start",
+        "recovery-sync-start",
+        json!({
+            "targetOptionId":target.id, "input":[{"type":"text","text":"Recover one admitted turn"}]
+        }),
+    )
+    .await;
+        let db = processor.crud_store.database_connection();
+        let row = pioneer_crud::load_agent_action_outbox(
+            &db,
+            crate::authorization::action_id_for_call("recovery-sync-start").as_str(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
+        let params: TurnStartParams =
+            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        // Keep the real prepared snapshot and activation fence, before actor/model
+        // admission. The recovery worker owns the ensuing terminal transition.
+        processor
+            .arm_completed_history_preparation_barrier("__agent_start_after_activation_claim__");
+        let dispatch = tokio::spawn({
+            let processor = processor.clone();
+            async move {
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap()
+            }
+        });
+        timeout(
+            Duration::from_secs(5),
+            processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .unwrap();
+        dispatch.abort();
+        let _ = dispatch.await;
+        processor.release_completed_history_preparation_barrier();
+        let before = processor
+            .crud_store
+            .get_turn_execution(&params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = now_timestamp_secs();
+        let job = processor
+            .crud_store
+            .enqueue_recovery_job(
+                params.turn_id.clone(),
+                "recovery-sync-reasoning".into(),
+                pioneer_protocol::TurnItemType::Reasoning,
+                None,
+                pioneer_protocol::RecoveryTrigger::Timeout,
+                pioneer_protocol::RecoveryAction::BlockResumable,
+                None,
+                None,
+                None,
+                None,
+                0,
+                0,
+                json!({}),
+                json!({"base_backoff_secs":0,"max_wall_clock_secs":60}),
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(
+            processor
+                .crud_store
+                .mark_recovery_job_terminal(
+                    &job.id,
+                    pioneer_protocol::RecoveryJobStatus::Blocked,
+                    None,
+                    now,
+                )
+                .await
+                .unwrap()
+        );
+        processor
+            .arm_completed_history_preparation_barrier("__agent_terminal_before_memory_sync__");
+        let recovery = tokio::spawn({
+            let processor = processor.clone();
+            async move {
+                processor
+                    .process_due_recovery_terminalizations(now, 64)
+                    .await
+                    .unwrap()
+            }
+        });
+        timeout(
+            Duration::from_secs(5),
+            processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            processor
+                .crud_store
+                .get_turn(&params.thread_id, &params.turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::Blocked
+        );
+        let recovery = if resume_first {
+            Some(recovery)
+        } else {
+            processor.release_completed_history_preparation_barrier();
+            assert_eq!(recovery.await.unwrap(), 1);
+            assert_eq!(
+                processor
+                    .thread_manager
+                    .turn_get(&params.thread_id, &params.turn_id)
+                    .await
+                    .unwrap()
+                    .1
+                    .status,
+                TurnStatus::Blocked
+            );
+            None
+        };
+        assert!(
+            processor
+                .resume_blocked_turn_control(
+                    &context.workspace_id,
+                    &params.thread_id,
+                    &params.turn_id,
+                    Some(&job.id),
+                    now,
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let resumed = processor
+            .crud_store
+            .get_turn_execution(&params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.owner_id, before.owner_id);
+        assert_eq!(resumed.owner_generation, before.owner_generation + 1);
+        if let Some(recovery) = recovery {
+            processor.release_completed_history_preparation_barrier();
+            assert_eq!(recovery.await.unwrap(), 1);
+        }
+        let canonical = processor
+            .crud_store
+            .get_turn(&params.thread_id, &params.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(canonical.status, TurnStatus::InProgress);
+        assert_eq!(
+            processor
+                .thread_manager
+                .turn_get(&params.thread_id, &params.turn_id)
+                .await
+                .unwrap()
+                .1,
+            canonical
+        );
+        let mut competing = params.clone();
+        competing.turn_id = "competing-with-recovery-resume".into();
+        let conflict = processor
+            .thread_manager
+            .agent_turn_start_with_permission_profile(
+                competing,
+                canonical.permission_profile.clone(),
+                canonical.author.clone().unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            conflict
+                .downcast_ref::<crate::thread::ForegroundTurnConflict>()
+                .is_some()
+        );
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
     }
 }

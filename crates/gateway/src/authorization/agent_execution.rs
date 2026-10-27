@@ -44,6 +44,7 @@ pub(crate) struct ChildAgentLaunchGrant {
     pub(crate) root_execution_id: AgentExecutionId,
     pub(crate) home_root_thread_id: String,
     pub(crate) depth: u16,
+    pub(crate) independent_root: bool,
     pub(crate) branch_key: String,
     pub(crate) envelope: AgentSecurityEnvelope,
     pub(crate) route: Option<AgentRouteFacts>,
@@ -339,6 +340,7 @@ pub(crate) fn derive_child_launch_grant(
     target: AgentStartTarget,
     route: Option<AgentRouteFacts>,
     depth: u16,
+    independent_root: bool,
     branch_key: impl Into<String>,
     policy: &AgentWorkResourcePolicy,
     registry: RoleDefinitionRegistry,
@@ -346,7 +348,15 @@ pub(crate) fn derive_child_launch_grant(
     if options.generation_fingerprint != parent.options_generation_fingerprint {
         return Err(ExecutionMaterializationError::PolicyGenerationStale);
     }
-    if depth == 0 || depth > policy.max_depth {
+    if (independent_root && depth != 0)
+        || (!independent_root && (depth == 0 || depth > policy.max_depth))
+        || (independent_root
+            && !route.as_ref().is_some_and(|route| {
+                !route.same_capsule
+                    && route.destination_thread_id == route.destination_capsule_id
+                    && route.destination_capsule_id != parent.home_root_thread_id
+            }))
+    {
         return Err(ExecutionMaterializationError::BoundaryExceeded);
     }
     if !parent.envelope.allows(ResourceAction::ChildStart) {
@@ -434,13 +444,18 @@ pub(crate) fn derive_child_launch_grant(
             )
         })?;
     Ok(ChildAgentLaunchGrant {
+        root_execution_id: if independent_root {
+            execution_id.clone()
+        } else {
+            parent.work_graph_root_execution_id.clone()
+        },
         execution_id,
         parent_execution_id: parent.execution_id.clone(),
         identity,
         profile,
-        root_execution_id: parent.work_graph_root_execution_id.clone(),
         home_root_thread_id: child_home_root_thread_id,
         depth,
+        independent_root,
         branch_key: branch_key.into(),
         envelope,
         route,
@@ -460,6 +475,7 @@ pub(crate) fn materialize_child_agent_start(
     options: &AgentStartOptionsProjection,
     route: Option<AgentRouteFacts>,
     depth: u16,
+    independent_root: bool,
     branch_key: &str,
     policy: &AgentWorkResourcePolicy,
     registry: RoleDefinitionRegistry,
@@ -473,6 +489,7 @@ pub(crate) fn materialize_child_agent_start(
         intent.target.clone(),
         route,
         depth,
+        independent_root,
         branch_key.to_owned(),
         policy,
         registry,
@@ -868,6 +885,7 @@ mod tests {
             AgentStartTarget::CurrentThread,
             None,
             1,
+            false,
             "branch-ephemeral",
             &AgentWorkResourcePolicy::default(),
             RoleDefinitionRegistry::new(),
@@ -930,6 +948,7 @@ mod tests {
             AgentStartTarget::CurrentThread,
             None,
             1,
+            false,
             "branch",
             &AgentWorkResourcePolicy::default(),
             RoleDefinitionRegistry::new(),
@@ -949,6 +968,7 @@ mod tests {
                 AgentStartTarget::CurrentThread,
                 None,
                 1,
+                false,
                 "branch",
                 &AgentWorkResourcePolicy::default(),
                 RoleDefinitionRegistry::new(),
