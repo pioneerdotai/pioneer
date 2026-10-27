@@ -16,6 +16,16 @@ use crate::session::ConnectionId;
 const DEFAULT_SANDBOX_MODE: SandboxMode = SandboxMode::FullAccess;
 const DEFAULT_THREAD_MODE: ThreadMode = ThreadMode::Message;
 
+/// The atomic foreground admission guard rejected a competing turn.
+#[derive(Debug)]
+pub(crate) struct ForegroundTurnConflict;
+impl std::fmt::Display for ForegroundTurnConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("thread already has a running turn")
+    }
+}
+impl std::error::Error for ForegroundTurnConflict {}
+
 #[derive(Debug)]
 pub struct ThreadStartOutcome {
     pub response: ThreadStartResponse,
@@ -1161,7 +1171,7 @@ impl ThreadManager {
         let has_running_turn = entry.thread.turns.iter().any(turn_owns_foreground);
 
         if has_running_turn && !allow_concurrent_agent_child {
-            bail!("thread `{thread_id}` already has a running turn");
+            return Err(ForegroundTurnConflict.into());
         }
 
         let previous_preview = entry.thread.preview.clone();
@@ -1538,6 +1548,99 @@ impl ThreadManager {
     pub async fn commit_terminal_turn(&self, thread_id: &str, terminal: &Turn) -> Result<bool> {
         let now = unix_timestamp_secs()? as i64;
         let mut state = self.state.write().await;
+        Self::commit_terminal_turn_in_state(&mut state, thread_id, terminal, now, false)
+    }
+
+    /// Validate the canonical source while holding the memory lock also used by
+    /// resume/recovery. Their memory application either precedes validation or
+    /// follows this commit. The proof releases all DB capacity before returning.
+    pub(crate) async fn commit_terminal_turn_if_current(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        terminal: &Turn,
+        confirm: impl std::future::Future<Output = Result<bool>> + Send,
+    ) -> Result<bool> {
+        let now = unix_timestamp_secs()? as i64;
+        let mut state = self.state.write().await;
+        if !confirm.await? {
+            return Ok(false);
+        }
+        if let Some(entry) = state.threads.get(thread_id) {
+            anyhow::ensure!(
+                entry.thread.workspace_id == workspace_id,
+                "loaded terminal Turn workspace changed"
+            );
+        }
+        if state
+            .threads
+            .get(thread_id)
+            .is_some_and(|entry| !entry.thread.turns.iter().any(|turn| turn.id == terminal.id))
+        {
+            return Ok(true);
+        }
+        Self::commit_terminal_turn_in_state(&mut state, thread_id, terminal, now, true)?;
+        Ok(true) // unloaded state needs no synchronization
+    }
+
+    /// The existing generic Blocked resume transition shares terminal sync's
+    /// memory lock. Only its durable transition and canonical read run here;
+    /// recovery/provider dispatch starts after this method releases the lock.
+    pub(crate) async fn resume_blocked_turn_with_projection<T: Send>(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        resume: impl std::future::Future<Output = Result<(T, Option<Turn>)>> + Send,
+    ) -> Result<T> {
+        let mut state = self.state.write().await;
+        if let Some(entry) = state.threads.get(thread_id) {
+            anyhow::ensure!(
+                entry.thread.workspace_id == workspace_id,
+                "resume workspace changed"
+            );
+            let mut matching = entry.thread.turns.iter().filter(|turn| turn.id == turn_id);
+            if let Some(turn) = matching.next() {
+                anyhow::ensure!(
+                    matching.next().is_none(),
+                    "loaded thread has duplicate Turns before resume"
+                );
+                anyhow::ensure!(
+                    matches!(turn.status, TurnStatus::Blocked | TurnStatus::InProgress),
+                    "loaded Turn has a conflicting terminal result before resume"
+                );
+            }
+        }
+        let (result, turn) = resume.await?;
+        if let Some(turn) = turn {
+            anyhow::ensure!(
+                turn.id == turn_id && turn.status == TurnStatus::InProgress,
+                "resume did not project its canonical InProgress Turn"
+            );
+            if let Some(entry) = state.threads.get_mut(thread_id) {
+                if let Some(current) = entry
+                    .thread
+                    .turns
+                    .iter_mut()
+                    .find(|current| current.id == turn_id)
+                {
+                    *current = turn;
+                } else {
+                    entry.thread.turns.push(turn);
+                }
+                entry.thread.status = foreground_thread_status(&entry.thread);
+            }
+        }
+        Ok(result)
+    }
+
+    fn commit_terminal_turn_in_state(
+        state: &mut ThreadStateManager,
+        thread_id: &str,
+        terminal: &Turn,
+        now: i64,
+        hydrate_interrupted_manifest: bool,
+    ) -> Result<bool> {
         let Some(entry) = state.threads.get_mut(thread_id) else {
             return Ok(false);
         };
@@ -1558,6 +1661,21 @@ impl ThreadManager {
         if current.status != TurnStatus::InProgress {
             if current == terminal {
                 return Ok(true);
+            }
+            // Snapshot restoration intentionally omits the persisted manifest.
+            // Only the guarded canonical projection may hydrate this one field;
+            // every other identity/result field must still match exactly.
+            if hydrate_interrupted_manifest
+                && current.status == TurnStatus::Interrupted
+                && current.prompt_manifest.is_none()
+                && terminal.prompt_manifest.is_some()
+            {
+                let mut hydrated = current.clone();
+                hydrated.prompt_manifest = terminal.prompt_manifest.clone();
+                if &hydrated == terminal {
+                    *current = hydrated;
+                    return Ok(true);
+                }
             }
             bail!(
                 "turn `{}` already has conflicting terminal status `{:?}`",
@@ -2600,6 +2718,69 @@ mod tests {
             .await
             .expect("restored turn should remain addressable");
         assert_eq!(turn.status, TurnStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_conflicting_loaded_turns_before_durable_transition() {
+        for statuses in [
+            vec![TurnStatus::Blocked, TurnStatus::Blocked],
+            vec![TurnStatus::Blocked, TurnStatus::Completed],
+            vec![TurnStatus::Completed],
+        ] {
+            let manager = ThreadManager::new("o4-mini", "openai");
+            let thread_id = "thr_resume_loaded_conflict";
+            let workspace_id = "ws_000000000000000001";
+            manager
+                .thread_start(10, workspace_id.to_owned(), start_params(thread_id))
+                .await
+                .unwrap();
+            // Corrupt only the loaded projection, preserving the real resume
+            // boundary: it must refuse before polling the durable transition.
+            {
+                let mut state = manager.state.write().await;
+                let entry = state.threads.get_mut(thread_id).unwrap();
+                entry.thread.turns = statuses
+                    .iter()
+                    .map(|status| pioneer_protocol::Turn {
+                        id: "turn_resume_loaded_conflict".into(),
+                        status: *status,
+                        turn_kind: Default::default(),
+                        origin: Default::default(),
+                        mode: ThreadMode::Agent,
+                        author: None,
+                        reply_to_turn_id: None,
+                        mentions: Vec::new(),
+                        message_revision: 0,
+                        message_deleted: false,
+                        error: None,
+                        prompt_manifest: None,
+                        permission_profile:
+                            pioneer_protocol::default_turn_permission_profile_snapshot(),
+                    })
+                    .collect();
+            }
+            let before = manager.thread_get(thread_id).await.unwrap();
+            let transitioned = std::sync::atomic::AtomicBool::new(false);
+            let error = manager
+                .resume_blocked_turn_with_projection(
+                    workspace_id,
+                    thread_id,
+                    "turn_resume_loaded_conflict",
+                    async {
+                        transitioned.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(((), None))
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(if statuses.len() > 1 {
+                "duplicate Turns"
+            } else {
+                "conflicting terminal result"
+            }));
+            assert!(!transitioned.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(manager.thread_get(thread_id).await.unwrap(), before);
+        }
     }
 
     #[tokio::test]
