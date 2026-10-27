@@ -100,6 +100,10 @@
             "effective_enabled": false,
             "phase": "disabled"
           }
+        },
+        "transcribe_while_recording": {
+          "type": "boolean",
+          "default": true
         }
       }
     }

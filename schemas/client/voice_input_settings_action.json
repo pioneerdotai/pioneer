@@ -29,6 +29,22 @@
     {
       "type": "object",
       "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "type": "string",
+          "const": "set_transcribe_while_recording"
+        }
+      },
+      "required": [
+        "kind",
+        "enabled"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
         "kind": {
           "type": "string",
           "const": "select"

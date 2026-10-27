@@ -910,3 +910,17 @@ verification. Any further code changes require renewed external review.
 Код подготовлен к повторному внешнему ревью; тесты, сборки, cargo check, Migrator
 и codegen не запускались. Саморевью и локальный коммит не снимают запрет на
 динамические проверки; после исправления снова требуется полное внешнее ревью.
+
+
+## GitHub publication and main compatibility
+
+The user accepted the implementation and authorized a GitHub PR and CI monitoring.
+Before publication, current main `f85e19f7166d0e5484f66beafcf1b3592a196fca`
+conflicted only in Migrator module/registration lists. The branch merges that main
+revision with its two existing agent outbox index migrations before the five
+portable payload migrations. Both sides retain their migration names, ordering
+and bodies. Automatic Cargo.lock and CRUD import merges retain current main's
+changes and the portable storage additions. No migration, Entity generator,
+local build or test was executed. The monitor will use GitHub CI and continue in
+the same branch/worktree, without CI skip markers or changes to neighboring
+checkouts.

@@ -87,6 +87,10 @@ pub struct GatewayVoiceConfig {
     pub models_dir: String,
     #[serde(default)]
     pub transcription_strategy: GatewayVoiceTranscriptionStrategy,
+    /// Selects the session pipeline. Legacy transcription_strategy values do
+    /// not override this setting: both previously used incremental sessions.
+    #[serde(default = "default_gateway_voice_transcribe_while_recording")]
+    pub transcribe_while_recording: bool,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -100,6 +104,7 @@ impl Default for GatewayVoiceConfig {
         Self {
             models_dir: default_gateway_voice_models_dir(),
             transcription_strategy: GatewayVoiceTranscriptionStrategy::default(),
+            transcribe_while_recording: true,
             enabled: false,
             provider: None,
             model: None,
@@ -117,6 +122,10 @@ impl GatewayVoiceConfig {
 
 fn default_gateway_voice_models_dir() -> String {
     "models/voice".to_owned()
+}
+
+const fn default_gateway_voice_transcribe_while_recording() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -4454,12 +4463,14 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
     #[test]
     fn gateway_voice_config_selection_defaults_disabled_and_roundtrips() {
         let defaults = super::GatewayVoiceConfig::default();
+        assert!(defaults.transcribe_while_recording);
         assert!(!defaults.enabled);
         assert_eq!(defaults.provider, None);
         assert_eq!(defaults.model, None);
 
         let serialized = toml::to_string(&super::GatewayVoiceConfig {
             enabled: true,
+            transcribe_while_recording: false,
             provider: Some(super::GatewayVoiceInputProviderConfig::Local),
             model: Some("parakeet-tdt-0.6b-v3".to_owned()),
             ..super::GatewayVoiceConfig::default()
@@ -4469,12 +4480,28 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
             toml::from_str(serialized.as_str()).expect("voice config should deserialize");
 
         assert!(roundtrip.enabled);
+        assert!(!roundtrip.transcribe_while_recording);
         assert_eq!(
             roundtrip.provider,
             Some(super::GatewayVoiceInputProviderConfig::Local)
         );
         assert_eq!(roundtrip.model.as_deref(), Some("parakeet-tdt-0.6b-v3"));
         assert_eq!(roundtrip.models_dir, "models/voice");
+    }
+
+    #[test]
+    fn legacy_voice_strategy_values_preserve_incremental_mode_without_explicit_boolean() {
+        for strategy in ["buffered_gateway_session", "experimental_streaming"] {
+            let legacy: super::GatewayVoiceConfig =
+                toml::from_str(&format!("transcription_strategy = \"{strategy}\""))
+                    .expect("legacy strategy remains supported");
+            assert!(legacy.transcribe_while_recording);
+            let explicit: super::GatewayVoiceConfig = toml::from_str(&format!(
+                "transcription_strategy = \"{strategy}\"\ntranscribe_while_recording = false"
+            ))
+            .expect("explicit session mode");
+            assert!(!explicit.transcribe_while_recording);
+        }
     }
 
     #[test]

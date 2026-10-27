@@ -137,7 +137,10 @@ async fn agent_action_outbox_poison_payloads_keep_retry_contract_and_process_rem
     );
     assert_eq!((bad.status.as_str(), bad.attempts), ("failed", 1));
     assert!(bad.next_attempt_at.unwrap() >= now + chrono::Duration::seconds(30));
-    assert_eq!(bad.last_error.as_deref(), Some("outbox_delivery_failed"));
+    assert_eq!(
+        bad.last_error.as_deref(),
+        Some("outbox_start_integrity_rejected")
+    );
     let final_row = agent_action_outbox::Entity::find_by_id("b-final-invalid-start")
         .one(&database)
         .await
@@ -519,6 +522,119 @@ async fn agent_action_outbox_ack_panic_after_commit_does_not_compensate_or_stop_
     writer.rollback().await.unwrap();
 }
 
+#[tokio::test]
+async fn start_outbox_refusal_stops_delivery_without_inflating_attempts_and_unknown_error_is_safe()
+{
+    use crate::message::agent_action_tools::{
+        AgentActionOutboxDispatch, process_claimed_agent_action_outbox,
+    };
+    use pioneer_crud::AgentActionOutboxFailure as Failure;
+    let (_directory, processor, _observer, now) = outbox_fixture(&[
+        ("refused", r#"{"kind":"start_agent"}"#, 0),
+        ("temporary", r#"{"kind":"start_agent"}"#, 0),
+        ("unknown", r#"{"kind":"start_agent"}"#, 0),
+        ("stale-refusal", r#"{"kind":"start_agent"}"#, 7),
+    ])
+    .await;
+    let db = processor
+        .crud_store
+        .with_maintenance_access()
+        .database_connection();
+    let batch = pioneer_crud::claim_agent_action_outbox(&db, 64)
+        .await
+        .unwrap();
+    let result = process_claimed_agent_action_outbox(&db, batch, |row| {
+        let db = db.clone();
+        async move {
+            match row.id.as_str() {
+                "stale-refusal" => {
+                    // Another delivery already acknowledged this exact claim. The
+                    // losing CAS must not count a second successful acknowledgement.
+                    assert!(
+                        pioneer_crud::mark_agent_action_outbox_delivered(
+                            &db,
+                            &row.id,
+                            row.attempts,
+                            pioneer_crud::utc_now(),
+                        )
+                        .await
+                        .unwrap()
+                    );
+                    Ok(AgentActionOutboxDispatch::Rejected(Failure::OutcomeUnknown))
+                }
+                "refused" => Ok(AgentActionOutboxDispatch::Rejected(
+                    Failure::ForegroundConflict,
+                )),
+                "temporary" => Err(Failure::ControlUnavailable.into()),
+                _ => Err(anyhow::anyhow!(
+                    "provider secret and private input must not be persisted"
+                )),
+            }
+        }
+    })
+    .await;
+    assert!(result.errors.is_empty());
+    assert_eq!(result.delivered, 0);
+    let refused = agent_action_outbox::Entity::find_by_id("refused")
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            refused.status.as_str(),
+            refused.attempts,
+            refused.next_attempt_at
+        ),
+        ("failed", 1, None)
+    );
+    assert_eq!(
+        refused.last_error.as_deref(),
+        Some("outbox_foreground_conflict")
+    );
+    assert!(refused.delivered_at.is_none());
+    for (id, class) in [
+        ("temporary", "outbox_runtime_control_unavailable"),
+        ("unknown", "outbox_start_outcome_unknown"),
+    ] {
+        let row = agent_action_outbox::Entity::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.attempts, 1);
+        assert!(row.next_attempt_at.unwrap() >= now + chrono::Duration::seconds(30));
+        assert_eq!(row.last_error.as_deref(), Some(class));
+    }
+    // Make the retry deadline due. A new claim must contain only retryable rows.
+    let due = now - chrono::Duration::seconds(1);
+    use sea_orm::{ActiveModelTrait, Set};
+    for id in ["temporary", "unknown"] {
+        let mut row: agent_action_outbox::ActiveModel = agent_action_outbox::Entity::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        row.next_attempt_at = Set(Some(due));
+        row.update(&db).await.unwrap();
+    }
+    let batch = pioneer_crud::claim_agent_action_outbox(&db, 64)
+        .await
+        .unwrap();
+    let ids = batch
+        .rows
+        .into_iter()
+        .map(|row| row.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        ids,
+        ["temporary".to_owned(), "unknown".to_owned()]
+            .into_iter()
+            .collect()
+    );
+}
+
 #[test]
 fn agent_start_proof_preserves_typed_storage_faults_without_retrying_semantic_denials() {
     use crate::message::agent_action_tools::agent_start_proof_error;
@@ -604,4 +720,103 @@ fn agent_start_proof_preserves_typed_storage_faults_without_retrying_semantic_de
             assert_eq!(proof_error.downcast_ref::<Failure>(), Some(&semantic));
         }
     }
+}
+
+#[tokio::test]
+async fn exhausted_start_reconciliation_is_bounded_and_yields_to_an_ordinary_due_row() {
+    use sea_orm::ActiveModelTrait;
+    let (_directory, processor, _observer, now) = outbox_fixture(&[
+        (
+            "a-exhausted-start",
+            r#"{"kind":"start_agent","spawned_execution_id":"E00000000000000000007","dispatch":{"thread_id":"poison-destination","turn_id":"poison-turn"}}"#,
+            pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS,
+        ),
+        ("b-ordinary-due", r#"{"kind":"send_message"}"#, 0),
+    ])
+    .await;
+    let database = processor.crud_store.database_connection();
+    // This intentionally malformed StartAgent has no response binding. Its
+    // durable obligation must stay unresolved rather than masquerade as cleanup.
+    agent_action::Entity::update_many()
+        .col_expr(
+            agent_action::Column::ActionKind,
+            sea_orm::sea_query::Expr::value("start_agent"),
+        )
+        .filter(agent_action::Column::Id.eq("a-exhausted-start"))
+        .exec(&database)
+        .await
+        .unwrap();
+    for id in ["a-exhausted-start", "b-ordinary-due"] {
+        let mut row: agent_action_outbox::ActiveModel = agent_action_outbox::Entity::find_by_id(id)
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        row.status = Set("failed".to_owned());
+        row.next_attempt_at = Set(if id == "a-exhausted-start" {
+            None // legacy exhausted delivery without a scheduled reconciliation
+        } else {
+            Some(now - chrono::Duration::seconds(1))
+        });
+        row.update(&database).await.unwrap();
+    }
+    // A limit of two supplies one timed quantum. The exhausted row is first;
+    // rescheduling its reconciliation must give the older ordinary row progress
+    // on the very next quantum, without spending a ninth delivery attempt.
+    let first = crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 2)
+        .await
+        .unwrap();
+    assert_eq!(first.delivered, 0);
+    assert!(first.errors.len() <= 2);
+    let exhausted = agent_action_outbox::Entity::find_by_id("a-exhausted-start")
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exhausted.status, "failed");
+    assert_eq!(
+        exhausted.attempts,
+        pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS
+    );
+    assert!(exhausted.next_attempt_at.is_some_and(|next| next > now));
+    assert!(exhausted.delivered_at.is_none());
+    let second = crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 2)
+        .await
+        .unwrap();
+    assert_eq!(second.delivered, 1);
+    assert!(second.errors.len() <= 2);
+    let ordinary = agent_action_outbox::Entity::find_by_id("b-ordinary-due")
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (ordinary.status.as_str(), ordinary.attempts),
+        ("delivered", 1)
+    );
+    let unchanged = agent_action_outbox::Entity::find_by_id("a-exhausted-start")
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unchanged.attempts,
+        pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS
+    );
+    assert_eq!(unchanged.next_attempt_at, exhausted.next_attempt_at);
+    assert!(
+        !processor
+            .agent_manager
+            .has_thread("poison-destination")
+            .await
+    );
+    assert!(
+        processor
+            .crud_store
+            .get_turn_runtime_snapshot("poison-turn")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

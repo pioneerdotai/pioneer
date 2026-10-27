@@ -1299,7 +1299,7 @@ impl SettingsScreenView {
             settings.runtime.phase == GatewayVoiceInputRuntimePhase::Failed,
             selected_provider,
             selected_model,
-            desktop_entity,
+            desktop_entity.clone(),
         );
 
         v_flex()
@@ -1308,6 +1308,7 @@ impl SettingsScreenView {
             .gap_3()
             .child(
                 h_flex()
+                    .debug_selector(|| "settings-voice-input-model-row".to_string())
                     .w_full()
                     .gap_6()
                     .justify_between()
@@ -1325,6 +1326,7 @@ impl SettingsScreenView {
                     )
                     .child(actions),
             )
+            .child(self.render_voice_input_transcription_mode(settings, desktop_entity))
             .when_some(progress, |this, progress| this.child(progress))
             .when_some(settings.runtime.error.clone(), |this, error| {
                 this.child(Self::render_voice_input_error(error, cx))
@@ -1332,6 +1334,50 @@ impl SettingsScreenView {
             .when_some(action_error, |this, error| {
                 this.child(Self::render_voice_input_error(error, cx))
             })
+            .into_any_element()
+    }
+
+    fn render_voice_input_transcription_mode(
+        &self,
+        settings: &GatewayVoiceInputSettings,
+        desktop_entity: Entity<Self>,
+    ) -> AnyElement {
+        let label = t!("settings.voice_input.transcribe_while_recording").to_string();
+        let description =
+            t!("settings.voice_input.transcribe_while_recording_description").to_string();
+        let disabled = self.gateway.settings_loading
+            || self.gateway.connection_state != GatewayConnectionState::Connected
+            || !self
+                .principal_presentation_capabilities()
+                .can_manage_gateway_settings;
+
+        h_flex()
+            .debug_selector(|| "settings-voice-input-transcription-mode-row".to_string())
+            .w_full()
+            .gap_6()
+            .py_3()
+            .justify_between()
+            .items_center()
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .child(div().text_sm().font_semibold().child(label.clone()))
+                    .child(div().text_xs().opacity(0.6).child(description.clone())),
+            )
+            .child(
+                Switch::new("settings-voice-input-transcribe-while-recording")
+                    .checked(settings.transcribe_while_recording)
+                    .accessibility_label(label)
+                    .tooltip(description)
+                    .disabled(disabled)
+                    .on_click(move |enabled, _, cx| {
+                        let _ = desktop_entity.update(cx, |view, cx| {
+                            view.apply_voice_input_transcribe_while_recording(*enabled, cx);
+                            cx.notify();
+                        });
+                    }),
+            )
             .into_any_element()
     }
 
@@ -2794,6 +2840,8 @@ mod tests {
         let required_keys = [
             "label",
             "description",
+            "transcribe_while_recording",
+            "transcribe_while_recording_description",
             "no_model_selected",
             "recommended",
             "change_model",

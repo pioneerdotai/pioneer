@@ -409,7 +409,7 @@ impl ProviderReadinessSupervisor {
 
     fn next_cli_generation(&self) -> u64 {
         self.cli_generation_sequence
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |epoch| epoch.checked_add(1),

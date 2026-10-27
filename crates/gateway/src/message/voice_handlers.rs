@@ -113,11 +113,29 @@ impl MessageProcessor {
 
         let _settings_guard = self.gateway_settings_update_lock.lock().await;
 
-        let settings = self
+        let mut settings = self
             .voice_input_supervisor
             .as_ref()
             .map(|supervisor| supervisor.settings_snapshot())
             .unwrap_or_default();
+        if self
+            .apply_persisted_voice_input_mode(&mut settings)
+            .is_err()
+        {
+            self.send_voice_error(
+                connection_id,
+                request_id,
+                INVALID_REQUEST_CODE,
+                methods::VOICE_SESSION_START,
+                VoiceError {
+                    kind: VoiceErrorKind::InvalidSession,
+                    message: "voice session settings are unavailable".to_owned(),
+                    public_error: None,
+                },
+            )
+            .await;
+            return;
+        }
         let model_status = settings.runtime.phase.coarse_voice_status();
         if model_status != VoiceStatus::Ready || !settings.runtime.effective_enabled {
             self.send_voice_error(
@@ -250,6 +268,7 @@ impl MessageProcessor {
             &self.voice_finalizations,
             lease,
             transcriber,
+            settings.transcribe_while_recording,
         ) {
             let _ = self
                 .voice_sessions

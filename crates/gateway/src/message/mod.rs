@@ -1538,6 +1538,21 @@ impl MessageProcessor {
                 let Some(processor) = processor.upgrade() else {
                     break;
                 };
+                // Serialize with settings saves so an older engine event cannot
+                // overwrite a newly persisted session mode on another client.
+                let _settings_guard = processor.gateway_settings_update_lock.lock().await;
+                settings = processor
+                    .voice_input_supervisor
+                    .as_ref()
+                    .map(|supervisor| supervisor.settings_snapshot())
+                    .unwrap_or_default();
+                if processor
+                    .apply_persisted_voice_input_mode(&mut settings)
+                    .is_err()
+                {
+                    warn!("failed to read Voice Input mode for status publication");
+                    continue;
+                }
                 processor
                     .send_gateway_management_notification(
                         events::GATEWAY_VOICE_INPUT_STATUS_CHANGED,
@@ -1550,6 +1565,28 @@ impl MessageProcessor {
                 last_notification = tokio::time::Instant::now();
             }
         });
+    }
+
+    fn apply_persisted_voice_input_mode(
+        &self,
+        settings: &mut pioneer_protocol::GatewayVoiceInputSettings,
+    ) -> anyhow::Result<()> {
+        #[cfg(not(test))]
+        let config = pioneer_config::AppConfig::load()?;
+        #[cfg(test)]
+        let config = crate::isolated_test_app_config()?;
+        let file_name = crate::settings::normalize_settings_file_name(
+            config.gateway.settings_file_name.as_str(),
+        )?;
+        let persisted = crate::settings::load_or_create_gateway_settings(
+            &self.artifact_runtime_home.join(&file_name),
+            config.gateway.settings_version,
+            &file_name,
+        )?;
+        settings.transcribe_while_recording = persisted
+            .effective_voice_input_config(&config.gateway.voice)
+            .transcribe_while_recording;
+        Ok(())
     }
 
     pub(crate) fn thread_episodic_vector_refill_status_sender(

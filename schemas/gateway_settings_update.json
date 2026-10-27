@@ -639,6 +639,12 @@
         },
         "retry_install": {
           "type": "boolean"
+        },
+        "transcribe_while_recording": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       }
     },

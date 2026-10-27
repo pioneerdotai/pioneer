@@ -7967,7 +7967,7 @@ impl MessageProcessor {
             }
         }
 
-        if changes.voice_input.changed || changes.voice_input.retry_install {
+        if changes.voice_input.reconfigure || changes.voice_input.retry_install {
             if let Some(supervisor) = self.voice_input_supervisor.as_ref() {
                 let desired = crate::voice::supervisor::VoiceInputDesiredState::from_config(
                     &settings.effective_voice_input_config(&config.gateway.voice),
@@ -8107,6 +8107,16 @@ impl MessageProcessor {
             crate::settings::mark_thread_episodic_vector_refill_running_if_ready(
                 &mut snapshot.thread_episodic.vector_search,
             );
+        }
+
+        if changes.voice_input.changed {
+            self.send_gateway_management_notification(
+                events::GATEWAY_VOICE_INPUT_STATUS_CHANGED,
+                &pioneer_protocol::GatewayVoiceInputStatusChangedNotification {
+                    settings: snapshot.voice_input.clone(),
+                },
+            )
+            .await;
         }
 
         Ok(snapshot)

@@ -148,7 +148,7 @@ impl ThreadView {
     }
     pub fn new(config: ThreadViewConfig, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let mount = NEXT_MOUNT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |mount| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |mount| {
                 mount.checked_add(3)
             })
             .expect("thread mount identity exhausted");

@@ -3156,12 +3156,48 @@ where
                     .await
                     .map(|_| false)
                 }
-                Err(_error) => {
-                    let marked = pioneer_crud::mark_agent_action_outbox_failed(
+                Ok(AgentActionOutboxDispatch::Rejected(_))
+                    if attempts == pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS =>
+                {
+                    // Exhausted StartAgent reconciliation returns Rejected only
+                    // after canonical acceptance, fenced cleanup and memory sync.
+                    // ACK that boundary so closed history leaves its due index.
+                    pioneer_crud::mark_agent_action_outbox_delivered(
                         database,
                         &outbox_id,
                         attempts,
                         pioneer_crud::utc_now(),
+                    )
+                    .await
+                }
+                Ok(AgentActionOutboxDispatch::Rejected(failure)) => {
+                    pioneer_crud::mark_agent_action_outbox_failed_with_cause(
+                        database,
+                        &outbox_id,
+                        attempts,
+                        pioneer_crud::utc_now(),
+                        failure,
+                        true,
+                    )
+                    .await
+                    .map(|_| false)
+                }
+                Err(error) => {
+                    let failure = if agent_start_has_storage_failure(&error) {
+                        pioneer_crud::AgentActionOutboxFailure::StorageUnavailable
+                    } else {
+                        error
+                            .downcast_ref::<pioneer_crud::AgentActionOutboxFailure>()
+                            .copied()
+                            .unwrap_or(pioneer_crud::AgentActionOutboxFailure::OutcomeUnknown)
+                    };
+                    let marked = pioneer_crud::mark_agent_action_outbox_failed_with_cause(
+                        database,
+                        &outbox_id,
+                        attempts,
+                        pioneer_crud::utc_now(),
+                        failure,
+                        false,
                     )
                     .await;
                     if matches!(marked, Ok(true))
@@ -3171,7 +3207,7 @@ where
                             outbox_id,
                             action_id,
                             attempts = attempts,
-                            failure_class = "outbox_delivery_failed",
+                            failure_class = failure.safe_name(),
                             "agent domain action outbox reached its delivery retry limit"
                         );
                     }
@@ -3202,6 +3238,7 @@ pub(super) enum AgentActionOutboxDispatch {
     Delivered,
     AwaitingPermit,
     AwaitingRuntime,
+    Rejected(pioneer_crud::AgentActionOutboxFailure),
 }
 
 // Failure to obtain a proof is different from a proof denying the action.
@@ -3239,6 +3276,355 @@ pub(super) fn agent_start_proof_error(
 }
 
 async fn dispatch_agent_action_outbox_row(
+    processor: &Arc<MessageProcessor>,
+    row: &pioneer_entity::agent_action_outbox::Model,
+) -> anyhow::Result<AgentActionOutboxDispatch> {
+    use pioneer_crud::AgentActionOutboxFailure as Failure;
+    if row.last_error.as_deref() == Some(pioneer_crud::AGENT_START_RECONCILIATION_REQUIRED) {
+        return match finalize_rejected_agent_start(processor, row, Failure::OutcomeUnknown).await? {
+            AgentStartReconciliation::Finalized => {
+                Ok(AgentActionOutboxDispatch::Rejected(Failure::OutcomeUnknown))
+            }
+            AgentStartReconciliation::RuntimeOwned => Ok(AgentActionOutboxDispatch::Delivered),
+            AgentStartReconciliation::Unresolved => Err(Failure::OutcomeUnknown.into()),
+        };
+    }
+    match dispatch_agent_action_outbox_row_inner(processor, row).await {
+        Err(error) if agent_start_has_storage_failure(&error) => Err(error),
+        Err(error)
+            if error.downcast_ref::<Failure>().is_some_and(|failure| {
+                matches!(
+                    failure,
+                    Failure::InvalidStart
+                        | Failure::AuthorityDenied
+                        | Failure::RuntimeUnavailable
+                        | Failure::ForegroundConflict
+                        | Failure::OutcomeUnknown
+                )
+            }) =>
+        {
+            let failure = *error.downcast_ref::<Failure>().expect("typed rejection");
+            match finalize_rejected_agent_start(processor, row, failure).await {
+                Ok(AgentStartReconciliation::Finalized) => {
+                    Ok(AgentActionOutboxDispatch::Rejected(failure))
+                }
+                Ok(AgentStartReconciliation::RuntimeOwned) => {
+                    Ok(AgentActionOutboxDispatch::Delivered)
+                }
+                Ok(AgentStartReconciliation::Unresolved) => Err(error),
+                Err(finalization) => Err(finalization.context(failure)),
+            }
+        }
+        Err(error) if row.attempts >= pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS => {
+            // Unknown transport/preparation outcomes must first reconcile the
+            // exact runtime. The finalizer refuses any potentially live owner.
+            match finalize_rejected_agent_start(processor, row, Failure::OutcomeUnknown).await {
+                Ok(AgentStartReconciliation::Finalized) => {
+                    Ok(AgentActionOutboxDispatch::Rejected(Failure::OutcomeUnknown))
+                }
+                Ok(AgentStartReconciliation::RuntimeOwned) => {
+                    Ok(AgentActionOutboxDispatch::Delivered)
+                }
+                Ok(AgentStartReconciliation::Unresolved) => Err(error),
+                Err(finalization) => Err(finalization),
+            }
+        }
+        result => result,
+    }
+}
+
+enum AgentStartReconciliation {
+    Finalized,
+    RuntimeOwned,
+    Unresolved,
+}
+
+fn is_legacy_agent_child_grant(grant: &serde_json::Value) -> bool {
+    grant.get("kind").and_then(serde_json::Value::as_str) == Some("agent_child")
+        && ["source_action_id", "source_execution_id", "turn_id"]
+            .iter()
+            .all(|field| grant.get(*field).is_none())
+}
+
+// Parent identity alone cannot bind two sibling starts to their source actions.
+// Both producers bind the input Turn ID to its action; callers also validate
+// the saved Turn author, response execution/presentation and owner/generation.
+async fn agent_start_grant_matches_source(
+    processor: &MessageProcessor,
+    row: &pioneer_entity::agent_action_outbox::Model,
+    execution: &pioneer_entity::agent_execution::Model,
+    saved_grant: &pioneer_entity::agent_execution_grant::Model,
+    grant: &serde_json::Value,
+    turn_id: &str,
+) -> anyhow::Result<bool> {
+    if saved_grant.parent_execution_id != execution.parent_execution_id
+        || saved_grant.child_identity_id != execution.agent_identity_id
+        || grant
+            .get("execution_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(execution.id.as_str())
+    {
+        return Ok(false);
+    }
+    if !is_legacy_agent_child_grant(grant) {
+        // Present but invalid/contradictory source fields never enable fallback.
+        return Ok(grant
+            .get("source_action_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(row.action_id.as_str())
+            && grant
+                .get("source_execution_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(row.owner_execution_id.as_str())
+            && grant.get("turn_id").and_then(serde_json::Value::as_str) == Some(turn_id));
+    }
+    // The historical producer used this exact action-derived input Turn ID.
+    // Its saved allowed receipt and the caller's exact response link prove the
+    // source without rewriting the old grant or restoring user payload.
+    if execution.parent_execution_id.as_deref() != Some(row.owner_execution_id.as_str())
+        || grant
+            .get("parent_execution_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(row.owner_execution_id.as_str())
+        || turn_id
+            != pioneer_crud::canonical_agent_id(
+                'T',
+                &format!("agent-start-turn\0{}", row.action_id),
+            )
+    {
+        return Ok(false);
+    }
+    let database = processor.crud_store.database_connection();
+    let action = pioneer_crud::load_agent_action(&database, &row.action_id).await?;
+    let receipt = pioneer_crud::load_agent_action_receipt(&database, &row.action_id).await?;
+    Ok(action.is_some_and(|action| {
+        action.status == "committed"
+            && action.action_kind == "start_agent"
+            && action.execution_id == row.owner_execution_id
+    }) && receipt.is_some_and(|receipt| {
+        receipt.decision == "allowed"
+            && receipt.actor_kind == "agent_execution"
+            && receipt.actor_id.as_deref() == Some(row.owner_execution_id.as_str())
+    }))
+}
+
+// A malformed envelope must never terminalize an unrelated Turn. Bind the
+// compensating terminal event to the exact saved response and current owner.
+async fn finalize_rejected_agent_start(
+    processor: &Arc<MessageProcessor>,
+    row: &pioneer_entity::agent_action_outbox::Model,
+    failure: pioneer_crud::AgentActionOutboxFailure,
+) -> anyhow::Result<AgentStartReconciliation> {
+    let payload: serde_json::Value = serde_json::from_str(&row.payload_json)?;
+    let Some(execution_id) = payload
+        .get("spawned_execution_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(AgentStartReconciliation::Unresolved);
+    };
+    let legacy_compacted = payload.get("_pioneer_compacted").is_some()
+        && payload.pointer("/dispatch/turn_id").is_none();
+    let Some(saved_grant) = pioneer_crud::load_agent_execution_grant(
+        &processor.crud_store.database_connection(),
+        execution_id,
+    )
+    .await?
+    else {
+        return Ok(AgentStartReconciliation::Unresolved);
+    };
+    let grant: serde_json::Value = serde_json::from_str(&saved_grant.grant_json)?;
+    let canonical_turn_id =
+        pioneer_crud::canonical_agent_id('T', &format!("agent-start-turn\0{}", row.action_id));
+    let Some(turn_id) = payload
+        .pointer("/dispatch/turn_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            legacy_compacted
+                .then(|| grant.get("turn_id"))
+                .flatten()
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    (legacy_compacted && is_legacy_agent_child_grant(&grant))
+                        .then_some(canonical_turn_id.as_str())
+                })
+        })
+    else {
+        return Ok(AgentStartReconciliation::Unresolved);
+    };
+    let store = &processor.crud_store;
+    let Some(response) =
+        pioneer_crud::load_agent_turn_response(&store.database_connection(), turn_id).await?
+    else {
+        return Ok(AgentStartReconciliation::Unresolved);
+    };
+    let Some(owner) = store.get_turn_execution(turn_id).await? else {
+        return Ok(AgentStartReconciliation::Unresolved);
+    };
+    let Some(execution) =
+        pioneer_crud::load_agent_execution(&store.database_connection(), execution_id).await?
+    else {
+        return Ok(AgentStartReconciliation::Unresolved);
+    };
+    if response.execution_id != execution_id
+        || Some(response.presentation_snapshot_id.as_str())
+            != execution.presentation_snapshot_id.as_deref()
+        || execution.workspace_id != owner.workspace_id
+        || execution.parent_thread_id.as_deref() != Some(owner.thread_id.as_str())
+        || !agent_start_grant_matches_source(
+            processor,
+            row,
+            &execution,
+            &saved_grant,
+            &grant,
+            turn_id,
+        )
+        .await?
+        || (!legacy_compacted
+            && payload
+                .pointer("/dispatch/execution_generation")
+                .and_then(serde_json::Value::as_i64)
+                != Some(execution.execution_generation))
+    {
+        return Ok(AgentStartReconciliation::Unresolved);
+    }
+    let action = pioneer_crud::load_agent_action(&store.database_connection(), &row.action_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("rejected StartAgent source action is missing"))?;
+    let receipt =
+        pioneer_crud::load_agent_action_receipt(&store.database_connection(), &row.action_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("rejected StartAgent source receipt is missing"))?;
+    let (workspace_id, authored_turn) = store
+        .get_turn(&owner.thread_id, turn_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("rejected StartAgent Turn is missing"))?;
+    if workspace_id != owner.workspace_id
+        || action.status != "committed" || action.action_kind != "start_agent"
+        || action.execution_id != row.owner_execution_id || receipt.decision != "allowed"
+        || receipt.actor_kind != "agent_execution"
+        || receipt.actor_id.as_deref() != Some(row.owner_execution_id.as_str())
+        || !authored_turn.author.as_ref().is_some_and(|author| matches!(&author.actor,
+            pioneer_protocol::PersistedActorRef::AgentExecution(id) if id.as_str() == row.owner_execution_id)) {
+        return Ok(AgentStartReconciliation::Unresolved);
+    }
+    if let Some(parent) = execution.parent_execution_id.as_deref() {
+        if parent != row.owner_execution_id {
+            return Ok(AgentStartReconciliation::Unresolved);
+        }
+    }
+    if authored_turn.status != pioneer_protocol::TurnStatus::InProgress {
+        if !store
+            .finalize_terminal_agent_turn_owned(&owner, execution_id, pioneer_crud::utc_now())
+            .await?
+        {
+            return Ok(AgentStartReconciliation::Unresolved);
+        }
+        return Ok(
+            if processor
+                .synchronize_projected_native_terminal_turn(
+                    &owner.workspace_id,
+                    &owner.thread_id,
+                    turn_id,
+                )
+                .await?
+            {
+                AgentStartReconciliation::Finalized
+            } else {
+                AgentStartReconciliation::Unresolved
+            },
+        );
+    }
+    if store.native_turn_has_accepted_terminal(turn_id).await? {
+        // Projection, cleanup and memory synchronization still owe confirmation.
+        // Runtime evidence cannot acknowledge a pending canonical terminal.
+        return Ok(AgentStartReconciliation::Unresolved);
+    }
+    // Process ownership protects active mutation, not acknowledgement of an
+    // already canonical terminal generation after Gateway restart.
+    if owner.owner_id != processor.turn_execution_owner_id.as_ref() {
+        return Ok(AgentStartReconciliation::Unresolved);
+    }
+    if legacy_compacted {
+        // A recovered compacted link can confirm only a canonical terminal.
+        // It never authorizes activation or refusal of a later generation.
+        return Ok(AgentStartReconciliation::Unresolved);
+    }
+    if owner.owner_generation > 1 {
+        return Ok(AgentStartReconciliation::RuntimeOwned); // recovery/resume owns its outcome
+    }
+    // Reconcile potential effects before a local refusal. A runtime that has
+    // already accepted the Turn owns its outcome; a lost ACK is not a new start.
+    if owner.started_at.is_some()
+        || store
+            .latest_cli_runtime_turn_attempt(turn_id)
+            .await?
+            .is_some()
+    {
+        return Ok(AgentStartReconciliation::RuntimeOwned);
+    }
+    if owner.executor_kind != pioneer_crud::TurnExecutorKind::CliRuntime {
+        match processor
+            .agent_manager
+            .observe_turn(&owner.thread_id, turn_id)
+            .await
+        {
+            Ok(Some(_)) => return Ok(AgentStartReconciliation::RuntimeOwned),
+            Ok(None) | Err(pioneer_agent::AgentControlError::ThreadNotFound) => {}
+            Err(_) => return Ok(AgentStartReconciliation::Unresolved),
+        }
+    }
+    processor
+        .ensure_thread_loaded(&owner.thread_id, &owner.workspace_id)
+        .await?;
+    let mut terminal_turn = authored_turn;
+    terminal_turn.error = Some(failure.safe_name().to_owned());
+    let event = if failure == pioneer_crud::AgentActionOutboxFailure::OutcomeUnknown {
+        terminal_turn.status = pioneer_protocol::TurnStatus::Blocked;
+        pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(
+            pioneer_protocol::TurnBlockedNotification {
+                workspace_id: owner.workspace_id.clone(),
+                thread_id: owner.thread_id.clone(),
+                turn: terminal_turn,
+                resume: None,
+            },
+        )
+    } else {
+        terminal_turn.status = pioneer_protocol::TurnStatus::Failed;
+        pioneer_crud::CanonicalTurnEventPayload::TurnFailed(
+            pioneer_protocol::TurnFailedNotification {
+                workspace_id: owner.workspace_id.clone(),
+                thread_id: owner.thread_id.clone(),
+                turn: terminal_turn,
+            },
+        )
+    };
+    let timestamp = pioneer_crud::utc_now().timestamp();
+    store
+        .materialize_unactivated_turn_refusal_owned(event.clone(), timestamp, owner.clone())
+        .await?;
+    #[cfg(test)]
+    processor
+        .completed_history_preparation_barrier
+        .wait_if_armed(
+            "__agent_start_after_terminal_acceptance__",
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    // Confirm through the existing Gateway publication/synchronization path.
+    // Acceptance above already owns the terminal result and released resources.
+    processor
+        .materialize_native_agent_turn_event(event, timestamp, None)
+        .await?;
+    if !processor
+        .synchronize_projected_native_terminal_turn(&owner.workspace_id, &owner.thread_id, turn_id)
+        .await?
+    {
+        return Ok(AgentStartReconciliation::Unresolved);
+    }
+    Ok(AgentStartReconciliation::Finalized)
+}
+
+async fn dispatch_agent_action_outbox_row_inner(
     processor: &Arc<MessageProcessor>,
     row: &pioneer_entity::agent_action_outbox::Model,
 ) -> anyhow::Result<AgentActionOutboxDispatch> {
@@ -3314,6 +3700,27 @@ async fn dispatch_agent_action_outbox_row(
     else {
         return Err(Failure::InvalidStart.into());
     };
+    let saved_grant = pioneer_crud::load_agent_execution_grant(
+        &processor.crud_store.database_connection(),
+        &execution.id,
+    )
+    .await?
+    .ok_or(Failure::InvalidStart)?;
+    let grant: serde_json::Value =
+        serde_json::from_str(&saved_grant.grant_json).map_err(|_| Failure::InvalidStart)?;
+    if row.owner_execution_id != input_execution_id.as_str()
+        || !agent_start_grant_matches_source(
+            processor,
+            row,
+            &execution,
+            &saved_grant,
+            &grant,
+            &dispatch.turn_id,
+        )
+        .await?
+    {
+        return Err(Failure::InvalidStart.into());
+    }
     let independent_root = execution.parent_execution_id.is_none()
         && execution.id == execution.work_graph_root_execution_id
         && execution.home_root_thread_id == dispatch.thread_id;
@@ -3331,22 +3738,6 @@ async fn dispatch_agent_action_outbox_row(
             )
             .await
             .map_err(|error| agent_start_proof_error(error, Failure::InvalidStart))?;
-        let grant = pioneer_crud::load_agent_execution_grant(
-            &processor.crud_store.database_connection(),
-            &execution.id,
-        )
-        .await?
-        .ok_or(Failure::InvalidStart)?;
-        let grant: serde_json::Value =
-            serde_json::from_str(&grant.grant_json).map_err(|_| Failure::InvalidStart)?;
-        if row.owner_execution_id != input_execution_id.as_str()
-            || grant
-                .get("source_action_id")
-                .and_then(serde_json::Value::as_str)
-                != Some(row.action_id.as_str())
-        {
-            return Err(Failure::InvalidStart.into());
-        }
     } else if execution.parent_execution_id.as_deref() != Some(input_execution_id.as_str()) {
         return Err(Failure::InvalidStart.into());
     }
@@ -3375,10 +3766,40 @@ async fn dispatch_agent_action_outbox_row(
             execution.status.as_str(),
             "completed" | "succeeded" | "failed" | "blocked" | "cancelled" | "timed_out"
         )
+        || processor
+            .crud_store
+            .native_turn_has_accepted_terminal(&dispatch.turn_id)
+            .await?
     {
-        // The runtime was already activated (or has since reached a terminal
-        // state). This is the crash-after-dispatch replay window: acknowledge
-        // the outbox without starting the same provider/CLI turn again.
+        if committed_turn.status != pioneer_protocol::TurnStatus::InProgress {
+            anyhow::ensure!(
+                processor
+                    .crud_store
+                    .finalize_terminal_agent_turn_owned(
+                        &owner,
+                        &execution.id,
+                        pioneer_crud::utc_now()
+                    )
+                    .await?,
+                Failure::PreparationUnavailable
+            );
+            anyhow::ensure!(
+                processor
+                    .synchronize_projected_native_terminal_turn(
+                        &owner.workspace_id,
+                        &owner.thread_id,
+                        &dispatch.turn_id,
+                    )
+                    .await?,
+                Failure::PreparationUnavailable
+            );
+        } else {
+            // A terminal graph alone does not prove canonical projection or
+            // recovery ownership. Reconciliation retains the outbox obligation.
+            return Err(Failure::OutcomeUnknown.into());
+        }
+        // Delivery acknowledgement confirms only the dispatch boundary. The
+        // canonical Turn remains the source of truth for the model's outcome.
         return Ok(AgentActionOutboxDispatch::Delivered);
     }
     if owner.owner_id != processor.turn_execution_owner_id.as_ref() {
@@ -3387,13 +3808,6 @@ async fn dispatch_agent_action_outbox_row(
     if owner.owner_generation > 1 {
         // Recovery/resume has taken ownership of this Turn. Its own runtime
         // protocol owns activation; the initial outbox must not start it again.
-        return Ok(AgentActionOutboxDispatch::Delivered);
-    }
-    if processor
-        .crud_store
-        .native_turn_has_accepted_terminal(&dispatch.turn_id)
-        .await?
-    {
         return Ok(AgentActionOutboxDispatch::Delivered);
     }
     let cli = matches!(
@@ -3448,6 +3862,17 @@ async fn dispatch_agent_action_outbox_row(
                 .await
                 .is_some_and(|active| active != dispatch.turn_id))
     {
+        let user_root = dispatch.home_root_thread_id == dispatch.thread_id
+            && target_thread.sidebar_visibility
+                == pioneer_protocol::ThreadSidebarVisibility::Visible
+            && processor
+                .crud_store
+                .get_task_thread_lineage(&dispatch.thread_id)
+                .await?
+                .is_none();
+        if user_root {
+            return Err(Failure::ForegroundConflict.into());
+        }
         return Ok(AgentActionOutboxDispatch::AwaitingRuntime);
     }
     let resource = pioneer_crud::load_agent_execution_resource_state(
@@ -3603,6 +4028,52 @@ async fn dispatch_agent_action_outbox_row(
             processor
                 .dispatch_prepared_api_provider_turn_start(prepared)
                 .await;
+            // The shared helper also serves ordinary callers and may fail to
+            // persist either recovery or a terminal result. Its return is not ACK.
+            if processor
+                .crud_store
+                .native_turn_has_accepted_terminal(&dispatch.turn_id)
+                .await?
+            {
+                anyhow::ensure!(
+                    processor
+                        .crud_store
+                        .finalize_terminal_agent_turn_owned(
+                            &owner,
+                            &execution.id,
+                            pioneer_crud::utc_now(),
+                        )
+                        .await?,
+                    Failure::PreparationUnavailable
+                );
+                anyhow::ensure!(
+                    processor
+                        .synchronize_projected_native_terminal_turn(
+                            &owner.workspace_id,
+                            &owner.thread_id,
+                            &dispatch.turn_id,
+                        )
+                        .await?,
+                    Failure::PreparationUnavailable
+                );
+            } else if processor
+                .crud_store
+                .find_unresolved_recovery_job_for_turn(&dispatch.turn_id)
+                .await?
+                .is_none()
+            {
+                match processor
+                    .agent_manager
+                    .observe_turn(&dispatch.thread_id, &dispatch.turn_id)
+                    .await
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(pioneer_agent::AgentControlError::ThreadNotFound) => {
+                        return Err(Failure::OutcomeUnknown.into());
+                    }
+                    Err(_) => return Err(Failure::ControlUnavailable.into()),
+                }
+            }
         }
         Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime {
             runtime_id,

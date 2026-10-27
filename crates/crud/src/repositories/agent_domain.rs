@@ -53,9 +53,26 @@ pub const AGENT_ACTION_OUTBOX_MAX_ATTEMPTS: i64 = 8;
 const _: () = assert!(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS == 8);
 const AGENT_ACTION_OUTBOX_BATCH_LIMIT: u64 = 64;
 const AGENT_ACTION_OUTBOX_RANGE_LIMIT: u64 = 32;
-const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 ORDER BY created_at,id LIMIT ?";
+const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 AND (status='pending' OR last_error IS NULL OR last_error NOT IN ('outbox_start_integrity_rejected','outbox_start_authority_denied','outbox_start_runtime_unavailable','outbox_foreground_conflict','outbox_start_outcome_unknown')) ORDER BY created_at,id LIMIT ?";
 const AGENT_ACTION_OUTBOX_TIMED_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NOT NULL AND (status='pending' OR (status='failed' AND attempts<8)) AND next_attempt_at<=? ORDER BY next_attempt_at,created_at,id LIMIT ?";
 const AGENT_ACTION_OUTBOX_FAILURE_CLASS: &str = "outbox_delivery_failed";
+// An exhausted StartAgent still owes outcome reconciliation, never delivery.
+pub const AGENT_START_RECONCILIATION_REQUIRED: &str = "outbox_start_reconciliation_required";
+// Reconciliation claims bounded candidates before checking canonical proof.
+// Legacy failed/8/NULL terminal receipts must be ACKed once, not filtered while
+// remaining forever in the working index. The dispatcher validates their exact
+// terminal generation/resources and never redelivers an exhausted model start.
+// The immutable payload kind narrows the index; missing/invalid kind remains a
+// candidate. The action join remains authoritative, never payload authorization.
+const AGENT_START_RECONCILIATION_SQL: &str = "SELECT o.id FROM agent_action_outbox o JOIN agent_action a ON a.id=o.action_id WHERE a.action_kind='start_agent' AND o.status IN ('pending','failed') AND o.attempts=8 AND COALESCE(CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.kind') END,'start_agent')='start_agent' AND (o.next_attempt_at IS NULL OR o.next_attempt_at<=?) ORDER BY o.next_attempt_at,o.created_at,o.id LIMIT ?";
+
+const AGENT_START_TERMINAL_FAILURE_CLASSES: [&str; 5] = [
+    "outbox_start_integrity_rejected",
+    "outbox_start_authority_denied",
+    "outbox_start_runtime_unavailable",
+    "outbox_foreground_conflict",
+    "outbox_start_outcome_unknown",
+];
 pub const AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS: i64 = 30;
 pub const AGENT_ROUTE_GRAPH_MAX_EDGES: usize = 2_048;
 const AGENT_PROJECTION_BATCH_LIMIT: usize = 200;
@@ -4800,7 +4817,41 @@ where
         .add(
             Condition::all()
                 .add(agent_action_outbox::Column::Status.eq("failed"))
-                .add(agent_action_outbox::Column::Attempts.gte(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS))
+                .add(
+                    Condition::any()
+                        .add(
+                            Condition::all()
+                                .add(
+                                    agent_action_outbox::Column::Attempts
+                                        .gte(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS),
+                                )
+                                // Exclude unresolved starts before LIMIT using
+                                // a point lookup of the canonical action.
+                                .add(sea_orm::sea_query::Expr::exists(
+                                    Query::select()
+                                        .column(agent_action::Column::Id)
+                                        .from(agent_action::Entity)
+                                        .and_where(
+                                            sea_orm::sea_query::Expr::col((
+                                                agent_action::Entity,
+                                                agent_action::Column::Id,
+                                            ))
+                                            .equals((
+                                                agent_action_outbox::Entity,
+                                                agent_action_outbox::Column::ActionId,
+                                            )),
+                                        )
+                                        .and_where(
+                                            agent_action::Column::ActionKind.ne("start_agent"),
+                                        )
+                                        .to_owned(),
+                                )),
+                        )
+                        .add(
+                            agent_action_outbox::Column::LastError
+                                .is_in(AGENT_START_TERMINAL_FAILURE_CLASSES),
+                        ),
+                )
                 .add(agent_action_outbox::Column::NextAttemptAt.is_null()),
         );
     let candidates = agent_action_outbox::Entity::find()
@@ -4823,6 +4874,44 @@ where
             .await
             .context("failed to load compactable agent domain action")?
             .context("compactable agent domain outbox has no action")?;
+        if action.action_kind == "start_agent"
+            && candidate.status == "failed"
+            && !candidate
+                .last_error
+                .as_deref()
+                .is_some_and(|cause| AGENT_START_TERMINAL_FAILURE_CLASSES.contains(&cause))
+        {
+            continue; // exhaustion is a reconciliation obligation, not a terminal receipt
+        }
+        if action.action_kind == "start_agent" && candidate.status == "failed" {
+            let payload: serde_json::Value = serde_json::from_str(&candidate.payload_json)?;
+            let Some(turn_id) = payload
+                .pointer("/dispatch/turn_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(execution_id) = payload
+                .get("spawned_execution_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let response = load_agent_turn_response(db, turn_id).await?;
+            let resource = load_agent_execution_resource_state(db, execution_id).await?;
+            if response.is_none_or(|response| response.execution_id != execution_id)
+                || !super::turn_event_projection_stream_state::has_accepted_terminal(db, turn_id)
+                    .await?
+                || resource.is_none_or(|resource| {
+                    !matches!(
+                        resource.status.as_str(),
+                        "completed" | "failed" | "blocked" | "cancelled" | "timed_out"
+                    )
+                })
+            {
+                continue;
+            }
+        }
         let receipt = agent_action_receipt::Entity::find()
             .filter(agent_action_receipt::Column::ActionId.eq(candidate.action_id.clone()))
             .one(db)
@@ -4979,6 +5068,22 @@ fn compacted_agent_action_outbox_payload(
             spawned_execution_id.clone(),
         );
     }
+    if action.action_kind == "start_agent" {
+        // Keep only the immutable binding required for terminal reconciliation;
+        // input, launch parameters and the runtime dispatch payload are released.
+        let turn_id = original
+            .pointer("/dispatch/turn_id")
+            .and_then(serde_json::Value::as_str)
+            .context("compactable StartAgent has no terminal Turn binding")?;
+        let generation = original
+            .pointer("/dispatch/execution_generation")
+            .and_then(serde_json::Value::as_i64)
+            .context("compactable StartAgent has no execution generation")?;
+        retained.insert(
+            "dispatch".to_owned(),
+            serde_json::json!({"turn_id":turn_id, "execution_generation":generation}),
+        );
+    }
     // Replay must distinguish the original launch choice from its resolved
     // profile even after the dispatch envelope has been released.
     if let Some(fingerprint) = original.get("launch_request_fingerprint") {
@@ -5067,8 +5172,30 @@ struct AgentActionOutboxId {
     id: String,
 }
 
-// Keep these predicates literally aligned with the partial indexes in
-// m20261008_000002_background_access_indexes. Only clocks and limits are binds.
+// Predicates and ordering match the existing due indexes and the exhausted
+// expression index added by m20261026_000001_agent_start_reconciliation_index.
+// SeaORM/SeaQuery do not expose SQLite INDEXED BY on the bounded UNION arm;
+// keep that discovery statement here, with only clocks and limits as binds.
+fn agent_action_outbox_timed_discovery_sql() -> String {
+    // Empty text sorts before every stored timestamp. This makes NULL and timed
+    // exhausted deadlines one searchable range with the unchanged input quota.
+    let exhausted = AGENT_START_RECONCILIATION_SQL.replace(
+        "SELECT o.id FROM agent_action_outbox o",
+        "SELECT o.id,o.next_attempt_at,o.created_at FROM agent_action_outbox o INDEXED BY idx_agent_action_outbox_exhausted",
+    ).replace("(o.next_attempt_at IS NULL OR o.next_attempt_at<=?)",
+        "COALESCE(o.next_attempt_at,'')<=?")
+     .replace("ORDER BY o.next_attempt_at,o.created_at,o.id",
+        "ORDER BY COALESCE(o.next_attempt_at,''),o.created_at,o.id");
+    format!(
+        "SELECT id FROM (SELECT id,next_attempt_at,created_at FROM ({}) UNION SELECT id,next_attempt_at,created_at FROM ({})) ORDER BY next_attempt_at,created_at,id LIMIT ?",
+        AGENT_ACTION_OUTBOX_TIMED_SQL.replace(
+            "SELECT id FROM",
+            "SELECT id,next_attempt_at,created_at FROM"
+        ),
+        exhausted,
+    )
+}
+
 async fn discover_agent_action_outbox<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
@@ -5084,15 +5211,25 @@ async fn discover_agent_action_outbox<C: ConnectionTrait>(
     .all(db)
     .await
     .context("failed to list immediate agent action outbox IDs")?;
+    // The original timed predicate retains its partial-index access. A second
+    // bounded range supplies exhausted StartAgent reconciliation; their merged
+    // due order shares the existing timed quantum, including limit=2 callers.
+    let timed_sql = agent_action_outbox_timed_discovery_sql();
     ids.extend(
         AgentActionOutboxId::find_by_statement(Statement::from_sql_and_values(
             db.get_database_backend(),
-            AGENT_ACTION_OUTBOX_TIMED_SQL,
-            [now.into(), timed_limit.into()],
+            timed_sql,
+            [
+                now.clone().into(),
+                timed_limit.into(),
+                now.into(),
+                timed_limit.into(),
+                timed_limit.into(),
+            ],
         ))
         .all(db)
         .await
-        .context("failed to list timed agent action outbox IDs")?,
+        .context("failed to list timed agent start delivery/reconciliation IDs")?,
     );
     // A concurrent source transition can move an ID between these two reads.
     // Retain range order but never transition the same input twice per quantum.
@@ -5276,8 +5413,27 @@ async fn transition_agent_action_outbox<C: ConnectionTrait>(
         return Ok(false);
     }
     let exhausted = candidate.attempts >= AGENT_ACTION_OUTBOX_MAX_ATTEMPTS;
-    if exhausted && (candidate.status != "pending" || candidate.next_attempt_at.is_none()) {
-        // Final attempt with a NULL lease was never supported closure eligibility.
+    let reconcile_start = exhausted
+        && agent_action::Entity::find_by_id(candidate.action_id.clone())
+            .one(db)
+            .await?
+            .is_some_and(|action| action.action_kind == "start_agent");
+    // Only locally finalized StartAgent refusals add an early terminal case.
+    // Legacy immediate failures and other action kinds retain their behavior.
+    if !reconcile_start
+        && candidate.status == "failed"
+        && candidate.next_attempt_at.is_none()
+        && candidate
+            .last_error
+            .as_deref()
+            .is_some_and(|cause| AGENT_START_TERMINAL_FAILURE_CLASSES.contains(&cause))
+    {
+        return Ok(false);
+    }
+    if exhausted
+        && !reconcile_start
+        && (candidate.status != "pending" || candidate.next_attempt_at.is_none())
+    {
         return Ok(false);
     }
     let lease_guard = match candidate.next_attempt_at.clone() {
@@ -5289,7 +5445,14 @@ async fn transition_agent_action_outbox<C: ConnectionTrait>(
         .filter(agent_action_outbox::Column::Status.eq(candidate.status.clone()))
         .filter(agent_action_outbox::Column::Attempts.eq(candidate.attempts))
         .filter(lease_guard);
-    let (status, attempts, next_attempt_at, last_error) = if exhausted {
+    let (status, attempts, next_attempt_at, last_error) = if reconcile_start {
+        (
+            "pending",
+            candidate.attempts,
+            Some(now + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS)),
+            Some(AGENT_START_RECONCILIATION_REQUIRED.to_owned()),
+        )
+    } else if exhausted {
         (
             "failed",
             candidate.attempts,
@@ -5324,7 +5487,7 @@ async fn transition_agent_action_outbox<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to transition agent action outbox input")?;
-    if result.rows_affected != 1 || exhausted {
+    if result.rows_affected != 1 || (exhausted && !reconcile_start) {
         return Ok(false);
     }
     candidate.status = status.to_owned();
@@ -5403,7 +5566,48 @@ pub async fn mark_agent_action_outbox_failed<C: ConnectionTrait>(
     expected_attempts: i64,
     failed_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    let next_attempt_at = agent_action_outbox_retry_at(expected_attempts, failed_at.clone())?;
+    mark_agent_action_outbox_failed_with_cause(
+        db,
+        outbox_id,
+        expected_attempts,
+        failed_at,
+        AgentActionOutboxFailure::DeliveryFailed,
+        false,
+    )
+    .await
+}
+
+pub async fn mark_agent_action_outbox_failed_with_cause<C: ConnectionTrait>(
+    db: &C,
+    outbox_id: &str,
+    expected_attempts: i64,
+    failed_at: DateTimeWithTimeZone,
+    failure: AgentActionOutboxFailure,
+    terminal: bool,
+) -> Result<bool> {
+    let exhausted_start = if !terminal && expected_attempts == AGENT_ACTION_OUTBOX_MAX_ATTEMPTS {
+        match agent_action_outbox::Entity::find_by_id(outbox_id.to_owned())
+            .one(db)
+            .await?
+        {
+            Some(row) if row.attempts == expected_attempts => {
+                agent_action::Entity::find_by_id(row.action_id)
+                    .one(db)
+                    .await?
+                    .is_some_and(|action| action.action_kind == "start_agent")
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    let next_attempt_at = if terminal {
+        None
+    } else if exhausted_start {
+        Some(failed_at.clone() + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS))
+    } else {
+        agent_action_outbox_retry_at(expected_attempts, failed_at.clone())?
+    };
     let result = agent_action_outbox::Entity::update_many()
         .col_expr(
             agent_action_outbox::Column::Status,
@@ -5411,7 +5615,15 @@ pub async fn mark_agent_action_outbox_failed<C: ConnectionTrait>(
         )
         .col_expr(
             agent_action_outbox::Column::LastError,
-            sea_orm::sea_query::Expr::value(Some(AGENT_ACTION_OUTBOX_FAILURE_CLASS.to_owned())),
+            sea_orm::sea_query::Expr::value(Some(
+                if exhausted_start
+                    && AGENT_START_TERMINAL_FAILURE_CLASSES.contains(&failure.safe_name())
+                {
+                    AGENT_START_RECONCILIATION_REQUIRED.to_owned()
+                } else {
+                    failure.safe_name().to_owned()
+                },
+            )),
         )
         .col_expr(
             agent_action_outbox::Column::NextAttemptAt,
@@ -8253,7 +8465,7 @@ mod tests {
             "kind": "start_agent",
             "spawned_execution_id": "spawned-old",
             "launch_request_fingerprint": "a".repeat(64),
-            "dispatch": {"opaque": "y".repeat(8192)},
+            "dispatch": {"turn_id":"turn-old", "execution_generation":1, "opaque": "y".repeat(8192)},
         })
         .to_string();
         insert_compaction_test_tuple(
@@ -8265,6 +8477,26 @@ mod tests {
             Some(old.clone()),
             old_response.clone(),
             old_payload.clone(),
+        )
+        .await;
+        // An older exhausted StartAgent still owes reconciliation. It must not
+        // consume the compaction quantum forever ahead of closed action tuples.
+        insert_compaction_test_tuple(
+            &db,
+            "unresolved",
+            "failed",
+            AGENT_ACTION_OUTBOX_MAX_ATTEMPTS,
+            old - Duration::days(1),
+            None,
+            "unresolved-response".to_owned(),
+            serde_json::json!({
+                "action_id": "action-unresolved",
+                "execution_id": "execution-unresolved",
+                "kind": "start_agent",
+                "spawned_execution_id": "spawned-unresolved",
+                "dispatch": {"turn_id":"turn-unresolved", "execution_generation":1},
+            })
+            .to_string(),
         )
         .await;
         insert_compaction_test_tuple(
@@ -8300,12 +8532,18 @@ mod tests {
         )
         .await;
 
-        let summary = compact_terminal_agent_action_ledger(&db, now, 100)
+        let summary = compact_terminal_agent_action_ledger(&db, now, 1)
             .await
             .unwrap();
         assert_eq!(summary.candidate_rows, 1);
         assert_eq!(summary.compacted_rows, 1);
         assert!(summary.payload_bytes_released > 0);
+        let unresolved = agent_action_outbox::Entity::find_by_id("outbox-unresolved")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!unresolved.payload_json.contains("_pioneer_compacted"));
 
         let action = agent_action::Entity::find_by_id("action-old")
             .one(&db)
@@ -8344,6 +8582,10 @@ mod tests {
                 .get("spawned_execution_id")
                 .and_then(serde_json::Value::as_str),
             Some("spawned-old")
+        );
+        assert_eq!(
+            compacted_payload["dispatch"],
+            serde_json::json!({"turn_id":"turn-old", "execution_generation":1})
         );
         assert_eq!(
             compacted_payload["launch_request_fingerprint"],

@@ -4662,6 +4662,7 @@ impl ThreadsFacade {
         use crate::turn_mcp::native_tools::NativeToolFamily;
         let definitions = [
             NativeToolFamily::Html,
+            NativeToolFamily::ComputerUse,
             NativeToolFamily::Tasks,
             NativeToolFamily::Threads,
         ]
@@ -5576,6 +5577,236 @@ fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() 
             assert!(
                 !caller.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
             );
+        }
+    });
+}
+
+#[test]
+fn ordinary_cli_delegated_root_dispatch_uses_cli_attempt_and_replays_without_native_actor() {
+    run_standard_stack_message_test("CLI Threads first root dispatch", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            for proof_fault in ["none", "lease", "context", "catalog"] {
+                let (harness, processor, turn) = start_task_cli_fixture(kind).await;
+                let facade = ThreadsFacade::new(&processor, &turn, kind).await;
+                let options = facade
+                    .call(
+                        "root-options",
+                        "root-options",
+                        "threads_start_options",
+                        json!({}),
+                    )
+                    .await;
+                let creation = options["threadCreationOptions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|option| option["label"] == "New delegated root")
+                    .unwrap()["id"]
+                    .clone();
+                let created = facade
+                    .call(
+                        "root-create",
+                        "root-create",
+                        "thread_create",
+                        json!({"optionId":creation}),
+                    )
+                    .await;
+                let target = created["targetOptions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|option| {
+                        !options["targetOptions"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|old| old["id"] == option["id"])
+                    })
+                    .unwrap()["id"]
+                    .clone();
+                let started = facade.call("root-start", "root-start", "threads_turn_start", json!({
+                "targetOptionId":target, "input":[{"type":"text","text":"Ordinary CLI root execution"}],
+            })).await;
+                let db = processor.crud_store.database_connection();
+                let outbox = pioneer_entity::agent_action_outbox::Entity::find_by_id(
+                    started["outboxId"].as_str().unwrap(),
+                )
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+                let payload: JsonValue = serde_json::from_str(&outbox.payload_json).unwrap();
+                let params: pioneer_protocol::TurnStartParams =
+                    serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+                let execution = pioneer_crud::load_agent_execution(
+                    &db,
+                    payload["spawned_execution_id"].as_str().unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(execution.parent_execution_id.is_none());
+                assert_eq!(execution.work_graph_root_execution_id, execution.id);
+                assert_eq!(execution.home_root_thread_id, params.thread_id);
+                assert!(
+                    processor
+                        .crud_store
+                        .get_task_run_turn_by_turn(&params.thread_id, &params.turn_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(matches!(
+                    processor
+                        .agent_manager
+                        .observe_turn(&params.thread_id, &params.turn_id)
+                        .await,
+                    Err(pioneer_agent::AgentControlError::ThreadNotFound)
+                ));
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("threads-independent-cli")
+                    .await;
+                if proof_fault != "none" {
+                    processor.arm_completed_history_preparation_barrier(
+                        if proof_fault == "lease" {
+                            "__cli_agent_before_lease_proof__"
+                        } else if proof_fault == "catalog" {
+                            "__cli_agent_catalog_before_task_proof__"
+                        } else {
+                            "__cli_agent_before_context_proof__"
+                        },
+                    );
+                    let dispatch = tokio::spawn({
+                        let processor = processor.clone();
+                        async move {
+                            crate::message::agent_action_tools::process_due_agent_action_outbox(
+                                &processor, 64,
+                            )
+                            .await
+                            .unwrap()
+                        }
+                    });
+                    timeout(
+                        Duration::from_secs(10),
+                        processor.wait_for_completed_history_preparation_barrier(),
+                    )
+                    .await
+                    .unwrap();
+                    db.execute_unprepared("ALTER TABLE turn RENAME TO unavailable_turn")
+                        .await
+                        .unwrap();
+                    if proof_fault == "catalog" {
+                        processor.arm_completed_history_preparation_barrier(
+                            "__cli_agent_catalog_proof_failed__",
+                        );
+                    }
+                    processor.release_completed_history_preparation_barrier();
+                    if proof_fault == "catalog" {
+                        timeout(
+                            Duration::from_secs(10),
+                            processor.wait_for_completed_history_preparation_barrier(),
+                        )
+                        .await
+                        .unwrap();
+                        // Restore before the finalizer caller decides whether to
+                        // write Blocked: terminal persistence is now available.
+                        db.execute_unprepared("ALTER TABLE unavailable_turn RENAME TO turn")
+                            .await
+                            .unwrap();
+                        processor.release_completed_history_preparation_barrier();
+                    }
+                    dispatch.await.unwrap();
+                    if proof_fault != "catalog" {
+                        db.execute_unprepared("ALTER TABLE unavailable_turn RENAME TO turn")
+                            .await
+                            .unwrap();
+                    }
+                    assert_eq!(
+                        processor
+                            .crud_store
+                            .get_turn(&params.thread_id, &params.turn_id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .1
+                            .status,
+                        pioneer_protocol::TurnStatus::InProgress
+                    );
+                    assert!(
+                        !processor
+                            .crud_store
+                            .native_turn_has_accepted_terminal(&params.turn_id)
+                            .await
+                            .unwrap()
+                    );
+                    assert!(
+                        processor
+                            .crud_store
+                            .latest_cli_runtime_turn_attempt(&params.turn_id)
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(harness.cli_session.turn_starts.lock().await.len(), 1);
+                    use sea_orm::{ActiveModelTrait, Set};
+                    let failed =
+                        pioneer_entity::agent_action_outbox::Entity::find_by_id(&outbox.id)
+                            .one(&db)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(
+                        failed.last_error.as_deref(),
+                        Some("outbox_storage_unavailable")
+                    );
+                    let mut retry: pioneer_entity::agent_action_outbox::ActiveModel = failed.into();
+                    retry.next_attempt_at =
+                        Set(Some(pioneer_crud::utc_now() - chrono::Duration::seconds(1)));
+                    retry.update(&db).await.unwrap();
+                }
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap();
+                wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
+                wait_for_task_cli_activation(&processor, &params.turn_id).await;
+                assert!(
+                    processor
+                        .crud_store
+                        .latest_cli_runtime_turn_attempt(&params.turn_id)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(matches!(
+                    processor
+                        .agent_manager
+                        .observe_turn(&params.thread_id, &params.turn_id)
+                        .await,
+                    Err(pioneer_agent::AgentControlError::ThreadNotFound)
+                ));
+                // Lose the dispatch ACK, then replay the exact durable operation.
+                use sea_orm::{ActiveModelTrait, Set};
+                let mut pending: pioneer_entity::agent_action_outbox::ActiveModel =
+                    pioneer_entity::agent_action_outbox::Entity::find_by_id(&outbox.id)
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .into();
+                pending.status = Set("pending".into());
+                pending.delivered_at = Set(None);
+                pending.next_attempt_at = Set(None);
+                pending.update(&db).await.unwrap();
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap();
+                assert_eq!(harness.cli_session.turn_starts.lock().await.len(), 2);
+            }
         }
     });
 }
