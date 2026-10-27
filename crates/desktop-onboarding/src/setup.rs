@@ -491,7 +491,7 @@ fn handle_alphanumeric_otp_key_down(
     cx: &mut Context<OtpState>,
 ) {
     let keystroke = &event.keystroke;
-    if keystroke.modifiers.secondary() && keystroke.key.eq_ignore_ascii_case("v") {
+    if keystroke.modifiers.secondary(cx) && keystroke.key.eq_ignore_ascii_case("v") {
         if let Some(value) = cx.read_from_clipboard().and_then(|item| item.text())
             && let Ok(normalized) = normalize_device_activation_code_input(value.trim())
             && !normalized.is_empty()
