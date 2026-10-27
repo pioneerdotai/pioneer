@@ -2551,6 +2551,7 @@ async fn capability_persistence_order_impl() {
             .expect("committed lane should stay open");
         // This unrestricted turn admits the Threads catalog alongside the
         // default HTML and task tools.
+        let thread_actions = ["thread_create", "thread_message_send", "threads_turn_start"];
         let expected_mcp_bindings = 2
             + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
                 .definitions()
@@ -2572,6 +2573,7 @@ async fn capability_persistence_order_impl() {
                 && mcp_bindings.len() == expected_mcp_bindings
                 && mcp_bindings.iter().all(|binding| crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id).is_some())
                 && mcp_bindings.iter().any(|binding| binding.raw_tool_name == "task_wait")
+                && thread_actions.iter().all(|name| mcp_bindings.iter().any(|binding| binding.raw_tool_name == *name))
         ));
         let committed_skills = timeout(Duration::from_secs(1), committed_rx.recv())
             .await
