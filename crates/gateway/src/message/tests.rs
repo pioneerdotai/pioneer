@@ -2549,15 +2549,15 @@ async fn capability_persistence_order_impl() {
             .await
             .expect("committed MCP capability event should arrive")
             .expect("committed lane should stay open");
-        // Thread actions/model options require explicit selection; this turn
-        // admits only the readers alongside the default HTML and task tools.
+        // This unrestricted turn admits the Threads catalog alongside the
+        // default HTML and task tools.
         let expected_mcp_bindings = 2
             + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
                 .definitions()
                 .len()
-            + super::thread_read_tools::thread_read_tool_specs().len()
-            + super::thread_search_tools::thread_search_tool_specs().len()
-            + super::thread_tool_results::thread_result_tool_specs().len();
+            + crate::turn_mcp::native_tools::NativeToolFamily::Threads
+                .definitions()
+                .len();
         assert!(matches!(
             committed_capabilities,
             AgentDurableEvent::TurnCapabilitiesResolved {

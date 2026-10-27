@@ -478,8 +478,8 @@ impl GatewayTurnMcpInvoker {
             })?;
         let native_family =
             super::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id);
-        let action = native_family
-            .map(|family| family.action(&binding.raw_tool_name))
+        let actions = native_family
+            .map(|family| family.actions(&binding.raw_tool_name))
             .transpose()
             .map_err(|_| {
                 invocation_error(
@@ -487,33 +487,42 @@ impl GatewayTurnMcpInvoker {
                     "unknown native callable",
                 )
             })?
-            .unwrap_or(ResourceAction::McpUse);
-        let revalidated = self
-            .execution_leases
-            .revalidate_for_turn(
-                self.crud_store.as_ref(),
-                &context,
-                invocation.workspace_id.as_str(),
-                invocation.thread_id.as_str(),
-                invocation.turn_id.as_str(),
-                action,
-                self.authorization_invalidation_hub
-                    .current_revision()
-                    .await
-                    .map_err(|_| {
-                        invocation_error(
-                            TurnMcpInvocationErrorCode::ProjectionUnavailable,
-                            "MCP authorization policy generation is unavailable",
-                        )
-                    })?,
-            )
+            .unwrap_or_else(|| vec![ResourceAction::McpUse]);
+        let revision = self
+            .authorization_invalidation_hub
+            .current_revision()
             .await
             .map_err(|_| {
                 invocation_error(
-                    TurnMcpInvocationErrorCode::PermissionDenied,
-                    "current execution authorization no longer permits MCP use",
+                    TurnMcpInvocationErrorCode::ProjectionUnavailable,
+                    "MCP authorization policy generation is unavailable",
                 )
             })?;
+        let mut revalidated = None;
+        for action in actions {
+            if let Ok(proof) = self
+                .execution_leases
+                .revalidate_for_turn(
+                    self.crud_store.as_ref(),
+                    &context,
+                    invocation.workspace_id.as_str(),
+                    invocation.thread_id.as_str(),
+                    invocation.turn_id.as_str(),
+                    action,
+                    revision,
+                )
+                .await
+            {
+                revalidated = Some(proof);
+                break;
+            }
+        }
+        let revalidated = revalidated.ok_or_else(|| {
+            invocation_error(
+                TurnMcpInvocationErrorCode::PermissionDenied,
+                "current execution authorization no longer permits MCP use",
+            )
+        })?;
 
         if binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID && native_family.is_none() {
             let action_gate = AuthorizationService::new().authorize_action(

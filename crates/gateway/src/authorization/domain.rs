@@ -196,6 +196,13 @@ pub(crate) enum ResourceAction {
 }
 
 impl ResourceAction {
+    pub(crate) const fn is_thread_creation(self) -> bool {
+        matches!(
+            self,
+            Self::ThreadCreatePrivate | Self::ThreadCreateWorkspace
+        )
+    }
+
     pub(crate) const ALL: [Self; 88] = [
         Self::GatewayManage,
         Self::WorkspaceList,

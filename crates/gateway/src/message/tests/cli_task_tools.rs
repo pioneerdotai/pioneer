@@ -138,6 +138,40 @@ fn cli_explicit_model_and_reasoning_reach_native_launch_and_survive_mcp_replay()
         let child =
             wait_for_task_cli_child(&processor, created["runId"].as_str().unwrap(), None).await;
         let starts = wait_for_cli_runtime_turn_starts(&harness.cli_session, 2).await;
+        let child_authority = processor
+            .load_turn_execution_authorization_context(&child.turn_id)
+            .await
+            .unwrap();
+        assert!(
+            child_authority
+                .grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate)
+        );
+        let child_facade =
+            ThreadsFacade::new(&processor, &child.turn_id, CLIAgentRuntimeKind::Codex).await;
+        let options = child_facade
+            .call(
+                "task-child-options",
+                "task-child-options",
+                "threads_start_options",
+                json!({}),
+            )
+            .await;
+        let private_option = options["threadCreationOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["label"] == "Current collaboration")
+            .unwrap()["id"]
+            .clone();
+        let created_thread = child_facade
+            .call(
+                "task-child-create",
+                "task-child-create",
+                "thread_create",
+                json!({"optionId":private_option}),
+            )
+            .await;
+        assert_eq!(created_thread["status"], "accepted");
         let start = &starts[1];
         assert_eq!(start.native_thread_id, child.native_thread_id);
         assert_eq!(start.model.as_deref(), Some("catalog-cli-choice"));
@@ -2126,8 +2160,8 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 "threads_turn_start",
             ] {
                 assert!(
-                    !bindings.iter().any(|binding| binding.raw_tool_name == name),
-                    "unselected thread action must stay outside the fixed CLI catalog: {name}"
+                    bindings.iter().any(|binding| binding.raw_tool_name == name),
+                    "authorized thread operation must reach the ordinary CLI catalog: {name}"
                 );
             }
             // The fixed CLI binding must reach the shared observation handlers,
@@ -3857,11 +3891,24 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
     });
 }
 
-// Trusted admission fixture with an explicit Threads selection. The recording
-// runtime never starts an external provider process.
+// Permission-matrix fixture using real admission and the recording CLI runtime.
+// The primary positive facade test below uses process_request_for_connection.
 async fn start_threads_cli_fixture(
     kind: CLIAgentRuntimeKind,
     denied: &[&str],
+) -> (
+    CliRuntimeSkillPreflightHarness,
+    Arc<MessageProcessor>,
+    String,
+) {
+    let mut profile = default_test_permission_profile();
+    profile.effective_policy.denied_tools = denied.iter().map(|name| (*name).to_owned()).collect();
+    start_threads_cli_fixture_with_policy(kind, profile).await
+}
+
+async fn start_threads_cli_fixture_with_policy(
+    kind: CLIAgentRuntimeKind,
+    profile: pioneer_protocol::TurnPermissionProfileSnapshot,
 ) -> (
     CliRuntimeSkillPreflightHarness,
     Arc<MessageProcessor>,
@@ -3894,14 +3941,6 @@ async fn start_threads_cli_fixture(
         .unwrap();
     let params: pioneer_protocol::TurnStartParams =
         serde_json::from_value(request["params"].clone()).unwrap();
-    let mut profile = default_test_permission_profile();
-    profile.effective_policy.allowed_tools = pioneer_tools::THREADS_DOMAIN_TOOL_NAMES
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
-    // Explicit deny wins over allow and must remove the search schema and
-    // corresponding capability instruction from the frozen catalog.
-    profile.effective_policy.denied_tools = denied.iter().map(|name| (*name).to_owned()).collect();
     let connection = processor
         .session_manager
         .connection_context(harness.connection_id)
@@ -3920,13 +3959,7 @@ async fn start_threads_cli_fixture(
     let admission = ExecutionAdmissionRequest::for_turn(
         ExecutionAdmissionEntryPoint::CliRuntime,
         ResourceAction::AgentTurnStart,
-        vec![
-            ResourceAction::ThreadCreatePrivate,
-            ResourceAction::ThreadCreateWorkspace,
-            ResourceAction::ChildStart,
-            ResourceAction::ChildWrite,
-            ResourceAction::ChildObserve,
-        ],
+        Vec::new(),
         &harness.workspace_id,
         &thread,
         &format!("cli_runtime:{}", harness.runtime_id),
@@ -4265,6 +4298,19 @@ impl ThreadsFacade {
     }
 
     async fn call(&self, rpc: &str, item: &str, name: &str, arguments: JsonValue) -> JsonValue {
+        let response = self.call_response(rpc, item, name, arguments).await;
+        assert!(response.get("error").is_none(), "{name}: {response}");
+        assert_ne!(response["result"]["isError"], true, "{name}: {response}");
+        response["result"]["structuredContent"].clone()
+    }
+
+    async fn call_response(
+        &self,
+        rpc: &str,
+        item: &str,
+        name: &str,
+        arguments: JsonValue,
+    ) -> JsonValue {
         let fingerprint =
             crate::cli_runtime::codex_mcp::canonical_value_fingerprint(&arguments).unwrap();
         let item_id = match self.kind {
@@ -4315,13 +4361,7 @@ impl ThreadsFacade {
         let (response, diagnostics) = crate::public_error::test_support::capture_events_async(
             self.facade.handle_message(&self.context, json!({"jsonrpc":"2.0","id":rpc,"method":"tools/call","params":{"name":name,"arguments":wire,"_meta":meta}})),
         ).await;
-        let response = response.unwrap();
-        assert!(
-            response.get("error").is_none(),
-            "{name}: {response}; diagnostics: {diagnostics:#?}"
-        );
-        assert_ne!(response["result"]["isError"], true, "{name}: {response}");
-        response["result"]["structuredContent"].clone()
+        response.unwrap_or_else(|| panic!("{name}: no response; diagnostics: {diagnostics:#?}"))
     }
 }
 
@@ -4537,5 +4577,409 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
         let facade = ThreadsFacade::new(&processor, &turn, CLIAgentRuntimeKind::Codex).await;
         let denied = facade.facade.handle_message(&facade.context, json!({"jsonrpc":"2.0","id":"denied-options","method":"tools/call","params":{"name":"threads_start_options","arguments":{}}})).await.unwrap();
         assert_eq!(denied["error"]["data"]["kind"], "tool_unbound");
+    });
+}
+
+#[test]
+fn cli_threads_permission_matrix_preserves_restricted_names_denies_and_missing_grants() {
+    run_standard_stack_message_test("CLI Threads permission ceiling", async {
+        for (restricted, allowed, denied, expect_create, expect_models) in [
+            (false, vec![], vec![], true, true),
+            (true, vec![], vec![], false, false),
+            (false, vec!["thread_create"], vec![], true, false),
+            (
+                false,
+                vec!["thread_create"],
+                vec!["thread_create"],
+                false,
+                false,
+            ),
+        ] {
+            let mut profile = default_test_permission_profile();
+            profile.effective_policy.allowed_tools_restricted = restricted;
+            profile.effective_policy.allowed_tools =
+                allowed.into_iter().map(str::to_owned).collect();
+            profile.effective_policy.denied_tools = denied.into_iter().map(str::to_owned).collect();
+            let (_harness, processor, turn) =
+                start_threads_cli_fixture_with_policy(CLIAgentRuntimeKind::Codex, profile).await;
+            let bindings = processor
+                .crud_store
+                .list_turn_mcp_bindings(&turn)
+                .await
+                .unwrap();
+            assert_eq!(
+                bindings
+                    .iter()
+                    .any(|binding| binding.raw_tool_name == "thread_create"),
+                expect_create
+            );
+            assert_eq!(
+                bindings
+                    .iter()
+                    .any(|binding| binding.raw_tool_name == "threads_identity_models_list"),
+                expect_models
+            );
+            assert!(
+                bindings
+                    .iter()
+                    .filter(|binding| binding.raw_tool_name == "threads_start_options")
+                    .count()
+                    <= 1
+            );
+        }
+        let (harness, processor, turn) = start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let facade = ThreadsFacade::new(&processor, &turn, CLIAgentRuntimeKind::Codex).await;
+        let options = facade
+            .call(
+                "old-options",
+                "old-options",
+                "threads_start_options",
+                json!({}),
+            )
+            .await;
+        let option = options["threadCreationOptions"][0]["id"].clone();
+        let original_binding = processor.agent_action_binding(&turn).await.unwrap();
+        let mut limited_binding = original_binding.clone();
+        limited_binding
+            .capabilities
+            .remove(&pioneer_protocol::AgentToolCapability::ThreadCreate);
+        processor
+            .register_agent_action_binding(turn.clone(), limited_binding)
+            .await;
+        let limited = facade
+            .call_response(
+                "limited-create",
+                "limited-create",
+                "thread_create",
+                json!({"optionId":option}),
+            )
+            .await;
+        assert!(
+            limited.get("error").is_some() || limited["result"]["isError"] == true,
+            "{limited}"
+        );
+        assert_ne!(
+            limited["error"]["data"]["kind"], "invalid_request",
+            "correlation must reach the restricted binding"
+        );
+        processor
+            .register_agent_action_binding(turn.clone(), original_binding)
+            .await;
+        // Model an older immutable admission with no creation actions, retaining
+        // the already-frozen transport catalog. Broader current user rights
+        // cannot substitute for either missing action grant.
+        let authority = processor
+            .load_turn_execution_authorization_context(&turn)
+            .await
+            .unwrap();
+        let mut encoded: JsonValue =
+            serde_json::from_str(&authority.to_persisted_json().unwrap()).unwrap();
+        let private = crate::authorization::ResourceAction::ThreadCreatePrivate.safe_name();
+        let workspace = crate::authorization::ResourceAction::ThreadCreateWorkspace.safe_name();
+        encoded["grant_manifest"]["actions"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|value| value.as_str() != Some(private) && value.as_str() != Some(workspace));
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(&turn, &encoded.to_string())
+            .await
+            .unwrap();
+        let reply = facade
+            .call_response(
+                "old-create",
+                "old-create",
+                "thread_create",
+                json!({"optionId":option}),
+            )
+            .await;
+        assert_eq!(
+            reply["error"]["data"]["kind"], "permission_denied",
+            "{reply}"
+        );
+        let restored = processor
+            .load_turn_execution_authorization_context(&turn)
+            .await
+            .unwrap();
+        assert!(!restored.grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate));
+        assert!(
+            !restored.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+        );
+        // A new Task must not restore creation rights absent from the source
+        // execution, despite Full Access and the initiator's current role.
+        harness
+            .cli_session
+            .set_next_native_turn_id("old-manifest-task-child")
+            .await;
+        let task = facade
+            .call(
+                "old-task-create",
+                "old-task-create",
+                "task_create",
+                json!({"title":"Retain the source ceiling","goal":"Inspect without creating conversations"}),
+            )
+            .await;
+        let admission = processor
+            .crud_store
+            .get_task_execution_admission(task["taskId"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let admission = crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
+            &admission.authorization_context_json,
+        )
+        .unwrap();
+        let child =
+            wait_for_task_cli_child(&processor, task["runId"].as_str().unwrap(), None).await;
+        let child_authority = processor
+            .load_turn_execution_authorization_context(&child.turn_id)
+            .await
+            .unwrap();
+        for context in [&admission, &child_authority] {
+            assert!(
+                !context.grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate)
+            );
+            assert!(
+                !context.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+            );
+        }
+        assert!(
+            processor
+                .crud_store
+                .list_turn_mcp_bindings(&child.turn_id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|binding| binding.raw_tool_name != "thread_create")
+        );
+        let child_facade =
+            ThreadsFacade::new(&processor, &child.turn_id, CLIAgentRuntimeKind::Codex).await;
+        let child_options = child_facade
+            .call(
+                "old-child-options",
+                "old-child-options",
+                "threads_start_options",
+                json!({}),
+            )
+            .await;
+        assert!(
+            child_options["threadCreationOptions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let denied = child_facade
+            .call_response(
+                "old-child-create",
+                "old-child-create",
+                "thread_create",
+                json!({"optionId":option}),
+            )
+            .await;
+        assert!(
+            denied.get("error").is_some() || denied["result"]["isError"] == true,
+            "{denied}"
+        );
+    });
+}
+
+#[test]
+fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() {
+    run_standard_stack_message_test("immutable Task readmission ceiling", async {
+        for persisted in [true, false] {
+            let (harness, processor, turn) =
+                start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+            harness
+                .cli_session
+                .set_next_native_turn_id("immutable-resume-child")
+                .await;
+            let facade = ThreadsFacade::new(&processor, &turn, CLIAgentRuntimeKind::Codex).await;
+            let created = facade
+                .call(
+                    "resume-create",
+                    "resume-create",
+                    "task_create",
+                    json!({"title":"Preserve admitted Task authority","goal":"Readmitted work"}),
+                )
+                .await;
+            let task_id = created["taskId"].as_str().unwrap();
+            let child =
+                wait_for_task_cli_child(&processor, created["runId"].as_str().unwrap(), None).await;
+            let saved = processor
+                .crud_store
+                .get_task_execution_admission(task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let original =
+                crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
+                    &saved.authorization_context_json,
+                )
+                .unwrap();
+            assert!(
+                original.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+            );
+            // The running binding is persisted before startup releases its
+            // session gate. Wait for that handoff and hold the gate while blocking.
+            let transition = timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(transition) = processor
+                        .try_cli_runtime_turn_transition(&child)
+                        .await
+                        .unwrap()
+                    {
+                        break transition;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Task child must release its startup transition");
+            assert!(
+                processor
+                    .mark_turn_blocked_with_transition(
+                        child.thread_id.clone(),
+                        child.turn_id.clone(),
+                        "resumable Task".into(),
+                        Some(transition),
+                    )
+                    .await
+            );
+            processor
+                .reconcile_terminal_task_child_turns(64)
+                .await
+                .unwrap();
+            assert_eq!(
+                processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .status,
+                pioneer_protocol::TaskStatus::Blocked
+            );
+            // A different, still-running execution in the same capsule may
+            // manage A without lending its own create rights to a new admission.
+            // Model the restricted source on the principal-authored root fixture
+            // before task_create derives the sibling admission and execution graph.
+            let source = processor
+                .load_turn_execution_authorization_context(&turn)
+                .await
+                .unwrap();
+            let mut encoded: JsonValue =
+                serde_json::from_str(&source.to_persisted_json().unwrap()).unwrap();
+            encoded["grant_manifest"]["actions"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|action| {
+                    action.as_str()
+                        != Some(
+                            crate::authorization::ResourceAction::ThreadCreatePrivate.safe_name(),
+                        )
+                        && action.as_str()
+                            != Some(
+                                crate::authorization::ResourceAction::ThreadCreateWorkspace
+                                    .safe_name(),
+                            )
+                });
+            processor
+                .crud_store
+                .set_turn_execution_authorization_context(&turn, &encoded.to_string())
+                .await
+                .unwrap();
+            harness
+                .cli_session
+                .set_next_native_turn_id("immutable-resume-caller")
+                .await;
+            let sibling = facade.call("resume-caller-create", "resume-caller-create", "task_create",
+                json!({"title":"Authorized Task controller","goal":"Manage another permitted Task"}),
+            ).await;
+            let caller =
+                wait_for_task_cli_child(&processor, sibling["runId"].as_str().unwrap(), None).await;
+            assert_ne!(caller.turn_id, turn);
+            // The normal loader checks the child's graph fingerprint and lineage.
+            // Never rewrite an already-pinned Task child's authority envelope.
+            let caller_authority = processor
+                .load_turn_execution_authorization_context(&caller.turn_id)
+                .await
+                .unwrap();
+            assert!(
+                !caller_authority
+                    .grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate)
+            );
+            assert!(
+                !caller_authority
+                    .grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+            );
+            assert_eq!(caller_authority.root_thread_id(), saved.root_thread_id);
+            if !persisted {
+                // Model the supported legacy case with no immutable admission;
+                // source ceiling applies when the real readmission path creates it.
+                pioneer_entity::task_execution_admission::Entity::delete_by_id(task_id)
+                    .exec(&processor.crud_store.database_connection())
+                    .await
+                    .unwrap();
+            }
+            let caller_facade =
+                ThreadsFacade::new(&processor, &caller.turn_id, CLIAgentRuntimeKind::Codex).await;
+            let resumed = caller_facade
+                .call(
+                    "resume-frozen",
+                    "resume-frozen",
+                    "task_resume",
+                    json!({"taskId":task_id}),
+                )
+                .await;
+            assert_eq!(resumed["task"]["id"], task_id, "{resumed}");
+            assert_ne!(
+                processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .status,
+                pioneer_protocol::TaskStatus::Blocked
+            );
+            let current = processor
+                .crud_store
+                .get_task_execution_admission(task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if persisted {
+                assert_eq!(
+                    current, saved,
+                    "existing immutable admission is reused verbatim"
+                );
+            } else {
+                let legacy =
+                    crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
+                        &current.authorization_context_json,
+                    )
+                    .unwrap();
+                assert!(
+                    !legacy
+                        .grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate)
+                );
+                assert!(
+                    !legacy
+                        .grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+                );
+            }
+            let caller = processor
+                .load_turn_execution_authorization_context(&caller.turn_id)
+                .await
+                .unwrap();
+            assert!(
+                !caller.grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate)
+            );
+            assert!(
+                !caller.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+            );
+        }
     });
 }
