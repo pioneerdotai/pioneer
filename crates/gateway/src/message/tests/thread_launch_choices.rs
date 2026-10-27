@@ -2419,6 +2419,7 @@ async fn definitive_start_refusal_has_safe_cause_terminal_turn_and_released_reso
                 .unwrap()
                 .into();
             identity.status = Set("retired".into());
+            identity.retired_at = Set(Some(pioneer_crud::utc_now()));
             identity.update(&db).await.unwrap();
         } else {
             let authority = processor
@@ -3060,6 +3061,22 @@ async fn exhausted_child_start_cannot_reconcile_a_sibling_from_another_action() 
             }
             continue;
         }
+        // Keep the target Turn loaded so terminal replay must synchronize its
+        // memory projection, even when the actor finishes before compaction.
+        processor
+            .ensure_runtime_turn_loaded_for_lifecycle(
+                &context.workspace_id,
+                &own_params.thread_id,
+                &own_turn.1,
+            )
+            .await
+            .unwrap();
+        assert!(
+            processor
+                .thread_manager
+                .subscribe_connection(&own_params.thread_id, 1)
+                .await
+        );
         // Restore the own payload: only the intended child may dispatch/reconcile.
         let mut restored: pioneer_entity::agent_action_outbox::ActiveModel = unresolved.into();
         restored.payload_json = Set(original.to_string());
@@ -3446,7 +3463,7 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
             // Force a semantic refusal, then fail its real canonical append.
             let identity_id = payload["dispatch"]["identity"]["id"].as_str().unwrap();
             db.execute_unprepared(&format!(
-                "UPDATE agent_identity SET status='retired' WHERE id='{identity_id}'"
+                "UPDATE agent_identity SET status='retired', retired_at=CURRENT_TIMESTAMP WHERE id='{identity_id}'"
             ))
             .await
             .unwrap();
@@ -3504,7 +3521,8 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
             assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
             match fault {
                 "lease" => {
-                    db.execute_unprepared(&format!("UPDATE turn_execution SET lease_until='2000-01-01 00:00:00+00:00' WHERE turn_id='{}'", params.turn_id)).await.unwrap();
+                    // Expire the lease without violating lease_until >= heartbeat_at.
+                    db.execute_unprepared(&format!("UPDATE turn_execution SET heartbeat_at='1999-12-31 23:59:59+00:00', lease_until='2000-01-01 00:00:00+00:00' WHERE turn_id='{}'", params.turn_id)).await.unwrap();
                 }
                 "claim_storage" | "exhausted_storage" => {
                     db.execute_unprepared(&format!("CREATE TRIGGER fail_activation_claim BEFORE UPDATE OF status ON turn_execution WHEN OLD.turn_id='{}' AND NEW.status='running' BEGIN SELECT RAISE(ABORT,'fixture storage unavailable'); END", params.turn_id)).await.unwrap();
