@@ -1,5 +1,10 @@
 # Portable payload compression — implementation record
 
+Review status (2026-10-27): candidate `f4c09602973c82d555e1286bf6e5efb8b5ccbcae`
+was **not accepted** by external review. The repeat-review corrections and their
+limits are recorded at the end of this document. Internal review or a local commit
+does not constitute external acceptance; execution remains prohibited.
+
 ## Baseline and boundaries
 
 Base: `dcc63b7142bf681cba96de8267a15e8383e82b11` (local main, 2026-10-27).
@@ -303,11 +308,12 @@ The legacy root parser retains <=127 open containers, <=64-byte pending labels,
 Values exceeding these selected-token policies remain unknown with original bytes
 intact; total content/history size has no such cap. This is a documented supported
 legacy-parser bound, not evidence that a larger identity is semantically invalid.
-Legacy TEXT fragments still use SQLite substr/CAST; only returned fragment bytes
-and application preparation memory are bounded there. Internal SQLite overflow-page
-I/O and source TEXT materialization costs are not dynamically established. The new
-published block path avoids that representation for fragment reads. This residual
-legacy substrate cost needs reviewer attention and measurement after acceptance.
+The repeat-review corrections replace legacy substr/CAST fragments with native
+incremental TEXT/BLOB byte reads through the existing scoped SQLite reader. This
+removes full TEXT materialization, including the new legacy-root preparation path
+and the modified Task snapshot readers. Native SQLite still allocates an overflow
+page-number map and may revisit overflow prefixes for a new cursor. Constant native
+workspace and linear total I/O are not asserted; see the detailed limits below.
 
 ## Written or changed tests — none executed
 
@@ -388,6 +394,8 @@ Task-event batch proofs with shared typed payloads. Candidate payloads are copie
 once lazily per participating input, not once per proof. Persisted preflight
 winners are shared as well. A unique single-event winner moves without a copy;
 only a selected shared winner is materialized for its returned owned outcome.
+The repeat-review correction defers that materialization until after commit releases
+the writer (the original candidate still copied shared winners inside the writer).
 Proof comparison remains quadratic in the existing maximum of 64 events, but
 retained payload bytes are linear. Heap/copy latency has not been measured.
 
@@ -506,11 +514,294 @@ including untracked files before staging, dependencies/exports, all new schema
 objects and triggers, manual Entity synchronization, production readers/writers,
 maintenance cleanup/publication, tests and this record. It did not stop at the
 first issue. Corrected areas were re-read, formatted and checked with Git diff;
-no additional concrete finding remains from that static pass. Residual supported
-bounds, unmeasured SQLite TEXT costs and all missing dynamic evidence remain
-explicit above. This is preparation for external review, not external acceptance.
+that initial static pass missed the four subsequent external findings. Their
+corrections are recorded below. Residual supported bounds, native SQLite costs and
+all missing dynamic evidence remain explicit. This is preparation for external
+review, not external acceptance.
 
 Тесты, cargo check, сборки, новый Migrator и генерация Entity не запускались.
 Выполнены только разрешённые статические проверки и cargo fmt. Реализация
 подготовлена к внешнему ревью; компилируемость, штатная генерация Entity и
 прохождение тестов пока не подтверждены.
+
+
+## Repeat-review revision, 2026-10-27
+
+The starting HEAD was exactly `f4c09602973c82d555e1286bf6e5efb8b5ccbcae`; staged,
+unstaged and untracked state was clean. Base remains
+`dcc63b7142bf681cba96de8267a15e8383e82b11`. Work continued in the same branch
+`feature/portable-payload-compression` and absolute worktree
+`/Users/alexander/Code/pioneer/pioneer/.worktrees/portable-payload-compression`.
+No new branch/worktree, fetch, merge, rebase or reset was used. Main and sibling
+worktrees were not modified. There were no foreign edits to preserve.
+
+| External finding | Correction commit |
+| --- | --- |
+| P1 missing AcceptedImportBasis fields; P2 independent oracle bind contract | `6ae5c8230820a0b28e0605fa1954ab188054fbc7` |
+| P2 TaskEventPayload deep copy inside writer | `b0e1430fd3b5c8cb6f460a8bc3b4eec438ff0c89` |
+| P1 full legacy TEXT materialization | `4457db231211294ef034ab6876985120d61bc8ec` |
+
+The following documentation-only commit records this audit; its exact SHA is in
+the final handoff. Hooks and signing were disabled only on each commit command
+(`-c core.hooksPath=/dev/null -c commit.gpgsign=false`), with no shared configuration
+or hook modification. The earlier candidate remains an unaccepted historical
+checkpoint.
+
+### 1. Legacy range reads: actual mechanism and limits
+
+Source inspection covered SQLx 0.9, rusqlite 0.39 and their existing shared
+libsqlite3-sys 0.37 dependency. SQLx exposes `lock_handle` / `as_raw_handle`, but no
+public incremental blob reader. rusqlite `Connection::from_handle` borrows that
+same connection without opening or closing it. `blob_open(..., read_only=true)`
+accepts ordinary rowid-table TEXT and BLOB, including indexed TEXT columns. It
+cannot read NULL/numeric values, views, virtual tables or WITHOUT ROWID tables.
+All five target columns are ordinary rowid-table TEXT. Nullable metadata is
+excluded from pending discovery and remains NULL; no blob handle is opened for it.
+Physical UTF-8 encoding is checked rather than guessing offsets or converting
+UTF-16 storage.
+
+The narrow runtime owner is `pioneer-sqlite::SqliteDatabase::read_blob_range`.
+There is no new connection, pool, service or orchestration framework. It inherits
+the scoped read class and existing maintenance limiter/read observer. Values are
+bound before admission; only the necessary SQLite operations run with capacity:
+
+1. Acquire the existing reader and SQLx native-handle lock.
+2. Run a parameterized, readonly, single-row rowid guard. Keep it on SQLITE_ROW
+   to pin the guard and incremental read to the same snapshot.
+3. Open the read-only incremental handle, verify exact physical byte length,
+   and read at most 65536 bytes at the requested byte offset.
+4. Close the blob and drop rows, statement, borrowed wrapper, SQLx lock, pooled
+   connection and permit before returning the owned bytes.
+
+RAII also releases those resources on errors. No await occurs after borrowing the
+native handle. Waiting for admission/pool/handle is cancellable; the synchronous
+native call finishes before cancellation can next be observed. Nothing detached
+continues after cancellation. Busy/locked errors remain recognizable by existing
+retry classification; other errors are explicit and contain no payload or SQL
+values. A guard miss alone returns None.
+
+`Preparation::step` now builds the same typed owner/revision/incarnation/reference,
+logical-length and owner/root stamp guard and obtains bytes through this owner.
+The five families share the implementation. Dictionary training, hashing, UTF-8
+carry handling and Zstd 6 compression remain after reader release. Publication,
+staging cleanup, raw completion and writer/root guards are unchanged.
+
+`LocatorRead::step` in frozen_storage_lifetime uses the same byte owner and retains
+its existing scope/sentinel/length and final verified-root guards. Discovery already
+uses direct `octet_length(field)`. This removes the repeated full TEXT load before
+CLI/history root preparation as well. The helper is also used for its existing
+other root kinds; no additional payload becomes a compression target.
+
+The two modified whole-snapshot readers (snapshot `hydrate_record` and
+`compaction_task_basis_snapshot`) now separate small reference metadata from the
+native legacy/raw byte range. They revalidate captured reference plus identity,
+revision, scope and original length; physical cutover races retry instead of
+reading the small SQL projection as legacy bytes. Compressed immutable blocks and
+read holds retain their prior path. Whole-value public results still necessarily
+allocate the logical result outside database capacity.
+
+Task-basis character fragments needed an additional fix: their old join to
+compaction_live_sources evaluated `ltrim(history_json)` before the fragment.
+That join is replaced locally by its exact Task relational predicates: run,
+workspace, conversation thread, matching thread workspace, exact scope and logical
+basis revision. The array predicate still means ASCII-space ltrim followed by `[`,
+but executes over released native byte ranges. The compressed branch checks its
+tiny array/descriptor projection. Legacy/raw metadata never selects the large TEXT
+through a CASE branch. Direct-column octet_length keeps SQLite's no-content-load
+optimization; no CAST wraps that argument.
+
+A store-local continuation (maximum 16 entries, at most 4096 bytes of identifiers
+per entry) retains only run/incarnation/revision and byte/character offsets, never
+payload bytes or database resources. Every native range rechecks scope/version.
+Sequential 16384-character reads reuse their UTF-8 position; backward/cold random
+seeks can scan the prefix. An incomplete scalar rereads at most three bytes; byte
+and character offsets, ASCII spaces and SQLite NUL termination retain their
+meaning. Cache entries are independent for separate CrudStore instances/databases,
+and shared only by scoped clones of that store. Logical edits/recreated rows
+cannot reuse an old incarnation/revision entry.
+
+Self-audit also corrected the snapshot created_at fence: capture the original
+SQLite TEXT spelling alongside the decoded timestamp and compare that spelling.
+A legacy CURRENT_TIMESTAMP value uses a space, whereas a decoded timestamp bound
+back through SQLx uses RFC3339. Comparing the latter to the former could reject
+an unchanged legacy row. This changes an internal query projection only, with no
+schema, Entity, timestamp value or public protocol change. Constructor searches
+found no hand-built StoredTaskRunConversationSnapshot to update.
+
+The installed SQLite source establishes what this change does and does not prove:
+OP_Column under the former substr(CAST(TEXT AS BLOB)) can allocate len+3 and read
+all len bytes before substrFunc. Incremental blob_read instead requests only the
+range from the B-tree payload; no full TEXT Mem value is constructed. Direct
+length/typeof/octet_length column arguments carry SQLite's skip-load flags.
+However, accessPayload allocates aOverflow at up to
+`2 * sizeof(Pgno) * overflow_page_count` for the **whole record**, including an
+adjacent large field, and clears/populates that page map. Closing a cursor loses
+its map; the next range can walk an overflow prefix again. Guard metadata stored
+after a large column can itself require overflow traversal. This is neither a
+constant-native-workspace proof nor a linear-total-I/O proof. Those stronger
+properties cannot be inferred from the <=64 KiB Vec, and are not claimed here.
+Keeping the map in a native cursor across CPU work would violate the resource
+lifetime requirement. A different substrate for stronger native bounds would
+require a further design/review decision; no such architecture or total-size cap
+was introduced. UTF-16 legacy databases explicitly fail this reader rather than
+silently altering original UTF-8 bytes.
+
+### 2–3. Accepted import fixture and independent legacy oracle
+
+The existing AcceptedImportBasis fixture now supplies SHA-256 and i64 byte length
+from the exact UTF-8 bytes of `["accepted"]`. Production fields remain required;
+no default or cfg change was introduced. Static search found only the production
+constructor and this test constructor, and both supply the required fields.
+
+The old SQL text and all oracle comparisons/negative controls remain unchanged.
+Its statement is now constructed entirely in test code, independently of the
+production twelve-bind helper. The ten binds remain manifest, ordinal,
+destination, turn, workspace, history_json, digest, proof_json, imports_digest,
+and checked i64(import_count), in that order. The suite was repaired in place;
+no duplicate suite or replacement oracle was added.
+
+### 4. Event result materialization after writer release
+
+An internal DeferredAppendedTaskEvent carries the selected typed payload in Arc.
+The repository moves a new payload into Arc or retains the actual fenced preflight
+winner; it does not unwrap/clone the shared winner inside append. Database-dependent
+key selection, actual batch-winner identity, persisted revision/incarnation,
+semantic timestamp/cancelled equivalence and projection ordering remain unchanged.
+Projectors borrow that payload. Public AppendedTaskEvent still owns TaskEventPayload.
+
+Callers materialize the owned public result after successful commit: single/batch
+append, agent action, Task creation/readmission, trigger admission/reconciliation,
+dispatch claim, run-start, terminal transition, delivery transition/cancellation,
+finish and webhook admission. The nontransactional repository wrapper accepts the
+concrete SqliteDatabase, so its DB operation has returned before conversion. The
+resume path that discards events does not materialize unused public results.
+Internal terminal outcomes defer their event vector; public outcome types and
+fanout interfaces are unchanged. Static search traced every changed helper caller
+and conversion site, including existing direct repository test callers.
+
+A shared winner may still require one copy per returned public event, as required
+by the existing owned API, but those copies occur after writer release. Proofs
+remain Arc-shared: there is no per-pair full payload copy and no new N-squared
+retained body set. Commit/rollback, sequence allocation, inserted-only projections
+and real fanout work remain on their former paths. No physical backfill creates
+an event or notification. Copy latency and memory have not been measured.
+
+### Test changes and evidence boundary
+
+The test-audit skill and Pioneer reference were used for test-only edits, separately
+from the authorized production repair. Existing assertions and oracle independence
+were retained; no production hook, source-grep test or duplicate business suite was
+added. The parent test-only edit checked its protected source hashes before/after.
+
+* New SQLite owner `legacy_text_ranges_avoid_full_allocations_and_release_maintenance_reader`:
+  16 MiB Unicode TEXT plus an adjacent large TEXT, a far misaligned byte range,
+  physical mode=ro/query_only reader, and real SQLITE_STATUS_MALLOC_SIZE high-water
+  measurement. It rejects a full-payload-sized allocation, not merely a large
+  result Vec. An independent former substr SQL negative control must report the
+  full allocation while returning the same bytes. Existing read observability
+  and a subsequent operation using the sole reader check capacity release.
+  Revision miss, byte bounds, physical-length mismatch and empty end range are
+  exercised. The global allocation counter requires nextest process isolation;
+  this is not a peak-RSS or total-I/O benchmark.
+* Existing Task snapshot immutable/restart/revision owner now uses the same
+  independent expected Unicode fragments before legacy cutover and after compressed
+  restart. Backward seek and EOF exercise the new legacy continuation behavior;
+  its immutable-winner, epoch and revision assertions remain in place.
+* Existing compressed duplicate append owner now returns two large persisted
+  replays and retains its winner ID/sequence/timestamp/payload and fanout assertions.
+  Existing atomic cancelled replay owner now uses a large first candidate and
+  three equivalent inputs, retaining first-winner/sequence/one-real-append checks.
+  These behavioral owners do not dynamically prove CPU placement; the boundary
+  evidence for that property is the reviewed commit-before-conversion control flow.
+* Existing accepted-import oracle suite was repaired as described above; all
+  comparisons and negative controls remain its proof owner.
+
+None of these tests was run. Pre-fix dynamic baseline proof, compilation, allocation
+thresholds on real platforms, timing and test success are unconfirmed.
+
+### Final static self-audit and exact revision inventory
+
+Each logical repair's diff and its callers were re-read before commit, followed by
+the full revision inventory (including both newly added files) and accumulated
+base-to-HEAD inventory. Review covered error/retry and cancellation/drop boundaries,
+legacy/raw/compressed and NULL/empty/Unicode interpretation, restart/staging/cleanup
+against read holds, CAS/ABA and source ownership, SQL projections, immutable roots,
+and event ordering. Codec/wire format, dictionary identity/lifetime, all migration
+DDL/triggers, Entity, dependencies, retention and publication/cleanup algorithms
+remain unchanged from the candidate. The new read mechanism does not hold a blob
+or reader through hashing/parsing/training/compression. The original root and
+physical-publication fences still decide commits. No outside payload was added.
+
+Additional self-audit findings corrected here were the Task live-source view's
+full ltrim materialization and the legacy created_at TEXT spelling fence. No
+remaining concrete defect was identified by this static pass. That statement is
+limited to source inspection; the native resource and platform limits above and
+all missing dynamic evidence remain review items, not accepted properties.
+
+Files changed from the rejected candidate (new files included):
+
+```text
+crates/crud/src/lib.rs
+crates/crud/src/repositories/compaction.rs
+crates/crud/src/repositories/compaction_frozen_import_tests.rs
+crates/crud/src/repositories/compaction_history.rs
+crates/crud/src/repositories/frozen_storage_lifetime.rs
+crates/crud/src/repositories/mod.rs
+crates/crud/src/repositories/portable_payload.rs
+crates/crud/src/repositories/portable_payload_legacy_text.rs
+crates/crud/src/repositories/task_event.rs
+crates/crud/src/repositories/task_run_conversation_snapshot.rs
+crates/crud/src/task_delivery_lifecycle.rs
+crates/crud/src/task_events.rs
+crates/crud/src/task_finish.rs
+crates/crud/src/task_projector.rs
+crates/crud/src/task_terminal.rs
+crates/crud/src/task_webhook.rs
+crates/crud/src/tests/task_event_fanout.rs
+crates/crud/tests/compaction_payload_compression.rs
+crates/sqlite/src/blob_range.rs
+crates/sqlite/src/database.rs
+crates/sqlite/src/lib.rs
+docs/reviews/portable-payload-compression/implementation.md
+```
+
+Local low-level exceptions: the native-handle bridge is necessary because SQLx
+has no public incremental blob wrapper; rusqlite borrows the existing SQLx physical
+handle under its documented exclusive lock. Repository guards stay typed Entity
+queries except LocatorRead's existing fixed-schema metadata SQL, now selecting
+rowid. Task fragment scalar header/CASE/version expressions fill gaps in the ORM
+column API without replacing ordinary owner queries. There are no schema additions
+or new installation costs in this revision. Entity was not edited; the earlier
+manual-generation exception and required later regeneration comparison still apply.
+
+Actually performed: source/dependency reads and static caller/constructor searches;
+full changed-file and Git diff inspection, including staged and new files;
+`git diff --check` (working and staged/accumulated changes); scoped cargo fmt and
+cargo fmt --check for pioneer-crud/pioneer-sqlite with child traversal disabled.
+The first formatting check reported only the edited Task test formatting; after
+formatting, the same check passed. Formatting status inventory contained only task
+files. Local Git commits ran with hooks disabled as described above. After the
+code commits the worktree was clean; only this report was then edited. The final
+handoff reports the post-documentation-commit status. Delivery checkpoint: all
+task changes are committed; the final porcelain status must be empty (no staged,
+unstaged or untracked changes), and is checked after the documentation commit.
+
+Still prohibited and NOT performed: any tests/reproducer, compilation, cargo check,
+build/clippy/nextest/bench/run, rustc, new Migrator, Entity codegen, application,
+production database access or mutation, VACUUM, CI, push/merge/deploy/PR or restart.
+
+After complete external review and explicit acceptance only: perform the previously
+listed normal Entity generation/diff and migration/fresh-install/upgrade/rollback
+verification, then appropriate crate/workspace compilation and nextest owners.
+Run the SQLite allocation owner in its isolated nextest process; measure peak RSS,
+SQLite allocations and native page I/O/CPU for increasing values and far offsets,
+including adjacent large fields and scoped guard columns after the payload. Verify
+reader release and cancellation under admission/handle contention; distinguish
+remaining overflow-map/prefix traversal from full TEXT materialization. Exercise
+legacy/plain/raw/compressed, root preparation, concurrent edit/delete/recreate,
+restart and cleanup read holds through the existing owners. Any resulting code
+changes require another full external review before continuing dynamic checks.
+
+Код подготовлен к повторному внешнему ревью; тесты, сборки, cargo check, Migrator
+и codegen не запускались. После любых исправлений снова требуется полное внешнее
+ревью. Саморевью и локальные коммиты не являются внешним принятием реализации.
