@@ -2551,6 +2551,12 @@ async fn capability_persistence_order_impl() {
             .expect("committed lane should stay open");
         // This unrestricted turn admits the Threads catalog alongside the
         // default HTML and task tools.
+        let thread_actions = [
+            "threads_identity_models_list",
+            "thread_create",
+            "thread_message_send",
+            "threads_turn_start",
+        ];
         let expected_mcp_bindings = 2
             + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
                 .definitions()
