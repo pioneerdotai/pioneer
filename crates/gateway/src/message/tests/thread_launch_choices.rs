@@ -2378,12 +2378,13 @@ async fn definitive_start_refusal_has_safe_cause_terminal_turn_and_released_reso
     use sea_orm::{ActiveModelTrait, Set};
     for denial in ["retired_identity", "suspended_initiator"] {
         let probe = Arc::new(ChoiceRuntimeProbe::default());
-        let (processor, context, tools) = fixture_with_probe(
+        let (processor, context, tools) = fixture_with_principal_probe(
             Default::default(),
             Default::default(),
             Default::default(),
             false,
             probe.clone(),
+            denial == "suspended_initiator",
         )
         .await;
         let binding = processor
@@ -3484,11 +3485,9 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
         } else {
             let barrier = match fault {
                 "authority_read" => "__agent_start_before_authority_read__",
-                "claimed_unknown"
-                | "actor_admission_storage"
-                | "terminal_memory"
-                | "terminal_restart"
-                | "terminal_resume" => "__agent_start_after_activation_claim__",
+                "claimed_unknown" | "actor_admission_storage" => {
+                    "__agent_start_after_activation_claim__"
+                }
                 _ => "__agent_start_before_activation_claim__",
             };
             processor.arm_completed_history_preparation_barrier(barrier);
@@ -3545,8 +3544,8 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
                     db.execute_unprepared(&format!("CREATE TRIGGER fail_dispatch_terminal BEFORE INSERT ON turn_event WHEN NEW.turn_id='{}' BEGIN SELECT RAISE(ABORT,'fixture terminal storage unavailable'); END", params.turn_id)).await.unwrap();
                 }
                 "claimed_unknown" | "terminal_memory" | "terminal_restart" | "terminal_resume" => {
-                    // Loss between durable claim and runtime admission is genuinely
-                    // ambiguous. Never turn this replay into a second activation.
+                    // Claimed loss belongs to runtime reconciliation. The terminal
+                    // cases stop before claim so exhausted refusal can own them.
                     let dispatch = dispatch.take().unwrap();
                     dispatch.abort();
                     let _ = dispatch.await;
@@ -3646,6 +3645,87 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
                 Some("outbox_storage_unavailable")
             );
         }
+        if matches!(fault, "claimed_unknown" | "actor_admission_storage") {
+            let owner = processor
+                .crud_store
+                .get_turn_execution(&params.turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(owner.started_at.is_some(), "{fault}");
+            let execution = pioneer_crud::load_agent_execution(&db, execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let resource = pioneer_crud::load_agent_execution_resource_state(&db, execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+            // A durable claim owns the dispatch boundary even if admission's
+            // outcome is lost. Replay must neither activate nor refuse it again.
+            for _ in 0..2 {
+                let mut due: pioneer_entity::agent_action_outbox::ActiveModel = row.clone().into();
+                due.status = Set("pending".into());
+                due.delivered_at = Set(None);
+                due.next_attempt_at =
+                    Set(Some(pioneer_crud::utc_now() - chrono::Duration::seconds(1)));
+                due.update(&db).await.unwrap();
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    pioneer_crud::load_agent_action_outbox(&db, action.as_str())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "delivered",
+                    "{fault}"
+                );
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_turn_execution(&params.turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    owner
+                );
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_turn(&params.thread_id, &params.turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .1,
+                    saved
+                );
+                assert!(
+                    !processor
+                        .crud_store
+                        .native_turn_has_accepted_terminal(&params.turn_id)
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(
+                    pioneer_crud::load_agent_execution(&db, execution_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    execution
+                );
+                assert_eq!(
+                    pioneer_crud::load_agent_execution_resource_state(&db, execution_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    resource
+                );
+                assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
+            }
+            continue;
+        }
         if fault == "exhausted_storage" {
             pioneer_crud::compact_terminal_agent_action_ledger(
                 &db,
@@ -3664,6 +3744,30 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
         due.next_attempt_at = Set(Some(pioneer_crud::utc_now() - chrono::Duration::seconds(1)));
         due.update(&db).await.unwrap();
         if fault.starts_with("terminal_") {
+            assert!(
+                processor
+                    .crud_store
+                    .get_turn_execution(&params.turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .started_at
+                    .is_none()
+            );
+            processor
+                .ensure_runtime_turn_loaded_for_lifecycle(
+                    &context.workspace_id,
+                    &params.thread_id,
+                    &saved,
+                )
+                .await
+                .unwrap();
+            assert!(
+                processor
+                    .thread_manager
+                    .subscribe_connection(&params.thread_id, 1)
+                    .await
+            );
             processor.arm_completed_history_preparation_barrier(
                 "__agent_start_after_terminal_acceptance__",
             );
@@ -3997,11 +4101,7 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
         if exhausted
             || matches!(
                 fault,
-                "claimed_unknown"
-                    | "actor_admission_storage"
-                    | "terminal_memory"
-                    | "terminal_restart"
-                    | "terminal_resume"
+                "terminal_memory" | "terminal_restart" | "terminal_resume"
             )
         {
             let turn = processor
