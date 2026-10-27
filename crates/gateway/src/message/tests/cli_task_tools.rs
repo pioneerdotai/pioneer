@@ -4662,6 +4662,7 @@ impl ThreadsFacade {
         use crate::turn_mcp::native_tools::NativeToolFamily;
         let definitions = [
             NativeToolFamily::Html,
+            NativeToolFamily::ComputerUse,
             NativeToolFamily::Tasks,
             NativeToolFamily::Threads,
         ]
