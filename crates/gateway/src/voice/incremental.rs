@@ -525,7 +525,12 @@ impl IncrementalSpeech {
             )?;
             (
                 preferred_cut,
-                align_boundary(&self.full_hypothesis.text, &left.text, &right.text),
+                project_boundary(
+                    &self.full_hypothesis.text,
+                    &left.text,
+                    &right.text,
+                    Some((preferred_cut, self.speech.len())),
+                ),
             )
         };
         let text_end = text_end.max(self.owned_text_start);
@@ -556,6 +561,10 @@ impl IncrementalSpeech {
             context.text
         };
         let tail = self.full_hypothesis.text[text_end..].to_owned();
+        // Transfer the projected left text BEFORE discarding its PCM. Only the
+        // projected right slice remains replaceable on the next refresh. A
+        // textual tie here must not use the context-exclusion bias in refresh:
+        // that could leave the entire old whole in a now unsupported tail.
         append_text(
             &mut self.text,
             &self.full_hypothesis.text[self.owned_text_start..text_end],
@@ -892,30 +901,51 @@ fn edit_costs(
 }
 
 fn align_boundary(whole: &str, left: &str, right: &str) -> usize {
+    project_boundary(whole, left, right, None)
+}
+
+// A partition transfers ownership before PCM eviction; context exclusion only
+// removes technical replay. They need different tie priors: favoring the best
+// prefix fit is conservative for exclusion, but can discard left ownership at
+// a partition. Neither prior establishes exact acoustic correspondence.
+fn project_boundary(
+    whole: &str,
+    left: &str,
+    right: &str,
+    partition: Option<(usize, usize)>,
+) -> usize {
     let mut whole_units = alignment_units(whole, false);
     let mut left_units = alignment_units(left, false);
     let mut right_units = alignment_units(right, false);
     // The partition can lie inside one coarse unit even with other correct
-    // words around it. Boundary probe units that form a prefix of that unit
-    // indicate insufficient resolution, NOT confirmed ownership. Keep the
-    // one-unit fallback for disagreement with no such textual match.
-    let scalar = left_units
-        .last()
-        .zip(right_units.first())
-        .is_some_and(|(left, right)| {
-            whole_units.len() == 1
-                || whole_units.iter().any(|unit| {
-                    unit.raw
-                        .strip_prefix(left.raw)
-                        .is_some_and(|rest| rest.starts_with(right.raw))
-                        || (!left.key.is_empty()
-                            && !right.key.is_empty()
-                            && unit
-                                .key
-                                .strip_prefix(left.key.as_str())
-                                .is_some_and(|rest| rest.starts_with(right.key.as_str())))
-                })
-        });
+    // words around it. An unmatched boundary probe also needs refinement: a
+    // typo must not prevent locating the other probe inside a coarse unit.
+    // Matching coarse words stay intact (including long repeated sequences).
+    // This is resolution selection, not evidence of confirmed ownership.
+    let unmatched = |probe: &AlignmentUnit<'_>| {
+        !whole_units
+            .iter()
+            .any(|unit| unit.raw == probe.raw || (!probe.key.is_empty() && unit.key == probe.key))
+    };
+    let scalar = left_units.last().is_some_and(unmatched)
+        || right_units.first().is_some_and(unmatched)
+        || left_units
+            .last()
+            .zip(right_units.first())
+            .is_some_and(|(left, right)| {
+                whole_units.len() == 1
+                    || whole_units.iter().any(|unit| {
+                        unit.raw
+                            .strip_prefix(left.raw)
+                            .is_some_and(|rest| rest.starts_with(right.raw))
+                            || (!left.key.is_empty()
+                                && !right.key.is_empty()
+                                && unit
+                                    .key
+                                    .strip_prefix(left.key.as_str())
+                                    .is_some_and(|rest| rest.starts_with(right.key.as_str())))
+                    })
+            });
     if scalar {
         // Use one shared resolution for ALL sequences, then only one global
         // edit-distance projection. Both modes retain the 2,048-unit cap and
@@ -926,18 +956,30 @@ fn align_boundary(whole: &str, left: &str, right: &str) -> usize {
     }
     let prefix = edit_costs(&left_units, &whole_units, false);
     let suffix = edit_costs(&right_units, &whole_units, true);
-    // A tie cannot establish true acoustic ownership. Prefer the better prefix
-    // fit so new repeated tail words cannot be assigned to old context merely
-    // because the tail grew; then use probe token counts as a deterministic
-    // prior. Neither rule is evidence of correct acoustic ownership.
-    let prior =
-        whole_units.len() * left_units.len() / (left_units.len() + right_units.len()).max(1);
+    // At eviction, use the known PCM partition as a positional tie prior.
+    // Probe omissions (even just one empty side) must not bias every unmatched
+    // whole unit into the replaceable tail. This assumes roughly even text
+    // density ONLY among equally good edit projections; it supplies no timing.
+    // Context exclusion instead keeps the probe-count prior behind prefix fit.
+    let probe_units = left_units.len() + right_units.len();
+    let prior = partition.map_or_else(
+        || whole_units.len() * left_units.len() / probe_units.max(1),
+        |(left_samples, samples)| (whole_units.len() * left_samples + samples / 2) / samples.max(1),
+    );
     let split = (0..=whole_units.len())
         .min_by_key(|index| {
+            let (first_tie, second_tie) = if partition.is_some() {
+                (index.abs_diff(prior), prefix[*index])
+            } else {
+                // A growing tail is not evidence of more old context: prefer
+                // the better prefix fit before the positional prior, preserving
+                // genuinely new occurrences of repeated words.
+                (prefix[*index], index.abs_diff(prior))
+            };
             (
                 prefix[*index] + suffix[whole_units.len() - *index],
-                prefix[*index],
-                index.abs_diff(prior),
+                first_tie,
+                second_tie,
                 *index,
             )
         })
@@ -1918,6 +1960,95 @@ mod tests {
                     2 * MAX_SPEECH_WINDOW_SAMPLES + audio.len() - cut + 2 * LEFT_CONTEXT_SAMPLES
                 );
             }
+        }
+    }
+
+    #[test]
+    fn inexact_mixed_probes_keep_ownership_through_two_advances_and_commit() {
+        // Constant magnitude keeps VAD and the energy partition deterministic.
+        // The negative context identifies the second whole by its actual PCM,
+        // independently of invocation order. No decoder text is an expectation.
+        let mut audio = vec![12000_i16; 30 * 16000 + 7];
+        audio[144000..168000].fill(-12000);
+        let normalized: Vec<_> = audio.iter().map(|s| f32::from(*s) / 32768.0).collect();
+        for (left, right, context, timing) in [
+            ("ทดสอป", "ระบบ OK", "อบ", "none"),
+            ("ทดสอป", "ระบบ OK", "อบ", "coarse"),
+            ("ทดสอป", "ระบบ OK", "อบ", "nonfinite"),
+            ("", "ระบบ OK", "", "none"),
+            ("ทดสอป", "", "", "none"),
+            ("", "", "", "none"),
+            ("XXXXX", "YYYYYYYYYY", "", "none"),
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let captured = calls.clone();
+            let fake = HypothesisTranscriber(move |buffer: &PreparedSpeechBuffer| {
+                let samples = buffer.flattened_samples();
+                let count = samples.len();
+                let negative = samples[0] < 0.0;
+                let text = match (count, negative) {
+                    // The left typo used to suppress refinement and assign
+                    // zero bytes to the PCM about to be evicted.
+                    (288000, false) => "ทดสอบระบบ OK",
+                    (168000, false) => left,
+                    (120000, false) => right,
+                    (24000, true) => context,
+                    // The later OK is a real new occurrence; the first OK in
+                    // the final whole is technical replay of confirmed PCM.
+                    (288000, true) => "อบระบบ OK OK FIN",
+                    (180000, true) => "อบระบบ OK",
+                    (108000, false) => "OK FIN",
+                    (24000, false) => "OK",
+                    (180007, false) => "OK OK FIN fin.",
+                    _ => panic!("unexpected PCM span: {count}, negative={negative}"),
+                }
+                .to_owned();
+                let segments = match timing {
+                    "none" => None,
+                    _ => Some(vec![transcribe_rs::TranscriptionSegment {
+                        start: 0.0,
+                        end: if timing == "nonfinite" {
+                            f32::NAN
+                        } else {
+                            count as f32 / 16000.0
+                        },
+                        text: text.clone(),
+                    }]),
+                };
+                captured.lock().unwrap().push(samples);
+                Ok(VoiceSpeechHypothesis { text, segments })
+            });
+            let result = closed_input(&audio, 317, false, &fake).unwrap();
+            let GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. } = result else {
+                panic!("mixed transcript expected after two window advances");
+            };
+            assert_eq!(
+                transcript.text, "ทดสอบระบบ OK OK FIN fin.",
+                "{left:?}/{right:?}/{context:?}/{timing}"
+            );
+            assert_eq!(transcript.diagnostics.segment_count, 3);
+            assert_eq!(transcript.diagnostics.speech_samples, 480007);
+            assert_eq!(transcript.diagnostics.total_samples, 480007);
+            let calls = calls.lock().unwrap();
+            // Two disjoint partitions and their bounded context, then a changed
+            // final refresh after new source. No retry-until-agreement calls.
+            let spans = [
+                (0, 288000),
+                (0, 168000),
+                (168000, 288000),
+                (144000, 168000),
+                (144000, 432000),
+                (144000, 324000),
+                (324000, 432000),
+                (300000, 324000),
+                (300000, 480007),
+            ];
+            assert_eq!(calls.len(), spans.len());
+            for (call, (start, end)) in calls.iter().zip(spans) {
+                assert_eq!(call.as_slice(), &normalized[start..end]);
+                assert!(call.len() <= MAX_SPEECH_WINDOW_SAMPLES);
+            }
+            assert_eq!(calls.iter().map(Vec::len).sum::<usize>(), 1380007);
         }
     }
 
