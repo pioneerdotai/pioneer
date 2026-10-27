@@ -1991,6 +1991,20 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 .unwrap();
                 let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
                 let child_turn = payload["dispatch"]["turn_id"].as_str().unwrap();
+                let child_thread = payload["dispatch"]["thread_id"].as_str().unwrap();
+                let canonical = store
+                    .get_turn(child_thread, child_turn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1;
+                // A loaded thread can still have an unloaded target Turn.
+                // Load it before Stop so the memory assertion checks the actual
+                // terminal synchronization rather than a later restoration.
+                processor
+                    .ensure_runtime_turn_loaded_for_lifecycle(&workspace, child_thread, &canonical)
+                    .await
+                    .unwrap();
                 child_owners.insert(
                     child_turn.to_owned(),
                     store.get_turn_execution(child_turn).await.unwrap().unwrap(),
