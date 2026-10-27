@@ -1331,7 +1331,7 @@ mod connection_generation_tests {
     #[test]
     fn bound_native_request_does_not_recapture_route_changed_before_send() {
         use crate::rpc::JsonRpcRequestTransport;
-        let (command_tx, mut queue) = unbounded_channel();
+        let (command_tx, mut queue) = work_channel(Boundary::ClientCommand);
         let sender = GatewayWsCommandSender {
             command_tx,
             next_connection_id: Arc::new(AtomicU64::new(8)),
@@ -1357,7 +1357,7 @@ mod connection_generation_tests {
             let GatewayWsCommand::Request {
                 expected_connection,
                 ..
-            } = queue.try_recv().unwrap()
+            } = queue.try_recv().unwrap().value
             else {
                 panic!()
             };
