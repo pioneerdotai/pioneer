@@ -787,6 +787,9 @@ mod tests {
             cx.update(|window, cx| window.draw(cx).clear(cx));
             assert!(cx.debug_bounds("gateway-switcher-content").is_some());
             cx.simulate_keystrokes("escape");
+            // Fast retains old debug bounds when any subtree is reused. A full
+            // frame makes this absence assertion inspect the current popover.
+            cx.update(|window, _| window.refresh());
             cx.update(|window, cx| window.draw(cx).clear(cx));
             assert!(cx.debug_bounds("gateway-switcher-content").is_none());
             assert_eq!(count.load(Ordering::SeqCst), subscriptions);

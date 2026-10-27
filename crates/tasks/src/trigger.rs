@@ -76,6 +76,13 @@ impl TaskTriggerCalculator {
                 let _ = tz;
                 Ok(())
             }
+            TaskTriggerSpec::External {
+                source,
+                event_type,
+                filter,
+            } if source == "webhook" && (event_type.is_some() || filter.is_some()) => {
+                bail!("webhook triggers do not accept eventType or filters")
+            }
             TaskTriggerSpec::Manual { .. } | TaskTriggerSpec::External { .. } => Ok(()),
         }
     }
@@ -128,6 +135,37 @@ impl TaskTriggerCalculator {
         }
     }
 
+    /// Plan a scheduler observation, separating an armed occurrence from recovery.
+    /// `armed` means the scheduler observed this schedule while it was still
+    /// in the future. Tick latency alone does not make that occurrence missed.
+    /// Once a subsequent recurring fire is due, use the catch-up policy for the
+    /// backlog instead. A cold observation exactly at the deadline is also due.
+    pub fn due_plan(
+        trigger: &TaskTrigger,
+        now: i64,
+        armed: bool,
+    ) -> TaskRuntimeResult<TaskTriggerCatchUpPlan> {
+        Self::validate(&trigger.spec)?;
+        if let Some(first_due_at) = trigger.next_fire_at
+            && first_due_at <= now
+            && (armed || first_due_at == now)
+        {
+            let next_fire_at = Self::next_after_fire(trigger, first_due_at)?;
+            if next_fire_at.is_none_or(|next| next > now) {
+                return Ok(TaskTriggerCatchUpPlan {
+                    fire_times: vec![first_due_at],
+                    last_fire_at: Some(first_due_at),
+                    next_fire_at,
+                    exhausted: !is_recurring_trigger(trigger),
+                });
+            }
+        }
+        Self::catch_up_plan(trigger, now)
+    }
+
+    /// Recover occurrences already missed when the schedule was observed.
+    /// `last_fire_at` is a consumed schedule cursor, including skipped fires;
+    /// only `fire_times` requests creation of Runs.
     pub fn catch_up_plan(
         trigger: &TaskTrigger,
         now: i64,
@@ -502,6 +540,7 @@ mod tests {
         catch_up_policy: Option<TaskTriggerCatchUpPolicy>,
     ) -> TaskTrigger {
         TaskTrigger {
+            webhook_secret_ref: None,
             id: "cron_test".to_owned(),
             task_id: "task_test".to_owned(),
             status: TaskTriggerStatus::Active,
@@ -522,6 +561,104 @@ mod tests {
             .single()
             .unwrap()
             .timestamp()
+    }
+
+    #[test]
+    fn due_plan_distinguishes_live_deadlines_from_recovery_without_time_tolerance() {
+        let first = utc(2026, 10, 20, 7, 0);
+        for policy in [
+            TaskTriggerCatchUpPolicy::skip_missed(),
+            TaskTriggerCatchUpPolicy::run_once_for_latest_missed(),
+            TaskTriggerCatchUpPolicy::run_all_missed(2),
+        ] {
+            for spec in [
+                TaskTriggerSpec::Interval {
+                    interval_seconds: 60,
+                    interval_anchor_at: Some(first),
+                    catch_up_policy: Some(policy),
+                },
+                TaskTriggerSpec::Cron {
+                    cron_expr: "* * * * *".to_owned(),
+                    timezone: "UTC".to_owned(),
+                    catch_up_policy: Some(policy),
+                },
+                TaskTriggerSpec::ScheduledAt {
+                    scheduled_at: first,
+                    timezone: None,
+                    catch_up_policy: Some(policy),
+                },
+            ] {
+                let mut trigger = cron_trigger("* * * * *", "UTC", first, Some(policy));
+                trigger.spec = spec;
+                let recurring = is_recurring_trigger(&trigger);
+                let next = recurring.then_some(first + 60);
+                let before = TaskTriggerCalculator::due_plan(&trigger, first - 1, true).unwrap();
+                assert!(before.fire_times.is_empty());
+                assert_eq!(before.next_fire_at, Some(first));
+                for (now, armed) in [
+                    (first, false),
+                    (first, true),
+                    (first + 1, true),
+                    (first + 59, true),
+                ] {
+                    let plan = TaskTriggerCalculator::due_plan(&trigger, now, armed).unwrap();
+                    assert_eq!(plan.fire_times, vec![first], "{policy:?} {now} {armed}");
+                    assert_eq!(plan.last_fire_at, Some(first));
+                    assert_eq!(plan.next_fire_at, next);
+                    assert_eq!(plan.exhausted, !recurring);
+                    let mut consumed = trigger.clone();
+                    consumed.last_fire_at = plan.last_fire_at;
+                    consumed.next_fire_at = plan.next_fire_at;
+                    assert!(
+                        TaskTriggerCalculator::due_plan(&consumed, now, false)
+                            .unwrap()
+                            .fire_times
+                            .is_empty()
+                    );
+                }
+                // A cold overdue observation remains recovery, even with only
+                // one elapsed deadline. No invented grace period is involved.
+                let cold = TaskTriggerCalculator::due_plan(&trigger, first + 1, false).unwrap();
+                assert_eq!(
+                    cold.fire_times,
+                    if policy.mode == TaskTriggerCatchUpMode::SkipMissed {
+                        vec![]
+                    } else {
+                        vec![first]
+                    }
+                );
+                if recurring {
+                    // Reaching the next schedule boundary makes a backlog,
+                    // even in a live scheduler that had armed the first fire.
+                    for armed in [false, true] {
+                        let boundary =
+                            TaskTriggerCalculator::due_plan(&trigger, first + 60, armed).unwrap();
+                        assert_eq!(
+                            boundary.fire_times,
+                            match policy.mode {
+                                TaskTriggerCatchUpMode::SkipMissed => vec![],
+                                TaskTriggerCatchUpMode::RunOnceForLatestMissed => vec![first + 60],
+                                TaskTriggerCatchUpMode::RunAllMissed => vec![first, first + 60],
+                            }
+                        );
+                        let plan =
+                            TaskTriggerCalculator::due_plan(&trigger, first + 180, armed).unwrap();
+                        let (fires, last) = match policy.mode {
+                            TaskTriggerCatchUpMode::SkipMissed => (vec![], first + 180),
+                            TaskTriggerCatchUpMode::RunOnceForLatestMissed => {
+                                (vec![first + 180], first + 180)
+                            }
+                            TaskTriggerCatchUpMode::RunAllMissed => {
+                                (vec![first, first + 60], first + 60)
+                            }
+                        };
+                        assert_eq!(plan.fire_times, fires);
+                        assert_eq!(plan.last_fire_at, Some(last));
+                        assert_eq!(plan.next_fire_at, Some(last + 60));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

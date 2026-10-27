@@ -110,7 +110,8 @@ pub(crate) struct SkillsController {
     next: u64,
     publications: BTreeMap<(String, String), Arc<SkillsActionPublication>>,
     uploads: BTreeMap<(String, u64), Upload>,
-    sender: Option<mpsc::SyncSender<Work>>,
+    queue: Option<pioneer_observability::queues::QueueObserver>,
+    sender: Option<mpsc::SyncSender<pioneer_observability::work::WorkItem<Work>>>,
     task: Option<std::thread::JoinHandle<()>>,
 }
 impl SkillsController {
@@ -278,19 +279,24 @@ impl ClientCore {
             .checked_add(1)
             .expect("Skills operation identity exhausted");
         let operation = owner.next;
-        owner
-            .sender
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("client_stopped"))?
-            .try_send(Work::Action(Action {
-                workspace: workspace.into(),
-                target: target.clone(),
-                operation,
-                epoch,
-                intent: intent.clone(),
-                previous_policy,
-            }))
-            .map_err(|_| anyhow::anyhow!("skills_action_backpressure"))?;
+        anyhow::ensure!(owner.sender.is_some(), "client_stopped");
+        send_skill_work(
+            &owner,
+            pioneer_observability::work::WorkItem::new(
+                Work::Action(Action {
+                    workspace: workspace.into(),
+                    target: target.clone(),
+                    operation,
+                    epoch,
+                    intent: intent.clone(),
+                    previous_policy,
+                }),
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
+        )
+        .map_err(|_| anyhow::anyhow!("skills_action_backpressure"))?;
         self.publish_skills_action(
             &mut owner,
             workspace,
@@ -368,8 +374,36 @@ impl ClientCore {
                         })
             }
     }
+    fn retire_skills_action(&self, action: &Action) {
+        let mut owner = self
+            .skills_controller
+            .lock()
+            .expect("Skills controller poisoned");
+        if !owner
+            .publications
+            .get(&(action.workspace.clone(), action.target.clone()))
+            .is_some_and(|p| {
+                p.operation_id == action.operation && p.state == SkillsActionState::Pending
+            })
+        {
+            return;
+        }
+        self.publish_skills_action(
+            &mut owner,
+            &action.workspace,
+            &action.target,
+            action.operation,
+            SkillsActionState::Cancelled,
+            action.intent.kind(),
+        );
+        drop(owner);
+        if self.capability_management_allowed(&action.workspace) {
+            self.fence_skills_reads_after_action(&action.workspace);
+        }
+    }
     fn complete_skills_action(&self, action: Action, result: anyhow::Result<()>) {
         if !self.skills_action_current(&action) {
+            self.retire_skills_action(&action);
             return;
         }
         let mut owner = self
@@ -385,9 +419,7 @@ impl ClientCore {
         {
             return;
         }
-        if result.is_ok() {
-            self.fence_skills_reads_after_action(&action.workspace);
-        }
+        self.fence_skills_reads_after_action(&action.workspace);
         self.publish_skills_action(
             &mut owner,
             &action.workspace,
@@ -489,16 +521,21 @@ impl ClientCore {
             .checked_add(1)
             .expect("Skills operation identity exhausted");
         let operation = owner.next;
-        owner
-            .sender
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("client_stopped"))?
-            .try_send(Work::Prepare {
-                workspace: workspace.into(),
-                operation,
-                path,
-            })
-            .map_err(|_| anyhow::anyhow!("skills_upload_backpressure"))?;
+        anyhow::ensure!(owner.sender.is_some(), "client_stopped");
+        send_skill_work(
+            &owner,
+            pioneer_observability::work::WorkItem::new(
+                Work::Prepare {
+                    workspace: workspace.into(),
+                    operation,
+                    path,
+                },
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
+        )
+        .map_err(|_| anyhow::anyhow!("skills_upload_backpressure"))?;
         let connection_bound = expected_connection.is_some()
             || matches!(
                 target,
@@ -623,13 +660,21 @@ impl ClientCore {
             });
         self.publish_skill_upload(workspace, upload);
         if let Some(remote) = remote
-            && let Some(sender) = &owner.sender
+            && owner.sender.is_some()
         {
-            let _ = sender.try_send(Work::Abort {
-                workspace: workspace.into(),
-                upload: remote,
-                epoch,
-            });
+            let _ = send_skill_work(
+                &owner,
+                pioneer_observability::work::WorkItem::new(
+                    Work::Abort {
+                        workspace: workspace.into(),
+                        upload: remote,
+                        epoch,
+                    },
+                    pioneer_observability::work::Boundary::StdThread,
+                    pioneer_observability::work::WorkKind::ClientCommand,
+                    pioneer_observability::work::ExecutorRole::ClientController,
+                ),
+            );
         }
     }
     pub(crate) fn invalidate_skills_operations(&self) {
@@ -652,18 +697,33 @@ impl ClientCore {
             self.publish_skill_upload(workspace, upload);
         }
     }
+    fn retire_skill_upload(&self, workspace: &str, upload: &mut Upload) -> bool {
+        if upload.flow.publication.state.is_terminal() {
+            return false;
+        }
+        upload.flow.terminate(SkillUploadState::Cancelled);
+        self.publish_skill_upload(workspace, upload);
+        true
+    }
     fn skill_preparation_target(
         &self,
         workspace: &str,
         operation: u64,
     ) -> Option<SkillUploadTarget> {
-        let owner = self
+        let mut owner = self
             .skills_controller
             .lock()
             .expect("Skills controller poisoned");
-        let upload = owner.uploads.get(&(workspace.into(), operation))?;
-        self.upload_current(workspace, upload)
-            .then(|| upload.target.clone())
+        let upload = owner.uploads.get_mut(&(workspace.into(), operation))?;
+        if !self.upload_current(workspace, upload) {
+            let retired = self.retire_skill_upload(workspace, upload);
+            drop(owner);
+            if retired && self.capability_management_allowed(workspace) {
+                self.fence_skills_reads_after_action(workspace);
+            }
+            return None;
+        }
+        Some(upload.target.clone())
     }
     fn complete_skill_preparation(
         &self,
@@ -678,9 +738,15 @@ impl ClientCore {
         let Some(upload) = owner.uploads.get_mut(&(workspace.into(), operation)) else {
             return;
         };
-        if !self.upload_current(workspace, upload)
-            || upload.flow.publication.state != SkillUploadState::Preparing
-        {
+        if upload.flow.publication.state != SkillUploadState::Preparing {
+            return;
+        }
+        if !self.upload_current(workspace, upload) {
+            let retired = self.retire_skill_upload(workspace, upload);
+            drop(owner);
+            if retired && self.capability_management_allowed(workspace) {
+                self.fence_skills_reads_after_action(workspace);
+            }
             return;
         }
         match prepared {
@@ -712,6 +778,11 @@ impl ClientCore {
             .expect("Skills controller poisoned");
         let upload = owner.uploads.get_mut(&(workspace.into(), operation))?;
         if !self.upload_current(workspace, upload) {
+            let retired = self.retire_skill_upload(workspace, upload);
+            drop(owner);
+            if retired && self.capability_management_allowed(workspace) {
+                self.fence_skills_reads_after_action(workspace);
+            }
             return None;
         }
         Some((
@@ -736,12 +807,18 @@ impl ClientCore {
         let Some(upload) = owner.uploads.get_mut(&(workspace.into(), operation)) else {
             return;
         };
-        if !self.upload_current(workspace, upload) {
-            return;
-        }
         if !upload.flow.accepts_effect(effect_generation) {
             return;
         }
+        if !self.upload_current(workspace, upload) {
+            let retired = self.retire_skill_upload(workspace, upload);
+            drop(owner);
+            if retired && self.capability_management_allowed(workspace) {
+                self.fence_skills_reads_after_action(workspace);
+            }
+            return;
+        }
+        let failed = result.is_err();
         match result {
             Ok(completion) => {
                 if !upload.flow.complete(effect_generation, completion) {
@@ -757,40 +834,60 @@ impl ClientCore {
         let cleanup = upload.flow.take_cleanup();
         let epoch = upload.epoch;
         if let Some(upload) = cleanup
-            && let Some(sender) = &owner.sender
+            && owner.sender.is_some()
         {
-            let _ = sender.try_send(Work::Abort {
-                workspace: workspace.into(),
-                upload,
-                epoch,
-            });
+            let _ = send_skill_work(
+                &owner,
+                pioneer_observability::work::WorkItem::new(
+                    Work::Abort {
+                        workspace: workspace.into(),
+                        upload,
+                        epoch,
+                    },
+                    pioneer_observability::work::Boundary::StdThread,
+                    pioneer_observability::work::WorkKind::ClientCommand,
+                    pioneer_observability::work::ExecutorRole::ClientController,
+                ),
+            );
         }
         drop(owner);
-        if succeeded {
+        if succeeded || failed {
             self.fence_skills_reads_after_action(workspace);
             self.refresh_plugin_publication(workspace);
         }
     }
     pub(crate) fn start_skills_operation_controller(self: &Arc<Self>) {
-        let (sender, receiver) = mpsc::sync_channel::<Work>(32);
+        let (sender, receiver) =
+            mpsc::sync_channel::<pioneer_observability::work::WorkItem<Work>>(32);
+        let queue = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(32),
+            "skills work items; payload bytes unavailable without traversal",
+        );
+        let receiver_queue = queue.clone();
         let weak = Arc::downgrade(self);
-        let task=std::thread::Builder::new().name("client-skills-actions".into()).spawn(move||while let Ok(work)=receiver.recv(){
+        let task=std::thread::Builder::new().name("client-skills-actions".into()).spawn(move||while let Ok(item)=receiver.recv(){
+            let (work,carrier)=item.received(pioneer_observability::work::Boundary::StdThread,pioneer_observability::work::WorkKind::ClientCommand,pioneer_observability::work::ExecutorRole::ClientController);let _scope=carrier.enter();
+            let mut active = pioneer_observability::live::WorkGuard::start(carrier.context(), false);
+            let mut processing = receiver_queue.processing();
+            let mut outcome=pioneer_observability::work::Outcome::Completed;
             match work {
                 Work::Action(action)=>{
-                    let Some(core)=weak.upgrade() else{return;};if !core.skills_action_current(&action){continue;}let sender=core.transport_runtime().ws_command_sender();drop(core);
+                    let Some(core)=weak.upgrade() else{return;};if !core.skills_action_current(&action){core.retire_skills_action(&action);continue;}let sender=core.transport_runtime().ws_command_sender();drop(core);
                     let bound=sender.requests_for_connection(action.epoch.2.expect("admitted Skills action has a connection"));
                     let result=match &action.intent {
                         SkillsIntent::Policy{skill_id,enabled,allow_implicit_invocation}=>crate::transport::ws::command_sender::skills_policy_set(&bound,super::actions::skills_policy_set_params(&action.workspace,skill_id.clone(),*enabled,*allow_implicit_invocation)).map(|_|()),
                         SkillsIntent::Remove{skill_id}=>crate::transport::ws::command_sender::skills_uninstall(&bound,super::actions::skills_uninstall_params(&action.workspace,skill_id.clone())).map(|_|()),
                         SkillsIntent::RemovePack{pack_id}=>crate::transport::ws::command_sender::skills_pack_uninstall(&bound,super::actions::skills_pack_uninstall_params(&action.workspace,pack_id.clone())).map(|_|()),
-                    };if let Some(core)=weak.upgrade(){core.complete_skills_action(action,result);}
+                    };if result.is_err(){outcome=pioneer_observability::work::Outcome::Failed;} if let Some(core)=weak.upgrade(){core.complete_skills_action(action,result);}
                 }
                 Work::Abort{workspace,upload,epoch}=>{
-                    let Some(core)=weak.upgrade() else{return;};if core.is_stopped()||core.provider_runtime_epoch()!=epoch||!core.capability_management_allowed(&workspace){continue;}let sender=core.transport_runtime().ws_command_sender();drop(core);if let Some(connection)=epoch.2 { let _=crate::transport::ws::command_sender::skills_upload_abort(&sender.requests_for_connection(connection),super::upload::skills_upload_abort_params(workspace,upload)); }
+                    let Some(core)=weak.upgrade() else{return;};if core.is_stopped()||core.provider_runtime_epoch()!=epoch||!core.capability_management_allowed(&workspace){continue;}let sender=core.transport_runtime().ws_command_sender();drop(core);if let Some(connection)=epoch.2 {if crate::transport::ws::command_sender::skills_upload_abort(&sender.requests_for_connection(connection),super::upload::skills_upload_abort_params(workspace,upload)).is_err(){outcome=pioneer_observability::work::Outcome::Failed;}}
                 }
                 Work::Prepare{workspace,operation,path}=>{
                     let Some(core)=weak.upgrade() else{return;};let target=core.skill_preparation_target(&workspace,operation);drop(core);let Some(target)=target else{continue;};
                     let prepared=prepare_archive_effect(target,path);
+                    if prepared.is_err(){outcome=pioneer_observability::work::Outcome::Failed;}
                     if let Some(core)=weak.upgrade(){core.complete_skill_preparation(&workspace,operation,prepared);}else{return;}
 
                     loop {
@@ -822,17 +919,47 @@ impl ClientCore {
                                 },
                                 SkillUploadTarget::UpdatePack{pack_id}=>sender.skills_pack_update(super::actions::skills_pack_update_uploaded_archive_params(&workspace,pack_id,upload_id)).map(|_|()),
                             }.map(|_|UploadCompletion::Applied),
-                        };if let Some(core)=weak.upgrade(){core.complete_skill_upload_effect(&workspace,operation,effect_generation,result);}
+                        };if result.is_err(){outcome=pioneer_observability::work::Outcome::Failed;} if let Some(core)=weak.upgrade(){core.complete_skill_upload_effect(&workspace,operation,effect_generation,result);}
                     }
                 }
             }
+            processing.processed();
+            active.finish(outcome);
         }).expect("Skills operation controller could not start");
         let mut owner = self
             .skills_controller
             .lock()
             .expect("Skills controller poisoned");
+        owner.queue = Some(queue);
         owner.sender = Some(sender);
         owner.task = Some(task);
+    }
+}
+
+fn send_skill_work(
+    owner: &SkillsController,
+    mut item: pioneer_observability::work::WorkItem<Work>,
+) -> Result<(), ()> {
+    let Some(sender) = &owner.sender else {
+        return Err(());
+    };
+    if let Some(queue) = &owner.queue {
+        item = item.observed(
+            queue.clone(),
+            pioneer_observability::queues::QueueBytes::Unsupported,
+        );
+    }
+    match sender.try_send(item) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let item = match error {
+                mpsc::TrySendError::Full(item) | mpsc::TrySendError::Disconnected(item) => item,
+            };
+            if let Some((queue, bytes)) = &item.queue {
+                queue.rejected_send(*bytes);
+            }
+            Err(())
+        }
     }
 }
 
@@ -876,7 +1003,10 @@ fn prepare_archive_effect(
 mod tests {
     use super::*;
     use crate::catalog_test_support::{client, skill};
-    fn fixture() -> (Arc<ClientCore>, mpsc::Receiver<Work>) {
+    fn fixture() -> (
+        Arc<ClientCore>,
+        mpsc::Receiver<pioneer_observability::work::WorkItem<Work>>,
+    ) {
         let core = client();
         core.accept_skills_catalog_for_test(
             "workspace",
@@ -930,13 +1060,76 @@ mod tests {
             let admitted = core.provider_runtime_epoch();
             core.skills_intent_bound("workspace", intent, admitted)
                 .unwrap();
-            let Work::Action(action) = receiver.try_recv().unwrap() else {
+            let Work::Action(action) = receiver.try_recv().unwrap().value else {
                 panic!()
             };
             crate::catalog_test_support::switch_connection(&core, 9);
             assert_eq!(action.epoch, admitted);
             assert!(!core.skills_action_current(&action));
         }
+    }
+    #[test]
+    fn retired_ticket_releases_action_and_archive_without_touching_replacements() {
+        let (core, queue) = fixture();
+        let skill_id = skill('A').skill_id;
+        let intent = || SkillsIntent::Remove {
+            skill_id: skill_id.clone(),
+        };
+        core.skills_intent("workspace", intent()).unwrap();
+        let Work::Action(action) = queue.try_recv().unwrap().value else {
+            panic!()
+        };
+        let late = Action {
+            workspace: action.workspace.clone(),
+            target: action.target.clone(),
+            operation: action.operation,
+            epoch: action.epoch,
+            intent: intent(),
+            previous_policy: None,
+        };
+        let upload = core
+            .start_skill_upload("workspace", SkillUploadTarget::Install, "unused".into())
+            .unwrap();
+        let _ = queue.try_recv().unwrap();
+        crate::catalog_test_support::replace_connection(&core, 8);
+        core.complete_skills_action(action, Ok(()));
+        assert_eq!(
+            core.skills_action_snapshot("workspace", &skill_id.to_string())
+                .unwrap()
+                .state,
+            SkillsActionState::Cancelled
+        );
+        assert!(
+            core.skill_preparation_target("workspace", upload.id())
+                .is_none()
+        );
+        assert_eq!(
+            core.skill_upload_snapshot("workspace", upload.id())
+                .unwrap()
+                .state,
+            SkillUploadState::Cancelled
+        );
+        core.skills_intent("workspace", intent()).unwrap();
+        let pending = core
+            .skills_action_snapshot("workspace", &skill_id.to_string())
+            .unwrap();
+        let next = core
+            .start_skill_upload("workspace", SkillUploadTarget::Install, "unused".into())
+            .unwrap();
+        core.complete_skills_action(late, Err(anyhow::anyhow!("late")));
+        core.complete_skill_preparation("workspace", upload.id(), Err(anyhow::anyhow!("late")));
+        assert!(Arc::ptr_eq(
+            &pending,
+            &core
+                .skills_action_snapshot("workspace", &skill_id.to_string())
+                .unwrap()
+        ));
+        assert_eq!(
+            core.skill_upload_snapshot("workspace", next.id())
+                .unwrap()
+                .state,
+            SkillUploadState::Preparing
+        );
     }
     #[test]
     fn skill_policy_remove_failure_retry_and_access_fence_share_one_controller() {
@@ -949,7 +1142,7 @@ mod tests {
         };
         let first = core.skills_intent("workspace", intent()).unwrap();
         assert!(core.skills_intent("workspace", intent()).is_err());
-        let Work::Action(action) = receiver.try_recv().unwrap() else {
+        let Work::Action(action) = receiver.try_recv().unwrap().value else {
             panic!()
         };
         core.complete_skills_action(action, Err(anyhow::anyhow!("synthetic failure")));
@@ -960,7 +1153,7 @@ mod tests {
             SkillsActionState::Failed
         );
         assert!(core.skills_intent("workspace", intent()).unwrap() > first);
-        let Work::Action(action) = receiver.try_recv().unwrap() else {
+        let Work::Action(action) = receiver.try_recv().unwrap().value else {
             panic!()
         };
         core.complete_skills_action(action, Ok(()));
@@ -971,7 +1164,7 @@ mod tests {
             },
         )
         .unwrap();
-        let Work::Action(action) = receiver.try_recv().unwrap() else {
+        let Work::Action(action) = receiver.try_recv().unwrap().value else {
             panic!()
         };
         core.invalidate_skills_operations();
@@ -999,7 +1192,10 @@ mod tests {
                 Some(connection),
             )
             .unwrap();
-        assert!(matches!(receiver.try_recv(), Ok(Work::Prepare { .. })));
+        assert!(matches!(
+            receiver.try_recv().map(|item| item.value),
+            Ok(Work::Prepare { .. })
+        ));
         core.complete_skill_preparation(
             "workspace",
             operation.id(),
@@ -1048,7 +1244,10 @@ mod tests {
                 PathBuf::from("synthetic-unused-picker-result"),
             )
             .unwrap();
-        assert!(matches!(receiver.try_recv(), Ok(Work::Prepare { .. })));
+        assert!(matches!(
+            receiver.try_recv().map(|item| item.value),
+            Ok(Work::Prepare { .. })
+        ));
         core.complete_skill_preparation(
             "workspace",
             operation.id(),
@@ -1114,7 +1313,10 @@ mod tests {
         drop(operation);
         let cancelled = core.skill_upload_snapshot("workspace", id).unwrap();
         assert_eq!(cancelled.state, SkillUploadState::Cancelled);
-        assert!(matches!(receiver.try_recv(), Ok(Work::Abort { .. })));
+        assert!(matches!(
+            receiver.try_recv().map(|item| item.value),
+            Ok(Work::Abort { .. })
+        ));
         core.complete_skill_upload_effect("workspace", id, 3, Ok(UploadCompletion::Applied));
         assert!(Arc::ptr_eq(
             &cancelled,
@@ -1141,7 +1343,10 @@ mod tests {
             )
             .unwrap();
         let op = operation.id();
-        assert!(matches!(receiver.try_recv(), Ok(Work::Prepare { .. })));
+        assert!(matches!(
+            receiver.try_recv().map(|item| item.value),
+            Ok(Work::Prepare { .. })
+        ));
         core.complete_skill_preparation(
             "workspace",
             op,

@@ -1182,6 +1182,14 @@
         "end"
       ]
     },
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude",
+        "opencode"
+      ]
+    },
     "DeltaOutputPolicy": {
       "oneOf": [
         {
@@ -1500,6 +1508,47 @@
           ]
         },
         {
+          "description": "Structured cells and the original GFM fragment with its used reference\ndefinitions, without Quote/List prefixes.",
+          "type": "object",
+          "properties": {
+            "alignments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownTableAlignment"
+              }
+            },
+            "headers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownInline"
+              }
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/MarkdownInline"
+                }
+              }
+            },
+            "source": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "table"
+            }
+          },
+          "required": [
+            "type",
+            "headers",
+            "rows",
+            "alignments",
+            "source"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "type": {
@@ -1674,6 +1723,15 @@
             "url"
           ]
         }
+      ]
+    },
+    "MarkdownTableAlignment": {
+      "type": "string",
+      "enum": [
+        "none",
+        "left",
+        "center",
+        "right"
       ]
     },
     "McpScopeKind": {
@@ -3252,6 +3310,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "cli_runtime_kind": {
+          "description": "CLI provider identity projected from persisted execution bindings, independent of artwork.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CLIAgentRuntimeKind"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "display_name": {

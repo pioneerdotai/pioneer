@@ -7,7 +7,7 @@ use crate::tools::stream::IncrementalSseDecoder;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
     ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
-    ProviderToolCall, ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderToolCall, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -61,6 +61,10 @@ struct ApiChatRequest {
     output_config: Option<AnthropicOutputConfig>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<serde_json::Value>,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,6 +156,10 @@ enum AnthropicToolChoiceMode {
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     content: Vec<ContentBlock>,
     #[serde(default)]
     stop_reason: Option<String>,
@@ -181,30 +189,7 @@ struct ContentBlock {
     extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    input_tokens: Option<u64>,
-    #[serde(default)]
-    output_tokens: Option<u64>,
-    #[serde(default)]
-    cache_creation_input_tokens: Option<u64>,
-    #[serde(default)]
-    cache_read_input_tokens: Option<u64>,
-}
-
-impl ApiUsage {
-    fn normalized(&self) -> TokenUsage {
-        TokenUsage {
-            input_tokens: self.input_tokens.and_then(|input| {
-                input
-                    .checked_add(self.cache_creation_input_tokens?)?
-                    .checked_add(self.cache_read_input_tokens?)
-            }),
-            output_tokens: self.output_tokens,
-        }
-    }
-}
+type ApiUsage = crate::usage::AnthropicUsage;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
@@ -236,6 +221,10 @@ struct StreamNativeError {
 
 #[derive(Debug, Deserialize)]
 struct StreamMessage {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     usage: Option<ApiUsage>,
 }
@@ -293,6 +282,8 @@ struct ModelsListResponse {
 struct AnthropicModelEntry {
     id: String,
     #[serde(default)]
+    capabilities: Option<serde_json::Value>,
+    #[serde(default)]
     display_name: Option<String>,
     #[serde(default)]
     created_at: Option<String>,
@@ -305,6 +296,56 @@ struct AnthropicModelEntry {
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl AnthropicProvider {
+    fn build_chat_request(
+        request: &ChatRequest,
+        system: Option<String>,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        Self::build_chat_request_with_catalog(
+            request,
+            system,
+            messages,
+            stream,
+            crate::catalog::model_catalog().ok().as_deref(),
+        )
+    }
+
+    fn build_chat_request_with_catalog(
+        request: &ChatRequest,
+        system: Option<String>,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<ApiChatRequest> {
+        let generation =
+            crate::generation::anthropic_fields_with_catalog(catalog, "anthropic", request)?;
+        Ok(ApiChatRequest {
+            generation,
+            cache_control: None,
+            model: request.model.clone(),
+            messages,
+            max_tokens: crate::generation::required_cap_with_catalog(
+                catalog,
+                "anthropic",
+                request,
+                DEFAULT_MAX_TOKENS,
+            )?,
+            temperature: request.temperature,
+            system,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: Self::convert_tool_choice(
+                request.tool_choice.clone(),
+                request.parallel_tool_calls,
+            ),
+            output_config: None,
+            stream,
+        })
+    }
+
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
     }
@@ -325,10 +366,12 @@ impl AnthropicProvider {
         base_url: impl Into<String>,
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
+        let api_key = api_key.into();
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
         Self {
-            replay_authority: pioneer_protocol::generate_id(32),
-            api_key: api_key.into(),
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
+            replay_authority: crate::continuation::replay_authority("anthropic", &[&base_url]),
+            api_key,
+            base_url,
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
@@ -355,7 +398,14 @@ impl AnthropicProvider {
             .as_deref()
             .map(ProviderTermination::from_openai_reason)
             .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
-        let usage = api_response.usage.map(|u| u.normalized());
+        let usage = Some(
+            api_response
+                .usage
+                .map(|u| u.normalized())
+                .unwrap_or_default()
+                .with_native_id(api_response.id.as_deref())
+                .with_reported_model(api_response.model.as_deref()),
+        );
 
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
@@ -416,6 +466,7 @@ impl AnthropicProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage,
             termination,
@@ -430,45 +481,43 @@ impl AnthropicProvider {
         request: &ChatRequest,
         prepared: &PreparedProviderMessages,
         stream: bool,
-    ) -> Result<ApiChatRequest> {
-        if self.base_url != BASE_URL
-            && prepared.messages.iter().any(|message| {
-                message.provider_replay_state.as_ref().is_some_and(|state| {
-                    crate::continuation::retention(state)
-                        != crate::continuation::Retention::Ordinary
-                })
-            })
-        {
-            anyhow::bail!(
-                "native thinking replay through a custom Messages relay lacks documented prefix/account authority"
-            );
-        }
+    ) -> Result<serde_json::Value> {
         let (system, messages) = Self::prepare_messages(prepared)?;
-        let body = ApiChatRequest {
-            model: request.model.clone(),
-            messages,
-            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            temperature: request.temperature,
-            system,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: Self::convert_tool_choice(
-                request.tool_choice.clone(),
-                request.parallel_tool_calls,
-            ),
-            output_config: Self::output_config(request.reasoning),
-            stream,
-        };
+        let mut body = Self::build_chat_request(request, system, messages, stream)?;
+        body.cache_control = crate::usage::anthropic_cache_control(&self.base_url, &request.model);
+        let mut body = serde_json::to_value(body)?;
+        let states: Vec<_> = prepared
+            .messages
+            .iter()
+            .filter_map(|message| message.provider_replay_state.clone())
+            .collect();
+        crate::continuation::stabilize_anthropic_prefix(&mut body, &states)?;
+        // Parallel tool results are merged into one native user message, and
+        // native system updates add wire messages. Canonical indices therefore
+        // cannot serve as positions in the signed native prefix.
+        let mut search_from = 0;
+        let positions: Vec<_> = states
+            .into_iter()
+            .map(|state| {
+                let index = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                    .skip(search_from)
+                    .find(|(_, message)| {
+                        message["role"] == "assistant"
+                            && message["content"] == state.payload["blocks"]
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(search_from);
+                search_from = index + 1;
+                (index, state)
+            })
+            .collect();
         crate::continuation::validate_prefix(
-            &serde_json::to_value(&body)?,
-            prepared
-                .messages
-                .iter()
-                .filter(|m| m.role != Role::System)
-                .enumerate()
-                .filter_map(|(i, m)| m.provider_replay_state.clone().map(|s| (i, s))),
+            &body,
+            positions.into_iter(),
             &request.model,
             &self.replay_authority,
         )?;
@@ -569,6 +618,7 @@ impl AnthropicProvider {
                                 role: role.to_owned(),
                                 content,
                             });
+                            previous_tool = false;
                             continue;
                         }
                         content.extend(
@@ -687,15 +737,6 @@ impl AnthropicProvider {
         })
     }
 
-    fn output_config(reasoning: Option<ReasoningConfig>) -> Option<AnthropicOutputConfig> {
-        match reasoning {
-            Some(ReasoningConfig::Effort(effort)) => Some(AnthropicOutputConfig {
-                effort: effort.as_str().to_owned(),
-            }),
-            Some(ReasoningConfig::Disabled) | None => None,
-        }
-    }
-
     fn messages_url(&self) -> String {
         format!("{}/v1/messages", self.base_url)
     }
@@ -775,7 +816,6 @@ impl PendingToolUse {
 struct StreamReplayContext {
     model: String,
     authority: String,
-    unverified_relay: bool,
     prefix_body: serde_json::Value,
 }
 
@@ -785,16 +825,27 @@ impl AnthropicProvider {
     pub(super) fn decode_stream(
         byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
     ) -> BoxStream<'static, Result<StreamChunk>> {
-        Self::decode_stream_with_replay(byte_stream, None)
+        Self::decode_stream_with_replay(byte_stream, None, None)
     }
 
     fn decode_stream_with_replay(
         byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
         replay_context: Option<StreamReplayContext>,
+        native_request_id: Option<String>,
     ) -> BoxStream<'static, Result<StreamChunk>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         tokio::spawn(async move {
+            if native_request_id.is_some()
+                && tx
+                    .send(Ok(StreamChunk::usage(
+                        TokenUsage::default().with_request_id(native_request_id.as_deref()),
+                    )))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
             use std::collections::{BTreeMap, HashMap, HashSet};
 
             let mut decoder = IncrementalSseDecoder::default();
@@ -862,6 +913,23 @@ impl AnthropicProvider {
                                     return;
                                 }
                                 message_started = true;
+                            }
+                            if let Some(message) = event
+                                .message
+                                .as_ref()
+                                .filter(|_| event.event_type == "message_start")
+                            {
+                                if tx
+                                    .send(Ok(StreamChunk::usage(
+                                        TokenUsage::default()
+                                            .with_native_id(message.id.as_deref())
+                                            .with_reported_model(message.model.as_deref()),
+                                    )))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
                             }
                             if matches!(
                                 event.event_type.as_str(),
@@ -1043,13 +1111,6 @@ impl AnthropicProvider {
                                     // Decoder-only fixtures have no request prefix authority.
                                     // HTTP always supplies the exact body and adapter instance.
                                     if let Some(context) = &replay_context {
-                                        if context.unverified_relay
-                                            && crate::continuation::retention(&state)
-                                                != crate::continuation::Retention::Ordinary
-                                        {
-                                            state.payload["api_profile"] =
-                                                serde_json::json!("unverified-relay");
-                                        }
                                         if let Err(error) = crate::continuation::bind_prefix(
                                             &mut state,
                                             &context.model,
@@ -1288,6 +1349,13 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl crate::traits::Provider for AnthropicProvider {
+    fn usage_api(&self) -> &'static str {
+        "messages"
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(&self.base_url, "/v1/messages")
+    }
+
     fn name(&self) -> &str {
         "anthropic"
     }
@@ -1324,13 +1392,16 @@ impl crate::traits::Provider for AnthropicProvider {
         let prefix_body = serde_json::to_value(&api_request)?;
 
         crate::attachments::validate_inline_payload("anthropic", &api_request)?;
-        let request_builder = self
+        let mut request_builder = self
             .client
             .post(self.messages_url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&api_request);
+        if crate::continuation::anthropic_inline_tools(&api_request) {
+            request_builder = request_builder.header("anthropic-beta", "inline-tools-2026-09-15");
+        }
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
             .await?;
@@ -1339,6 +1410,12 @@ impl crate::traits::Provider for AnthropicProvider {
             return Err(Self::api_error(response).await);
         }
 
+        let native_request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
         let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
             response,
             Default::default(),
@@ -1346,12 +1423,11 @@ impl crate::traits::Provider for AnthropicProvider {
         )
         .await?;
         let mut response = Self::parse_response(api_response)?;
+        response
+            .usage
+            .get_or_insert_with(Default::default)
+            .request_id = crate::usage::native_id(native_request_id.as_deref());
         if let Some(state) = response.provider_replay_state.as_mut() {
-            if self.base_url != BASE_URL
-                && crate::continuation::retention(state) != crate::continuation::Retention::Ordinary
-            {
-                state.payload["api_profile"] = serde_json::json!("unverified-relay");
-            }
             crate::continuation::bind_prefix(
                 state,
                 &request.model,
@@ -1380,13 +1456,16 @@ impl crate::traits::Provider for AnthropicProvider {
         let prefix_body = serde_json::to_value(&api_request)?;
 
         crate::attachments::validate_inline_payload("anthropic", &api_request)?;
-        let request_builder = self
+        let mut request_builder = self
             .client
             .post(self.messages_url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&api_request);
+        if crate::continuation::anthropic_inline_tools(&api_request) {
+            request_builder = request_builder.header("anthropic-beta", "inline-tools-2026-09-15");
+        }
         let response =
             crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
 
@@ -1394,6 +1473,12 @@ impl crate::traits::Provider for AnthropicProvider {
             return Err(Self::api_error(response).await);
         }
 
+        let native_request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
         let byte_stream = crate::http::bounded_response_stream(
             response,
             crate::types::ProviderResponseLimits::default().max_transport_bytes,
@@ -1405,9 +1490,9 @@ impl crate::traits::Provider for AnthropicProvider {
             Some(StreamReplayContext {
                 model: request.model.clone(),
                 authority: self.replay_authority.clone(),
-                unverified_relay: self.base_url != BASE_URL,
                 prefix_body,
             }),
+            native_request_id,
         ))
     }
 
@@ -1453,6 +1538,19 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
     });
     let mut capabilities = ProviderModelCapabilities::default();
     reasoning_registry::apply_reasoning_capabilities("anthropic", m.id.as_str(), &mut capabilities);
+    if let Some(native) = m.capabilities.as_ref() {
+        let mut facts = std::collections::BTreeMap::new();
+        if let Some(effort) = native.get("effort") {
+            reasoning_registry::read_native_supports(effort, "effort", &mut facts);
+        }
+        if let Some(thinking) = native.get("thinking") {
+            reasoning_registry::read_native_supports(thinking, "thinking", &mut facts);
+            if let Some(types) = thinking.get("types") {
+                reasoning_registry::read_native_supports(types, "thinking.types", &mut facts);
+            }
+        }
+        reasoning_registry::apply_native_reasoning(&mut capabilities, facts);
+    }
 
     ProviderModelInfo {
         id: m.id.clone(),
@@ -1480,9 +1578,638 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn native_reasoning_facts_survive_enrichment_and_reach_both_messages_modes() {
+        for effort_support in [
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::Value::Null,
+        ] {
+            for adaptive_support in [true, false] {
+                let entry: AnthropicModelEntry = serde_json::from_value(serde_json::json!({
+                    "id":"claude-opus-4-6", "capabilities": {
+                        "effort":{"supported":effort_support,"low":{"supported":true},"medium":{"supported":false},"high":{"supported":true}},
+                        "thinking":{"supported":true,"types":{"adaptive":{"supported":adaptive_support},"enabled":{"supported":null}}}
+                    }
+                })).unwrap();
+                let parsed = provider_model_from_anthropic_model_entry(entry);
+                let native = parsed
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .native
+                    .clone();
+                assert_eq!(native["thinking.types.enabled"], None);
+                assert_eq!(native["effort.supported"], effort_support.as_bool());
+                let conflict = crate::generation::test_catalog_model(
+                    "anthropic",
+                    "claude-opus-4-6",
+                    "claude-opus-4-6",
+                    serde_json::json!({"reasoning":false,"compat":{"supportsReasoningEffort":false},"thinkingLevelMap":{"low":null,"medium":"medium","high":null}}),
+                );
+                for catalog in [
+                    crate::generation::test_catalog(false),
+                    crate::generation::test_catalog(true),
+                    conflict,
+                ] {
+                    let mut models = vec![parsed.clone()];
+                    catalog.enrich("anthropic", &mut models);
+                    let r = models[0].capabilities.reasoning.as_ref().unwrap();
+                    assert_eq!(r.native, native);
+                    assert_eq!(models[0].capabilities.thinking, Some(true));
+                    assert!(!r.effort_options.contains(&"medium".into()));
+                    let allowed = effort_support != serde_json::json!(false) && adaptive_support;
+                    assert_eq!(r.effort_options.contains(&"low".into()), allowed);
+                    let mut request = crate::generation::test_request("claude-opus-4-6");
+                    for selected in [
+                        None,
+                        Some(ReasoningConfig::Effort(ReasoningEffort::Low)),
+                        Some(ReasoningConfig::Effort(ReasoningEffort::Medium)),
+                    ] {
+                        request.reasoning = selected;
+                        for stream in [false, true] {
+                            let body = crate::generation::with_native_reasoning(
+                                "anthropic",
+                                true,
+                                [(request.model.clone(), native.clone())]
+                                    .into_iter()
+                                    .collect(),
+                                async {
+                                    AnthropicProvider::build_chat_request_with_catalog(
+                                        &request,
+                                        None,
+                                        vec![],
+                                        stream,
+                                        Some(&catalog),
+                                    )
+                                },
+                            )
+                            .await;
+                            assert_eq!(
+                                body.is_ok(),
+                                selected.is_none()
+                                    || selected
+                                        == Some(ReasoningConfig::Effort(ReasoningEffort::Low))
+                                        && allowed
+                            );
+                            if let Ok(body) = body {
+                                let json = serde_json::to_value(body).unwrap();
+                                assert_eq!(json["max_tokens"], 1024);
+                                if selected.is_none() {
+                                    assert!(json.get("thinking").is_none());
+                                } else {
+                                    assert_eq!(json["thinking"]["type"], "adaptive");
+                                    assert_eq!(json["output_config"]["effort"], "low");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn documented_partial_and_missing_claude_maps_keep_base_controls_and_original_ids() {
+        for id in [
+            "claude-fable-5-1",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-opus-4-5-20251101",
+        ] {
+            let parsed = provider_model_from_anthropic_model_entry(
+                serde_json::from_value(serde_json::json!({"id":id})).unwrap(),
+            );
+            let partial = crate::generation::test_catalog_model(
+                "anthropic",
+                id,
+                "claude-opus-4-6",
+                serde_json::json!({"thinkingLevelMap":{"xhigh":"xhigh","max":"max"}}),
+            );
+            for catalog in [
+                crate::generation::test_catalog(false),
+                crate::generation::test_catalog(true),
+                partial,
+            ] {
+                let mut models = vec![parsed.clone()];
+                catalog.enrich("anthropic", &mut models);
+                assert_eq!(models[0].id, id);
+                let r = models[0].capabilities.reasoning.as_ref().unwrap();
+                for base in ["low", "medium", "high"] {
+                    assert!(r.effort_options.contains(&base.into()));
+                }
+                assert_eq!(
+                    r.effort_options.iter().any(|e| e == "none"),
+                    r.mandatory == Some(false)
+                );
+                for stream in [false, true] {
+                    let request = crate::generation::test_request(id);
+                    let body = serde_json::to_value(
+                        AnthropicProvider::build_chat_request_with_catalog(
+                            &request,
+                            None,
+                            vec![],
+                            stream,
+                            Some(&catalog),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert!(body.get("thinking").is_none());
+                    assert!(body.get("output_config").is_none());
+                    if r.mandatory == Some(false) {
+                        let mut request = request;
+                        request.reasoning = Some(ReasoningConfig::Disabled);
+                        let body = serde_json::to_value(
+                            AnthropicProvider::build_chat_request_with_catalog(
+                                &request,
+                                None,
+                                vec![],
+                                stream,
+                                Some(&catalog),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(body["thinking"]["type"], "disabled");
+                        assert!(body.get("output_config").is_none());
+                    }
+                }
+                for effort in &r.effort_options {
+                    let mut request = crate::generation::test_request(id);
+                    request.reasoning = Some(ReasoningConfig::Effort(
+                        ReasoningEffort::from_str(effort).unwrap(),
+                    ));
+                    for stream in [false, true] {
+                        let json = serde_json::to_value(
+                            AnthropicProvider::build_chat_request_with_catalog(
+                                &request,
+                                None,
+                                vec![],
+                                stream,
+                                Some(&catalog),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(json["model"], id);
+                        if effort == "none" {
+                            assert_eq!(json["thinking"]["type"], "disabled");
+                            assert!(json.get("output_config").is_none());
+                        } else {
+                            assert_eq!(json["output_config"]["effort"], effort.as_str());
+                        }
+                        assert_eq!(json["max_tokens"], 1024);
+                    }
+                }
+                if r.mandatory == Some(true) {
+                    for off in [
+                        ReasoningConfig::Disabled,
+                        ReasoningConfig::Effort(ReasoningEffort::None),
+                    ] {
+                        let mut request = crate::generation::test_request(id);
+                        request.reasoning = Some(off);
+                        for stream in [false, true] {
+                            let error = AnthropicProvider::build_chat_request_with_catalog(
+                                &request,
+                                None,
+                                vec![],
+                                stream,
+                                Some(&catalog),
+                            )
+                            .unwrap_err()
+                            .to_string();
+                            let expected = if crate::generation::protocol_mandatory("anthropic", id)
+                            {
+                                "mandatory"
+                            } else {
+                                // An optional family can have an explicit
+                                // catalog off veto without becoming mandatory
+                                // in its documented protocol.
+                                "selected reasoning `off` is unsupported by the model's catalog thinking map"
+                            };
+                            assert!(error.contains(expected), "{id}, stream={stream}: {error}");
+                        }
+                    }
+                }
+            }
+        }
+        // Effort and thinking support are distinct: Opus 4.5 needs no thinking mode.
+        let parsed = provider_model_from_anthropic_model_entry(serde_json::from_value(serde_json::json!({"id":"claude-opus-4-5", "capabilities":{"effort":{"supported":true},"thinking":{"supported":false}}})).unwrap());
+        assert_eq!(parsed.capabilities.thinking, Some(false));
+        assert_eq!(
+            parsed.capabilities.reasoning.as_ref().unwrap().supported,
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_claude_off_obeys_native_and_catalog_vetoes_in_both_bodies() {
+        for id in [
+            "claude-opus-4-5",
+            "claude-opus-4-6",
+            "claude-opus-5",
+            "claude-sonnet-5",
+        ] {
+            for native_veto in [false, true] {
+                let parsed = provider_model_from_anthropic_model_entry(serde_json::from_value(serde_json::json!({
+                    "id":id, "capabilities":{"thinking":{"supported":true,"types":{"disabled":{"supported":!native_veto}}}}
+                })).unwrap());
+                let native = parsed
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .native
+                    .clone();
+                for catalog_veto in [false, true] {
+                    let catalog = crate::generation::test_catalog_model(
+                        "anthropic",
+                        id,
+                        "claude-opus-4-6",
+                        if catalog_veto {
+                            serde_json::json!({"thinkingLevelMap":{"off":null}})
+                        } else {
+                            serde_json::json!({"thinkingLevelMap":{"max":"max"}})
+                        },
+                    );
+                    let mut models = vec![parsed.clone()];
+                    catalog.enrich("anthropic", &mut models);
+                    let allowed = !native_veto && !catalog_veto;
+                    assert_eq!(
+                        models[0]
+                            .capabilities
+                            .reasoning
+                            .as_ref()
+                            .unwrap()
+                            .effort_options
+                            .iter()
+                            .any(|e| e == "none"),
+                        allowed
+                    );
+                    for selected in [
+                        None,
+                        Some(ReasoningConfig::Disabled),
+                        Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                    ] {
+                        let mut request = crate::generation::test_request(id);
+                        request.reasoning = selected;
+                        for stream in [false, true] {
+                            let result = crate::generation::with_native_reasoning(
+                                "anthropic",
+                                true,
+                                [(id.into(), native.clone())].into_iter().collect(),
+                                async {
+                                    AnthropicProvider::build_chat_request_with_catalog(
+                                        &request,
+                                        None,
+                                        vec![],
+                                        stream,
+                                        Some(&catalog),
+                                    )
+                                },
+                            )
+                            .await;
+                            if selected.is_none() || allowed {
+                                let body = serde_json::to_value(result.unwrap()).unwrap();
+                                assert!(body.get("output_config").is_none());
+                                if selected.is_none() {
+                                    assert!(body.get("thinking").is_none());
+                                } else {
+                                    assert_eq!(body["thinking"]["type"], "disabled");
+                                }
+                                assert_eq!(body["max_tokens"], 1024);
+                            } else {
+                                assert!(result.is_err());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_off_cannot_be_omitted_by_negative_claude_catalog() {
+        for id in ["claude-sonnet-5", "claude-opus-5"] {
+            for reasoning in [false, true] {
+                for off_map in [
+                    serde_json::json!({}),
+                    serde_json::json!({"off":"none"}),
+                    serde_json::json!({"off":null}),
+                ] {
+                    for native_case in ["absent", "unknown", "veto"] {
+                        let mut entry = serde_json::json!({"id":id});
+                        if native_case != "absent" {
+                            entry["capabilities"] = serde_json::json!({"thinking":{"supported":null,"types":{"disabled":{"supported":if native_case == "veto" { serde_json::json!(false) } else { serde_json::Value::Null }}}}});
+                        }
+                        let parsed = provider_model_from_anthropic_model_entry(
+                            serde_json::from_value(entry).unwrap(),
+                        );
+                        let native = parsed
+                            .capabilities
+                            .reasoning
+                            .as_ref()
+                            .unwrap()
+                            .native
+                            .clone();
+                        let catalog = crate::generation::test_catalog_model(
+                            "anthropic",
+                            id,
+                            "claude-opus-4-6",
+                            serde_json::json!({"reasoning":reasoning,"thinkingLevelMap":off_map}),
+                        );
+                        let mut models = vec![parsed];
+                        catalog.enrich("anthropic", &mut models);
+                        let allowed = reasoning
+                            && off_map.get("off") != Some(&serde_json::Value::Null)
+                            && native_case != "veto";
+                        assert_eq!(
+                            models[0]
+                                .capabilities
+                                .reasoning
+                                .as_ref()
+                                .unwrap()
+                                .effort_options
+                                .iter()
+                                .any(|e| e == "none"),
+                            allowed
+                        );
+                        for setting in [
+                            None,
+                            Some(ReasoningConfig::Disabled),
+                            Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                        ] {
+                            let mut request = crate::generation::test_request(id);
+                            request.reasoning = setting;
+                            for stream in [false, true] {
+                                let result = crate::generation::with_native_reasoning(
+                                    "anthropic",
+                                    true,
+                                    [(id.into(), native.clone())].into_iter().collect(),
+                                    async {
+                                        AnthropicProvider::build_chat_request_with_catalog(
+                                            &request,
+                                            None,
+                                            vec![],
+                                            stream,
+                                            Some(&catalog),
+                                        )
+                                    },
+                                )
+                                .await;
+                                if setting.is_none() || allowed {
+                                    let body = serde_json::to_value(result.unwrap()).unwrap();
+                                    assert!(body.get("output_config").is_none());
+                                    if setting.is_none() {
+                                        assert!(body.get("thinking").is_none());
+                                    } else {
+                                        assert_eq!(body["thinking"]["type"], "disabled");
+                                    }
+                                    assert_eq!(body["max_tokens"], 1024);
+                                } else {
+                                    let error = result.unwrap_err().to_string();
+                                    assert!(
+                                        error.contains("explicit Claude off")
+                                            || error.contains(
+                                                "unsupported by the model's catalog thinking map"
+                                            )
+                                            || error.contains("denies disabled thinking"),
+                                        "{error}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_opus_46_vocabulary_is_not_expanded_by_aws_platform_rules() {
+        for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {
+            let mut request = crate::generation::test_request("claude-opus-4-6");
+            request.reasoning = Some(ReasoningConfig::Effort(effort));
+            let mapped = crate::generation::test_catalog_model(
+                "anthropic",
+                "claude-opus-4-6",
+                "claude-opus-4-6",
+                serde_json::json!({"thinkingLevelMap":{"xhigh":"xhigh","max":"max"}}),
+            );
+            for catalog in [None, Some(&mapped)] {
+                for stream in [false, true] {
+                    let result = AnthropicProvider::build_chat_request_with_catalog(
+                        &request,
+                        None,
+                        vec![],
+                        stream,
+                        catalog,
+                    );
+                    assert_eq!(result.is_ok(), effort == ReasoningEffort::Max);
+                    if let Ok(body) = result {
+                        let json = serde_json::to_value(body).unwrap();
+                        assert_eq!(json["output_config"]["effort"], "max");
+                        assert_eq!(json["thinking"]["type"], "adaptive");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stale_adaptive_hint_cannot_change_opus_45_effort_only_contract() {
+        let catalog = crate::generation::test_catalog_model(
+            "anthropic",
+            "claude-opus-4-5",
+            "claude-opus-4-5",
+            serde_json::json!({"compat":{"forceAdaptiveThinking":true}}),
+        );
+        let mut request = crate::generation::test_request("claude-opus-4-5");
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        for stream in [false, true] {
+            let body = serde_json::to_value(
+                AnthropicProvider::build_chat_request_with_catalog(
+                    &request,
+                    None,
+                    vec![],
+                    stream,
+                    Some(&catalog),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["output_config"]["effort"], "high");
+            assert!(body.get("thinking").is_none());
+        }
+    }
+
+    #[test]
+    fn mandatory_off_and_adaptive_families_survive_missing_partial_and_stale_catalog() {
+        use crate::generation::{test_catalog_model, test_request};
+        for id in [
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "claude-opus-5-5",
+        ] {
+            let partial = test_catalog_model(
+                "anthropic",
+                id,
+                "claude-opus-4-6",
+                serde_json::json!({"thinkingLevelMap":{}}),
+            );
+            let stale = test_catalog_model(
+                "anthropic",
+                id,
+                "claude-opus-4-6",
+                serde_json::json!({"reasoning":false,"thinkingLevelMap":{"off":"low"}}),
+            );
+            for catalog in [None, Some(&partial), Some(&stale)] {
+                for off in [
+                    ReasoningConfig::Disabled,
+                    ReasoningConfig::Effort(ReasoningEffort::None),
+                ] {
+                    let mut request = test_request(id);
+                    request.reasoning = Some(off);
+                    for stream in [false, true] {
+                        assert!(
+                            AnthropicProvider::build_chat_request_with_catalog(
+                                &request,
+                                None,
+                                vec![],
+                                stream,
+                                catalog
+                            )
+                            .is_err()
+                        );
+                    }
+                }
+            }
+        }
+        for id in ["claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"] {
+            let mut request = test_request(id);
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+            for stream in [false, true] {
+                let body = serde_json::to_value(
+                    AnthropicProvider::build_chat_request_with_catalog(
+                        &request,
+                        None,
+                        vec![],
+                        stream,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(body["thinking"]["type"], "adaptive");
+                assert_eq!(body["output_config"]["effort"], "high");
+                assert_eq!(body["max_tokens"], 1024);
+                assert!(body["thinking"].get("budget_tokens").is_none());
+            }
+        }
+        let invalid = test_catalog_model(
+            "anthropic",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            serde_json::json!({"thinkingLevelMap":{"high":"invented"}}),
+        );
+        let mut request = test_request("claude-opus-4-7");
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        for stream in [false, true] {
+            assert!(
+                AnthropicProvider::build_chat_request_with_catalog(
+                    &request,
+                    None,
+                    vec![],
+                    stream,
+                    Some(&invalid)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_negative_temperature_and_known_restrictions_apply_in_every_thinking_state() {
+        let catalog = crate::generation::test_source_temperature("anthropic", "claude-sonnet-5");
+        assert_eq!(
+            catalog
+                .model("anthropic", "claude-sonnet-5")
+                .unwrap()
+                .metadata["sourceGeneration"]["temperature"],
+            false
+        );
+        for id in ["claude-sonnet-5", "claude-fable-5", "claude-opus-4-8"] {
+            for snapshot in [None, Some(&catalog)] {
+                for reasoning in [
+                    None,
+                    Some(ReasoningConfig::Disabled),
+                    Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                ] {
+                    let mut request = crate::generation::test_request(id);
+                    request.reasoning = reasoning;
+                    request.temperature = Some(0.7);
+                    for stream in [false, true] {
+                        assert!(
+                            AnthropicProvider::build_chat_request_with_catalog(
+                                &request,
+                                None,
+                                vec![],
+                                stream,
+                                snapshot
+                            )
+                            .is_err()
+                        );
+                    }
+                }
+            }
+        }
+        let source_only =
+            crate::generation::test_source_temperature("anthropic", "claude-opus-4-5");
+        assert_ne!(
+            source_only
+                .model("anthropic", "claude-opus-4-5")
+                .unwrap()
+                .metadata
+                .get("compat")
+                .and_then(|c| c.get("supportsTemperature")),
+            Some(&serde_json::json!(false))
+        );
+        let mut request = crate::generation::test_request("claude-opus-4-5");
+        request.temperature = Some(0.7);
+        for stream in [false, true] {
+            assert!(
+                AnthropicProvider::build_chat_request_with_catalog(
+                    &request,
+                    None,
+                    vec![],
+                    stream,
+                    Some(&source_only)
+                )
+                .is_err()
+            );
+            let body = serde_json::to_value(
+                AnthropicProvider::build_chat_request_with_catalog(
+                    &request,
+                    None,
+                    vec![],
+                    stream,
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(body.get("temperature").is_some());
+        }
+    }
+
     // Synthetic signatures exercise our policy, never vendor cryptography.
     #[test]
-    fn production_native_body_enforces_durable_prefix_and_instance_authority() {
+    fn production_native_body_preserves_prefix_across_updates_and_restart() {
         use super::super::history_test_support::request;
         let provider = AnthropicProvider::new("test-key");
         let mut req = request(vec![ChatMessage::user("first")]);
@@ -1562,15 +2289,52 @@ mod tests {
                         .remove("prefix_proof");
                 }
             }
-            assert!(
-                build(&provider, &changed).is_err(),
-                "changed timestamp/system/tools/retry/legacy {change}"
-            );
+            let result = build(&provider, &changed);
+            if change == 3 {
+                assert!(
+                    result.is_err(),
+                    "rewritten historical user input must be rejected"
+                );
+            } else {
+                let body = result.unwrap();
+                assert_eq!(body["system"], sent["system"]);
+                assert_eq!(body["tools"], sent["tools"]);
+                if change < 3 {
+                    assert_eq!(
+                        body["messages"].as_array().unwrap().last().unwrap()["role"],
+                        "system"
+                    );
+                }
+            }
         }
         let restarted = AnthropicProvider::new("test-key");
         assert!(
-            build(&restarted, &req).is_err(),
-            "restart/fork has no verified account authority"
+            build(&restarted, &req).is_ok(),
+            "reconstructed adapters retain the configured transport identity"
+        );
+        assert!(build(&AnthropicProvider::new("rotated-key"), &req).is_ok());
+        assert!(
+            build(
+                &AnthropicProvider::with_base_url("test-key", "https://other.example"),
+                &req
+            )
+            .is_err()
+        );
+        let mut legacy = req.clone();
+        let payload = legacy.messages[1]
+            .provider_replay_state
+            .as_mut()
+            .unwrap()
+            .payload
+            .as_object_mut()
+            .unwrap();
+        payload.remove("prefix_context");
+        payload.get_mut("prefix_proof").unwrap()["authority"] =
+            serde_json::json!("0123456789abcdef0123456789abcdef");
+        legacy.compiled_prompt.as_mut().unwrap().full_system_text = "rules time=two".into();
+        assert!(
+            build(&restarted, &legacy).is_ok(),
+            "legacy instance proofs must defer native binding validation to Messages"
         );
         let mut foreign = req.clone();
         foreign.model = "claude-opus-4-6".into();
@@ -1601,6 +2365,82 @@ mod tests {
             build(&provider, &unbound).is_ok(),
             "documented old generation does not bind prefix"
         );
+    }
+
+    #[test]
+    fn signed_prefix_reconstruction_replays_prior_updates_and_parallel_results() {
+        use super::super::history_test_support::request;
+        let provider = AnthropicProvider::new("fixture");
+        let mut req = request(vec![
+            ChatMessage::system("rules time=1"),
+            ChatMessage::user("inspect"),
+        ]);
+        req.model = "claude-sonnet-5-5".into();
+        req.tools = Some(vec![crate::ToolDefinition {
+            name: "inspect".into(),
+            description: "inspect".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        let build = |request: &ChatRequest, stream| {
+            let prepared = prepare_messages_for_provider_model(
+                provider.name(),
+                &request.model,
+                &provider.capabilities(),
+                &request.rendered_messages_with_compiled_prompt(),
+            )
+            .unwrap();
+            provider
+                .build_native_request(request, &prepared, stream)
+                .unwrap()
+        };
+        let mut previous_wire = build(&req, false);
+        for round in 0..3 {
+            let blocks: Vec<_> = (0..2).map(|index| serde_json::json!({
+                "type":"tool_use", "id":format!("call_{round}_{index}"), "name":"inspect", "input":{}
+            })).collect();
+            let response = AnthropicProvider::decode_response(serde_json::from_value(serde_json::json!({
+                "content":[{"type":"thinking", "thinking":"reason", "signature":format!("synthetic_{round}")},
+                    blocks[0], blocks[1]], "stop_reason":"tool_use"
+            })).unwrap()).unwrap();
+            let calls = response.tool_calls.clone();
+            let mut state = response.provider_replay_state.unwrap();
+            crate::continuation::bind_prefix(
+                &mut state,
+                &req.model,
+                &provider.replay_authority,
+                &previous_wire,
+            )
+            .unwrap();
+            let message = ChatMessage::assistant_tool_calls_with_provider_state(
+                Some(response.text),
+                response.reasoning_content,
+                calls.clone(),
+                Some(state),
+            );
+            req.messages
+                .push(serde_json::from_value(serde_json::to_value(message).unwrap()).unwrap());
+            req.messages.extend(
+                calls
+                    .iter()
+                    .map(|call| ChatMessage::tool_result(&call.id, &call.name, "ok")),
+            );
+            req.messages[0].content = format!("rules time={}", round + 2);
+            let wire = build(&req, false);
+            let mut stream_wire = build(&req, true);
+            stream_wire.as_object_mut().unwrap().remove("stream");
+            assert_eq!(stream_wire, wire);
+            assert_eq!(wire["system"], "rules time=1");
+            let preceding = previous_wire["messages"].as_array().unwrap();
+            assert_eq!(
+                &wire["messages"].as_array().unwrap()[..preceding.len()],
+                preceding
+            );
+            assert_eq!(
+                wire["messages"].as_array().unwrap().last().unwrap()["role"],
+                "system"
+            );
+            previous_wire = wire;
+        }
     }
 
     #[test]
@@ -1771,15 +2611,27 @@ mod tests {
             Some(StreamReplayContext {
                 model: req.model.clone(),
                 authority: provider.replay_authority.clone(),
-                unverified_relay: false,
                 prefix_body: sent.clone(),
             }),
+            Some("native-header-request".into()),
         )
         .collect::<Vec<_>>()
         .await
         .into_iter()
         .collect::<Result<Vec<_>>>()
         .unwrap();
+        assert_eq!(
+            chunks
+                .first()
+                .unwrap()
+                .usage
+                .as_ref()
+                .unwrap()
+                .request_id
+                .as_deref(),
+            Some("native-header-request"),
+            "binding native replay must preserve the independently observed request header"
+        );
         assert_eq!(
             chunks.last().unwrap().termination,
             Some(ProviderTermination::ToolCalls)
@@ -1850,7 +2702,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_normalization_requires_complete_separate_cache_counters() {
+    fn usage_normalization_preserves_input_without_optional_cache_counters() {
         let complete: super::ApiUsage = serde_json::from_value(serde_json::json!({
             "input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":20,"output_tokens":8
         })).unwrap();
@@ -1860,7 +2712,7 @@ mod tests {
             "input_tokens":10,"output_tokens":8
         }))
         .unwrap();
-        assert_eq!(missing.normalized().input_tokens, None);
+        assert_eq!(missing.normalized().input_tokens, Some(10));
         assert_eq!(missing.normalized().output_tokens, Some(8));
     }
 
@@ -2013,7 +2865,7 @@ mod tests {
         assert_eq!(reasoning.supported, Some(true));
         assert_eq!(
             reasoning.effort_options,
-            vec!["low", "medium", "high", "xhigh", "max"]
+            vec!["none", "low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
     }
@@ -2027,7 +2879,7 @@ mod tests {
         assert_eq!(reasoning.supported, Some(true));
         assert_eq!(
             reasoning.effort_options,
-            vec!["low", "medium", "high", "max"]
+            vec!["none", "low", "medium", "high", "max"]
         );
     }
 
@@ -2072,7 +2924,7 @@ mod tests {
             .expect("supported reasoning model");
         assert_eq!(
             reasoning.effort_options,
-            vec!["low", "medium", "high", "xhigh", "max"]
+            vec!["none", "low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(models[0].capabilities.thinking, Some(true));
         assert_eq!(models[0].limits.context_window, Some(264000));
@@ -2203,6 +3055,8 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            cache_control: None,
+            generation: Default::default(),
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ApiMessage {
                 role: "user".into(),
@@ -2234,6 +3088,8 @@ mod tests {
     #[test]
     fn api_request_serializes_stream_true() {
         let request = ApiChatRequest {
+            cache_control: None,
+            generation: Default::default(),
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ApiMessage {
                 role: "user".into(),
@@ -2258,38 +3114,49 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_thinking_body_validates_effort_and_temperature_without_a_second_reserve() {
+        let mut request = crate::generation::test_request("claude-opus-4-6");
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        for stream in [false, true] {
+            let body = serde_json::to_value(
+                AnthropicProvider::build_chat_request(&request, None, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert_eq!(body["output_config"]["effort"], "high");
+            assert_eq!(body["max_tokens"], 1024);
+            assert!(body["thinking"].get("budget_tokens").is_none());
+        }
+        request.temperature = Some(0.7);
+        assert!(AnthropicProvider::build_chat_request(&request, None, vec![], false).is_err());
+        request.temperature = None;
+        request.model = "claude-sonnet-4-20250514".into();
+        assert!(AnthropicProvider::build_chat_request(&request, None, vec![], false).is_err());
+        request.model = "claude-opus-5.5".into();
+        request.reasoning = Some(ReasoningConfig::Disabled);
+        assert!(AnthropicProvider::build_chat_request(&request, None, vec![], false).is_err());
+    }
+
+    #[test]
     fn api_request_serializes_reasoning_effort_under_output_config() {
-        assert!(AnthropicProvider::output_config(Some(ReasoningConfig::disabled())).is_none());
-        assert_eq!(
-            AnthropicProvider::output_config(Some(ReasoningConfig::effort(ReasoningEffort::None)))
-                .expect("explicit none effort should serialize")
-                .effort,
-            "none"
-        );
-
-        let request = ApiChatRequest {
-            model: "claude-sonnet-4-20250514".into(),
-            messages: vec![ApiMessage {
-                role: "user".into(),
-                content: vec![ApiMessageContentBlock::Text {
-                    text: "Hello".into(),
-                }],
-            }],
-            max_tokens: 8192,
-            temperature: None,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            output_config: AnthropicProvider::output_config(Some(ReasoningConfig::effort(
-                ReasoningEffort::High,
-            ))),
-            stream: false,
-        };
-
-        let json = serde_json::to_value(&request).unwrap();
-
-        assert_eq!(json["output_config"]["effort"], "high");
-        assert!(json.get("thinking").is_none());
+        let mut request = crate::generation::test_request("claude-opus-4-5");
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        for stream in [false, true] {
+            let body = serde_json::to_value(
+                AnthropicProvider::build_chat_request(&request, None, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["output_config"]["effort"], "high");
+            assert_eq!(body["max_tokens"], 1024);
+            assert!(body.get("thinking").is_none());
+        }
+        request.reasoning = Some(ReasoningConfig::Disabled);
+        let body = serde_json::to_value(
+            AnthropicProvider::build_chat_request(&request, None, vec![], false).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("output_config").is_none());
     }
 
     #[test]
@@ -2304,7 +3171,7 @@ mod tests {
             response.content[0].text.as_deref(),
             Some("Hello from Claude")
         );
-        let usage = response.usage.unwrap();
+        let usage = response.usage.unwrap().normalized();
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(25));
     }

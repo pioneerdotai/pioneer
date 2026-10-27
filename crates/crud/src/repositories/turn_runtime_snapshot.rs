@@ -49,10 +49,35 @@ pub struct NewTurnRuntimeSnapshot {
     pub updated_at: DateTimeWithTimeZone,
 }
 
+/// Recheck the request's bounded metadata in the same short writer transaction
+/// that attaches the live runtime root. The JSON is prepared before admission.
+pub(crate) async fn verify_source_epochs<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    epochs_json: &str,
+) -> Result<()> {
+    let changed = db
+        .query_one_raw(super::compaction::sqlite_specific_sql(
+            "SELECT wanted.key FROM json_each(?) wanted \
+         LEFT JOIN thread t ON t.id=wanted.key AND t.workspace_id=? \
+         LEFT JOIN compaction_projection_epoch e ON e.thread_id=t.id \
+         WHERE t.id IS NULL OR COALESCE(e.version,0)<>wanted.value LIMIT 1",
+            [epochs_json.into(), workspace.into()],
+        ))
+        .await?;
+    anyhow::ensure!(
+        changed.is_none(),
+        "history changed before runtime publication"
+    );
+    Ok(())
+}
+
 pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
     db: &C,
     snapshot: NewTurnRuntimeSnapshot,
+    root: &crate::frozen_lifetime::PreparedFrozenRoot,
 ) -> Result<TurnRuntimeSnapshotRecord> {
+    root.verify(db, &snapshot.workspace_id).await?;
     let turn_id = snapshot.turn_id.clone();
     turn_runtime_snapshot::Entity::insert(turn_runtime_snapshot::ActiveModel {
         turn_id: Set(snapshot.turn_id),
@@ -70,6 +95,7 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
         resolved_artifacts_json: Set(snapshot.resolved_artifacts_json),
         runtime_environment_json: Set(snapshot.runtime_environment_json),
         history_json: Set(snapshot.history_json),
+        frozen_manifest_id: Set(root.locator()),
         created_at: Set(snapshot.created_at),
         updated_at: Set(snapshot.updated_at),
     })
@@ -90,6 +116,7 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
                 turn_runtime_snapshot::Column::ResolvedArtifactsJson,
                 turn_runtime_snapshot::Column::RuntimeEnvironmentJson,
                 turn_runtime_snapshot::Column::HistoryJson,
+                turn_runtime_snapshot::Column::FrozenManifestId,
                 turn_runtime_snapshot::Column::UpdatedAt,
             ])
             .to_owned(),
@@ -167,6 +194,11 @@ pub async fn delete_turn_runtime_snapshots_for_closed_turns<C: ConnectionTrait>(
         .column(turn::Column::Id)
         .from(turn::Entity)
         .and_where(turn::Column::Status.is_in(closed_statuses))
+        // Task children retain a capsule until their existing reconciler sees
+        // the parent receipt; startup must not bypass that owner.
+        .and_where(Expr::cust(
+            "NOT EXISTS (SELECT 1 FROM task_run_turn trt WHERE trt.turn_id = turn.id)",
+        ))
         .to_owned();
 
     let deleted = turn_runtime_snapshot::Entity::delete_many()

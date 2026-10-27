@@ -3,8 +3,8 @@ use crate::thread_episodic_embedding::{
 };
 use async_trait::async_trait;
 use memvid_core::{
-    AclEnforcementMode, AskMode, AskRequest, DocMetadata, FrameStatus, Memvid, MemvidError,
-    PutOptions, SearchEngineKind, SearchHit, SearchHitMetadata, SearchRequest, TemporalFilter,
+    AclEnforcementMode, DocMetadata, FrameStatus, Memvid, MemvidError, PutOptions,
+    SearchEngineKind, SearchHit, SearchHitMetadata, SearchRequest, TemporalFilter,
 };
 use pioneer_protocol::{
     ThreadEpisodicAdaptiveStrategy, ThreadEpisodicItemStatus, ThreadEpisodicScoreBreakdown,
@@ -69,15 +69,6 @@ pub enum ThreadEpisodicAdaptiveRetrievalImplementation {
 pub enum ThreadEpisodicMemvidAskRetrievalMode {
     Hybrid,
     Semantic,
-}
-
-impl ThreadEpisodicMemvidAskRetrievalMode {
-    const fn ask_mode(self) -> AskMode {
-        match self {
-            Self::Hybrid => AskMode::Hybrid,
-            Self::Semantic => AskMode::Sem,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -600,6 +591,16 @@ pub struct ThreadEpisodicMemvidSearchOutput {
     pub diagnostics: ThreadEpisodicSearchDiagnostics,
 }
 
+/// One engine page from a single segment. Access and current-source validation
+/// belong to the caller; an empty page may still carry a continuation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadEpisodicMemvidSearchPage {
+    pub hits: Vec<ThreadEpisodicMemvidSearchHit>,
+    pub next_cursor: Option<String>,
+    pub unavailable_segment_ids: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ThreadEpisodicRankingContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -617,10 +618,33 @@ pub trait ThreadEpisodicMemvidBackend: Send + Sync {
         request: ThreadEpisodicMemvidIndexRequest,
     ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>;
 
+    async fn index_item_with_workspace_ownership(
+        &self,
+        request: ThreadEpisodicMemvidIndexRequest,
+        ownership: ThreadEpisodicWorkspaceOwnership,
+    ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
+        let _ownership = ownership;
+        self.index_item(request).await
+    }
+
     async fn search(
         &self,
         request: ThreadEpisodicMemvidSearchRequest,
     ) -> Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>;
+
+    /// Search exactly one explicitly selected segment without profile cutoffs.
+    /// The caller owns catalog traversal, authorization and global pagination.
+    async fn search_segment_page(
+        &self,
+        _request: ThreadEpisodicMemvidSearchRequest,
+        _page_size: usize,
+        _cursor: Option<String>,
+        _embedding: Option<ThreadEpisodicMemvidIndexEmbedding>,
+    ) -> Result<ThreadEpisodicMemvidSearchPage, ThreadEpisodicMemvidError> {
+        Err(ThreadEpisodicMemvidError::non_retryable(
+            "segment pagination is not implemented for this backend",
+        ))
+    }
 
     async fn ask_retrieval(
         &self,
@@ -638,6 +662,81 @@ pub trait ThreadEpisodicMemvidBackend: Send + Sync {
 
 pub struct MemvidThreadEpisodicBackend {
     capabilities: ThreadEpisodicMemvidBackendCapabilities,
+    workspace_ownership: Option<ThreadEpisodicWorkspaceOwnership>,
+}
+
+// Shared by ordinary indexing and destructive projection replacement. The
+// clone passed into a blocking capsule operation outlives a canceled waiter.
+pub type ThreadEpisodicWorkspaceOwnership = Arc<ThreadEpisodicWorkspaceGuard>;
+
+pub struct ThreadEpisodicWorkspaceGuard {
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+fn workspace_releases() -> &'static tokio::sync::watch::Sender<()> {
+    static RELEASES: OnceLock<tokio::sync::watch::Sender<()>> = OnceLock::new();
+    RELEASES.get_or_init(|| tokio::sync::watch::channel(()).0)
+}
+
+// A single coalesced release signal covers all workspaces, including releases
+// by blocking capsule operations whose async waiter has been canceled.
+pub fn thread_episodic_workspace_releases() -> tokio::sync::watch::Receiver<()> {
+    workspace_releases().subscribe()
+}
+
+impl Drop for ThreadEpisodicWorkspaceGuard {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        workspace_releases().send_replace(());
+    }
+}
+type WorkspaceLockRegistry = Mutex<BTreeMap<String, Weak<Mutex<()>>>>;
+
+async fn workspace_lock(workspace_id: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<WorkspaceLockRegistry> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .await;
+    if let Some(lock) = locks.get(workspace_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(workspace_id.to_owned(), Arc::downgrade(&lock));
+    lock
+}
+
+pub async fn lock_thread_episodic_workspace(
+    workspace_id: &str,
+) -> ThreadEpisodicWorkspaceOwnership {
+    Arc::new(ThreadEpisodicWorkspaceGuard {
+        guard: Some(workspace_lock(workspace_id).await.lock_owned().await),
+    })
+}
+
+pub async fn try_lock_thread_episodic_workspace(
+    workspace_id: &str,
+) -> Option<ThreadEpisodicWorkspaceOwnership> {
+    workspace_lock(workspace_id)
+        .await
+        .try_lock_owned()
+        .ok()
+        .map(|guard| Arc::new(ThreadEpisodicWorkspaceGuard { guard: Some(guard) }))
+}
+
+// Serialize deletion with capsule readers too, and retain workspace ownership
+// in the actual blocking removal even if its async caller is canceled.
+pub async fn remove_thread_episodic_capsule_file(
+    path: &Path,
+    ownership: ThreadEpisodicWorkspaceOwnership,
+) -> std::io::Result<()> {
+    let path_for_task = path.to_owned();
+    run_capsule_blocking(path, move || {
+        let _ownership = ownership;
+        std::fs::remove_file(path_for_task)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 type CapsuleLock = Arc<Mutex<()>>;
@@ -676,7 +775,7 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let guard = lock_for_capsule_path(path).await.lock_owned().await;
-    tokio::task::spawn_blocking(move || {
+    pioneer_observability::work::spawn_blocking(move || {
         // Keep ownership inside the blocking task. Cancelling the async waiter detaches the
         // task but cannot expose the capsule to another operation while this closure is running.
         let _guard = guard;
@@ -689,11 +788,20 @@ impl MemvidThreadEpisodicBackend {
     pub fn new() -> Self {
         Self {
             capabilities: ThreadEpisodicMemvidBackendCapabilities::memvid_default(),
+            workspace_ownership: None,
         }
     }
 
     pub fn with_capabilities(capabilities: ThreadEpisodicMemvidBackendCapabilities) -> Self {
-        Self { capabilities }
+        Self {
+            capabilities,
+            workspace_ownership: None,
+        }
+    }
+
+    pub fn with_workspace_ownership(mut self, ownership: ThreadEpisodicWorkspaceOwnership) -> Self {
+        self.workspace_ownership = Some(ownership);
+        self
     }
 
     async fn run_blocking<T, F>(
@@ -705,7 +813,12 @@ impl MemvidThreadEpisodicBackend {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        run_capsule_blocking(path, operation).await
+        let ownership = self.workspace_ownership.clone();
+        run_capsule_blocking(path, move || {
+            let _ownership = ownership;
+            operation()
+        })
+        .await
     }
 }
 
@@ -753,6 +866,17 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
         })?
     }
 
+    async fn index_item_with_workspace_ownership(
+        &self,
+        request: ThreadEpisodicMemvidIndexRequest,
+        ownership: ThreadEpisodicWorkspaceOwnership,
+    ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
+        Self::with_capabilities(self.capabilities.clone())
+            .with_workspace_ownership(ownership)
+            .index_item(request)
+            .await
+    }
+
     async fn search(
         &self,
         request: ThreadEpisodicMemvidSearchRequest,
@@ -760,7 +884,6 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
         request.profile.validate()?;
         let mut segments = request.segments.clone();
         segments.sort_by(|left, right| right.segment_index.cmp(&left.segment_index));
-        segments.truncate(request.profile.max_segments as usize);
 
         let mut warnings = Vec::new();
         if request.profile.mode == ThreadEpisodicSearchMode::Semantic {
@@ -826,6 +949,34 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
         ))
     }
 
+    async fn search_segment_page(
+        &self,
+        request: ThreadEpisodicMemvidSearchRequest,
+        page_size: usize,
+        cursor: Option<String>,
+        embedding: Option<ThreadEpisodicMemvidIndexEmbedding>,
+    ) -> Result<ThreadEpisodicMemvidSearchPage, ThreadEpisodicMemvidError> {
+        if request.segments.len() != 1 || page_size == 0 {
+            return Err(ThreadEpisodicMemvidError::non_retryable(
+                "segment search requires exactly one segment and a positive page size",
+            ));
+        }
+        let segment = request.segments[0].clone();
+        let path = path_from_storage_uri(&segment.storage_uri)?;
+        let task_path = path.clone();
+        self.run_blocking(&path, move || {
+            search_segment_page_blocking(
+                task_path, request, segment, page_size, cursor, embedding, false,
+            )
+        })
+        .await
+        .map_err(|error| {
+            ThreadEpisodicMemvidError::retryable(format!(
+                "thread episodic segment page task failed: {error}"
+            ))
+        })?
+    }
+
     async fn ask_retrieval(
         &self,
         request: ThreadEpisodicMemvidSearchRequest,
@@ -833,70 +984,77 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
         embedder: Arc<ThreadEpisodicMemvidEmbedder>,
     ) -> Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError> {
         request.profile.validate()?;
-        let mut segments = request.segments.clone();
-        segments.sort_by(|left, right| right.segment_index.cmp(&left.segment_index));
-        segments.truncate(request.profile.max_segments as usize);
-
-        let mut searched_segment_ids = Vec::new();
-        let mut unavailable_segment_ids = Vec::new();
+        let provider = embedder.provider();
+        let query = request.query.clone();
+        let embedder_for_task = embedder.clone();
+        let vector = tokio::task::spawn_blocking(move || {
+            embedder_for_task.provider().embed_query_checked(&query)
+        })
+        .await
+        .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?
+        .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?;
+        let embedding = ThreadEpisodicMemvidIndexEmbedding::new(provider.identity(), vector)?;
+        let mut hits = Vec::new();
+        let mut searched = Vec::new();
+        let mut unavailable = Vec::new();
         let mut warnings = Vec::new();
-        let mut raw_hits = Vec::new();
+        let mut segments = request.segments.clone();
+        segments.sort_by(|a, b| b.segment_index.cmp(&a.segment_index));
         for segment in &segments {
-            let path = path_from_storage_uri(segment.storage_uri.as_str())?;
-            if !path.exists() {
-                unavailable_segment_ids.push(segment.capsule_id.clone());
+            if !path_from_storage_uri(&segment.storage_uri)?.exists() {
+                unavailable.push(segment.capsule_id.clone());
                 continue;
             }
-
-            let path_for_task = path.clone();
-            let ask_request = memvid_thread_episodic_ask_request(
-                &request.profile,
-                &request.query,
-                request.scope.as_deref(),
-                mode,
-            );
-            let embedder_for_task = (*embedder).clone();
-            let segment_for_task = segment.clone();
-            let workspace_id = request.workspace_id.clone();
-            let thread_id = request.thread_id.clone();
-            let segment_hits = self
-                .run_blocking(path.as_path(), move || {
-                    ask_segment_blocking(
-                        path_for_task,
-                        ask_request,
-                        embedder_for_task,
-                        segment_for_task,
-                        workspace_id.as_str(),
-                        thread_id.as_str(),
+            let mut segment_request = request.clone();
+            segment_request.segments = vec![segment.clone()];
+            let page = if mode == ThreadEpisodicMemvidAskRetrievalMode::Semantic {
+                let path = path_from_storage_uri(&segment.storage_uri)?;
+                let task_path = path.clone();
+                let segment = segment.clone();
+                let embedding = embedding.clone();
+                let size = request.profile.max_candidates as usize;
+                self.run_blocking(&path, move || {
+                    search_segment_page_blocking(
+                        task_path,
+                        segment_request,
+                        segment,
+                        size,
+                        None,
+                        Some(embedding),
+                        true,
                     )
                 })
                 .await
-                .map_err(|error| {
-                    ThreadEpisodicMemvidError::retryable(format!(
-                        "thread episodic memvid ask retrieval task failed: {error}"
-                    ))
-                })?;
-
-            match segment_hits {
-                Ok(hits) => {
-                    searched_segment_ids.push(segment.capsule_id.clone());
-                    raw_hits.extend(hits);
+                .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?
+            } else {
+                self.search_segment_page(
+                    segment_request,
+                    request.profile.max_candidates as usize,
+                    None,
+                    Some(embedding.clone()),
+                )
+                .await
+            };
+            match page {
+                Ok(page) => {
+                    searched.push(segment.capsule_id.clone());
+                    hits.extend(page.hits);
+                    warnings.extend(page.warnings);
                 }
                 Err(error) if error.kind == ThreadEpisodicMemvidFailureKind::NonRetryable => {
-                    unavailable_segment_ids.push(segment.capsule_id.clone());
+                    unavailable.push(segment.capsule_id.clone());
                     warnings.push(error.message);
                 }
                 Err(error) => return Err(error),
             }
         }
-
         Ok(finalize_thread_episodic_search_output(
             request,
-            raw_hits,
-            searched_segment_ids,
-            unavailable_segment_ids,
+            hits,
+            searched,
+            unavailable,
             warnings,
-            true,
+            false,
         ))
     }
 }
@@ -917,18 +1075,22 @@ fn finalize_thread_episodic_search_output(
             .then_with(|| left.index_item_id.cmp(&right.index_item_id))
     });
 
-    let scores = raw_hits
-        .iter()
-        .map(|hit| hit.memvid_score)
-        .collect::<Vec<_>>();
-    let (cutoff_len, adaptive) =
-        PioneerAdaptiveCutoff::cutoff_len(&scores, request.profile.adaptive_cutoff_config());
-    let raw_hits = raw_hits.into_iter().take(cutoff_len).collect::<Vec<_>>();
     let filtered = filter_thread_episodic_search_candidates(
         request.workspace_id.as_str(),
         request.thread_id.as_str(),
         raw_hits,
     );
+    let scores = filtered
+        .hits
+        .iter()
+        .map(|hit| hit.memvid_score)
+        .collect::<Vec<_>>();
+    let (cutoff_len, adaptive) =
+        PioneerAdaptiveCutoff::cutoff_len(&scores, request.profile.adaptive_cutoff_config());
+    let filtered = ThreadEpisodicFilteredSearchCandidates {
+        hits: filtered.hits.into_iter().take(cutoff_len).collect(),
+        suppressions: filtered.suppressions,
+    };
     let mut ranked = rank_thread_episodic_search_hits(
         filtered.hits,
         ThreadEpisodicRankingContext {
@@ -1034,36 +1196,6 @@ fn validate_index_embedding(
     )))
 }
 
-fn ask_segment_blocking(
-    path: PathBuf,
-    request: AskRequest,
-    embedder: ThreadEpisodicMemvidEmbedder,
-    segment: ThreadEpisodicMemvidSearchSegment,
-    workspace_id: &str,
-    thread_id: &str,
-) -> Result<Vec<ThreadEpisodicMemvidSearchHit>, ThreadEpisodicMemvidError> {
-    let mut memvid = Memvid::open_read_only(path.as_path()).map_err(classify_memvid_error)?;
-    let response = memvid
-        .ask(request, Some(&embedder))
-        .map_err(classify_memvid_error)?;
-    let engine = response.retrieval.engine;
-    Ok(response
-        .retrieval
-        .hits
-        .into_iter()
-        .filter_map(|mut hit| {
-            hydrate_search_hit_metadata(&memvid, &mut hit);
-            search_hit_to_thread_episodic_hit(
-                hit,
-                engine.clone(),
-                &segment,
-                workspace_id,
-                thread_id,
-            )
-        })
-        .collect())
-}
-
 fn search_segment_blocking(
     path: PathBuf,
     request: SearchRequest,
@@ -1088,6 +1220,129 @@ fn search_segment_blocking(
             )
         })
         .collect())
+}
+
+// Read only committed TOC metadata under the already-held Memvid file lock.
+// Public codecs preserve legacy-format decoding; no vector/payload data is read.
+fn validate_segment_embedding_identity(
+    path: &Path,
+    embedding: &ThreadEpisodicMemvidIndexEmbedding,
+) -> Result<(), ThreadEpisodicMemvidError> {
+    use memvid_core::{CommitFooter, Toc, footer::FOOTER_SIZE, io::header::HeaderCodec};
+    use std::io::{Read, Seek, SeekFrom};
+    let unavailable = || {
+        ThreadEpisodicMemvidError::non_retryable(
+            "segment has no compatible persisted embedding identity",
+        )
+    };
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?;
+    let header = HeaderCodec::read(&mut file).map_err(classify_memvid_error)?;
+    let length = file.metadata().map_err(|_| unavailable())?.len();
+    let footer_offset = length
+        .checked_sub(FOOTER_SIZE as u64)
+        .ok_or_else(unavailable)?;
+    file.seek(SeekFrom::Start(footer_offset))
+        .map_err(|_| unavailable())?;
+    let mut footer_bytes = [0u8; FOOTER_SIZE];
+    file.read_exact(&mut footer_bytes)
+        .map_err(|_| unavailable())?;
+    let footer = CommitFooter::decode(&footer_bytes).ok_or_else(unavailable)?;
+    let toc_offset = footer_offset
+        .checked_sub(footer.toc_len)
+        .ok_or_else(unavailable)?;
+    if toc_offset != header.footer_offset {
+        return Err(unavailable());
+    }
+    let toc_len = usize::try_from(footer.toc_len).map_err(|_| unavailable())?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(toc_len)
+        .map_err(|_| unavailable())?;
+    bytes.resize(toc_len, 0);
+    file.seek(SeekFrom::Start(toc_offset))
+        .map_err(|_| unavailable())?;
+    file.read_exact(&mut bytes).map_err(|_| unavailable())?;
+    if !footer.hash_matches(&bytes) {
+        return Err(unavailable());
+    }
+    let toc = Toc::decode(&bytes).map_err(classify_memvid_error)?;
+    let manifest = toc.indexes.vec.as_ref().ok_or_else(unavailable)?;
+    if manifest.model.as_deref() != Some(embedding.identity.memvid_model_id().as_str())
+        || usize::try_from(manifest.dimension).ok() != Some(embedding.identity.dimension)
+        || toc.segment_catalog.vec_segments.iter().any(|segment| {
+            segment.dimension != 0
+                && usize::try_from(segment.dimension).ok() != Some(embedding.identity.dimension)
+        })
+    {
+        return Err(unavailable());
+    }
+    Ok(())
+}
+
+fn search_segment_page_blocking(
+    path: PathBuf,
+    request: ThreadEpisodicMemvidSearchRequest,
+    segment: ThreadEpisodicMemvidSearchSegment,
+    page_size: usize,
+    cursor: Option<String>,
+    embedding: Option<ThreadEpisodicMemvidIndexEmbedding>,
+    semantic_only: bool,
+) -> Result<ThreadEpisodicMemvidSearchPage, ThreadEpisodicMemvidError> {
+    let mut memvid = Memvid::open_read_only(&path).map_err(classify_memvid_error)?;
+    let mut search = memvid_thread_episodic_search_request(
+        &request.profile,
+        &request.query,
+        request.scope.as_deref(),
+    );
+    search.top_k = page_size;
+    search.cursor = cursor;
+    if let Some(embedding) = embedding {
+        validate_index_embedding(&embedding)?;
+        validate_segment_embedding_identity(&path, &embedding)?;
+        search.query_embedding = Some(embedding.vector);
+    }
+    let response = if semantic_only {
+        memvid
+            .vec_search_with_embedding_acl(
+                &search.query,
+                search.query_embedding.as_deref().unwrap_or_default(),
+                search.top_k,
+                search.snippet_chars,
+                search.scope.as_deref(),
+                search.acl_context.as_ref(),
+                search.acl_enforcement_mode,
+                search.cursor.as_deref(),
+            )
+            .map_err(classify_memvid_error)?
+    } else {
+        memvid.search(search).map_err(classify_memvid_error)?
+    };
+
+    let engine = response.engine;
+    let hits = response
+        .hits
+        .into_iter()
+        .filter_map(|mut hit| {
+            hydrate_search_hit_metadata(&memvid, &mut hit);
+            // The public engine snippet is sufficient; the canonical source is
+            // opened through its real history reference when more text is needed.
+            hit.chunk_text = None;
+            search_hit_to_thread_episodic_hit(
+                hit,
+                engine.clone(),
+                &segment,
+                &request.workspace_id,
+                &request.thread_id,
+            )
+        })
+        .collect();
+    Ok(ThreadEpisodicMemvidSearchPage {
+        hits,
+        next_cursor: response.next_cursor,
+        unavailable_segment_ids: Vec::new(),
+        warnings: Vec::new(),
+    })
 }
 
 fn hydrate_search_hit_metadata(memvid: &Memvid, hit: &mut SearchHit) {
@@ -1207,6 +1462,7 @@ fn memvid_thread_episodic_search_request(
     scope: Option<&str>,
 ) -> SearchRequest {
     SearchRequest {
+        query_embedding: None,
         query: query.to_owned(),
         top_k: profile.max_candidates as usize,
         snippet_chars: profile.snippet_chars as usize,
@@ -1222,37 +1478,6 @@ fn memvid_thread_episodic_search_request(
         as_of_frame: None,
         as_of_ts: None,
         no_sketch: true,
-        acl_context: None,
-        acl_enforcement_mode: AclEnforcementMode::default(),
-    }
-}
-
-fn memvid_thread_episodic_ask_request(
-    profile: &ThreadEpisodicSearchProfile,
-    query: &str,
-    scope: Option<&str>,
-    mode: ThreadEpisodicMemvidAskRetrievalMode,
-) -> AskRequest {
-    AskRequest {
-        question: query.to_owned(),
-        top_k: profile.max_candidates as usize,
-        snippet_chars: profile.snippet_chars as usize,
-        uri: None,
-        scope: scope.map(str::to_owned),
-        cursor: None,
-        start: None,
-        end: None,
-        temporal: profile.recent_start_unix.map(|start_utc| TemporalFilter {
-            start_utc: Some(start_utc),
-            end_utc: None,
-            phrase: None,
-            tz: None,
-        }),
-        context_only: true,
-        mode: mode.ask_mode(),
-        as_of_frame: None,
-        as_of_ts: None,
-        adaptive: None,
         acl_context: None,
         acl_enforcement_mode: AclEnforcementMode::default(),
     }
@@ -1734,6 +1959,192 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    // The adapter must preserve engine continuation even when the legacy
+    // profile permits fewer candidates than the requested page.
+    #[tokio::test]
+    async fn segment_page_preserves_continuation_and_ignores_profile_candidate_cap() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("pages.mv2");
+        let backend = MemvidThreadEpisodicBackend::new();
+        for number in 0..7 {
+            let mut item =
+                concurrent_index_request(&path, &number.to_string(), vec![1.0, 0.0, 0.0]);
+            item.embedding = None;
+            item.text = format!("paginationneedle saved message {number}");
+            backend.index_item(item).await.expect("index document");
+        }
+        let mut profile =
+            ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::DefaultContext);
+        profile.max_candidates = 1;
+        let request = ThreadEpisodicMemvidSearchRequest {
+            workspace_id: "workspace".into(),
+            thread_id: String::new(),
+            query: "paginationneedle".into(),
+            scope: None,
+            profile,
+            segments: vec![ThreadEpisodicMemvidSearchSegment {
+                capsule_id: "shared_capsule".into(),
+                capsule_ref: "capsule".into(),
+                storage_uri: thread_episodic_storage_uri_from_path(&path),
+                segment_index: 25,
+            }],
+            exact_source: None,
+        };
+        let mut cursor = None;
+        let mut ids = std::collections::BTreeSet::new();
+        let mut sizes = Vec::new();
+        loop {
+            let page = backend
+                .search_segment_page(request.clone(), 3, cursor, None)
+                .await
+                .expect("page");
+            sizes.push(page.hits.len());
+            ids.extend(page.hits.into_iter().map(|hit| hit.index_item_id));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(sizes, vec![3, 3, 1]);
+        assert_eq!(ids.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn segment_page_rejects_incompatible_prepared_embedding_identity() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("identity.mv2");
+        let backend = MemvidThreadEpisodicBackend::new();
+        backend
+            .index_item(concurrent_index_request(
+                &path,
+                "identity",
+                vec![1.0, 0.0, 0.0],
+            ))
+            .await
+            .expect("index embedded document");
+        let request = ThreadEpisodicMemvidSearchRequest {
+            workspace_id: "workspace".into(),
+            thread_id: String::new(),
+            query: "concurrent".into(),
+            scope: None,
+            profile: ThreadEpisodicSearchProfile::for_kind(
+                ThreadEpisodicSearchProfileKind::DefaultContext,
+            ),
+            segments: vec![ThreadEpisodicMemvidSearchSegment {
+                capsule_id: "shared_capsule".into(),
+                capsule_ref: "capsule".into(),
+                storage_uri: thread_episodic_storage_uri_from_path(&path),
+                segment_index: 0,
+            }],
+            exact_source: None,
+        };
+        for identity in [
+            ThreadEpisodicEmbeddingIdentity::new("other", "test-model", 3, true),
+            ThreadEpisodicEmbeddingIdentity::new("test", "other", 3, true),
+            ThreadEpisodicEmbeddingIdentity::new("test", "test-model", 3, false),
+            ThreadEpisodicEmbeddingIdentity::new("test", "test-model", 4, true),
+        ] {
+            let vector = vec![1.0; identity.dimension];
+            let embedding = ThreadEpisodicMemvidIndexEmbedding::new(identity, vector).unwrap();
+            let error = backend
+                .search_segment_page(request.clone(), 3, None, Some(embedding))
+                .await
+                .expect_err("incompatible vector space");
+            assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
+        }
+    }
+
+    #[tokio::test]
+    async fn segment_page_rejects_unbound_vector_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("unbound.mv2");
+        {
+            let mut mem = Memvid::create(&path).unwrap();
+            mem.enable_lex().unwrap();
+            mem.enable_vec().unwrap();
+            mem.put_with_embedding_and_options(
+                b"unknown embedding identity",
+                vec![1.0, 0.0, 0.0],
+                PutOptions::default(),
+            )
+            .unwrap();
+            mem.commit().unwrap();
+        }
+        let embedding = ThreadEpisodicMemvidIndexEmbedding::new(
+            ThreadEpisodicEmbeddingIdentity::new("test", "test-model", 3, true),
+            vec![1.0, 0.0, 0.0],
+        )
+        .unwrap();
+        let request = ThreadEpisodicMemvidSearchRequest {
+            workspace_id: "workspace".into(),
+            thread_id: String::new(),
+            query: "unknown".into(),
+            scope: None,
+            profile: ThreadEpisodicSearchProfile::for_kind(
+                ThreadEpisodicSearchProfileKind::DefaultContext,
+            ),
+            segments: vec![ThreadEpisodicMemvidSearchSegment {
+                capsule_id: "unbound".into(),
+                capsule_ref: "unbound".into(),
+                storage_uri: thread_episodic_storage_uri_from_path(&path),
+                segment_index: 0,
+            }],
+            exact_source: None,
+        };
+        let error = MemvidThreadEpisodicBackend::new()
+            .search_segment_page(request, 3, None, Some(embedding))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
+        assert!(error.message.contains("persisted embedding identity"));
+    }
+
+    #[tokio::test]
+    async fn prepared_vector_can_be_reused_across_independent_segment_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = MemvidThreadEpisodicBackend::new();
+        let embedding = ThreadEpisodicMemvidIndexEmbedding::new(
+            ThreadEpisodicEmbeddingIdentity::new("test", "test-model", 3, true),
+            vec![1.0, 0.0, 0.0],
+        )
+        .unwrap();
+        for name in ["first", "second"] {
+            let path = temp.path().join(format!("{name}.mv2"));
+            backend
+                .index_item(concurrent_index_request(
+                    &path,
+                    name,
+                    embedding.vector.clone(),
+                ))
+                .await
+                .unwrap();
+            let request = ThreadEpisodicMemvidSearchRequest {
+                workspace_id: "workspace".into(),
+                thread_id: String::new(),
+                query: "concurrent".into(),
+                scope: None,
+                profile: ThreadEpisodicSearchProfile::for_kind(
+                    ThreadEpisodicSearchProfileKind::DefaultContext,
+                ),
+                segments: vec![ThreadEpisodicMemvidSearchSegment {
+                    capsule_id: name.into(),
+                    capsule_ref: name.into(),
+                    storage_uri: thread_episodic_storage_uri_from_path(&path),
+                    segment_index: 0,
+                }],
+                exact_source: None,
+            };
+            let page = backend
+                .search_segment_page(request, 3, None, Some(embedding.clone()))
+                .await
+                .unwrap();
+            assert_eq!(page.hits.len(), 1);
+            assert_eq!(page.hits[0].index_item_id, format!("index_{name}"));
+            assert_eq!(page.hits[0].capsule_id, name);
+            assert!(page.next_cursor.is_none());
+        }
+    }
+
     #[tokio::test]
     async fn independent_backends_share_capsule_lock_after_async_cancellation() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1902,6 +2313,92 @@ mod tests {
                 frame.id
             );
         }
+    }
+
+    #[tokio::test]
+    async fn canceled_blocking_index_retains_workspace_until_real_write_finishes_before_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("transition.mv2");
+        let workspace = "blocking_projection_transition";
+        let ownership = lock_thread_episodic_workspace(workspace).await;
+        let backend = MemvidThreadEpisodicBackend::new().with_workspace_ownership(ownership);
+        let old_request = concurrent_index_request(&path, "model_a", vec![1.0, 0.0, 0.0]);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let old_path = path.clone();
+        let waiter = tokio::spawn(async move {
+            // The real backend helper moves ownership into its blocking task.
+            // This controlled point is inside the capsule write, outside Tokio
+            // and DB capacity. Dropping release_tx on panic also unblocks it.
+            let task_path = old_path.clone();
+            backend
+                .run_blocking(&old_path, move || {
+                    let _ = started_tx.send(());
+                    if release_rx.recv().is_err() {
+                        return None;
+                    }
+                    let output = index_item_blocking(task_path, old_request);
+                    let _ = finished_tx.send(output);
+                    Some(())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        assert!(
+            try_lock_thread_episodic_workspace(workspace)
+                .await
+                .is_none()
+        );
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        // Cancellation of the waiter cannot admit cleanup or a new claim.
+        assert!(
+            try_lock_thread_episodic_workspace(workspace)
+                .await
+                .is_none()
+        );
+        assert!(
+            try_lock_thread_episodic_workspace("independent_projection_transition")
+                .await
+                .is_some()
+        );
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap().unwrap();
+        let replacement = lock_thread_episodic_workspace(workspace).await;
+        remove_thread_episodic_capsule_file(&path, replacement.clone())
+            .await
+            .unwrap();
+        let mut request_b = concurrent_index_request(&path, "model_b", vec![0.0, 1.0, 0.0]);
+        request_b.embedding = Some(
+            ThreadEpisodicMemvidIndexEmbedding::new(
+                ThreadEpisodicEmbeddingIdentity::new("test", "model-b", 4, true),
+                vec![0.0, 1.0, 0.0, 0.0],
+            )
+            .unwrap(),
+        );
+        MemvidThreadEpisodicBackend::new()
+            .index_item_with_workspace_ownership(request_b, replacement.clone())
+            .await
+            .unwrap();
+        // The detached A task has completed before deletion and B's actual
+        // commit. Its old frame cannot reappear after the replacement.
+        let mut capsule = Memvid::open_read_only(&path).unwrap();
+        assert!(
+            capsule
+                .frame_by_uri("mv2://workspace/shared/item/model_a")
+                .is_err()
+        );
+        let frame_b = capsule
+            .frame_by_uri("mv2://workspace/shared/item/model_b")
+            .unwrap();
+        assert_eq!(
+            capsule
+                .frame_canonical_payload(frame_b.id)
+                .unwrap()
+                .as_slice(),
+            b"concurrent payload model_b"
+        );
     }
 
     struct StaticEmbeddingProvider {
@@ -2088,39 +2585,6 @@ mod tests {
             ThreadEpisodicAdaptiveRetrievalImplementation::PioneerFallback
         );
         assert!(audit.graph_search_note.contains("not enabled"));
-    }
-
-    #[test]
-    fn ask_retrieval_request_uses_context_only_hybrid_and_scope() {
-        let profile =
-            ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::DefaultContext);
-        let request = memvid_thread_episodic_ask_request(
-            &profile,
-            "architecture decision",
-            Some("thread_scope"),
-            ThreadEpisodicMemvidAskRetrievalMode::Hybrid,
-        );
-
-        assert_eq!(request.question, "architecture decision");
-        assert_eq!(request.mode, AskMode::Hybrid);
-        assert!(request.context_only);
-        assert_eq!(request.scope.as_deref(), Some("thread_scope"));
-        assert_eq!(request.top_k, profile.max_candidates as usize);
-    }
-
-    #[test]
-    fn ask_retrieval_request_supports_semantic_debug_mode() {
-        let profile =
-            ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::DefaultContext);
-        let request = memvid_thread_episodic_ask_request(
-            &profile,
-            "architecture decision",
-            None,
-            ThreadEpisodicMemvidAskRetrievalMode::Semantic,
-        );
-
-        assert_eq!(request.mode, AskMode::Sem);
-        assert!(request.context_only);
     }
 
     #[test]
@@ -2716,11 +3180,12 @@ mod tests {
             .await
             .expect("ask retrieval should return hits");
 
-        assert!(
-            calls.load(Ordering::SeqCst) > 0,
-            "Memvid ask should call the supplied embedder for hybrid retrieval"
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "prepare the query once per retrieval"
         );
-        assert_eq!(output.diagnostics.native_memvid_adaptive_used, true);
+        assert!(!output.diagnostics.native_memvid_adaptive_used);
         assert_eq!(output.diagnostics.returned_count, 1);
         let hit = &output.hits[0].hit;
         assert_eq!(hit.index_item_id, "index_item_ask");

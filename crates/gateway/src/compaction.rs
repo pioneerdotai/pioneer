@@ -5,24 +5,29 @@ mod background_history;
 mod checkpoint;
 mod compatible;
 mod coordination;
-pub(crate) use coordination::{ContextCompactionCoordinator, ContextWorkPriority};
+pub(crate) use coordination::{
+    ContextCompactionCoordinator, ContextCompactionLease, ContextWorkPriority,
+};
 mod coverage;
 #[cfg(test)]
 pub(crate) use coverage::{CheckpointGraphResolver, observe_preparation_work};
 mod delivered;
 pub(crate) mod frozen;
 mod history;
-pub(crate) use history::final_response_aliases;
 #[cfg(test)]
 pub(crate) use history::load_exact_line_history;
 #[cfg(test)]
 pub(crate) use history::pause_selected_turn_load;
+pub(crate) use history::provider_round_aliases;
 mod native;
 mod origins;
 #[cfg(test)]
 pub(crate) use origins::resolve_message_origins;
 mod result_budget;
 mod service;
+pub(crate) use service::apply_cli_usage;
+#[cfg(test)]
+pub(crate) use service::finish_cli_summary;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod tool_outcomes;
@@ -54,7 +59,8 @@ use pioneer_compaction::runner::{
     SourceCursor,
 };
 use pioneer_compaction::summary::{
-    ReferenceMaterial, Summarizer, SummaryInput, SummaryPart, SummaryRequest, validate_summary,
+    ReferenceMaterial, Summarizer, SummaryInput, SummaryPart, SummaryRequest,
+    validate_summary_classified,
 };
 use pioneer_compaction::{Checkpoint, OperationSnapshot, SourceRef};
 use pioneer_crud::{
@@ -396,6 +402,7 @@ pub(crate) struct CompactionRunner {
     store: CrudStore,
     workspace: String,
     snapshot: OperationSnapshot,
+    execution_turn: Option<String>,
     summarizer: Arc<dyn Summarizer>,
     target: Arc<dyn CompactionTarget>,
     observer: Arc<dyn CompactionObserver>,
@@ -423,6 +430,7 @@ impl CompactionRunner {
             store,
             workspace,
             snapshot,
+            execution_turn: None,
             summarizer,
             target,
             observer,
@@ -432,6 +440,23 @@ impl CompactionRunner {
             #[cfg(test)]
             active_payload_loads: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    pub fn with_execution_turn(mut self, turn: String) -> Self {
+        self.execution_turn = Some(turn);
+        self
+    }
+
+    fn ensure_execution(&self, record: &pioneer_crud::compaction::OperationRecord) -> Result<()> {
+        ensure!(
+            record.deadline_ms == i64::try_from(self.snapshot.admission.deadline_ms)?
+                && self
+                    .execution_turn
+                    .as_ref()
+                    .is_none_or(|turn| record.execution_turn.as_ref() == Some(turn)),
+            "compaction execution superseded"
+        );
+        Ok(())
     }
 
     #[cfg(test)]
@@ -620,7 +645,13 @@ impl CompactionRunner {
             ("failed", "deadline")
         };
         self.store
-            .compaction_finish(&self.snapshot.id, status, outcome)
+            .compaction_finish_execution(
+                &self.snapshot.id,
+                self.execution_turn.as_deref(),
+                self.snapshot.admission.deadline_ms,
+                status,
+                outcome,
+            )
             .await?;
         // The caller may have dropped run itself on its enclosing deadline.
         self.summarizer.cleanup().await?;
@@ -629,6 +660,7 @@ impl CompactionRunner {
             .compaction_operation(&self.snapshot.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("operation missing during reconciliation"))?;
+        self.ensure_execution(&durable)?;
         let state = self
             .store
             .compaction_reconcile_runner_state(&self.snapshot.id)
@@ -676,6 +708,12 @@ impl CompactionRunner {
 
     async fn drive(&self) -> Result<CompactionExit> {
         let operation = &self.snapshot.id;
+        let durable = self
+            .store
+            .compaction_operation(operation)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("compaction operation missing"))?;
+        self.ensure_execution(&durable)?;
         let plan = self
             .store
             .compaction_runner_plan(operation)
@@ -701,6 +739,7 @@ impl CompactionRunner {
                 .compaction_operation(operation)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("compaction operation missing"))?;
+            self.ensure_execution(&durable)?;
             if durable.status == "completed" {
                 let applied = self
                     .store
@@ -860,23 +899,30 @@ impl CompactionRunner {
                                 observation.input_tokens = completion.input_tokens;
                                 observation.output_tokens = completion.output_tokens;
                             }
-                            let summary = match validate_summary(
+                            let summary = match validate_summary_classified(
                                 &completion,
                                 portion.request.output_cap,
                             ) {
                                 Ok(text) => text,
-                                Err(_) => {
+                                Err(reason) => {
                                     state = self
-                                            .persist(
-                                                &state,
-                                                Self::diagnose(state.attempt_failed(
+                                        .persist(
+                                            &state,
+                                            Self::diagnose(
+                                                self.attempt_failed(
+                                                    &state,
                                                     FailureKind::InvalidCompletion,
-                                                    self.clock.now_ms(),
                                                     None,
-                                                )?, FailureDiagnostic::new("summary_validation", "invalid_completion", "Summary completion did not satisfy the required format or output budget")),
-                                                None,
-                                            )
-                                            .await?;
+                                                )?,
+                                                FailureDiagnostic::new(
+                                                    "summary_validation",
+                                                    "invalid_completion",
+                                                    reason.explanation(),
+                                                ),
+                                            ),
+                                            None,
+                                        )
+                                        .await?;
                                     continue;
                                 }
                             };
@@ -1372,15 +1418,25 @@ pub(crate) fn load_test_catalog() {
     static READY: std::sync::Once = std::sync::Once::new();
     READY.call_once(|| {
         let directory = tempfile::tempdir().unwrap();
+        // The Pi comparison fixture retains legacy negative router prices.
+        // Restore a catalog generated from native source evidence instead.
+        let source: pioneer_provider::catalog::generator::SourceSnapshot =
+            serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../provider/tests/fixtures/catalog/sources.json"
+            )))
+            .unwrap();
+        let catalog = pioneer_provider::catalog::generator::generate(&source, true).unwrap();
         let saved = serde_json::json!({
             "version": 1,
-            "updated_at": "2026-09-12T00:00:00Z",
-            "catalog": {
-                "models": serde_json::from_str::<serde_json::Value>(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../provider/tests/fixtures/catalog/models.json"))).unwrap(),
-                "provenance": serde_json::from_str::<serde_json::Value>(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../provider/tests/fixtures/catalog/provenance.json"))).unwrap(),
-            }
+            "updated_at": source.captured_at,
+            "catalog": catalog,
         });
-        std::fs::write(directory.path().join("catalog.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+        std::fs::write(
+            directory.path().join("catalog.json"),
+            serde_json::to_vec(&saved).unwrap(),
+        )
+        .unwrap();
         pioneer_provider::catalog::runtime::restore_cached_catalog(directory.path()).unwrap();
     });
 }

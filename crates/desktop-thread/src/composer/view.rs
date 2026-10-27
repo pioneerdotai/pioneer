@@ -451,7 +451,7 @@ impl ComposerView {
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let candidates = self
             .thread_member_input
             .as_ref()
@@ -477,7 +477,9 @@ impl ComposerView {
             self.composer_mention_select.update(cx, |state, cx| {
                 state.set_items(select_items, window, cx);
             });
+            return true;
         }
+        false
     }
 
     fn render_composer_mention_picker(&mut self) -> Option<AnyElement> {

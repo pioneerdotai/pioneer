@@ -67,6 +67,7 @@ pub(super) async fn prepare_native_projection(
 }
 
 struct PreparedProjection {
+    frozen_hold: Option<pioneer_crud::FrozenReadHold>,
     descriptor: pioneer_compaction::frozen::FrozenHistoryRef,
     accepted_scopes: BTreeSet<String>,
     source_epochs: std::collections::BTreeMap<String, u64>,
@@ -309,12 +310,21 @@ async fn prepare_native_projection_with_prepared(
     let preparation_deadline = now
         .saturating_add(pioneer_compaction::OPERATION_MILLIS)
         .min(operation_deadline.unwrap_or(u64::MAX));
+    // Cover direct native media preparation through pinning, with the same
+    // absolute deadline/cancellation as the rest of this operation.
+    let _preview_activity = match processor {
+        Some(processor) => Some(tokio::select! { biased;
+            _ = context.cancellation.cancelled() => anyhow::bail!("native media preparation cancelled"),
+            _ = clock.sleep_until(preparation_deadline) => anyhow::bail!("native media preparation deadline exceeded"),
+            guard = processor.artifact_service.html_preview_activity() => guard,
+        }),
+        None => None,
+    };
     if let Some(AcceptedProjection::Prepared(projection)) = &accepted_projection {
         observe_consumed_projection(store, workspace, thread, &request, projection)?;
     }
     // This deadline includes reader/writer queues and admission, not just LLM time.
     let prepared = async {
-        let catalog = pioneer_provider::catalog::model_catalog()?;
         let version = store
             .compaction_projection_version(workspace, thread)
             .await?;
@@ -336,14 +346,20 @@ async fn prepare_native_projection_with_prepared(
         } else {
             None
         };
-        let mut authorized = super::frozen::execution_history_scopes(
-            &store,
-            workspace,
-            thread,
-            &context.turn_id,
-            context.conversation_thread_id.as_deref(),
-        )
-        .await?;
+        let mut authorized = if accepted_projection.is_some() {
+            let mut allowed = BTreeSet::from([thread.to_owned()]);
+            allowed.extend(context.conversation_thread_id.iter().cloned());
+            allowed
+        } else {
+            super::frozen::execution_history_scopes(
+                &store,
+                workspace,
+                thread,
+                &context.turn_id,
+                context.conversation_thread_id.as_deref(),
+            )
+            .await?
+        };
         if let Some(projection) = &accepted_projection {
             match projection {
                 AcceptedProjection::Prepared(prepared) => {
@@ -449,7 +465,21 @@ async fn prepare_native_projection_with_prepared(
         )
         .await?;
         super::origins::validate_message_origins(&store, workspace, &request.messages).await?;
-        super::frozen::order_history_by_creation(&store, workspace, &mut request.messages).await?;
+        // Attached Task hooks have no conversation_thread_id either. Classify
+        // this native execution by its durable Task turn, without opening input.
+        // Completed-history preparation uses the separate conversation path.
+        if matches!(&accepted_projection, Some(AcceptedProjection::Prepared(_)))
+            && store
+                .get_task_run_turn_by_turn(thread, &context.turn_id)
+                .await?
+                .is_none()
+        {
+            super::frozen::order_conversation_history(&store, workspace, &mut request.messages)
+                .await?;
+        } else {
+            super::frozen::order_history_by_creation(&store, workspace, &mut request.messages)
+                .await?;
+        }
         if request.messages.iter().any(|message| {
             message.content_parts.iter().any(|part| match part {
                 pioneer_provider::MessageContentPart::File { file } => {
@@ -473,7 +503,7 @@ async fn prepare_native_projection_with_prepared(
         if matches!(&accepted_projection, Some(AcceptedProjection::Prepared(_))) {
             observe_reused_projection(store, workspace, thread);
         }
-        let limits = catalog.limits(context.provider.name(), &request.model);
+        let limits = context.provider.model_limits(&request.model).await?;
         let budget = ModelBudget::new(
             Some(limits.context_window),
             limits.max_input,
@@ -556,7 +586,8 @@ async fn prepare_native_projection_with_prepared(
         };
         let selection = effective_selection(&current, settings.selection.as_ref(), None).clone();
         let summarizer =
-            super::service::make_summarizer(providers, processor, workspace, selection).await?;
+            super::service::make_summarizer(providers, store, processor, workspace, selection)
+                .await?;
         let layout = NativeHistoryLayout::from_messages(
             workspace,
             thread,
@@ -661,6 +692,7 @@ async fn prepare_native_projection_with_prepared(
             PreparedOperation {
                 owner: owner.clone(),
                 execution_turn: context.turn_id.clone(),
+                user_initiated: true,
                 source_projection,
                 expected_checkpoint: head,
                 summary_basis: basis,
@@ -687,6 +719,12 @@ async fn prepare_native_projection_with_prepared(
         _ = clock.sleep_until(preparation_deadline) => anyhow::bail!("native context preparation deadline exceeded"),
         prepared = prepared => prepared?,
     };
+    // Admission has transferred the hold to the durable running operation.
+    // No frozen byte read follows for the saved request; provider await must
+    // not keep a temporary pin alive.
+    if let Some(AcceptedProjection::Prepared(projection)) = &mut accepted_projection {
+        drop(projection.frozen_hold.take());
+    }
     let Some((snapshot, summarizer, projection, summary_index)) = operation else {
         return Ok(NativePreparedRequest {
             request,
@@ -706,7 +744,8 @@ async fn prepare_native_projection_with_prepared(
         Arc::new(NativeRequestTarget(projection.clone())),
         observer,
         clock.clone(),
-    );
+    )
+    .with_execution_turn(context.turn_id.clone());
     let execution = tokio::select! { biased;
         _ = clock.sleep_until(request_deadline) => CompactionExit::Reconcile(FailureKind::Deadline),
         result = runner.run(context.cancellation.clone()) => result?,
@@ -785,6 +824,7 @@ pub(super) async fn prepare_native_projection_from_history(
     clock: Arc<dyn CompactionClock>,
 ) -> Result<NativePreparedRequest> {
     let super::frozen::PreparedHistory {
+        frozen_hold,
         descriptor,
         messages: _,
         accepted_scopes,
@@ -804,6 +844,7 @@ pub(super) async fn prepare_native_projection_from_history(
         observer,
         clock,
         Some(AcceptedProjection::Prepared(PreparedProjection {
+            frozen_hold,
             descriptor,
             accepted_scopes,
             source_epochs,
@@ -889,6 +930,11 @@ impl pioneer_agent::compaction::controller::NativeContextController
             &context.turn_id,
             pioneer_observability::turn_startup::Stage::CompactionWait,
         );
+        let _conversation_lease = tokio::select! { biased;
+            _ = context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
+            _ = clock.sleep_until(deadline) => anyhow::bail!("native context preparation deadline exceeded"),
+            result = processor.acquire_composer_history_priority(&history_store, &context.workspace_id, &context.thread_id, &context.turn_id, &context.cancellation) => result?,
+        };
         let lease = tokio::select! { biased;
             _ = context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
             _ = clock.sleep_until(deadline) => anyhow::bail!("native context preparation deadline exceeded"),
@@ -942,7 +988,7 @@ async fn refresh_native_history(
     mut request: ChatRequest,
 ) -> Result<(ChatRequest, PreparedProjection)> {
     let prepared = processor
-        .capture_current_context_basis_prepared(
+        .capture_running_context_basis_prepared(
             store,
             &context.workspace_id,
             &context.thread_id,
@@ -951,6 +997,7 @@ async fn refresh_native_history(
         )
         .await?;
     let super::frozen::PreparedHistory {
+        frozen_hold,
         descriptor,
         messages: mut history,
         accepted_scopes: allowed,
@@ -1045,6 +1092,7 @@ async fn refresh_native_history(
     }
     request.messages = history;
     let projection = PreparedProjection {
+        frozen_hold,
         descriptor,
         accepted_scopes: allowed,
         source_epochs,

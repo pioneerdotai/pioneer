@@ -1,7 +1,9 @@
 pub(crate) mod anthropic;
 mod azure_openai;
 mod bedrock;
-mod compatible;
+mod chat_completions_api_compatible;
+pub(crate) mod responses_api_compatible;
+pub use responses_api_compatible::ResponsesApiCompatibleProvider;
 pub(crate) mod copilot;
 pub(crate) mod deepseek;
 mod echo;
@@ -14,11 +16,13 @@ pub(crate) mod openai;
 pub(crate) mod openrouter;
 pub(crate) mod retired;
 pub(crate) mod telnyx;
+pub(crate) mod vercel_ai_gateway;
+pub use vercel_ai_gateway::VercelAiGatewayProvider;
 
 pub use anthropic::AnthropicProvider;
 pub use azure_openai::AzureOpenAiProvider;
 pub use bedrock::BedrockProvider;
-pub use compatible::{AuthStyle, OpenAiCompatibleProvider};
+pub use chat_completions_api_compatible::{AuthStyle, ChatCompletionsApiCompatibleProvider};
 pub use copilot::CopilotProvider;
 pub use deepseek::DeepSeekProvider;
 pub use echo::EchoProvider;

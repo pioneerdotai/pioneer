@@ -46,6 +46,22 @@
       "items": {
         "$ref": "#/$defs/PublicTaskTrigger"
       }
+    },
+    "webhookScope": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskWebhookScope"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "webhookUrl": {
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [
@@ -153,6 +169,33 @@
           "additionalProperties": false,
           "required": [
             "exact"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "object",
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                },
+                "provider_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "model_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "model"
           ]
         }
       ]
@@ -425,7 +468,8 @@
       "type": "string",
       "enum": [
         "codex",
-        "claude"
+        "claude",
+        "opencode"
       ]
     },
     "McpScopeKind": {
@@ -521,7 +565,7 @@
     "ProviderRequestId": {
       "type": "string",
       "maxLength": 128,
-      "pattern": "^(gen-|req-|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
+      "pattern": "^(gen-|req-|req_|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
     },
     "ProviderTransportKind": {
       "type": "string",
@@ -638,6 +682,16 @@
         },
         "executorKind": {
           "$ref": "#/$defs/TaskExecutorKind"
+        },
+        "finishRequest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskFinishRequest"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "goal": {
           "type": "string"
@@ -2519,6 +2573,31 @@
         "system"
       ]
     },
+    "TaskFinishRequest": {
+      "description": "A user-directed final soft stop; this is not evidence that the goal succeeded.",
+      "type": "object",
+      "properties": {
+        "firstRunNumber": {
+          "description": "Earliest admitted run whose real outcome contributes to the final state.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestedAt": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "requestedAt",
+        "firstRunNumber"
+      ]
+    },
     "TaskLifecyclePolicy": {
       "type": "object",
       "properties": {
@@ -2568,6 +2647,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/TaskValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "finishRequest": {
+          "description": "Server-owned durable decision to stop future runs.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskFinishRequest"
             },
             {
               "type": "null"
@@ -3541,6 +3631,14 @@
             "value"
           ]
         }
+      ]
+    },
+    "TaskWebhookScope": {
+      "type": "string",
+      "enum": [
+        "public",
+        "lan",
+        "loopback"
       ]
     },
     "TaskWriteLock": {

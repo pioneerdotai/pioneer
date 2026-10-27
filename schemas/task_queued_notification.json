@@ -93,7 +93,7 @@
     "ProviderRequestId": {
       "type": "string",
       "maxLength": 128,
-      "pattern": "^(gen-|req-|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
+      "pattern": "^(gen-|req-|req_|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
     },
     "ProviderTransportKind": {
       "type": "string",
@@ -509,6 +509,17 @@
             "null"
           ]
         },
+        "triggerInput": {
+          "description": "External data accepted for this occurrence, preserved across retries.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskRunTriggerInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "updatedAt": {
           "type": "integer",
           "format": "int64"
@@ -526,6 +537,13 @@
         "updatedAt"
       ]
     },
+    "TaskRunInputEncoding": {
+      "type": "string",
+      "enum": [
+        "utf8",
+        "base64"
+      ]
+    },
     "TaskRunStatus": {
       "type": "string",
       "enum": [
@@ -539,6 +557,27 @@
         "blocked",
         "cancelled",
         "timed_out"
+      ]
+    },
+    "TaskRunTriggerInput": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "contentType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "encoding": {
+          "$ref": "#/$defs/TaskRunInputEncoding"
+        }
+      },
+      "required": [
+        "encoding",
+        "body"
       ]
     },
     "TaskValue": {

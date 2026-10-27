@@ -255,7 +255,7 @@ impl ClientFfiRuntime {
         &self,
         input_json: &str,
     ) -> Result<telemetry::ClientMobileStartupRecordResult, String> {
-        self.require_initialized().map_err(|error| error.message)?;
+        // Reporting initialization failure must not require a domain Client.
         telemetry::record_mobile_startup(input_json)
     }
 
@@ -1857,6 +1857,23 @@ mod tests {
     }
 
     #[test]
+    fn initialization_failure_does_not_block_telemetry_validation() {
+        let runtime = ClientFfiRuntime::default();
+        assert!(runtime.initialize("invalid").is_err());
+        assert!(runtime.require_initialized().is_err());
+        let report = r#"{"enabled":true,"metrics_endpoint":"https://telemetry.getpioneer.dev/v1/metrics","traces_endpoint":"https://telemetry.getpioneer.dev/v1/traces","export_interval_ms":30000,"export_timeout_ms":15000,"deployment_environment":"production","started_at_unix_ms":1000,"duration_ms":700000,"outcome":"degraded","stages":[]}"#;
+        // Reaches the bounded telemetry validator, before any exporter/network
+        // initialization; domain APIs still reject the uninitialized Client.
+        assert!(
+            runtime
+                .mobile_startup_record(report)
+                .unwrap_err()
+                .contains("supported startup range")
+        );
+        assert!(runtime.client_intent_dispatch("{}").is_err());
+    }
+
+    #[test]
     fn initialize_accepts_shell_config() {
         let runtime = ClientFfiRuntime::default();
         let result = runtime
@@ -2021,6 +2038,8 @@ mod tests {
                 presented_rows: false,
                 scroll_generation: 0,
                 latest_user_turn_id: Some("turn".into()),
+                viewed_row_ids: Vec::new(),
+                viewed_through_block: None,
                 viewed_through_turn_id: Some("turn".into()),
                 read_requires_unread: false,
                 prefetch_on_visibility: true,

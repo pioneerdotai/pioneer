@@ -5234,6 +5234,7 @@
       "enum": [
         "openai",
         "openrouter",
+        "vercel-ai-gateway",
         "local"
       ]
     },
@@ -7857,22 +7858,6 @@
           "properties": {
             "kind": {
               "type": "string",
-              "const": "default_model"
-            },
-            "selection": {
-              "$ref": "#/$defs/GatewayModelSelection"
-            }
-          },
-          "required": [
-            "kind",
-            "selection"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "kind": {
-              "type": "string",
               "const": "compaction_model"
             },
             "selection": {
@@ -7887,17 +7872,19 @@
         {
           "type": "object",
           "properties": {
-            "enabled": {
-              "type": "boolean"
-            },
             "kind": {
               "type": "string",
-              "const": "context_compaction"
+              "const": "model_catalog_proxy"
+            },
+            "proxy_url": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
-            "kind",
-            "enabled"
+            "kind"
           ]
         },
         {
@@ -8468,6 +8455,22 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "load_more"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "workspace_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "dismiss"
             },
             "notification_id": {
@@ -8906,6 +8909,14 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0
+        },
+        "viewed_row_ids": {
+          "description": "Actual viewability, separate from pagination/prefetch row demand.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "viewed_through_turn_id": {
           "type": [

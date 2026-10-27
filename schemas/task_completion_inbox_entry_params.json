@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskCompletionInboxEntryParams",
+  "type": "object",
+  "properties": {
+    "runId": {
+      "type": "string"
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspaceId",
+    "runId"
+  ]
+}

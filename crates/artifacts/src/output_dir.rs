@@ -267,7 +267,7 @@ pub async fn execute_output_dir_gc(
             .join(path_segment("thread_id", candidate.thread_id.as_str())?)
             .join(path_segment("turn_id", candidate.turn_id.as_str())?);
         let removal_path = path.clone();
-        let removal = tokio::task::spawn_blocking(move || {
+        let removal = pioneer_observability::work::spawn_blocking(move || {
             let active = active_output_dirs().lock().map_err(|_| {
                 std::io::Error::other("artifact output activity registry lock poisoned")
             })?;

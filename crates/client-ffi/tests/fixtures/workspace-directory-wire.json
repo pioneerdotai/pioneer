@@ -22,6 +22,8 @@
           "child_folder_ids_by_parent_id": {},
           "folders_by_id": {},
           "placements_by_thread_id": {},
+          "running_task_folder_ids": [],
+          "running_task_thread_ids": [],
           "thread_ids_by_folder_id": {
             "__root__": [
               "a2",
@@ -61,6 +63,7 @@
             }
           },
           "unread": [],
+          "unread_by_folder_id": {},
           "workspace_id": "a"
         },
         "actions": {}
@@ -100,6 +103,8 @@
           "child_folder_ids_by_parent_id": {},
           "folders_by_id": {},
           "placements_by_thread_id": {},
+          "running_task_folder_ids": [],
+          "running_task_thread_ids": [],
           "thread_ids_by_folder_id": {
             "__root__": [
               "b1"
@@ -123,6 +128,7 @@
             }
           },
           "unread": [],
+          "unread_by_folder_id": {},
           "workspace_id": "b"
         },
         "actions": {}
@@ -164,6 +170,8 @@
           "child_folder_ids_by_parent_id": {},
           "folders_by_id": {},
           "placements_by_thread_id": {},
+          "running_task_folder_ids": [],
+          "running_task_thread_ids": [],
           "thread_ids_by_folder_id": {
             "__root__": [
               "a2"
@@ -187,6 +195,7 @@
             }
           },
           "unread": [],
+          "unread_by_folder_id": {},
           "workspace_id": "a"
         },
         "actions": {}
@@ -226,6 +235,8 @@
           "child_folder_ids_by_parent_id": {},
           "folders_by_id": {},
           "placements_by_thread_id": {},
+          "running_task_folder_ids": [],
+          "running_task_thread_ids": [],
           "thread_ids_by_folder_id": {
             "__root__": [
               "b1"
@@ -249,6 +260,7 @@
             }
           },
           "unread": [],
+          "unread_by_folder_id": {},
           "workspace_id": "b"
         },
         "actions": {}

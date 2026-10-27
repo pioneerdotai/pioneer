@@ -91,6 +91,7 @@ impl<'de> Deserialize<'de> for GatewaySettings {
         };
         settings.migrate_legacy_active_recall_model();
         settings.migrate_default_claude_cli_runtime_instance();
+        settings.migrate_default_opencode_cli_runtime_instance();
         Ok(settings)
     }
 }
@@ -397,6 +398,8 @@ struct GatewayCliRuntimeInstanceSettingsOverride {
 #[serde(deny_unknown_fields)]
 struct GatewayRemoteAccessSettingsOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_base_url: Option<pioneer_protocol::GatewayBaseUrl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     server: Option<String>,
@@ -461,6 +464,13 @@ impl GatewayRemoteAccessSettingsOverride {
             changes.clear_key = true;
         }
 
+        if changes.key.is_some()
+            || changes.clear_key
+            || changes.server_changed
+            || changes.enabled == Some(false)
+        {
+            self.public_base_url = None;
+        }
         Ok(changes)
     }
 }
@@ -598,6 +608,52 @@ impl GatewaySettings {
             &self.apply_to_gateway_config(config.clone()),
             self.cli_runtimes.as_ref(),
         )
+    }
+
+    /// Compare normalized common settings by stable ID. List order and
+    /// workspace compaction overrides do not change CLI probe configuration.
+    pub(crate) fn changed_cli_runtime_ids(
+        &self,
+        previous: &Self,
+        config: &GatewayConfig,
+    ) -> std::collections::BTreeSet<String> {
+        let by_id = |settings: &Self| {
+            let effective = settings.apply_to_gateway_config(config.clone());
+            let mut launch = effective
+                .effective_cli_agent_runtime_instances()
+                .into_iter()
+                .map(|instance| (instance.id.clone(), instance))
+                .collect::<BTreeMap<_, _>>();
+            cli_runtime_settings_from_gateway_config(&effective, settings.cli_runtimes.as_ref())
+                .instances
+                .into_iter()
+                .map(|instance| {
+                    let id = instance.id.clone();
+                    let effective = launch.remove(&id);
+                    (id, (instance, effective))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = by_id(previous);
+        let after = by_id(self);
+        before
+            .keys()
+            .chain(after.keys())
+            .filter(|id| before.get(*id) != after.get(*id))
+            .cloned()
+            .collect()
+    }
+
+    /// Runtime discovery, never a caller-supplied remote access setting.
+    pub(crate) fn set_remote_access_public_base_url(
+        &mut self,
+        public_base_url: Option<pioneer_protocol::GatewayBaseUrl>,
+    ) -> bool {
+        if self.remote_access.public_base_url == public_base_url {
+            return false;
+        }
+        self.remote_access.public_base_url = public_base_url;
+        true
     }
 
     pub fn remote_access_secret_ref(&self) -> Option<&str> {
@@ -829,6 +885,9 @@ impl GatewaySettings {
                             pioneer_protocol::CLIAgentRuntimeKind::Claude => {
                                 pioneer_protocol::ModelSelectionTransport::Claude
                             }
+                            pioneer_protocol::CLIAgentRuntimeKind::OpenCode => {
+                                pioneer_protocol::ModelSelectionTransport::OpenCode
+                            }
                         };
                         anyhow::ensure!(
                             selected_instance == &instance.id && transport == &expected,
@@ -1037,9 +1096,16 @@ impl GatewaySettings {
             self.apply_to_gateway_thread_episodic_config(config.thread_episodic);
         config.voice = self.effective_voice_input_config(&config.voice);
         if let Some(cli_runtimes) = &self.cli_runtimes {
+            // Settings expose only presentation, paths and enabled. Preserve
+            // the native launch fields of matching configured instances so a
+            // full-list save does not silently change their probe/session spec.
+            if config.cli_agent_runtimes.is_empty() {
+                config.cli_agent_runtime.enabled = true;
+            }
+            let inherited = config.effective_cli_agent_runtime_instances();
             config.cli_agent_runtime.enabled = false;
             config.cli_agent_runtimes =
-                cli_runtimes.to_gateway_cli_agent_runtime_instances_config();
+                cli_runtimes.to_gateway_cli_agent_runtime_instances_config(&inherited);
         } else if config.cli_agent_runtimes.is_empty() && !config.cli_agent_runtime.enabled {
             config.cli_agent_runtime.enabled = true;
         }
@@ -1062,6 +1128,56 @@ impl GatewaySettings {
         }
         self.migrated |= migrated;
         migrated
+    }
+
+    fn migrate_default_opencode_cli_runtime_instance(&mut self) -> bool {
+        let Some(runtimes) = &mut self.cli_runtimes else {
+            return false;
+        };
+        if runtimes.instances.len() != 2 {
+            return false;
+        }
+        for (instance, (id, kind, home, display)) in runtimes.instances.iter().zip([
+            (
+                "codex",
+                GatewayCliAgentRuntimeKindConfig::Codex,
+                "~/.codex",
+                "Codex",
+            ),
+            (
+                "claude",
+                GatewayCliAgentRuntimeKindConfig::Claude,
+                "~/.claude",
+                "Claude",
+            ),
+        ]) {
+            if instance.id != id
+                || instance.kind != kind
+                || !instance.enabled
+                || instance.binary_path != id
+                || instance.home_path != home
+                || instance.shadow_home_path.is_some()
+                || (!instance.nickname.is_empty() && instance.nickname != id)
+                || (instance.display_name != display
+                    && instance.display_name != format!("{display} CLI"))
+            {
+                return false;
+            }
+        }
+        runtimes
+            .instances
+            .push(GatewayCliRuntimeInstanceSettingsOverride {
+                id: "opencode".into(),
+                kind: GatewayCliAgentRuntimeKindConfig::OpenCode,
+                display_name: "OpenCode".into(),
+                nickname: "opencode".into(),
+                enabled: true,
+                binary_path: "opencode".into(),
+                home_path: "~/.config/opencode".into(),
+                shadow_home_path: None,
+            });
+        self.migrated = true;
+        true
     }
 
     fn migrate_default_claude_cli_runtime_instance(&mut self) -> bool {
@@ -1441,7 +1557,8 @@ pub fn thread_episodic_vector_refill_is_startable(
 
     match vector_search.provider {
         Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenAi)
-        | Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter) => {
+        | Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter)
+        | Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::VercelAiGateway) => {
             if vector_search
                 .model
                 .as_deref()
@@ -1533,6 +1650,9 @@ fn vector_provider_to_protocol(
         GatewayThreadEpisodicVectorProviderConfig::OpenRouter => {
             pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter
         }
+        GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway => {
+            pioneer_protocol::GatewayThreadEpisodicVectorProvider::VercelAiGateway
+        }
         GatewayThreadEpisodicVectorProviderConfig::Local => {
             pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local
         }
@@ -1549,6 +1669,9 @@ fn vector_provider_from_protocol(
         pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter => {
             GatewayThreadEpisodicVectorProviderConfig::OpenRouter
         }
+        pioneer_protocol::GatewayThreadEpisodicVectorProvider::VercelAiGateway => {
+            GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway
+        }
         pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local => {
             GatewayThreadEpisodicVectorProviderConfig::Local
         }
@@ -1560,6 +1683,7 @@ fn vector_provider_requires_key(provider: GatewayThreadEpisodicVectorProviderCon
         provider,
         GatewayThreadEpisodicVectorProviderConfig::OpenAi
             | GatewayThreadEpisodicVectorProviderConfig::OpenRouter
+            | GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway
     )
 }
 
@@ -1569,6 +1693,7 @@ pub(crate) fn vector_provider_identity_name(
     match provider {
         GatewayThreadEpisodicVectorProviderConfig::OpenAi => "openai",
         GatewayThreadEpisodicVectorProviderConfig::OpenRouter => "openrouter",
+        GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway => "vercel-ai-gateway",
         GatewayThreadEpisodicVectorProviderConfig::Local => "local",
     }
 }
@@ -1599,6 +1724,7 @@ pub(crate) fn resolved_vector_embedding_dimension(
                 _ => None,
             }
         }
+        Some(GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway) => None,
         None => None,
     }
 }
@@ -1608,7 +1734,10 @@ fn vector_provider_allows_runtime_dimension_probe(
 ) -> bool {
     matches!(
         config.provider,
-        Some(GatewayThreadEpisodicVectorProviderConfig::OpenRouter)
+        Some(
+            GatewayThreadEpisodicVectorProviderConfig::OpenRouter
+                | GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway
+        )
     ) && config
         .model
         .as_deref()
@@ -2013,11 +2142,19 @@ impl GatewayCliRuntimeSettingsOverride {
 
     fn to_gateway_cli_agent_runtime_instances_config(
         &self,
+        inherited: &[pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig],
     ) -> GatewayCliAgentRuntimeInstancesConfig {
+        let inherited = inherited
+            .iter()
+            .map(|instance| (instance.id.as_str(), instance))
+            .collect::<BTreeMap<_, _>>();
         let instances = self
             .instances
             .iter()
             .map(|instance| {
+                let base = inherited
+                    .get(instance.id.as_str())
+                    .filter(|base| base.kind == instance.kind);
                 (
                     instance.id.clone(),
                     GatewayCliAgentRuntimeInstanceConfig {
@@ -2028,14 +2165,18 @@ impl GatewayCliRuntimeSettingsOverride {
                         binary_path: Some(instance.binary_path.clone()),
                         home_path: Some(instance.home_path.clone()),
                         shadow_home_path: instance.shadow_home_path.clone(),
-                        custom_models: Vec::new(),
-                        app_server_args: Vec::new(),
-                        startup_probe_timeout_ms: None,
-                        request_timeout_ms: None,
-                        idle_session_ttl_secs: None,
-                        event_channel_capacity: None,
-                        stderr_ring_lines: None,
-                        debug_native_events: None,
+                        custom_models: base
+                            .map(|base| base.custom_models.clone())
+                            .unwrap_or_default(),
+                        app_server_args: base
+                            .map(|base| base.app_server_args.clone())
+                            .unwrap_or_default(),
+                        startup_probe_timeout_ms: base.map(|base| base.startup_probe_timeout_ms),
+                        request_timeout_ms: base.map(|base| base.request_timeout_ms),
+                        idle_session_ttl_secs: base.map(|base| base.idle_session_ttl_secs),
+                        event_channel_capacity: base.map(|base| base.event_channel_capacity),
+                        stderr_ring_lines: base.map(|base| base.stderr_ring_lines),
+                        debug_native_events: base.map(|base| base.debug_native_events),
                     },
                 )
             })
@@ -2085,6 +2226,9 @@ fn cli_runtime_kind_to_protocol(
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => pioneer_protocol::CLIAgentRuntimeKind::Codex,
         GatewayCliAgentRuntimeKindConfig::Claude => pioneer_protocol::CLIAgentRuntimeKind::Claude,
+        GatewayCliAgentRuntimeKindConfig::OpenCode => {
+            pioneer_protocol::CLIAgentRuntimeKind::OpenCode
+        }
     }
 }
 
@@ -2095,6 +2239,9 @@ fn cli_runtime_kind_from_protocol(
         pioneer_protocol::CLIAgentRuntimeKind::Codex => Ok(GatewayCliAgentRuntimeKindConfig::Codex),
         pioneer_protocol::CLIAgentRuntimeKind::Claude => {
             Ok(GatewayCliAgentRuntimeKindConfig::Claude)
+        }
+        pioneer_protocol::CLIAgentRuntimeKind::OpenCode => {
+            Ok(GatewayCliAgentRuntimeKindConfig::OpenCode)
         }
     }
 }
@@ -2375,6 +2522,22 @@ fn load_gateway_settings(
     expected_version: u32,
     _settings_file_name: &str,
 ) -> Result<GatewaySettings> {
+    let settings = read_gateway_settings(path, expected_version)?;
+    if settings.migrated {
+        save_gateway_settings(path, &settings).with_context(|| {
+            format!(
+                "failed to save migrated gateway settings `{}`",
+                path.display()
+            )
+        })?;
+    }
+    Ok(settings)
+}
+
+/// Read and validate the existing file without creating or rewriting it.
+/// Failure reconciliation must observe the writer's actual outcome, including
+/// an error returned after rename, without introducing another write attempt.
+pub(crate) fn read_gateway_settings(path: &Path, expected_version: u32) -> Result<GatewaySettings> {
     let path_display = path.display().to_string();
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read gateway settings `{path_display}`"))?;
@@ -2398,15 +2561,12 @@ fn load_gateway_settings(
         );
     }
 
-    if settings.migrated {
-        save_gateway_settings(path, &settings).with_context(|| {
-            format!("failed to save migrated gateway settings `{path_display}`")
-        })?;
-    }
-
     Ok(settings)
 }
 
+/// An error can follow a successful rename if the final permissions check
+/// fails. Callers must not infer that the previous configuration is still on
+/// disk from `Err` alone.
 pub fn save_gateway_settings(path: &Path, settings: &GatewaySettings) -> Result<()> {
     let mut settings = settings.clone();
     settings.migrate_legacy_active_recall_model();
@@ -2484,6 +2644,39 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn vercel_vector_settings_roundtrip_and_allow_dynamic_dimension() {
+        use pioneer_protocol::{
+            GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorSearchSettingsUpdate,
+        };
+        let mut config = GatewayThreadEpisodicVectorSearchConfig::default();
+        super::apply_vector_search_protocol_update(
+            &mut config,
+            GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                enabled: Some(true),
+                provider: Some(Some(GatewayThreadEpisodicVectorProvider::VercelAiGateway)),
+                model: Some(Some("private/team-embedding".into())),
+                ..Default::default()
+            },
+        );
+        let serialized = toml::to_string(&config).expect("serialize Vercel vector config");
+        assert!(serialized.contains("vercel-ai-gateway"));
+        let restored: GatewayThreadEpisodicVectorSearchConfig =
+            toml::from_str(&serialized).expect("restore config");
+        assert_eq!(
+            super::vector_provider_to_protocol(restored.provider.unwrap()),
+            GatewayThreadEpisodicVectorProvider::VercelAiGateway
+        );
+        assert_eq!(restored.model.as_deref(), Some("private/team-embedding"));
+        assert!(super::vector_provider_requires_key(
+            restored.provider.unwrap()
+        ));
+        assert!(super::vector_provider_allows_runtime_dimension_probe(
+            &restored
+        ));
+        assert_eq!(super::resolved_vector_embedding_dimension(&restored), None);
+    }
 
     #[test]
     fn creates_sanitized_gateway_settings_without_jwt_or_provider_secrets() {
@@ -4144,6 +4337,54 @@ backend = "keystore"
     }
 
     #[test]
+    fn discovered_relay_base_url_survives_settings_reload_and_is_cleared_on_reconfiguration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gateway-settings.toml");
+        let mut settings =
+            load_or_create_gateway_settings(&path, 1, "gateway-settings.toml").unwrap();
+        let base =
+            pioneer_protocol::GatewayBaseUrl::parse_presentation("https://relay.example/pioneer")
+                .unwrap();
+        assert!(settings.set_remote_access_public_base_url(Some(base.clone())));
+        assert!(!settings.set_remote_access_public_base_url(Some(base.clone())));
+        save_gateway_settings(&path, &settings).unwrap();
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("public_base_url = \"https://relay.example/pioneer/\""));
+        let settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml").unwrap();
+        assert_eq!(settings.remote_access.public_base_url.as_ref(), Some(&base));
+        for update in [
+            pioneer_protocol::GatewayRemoteAccessSettingsUpdate {
+                key: Some("replacement-key".into()),
+                ..Default::default()
+            },
+            pioneer_protocol::GatewayRemoteAccessSettingsUpdate {
+                clear_key: Some(true),
+                ..Default::default()
+            },
+            pioneer_protocol::GatewayRemoteAccessSettingsUpdate {
+                enabled: Some(false),
+                ..Default::default()
+            },
+            pioneer_protocol::GatewayRemoteAccessSettingsUpdate {
+                server: Some("another-relay:2333".into()),
+                ..Default::default()
+            },
+        ] {
+            let mut reconfigured = settings.clone();
+            reconfigured
+                .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                    remote_access: Some(update),
+                    ..Default::default()
+                })
+                .unwrap();
+            save_gateway_settings(&path, &reconfigured).unwrap();
+            let reloaded =
+                load_or_create_gateway_settings(&path, 1, "gateway-settings.toml").unwrap();
+            assert!(reloaded.remote_access.public_base_url.is_none());
+        }
+    }
+
+    #[test]
     fn gateway_remote_access_update_keeps_key_out_of_settings_file() {
         let temp_dir = unique_temp_dir();
         fs::create_dir_all(&temp_dir).expect("create temp dir");
@@ -4269,7 +4510,7 @@ backend = "keystore"
         .expect("gateway settings should parse");
         let mut config = gateway_config_with_keepawake(false);
         config.cli_agent_runtime.enabled = true;
-        assert_eq!(config.effective_cli_agent_runtime_instances().len(), 2);
+        assert_eq!(config.effective_cli_agent_runtime_instances().len(), 3);
 
         let snapshot = settings.snapshot(&config);
         assert!(snapshot.cli_runtimes.instances.is_empty());
@@ -4303,7 +4544,7 @@ backend = "keystore"
         assert!(config.effective_cli_agent_runtime_instances().is_empty());
 
         let snapshot = settings.snapshot(&config);
-        assert_eq!(snapshot.cli_runtimes.instances.len(), 2);
+        assert_eq!(snapshot.cli_runtimes.instances.len(), 3);
         assert_eq!(snapshot.cli_runtimes.instances[0].id, "codex");
         assert!(snapshot.cli_runtimes.instances[0].enabled);
         assert_eq!(snapshot.cli_runtimes.instances[1].id, "claude");
@@ -4311,11 +4552,13 @@ backend = "keystore"
 
         let applied = settings.apply_to_gateway_config(config);
         let instances = applied.effective_cli_agent_runtime_instances();
-        assert_eq!(instances.len(), 2);
+        assert_eq!(instances.len(), 3);
         assert_eq!(instances[0].id, "codex");
         assert!(instances[0].enabled);
         assert_eq!(instances[1].id, "claude");
         assert!(instances[1].enabled);
+        assert_eq!(instances[2].id, "opencode");
+        assert!(instances[2].enabled);
     }
 
     #[test]
@@ -4406,7 +4649,7 @@ home_path = "~/.codex"
             .expect("settings should load and migrate");
         let snapshot = settings.snapshot(&gateway_config_with_keepawake(false));
 
-        assert_eq!(snapshot.cli_runtimes.instances.len(), 2);
+        assert_eq!(snapshot.cli_runtimes.instances.len(), 3);
         let codex = snapshot
             .cli_runtimes
             .instances
@@ -4420,6 +4663,13 @@ home_path = "~/.codex"
             .iter()
             .find(|instance| instance.id == "claude")
             .expect("default Claude CLI runtime should be migrated");
+        assert!(
+            snapshot
+                .cli_runtimes
+                .instances
+                .iter()
+                .any(|i| i.id == "opencode")
+        );
         assert_eq!(claude.display_name, "Claude CLI");
         assert!(claude.enabled);
 
@@ -4871,6 +5121,95 @@ model = "legacy-model"
     }
 
     #[test]
+    fn cli_full_list_update_preserves_unexposed_launch_settings_and_compares_effective_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "settings.toml").unwrap();
+        // Model a legacy file whose CLI catalog still comes from AppConfig.
+        settings.cli_runtimes = None;
+        let mut config = gateway_config_with_keepawake(false);
+        config.cli_agent_runtimes = toml::from_str(
+            r#"
+[codex]
+kind = "codex"
+custom_models = ["private-codex"]
+app_server_args = ["--config", "model=private-codex"]
+request_timeout_ms = 12345
+[claude]
+kind = "claude"
+custom_models = ["private-claude"]
+app_server_args = ["--verbose"]
+startup_probe_timeout_ms = 23456
+[opencode]
+kind = "opencode"
+stderr_ring_lines = 73
+"#,
+        )
+        .unwrap();
+        let previous = settings.clone();
+        let before = settings
+            .apply_to_gateway_config(config.clone())
+            .effective_cli_agent_runtime_instances();
+        let mut runtimes = settings.effective_cli_runtime_settings(&config);
+        runtimes.instances.reverse();
+        settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                cli_runtimes: Some(runtimes.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            settings
+                .changed_cli_runtime_ids(&previous, &config)
+                .is_empty()
+        );
+        assert_eq!(
+            settings
+                .apply_to_gateway_config(config.clone())
+                .effective_cli_agent_runtime_instances(),
+            before
+        );
+        let previous = settings.clone();
+        runtimes
+            .instances
+            .iter_mut()
+            .find(|instance| instance.id == "codex")
+            .unwrap()
+            .enabled = false;
+        settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                cli_runtimes: Some(runtimes),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            settings.changed_cli_runtime_ids(&previous, &config),
+            std::collections::BTreeSet::from(["codex".to_owned()])
+        );
+        let after = settings
+            .apply_to_gateway_config(config)
+            .effective_cli_agent_runtime_instances();
+        for id in ["claude", "opencode"] {
+            assert_eq!(
+                before.iter().find(|instance| instance.id == id),
+                after.iter().find(|instance| instance.id == id)
+            );
+        }
+        assert_eq!(
+            before
+                .iter()
+                .find(|instance| instance.id == "codex")
+                .unwrap()
+                .app_server_args,
+            after
+                .iter()
+                .find(|instance| instance.id == "codex")
+                .unwrap()
+                .app_server_args
+        );
+    }
+
+    #[test]
     fn workspace_compaction_settings_roundtrip_reset_and_scope() {
         use pioneer_protocol::{
             GatewayGeneralSettingsUpdate, GatewayModelSelection as Selection,
@@ -5054,6 +5393,7 @@ model = "legacy-model"
             hooks: Default::default(),
             artifacts: GatewayArtifactsConfig::default(),
             resilience: Default::default(),
+            context_compaction: Default::default(),
             auth: GatewayAuthConfig {
                 jwt_issuer: "pioneer".to_owned(),
                 jwt_audience: "pioneer-clients".to_owned(),
@@ -5085,6 +5425,9 @@ fn compaction_selection(
             }
             pioneer_protocol::ModelSelectionTransport::Claude => {
                 pioneer_compaction::Transport::Claude
+            }
+            pioneer_protocol::ModelSelectionTransport::OpenCode => {
+                pioneer_compaction::Transport::OpenCode
             }
         },
         instance: instance.clone(),
@@ -5124,5 +5467,40 @@ fn legacy_model_selection(
         instance: provider.unwrap_or_default().to_owned(),
         model: model.unwrap_or_default().to_owned(),
         reasoning_effort: None,
+    }
+}
+
+#[cfg(test)]
+mod opencode_migration_tests {
+    #[test]
+    fn default_opencode_migration_is_narrow_and_idempotent() {
+        let mut defaults = super::GatewayCliRuntimeSettingsOverride::default_supported().unwrap();
+        defaults
+            .instances
+            .retain(|instance| instance.id != "opencode");
+        let make = || {
+            toml::from_str::<super::GatewaySettings>(
+                "version = 1\n[secrets]\nbackend = \"keystore\"\n",
+            )
+            .unwrap()
+        };
+        let mut settings = make();
+        settings.cli_runtimes = Some(defaults.clone());
+        assert!(settings.migrate_default_opencode_cli_runtime_instance());
+        assert!(!settings.migrate_default_opencode_cli_runtime_instance());
+        assert_eq!(settings.cli_runtimes.as_ref().unwrap().instances.len(), 3);
+        for case in 0..4 {
+            let mut custom = defaults.clone();
+            match case {
+                0 => custom.instances.clear(),
+                1 => custom.instances[0].enabled = false,
+                2 => custom.instances[0].nickname = "work".into(),
+                _ => custom.instances[1].home_path = "~/custom-claude".into(),
+            }
+            let mut settings = make();
+            settings.cli_runtimes = Some(custom.clone());
+            assert!(!settings.migrate_default_opencode_cli_runtime_instance());
+            assert_eq!(settings.cli_runtimes.unwrap(), custom);
+        }
     }
 }

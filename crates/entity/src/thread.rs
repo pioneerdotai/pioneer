@@ -31,6 +31,9 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub preview_author_json: Option<String>,
     pub created_by_actor_kind: Option<String>,
+    pub inbox_workspace_after_sequence: Option<i64>,
+    pub inbox_workspace_started_at: Option<DateTimeWithTimeZone>,
+    pub workspace_unread_started_at: i64,
     #[sea_orm(has_many)]
     pub compaction_contexts: HasMany<super::compaction_context::Entity>,
     #[sea_orm(has_many)]
@@ -39,6 +42,8 @@ pub struct Model {
     pub compaction_history_preparation: HasOne<super::compaction_history_preparation::Entity>,
     #[sea_orm(has_one)]
     pub compaction_projection_epoch: HasOne<super::compaction_projection_epoch::Entity>,
+    #[sea_orm(has_one)]
+    pub compaction_root_activity: HasOne<super::compaction_root_activity::Entity>,
     #[sea_orm(has_many)]
     pub compaction_task_outputs: HasMany<super::compaction_task_output::Entity>,
     #[sea_orm(has_many)]

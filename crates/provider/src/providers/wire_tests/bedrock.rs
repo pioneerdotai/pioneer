@@ -142,5 +142,50 @@ fn ordinary_and_unknown_response_blocks_parse_independently() {
     .unwrap();
     assert_eq!(response.text, "answer");
     assert!(response.tool_calls.is_empty());
-    assert!(response.provider_replay_state.is_none());
+    assert_eq!(
+        response.provider_replay_state.unwrap().payload["native_content"][1]["citationsContent"]["content"]
+            [0]["text"],
+        "citation"
+    );
+}
+
+#[test]
+fn stored_signed_content_keeps_native_order_and_fields_in_the_next_request() {
+    let blocks = serde_json::json!([
+        {"text":"before"},
+        {"reasoningContent":{"reasoningText":{"text":"think", "signature":"opaque"}}},
+        {"text":"between"},
+        {"toolUse":{"toolUseId":"call_1", "name":"inspect", "input":{}}},
+        {"reasoningContent":{"redactedContent":"AQIDBA=="}},
+        {"text":"after"}
+    ]);
+    let response = BedrockProvider::parse_response(
+        serde_json::from_value(serde_json::json!({
+            "output":{"message":{"content":blocks}}, "stopReason":"tool_use"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut state = response.provider_replay_state.unwrap();
+    state.model = Some("anthropic.claude-sonnet-4-5".into());
+    let message = ChatMessage::assistant_tool_calls_with_provider_state(
+        Some(response.text),
+        response.reasoning_content,
+        response.tool_calls,
+        Some(state),
+    );
+    let restored = serde_json::from_value(serde_json::to_value(message).unwrap()).unwrap();
+    let provider = BedrockProvider::new("fixture", "fixture", "us-east-1");
+    let prepared = prepare_messages_for_provider_model(
+        provider.name(),
+        "anthropic.claude-sonnet-4-5",
+        &provider.capabilities(),
+        &[restored],
+    )
+    .unwrap();
+    let (messages, _) = BedrockProvider::convert_messages(&prepared).unwrap();
+    assert_eq!(
+        serde_json::to_value(messages).unwrap()[0]["content"],
+        blocks
+    );
 }

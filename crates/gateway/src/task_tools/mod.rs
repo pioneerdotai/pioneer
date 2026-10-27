@@ -16,14 +16,15 @@ use pioneer_protocol::{
     TaskAgentResultContract, TaskAgentSpec, TaskAgentSpecInput, TaskAttachmentMode,
     TaskCancelParams, TaskCancelScope, TaskCompletionBehavior, TaskCreateParams,
     TaskCreateResponse, TaskDeliveryMode, TaskDeliveryPolicy, TaskDependencyTriggerPolicy,
-    TaskDetachParams, TaskError, TaskExecutorKind, TaskExternalTriggerFilter, TaskGetParams,
-    TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskManualActor, TaskMetadata,
-    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams, TaskResult,
-    TaskResultCandidateStatus, TaskResultReviewerKind, TaskResumeParams, TaskRetryPolicy,
-    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunStatus, TaskRunThreadBindingKind,
-    TaskStatus, TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy, TaskTriggerInput,
-    TaskTriggerKind, TaskTriggerSpec, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse,
-    TaskWaitMode, TaskWaitParams, ToolCallStatus, ToolStoragePayload, TurnItem, constants::events,
+    TaskDetachParams, TaskError, TaskExecutorKind, TaskExternalTriggerFilter, TaskFinishParams,
+    TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskManualActor,
+    TaskMetadata, TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams,
+    TaskResult, TaskResultCandidateStatus, TaskResultReviewerKind, TaskResumeParams,
+    TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunStatus,
+    TaskRunThreadBindingKind, TaskStatus, TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy,
+    TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTurnItem, TaskUpdateParams,
+    TaskUpdateResponse, TaskWaitMode, TaskWaitParams, ToolCallStatus, ToolStoragePayload, TurnItem,
+    constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -47,6 +48,7 @@ const TASK_WAIT_TOOL: &str = "task_wait";
 const TASK_ACCEPT_TOOL: &str = "task_accept";
 const TASK_REVISE_TOOL: &str = "task_revise";
 const TASK_CANCEL_TOOL: &str = "task_cancel";
+const TASK_FINISH_TOOL: &str = "task_finish";
 const TASK_UPDATE_TOOL: &str = "task_update";
 const TASK_DETACH_TOOL: &str = "task_detach";
 const TASK_LIST_TOOL: &str = "task_list";
@@ -115,11 +117,22 @@ where
 #[derive(Clone)]
 pub(crate) struct GatewayTaskToolProvider {
     processor: Weak<MessageProcessor>,
+    cli_replay: bool,
 }
 
 impl GatewayTaskToolProvider {
     pub(crate) fn new(processor: Weak<MessageProcessor>) -> Self {
-        Self { processor }
+        Self {
+            processor,
+            cli_replay: false,
+        }
+    }
+
+    pub(crate) fn for_cli(processor: Weak<MessageProcessor>) -> Self {
+        Self {
+            processor,
+            cli_replay: true,
+        }
     }
 
     fn processor(&self) -> Result<Arc<MessageProcessor>, String> {
@@ -129,35 +142,58 @@ impl GatewayTaskToolProvider {
     }
 }
 
-#[async_trait]
-impl TaskToolProvider for GatewayTaskToolProvider {
-    fn terminal_cleanup_runtime_contract(&self) -> &'static str {
-        "pioneer.gateway.attached-task-cleanup.v1"
-    }
-
-    async fn materialize_task_tools(
+impl GatewayTaskToolProvider {
+    // Only the internal CLI catalog keeps infrastructure failures typed. The
+    // public TaskToolProvider contract and handler diagnostics remain unchanged.
+    pub(crate) async fn materialize_cli_task_tools(
         &self,
         context: TaskTurnContext,
-    ) -> Result<TaskToolMaterialization, String> {
-        let processor = self.processor()?;
-        let authorization = resolve_task_tool_authorization_scope(processor.as_ref(), &context)
-            .await
-            .map_err(|error| error.to_string())?;
+    ) -> anyhow::Result<TaskToolMaterialization> {
+        let processor = self.processor().map_err(anyhow::Error::msg)?;
+        #[cfg(test)]
+        processor
+            .wait_at_completed_history_preparation_barrier(
+                "__cli_agent_catalog_before_task_proof__",
+            )
+            .await;
+        let authorization = resolve_task_tool_action_scope_proof(
+            processor.as_ref(),
+            &context,
+            crate::authorization::ResourceAction::AgentTurnStart,
+        )
+        .await?;
         let can_create = authorization
-            .authorize_root_action(
+            .authorize_root_action_proof(
                 processor.crud_store.as_ref(),
                 crate::authorization::ResourceAction::TaskCreate,
             )
+            .await?;
+        self.materialize_admitted_task_tools(processor, context, authorization, can_create)
             .await
-            .is_ok();
+            .map_err(anyhow::Error::msg)
+    }
+
+    async fn materialize_admitted_task_tools(
+        &self,
+        processor: Arc<MessageProcessor>,
+        context: TaskTurnContext,
+        authorization: TaskToolAuthorizationScope,
+        can_create: bool,
+    ) -> Result<TaskToolMaterialization, String> {
         let agent_capabilities = processor
             .agent_action_binding(context.turn_id.as_str())
             .await
             .map(|binding| binding.capabilities);
+        let mutation_cache = if self.cli_replay {
+            processor.cli_task_mutation_cache(&context.turn_id).await
+        } else {
+            Arc::new(TaskToolMutationCache::default())
+        };
         let handler = Arc::new(TaskToolHandler {
             processor,
             context,
-            mutation_cache: Arc::new(TaskToolMutationCache::default()),
+            mutation_cache,
+            cli_replay: self.cli_replay,
         });
         let mut bundle = ToolExtensionBundle::default();
         for configured in task_tool_specs() {
@@ -183,6 +219,32 @@ impl TaskToolProvider for GatewayTaskToolProvider {
             bundles: vec![bundle],
             diagnostics: Vec::new(),
         })
+    }
+}
+
+#[async_trait]
+impl TaskToolProvider for GatewayTaskToolProvider {
+    fn terminal_cleanup_runtime_contract(&self) -> &'static str {
+        "pioneer.gateway.attached-task-cleanup.v1"
+    }
+
+    async fn materialize_task_tools(
+        &self,
+        context: TaskTurnContext,
+    ) -> Result<TaskToolMaterialization, String> {
+        let processor = self.processor()?;
+        let authorization = resolve_task_tool_authorization_scope(processor.as_ref(), &context)
+            .await
+            .map_err(|error| error.to_string())?;
+        let can_create = authorization
+            .authorize_root_action(
+                processor.crud_store.as_ref(),
+                crate::authorization::ResourceAction::TaskCreate,
+            )
+            .await
+            .is_ok();
+        self.materialize_admitted_task_tools(processor, context, authorization, can_create)
+            .await
     }
 
     async fn attached_task_finalization_snapshot(
@@ -293,6 +355,22 @@ impl TaskToolProvider for GatewayTaskToolProvider {
             ));
         }
 
+        let mut accepted_candidates = BTreeMap::new();
+        for item in &wait_state.completed {
+            if let Some(run) = &item.run {
+                if let Some(candidate) = processor
+                    .crud_store
+                    .get_accepted_task_result_candidate(&run.id)
+                    .await
+                    .map_err(|error| format!("{error:#}"))?
+                {
+                    if candidate.task_id == item.task.id && candidate.run_id == run.id {
+                        accepted_candidates.insert(item.task.id.clone(), candidate.id);
+                    }
+                }
+            }
+        }
+
         let revision_after = processor
             .crud_store
             .task_finalization_revision(context.thread_id.as_str(), context.turn_id.as_str())
@@ -340,6 +418,8 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                 let run = item.run.as_ref();
                 TerminalTaskObservation {
                     task_id: item.task.id.clone(),
+                    task_revision: item.task.revision,
+                    accepted_candidate_id: accepted_candidates.get(&item.task.id).cloned(),
                     run_id: run.map(|run| run.id.clone()),
                     title: item.task.title.clone(),
                     status: task_status_label(item.task.status),
@@ -523,7 +603,7 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         resolve_task_tool_authorization_scope(processor.as_ref(), &context)
             .await
             .map_err(|error| error.to_string())?;
-        let observed = observed_terminal_task_ids(&processor, &context)
+        let observed = observed_terminal_task_outcomes(&processor, &context)
             .await
             .map_err(|error| format!("{error:#}"))?;
         let tasks = attached_tasks_for_turn(&processor, &context)
@@ -531,7 +611,7 @@ impl TaskToolProvider for GatewayTaskToolProvider {
             .map_err(|error| format!("{error:#}"))?;
         let mut observations = Vec::new();
         for task in tasks {
-            if !task.status.is_terminal() || observed.contains(task.id.as_str()) {
+            if !task.status.is_terminal() {
                 continue;
             }
             let response = processor
@@ -550,8 +630,17 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                 None => Default::default(),
             };
             let accepted_result = run.and_then(|run| accepted_candidate_result(&response, run));
-            observations.push(TerminalTaskObservation {
+            let observation = TerminalTaskObservation {
                 task_id: response.task.id.clone(),
+                task_revision: response.task.revision,
+                accepted_candidate_id: run
+                    .and_then(|run| {
+                        response.result_candidates.iter().find(|candidate| {
+                            candidate.run_id == run.id
+                                && candidate.status == TaskResultCandidateStatus::Accepted
+                        })
+                    })
+                    .map(|candidate| candidate.id.clone()),
                 run_id: run.map(|run| run.id.clone()),
                 title: response.task.title.clone(),
                 status: task_status_label(response.task.status),
@@ -584,7 +673,10 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                     }),
                 child_thread_id: child_anchor.child_thread_id,
                 child_turn_id: child_anchor.child_turn_id,
-            });
+            };
+            if !observation.was_observed(&observed) {
+                observations.push(observation);
+            }
         }
         Ok(observations)
     }
@@ -633,7 +725,10 @@ impl TaskToolProvider for GatewayTaskToolProvider {
     }
 }
 
-fn agent_bound_task_tool_visible(name: &str, capabilities: &BTreeSet<AgentToolCapability>) -> bool {
+pub(crate) fn agent_bound_task_tool_visible(
+    name: &str,
+    capabilities: &BTreeSet<AgentToolCapability>,
+) -> bool {
     match name {
         TASK_CREATE_TOOL => {
             capabilities.contains(&AgentToolCapability::TaskCreate)
@@ -650,8 +745,8 @@ fn agent_bound_task_tool_visible(name: &str, capabilities: &BTreeSet<AgentToolCa
         TASK_ACCEPT_TOOL | TASK_REVISE_TOOL => {
             capabilities.contains(&AgentToolCapability::TaskReview)
         }
-        TASK_CANCEL_TOOL | TASK_DETACH_TOOL | TASK_RESUME_TOOL | TASK_UPDATE_TOOL
-        | TASK_RESCHEDULE_TOOL | TASK_PAUSE_TOOL => {
+        TASK_CANCEL_TOOL | TASK_FINISH_TOOL | TASK_DETACH_TOOL | TASK_RESUME_TOOL
+        | TASK_UPDATE_TOOL | TASK_RESCHEDULE_TOOL | TASK_PAUSE_TOOL => {
             capabilities.contains(&AgentToolCapability::TaskControl)
         }
         _ => false,
@@ -674,6 +769,7 @@ fn accepted_candidate_result<'a>(
 
 #[derive(Clone)]
 struct TaskToolHandler {
+    cli_replay: bool,
     processor: Arc<MessageProcessor>,
     context: TaskTurnContext,
     mutation_cache: Arc<TaskToolMutationCache>,
@@ -728,8 +824,19 @@ impl TaskToolAuthorizationScope {
         store: &CrudStore,
         action: crate::authorization::ResourceAction,
     ) -> Result<(), ToolError> {
+        match self.authorize_root_action_proof(store, action).await {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(task_tool_authorization_error()),
+        }
+    }
+
+    async fn authorize_root_action_proof(
+        &self,
+        store: &CrudStore,
+        action: crate::authorization::ResourceAction,
+    ) -> anyhow::Result<bool> {
         if !self.granted_actions.contains(&action) {
-            return Err(task_tool_authorization_error());
+            return Ok(false);
         }
         let principal = &self.principal;
         let workspace_id = &self.workspace_id;
@@ -751,19 +858,19 @@ impl TaskToolAuthorizationScope {
         {
             Ok(crate::authorization::ProofResolution::Authorized(proof)) => {
                 crate::authorization::record_task_tool_decision(action, proof.decision());
-                Ok(())
+                Ok(true)
             }
             Ok(crate::authorization::ProofResolution::Denied(decision)) => {
                 crate::authorization::record_task_tool_decision(action, &decision);
-                Err(task_tool_authorization_error())
+                Ok(false)
             }
-            Err(_) => {
+            Err(error) => {
                 crate::authorization::record_authorization_unavailable(
                     action.safe_name(),
                     "thread",
                     "tool",
                 );
-                Err(task_tool_authorization_error())
+                Err(error)
             }
         }
     }
@@ -772,6 +879,7 @@ impl TaskToolAuthorizationScope {
         &self,
         processor: &MessageProcessor,
         params: &TaskCreateParams,
+        profile: Option<&pioneer_protocol::AgentExecutionProfileProjection>,
     ) -> Result<Option<pioneer_tasks::TaskExecutionAdmissionSeed>, ToolError> {
         let principal = &self.principal;
         let workspace_id = &self.workspace_id;
@@ -801,6 +909,14 @@ impl TaskToolAuthorizationScope {
                 .map_err(|_| task_tool_authorization_error())?
                 .execution;
         }
+        if let Some(profile) = profile {
+            request.provider = profile.provider_id.clone();
+            request.model = profile.model_id.clone();
+            request.execution_backend =
+                crate::message::agent_action_tools::execution_backend_for_profile(
+                    processor, profile,
+                )?;
+        }
         if !matches!(
             request.execution_backend,
             Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
@@ -826,12 +942,13 @@ impl TaskToolAuthorizationScope {
             .agent_spec
             .as_ref()
             .and_then(|spec| spec.permission_cap.as_ref());
-        let context = crate::authorization::ExecutionAdmissionService::new(
+        let mut context = crate::authorization::ExecutionAdmissionService::new(
             processor.crud_store.as_ref().clone(),
         )
         .admit_context(principal, revision, &request, requested_permission_cap)
         .await
         .map_err(|_| task_tool_authorization_error())?;
+        context.constrain_thread_creation_grants(&self.granted_actions);
         Ok(Some(pioneer_tasks::TaskExecutionAdmissionSeed {
             workspace_id: context.workspace_id().to_owned(),
             root_thread_id: context.root_thread_id().to_owned(),
@@ -1104,7 +1221,7 @@ fn task_runtime_tool_error(error: pioneer_tasks::TaskRuntimeError) -> ToolError 
     }
 }
 
-fn sanitize_task_tool_error(error: ToolError) -> ToolError {
+pub(crate) fn sanitize_task_tool_error(error: ToolError) -> ToolError {
     match error {
         ToolError::Rejected(message)
             if message.starts_with("task_access_denied:")
@@ -1141,7 +1258,7 @@ fn sanitize_task_tool_error(error: ToolError) -> ToolError {
     }
 }
 
-fn task_tool_resource_action(
+pub(crate) fn task_tool_resource_action(
     name: &str,
 ) -> Result<crate::authorization::ResourceAction, ToolError> {
     use crate::authorization::ResourceAction;
@@ -1153,9 +1270,8 @@ fn task_tool_resource_action(
         TASK_ACCEPT_TOOL | TASK_REVISE_TOOL => ResourceAction::TaskReview,
         TASK_CANCEL_TOOL => ResourceAction::TaskCancel,
         TASK_DETACH_TOOL => ResourceAction::TaskDetach,
-        TASK_UPDATE_TOOL | TASK_PAUSE_TOOL | TASK_RESUME_TOOL | TASK_RESCHEDULE_TOOL => {
-            ResourceAction::TaskScheduleManage
-        }
+        TASK_FINISH_TOOL | TASK_UPDATE_TOOL | TASK_PAUSE_TOOL | TASK_RESUME_TOOL
+        | TASK_RESCHEDULE_TOOL => ResourceAction::TaskScheduleManage,
         _ => return Err(ToolError::NotFound(name.to_owned())),
     })
 }
@@ -1177,14 +1293,7 @@ async fn resolve_task_tool_action_scope(
     context: &TaskTurnContext,
     action: crate::authorization::ResourceAction,
 ) -> Result<TaskToolAuthorizationScope, ToolError> {
-    let current = processor
-        .revalidate_tool_execution_authorization(
-            context.workspace_id.as_str(),
-            context.thread_id.as_str(),
-            context.turn_id.as_str(),
-            None,
-            action,
-        )
+    resolve_task_tool_action_scope_proof(processor, context, action)
         .await
         .map_err(|_| {
             crate::authorization::record_authorization_unavailable(
@@ -1193,16 +1302,31 @@ async fn resolve_task_tool_action_scope(
                 "tool",
             );
             task_tool_authorization_error()
-        })?;
+        })
+}
+
+async fn resolve_task_tool_action_scope_proof(
+    processor: &MessageProcessor,
+    context: &TaskTurnContext,
+    action: crate::authorization::ResourceAction,
+) -> anyhow::Result<TaskToolAuthorizationScope> {
+    let current = processor
+        .revalidate_tool_execution_authorization(
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+            context.turn_id.as_str(),
+            None,
+            action,
+        )
+        .await?;
     if current.resource_boundary()
         != crate::authorization::ExecutionResourceBoundary::RootThreadCapsule
     {
-        return Err(task_tool_authorization_error());
+        anyhow::bail!("task tools require their admitted root capsule");
     }
     let admission = processor
         .load_turn_execution_authorization_context(&context.turn_id)
-        .await
-        .map_err(|_| task_tool_authorization_error())?;
+        .await?;
     Ok(TaskToolAuthorizationScope {
         granted_actions: admission
             .granted_action_names()
@@ -1219,7 +1343,8 @@ async fn resolve_task_tool_action_scope(
 }
 
 #[derive(Default)]
-struct TaskToolMutationCache {
+pub(crate) struct TaskToolMutationCache {
+    arguments: Mutex<HashMap<String, String>>,
     outputs: Mutex<HashMap<String, JsonValue>>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
@@ -1364,6 +1489,9 @@ impl TaskToolHandler {
             TASK_CANCEL_TOOL => {
                 task_tool_future(self.handle_cancel(invocation, &authorization)).await
             }
+            TASK_FINISH_TOOL => {
+                task_tool_future(self.handle_finish(invocation, &authorization)).await
+            }
             TASK_UPDATE_TOOL => {
                 task_tool_future(self.handle_update(invocation, &authorization)).await
             }
@@ -1481,6 +1609,33 @@ impl TaskToolHandler {
         Ok(contents)
     }
 
+    fn bind_cli_mutation_receipt(
+        &self,
+        invocation: &ToolInvocation,
+        plan: &mut crate::authorization::AgentActionCommitPlan,
+    ) -> Result<(), ToolError> {
+        if !self.cli_replay {
+            return Ok(());
+        }
+        let ToolPayload::Function { arguments } = &invocation.payload else {
+            return Err(ToolError::invalid_arguments("task_invalid_arguments"));
+        };
+        let mut response: JsonValue =
+            serde_json::from_str(plan.input.receipt_response_json.as_deref().unwrap_or("{}"))
+                .map_err(|_| ToolError::internal("task action receipt is invalid"))?;
+        response["pioneerTaskToolCall"] = json!({
+            "tool": invocation.tool_name,
+            "argumentsFingerprint": crate::cli_runtime::codex_mcp::canonical_value_fingerprint(arguments).map_err(|_| ToolError::invalid_arguments("task_invalid_arguments"))?,
+            "mutationKey": invocation.idempotency_key.as_deref().map(str::trim),
+            "taskId": arguments.get("taskId"), "runId": arguments.get("runId"), "candidateId": arguments.get("candidateId"),
+        });
+        let response = serde_json::to_string(&response)
+            .map_err(|_| ToolError::internal("task action receipt cannot serialize"))?;
+        plan.input.action_response_json = Some(response.clone());
+        plan.input.receipt_response_json = Some(response);
+        Ok(())
+    }
+
     fn mutation_cache_key(&self, invocation: &ToolInvocation) -> Option<String> {
         invocation
             .idempotency_key
@@ -1523,6 +1678,23 @@ impl TaskToolHandler {
         let Some(cache_key) = cache_key else {
             return Ok(None);
         };
+        if self.cli_replay {
+            let ToolPayload::Function { arguments } = &invocation.payload else {
+                return Err(ToolError::invalid_arguments("task_invalid_arguments"));
+            };
+            let fingerprint = crate::cli_runtime::codex_mcp::canonical_value_fingerprint(arguments)
+                .map_err(|_| ToolError::invalid_arguments("task_invalid_arguments"))?;
+            let mut fingerprints = self.mutation_cache.arguments.lock().await;
+            if fingerprints
+                .get(cache_key)
+                .is_some_and(|previous| previous != &fingerprint)
+            {
+                return Err(ToolError::invalid_arguments(
+                    "task mutation identity was reused with different input",
+                ));
+            }
+            fingerprints.insert(cache_key.to_owned(), fingerprint);
+        }
         if let Some(output) = self.cached_mutation_output(Some(cache_key)).await {
             return Ok(Some(output));
         }
@@ -1608,6 +1780,7 @@ impl TaskToolHandler {
             &mut plan,
             &source_fence,
         );
+        self.bind_cli_mutation_receipt(invocation, &mut plan)?;
         Ok(Some(plan))
     }
 
@@ -1645,6 +1818,7 @@ impl TaskToolHandler {
             )
             .await?;
         let input: TaskCreateToolInput = decode_tool_args(invocation.clone())?;
+        let webhook_requested = matches!(input.trigger.as_ref(), Some(TaskTriggerToolInput::External { source, .. }) if source.trim() == "webhook");
         let requested_target_option_id = input.target_option_id.clone();
         let trigger_kind = input
             .trigger
@@ -1658,11 +1832,11 @@ impl TaskToolHandler {
                 identity: AgentToolIdentityChoice::InheritParent,
                 profile: AgentToolProfileChoice::InheritParent,
                 reasoning: None,
+                use_default_reasoning: false,
                 permission_profile: None,
                 skill_ids: Vec::new(),
                 mcp_server_ids: Vec::new(),
             });
-        let server_launch = requested_launch.clone().into_server_selection();
         let template_fingerprint = {
             let canonical = serde_json::to_vec(&input).map_err(|error| {
                 ToolError::internal(format!("failed to fingerprint task_create: {error}"))
@@ -1671,12 +1845,67 @@ impl TaskToolHandler {
         };
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
-        if let Some(output) = self
+        if let Some(mut output) = self
             .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
             .await?
         {
+            // A persisted historical tool response may contain a previous URL.
+            // Strip it before checking today's task-read authority and host.
+            if let Some(object) = output.as_object_mut() {
+                object.remove("webhookUrl");
+                object.remove("webhookScope");
+            }
+            if webhook_requested
+                && let Some(task_id) = output
+                    .get("taskId")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned)
+            {
+                // Creation grants alone do not authorize a later secret read.
+                if authorization
+                    .authorize_task(
+                        self.processor.crud_store.as_ref(),
+                        &task_id,
+                        crate::authorization::ResourceAction::TaskRead,
+                    )
+                    .await
+                    .is_ok()
+                {
+                    let response = self
+                        .processor
+                        .task_runtime
+                        .service()
+                        .get_task(TaskGetParams { task_id })
+                        .await
+                        .map_err(task_runtime_tool_error)?;
+                    enrich_task_webhook_output(
+                        self.processor.as_ref(),
+                        &response.triggers,
+                        &mut output,
+                    )
+                    .await
+                    .map_err(|_| ToolError::execution_failed("task_operation_failed"))?;
+                }
+            }
             return Ok(function_output(output));
         }
+        let inherit_current_model = matches!(
+            requested_launch.profile,
+            AgentToolProfileChoice::InheritParent
+        );
+        let (requested_launch, selected_profile) =
+            crate::message::agent_action_tools::resolve_tool_launch(
+                self.processor.as_ref(),
+                &pioneer_agent::TurnToolContext {
+                    workspace_id: self.context.workspace_id.clone(),
+                    thread_id: self.context.thread_id.clone(),
+                    turn_id: self.context.turn_id.clone(),
+                },
+                requested_launch,
+                &invocation.call_id,
+            )
+            .await?;
+        let server_launch = requested_launch.clone().into_server_selection();
         let mut params = self.create_params(input, authorization).await?;
         let agent_binding = self
             .processor
@@ -1726,6 +1955,7 @@ impl TaskToolHandler {
             ))
         })?;
         let mut adapter = binding.adapter.lock().await;
+        let launch_options = adapter.install_selected_launch_profiles(vec![selected_profile]);
         let mut server_required_actions = Vec::new();
         if nested_task {
             server_required_actions.push(crate::authorization::ResourceAction::ChildTaskCreate);
@@ -1759,6 +1989,27 @@ impl TaskToolHandler {
                 .resolve_task_launch(&server_launch)
                 .map_err(crate::message::agent_action_tools::adapter_tool_error)?
         };
+        crate::message::agent_action_tools::validate_new_launch_model(
+            self.processor.as_ref(),
+            &pioneer_agent::TurnToolContext {
+                workspace_id: self.context.workspace_id.clone(),
+                thread_id: self.context.thread_id.clone(),
+                turn_id: self.context.turn_id.clone(),
+            },
+            &profile,
+            server_launch.execution.reasoning.as_ref(),
+            &self
+                .processor
+                .load_turn_execution_authorization_context(&self.context.turn_id)
+                .await
+                .map_err(|_| task_tool_authorization_error())?,
+            inherit_current_model,
+        )
+        .await?;
+        if let Some(spec) = &mut params.agent_spec {
+            spec.model = Some(profile.model_id.clone());
+            spec.model_provider = Some(profile.provider_id.clone());
+        }
         create_context.resolved_launch_identity = Some(identity);
         create_context.resolved_launch_profile = Some(profile);
         let target_option_id = requested_target_option_id
@@ -1793,7 +2044,7 @@ impl TaskToolHandler {
                 invocation.call_id.as_str(),
                 tool,
                 arguments,
-                Some(&binding.options),
+                Some(&launch_options),
             )
             .map_err(crate::message::agent_action_tools::adapter_tool_error)?
             .ok_or_else(task_tool_authorization_error)?;
@@ -1824,6 +2075,7 @@ impl TaskToolHandler {
             &mut plan,
             &source_fence,
         );
+        self.bind_cli_mutation_receipt(&invocation, &mut plan)?;
         match prepared.normalized.target.as_ref() {
             Some(pioneer_protocol::AgentStartTarget::CurrentThread) | None => {}
             Some(pioneer_protocol::AgentStartTarget::SameCapsuleThread { thread_id }) => {
@@ -1880,7 +2132,11 @@ impl TaskToolHandler {
         params.launch = Some(persisted_launch.clone());
         create_context.launch_selection = Some(persisted_launch);
         let execution_admission = authorization
-            .authorize_execution_intent(self.processor.as_ref(), &params)
+            .authorize_execution_intent(
+                self.processor.as_ref(),
+                &params,
+                create_context.resolved_launch_profile.as_ref(),
+            )
             .await?;
         let agent_action_projection = plan.projection;
         create_context.agent_action_commit = Some(plan.input);
@@ -1965,6 +2221,25 @@ impl TaskToolHandler {
                 .await
                 .map_err(|_| task_tool_authorization_error())?;
         }
+        if is_webhook_trigger(&params.trigger.spec) {
+            // The stable mutation identity survives a failed task commit and a
+            // tool retry. Provision outside the serialized task transaction.
+            let mut fingerprint = Sha256::new();
+            for value in [
+                self.context.workspace_id.as_str(),
+                self.context.turn_id.as_str(),
+                cache_key.as_deref().unwrap_or(invocation.call_id.as_str()),
+            ] {
+                fingerprint.update((value.len() as u64).to_be_bytes());
+                fingerprint.update(value.as_bytes());
+            }
+            let secret_ref = hex::encode(fingerprint.finalize());
+            self.processor
+                .gateway_secrets()
+                .ensure_task_webhook_secret(&secret_ref)
+                .map_err(|_| ToolError::execution_failed("task_operation_failed"))?;
+            create_context.webhook_secret_ref = Some(secret_ref);
+        }
         let service = self.processor.task_runtime.service();
         let response =
             match task_tool_fresh_task(
@@ -1995,6 +2270,13 @@ impl TaskToolHandler {
         }
         self.cache_mutation_output(cache_key.as_deref(), &output)
             .await;
+        enrich_task_webhook_output(
+            self.processor.as_ref(),
+            std::slice::from_ref(&response.trigger),
+            &mut output,
+        )
+        .await
+        .map_err(|_| ToolError::execution_failed("task_operation_failed"))?;
         Ok(function_output(output))
     }
 
@@ -2309,6 +2591,81 @@ impl TaskToolHandler {
         Ok(function_output(output))
     }
 
+    async fn handle_finish(
+        &self,
+        invocation: ToolInvocation,
+        authorization: &TaskToolAuthorizationScope,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let input: TaskFinishToolInput = decode_tool_args(invocation.clone())?;
+        let params = input.into_params()?;
+        authorization
+            .authorize_task(
+                self.processor.crud_store.as_ref(),
+                params.task_id.as_str(),
+                crate::authorization::ResourceAction::TaskScheduleManage,
+            )
+            .await?;
+        let cache_key = self.mutation_cache_key(&invocation);
+        let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
+        if let Some(mut output) = self
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .await?
+        {
+            // Durable CLI receipts survive handler reconstruction but carry
+            // only mutation references. Preserve that receipt and restore the
+            // finish response from the exact task authorized above, without
+            // repeating the mutation or its queue cleanup.
+            if output.get("alreadyCommitted").and_then(JsonValue::as_bool) == Some(true)
+                && output.get("task").is_none()
+            {
+                let response = self
+                    .processor
+                    .crud_store
+                    .get_task(params.task_id.as_str())
+                    .await
+                    .map_err(task_runtime_tool_error)?
+                    .ok_or_else(task_tool_authorization_error)?;
+                output["task"] = task_summary(&response.task);
+                output["alreadyFinished"] = json!(response.task.status.is_terminal());
+                self.cache_mutation_output(cache_key.as_deref(), &output)
+                    .await;
+            }
+            return Ok(function_output(output));
+        }
+        let action_plan = self
+            .prepare_bound_task_action(
+                &invocation,
+                AgentModelToolName::ControlTask,
+                serde_json::to_value(AgentControlTaskToolInput {
+                    task_id: params.task_id.clone(),
+                    control: AgentTaskControl::Finish,
+                })
+                .map_err(|error| {
+                    ToolError::internal(format!("failed to encode task_finish action: {error}"))
+                })?,
+                AgentToolCapability::TaskControl,
+                std::slice::from_ref(&params.task_id),
+            )
+            .await?;
+        let mut mutation_context = authorization.mutation_context(&self.context);
+        mutation_context.agent_action_commit = action_plan.as_ref().map(|plan| plan.input.clone());
+        let response = self
+            .processor
+            .task_runtime
+            .service()
+            .finish_task(mutation_context, params)
+            .await
+            .map_err(task_runtime_tool_error)?;
+        let mut output = json!({
+            "task": task_summary(&response.task),
+            "alreadyFinished": response.already_finished,
+        });
+        Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
+        self.cache_mutation_output(cache_key.as_deref(), &output)
+            .await;
+        Ok(function_output(output))
+    }
+
     async fn handle_update(
         &self,
         invocation: ToolInvocation,
@@ -2539,12 +2896,15 @@ impl TaskToolHandler {
             .list_task_run_execution_observations(&run_ids)
             .await
             .map_err(task_runtime_tool_error)?;
-        let payload = task_get_tool_output(
+        let mut payload = task_get_tool_output(
             &response,
             configuration_allowed,
             &observations,
             now_timestamp_secs(),
         )?;
+        enrich_task_webhook_output(self.processor.as_ref(), &response.triggers, &mut payload)
+            .await
+            .map_err(|_| ToolError::execution_failed("task_operation_failed"))?;
         Ok(function_output(payload))
     }
 
@@ -2750,6 +3110,7 @@ impl TaskToolHandler {
                 &authorization.principal,
                 Some(authorization.root_thread_id.as_str()),
                 params.task_id.as_str(),
+                Some(&authorization.granted_actions),
             )
             .await
             .map_err(|_| task_tool_authorization_error())?;
@@ -2807,9 +3168,11 @@ impl TaskToolHandler {
         let lifecycle_policy =
             task_create_lifecycle_policy(input.background, trigger_kind, input.lifecycle_policy)?;
         let delivery_policy = task_create_delivery_policy(input.background, input.delivery_policy)?;
-        let instructions = normalize_task_instructions(input.instructions, trigger_kind)?;
+        let durable_prompt =
+            requires_durable_agent_prompt(trigger_kind) || is_webhook_trigger(&trigger.spec);
+        let instructions = normalize_task_instructions(input.instructions, durable_prompt)?;
         let output_instructions =
-            normalize_task_output_instructions(input.output_instructions, trigger_kind)?;
+            normalize_task_output_instructions(input.output_instructions, durable_prompt)?;
         let prompt_input = merge_task_agent_input(input.input_text, input.input)?;
         let prompt = TaskAgentPrompt {
             goal: goal.clone(),
@@ -2868,8 +3231,8 @@ impl TaskToolHandler {
                     )
                     .attachment
                 });
-            params.delivery_policy = Some(pioneer_tasks::default_delivery_policy(
-                trigger_kind,
+            params.delivery_policy = Some(pioneer_tasks::default_delivery_policy_for_trigger(
+                &params.trigger.spec,
                 attachment,
                 params.owner_kind,
                 params.owner_id.as_deref(),
@@ -2908,6 +3271,66 @@ impl TaskToolHandler {
         else {
             return Ok(None);
         };
+        if self.cli_replay {
+            let binding = self
+                .processor
+                .agent_action_binding(&self.context.turn_id)
+                .await
+                .ok_or_else(task_tool_authorization_error)?;
+            let execution_id = binding.adapter.lock().await.execution_id().to_string();
+            let database = self.processor.crud_store.database_connection();
+            let action_id = crate::authorization::action_id_for_call(&invocation.call_id);
+            if let Some(action) = pioneer_crud::load_agent_action(&database, action_id.as_str())
+                .await
+                .map_err(|_| ToolError::execution_failed("task_operation_failed"))?
+            {
+                if action.execution_id != execution_id || action.status != "committed" {
+                    return Err(task_tool_authorization_error());
+                }
+                let receipt =
+                    pioneer_crud::load_agent_action_receipt(&database, action_id.as_str())
+                        .await
+                        .map_err(|_| ToolError::execution_failed("task_operation_failed"))?
+                        .ok_or_else(|| ToolError::execution_failed("task_operation_failed"))?;
+                let response: JsonValue =
+                    serde_json::from_str(receipt.response_json.as_deref().unwrap_or("{}"))
+                        .map_err(|_| ToolError::execution_failed("task_operation_failed"))?;
+                let ToolPayload::Function { arguments } = &invocation.payload else {
+                    return Err(ToolError::invalid_arguments("task_invalid_arguments"));
+                };
+                let fingerprint =
+                    crate::cli_runtime::codex_mcp::canonical_value_fingerprint(arguments)
+                        .map_err(|_| ToolError::invalid_arguments("task_invalid_arguments"))?;
+                let marker = &response["pioneerTaskToolCall"];
+                if marker["tool"] != invocation.tool_name
+                    || marker["argumentsFingerprint"] != fingerprint
+                    || marker["mutationKey"].as_str() != Some(current_key)
+                {
+                    return Err(ToolError::invalid_arguments(
+                        "task mutation identity was reused with different input",
+                    ));
+                }
+                if let Some(created) = response.get("taskCreation") {
+                    let task_id = created["taskId"]
+                        .as_str()
+                        .ok_or_else(|| ToolError::execution_failed("task_operation_failed"))?;
+                    // A creation grant is not a read grant. Replay only the
+                    // references committed with the mutation; current state and
+                    // waitability must be obtained through authorized tools.
+                    return Ok(Some(json!({
+                        "alreadyCommitted": true,
+                        "taskId": task_id,
+                        "triggerId": created["triggerId"],
+                        "runId": created["runId"],
+                        "guidance": "This Task was already created. Do not create it again. Use authorized task_get/task_wait to inspect current state; wait only for active attached work, never merely for a saved runId.",
+                    })));
+                }
+                return Ok(Some(
+                    json!({"alreadyCommitted": true, "taskId": marker["taskId"], "runId": marker["runId"], "candidateId": marker["candidateId"],
+                    "guidance": "This mutation already committed. Observe current state with task_get/task_wait; do not repeat it."}),
+                ));
+            }
+        }
         let parent_items = self
             .processor
             .crud_store
@@ -2970,18 +3393,24 @@ impl TaskToolHandler {
             .trigger
             .map(TaskTriggerToolInput::into_trigger_input)
             .transpose()?;
-        let trigger_kind = match trigger.as_ref() {
-            Some(trigger) => trigger.spec.kind(),
-            None => self.current_task_trigger_kind(task_id.as_str()).await?,
+        let durable_prompt = match trigger.as_ref() {
+            Some(trigger) => {
+                requires_durable_agent_prompt(trigger.spec.kind())
+                    || is_webhook_trigger(&trigger.spec)
+            }
+            None => {
+                self.current_task_requires_durable_prompt(task_id.as_str())
+                    .await?
+            }
         };
         let instructions = input
             .instructions
-            .map(|instructions| normalize_task_instructions(instructions, trigger_kind))
+            .map(|instructions| normalize_task_instructions(instructions, durable_prompt))
             .transpose()?;
         let output_instructions = input
             .output_instructions
             .map(Some)
-            .map(|output| normalize_task_output_instructions(output, trigger_kind))
+            .map(|output| normalize_task_output_instructions(output, durable_prompt))
             .transpose()?
             .flatten();
         let merged_input = merge_task_agent_input(input.input_text, input.input)?;
@@ -3021,7 +3450,7 @@ impl TaskToolHandler {
         })
     }
 
-    async fn current_task_trigger_kind(&self, task_id: &str) -> Result<TaskTriggerKind, ToolError> {
+    async fn current_task_requires_durable_prompt(&self, task_id: &str) -> Result<bool, ToolError> {
         let response = self
             .processor
             .task_runtime
@@ -3031,11 +3460,9 @@ impl TaskToolHandler {
             })
             .await
             .map_err(task_runtime_tool_error)?;
-        Ok(response
-            .triggers
-            .last()
-            .map(TaskTrigger::kind)
-            .unwrap_or(TaskTriggerKind::Immediate))
+        Ok(response.triggers.last().is_some_and(|trigger| {
+            requires_durable_agent_prompt(trigger.kind()) || is_webhook_trigger(&trigger.spec)
+        }))
     }
 
     async fn persist_task_anchor(&self, task_id: &str) -> Result<TaskTurnItem, ToolError> {
@@ -3129,9 +3556,11 @@ struct TaskCreateToolInput {
     /// Optional child identity/profile and additional Skill/MCP selection from
     /// threads_start_options. Immediate tasks in the current capsule inherit the
     /// current Turn's selected capabilities. Empty lists keep that inheritance.
+    /// Set useDefaultReasoning=true to use the model's native default instead
+    /// of inheriting effort; this cannot be combined with reasoning.
     launch: Option<AgentToolLaunchSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For daily scheduled work choose the cron trigger kind and fill its leaf fields.
+    /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For daily scheduled work choose the cron trigger kind and fill its leaf fields. For incoming HTTP POST choose trigger kind external and source webhook; creation waits for requests and returns webhookUrl/webhookScope.
     trigger: Option<TaskTriggerToolInput>,
     #[serde(default)]
     /// Set true only when the user explicitly asks to run immediate work in the background. Omit trigger (or use kind "immediate"). This creates an Immediate + Detached Task that keeps running after the parent turn, delivers its result to the origin thread, and must not be joined with task_wait.
@@ -3155,7 +3584,7 @@ struct TaskCreateToolInput {
     /// Structured task input with variables, attachments, and references. Use this for data the future run should consume; keep execution behavior in instructions.
     input: Option<TaskAgentInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Final result format and delivery contract. Required for scheduled, interval, and cron tasks; specify language, markdown/json structure, required fields, and how to report failure.
+    /// Final result format and delivery contract. Required for scheduled, interval, cron, and webhook tasks; specify language, markdown/json structure, required fields, and how to report failure.
     output_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Advanced context policy for the child agent. Omit unless the user asks for custom context handling.
@@ -3333,7 +3762,7 @@ enum TaskTriggerToolInput {
     },
     /// Trigger from an external event source.
     External {
-        /// External source name. Example value: calendar.webhook.
+        /// Use "webhook" for a universal inbound HTTP POST endpoint. Other external sources remain reserved.
         source: String,
         #[serde(default, rename = "eventType", skip_serializing_if = "Option::is_none")]
         /// Optional external event type. Example value: event.created.
@@ -3611,6 +4040,34 @@ impl TaskCancelToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing input for task_finish.
+struct TaskFinishToolInput {
+    /// Task id to finish. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional human-readable finish reason.
+    reason: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "idempotency_key"
+    )]
+    /// Optional mutation idempotency key. Omit in normal model calls; runtime derives one from the tool call id.
+    idempotency_key: Option<String>,
+}
+
+impl TaskFinishToolInput {
+    fn into_params(self) -> Result<TaskFinishParams, ToolError> {
+        Ok(TaskFinishParams {
+            task_id: validate_entity_id(self.task_id, "taskId")?,
+            reason: clean_optional_string(self.reason),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Model-facing input for task_update. Patch only the fields that should change; omitted fields keep their current value. Use clear* flags to explicitly remove optional values.
 struct TaskUpdateToolInput {
     /// Task id to update. Pioneer entity ids are exactly 21 characters.
@@ -3629,7 +4086,7 @@ struct TaskUpdateToolInput {
     /// Replacement scheduling priority.
     priority: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Replacement trigger. Use this object directly; do not wrap it in spec. For daily scheduled work choose the cron trigger kind and fill its leaf fields.
+    /// Replacement trigger. Use this object directly; do not wrap it in spec. For daily scheduled work choose the cron trigger kind and fill its leaf fields. For incoming HTTP POST choose trigger kind external and source webhook; creation waits for requests and returns webhookUrl/webhookScope.
     trigger: Option<TaskTriggerToolInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Replacement role label for an agent task.
@@ -3882,11 +4339,11 @@ impl TaskResumeToolInput {
     }
 }
 
-fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
+pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
-            "Create a durable task or attached subagent for delegation. threads_turn_start starts a thread turn without creating a task. For explicit launch or destination selection, call threads_start_options from the task domain; inherited launch needs no lookup. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. The runtime carries the current Turn's selected Skills and MCP into immediate subagents in the same capsule, including background subagents; launch selections add to that set. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and delivers the result to the origin thread. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
+            "Create a durable task or attached subagent for delegation. threads_turn_start starts a thread turn without creating a task. For explicit launch or destination selection, call threads_start_options from the task domain; inherited launch needs no lookup. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. The runtime carries the current Turn's selected Skills and MCP into immediate subagents in the same capsule, including background subagents; launch selections add to that set. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and delivers the result to the origin thread. For incoming HTTP POST requests, choose trigger kind external and source webhook; creation returns webhookUrl and webhookScope, waits without launching an agent, and each POST creates its own run. Use the full returned URL; authorized task_get retrieves its current address later. For scheduled, interval, cron, and webhook work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
             task_create_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -3936,6 +4393,12 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
             safe_mutation_recovery(),
         ),
         task_tool_spec(
+            TASK_FINISH_TOOL,
+            "Permanently stop a task gently at the user's request: prohibit new runs and let all already-started work finish with results, required review/revisions, and configured delivery. Use only when the user asks to stop while finishing current work, including an explicitly specified stop condition. Ordinary run completion or a final answer does not call for task_finish. The response distinguishes an accepted stop request from an already-finished task; acceptance does not mean work or delivery has finished. Use task_pause for a temporary stop and task_cancel to interrupt work under the existing cancellation rules.",
+            task_finish_schema(),
+            safe_mutation_recovery(),
+        ),
+        task_tool_spec(
             TASK_UPDATE_TOOL,
             "Update a non-terminal task through the task service. Patch only fields that should change; use existing prompt fields instructions, inputText/input, and outputInstructions. inputText and input may be supplied together: inputText fills input.text when input.text is absent; different values are rejected. For scheduled, interval, and cron agent tasks, instructions and outputInstructions must remain self-contained and valid for future runs. Pass trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec.",
             task_update_schema(),
@@ -3955,7 +4418,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_GET_TOOL,
-            "Get durable task status, runs, triggers, and dependencies by stable taskId within the authorized root-thread capsule, including tasks from earlier executions. Each run has an execution observation with its status, heartbeatAt, lastActivityAt when confirmed task progress was recorded for the current attempt, and observedAt. A null execution status means no execution row was observed; null activity means unknown, not stalled. A heartbeat shows periodic liveness, not meaningful work progress. A running run has not finished; an unchanged updatedAt or missing result does not prove it is stuck. Do not cancel or repeat work solely because task_get stays the same or a result takes time. An access error does not mean the task is absent or cancelled. When the current execution may manage the exact task, the response also includes a safe configuration view with exact ordinary schedules, executor instructions, output instructions, and lifecycle/delivery/retry/timeout/concurrency settings. Secret webhook URLs, task input, external-trigger filters, internal host paths, raw diagnostics, and execution-security snapshots are never returned; executor instructions are returned exactly as authored.",
+            "Get durable task status, runs, triggers, and dependencies by stable taskId within the authorized root-thread capsule, including tasks from earlier executions. task.finishRequest records an accepted permanent gentle stop; it does not mean active work or delivery is complete. Each run has an execution observation with its status, heartbeatAt, lastActivityAt when confirmed task progress was recorded for the current attempt, and observedAt. A null execution status means no execution row was observed; null activity means unknown, not stalled. A heartbeat shows periodic liveness, not meaningful work progress. A running run has not finished; an unchanged updatedAt or missing result does not prove it is stuck. Do not cancel or repeat work solely because task_get stays the same or a result takes time. An access error does not mean the task is absent or cancelled. When the current execution may manage the exact task, the response also includes a safe configuration view with exact ordinary schedules, executor instructions, output instructions, and lifecycle/delivery/retry/timeout/concurrency settings. Authorized reads of an inbound webhook task include the current webhookUrl and webhookScope (public, lan, or loopback). Treat this URL as a secret capability. Task input, outbound delivery webhook URLs, external-trigger filters, internal host paths, raw diagnostics, and execution-security snapshots are never returned; executor instructions are returned exactly as authored.",
             task_id_schema(),
             safe_read_recovery(),
         ),
@@ -4038,6 +4501,10 @@ fn task_cancel_schema() -> JsonValue {
     tool_input_schema::<TaskCancelToolInput>()
 }
 
+fn task_finish_schema() -> JsonValue {
+    tool_input_schema::<TaskFinishToolInput>()
+}
+
 fn task_update_schema() -> JsonValue {
     tool_input_schema::<TaskUpdateToolInput>()
 }
@@ -4118,6 +4585,7 @@ fn task_tool_schema_for_name(tool_name: &str) -> JsonValue {
         TASK_ACCEPT_TOOL => task_accept_schema(),
         TASK_REVISE_TOOL => task_revise_schema(),
         TASK_CANCEL_TOOL => task_cancel_schema(),
+        TASK_FINISH_TOOL => task_finish_schema(),
         TASK_UPDATE_TOOL => task_update_schema(),
         TASK_DETACH_TOOL | TASK_GET_TOOL => task_id_schema(),
         TASK_LIST_TOOL => task_list_schema(),
@@ -4151,8 +4619,8 @@ fn task_tool_argument_hint(tool_name: &str) -> &'static str {
         TASK_REVISE_TOOL => {
             "Expected fields: taskId, runId, candidateId, and feedback. Use candidate ids returned by task_wait reviewRequired and provide concrete fix instructions."
         }
-        TASK_CANCEL_TOOL | TASK_DETACH_TOOL | TASK_GET_TOOL | TASK_PAUSE_TOOL
-        | TASK_RESUME_TOOL => {
+        TASK_CANCEL_TOOL | TASK_FINISH_TOOL | TASK_DETACH_TOOL | TASK_GET_TOOL
+        | TASK_PAUSE_TOOL | TASK_RESUME_TOOL => {
             "Expected field: taskId. The value must be a 21-character Pioneer entity id."
         }
         TASK_LIST_TOOL => {
@@ -4222,7 +4690,7 @@ fn clean_optional_string(value: Option<String>) -> Option<String> {
 
 fn normalize_task_instructions(
     instructions: Vec<String>,
-    trigger_kind: TaskTriggerKind,
+    durable_prompt: bool,
 ) -> Result<Vec<String>, ToolError> {
     let mut instructions = instructions
         .into_iter()
@@ -4231,7 +4699,7 @@ fn normalize_task_instructions(
         .collect::<Vec<_>>();
     dedup_preserve_order(&mut instructions);
 
-    if !requires_durable_agent_prompt(trigger_kind) {
+    if !durable_prompt {
         if instructions.is_empty() {
             instructions.push("Return a concise final result.".to_owned());
         }
@@ -4240,12 +4708,12 @@ fn normalize_task_instructions(
 
     if instructions.is_empty() {
         return Err(ToolError::invalid_arguments(
-            "`instructions` is required for scheduled, interval, and cron task_create calls; include self-contained future-run steps, runtime capability selection guidance, and failure conditions",
+            "`instructions` is required for scheduled, interval, cron, and webhook task_create calls; include self-contained future-run steps, runtime capability selection guidance, and failure conditions",
         ));
     }
     if instructions.len() == 1 && instructions[0] == "Return a concise final result." {
         return Err(ToolError::invalid_arguments(
-            "`instructions` for scheduled, interval, and cron task_create calls cannot use the concise default; provide a self-contained future-run prompt",
+            "`instructions` for scheduled, interval, cron, and webhook task_create calls cannot use the concise default; provide a self-contained future-run prompt",
         ));
     }
 
@@ -4260,12 +4728,12 @@ fn normalize_task_instructions(
 
 fn normalize_task_output_instructions(
     output_instructions: Option<String>,
-    trigger_kind: TaskTriggerKind,
+    durable_prompt: bool,
 ) -> Result<Option<String>, ToolError> {
     let output_instructions = clean_optional_string(output_instructions);
-    if requires_durable_agent_prompt(trigger_kind) && output_instructions.is_none() {
+    if durable_prompt && output_instructions.is_none() {
         return Err(ToolError::invalid_arguments(
-            "`outputInstructions` is required for scheduled, interval, and cron task_create calls; specify final result format and failure reporting format",
+            "`outputInstructions` is required for scheduled, interval, cron, and webhook task_create calls; specify final result format and failure reporting format",
         ));
     }
     Ok(output_instructions)
@@ -4591,15 +5059,15 @@ async fn attached_tasks_for_turn(
         .collect())
 }
 
-async fn observed_terminal_task_ids(
+pub(crate) async fn observed_terminal_task_outcomes(
     processor: &Arc<MessageProcessor>,
     context: &TaskTurnContext,
-) -> anyhow::Result<BTreeSet<String>> {
+) -> anyhow::Result<BTreeSet<pioneer_agent::ObservedTaskOutcome>> {
     let parent_items = processor
         .crud_store
         .list_turn_items_by_type(context.turn_id.as_str(), "system_event")
         .await?;
-    let mut task_ids = BTreeSet::new();
+    let mut outcomes = BTreeSet::new();
     for item in parent_items {
         let TurnItem::SystemEvent {
             code,
@@ -4612,13 +5080,131 @@ async fn observed_terminal_task_ids(
         if code.as_deref() != Some("task.terminal.observed") {
             continue;
         }
-        if let Some(ids) = details.get("taskIds").and_then(JsonValue::as_array) {
-            for task_id in ids.iter().filter_map(JsonValue::as_str) {
-                task_ids.insert(task_id.to_owned());
-            }
+        // Legacy ID-only markers cannot prove which outcome was delivered.
+        if let Some(keys) = details.get("outcomes") {
+            outcomes.extend(
+                serde_json::from_value::<BTreeSet<pioneer_agent::ObservedTaskOutcome>>(
+                    keys.clone(),
+                )
+                .unwrap_or_default(),
+            );
         }
     }
-    Ok(task_ids)
+    // A mutation receipt proves commit, not delivery. Only a successful native
+    // completion with its actual result can supplement the observation events.
+    // The turn-scoped item lane survives restart and includes earlier attempts
+    // of this logical turn; do not restrict it to the latest session generation.
+    let Some(cli_binding) = processor
+        .crud_store
+        .get_cli_runtime_turn_binding(&context.turn_id)
+        .await?
+    else {
+        return Ok(outcomes);
+    };
+    if cli_binding.workspace_id != context.workspace_id
+        || cli_binding.thread_id != context.thread_id
+    {
+        return Ok(outcomes);
+    }
+    let bindings = processor
+        .crud_store
+        .list_turn_mcp_bindings(&context.turn_id)
+        .await?;
+    let mut tools = processor
+        .crud_store
+        .list_turn_items_with_status_by_type_for_turns(
+            std::slice::from_ref(&context.turn_id),
+            "dynamic_tool_call",
+        )
+        .await?;
+    for (item, lifecycle) in tools.remove(&context.turn_id).unwrap_or_default() {
+        if lifecycle.as_deref() != Some("completed") {
+            continue;
+        }
+        let TurnItem::DynamicToolCall {
+            id,
+            tool_name,
+            status: pioneer_protocol::ToolCallStatus::Completed,
+            success: Some(true),
+            storage,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        let metadata = match storage {
+            ToolStoragePayload::Metadata { metadata } => metadata.to_json(),
+            ToolStoragePayload::Summary(summary) => summary.metadata.to_json(),
+            _ => continue,
+        };
+        let Some(binding) = bindings.iter().find(|binding| {
+            binding.canonical_callable_name == tool_name
+                && binding.raw_tool_name == tool_name
+                && crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
+                    &binding.server_installation_id,
+                ) == Some(crate::turn_mcp::native_tools::NativeToolFamily::Tasks)
+                && crate::turn_mcp::native_tools::current_identity(&context.workspace_id, binding)
+                    .is_ok()
+        }) else {
+            continue;
+        };
+        if metadata["canonicalCallableName"].as_str() != Some(tool_name.as_str())
+            || metadata["rawToolName"].as_str() != Some(binding.raw_tool_name.as_str())
+            || metadata["serverInstallationId"].as_str()
+                != Some(binding.server_installation_id.as_str())
+            || metadata["serverName"].as_str() != Some(binding.server_name.as_str())
+            || metadata["providerCallId"].as_str() != Some(id.as_str())
+            || metadata["sessionGeneration"].as_u64().is_none()
+            || metadata["invocationCorrelationId"]
+                .as_str()
+                .is_none_or(|id| id.is_empty())
+            || metadata["status"].as_str() != Some("completed")
+        {
+            continue;
+        }
+        // Older items can still have sufficient canonical structuredContent.
+        // Content-only metadata that was already redacted cannot be recovered.
+        let payload = metadata
+            .get("taskResult")
+            .cloned()
+            .or_else(|| delivered_task_payload(&metadata["result"]));
+        if let Some(payload) = payload {
+            outcomes.extend(pioneer_agent::observed_terminal_task_outcomes_from_payload(
+                &tool_name, &payload,
+            ));
+        }
+    }
+    Ok(outcomes)
+}
+
+// These are native MCP result envelopes/content blocks, never display text or
+// arguments. Codex preserves the envelope; Claude normalizes tool_result.content
+// to it; OpenCode preserves the exact returned content array. Missing/omitted
+// result metadata deliberately leaves the terminal task for the existing gate.
+pub(crate) fn delivered_task_payload(result: &JsonValue) -> Option<JsonValue> {
+    if result.get("isError").and_then(JsonValue::as_bool) == Some(true) {
+        return None;
+    }
+    if let Some(payload) = result
+        .get("structuredContent")
+        .filter(|value| value.is_object())
+    {
+        return Some(payload.clone());
+    }
+    let content = result.get("content").unwrap_or(result);
+    let text = if let Some(text) = content.as_str() {
+        text
+    } else {
+        let blocks = content.as_array()?;
+        let [block] = blocks.as_slice() else {
+            return None;
+        };
+        if block.get("type")?.as_str()? != "text" {
+            return None;
+        }
+        block.get("text")?.as_str()?
+    };
+    serde_json::from_str(text).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4677,6 +5263,47 @@ fn mutation_idempotency_key_for_item(
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .or_else(|| Some(format!("{tool_name}:{item_id}")))
+}
+
+pub(crate) fn is_webhook_trigger(spec: &TaskTriggerSpec) -> bool {
+    matches!(spec, TaskTriggerSpec::External { source, .. } if source == "webhook")
+}
+
+/// Only callers that just authorized creation or reading of this exact Task
+/// may enrich a response. General projections and event notifications never
+/// use this helper and never carry the capability URL.
+pub(crate) async fn enrich_task_webhook_output(
+    processor: &MessageProcessor,
+    triggers: &[TaskTrigger],
+    output: &mut JsonValue,
+) -> anyhow::Result<()> {
+    let Some(trigger) = triggers
+        .iter()
+        .find(|trigger| is_webhook_trigger(&trigger.spec) && trigger.webhook_secret_ref.is_some())
+    else {
+        return Ok(());
+    };
+    let secret_ref = trigger
+        .webhook_secret_ref
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("webhook secret unavailable"))?;
+    let secret = zeroize::Zeroizing::new(
+        processor
+            .gateway_secrets()
+            .get_task_webhook_secret(secret_ref)?
+            .ok_or_else(|| anyhow::anyhow!("webhook secret unavailable"))?,
+    );
+    let (base_url, scope) = processor.task_webhook_base_url().await?;
+    let url = base_url.task_webhook_url(&trigger.id, secret.as_str())?;
+    let object = output
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("invalid task response"))?;
+    object.insert("webhookUrl".to_owned(), JsonValue::String(url.to_string()));
+    object.insert(
+        "webhookScope".to_owned(),
+        JsonValue::String(scope.to_owned()),
+    );
+    Ok(())
 }
 
 fn task_create_tool_output(response: &TaskCreateResponse, anchor: &TaskTurnItem) -> JsonValue {
@@ -4875,6 +5502,11 @@ fn task_create_validation_hints(
         hints.push("do_not_call_task_wait_when_waitable_false");
         hints.push("future_run_prompt_must_be_self_contained");
     }
+    if is_webhook_trigger(&response.trigger.spec) {
+        hints.push("webhook_task_waits_for_request");
+        hints.push("do_not_call_task_wait_when_waitable_false");
+        hints.push("future_run_prompt_must_be_self_contained");
+    }
     if waitable {
         hints.push("active_attached_task_should_be_joined_before_final_answer");
     }
@@ -4894,6 +5526,14 @@ fn task_create_validation_hints(
 }
 
 fn task_create_response_waitable(response: &TaskCreateResponse) -> bool {
+    if is_webhook_trigger(&response.trigger.spec)
+        && response
+            .run
+            .as_ref()
+            .is_none_or(|run| run.status.is_terminal())
+    {
+        return false;
+    }
     task_create_response_attachment(response) == TaskAttachmentMode::Attached
         && (response
             .run
@@ -4910,6 +5550,9 @@ fn task_create_wait_recommendation(response: &TaskCreateResponse, waitable: bool
         return "call_task_wait_for_active_attached_work_before_final_answer";
     }
     match response.trigger.kind() {
+        TaskTriggerKind::External if is_webhook_trigger(&response.trigger.spec) => {
+            "do_not_call_task_wait_confirm_webhook_endpoint"
+        }
         TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron => {
             "do_not_call_task_wait_confirm_schedule"
         }
@@ -5555,6 +6198,7 @@ mod tests {
             identity: AgentToolIdentityChoice::InheritParent,
             profile: AgentToolProfileChoice::InheritParent,
             reasoning: None,
+            use_default_reasoning: false,
             permission_profile: None,
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
@@ -5585,6 +6229,7 @@ mod tests {
             identity: AgentToolIdentityChoice::InheritParent,
             profile: AgentToolProfileChoice::InheritParent,
             reasoning: None,
+            use_default_reasoning: false,
             permission_profile: None,
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
@@ -5686,6 +6331,7 @@ mod tests {
                 assert!(!agent_bound_task_tool_visible(name, &observer));
             }
             if [
+                TASK_FINISH_TOOL,
                 TASK_UPDATE_TOOL,
                 TASK_PAUSE_TOOL,
                 TASK_RESCHEDULE_TOOL,
@@ -6167,6 +6813,7 @@ mod tests {
 
     fn sample_cron_trigger(next_fire_at: Option<i64>) -> TaskTrigger {
         TaskTrigger {
+            webhook_secret_ref: None,
             id: "trigger_1234567890123".to_owned(),
             task_id: "task_1234567890123456".to_owned(),
             status: pioneer_protocol::TaskTriggerStatus::Active,
@@ -6184,6 +6831,7 @@ mod tests {
 
     fn sample_run(status: TaskRunStatus) -> TaskRun {
         TaskRun {
+            trigger_input: None,
             id: "run_12345678901234567".to_owned(),
             task_id: "task_1234567890123456".to_owned(),
             trigger_id: Some("trigger_1234567890123".to_owned()),
@@ -6384,6 +7032,210 @@ mod tests {
         assert_eq!(value["runs"][0]["execution"]["heartbeatAt"], 120);
         assert_eq!(value["runs"][1]["execution"]["lastActivityAt"], 125);
         assert_eq!(value["runs"][2]["execution"]["status"], JsonValue::Null);
+    }
+
+    #[test]
+    fn terminal_observation_uses_current_public_task_projections() {
+        fn observed(tool: &str, value: &JsonValue) -> BTreeSet<String> {
+            pioneer_agent::observed_terminal_task_outcomes_from_payload(tool, value)
+                .into_iter()
+                .map(|outcome| match outcome {
+                    pioneer_agent::ObservedTaskOutcome::TaskRevision { task_id, .. }
+                    | pioneer_agent::ObservedTaskOutcome::AcceptedCandidate { task_id, .. } => {
+                        task_id
+                    }
+                })
+                .collect()
+        }
+        let mut response = sample_review_wait_response(
+            vec![pioneer_protocol::TaskWaitReviewAction::TaskAccept],
+            1,
+            None,
+            TaskResultCandidateStatus::PendingReview,
+        );
+        let mut item = response.review_required[0].item.clone();
+        let mut terminal_ids = BTreeSet::new();
+        for (bucket, status) in [
+            (&mut response.completed, TaskStatus::Completed),
+            (&mut response.failed, TaskStatus::Failed),
+            (&mut response.blocked, TaskStatus::Blocked),
+            (&mut response.cancelled, TaskStatus::Cancelled),
+        ] {
+            item.task.status = status;
+            item.task.id = format!("terminal_{status:?}");
+            item.task.completed_at = Some(200);
+            if let Some(run) = &mut item.run {
+                run.id = format!("terminal_run_{status:?}");
+                run.task_id = item.task.id.clone();
+                run.status = match status {
+                    TaskStatus::Completed => TaskRunStatus::Succeeded,
+                    TaskStatus::Failed => TaskRunStatus::Failed,
+                    TaskStatus::Blocked => TaskRunStatus::Blocked,
+                    TaskStatus::Cancelled => TaskRunStatus::Cancelled,
+                    _ => unreachable!(),
+                };
+                run.completed_at = Some(200);
+            }
+            terminal_ids.insert(item.task.id.clone());
+            bucket.push(item.clone());
+        }
+        item.task.id = "still_running".into();
+        item.task.status = TaskStatus::Running;
+        item.task.completed_at = None;
+        if let Some(run) = &mut item.run {
+            run.id = "still_running_run".into();
+            run.task_id = item.task.id.clone();
+            run.status = TaskRunStatus::Running;
+            run.completed_at = None;
+        }
+        response.pending.push(item.clone());
+        item.task.id = "future_scheduled".into();
+        item.task.status = TaskStatus::Scheduled;
+        item.run = None;
+        response
+            .non_waitable
+            .push(pioneer_protocol::TaskWaitNonWaitableItem {
+                item,
+                reason: pioneer_protocol::TaskWaitNonWaitableReason::FutureScheduledTaskWithoutActiveRun,
+                next_fire_at: Some(9999),
+            });
+        response.mode = TaskWaitMode::AllTerminal;
+        response.timed_out = true;
+        response.terminal_count = 4;
+        response.pending_count = 1;
+        response.non_waitable_count = 1;
+        response.blocked_count = 1;
+        response.total_count = 7;
+        let signature = TaskWaitSignature {
+            task_ids: terminal_ids
+                .iter()
+                .cloned()
+                .chain(response.pending.iter().map(|item| item.task.id.clone()))
+                .chain(
+                    response
+                        .review_required
+                        .iter()
+                        .map(|review| review.item.task.id.clone()),
+                )
+                .chain(
+                    response
+                        .non_waitable
+                        .iter()
+                        .map(|future| future.item.task.id.clone()),
+                )
+                .chain(["unreturned_target".into()])
+                .collect(),
+            run_ids: vec![],
+            mode: response.mode,
+        };
+        let payload = task_wait_tool_output(&response, &signature, &BTreeMap::new());
+        let _: pioneer_protocol::PublicTaskWaitResponse =
+            serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(observed("task_wait", &payload), terminal_ids);
+        let durable =
+            pioneer_protocol::ToolMetadata::from_json(json!({"taskResult":payload})).to_json();
+        assert_eq!(
+            observed("task_wait", &durable["taskResult"]),
+            terminal_ids,
+            "raw result body redaction must preserve terminal public task identities"
+        );
+        for item in response
+            .completed
+            .iter()
+            .chain(&response.failed)
+            .chain(&response.blocked)
+            .chain(&response.cancelled)
+        {
+            assert!(
+                pioneer_agent::observed_terminal_task_outcomes_from_payload(
+                    "task_wait",
+                    &durable["taskResult"]
+                )
+                .contains(&pioneer_agent::ObservedTaskOutcome::TaskRevision {
+                    task_id: item.task.id.clone(),
+                    revision: item.task.revision
+                })
+            );
+        }
+        assert!(observed("foreign_task_wait", &payload).is_empty());
+        for status in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Cancelled,
+            TaskStatus::Running,
+            TaskStatus::Queued,
+            TaskStatus::WaitingReview,
+            TaskStatus::Scheduled,
+        ] {
+            let response = sample_task_response(status, vec![], None);
+            let get = task_get_tool_output(&response, false, &[], 200).unwrap();
+            let cancel = json!({"task": task_summary(&response.task)});
+            for (tool, payload) in [("task_get", get), ("task_cancel", cancel)] {
+                assert_eq!(
+                    observed(tool, &payload).contains(&response.task.id),
+                    status.is_terminal()
+                );
+            }
+        }
+        response.completed.clear();
+        response.failed.clear();
+        response.blocked.clear();
+        response.cancelled.clear();
+        response.review_required.clear();
+        response.non_waitable.clear();
+        response.terminal_count = 0;
+        response.blocked_count = 0;
+        response.review_required_count = 0;
+        response.non_waitable_count = 0;
+        response.total_count = 1;
+        assert!(
+            observed(
+                "task_wait",
+                &task_wait_tool_output(&response, &signature, &BTreeMap::new())
+            )
+            .is_empty()
+        );
+        for (tool, payload) in [
+            (
+                "task_accept",
+                json!({"alreadyCommitted":true,"taskId":"committed","runId":"run"}),
+            ),
+            (
+                "task_accept",
+                json!({"taskId":"pending","taskTerminal":false,"finalAnswerAllowed":true}),
+            ),
+            (
+                "task_revise",
+                json!({"taskId":"revised","taskTerminal":true}),
+            ),
+            ("task_wait", json!({"error":"failed"})),
+        ] {
+            assert!(observed(tool, &payload).is_empty());
+        }
+    }
+
+    #[test]
+    fn native_task_delivery_requires_a_complete_result_not_preview_or_arguments() {
+        let payload = json!({"taskId":"accepted", "taskTerminal":true});
+        let content = json!([{"type":"text","text":payload.to_string()}]);
+        for result in [
+            json!({"structuredContent":payload,"isError":false}),
+            json!({"content":content,"isError":false}),
+            content.clone(),
+            json!({"content":payload.to_string(),"isError":false}),
+        ] {
+            assert_eq!(delivered_task_payload(&result), Some(payload.clone()));
+        }
+        for result in [
+            json!({"structuredContent":payload,"isError":true}),
+            json!({"message":payload.to_string()}),
+            json!({"arguments":payload}),
+            json!({"content":[{"type":"text","text":"truncated {"}]}),
+            json!({"content":[{"type":"text","text":payload.to_string()},{"type":"text","text":"extra"}]}),
+        ] {
+            assert!(delivered_task_payload(&result).is_none());
+        }
     }
 
     #[test]
@@ -6593,6 +7445,57 @@ mod tests {
         };
 
         let output = task_accept_tool_output(&response, true);
+        assert_eq!(
+            pioneer_agent::observed_terminal_task_outcomes_from_payload("task_accept", &output),
+            BTreeSet::from([pioneer_agent::ObservedTaskOutcome::AcceptedCandidate {
+                task_id: response.task.id.clone(),
+                run_id: response.run.id.clone(),
+                candidate_id: response.candidate.id.clone()
+            }])
+        );
+
+        let observed =
+            pioneer_agent::observed_terminal_task_outcomes_from_payload("task_accept", &output);
+        let mut snapshot = TerminalTaskObservation {
+            task_id: response.task.id.clone(),
+            task_revision: response.task.revision,
+            accepted_candidate_id: Some(response.candidate.id.clone()),
+            run_id: Some(response.run.id.clone()),
+            title: response.task.title.clone(),
+            status: "completed".into(),
+            summary: None,
+            error_message: None,
+            child_thread_id: None,
+            child_turn_id: None,
+        };
+        assert!(snapshot.was_observed(&observed));
+        snapshot.accepted_candidate_id = Some("different-candidate".into());
+        assert!(
+            !snapshot.was_observed(&observed),
+            "accept cannot observe another candidate in the same run"
+        );
+        snapshot.accepted_candidate_id = Some(response.candidate.id.clone());
+        snapshot.status = "blocked".into();
+        assert!(
+            !snapshot.was_observed(&observed),
+            "an old accepted candidate cannot observe a blocked outcome"
+        );
+        let mut blocked_output = output.clone();
+        blocked_output["status"] = json!("blocked");
+        assert!(
+            pioneer_agent::observed_terminal_task_outcomes_from_payload(
+                "task_accept",
+                &blocked_output
+            )
+            .is_empty(),
+            "blocked acceptance cannot observe a future completion of that candidate after resume"
+        );
+        let mut incomplete = output.clone();
+        incomplete.as_object_mut().unwrap().remove("candidateId");
+        assert!(
+            pioneer_agent::observed_terminal_task_outcomes_from_payload("task_accept", &incomplete)
+                .is_empty()
+        );
 
         assert_eq!(output["accepted"], true);
         assert_eq!(output["alreadyAccepted"], false);
@@ -6659,6 +7562,14 @@ mod tests {
         };
 
         let output = task_accept_tool_output(&response, false);
+        assert_eq!(
+            pioneer_agent::observed_terminal_task_outcomes_from_payload("task_accept", &output),
+            BTreeSet::from([pioneer_agent::ObservedTaskOutcome::AcceptedCandidate {
+                task_id: response.task.id.clone(),
+                run_id: response.run.id.clone(),
+                candidate_id: response.candidate.id.clone()
+            }])
+        );
 
         assert_eq!(output["taskTerminal"], true);
         assert_eq!(output["finalAnswerAllowed"], false);
@@ -6739,6 +7650,8 @@ mod tests {
     #[test]
     fn scheduled_task_create_output_is_not_waitable_without_run() {
         let response = TaskCreateResponse {
+            webhook_url: None,
+            webhook_scope: None,
             task: sample_task(TaskStatus::Scheduled),
             trigger: sample_cron_trigger(Some(1_000)),
             run: None,
@@ -6785,8 +7698,11 @@ mod tests {
             format: pioneer_protocol::TaskDeliveryFormat::Summary,
         });
         let response = TaskCreateResponse {
+            webhook_url: None,
+            webhook_scope: None,
             task,
             trigger: TaskTrigger {
+                webhook_secret_ref: None,
                 id: "trigger_1234567890123".to_owned(),
                 task_id: "task_1234567890123456".to_owned(),
                 status: pioneer_protocol::TaskTriggerStatus::Exhausted,
@@ -6847,8 +7763,11 @@ mod tests {
             format: pioneer_protocol::TaskDeliveryFormat::Summary,
         });
         let response = TaskCreateResponse {
+            webhook_url: None,
+            webhook_scope: None,
             task,
             trigger: TaskTrigger {
+                webhook_secret_ref: None,
                 id: "trigger_1234567890123".to_owned(),
                 task_id: "task_1234567890123456".to_owned(),
                 status: pioneer_protocol::TaskTriggerStatus::Exhausted,
@@ -7565,11 +8484,11 @@ mod tests {
 
     #[test]
     fn scheduled_task_create_requires_existing_prompt_fields() {
-        let instructions = normalize_task_instructions(Vec::new(), TaskTriggerKind::Cron)
+        let instructions = normalize_task_instructions(Vec::new(), true)
             .expect_err("scheduled task should require instructions");
         assert!(instructions.to_string().contains("`instructions`"));
 
-        let output = normalize_task_output_instructions(None, TaskTriggerKind::Cron)
+        let output = normalize_task_output_instructions(None, true)
             .expect_err("scheduled task should require output instructions");
         assert!(output.to_string().contains("`outputInstructions`"));
     }
@@ -7582,7 +8501,7 @@ mod tests {
                     .to_owned(),
                 "If forecast data is unavailable, report a clear failure.".to_owned(),
             ],
-            TaskTriggerKind::Cron,
+            true,
         )
         .expect("scheduled task instructions should normalize");
         let rendered = instructions.join("\n");
@@ -7594,10 +8513,10 @@ mod tests {
 
     #[test]
     fn immediate_task_create_can_omit_instructions_for_concise_default() {
-        let instructions = normalize_task_instructions(Vec::new(), TaskTriggerKind::Immediate)
+        let instructions = normalize_task_instructions(Vec::new(), false)
             .expect("immediate task should keep concise default");
         assert_eq!(instructions, vec!["Return a concise final result."]);
-        let output = normalize_task_output_instructions(None, TaskTriggerKind::Immediate)
+        let output = normalize_task_output_instructions(None, false)
             .expect("immediate task should not require output instructions");
         assert_eq!(output, None);
     }

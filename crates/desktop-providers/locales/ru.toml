@@ -33,6 +33,8 @@ proxy_hint = "Необязательный workspace-прокси для это�
 replace_hint = "Для %{provider} уже настроен ключ. Сохранение заменит его."
 
 [providers.error]
+configure_failed = "Не удалось сохранить настройки %{provider}"
+disconnect_failed = "Не удалось удалить API-ключ %{provider}"
 gateway_not_connected = "Шлюз не подключён."
 workspace_not_selected = "Пространство не выбрано."
 load_failed = "Не удалось загрузить конфигурацию провайдеров"
@@ -127,6 +129,12 @@ unsupported = "Не поддерживается"
 error = "Ошибка"
 
 [providers.cli.error]
+settings_load_failed = "Не удалось загрузить настройки CLI-провайдеров"
+settings_forbidden = "У этого аккаунта нет прав на управление настройками Gateway"
+login_failed = "Не удалось начать вход для %{runtime}"
+proxy_failed = "Не удалось изменить прокси %{runtime}"
+save_failed = "Не удалось сохранить настройки %{runtime}"
+enabled_failed = "Не удалось включить или отключить %{runtime}"
 open_path_failed = "Не удалось открыть путь"
 
 [providers.catalog.anthropic]
@@ -157,6 +165,18 @@ description = "Модели Gemini от Google AI"
 title = "GLM"
 description = "GLM и Zhipu-совместимые модели"
 
+[providers.catalog.zai]
+title = "Z.AI"
+description = "Модели GLM через глобальный API Z.AI"
+
+[providers.catalog.glm-coding]
+title = "GLM Coding Plan"
+description = "Подписка GLM для программирования через API для Китая"
+
+[providers.catalog.zai-coding]
+title = "Z.AI Coding Plan"
+description = "Подписка GLM для программирования через глобальный API Z.AI"
+
 [providers.catalog.groq]
 title = "Groq"
 description = "Быстрый вывод на оборудовании Groq"
@@ -180,6 +200,10 @@ description = "GPT и другие модели OpenAI"
 [providers.catalog.openrouter]
 title = "OpenRouter"
 description = "Маршрутизатор для множества провайдеров моделей"
+
+[providers.catalog.vercel-ai-gateway]
+title = "Vercel AI Gateway"
+description = "Доступ к моделям через Vercel AI Gateway"
 
 [providers.catalog.telnyx]
 title = "Telnyx"

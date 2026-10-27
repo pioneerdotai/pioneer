@@ -184,6 +184,28 @@ fn gemini3(id: &str, family: &str) -> bool {
 }
 
 pub(super) fn apply(c: &mut Candidate) {
+    if c.provider() == "vercel-ai-gateway" {
+        // Vercel IDs are opaque routes, never direct-vendor family evidence.
+        if let Some(mut map) = effort_map(&c.reasoning_options) {
+            if map["off"].is_null() {
+                map.as_object_mut().unwrap().remove("off");
+            }
+            c.thinking(map);
+        }
+        // Chosen mapping: catalog toggle establishes an off control, encoded
+        // with Responses' shared `none`. This is an inference from both docs,
+        // not per-model evidence that every toggle-only route honors `none`.
+        // It never invents qualitative effort levels or a server default.
+        // https://vercel.com/docs/ai-gateway/models-and-providers/reasoning
+        // https://vercel.com/docs/ai-gateway/sdks-and-apis/responses/reasoning
+        if c.reasoning_options
+            .as_array()
+            .is_some_and(|options| options.iter().any(|option| option["type"] == "toggle"))
+        {
+            c.thinking(json!({"off":"none"}));
+        }
+        return;
+    }
     if c.api() == "openai-completions" {
         completions(c);
     }
@@ -322,7 +344,14 @@ pub(super) fn apply(c: &mut Candidate) {
     }
     if matches!(api.as_str(), "google-generative-ai" | "google-vertex") {
         if gemini3(&lower, "-pro") {
-            c.thinking(json!({"off":null,"minimal":null,"low":"LOW","medium":null,"high":"HIGH"}));
+            let medium = if api == "google-generative-ai" && lower.starts_with("gemini-3.1-pro") {
+                json!("MEDIUM")
+            } else {
+                Value::Null
+            };
+            c.thinking(
+                json!({"off":null,"minimal":null,"low":"LOW","medium":medium,"high":"HIGH"}),
+            );
         }
         if gemini3(&lower, "-flash")
             || matches!(

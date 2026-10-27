@@ -18,6 +18,7 @@ impl TaskNotificationMapper {
             TaskEventPayload::TaskScheduled { .. } => events::TASK_SCHEDULED,
             TaskEventPayload::TaskQueued { .. } => events::TASK_QUEUED,
             TaskEventPayload::RunCreated { .. } => events::TASK_RUN_CREATED,
+            TaskEventPayload::RunStarting { .. } => events::TASK_TREE_CHANGED,
             TaskEventPayload::RunStarted { .. } => events::TASK_RUN_STARTED,
             TaskEventPayload::Progress { .. } => events::TASK_PROGRESS,
             TaskEventPayload::RunCompleted { .. } => events::TASK_RUN_COMPLETED,

@@ -33,6 +33,8 @@ proxy_hint = "Optional workspace-scoped proxy for this provider."
 replace_hint = "A key is already configured for %{provider}. Saving will replace it."
 
 [providers.error]
+configure_failed = "Failed to save settings for %{provider}"
+disconnect_failed = "Failed to remove the API key for %{provider}"
 gateway_not_connected = "Gateway is not connected."
 workspace_not_selected = "Workspace is not selected."
 load_failed = "Failed to load provider configuration"
@@ -127,6 +129,12 @@ unsupported = "Unsupported"
 error = "Error"
 
 [providers.cli.error]
+settings_load_failed = "Failed to load CLI provider settings"
+settings_forbidden = "This account cannot manage Gateway settings"
+login_failed = "Failed to start login for %{runtime}"
+proxy_failed = "Failed to update the proxy for %{runtime}"
+save_failed = "Failed to save settings for %{runtime}"
+enabled_failed = "Failed to change the enabled state of %{runtime}"
 open_path_failed = "Open path failed"
 
 [providers.catalog.anthropic]
@@ -157,6 +165,18 @@ description = "Gemini models from Google AI"
 title = "GLM"
 description = "GLM and Zhipu-compatible models"
 
+[providers.catalog.zai]
+title = "Z.AI"
+description = "GLM models via the global Z.AI API"
+
+[providers.catalog.glm-coding]
+title = "GLM Coding Plan"
+description = "GLM coding subscription via the China API"
+
+[providers.catalog.zai-coding]
+title = "Z.AI Coding Plan"
+description = "GLM coding subscription via the global Z.AI API"
+
 [providers.catalog.groq]
 title = "Groq"
 description = "Fast inference with Groq hardware"
@@ -180,6 +200,10 @@ description = "GPT and other OpenAI models"
 [providers.catalog.openrouter]
 title = "OpenRouter"
 description = "Router for many model providers"
+
+[providers.catalog.vercel-ai-gateway]
+title = "Vercel AI Gateway"
+description = "Access models through Vercel AI Gateway"
 
 [providers.catalog.telnyx]
 title = "Telnyx"

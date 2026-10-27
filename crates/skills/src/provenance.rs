@@ -194,6 +194,16 @@ fn decode_legacy_skills_lock_v1(content: &str, path: &Path) -> Result<LegacySkil
 }
 
 pub fn write_skills_lock_atomic(path: &Path, lock: &SkillsLock) -> Result<()> {
+    write_skills_lock_atomic_tracked(path, lock, |_| {})
+}
+
+/// The watcher reserves exact mutation paths before events can be emitted.
+/// This does not bound full lock parsing/normalization/serialization.
+pub fn write_skills_lock_atomic_tracked(
+    path: &Path,
+    lock: &SkillsLock,
+    claim: impl Fn(&Path),
+) -> Result<()> {
     if lock.version != LOCK_VERSION {
         bail!(
             "skills lock version must be `{LOCK_VERSION}` (got `{}`)",
@@ -210,6 +220,7 @@ pub fn write_skills_lock_atomic(path: &Path, lock: &SkillsLock) -> Result<()> {
         })?;
     }
 
+    claim(path);
     let normalized = normalize_lock(lock.clone());
     let payload = toml::to_string_pretty(&normalized).context("failed to serialize skills lock")?;
     let tmp = path.with_extension(format!(
@@ -220,6 +231,7 @@ pub fn write_skills_lock_atomic(path: &Path, lock: &SkillsLock) -> Result<()> {
             .unwrap_or_default()
     ));
 
+    claim(&tmp);
     fs::write(&tmp, payload)
         .with_context(|| format!("failed to write temporary lock file `{}`", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| {

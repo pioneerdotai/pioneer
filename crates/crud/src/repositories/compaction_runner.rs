@@ -1,6 +1,6 @@
 use super::compaction::{
     CHECKPOINT_SOURCE_LIMIT, SOURCE_PAGE_BYTES, SOURCE_PAGE_ROWS, checkpoint_identity,
-    compaction_checkpoint_edges, sqlite_specific_sql,
+    sqlite_specific_sql,
 };
 use crate::CrudStore;
 use anyhow::{Result, ensure};
@@ -22,6 +22,8 @@ use sea_orm::{ConnectionTrait, TransactionTrait};
 pub enum PublicationTestPause {
     ReaderPreflight,
     BeforeWriter,
+    ProofSeal,
+    CheckpointOriginAcquire,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -91,11 +93,16 @@ impl Drop for PublicationTestHookHandle {
 }
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct PublicationTestMetrics {
+pub(super) struct PublicationTestMetrics {
     coverage_checks: usize,
     manifest_checks: usize,
     heavy_checks_while_writer: usize,
     writer_entries: usize,
+    proof_seal_writer_entries: usize,
+    topology_pages: usize,
+    topology_page_rows: usize,
+    topology_page_bytes: usize,
+    dependency_checks: usize,
     writer_depth: usize,
 }
 
@@ -105,7 +112,7 @@ static PUBLICATION_TEST_METRICS: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
-fn reset_publication_test_metrics(operation: &str) {
+pub(super) fn reset_publication_test_metrics(operation: &str) {
     PUBLICATION_TEST_METRICS
         .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
         .lock()
@@ -114,7 +121,7 @@ fn reset_publication_test_metrics(operation: &str) {
 }
 
 #[cfg(test)]
-fn publication_test_metrics(operation: &str) -> PublicationTestMetrics {
+pub(super) fn publication_test_metrics(operation: &str) -> PublicationTestMetrics {
     PUBLICATION_TEST_METRICS
         .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
         .lock()
@@ -144,10 +151,52 @@ fn record_publication_heavy_check(operation: &str, manifest: bool) {
 }
 
 #[cfg(test)]
-struct PublicationWriterTestGuard(String);
+pub(super) fn record_proof_preparation_check(operation: &str, topology: bool) {
+    let mut all = PUBLICATION_TEST_METRICS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(metrics) = all.get_mut(operation) {
+        if topology {
+            metrics.topology_pages += 1;
+        } else {
+            metrics.dependency_checks += 1;
+        }
+        if metrics.writer_depth != 0 {
+            metrics.heavy_checks_while_writer += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn record_topology_page(operation: &str, rows: usize, bytes: usize) {
+    let mut all = PUBLICATION_TEST_METRICS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(metrics) = all.get_mut(operation) {
+        metrics.topology_page_rows = metrics.topology_page_rows.max(rows);
+        metrics.topology_page_bytes = metrics.topology_page_bytes.max(bytes);
+    }
+}
+
+#[cfg(test)]
+pub(super) struct PublicationWriterTestGuard(String);
 
 #[cfg(test)]
 impl PublicationWriterTestGuard {
+    pub(super) fn enter_seal(operation: &str) -> Self {
+        let guard = Self::enter(operation);
+        let mut all = PUBLICATION_TEST_METRICS
+            .get()
+            .expect("metrics initialized by enter")
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(metrics) = all.get_mut(operation) {
+            metrics.proof_seal_writer_entries += 1;
+        }
+        guard
+    }
     fn enter(operation: &str) -> Self {
         let mut all = PUBLICATION_TEST_METRICS
             .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
@@ -219,7 +268,7 @@ pub async fn trigger_publication_test_hook(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-async fn pause_publication_test_hook(
+pub(super) async fn pause_publication_test_hook(
     runtime_identity: usize,
     operation: &str,
     phase: PublicationTestPause,
@@ -810,6 +859,7 @@ pub(crate) async fn compaction_activate_runner(
         initial.generation == 0
             && initial.attempts == 0
             && initial.retries == 0
+            && initial.portion_attempts == 0
             && initial.corrections == 0,
         "invalid initial runner state"
     );
@@ -1001,18 +1051,99 @@ pub(crate) async fn compaction_resume_deadline(
     execution_turn: &str,
     deadline_ms: u64,
 ) -> Result<bool> {
+    resume_failed_operation(store, operation, execution_turn, deadline_ms, false).await
+}
+
+pub(crate) async fn compaction_resume_invalid_completion(
+    store: &CrudStore,
+    operation: &str,
+    execution_turn: &str,
+    deadline_ms: u64,
+) -> Result<bool> {
+    resume_failed_operation(store, operation, execution_turn, deadline_ms, true).await
+}
+
+async fn resume_failed_operation(
+    store: &CrudStore,
+    operation: &str,
+    execution_turn: &str,
+    deadline_ms: u64,
+    invalid_completion: bool,
+) -> Result<bool> {
     let Some(record) =
         super::compaction::compaction_operation(&store.connection, operation).await?
     else {
         return Ok(false);
     };
-    if record.status != "failed" || record.outcome.as_deref() != Some("deadline") {
+    if record.status != "failed"
+        || (!invalid_completion && record.outcome.as_deref() != Some("deadline"))
+    {
         return Ok(false);
     }
+    // Expiry is diagnosed before any stale-source fallback, including Ready.
+    let bound = super::compaction_source_projection::compaction_bound_source_projection(
+        &store.connection,
+        operation,
+    )
+    .await
+    .map_err(|error| {
+        if invalid_completion {
+            error.context("compaction resume snapshot is unavailable")
+        } else {
+            error
+        }
+    })?;
     let Some(state) = compaction_runner_state(&store.connection, operation).await? else {
+        if invalid_completion {
+            anyhow::bail!("compaction resume phase is unsafe");
+        }
         return Ok(false);
     };
-    if !state.can_resume_deadline() || deadline_ms <= state.deadline_ms {
+    if invalid_completion {
+        if !matches!(
+            state.phase,
+            RunnerPhase::Failed {
+                kind: FailureKind::InvalidCompletion
+            }
+        ) {
+            return Ok(false);
+        }
+        ensure!(
+            state.previous_checkpoint.is_some(),
+            "compaction resume checkpoint is unavailable"
+        );
+        ensure!(
+            state.can_resume_invalid_completion(),
+            "compaction resume phase is unsafe"
+        );
+        ensure!(
+            compaction_runner_plan(&store.connection, operation)
+                .await?
+                .is_some_and(|p| p.ready),
+            "compaction resume plan is unavailable"
+        );
+        ensure!(
+            record
+                .execution_turn
+                .as_deref()
+                .is_some_and(|old| old != execution_turn),
+            "compaction resume requires a new user execution"
+        );
+        let checkpoint = state.previous_checkpoint.as_deref().unwrap();
+        let saved = compaction_checkpoint::Entity::find_by_id(checkpoint)
+            .filter(compaction_checkpoint::Column::Status.is_in(["candidate", "retained"]))
+            .filter(compaction_checkpoint::Column::Summary.ne(""))
+            .select_only()
+            .column(compaction_checkpoint::Column::OperationId)
+            .column(compaction_checkpoint::Column::Owner)
+            .into_tuple::<(String, String)>()
+            .one(&store.connection)
+            .await?;
+        ensure!(
+            saved.is_some_and(|(id, owner)| id == operation && owner == record.owner),
+            "compaction resume checkpoint is unavailable"
+        );
+    } else if !state.can_resume_deadline() || deadline_ms <= state.deadline_ms {
         return Ok(false);
     }
     let legacy_final = state.resume_phase.is_none()
@@ -1025,8 +1156,34 @@ pub(crate) async fn compaction_resume_deadline(
         )
         .await?
         .is_empty();
-    let next = state.resume_deadline(deadline_ms, legacy_final)?;
-    if matches!(
+    let next = if invalid_completion {
+        ensure!(!legacy_final, "compaction resume phase is unsafe");
+        state.resume_invalid_completion(deadline_ms)?
+    } else {
+        state.resume_deadline(deadline_ms, legacy_final)?
+    };
+    if invalid_completion
+        && matches!(
+            next.phase,
+            RunnerPhase::Ready {
+                purpose: pioneer_compaction::runner::AttemptPurpose::Portion,
+            }
+        )
+    {
+        ensure!(
+            !compaction_manifest_page(
+                &store.connection,
+                operation,
+                false,
+                state.cursor.unit,
+                state.cursor.source
+            )
+            .await?
+            .is_empty(),
+            "compaction resume plan is unavailable"
+        );
+    }
+    if (matches!(
         next.phase,
         RunnerPhase::Ready {
             purpose: pioneer_compaction::runner::AttemptPurpose::Portion
@@ -1034,12 +1191,26 @@ pub(crate) async fn compaction_resume_deadline(
             purpose: pioneer_compaction::runner::AttemptPurpose::Portion,
             ..
         }
-    ) && !compaction_manifest_sources_current(&store.connection, operation).await?
+    ) || invalid_completion)
+        && !compaction_manifest_sources_current(&store.connection, operation).await?
     {
+        if invalid_completion {
+            anyhow::bail!("compaction resume sources changed");
+        }
         return Ok(false);
     }
     let mut snapshot: pioneer_compaction::OperationSnapshot =
         serde_json::from_str(&record.snapshot)?;
+    // Legacy raw-assertion admission retained its complete original plan;
+    // frozen admission deliberately stored empty compact/coverage vectors.
+    // Absence of a binding alone never proves the old raw mode.
+    let legacy_raw = !snapshot.plan.compact.is_empty() && !snapshot.plan.coverage.is_empty();
+    if invalid_completion {
+        ensure!(
+            legacy_raw || bound.is_some(),
+            "compaction resume snapshot is unavailable"
+        );
+    }
     snapshot.admission.deadline_ms = deadline_ms;
     let snapshot = serde_json::to_string(&snapshot)?;
     let encoded = serde_json::to_string(&next)?;
@@ -1049,14 +1220,39 @@ pub(crate) async fn compaction_resume_deadline(
     );
     store.run_serialized_write(|| async {
         let tx = store.connection.begin().await?;
+        // Decode the bound header result in this same writer transition. An
+        // expired saved Commit is an explicit error, not an ordinary stale CAS.
+        super::compaction_source_projection::compaction_bound_source_projection(&tx, operation)
+            .await.map_err(|error| if invalid_completion {
+                error.context("compaction resume snapshot is unavailable")
+            } else { error })?;
+
+        // Patch only the new request deadline for InvalidCompletion. Keeping
+        // the saved JSON shape also preserves legacy defaults/unknown fields
+        // under the admission trigger; Deadline retains its existing rewrite.
         let changed = tx.execute_raw(Statement::from_sql_and_values(
             sea_orm::DbBackend::Sqlite,
             r#"UPDATE compaction_operation SET status='running',outcome=NULL,
-                    deadline_ms=?2,snapshot=?3,execution_turn=?6
-               WHERE id=?1 AND status='failed' AND outcome='deadline' AND snapshot=?4
+                    deadline_ms=?2,
+                    snapshot=CASE WHEN ?10 THEN json_set(snapshot,'$.admission.deadline_ms',?2) ELSE ?3 END,
+                    execution_turn=?6
+               WHERE id=?1 AND status='failed' AND outcome IS ?9 AND snapshot=?4
+               AND (NOT ?10 OR (execution_turn IS ?11 AND execution_turn<>?6
+                   AND EXISTS (SELECT 1 FROM turn old WHERE old.id=compaction_operation.execution_turn AND old.status IN ('failed','completed','blocked'))
+                   AND EXISTS (SELECT 1 FROM turn new WHERE new.id=?6 AND new.status='in_progress' AND new.origin='user')))
+               AND (EXISTS (SELECT 1 FROM compaction_operation_projection p
+                   JOIN compaction_frozen_history h ON h.id=p.manifest_id
+                   WHERE p.operation_id=?1 AND h.expired=0 AND h.ready=1
+                     AND h.message_count>=0 AND h.import_count>=0
+                     AND h.next_ordinal=h.message_count AND h.next_import=h.import_count
+                     AND h.identity_sha256=p.identity_sha256 AND h.imports_sha256=p.imports_sha256
+                     AND h.import_count=p.import_count)
+                 OR (?8 AND NOT EXISTS (SELECT 1 FROM compaction_operation_projection WHERE operation_id=?1)))
                AND EXISTS (SELECT 1 FROM compaction_runner_state s WHERE s.operation_id=?1 AND s.generation=?5)
+               AND (NOT ?10 OR EXISTS (SELECT 1 FROM compaction_runner_plan p WHERE p.operation_id=?1 AND p.ready=1))
                AND EXISTS (SELECT 1 FROM compaction_checkpoint p WHERE p.id=?7
-                   AND p.operation_id=?1 AND p.owner=compaction_operation.owner AND p.status IN ('candidate','retained'))
+                   AND p.operation_id=?1 AND p.owner=compaction_operation.owner AND p.status IN ('candidate','retained')
+                   AND (NOT ?10 OR length(p.summary)>0))
                AND EXISTS (SELECT 1 FROM compaction_context c JOIN turn t ON t.thread_id=c.thread_id
                    WHERE c.owner=compaction_operation.owner AND c.head IS compaction_operation.expected_head
                    AND t.id=?6 AND t.message_deleted_at IS NULL AND t.status NOT IN ('interrupted','cancelled'))
@@ -1066,7 +1262,8 @@ pub(crate) async fn compaction_resume_deadline(
                    AND (t.message_deleted_at IS NOT NULL OR t.status IN ('interrupted','cancelled')))"#,
             [operation.into(), i64::try_from(deadline_ms)?.into(), snapshot.clone().into(),
              record.snapshot.clone().into(), i64::try_from(state.generation)?.into(),
-             execution_turn.into(), state.previous_checkpoint.clone().into()],
+             execution_turn.into(), state.previous_checkpoint.clone().into(), legacy_raw.into(),
+             record.outcome.clone().into(), invalid_completion.into(), record.execution_turn.clone().into()],
         )).await?.rows_affected();
         if changed == 0 { tx.rollback().await?; return Ok(false); }
         compaction_runner_state::Entity::update_many()
@@ -1077,6 +1274,39 @@ pub(crate) async fn compaction_resume_deadline(
         tx.commit().await?;
         Ok(true)
     }).await
+}
+
+/// A late cleanup from the previous request must not terminate a resumed request.
+/// One bounded conditional write inherits the caller's serialized writer scope.
+pub(crate) async fn compaction_finish_execution<C: ConnectionTrait>(
+    db: &C,
+    operation: &str,
+    execution_turn: Option<&str>,
+    deadline_ms: u64,
+    status: &str,
+    outcome: &str,
+) -> Result<()> {
+    ensure!(
+        matches!(
+            (status, outcome),
+            ("failed", "deadline") | ("cancelled", "cancelled")
+        ),
+        "invalid reconciliation reason"
+    );
+    db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "UPDATE compaction_operation SET status=?4,outcome=?5 WHERE id=?1 AND status='running'
+         AND deadline_ms=?2 AND (?3 IS NULL OR execution_turn=?3)",
+        [
+            operation.into(),
+            i64::try_from(deadline_ms)?.into(),
+            execution_turn.into(),
+            status.into(),
+            outcome.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
 }
 
 /// Shared preparation for foreground reconciliation and pending repair. Decode
@@ -1271,6 +1501,7 @@ pub(crate) async fn compaction_runner_transition(
     ensure!(
         !matches!(next.phase, RunnerPhase::Applied { .. })
             && next.retries <= 2
+            && next.portion_attempts <= 3
             && next.corrections <= 1,
         "invalid state transition"
     );
@@ -1300,6 +1531,7 @@ pub(crate) async fn compaction_runner_transition(
         );
         let identity = checkpoint_identity(cp)?;
         candidate_model = Some(compaction_checkpoint::ActiveModel {
+            proof_version: sea_orm::Set(0),
             id: sea_orm::Set(cp.id.clone()),
             operation_id: sea_orm::Set(operation.to_owned()),
             owner: sea_orm::Set(cp.owner.clone()),
@@ -1634,6 +1866,22 @@ pub(crate) async fn compaction_runner_transition(
                     .exec_without_returning(&txn)
                     .await?;
             }
+            if let Some(cp) = candidate {
+                let portion = i64::try_from(next.attempts)?;
+                let next_portion = portion
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("candidate portion overflow"))?;
+                compaction_operation::Entity::update_many()
+                    .col_expr(
+                        compaction_operation::Column::NextPortion,
+                        Expr::val(next_portion),
+                    )
+                    .filter(compaction_operation::Column::Id.eq(&cp.operation_id))
+                    .filter(compaction_operation::Column::NextPortion.lt(next_portion))
+                    .exec(&txn)
+                    .await?;
+            }
+
             if let Some(query) = &identity_query {
                 ensure!(
                     query
@@ -1837,7 +2085,7 @@ WHERE o.id=?1
     // Stale candidates do not publish. Validate the graph only after exact
     // saved coverage validation, with the read snapshot released.
     if identity_current && coverage_exact {
-        validate_publication_checkpoint_graph(store, checkpoint).await?;
+        super::checkpoint_proofs::prepare_graph(store, checkpoint).await?;
     }
     Ok(PreparedRunnerPublication {
         operation: operation.to_owned(),
@@ -1847,128 +2095,6 @@ WHERE o.id=?1
         identity_current,
         coverage_exact,
     })
-}
-
-/// Match the read-time alias policy before publication. An exact input copy
-/// claimed by different leaves is not suppressed after the graphs meet;
-/// provider/tool replay conflicts are never interchangeable. Every edge is
-/// read through its bounded repository page and no source payload is opened.
-pub(super) async fn validate_publication_checkpoint_graph(
-    store: &CrudStore,
-    candidate: &str,
-) -> Result<()> {
-    let mut pending = vec![(candidate.to_owned(), false)];
-    let mut visited = std::collections::BTreeSet::new();
-    let mut visiting = std::collections::BTreeSet::new();
-    let mut done = std::collections::BTreeSet::new();
-    let mut leaves = std::collections::BTreeSet::new();
-    let mut aliases = pioneer_compaction::frozen::ReplayAliasGraph::default();
-    let mut root = None;
-    while let Some((id, exiting)) = pending.pop() {
-        if exiting {
-            visiting.remove(&id);
-            done.insert(id);
-            continue;
-        }
-        if done.contains(&id) {
-            continue;
-        }
-        ensure!(visiting.insert(id.clone()), "cyclic checkpoint coverage");
-        visited.insert(id.clone());
-        ensure!(
-            visited.len() <= 65_536,
-            "checkpoint historical coverage exceeds supported quantum"
-        );
-        pending.push((id.clone(), true));
-        let edges = compaction_checkpoint_edges(&store.connection, &id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("candidate checkpoint graph is unavailable"))?;
-        ensure!(
-            edges.format_version == pioneer_compaction::FORMAT_VERSION,
-            "checkpoint historical format changed"
-        );
-        if let Some((workspace, _, _)) = &root {
-            ensure!(
-                &edges.workspace_id == workspace,
-                "checkpoint historical workspace changed"
-            );
-        } else {
-            root = Some((
-                edges.workspace_id.clone(),
-                edges.owner.clone(),
-                edges.thread_id.clone(),
-            ));
-        }
-        for alias in edges.replay_aliases {
-            aliases.insert(
-                pioneer_compaction::frozen::ScopedReplaySource {
-                    thread: alias.replay.source_thread,
-                    source: alias.replay.source,
-                },
-                pioneer_compaction::frozen::ScopedReplaySource {
-                    thread: alias.covered.source_thread,
-                    source: alias.covered.source,
-                },
-                alias.tool_item_id.as_deref(),
-            )?;
-        }
-        if let Some(previous) = edges.previous {
-            let previous_edges = compaction_checkpoint_edges(&store.connection, &previous)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("previous checkpoint disappeared"))?;
-            ensure!(
-                previous_edges.owner == edges.owner
-                    && previous_edges.thread_id == edges.thread_id
-                    && previous_edges.workspace_id == edges.workspace_id
-                    && previous_edges.format_version == pioneer_compaction::FORMAT_VERSION,
-                "previous checkpoint changed historical ownership"
-            );
-            pending.push((previous, false));
-        }
-        for covered in edges.coverage {
-            if covered.source.scope.starts_with("checkpoint:") {
-                ensure!(
-                    store
-                        .compaction_checkpoint_source(
-                            &edges.workspace_id,
-                            &covered.source_thread,
-                            &covered.source.id,
-                        )
-                        .await?
-                        .as_ref()
-                        == Some(&covered.source),
-                    "checkpoint coverage node is not a published exact source"
-                );
-                let child = compaction_checkpoint_edges(&store.connection, &covered.source.id)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("checkpoint coverage node disappeared"))?;
-                ensure!(
-                    child.workspace_id == edges.workspace_id
-                        && child.thread_id == covered.source_thread
-                        && child.format_version == pioneer_compaction::FORMAT_VERSION
-                        && covered.source.scope == format!("checkpoint:{}", child.owner)
-                        && covered.source.version == child.identity_sha256,
-                    "checkpoint coverage owner or identity changed"
-                );
-                pending.push((covered.source.id, false));
-            } else {
-                leaves.insert((covered.source_thread, covered.source));
-            }
-        }
-    }
-    ensure!(!leaves.is_empty(), "checkpoint has no historical coverage");
-    aliases.validate_targets(
-        &leaves
-            .into_iter()
-            .map(
-                |(thread, source)| pioneer_compaction::frozen::ScopedReplaySource {
-                    thread,
-                    source,
-                },
-            )
-            .collect(),
-    )?;
-    Ok(())
 }
 
 async fn compaction_runner_coverage_exact<C: ConnectionTrait>(
@@ -2362,6 +2488,19 @@ pub(crate) async fn compaction_apply_runner(
                 txn.rollback().await?;
                 return Ok(super::compaction::CommitOutcome::Stale);
             }
+            let proof_ready = compaction_checkpoint::Entity::find_by_id(checkpoint)
+                .select_only()
+                .column(compaction_checkpoint::Column::Id)
+                .filter(compaction_checkpoint::Column::OperationId.eq(operation))
+                .filter(compaction_checkpoint::Column::ProofVersion.eq(1))
+                .into_tuple::<String>()
+                .one(&txn)
+                .await?;
+            if proof_ready.is_none() {
+                txn.rollback().await?;
+                return Ok(super::compaction::CommitOutcome::Stale);
+            }
+
             let changed = compaction_context::Entity::update_many()
                 .col_expr(
                     compaction_context::Column::Head,
@@ -2577,14 +2716,47 @@ current_sources(source_scope,source_id,source_version,thread_id,workspace_id) AS
   AND basis_source.workspace_id=o.workspace_id
 ),
 accepted_imports AS MATERIALIZED (
- SELECT i.source_scope, i.source_id, i.source_version, i.source_thread
+ SELECT i.source_scope, i.source_id,
+  CASE WHEN i.bytes BETWEEN 0 AND 262144
+    AND length(CAST(i.proof_json AS BLOB))=i.bytes AND json_valid(i.proof_json)
+   THEN CASE WHEN
+    json_extract(i.proof_json,'$.source.scope')=i.source_scope
+    AND json_extract(i.proof_json,'$.source.id')=i.source_id
+    AND json_extract(i.proof_json,'$.source.version')=i.source_version
+    AND json_extract(i.proof_json,'$.source_thread')=i.source_thread
+    AND json_extract(i.proof_json,'$.preview_archive.source.scope')=i.source_scope
+    AND json_extract(i.proof_json,'$.preview_archive.source.id')=i.source_id
+    AND EXISTS (
+     SELECT 1 FROM html_preview_frozen_result receipt
+     JOIN compaction_frozen_history output ON output.id=receipt.manifest_id
+     JOIN compaction_source_revision revision ON revision.source_id=receipt.source_id
+     WHERE receipt.manifest_id=json_extract(i.proof_json,'$.output_manifest')
+      AND receipt.ordinal=json_extract(i.proof_json,'$.output_ordinal')
+      AND receipt.source_id=i.source_id AND receipt.source_version=i.source_version
+      AND i.source_scope='context:'||receipt.turn_id
+      AND output.workspace_id=o.workspace_id AND output.owner_thread=i.source_thread
+      AND output.ready=1 AND output.expired=0
+      AND receipt.ordinal>=0 AND receipt.ordinal<output.message_count
+      AND output.next_ordinal=output.message_count AND output.import_count>=0
+      AND output.next_import=output.import_count
+      AND receipt.archive_wire_sha256=json_extract(i.proof_json,'$.preview_archive.wire_sha256')
+      AND receipt.archive_wire_sha256<>json_extract(CASE WHEN json_valid(receipt.reference_json) THEN receipt.reference_json ELSE '{}' END,'$.wire_sha256')
+      AND revision.present=1 AND revision.turn_id=receipt.turn_id
+      AND i.source_version='revision:'||(revision.revision-1)
+      AND json_extract(i.proof_json,'$.preview_archive.source.version')='revision:'||revision.revision
+    ) THEN json_extract(i.proof_json,'$.preview_archive.source.version')
+    ELSE i.source_version END
+   ELSE i.source_version END AS source_version,
+  i.source_thread
  FROM current_operation o
  JOIN compaction_operation_projection p ON p.operation_id=o.id
  JOIN compaction_frozen_history h ON h.id=p.manifest_id
-  AND h.workspace_id=o.workspace_id AND h.ready=1
+  AND h.workspace_id=o.workspace_id AND h.ready=1 AND h.expired=0
+  AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count
   AND h.identity_sha256=p.identity_sha256 AND h.imports_sha256=p.imports_sha256
   AND h.import_count=p.import_count AND h.next_import=p.import_count
  JOIN compaction_frozen_import i ON i.manifest_id=h.id
+  AND i.ordinal>=0 AND i.ordinal<h.import_count AND i.message_ordinal>=0 AND i.message_ordinal<h.message_count
   AND i.manifest_id=(SELECT manifest_id FROM compaction_operation_projection WHERE operation_id=?1)
 ),
 accepted_basis_messages AS MATERIALIZED (
@@ -2592,11 +2764,11 @@ accepted_basis_messages AS MATERIALIZED (
  FROM current_operation o
  JOIN compaction_operation_projection p ON p.operation_id=o.id
  JOIN compaction_frozen_history h ON h.id=p.manifest_id
-  AND h.workspace_id=o.workspace_id AND h.ready=1
+  AND h.workspace_id=o.workspace_id AND h.ready=1 AND h.expired=0
+  AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count
   AND h.identity_sha256=p.identity_sha256 AND h.imports_sha256=p.imports_sha256
   AND h.import_count=p.import_count AND h.next_import=p.import_count
-  AND h.next_ordinal=h.message_count
- JOIN compaction_frozen_message f ON f.manifest_id=h.id
+ JOIN compaction_frozen_message f ON f.manifest_id=h.id AND f.ordinal>=0 AND f.ordinal<h.message_count
   AND f.manifest_id=(SELECT manifest_id FROM compaction_operation_projection WHERE operation_id=?1)
  LIMIT 65537
 ),
@@ -2957,7 +3129,9 @@ pub(crate) async fn compaction_manifest_sources_current<C: ConnectionTrait>(
     // including its unambiguous exact input aliases. Those aliases never
     // authorize direct raw reads or OWN imports. Historical coverage never
     // joins canonical payload/revision rows. OWN imports still require
-    // their immutable delivery proofs. This check is used before reading raw
+    // their immutable delivery proofs. A preview proof keeps its original
+    // grant, but its adjacent diagnostic revision is read only when the exact
+    // persisted archive receipt agrees. This check is used before reading raw
     // portions; finished summaries no longer revalidate live sources.
     let stale = db
         .query_one_raw(compaction_manifest_sources_current_statement(operation))

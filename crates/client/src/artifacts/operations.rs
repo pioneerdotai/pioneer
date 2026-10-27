@@ -76,6 +76,24 @@ struct Operation {
 pub(crate) struct ArtifactDownloadController {
     generation: u64,
     operations: HashMap<String, Operation>,
+    waiting: usize,
+    slots_changed: Arc<tokio::sync::Notify>,
+}
+
+// Waiting preparations remain owned by their existing artifact action. The
+// same operation budget bounds waiters; they do not consume the eight slots.
+pub(super) struct ArtifactDownloadAdmission {
+    core: Arc<ClientCore>,
+    pub(super) slots_changed: Arc<tokio::sync::Notify>,
+}
+impl Drop for ArtifactDownloadAdmission {
+    fn drop(&mut self) {
+        self.core
+            .artifact_downloads
+            .lock()
+            .expect("artifact download owner poisoned")
+            .waiting -= 1;
+    }
 }
 
 /// A captured request lease. Dropping unfinished work cancels only this exact
@@ -115,6 +133,23 @@ impl Drop for ArtifactDownloadOperation {
 }
 
 impl ClientCore {
+    pub(super) fn wait_artifact_download_admission(
+        self: &Arc<Self>,
+    ) -> Option<ArtifactDownloadAdmission> {
+        let mut owner = self
+            .artifact_downloads
+            .lock()
+            .expect("artifact download owner poisoned");
+        if owner.waiting >= MAX_TRACKED_DOWNLOAD_OPERATIONS {
+            return None;
+        }
+        owner.waiting += 1;
+        Some(ArtifactDownloadAdmission {
+            core: self.clone(),
+            slots_changed: owner.slots_changed.clone(),
+        })
+    }
+
     pub fn begin_artifact_download_for_target(
         self: &Arc<Self>,
         target: ArtifactDownloadTarget,
@@ -308,6 +343,7 @@ impl ClientCore {
             operation.cancellation.cancel();
         }
         let thread_id = operation.publication.target.thread_id.clone();
+        owner.slots_changed.notify_waiters();
         drop(owner);
         self.publish_artifact_downloads(thread_id.as_deref());
         true
@@ -339,6 +375,7 @@ impl ClientCore {
                 operation.publication = Arc::new(next);
             }
         }
+        owner.slots_changed.notify_waiters();
         drop(owner);
         for thread_id in changed_threads {
             self.publish_artifact_downloads(Some(&thread_id));
@@ -414,6 +451,13 @@ mod tests {
             core.begin_artifact_download("overflow".into(), target("a")),
             Err(ArtifactDownloadOperationError::Capacity)
         ));
+        let waiting = (0..MAX_TRACKED_DOWNLOAD_OPERATIONS)
+            .map(|_| core.wait_artifact_download_admission().unwrap())
+            .collect::<Vec<_>>();
+        assert!(core.wait_artifact_download_admission().is_none());
+        drop(waiting);
+        assert_eq!(core.artifact_downloads.lock().unwrap().waiting, 0);
+        assert!(core.wait_artifact_download_admission().is_some());
         core.remove_thread_store("a");
         assert!(active[0].cancellation().is_cancelled());
         assert!(!active[1].cancellation().is_cancelled());

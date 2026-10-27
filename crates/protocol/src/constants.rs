@@ -11,6 +11,7 @@ pub mod methods {
     pub const AUTH_SESSION_REVOKE: &str = "auth/session/revoke";
     pub const AUTH_LOGOUT: &str = "auth/logout";
     pub const AUTH_DEVICE_CREATE: &str = "auth/device/create";
+    pub const AUTH_ACCESS_RENEW: &str = "auth/access_renew";
     pub const AUTH_REFRESH: &str = "auth/refresh";
     pub const AUTH_DEVICE_ACTIVATE: &str = "auth/device/activate";
     pub const INVITE_CREATE: &str = "invite/create";
@@ -33,6 +34,7 @@ pub mod methods {
     pub const WORKSPACE_UPDATE: &str = "workspace/update";
     pub const THREAD_START: &str = "thread/start";
     pub const THREAD_TREE: &str = "thread/tree";
+    pub const WORKSPACE_PUSH: &str = "workspace/push";
     pub const THREAD_UPDATE: &str = "thread/update";
     pub const THREAD_MOVE: &str = "thread/move";
     pub const THREAD_PARTICIPANTS_LIST: &str = "thread/participants/list";
@@ -134,6 +136,7 @@ pub mod methods {
     pub const TASK_ACCEPT: &str = "task/accept";
     pub const TASK_REVISE: &str = "task/revise";
     pub const TASK_CANCEL: &str = "task/cancel";
+    pub const TASK_FINISH: &str = "task/finish";
     pub const TASK_UPDATE: &str = "task/update";
     pub const TASK_RESCHEDULE: &str = "task/reschedule";
     pub const TASK_DETACH: &str = "task/detach";
@@ -141,6 +144,11 @@ pub mod methods {
     pub const TASK_RESUME: &str = "task/resume";
     pub const TASK_AGENDA: &str = "task/agenda";
     pub const TASK_DELIVERIES: &str = "task/deliveries";
+    pub const TASK_COMPLETION_INBOX_LIST: &str = "task/inbox/list";
+    pub const TASK_COMPLETION_INBOX_GET: &str = "task/inbox/get";
+    pub const TASK_COMPLETION_INBOX_READ: &str = "task/inbox/read";
+    pub const TASK_COMPLETION_INBOX_VIEWED: &str = "task/inbox/viewed";
+    pub const TASK_COMPLETION_INBOX_READ_ALL: &str = "task/inbox/read_all";
     pub const TASK_USER_NOTIFICATION_LIST: &str = "task/user_notification/list";
     pub const TASK_USER_NOTIFICATION_ACKNOWLEDGE: &str = "task/user_notification/acknowledge";
     pub const AGENT_ROUTE_CREATE: &str = "agent/route/create";
@@ -173,9 +181,13 @@ pub mod methods {
     pub const ARTIFACT_UPLOAD_FINISH: &str = "artifact/upload/finish";
     pub const ARTIFACT_UPLOAD_ABORT: &str = "artifact/upload/abort";
 
-    /// Authenticated JSON-RPC methods accepted by the normal Gateway
-    /// transport. Restricted credential exchange methods are deliberately
-    /// excluded and listed in `RESTRICTED_AUTH_METHODS`.
+    /// Authenticated transport control, handled before domain dispatch.
+    /// This renews an existing admission and never issues refresh credentials.
+    pub const AUTHENTICATED_TRANSPORT_METHODS: &[&str] = &[AUTH_ACCESS_RENEW];
+
+    /// Authenticated domain JSON-RPC methods accepted by the normal Gateway
+    /// dispatcher. Transport control and restricted credential exchanges are
+    /// listed separately.
     pub const NORMAL_METHODS: &[&str] = &[
         AUTH_ME,
         AUTHORIZATION_CAPABILITIES,
@@ -202,6 +214,7 @@ pub mod methods {
         WORKSPACE_UPDATE,
         THREAD_START,
         THREAD_TREE,
+        WORKSPACE_PUSH,
         THREAD_UPDATE,
         THREAD_MOVE,
         THREAD_PARTICIPANTS_LIST,
@@ -302,12 +315,18 @@ pub mod methods {
         TASK_ACCEPT,
         TASK_REVISE,
         TASK_CANCEL,
+        TASK_FINISH,
         TASK_RESCHEDULE,
         TASK_DETACH,
         TASK_PAUSE,
         TASK_RESUME,
         TASK_AGENDA,
         TASK_DELIVERIES,
+        TASK_COMPLETION_INBOX_LIST,
+        TASK_COMPLETION_INBOX_GET,
+        TASK_COMPLETION_INBOX_READ,
+        TASK_COMPLETION_INBOX_READ_ALL,
+        TASK_COMPLETION_INBOX_VIEWED,
         TASK_USER_NOTIFICATION_LIST,
         TASK_USER_NOTIFICATION_ACKNOWLEDGE,
         AGENT_ROUTE_CREATE,
@@ -365,6 +384,7 @@ pub mod events {
     pub const THREAD_PARTICIPANTS_CHANGED: &str = "thread/participants/changed";
     pub const THREAD_CLOSED: &str = "thread/closed";
     pub const THREAD_TREE_CHANGED: &str = "thread/tree/changed";
+    pub const WORKSPACE_PUSH_CHANGED: &str = "workspace/push";
     pub const THREAD_AGENTS_DOC_CHANGED: &str = "thread/agents_doc/changed";
     pub const THREAD_TIMELINE_BLOCKS_CHANGED: &str = "thread/timeline/blocks/changed";
     pub const THREAD_READ_CURSOR_CHANGED: &str = "thread/read/changed";
@@ -461,6 +481,7 @@ pub mod events {
     pub const TASK_DELIVERY_DELIVERED: &str = "task/delivery/delivered";
     pub const TASK_DELIVERY_FAILED: &str = "task/delivery/failed";
     pub const TASK_DELIVERY_CANCELLED: &str = "task/delivery/cancelled";
+    pub const TASK_COMPLETION_INBOX_CHANGED: &str = "task/inbox/changed";
     pub const TASK_USER_NOTIFICATION_DELIVERED: &str = "task/user_notification/delivered";
     pub const TASK_WRITE_LOCK_ACQUIRED: &str = "task/write_lock/acquired";
     pub const TASK_WRITE_LOCK_EXTENDED: &str = "task/write_lock/extended";

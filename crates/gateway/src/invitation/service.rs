@@ -2646,6 +2646,17 @@ mod tests {
             )
             .await
             .unwrap();
+        // An invitation can be accepted long after it was issued. Access
+        // starts at the newly committed grants, not the old invitation date.
+        invitation::Entity::update_many()
+            .col_expr(
+                invitation::Column::CreatedAt,
+                Expr::value(chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(60)),
+            )
+            .filter(invitation::Column::Id.eq(created.invitation.invitation_id.to_string()))
+            .exec(&harness.database)
+            .await
+            .unwrap();
         let raw_credential = created.presentation.token().to_owned();
         let credential_key = secrets
             .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
@@ -2674,6 +2685,35 @@ mod tests {
         .expect("post-commit hook must not run while the accept transaction is open")
         .unwrap();
 
+        // Unread starts from the actual saved acceptance grants, not from
+        // presenting an invitation or opening the first device. No read receipt
+        // is created by granting access.
+        let grants = pioneer_entity::workspace_membership::Entity::find()
+            .filter(
+                pioneer_entity::workspace_membership::Column::PrincipalId
+                    .eq(response.member.principal_id.to_string()),
+            )
+            .all(&harness.database)
+            .await
+            .unwrap();
+        assert_eq!(grants.len(), workspace_ids.len());
+        assert!(
+            grants
+                .iter()
+                .all(|grant| grant.created_at.timestamp()
+                    >= created.invitation.created_at_unix as i64)
+        );
+        assert!(
+            pioneer_entity::thread_read_cursor::Entity::find()
+                .filter(
+                    pioneer_entity::thread_read_cursor::Column::PrincipalId
+                        .eq(response.member.principal_id.to_string())
+                )
+                .all(&harness.database)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(response.workspace_ids, workspace_ids);
         assert_eq!(response.member.principal_id, response.grant.principal.id);
         assert_eq!(response.member.role_key.as_ref(), Some(&target_role));
@@ -2727,6 +2767,18 @@ mod tests {
                 .map(|row| row.workspace_id.as_str())
                 .collect::<Vec<_>>(),
             vec![WORKSPACE_RED_ID, WORKSPACE_BLUE_ID]
+        );
+        let inbox_clock = pioneer_entity::task_inbox_activation::Entity::find_by_id(1)
+            .one(&harness.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            memberships.iter().all(|row| {
+                row.inbox_after_sequence == Some(inbox_clock.completion_sequence)
+                    && row.created_at == accepted_principal.created_at
+            }),
+            "invitation acceptance persists each access start with the principal/session grant"
         );
         assert!(
             device::Entity::find_by_id(response.grant.device.id.to_string())

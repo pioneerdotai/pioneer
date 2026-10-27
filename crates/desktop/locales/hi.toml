@@ -1696,12 +1696,21 @@ add_confirm = "इस प्रतिभागी को जोड़ें?"
 remove_confirm = "इस प्रतिभागी को हटाएँ?"
 
 [tasks.notifications]
+mark_all_read = "सभी को पढ़ा हुआ चिह्नित करें"
 title = "कार्य परिणाम"
 loading = "परिणाम लोड हो रहे हैं…"
-empty = "कोई कार्य परिणाम नहीं"
+empty = "कोई अपठित कार्य परिणाम नहीं"
 task = "कार्य"
 mark_read = "पढ़ा हुआ चिह्नित करें"
 completed = "कार्य पूरा हुआ"
+
+open = "थ्रेड खोलें"
+more = "और लोड करें"
+read = "पढ़ा गया"
+unread = "अपठित"
+retry = "फिर कोशिश करें"
+loading_failed = "कार्य के परिणाम अपडेट नहीं किए जा सके"
+timed_out = "समय समाप्त"
 
 [settings.self_improvement.status]
 title = "गतिविधि"

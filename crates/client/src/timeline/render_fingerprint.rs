@@ -127,6 +127,7 @@ pub fn timeline_row_content_fingerprint(
                     hash_turn_item_without_identity(&item_view.item, &mut hasher);
                     hash_serializable(&item_view.route, &mut hasher);
                     hash_serializable(&item_view.timeline_origin, &mut hasher);
+                    hash_serializable(&item_view.html_publications, &mut hasher);
                     hash_serializable(&item_view.opaque_meta, &mut hasher);
                 }
             }
@@ -337,6 +338,7 @@ mod tests {
         let (projection, row) = projection_with_target_item(false);
         let mut authored = row.clone();
         authored.author = Some(TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::System,
             display_name: "System".to_owned(),
             nickname: "system".to_owned(),
@@ -371,6 +373,7 @@ mod tests {
         };
         let mut authored = row.clone();
         authored.author = Some(TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::System,
             display_name: "System".to_owned(),
             nickname: "system".to_owned(),
@@ -434,6 +437,7 @@ mod tests {
     ) {
         let item_index = projection.items.len();
         projection.items.push(ItemView {
+            html_publications: Vec::new(),
             id: item_id.to_owned(),
             turn_id: turn_id.to_owned(),
             item_type: "user_message".to_owned(),

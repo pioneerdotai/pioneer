@@ -1,6 +1,14 @@
 use super::*;
 #[path = "checkpoint_input_alias_tests.rs"]
 mod checkpoint_input_alias_tests;
+#[path = "frozen_preparation_tests.rs"]
+mod frozen_preparation_tests;
+#[path = "html_preview_retention_tests.rs"]
+mod html_preview_retention_tests;
+#[path = "invalid_completion_resume_tests.rs"]
+mod invalid_completion_resume_tests;
+#[path = "invalid_completion_tests.rs"]
+mod invalid_completion_tests;
 use migration::{Migrator, MigratorTrait};
 use pioneer_agent::compaction::composition::ScopedHistorySource;
 use pioneer_compaction::summary::{HEADINGS, SummaryInput};
@@ -35,6 +43,389 @@ fn test_checkpoint_domains(
         .cloned()
         .map(|source| (source, pioneer_compaction::CoverageDomain::WorkingContext))
         .collect()
+}
+
+// Exercise the real layout/admission path: never align coverage to manifest.
+async fn raw_layout_publication_preserves_actual_ownership(filtered_empty: bool) {
+    use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
+    let units_and_text = if filtered_empty {
+        vec![("empty", ""), ("A", "visible answer")]
+    } else {
+        vec![("A", "first A"), ("B", "only B"), ("A", "second A")]
+    };
+    let payloads = units_and_text
+        .iter()
+        .enumerate()
+        .map(|(i, (_, text))| {
+            serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: format!("answer-{i}"),
+                        text: (*text).into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+            ))
+            .unwrap()
+        })
+        .collect();
+    let f = fixture_with_canonical_payloads(payloads, vec![Reply::Success], true, false).await;
+    let db = f.store.database_connection();
+    db.execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    let fk: i64 = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA foreign_keys",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "foreign_keys")
+        .unwrap();
+    assert_eq!(fk, 0);
+    let sources = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|entry| entry.reference)
+        .collect::<Vec<_>>();
+    assert_eq!(sources.len(), units_and_text.len());
+    let messages = units_and_text
+        .iter()
+        .zip(&sources)
+        .map(|((unit, text), source)| {
+            let mut message = ChatMessage::assistant(*text);
+            message.provenance = Some(MessageProvenance {
+                logical_turn_id: None,
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                context_thread: Some("thread".into()),
+                unit_id: (*unit).into(),
+                sources: vec![MessageSourceRef {
+                    scope: source.scope.clone(),
+                    id: source.id.clone(),
+                    version: source.version.clone(),
+                }],
+                source_aliases: vec![],
+                ambiguous_input_aliases: vec![],
+                complete: true,
+                protected_input: false,
+                inherited: false,
+            });
+            message
+        })
+        .collect::<Vec<_>>();
+    let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+        "ws",
+        "thread",
+        &messages,
+        &vec![10; messages.len()],
+    )
+    .unwrap();
+    assert!(
+        layout
+            .units
+            .iter()
+            .all(|unit| unit.complete && !unit.protected_input)
+    );
+    if !filtered_empty {
+        assert_eq!(layout.message_indexes, vec![vec![0, 2], vec![1]]);
+    }
+    let mut plan = f.runner.snapshot.plan.clone();
+    plan.compact = (0..layout.units.len()).collect();
+    plan.retain.clear();
+    plan.coverage_domain = pioneer_compaction::coverage_domain_for(&layout.units, &plan.compact);
+    // Same unit/source traversal as native preparation, before history_manifest.
+    plan.coverage = plan
+        .compact
+        .iter()
+        .flat_map(|i| layout.units[*i].sources.clone())
+        .collect();
+    plan.fingerprint = "raw-layout-membership".into();
+    let manifest = super::admission::history_manifest(&messages, &layout, &plan).unwrap();
+    assert_eq!(
+        manifest
+            .iter()
+            .map(|entry| entry.source.clone())
+            .collect::<Vec<_>>(),
+        sources
+    );
+    if !filtered_empty {
+        assert_ne!(plan.coverage, sources);
+        assert!(manifest.iter().all(|entry| entry.unit == manifest[0].unit));
+    } else {
+        let empty_payload = f
+            .store
+            .compaction_reference_payload("ws", "thread", &sources[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            super::model_source_payload(&sources[0], empty_payload)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let epoch = f
+        .store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    let snapshot = admit_operation(
+        &f.store,
+        "ws",
+        "thread",
+        &CompactionSettings::default(),
+        &f.runner.snapshot.admission.selection,
+        None,
+        f.runner.summarizer.as_ref(),
+        PreparedOperation {
+            owner: "raw-layout-owner".into(),
+            execution_turn: "turn".into(),
+            user_initiated: true,
+            source_projection: None,
+            expected_checkpoint: None,
+            summary_basis: None,
+            operation_deadline_ms: None,
+            projection_version: epoch,
+            source_epochs: std::collections::BTreeMap::from([("thread".into(), epoch)]),
+            plan: plan.clone(),
+            manifest: manifest.clone(),
+            target_identity: "raw-layout-target".into(),
+            target_tokens: 500,
+        },
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot.plan.coverage, plan.coverage);
+    assert!(
+        f.store
+            .compaction_bound_source_projection(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let actual = f
+        .store
+        .compaction_manifest_page(&snapshot.id, false, 0, 0)
+        .await
+        .unwrap();
+    let selected = actual
+        .iter()
+        .map(|entry| entry.source.clone())
+        .collect::<Vec<_>>();
+    // The mismatch exists before runner/candidate/publication, with valid owners.
+    assert_ne!(snapshot.plan.coverage, selected);
+    assert_eq!(
+        selected,
+        if filtered_empty {
+            sources[1..].to_vec()
+        } else {
+            sources.clone()
+        }
+    );
+    if filtered_empty {
+        assert_eq!(actual[0].ordinal, 0);
+        assert_eq!(actual[0].unit, manifest[1].unit);
+        assert_eq!(snapshot.plan.coverage[1], actual[0].source);
+    }
+    assert!(
+        f.store
+            .compaction_manifest_sources_current(&snapshot.id)
+            .await
+            .unwrap()
+    );
+    for entry in &actual {
+        assert!(!entry.reference_only);
+        assert_eq!(entry.thread_id, "thread");
+        assert_eq!(
+            f.store
+                .compaction_reference_thread("ws", &entry.source)
+                .await
+                .unwrap(),
+            Some("thread".into())
+        );
+        assert!(snapshot.plan.coverage.contains(&entry.source));
+    }
+    let identities = |entries: &[ManifestEntry]| {
+        entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.ordinal,
+                    entry.unit,
+                    entry.reference_only,
+                    entry.thread_id.clone(),
+                    entry.source.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = identities(&actual);
+    let runner = Arc::new(CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "thread".into(),
+        snapshot.clone(),
+        f.runner.summarizer.clone(),
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    ));
+    let mut hook =
+        arm_publication_test_hook(&f.store, &snapshot.id, PublicationTestPause::BeforeWriter);
+    let run = tokio::spawn(async move { runner.run(CancellationToken::new()).await.unwrap() });
+    hook.reached().await;
+    let state = f
+        .store
+        .compaction_runner_state(&snapshot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let RunnerPhase::Commit { checkpoint: id } = &state.phase else {
+        panic!("expected real saved Commit")
+    };
+    let checkpoint = f.store.compaction_checkpoint(id).await.unwrap().unwrap();
+    assert_eq!(
+        checkpoint
+            .coverage
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        selected
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert_eq!(
+        f.store.compaction_head(&snapshot.owner).await.unwrap(),
+        None
+    );
+    // The real runner sealed this candidate. Retrying its save must be exact
+    // even when closed/sealed ownership cannot be INSERTed or rewritten.
+    let saved = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT proof_version,portion FROM compaction_checkpoint WHERE id=?",
+            [id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.try_get::<i64>("", "proof_version").unwrap(), 1);
+    let portion = saved.try_get::<i64>("", "portion").unwrap();
+    f.store
+        .compaction_save_candidate(&checkpoint, portion)
+        .await
+        .unwrap();
+    assert_eq!(
+        identities(
+            &f.store
+                .compaction_manifest_page(&snapshot.id, false, 0, 0)
+                .await
+                .unwrap()
+        ),
+        before
+    );
+    assert_eq!(
+        serde_json::to_string(
+            &f.store
+                .compaction_runner_state(&snapshot.id)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_string(&state).unwrap()
+    );
+    hook.release();
+    assert_eq!(run.await.unwrap(), CompactionExit::Applied(id.clone()));
+    let applied = f
+        .store
+        .compaction_runner_state(&snapshot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(&applied.phase, RunnerPhase::Applied { checkpoint } if checkpoint == id));
+    assert_eq!(
+        f.store.compaction_head(&snapshot.owner).await.unwrap(),
+        Some(id.clone())
+    );
+    assert_eq!(
+        identities(
+            &f.store
+                .compaction_manifest_page(&snapshot.id, false, 0, 0)
+                .await
+                .unwrap()
+        ),
+        before
+    );
+    let edges = f
+        .store
+        .compaction_checkpoint_edges(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(edges.thread_id, "thread");
+    assert!(
+        edges
+            .coverage
+            .iter()
+            .all(|entry| entry.source_thread == "thread")
+    );
+    assert_eq!(
+        edges
+            .coverage
+            .iter()
+            .map(|entry| entry.source.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        selected
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    let published = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT proof_version,status FROM compaction_checkpoint WHERE id=?",
+            [id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.try_get::<i64>("", "proof_version").unwrap(), 1);
+    assert_eq!(
+        published.try_get::<String>("", "status").unwrap(),
+        "applied"
+    );
+    assert_eq!(
+        f.store
+            .compaction_operation(&snapshot.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "completed"
+    );
+}
+
+#[tokio::test]
+async fn raw_interleaved_layout_publishes_without_rewriting_manifest_ordinals() {
+    raw_layout_publication_preserves_actual_ownership(false).await;
+}
+#[tokio::test]
+async fn raw_filtered_empty_projection_publishes_with_original_membership() {
+    raw_layout_publication_preserves_actual_ownership(true).await;
 }
 
 #[tokio::test]
@@ -83,7 +474,14 @@ async fn source_creation_order_keeps_child_tool_work_before_later_parent_input()
                     }
                 ),
                 id: source.into(),
-                version: "revision:1".into(),
+                version: if source == "child-new" {
+                    "item-revision:1"
+                } else if thread == "child" {
+                    "revision:1"
+                } else {
+                    "input-revision:1"
+                }
+                .into(),
             }],
             source_aliases: vec![],
             ambiguous_input_aliases: vec![],
@@ -217,6 +615,7 @@ async fn source_creation_order_keeps_child_tool_work_before_later_parent_input()
     for reference_only in [false, true] {
         let mut plan = f.runner.snapshot.plan.clone();
         if reference_only {
+            plan.compact.clear();
             plan.retain = (0..layout.units.len()).collect();
         } else {
             plan.compact = (1..layout.units.len()).collect();
@@ -1484,6 +1883,7 @@ async fn turn_started_and_edited_payload_projection_matches_history_without_even
         PreparedOperation {
             owner: "input-model-projection-owner".into(),
             execution_turn: "turn".into(),
+            user_initiated: true,
             source_projection: None,
             expected_checkpoint: None,
             summary_basis: None,
@@ -1568,6 +1968,7 @@ async fn turn_started_and_edited_payload_projection_matches_history_without_even
 
 #[derive(Clone, Copy)]
 enum Reply {
+    Invalid,
     Success,
     Transient,
     Hang,
@@ -1638,13 +2039,19 @@ impl Provider for ProviderFixture {
             .unwrap()
             .pop_front()
             .unwrap_or(Reply::Success);
+        let invalid = matches!(reply, Reply::Invalid);
         match reply {
             Reply::Transient => anyhow::bail!("synthetic rate limit"),
             Reply::Hang => std::future::pending::<()>().await,
-            Reply::Success => {}
+            Reply::Success | Reply::Invalid => {}
         }
         Ok(ChatResponse {
-            text: HEADINGS.iter().map(|h| format!("{h}\nState.\n")).collect(),
+            messages: Vec::new(),
+            text: if invalid {
+                "private invalid model response".into()
+            } else {
+                HEADINGS.iter().map(|h| format!("{h}\nState.\n")).collect()
+            },
             usage: None,
             termination: ProviderTermination::Complete,
             reasoning_content: None,
@@ -2131,12 +2538,16 @@ fn native_preflight_counts_the_projected_history_that_will_be_sent() {
     let selected = ModelBudget::new(Some(context), None, Some(128));
     let old = super::background_history::completed_history_request_projection(
         old.request,
+        vec![],
         selected.clone(),
     )
     .unwrap();
-    let new =
-        super::background_history::completed_history_request_projection(new.request, selected)
-            .unwrap();
+    let new = super::background_history::completed_history_request_projection(
+        new.request,
+        vec![],
+        selected,
+    )
+    .unwrap();
     assert!(
         !old.fits,
         "legacy duplicated history must exceed this fixture budget"
@@ -3041,6 +3452,7 @@ async fn legacy_frozen_failed_provider_observation_restores_portable_execution_a
         ]}),
     ));
     let payload = serde_json::to_string(&CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "failed-round".into(),
         termination: ProviderTermination::ProviderError,
@@ -3368,6 +3780,7 @@ async fn canonical_inputs_and_contexts_release_each_bounded_raw_payload_batch() 
             && sequence % 2 == 1
         {
             let envelope = CanonicalProviderRoundEnvelope {
+                ui_copies: None,
                 version: 1,
                 round_id: format!("large-round-{round}"),
                 termination: ProviderTermination::ToolCalls,
@@ -3467,6 +3880,294 @@ async fn canonical_inputs_and_contexts_release_each_bounded_raw_payload_batch() 
     let first = source_position("batched-context-2");
     let last = source_position("batched-context-130");
     assert!(first < last, "context order changed across payload batches");
+}
+
+async fn frozen_recapture_fixture() -> (CrudStore, Vec<pioneer_provider::ChatMessage>) {
+    // The runner fixture has an unbound legacy plan, which deliberately retains
+    // every manifest in its workspace. Capture/GC needs no runner or saved roots.
+    super::load_test_catalog();
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    Migrator::up(&db, None).await.unwrap();
+    let store = CrudStore::new(db);
+    let db = store.database_connection();
+    for sql in [
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    let payloads = [("first", "first answer"), ("second", "second answer")]
+        .into_iter()
+        .map(|(id, text)| {
+            serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+                ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: id.into(),
+                        text: text.into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+            ))
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for (index, payload) in payloads.iter().enumerate() {
+        let canonical: pioneer_crud::CanonicalTurnEventPayload =
+            serde_json::from_str(payload).unwrap();
+        let id = if index == 0 {
+            "source".to_owned()
+        } else {
+            format!("source-{index}")
+        };
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',?,?,?,CURRENT_TIMESTAMP)",
+            [id.into(), (index as i64 + 1).into(), canonical.event_type().into(), payload.clone().into()],
+        )).await.unwrap();
+    }
+    super::history::prepare_history(&store, "ws", "thread")
+        .await
+        .unwrap();
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    let messages = super::history::load_line_history(&store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 2);
+    (store, messages)
+}
+
+#[tokio::test]
+async fn frozen_equivalent_capture_verifies_selected_payloads_once_on_hit_and_miss() {
+    let (store, messages) = frozen_recapture_fixture().await;
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let observer = super::frozen::observe_store_restores(&store, "ws");
+    let first = super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages)
+        .await
+        .unwrap();
+    assert_eq!(observer.page_calls(), (1, 1));
+    assert_eq!(first.messages, messages);
+    assert!(first.frozen_hold.is_some());
+    let repeated = super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages)
+        .await
+        .unwrap();
+    assert_eq!(repeated.descriptor, first.descriptor);
+    assert_eq!(repeated.messages, first.messages);
+    assert_eq!(repeated.accepted_scopes, first.accepted_scopes);
+    assert!(repeated.frozen_hold.is_some());
+    assert_eq!(
+        observer.page_calls(),
+        (2, 2),
+        "hit must run each projection once"
+    );
+    // A different boundary still takes the ordinary new-manifest path.
+    let shorter = super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages[..1])
+        .await
+        .unwrap();
+    assert_ne!(shorter.descriptor.manifest_id, first.descriptor.manifest_id);
+    assert_eq!(shorter.messages, messages[..1]);
+    assert_eq!(observer.page_calls(), (3, 3));
+    assert_eq!(
+        super::frozen::restore(&store, "ws", &allowed, &first.descriptor)
+            .await
+            .unwrap(),
+        repeated.messages
+    );
+
+    // The hit must still check exact saved revisions, not return cached messages.
+    store.database_connection().execute_unprepared(
+        "UPDATE turn_event SET payload=replace(payload,'first answer','edited answer') WHERE id='source'"
+    ).await.unwrap();
+    assert!(
+        super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn frozen_equivalent_capture_rejects_corrupt_stored_references_without_fallback() {
+    use sea_orm::TransactionTrait;
+
+    for corruption in ["digest", "order", "count", "scope", "invalid", "bytes"] {
+        let (store, messages) = frozen_recapture_fixture().await;
+        let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+        let first = super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages)
+            .await
+            .unwrap();
+        let descriptor = first.descriptor.clone();
+        drop(first);
+        let mut references = store
+            .compaction_frozen_history_page("ws", "thread", &descriptor.manifest_id, 0)
+            .await
+            .unwrap();
+        let db = store.database_connection();
+        // Resolve physical backing just as the existing corruption regression does.
+        let backing: String = db.query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT source_manifest FROM compaction_frozen_span WHERE manifest_id=? AND kind=0 AND start<=0 AND end>0 LIMIT 1",
+            [descriptor.manifest_id.clone().into()],
+        )).await.unwrap().map(|row| row.try_get("", "source_manifest").unwrap())
+            .unwrap_or_else(|| descriptor.manifest_id.clone());
+        match corruption {
+            "count" => {
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "DELETE FROM compaction_frozen_message_data WHERE manifest_id=? AND ordinal=1",
+                    [backing.clone().into()],
+                ))
+                .await
+                .unwrap();
+            }
+            "bytes" => {
+                let update = Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE compaction_frozen_message_data SET bytes=bytes+1 WHERE manifest_id=? AND ordinal=0",
+                    [backing.clone().into()],
+                );
+                // Seed legacy corruption on one pinned writer connection, then
+                // restore CHECK enforcement before capture reads the manifest.
+                let tx = db.begin().await.unwrap();
+                tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
+                    .await
+                    .unwrap();
+                tx.execute_raw(update).await.unwrap();
+                tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+            }
+            _ => {
+                match corruption {
+                    "digest" => references[0].wire_sha256 = "0".repeat(64),
+                    "order" => references.swap(0, 1),
+                    "scope" => references[0].context_thread = Some("outside".into()),
+                    "invalid" => references[0].sources.clear(),
+                    _ => unreachable!(),
+                }
+                for (ordinal, reference) in references.iter().enumerate() {
+                    let json = serde_json::to_string(reference).unwrap();
+                    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                        "UPDATE compaction_frozen_message_data SET reference_json=?,bytes=? WHERE manifest_id=? AND ordinal=?",
+                        [json.clone().into(), (json.len() as i64).into(), backing.clone().into(), (ordinal as i64).into()],
+                    )).await.unwrap();
+                }
+            }
+        }
+        // The matching header is deliberately unchanged: lookup must find it.
+        assert_eq!(
+            store
+                .compaction_equivalent_frozen_history(
+                    "ws",
+                    "thread",
+                    &descriptor,
+                    0,
+                    pioneer_crud::compaction::EMPTY_FROZEN_IMPORT_SHA256,
+                )
+                .await
+                .unwrap(),
+            Some(descriptor.clone())
+        );
+        let observer = super::frozen::observe_store_restores(&store, "ws");
+        let error = super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages)
+            .await
+            .err()
+            .expect(corruption);
+        assert_eq!(observer.page_calls(), (0, 0), "{corruption}: {error:#}");
+        let count: i64 = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT count(*) AS n FROM compaction_frozen_history",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap();
+        assert_eq!(count, 1, "{corruption} silently created a replacement");
+    }
+}
+
+#[tokio::test]
+async fn frozen_equivalent_capture_holds_selected_manifest_through_handoff_and_cancellation() {
+    async fn sweep(store: &CrudStore) {
+        let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
+        for _ in 0..10_000 {
+            // Layout compaction alone does not expire manifests. Exercise the
+            // lifetime worker's expiry and physical cleanup phases here.
+            if !progress.quantum(store).await.unwrap() {
+                return;
+            }
+        }
+        panic!("fixture lifetime pass did not finish");
+    }
+    for outcome in ["return", "cancel", "error"] {
+        let (store, messages) = frozen_recapture_fixture().await;
+        let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+        let first = super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages)
+            .await
+            .unwrap();
+        let descriptor = first.descriptor.clone();
+        drop(first);
+        let observer = super::frozen::observe_store_restores(&store, "ws");
+        let (reached, resume) = observer.pause_next_execution_page();
+        let mut capture = Box::pin(super::frozen::capture_prepared(
+            &store, "ws", "thread", &allowed, &messages,
+        ));
+        tokio::select! {
+            _ = reached.notified() => {},
+            _ = &mut capture => panic!("capture did not pause at execution verification"),
+        }
+        sweep(&store).await;
+        drop(
+            store
+                .compaction_acquire_frozen_history("ws", &descriptor)
+                .await
+                .unwrap(),
+        );
+        if outcome == "cancel" {
+            // Dropping the request future must release the selected outer hold.
+            drop(capture);
+        } else {
+            if outcome == "error" {
+                // Mutate after literal verification, before execution reads the
+                // same exact revisions. Its error must release the outer hold.
+                store.database_connection().execute_unprepared(
+                    "UPDATE turn_event SET payload=replace(payload,'first answer','edited answer') WHERE id='source'"
+                ).await.unwrap();
+            }
+            resume.notify_one();
+            let result = capture.await;
+            if outcome == "error" {
+                assert!(result.is_err());
+            } else {
+                let prepared = result.unwrap();
+                assert_eq!(prepared.descriptor, descriptor);
+                assert_eq!(prepared.messages, messages);
+                sweep(&store).await;
+                drop(
+                    store
+                        .compaction_acquire_frozen_history("ws", &descriptor)
+                        .await
+                        .unwrap(),
+                );
+                drop(prepared);
+            }
+        }
+        sweep(&store).await;
+        assert!(
+            store
+                .compaction_acquire_frozen_history("ws", &descriptor)
+                .await
+                .is_err(),
+            "selected manifest retained after request/result drop ({outcome})"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3619,15 +4320,15 @@ async fn frozen_capture_rejects_foreign_scope_before_legacy_registration() {
         "UPDATE compaction_frozen_message_data SET reference_json=?,bytes=? WHERE manifest_id=? AND ordinal=0",
         [reference_json.clone().into(), (reference_json.len() as i64).into(), storage_manifest.into()],
     )).await.unwrap();
-    let held_writer = store.database_connection().begin().await.unwrap();
+    // Acquiring a read hold legitimately serializes with expiry. Scope rejection
+    // must precede legacy source registration, after that short acquisition.
     let restore_error = tokio::time::timeout(
         Duration::from_secs(1),
         super::frozen::restore(&store, "ws", &allowed, &descriptor),
     )
     .await
-    .expect("foreign restore waited for the serialized writer")
+    .expect("foreign restore must reject the scoped reference promptly")
     .unwrap_err();
-    held_writer.rollback().await.unwrap();
     assert!(
         restore_error
             .to_string()
@@ -3718,6 +4419,7 @@ async fn benchmark_frozen_capture_restore_and_compressed_runner() {
         "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES('operation',1,0,1,'thread',?,?,?)",
         [reference_only.scope.into(), reference_only.id.into(), reference_only.version.into()],
     )).await.unwrap();
+    seed_active_manifest_entries(&f.store, &[]).await;
     let config = serde_json::json!({
         "table":"turn_llm_context", "column":"payload", "compression_level":3,
         "dict_chooser":"'[nodict]'"
@@ -3816,12 +4518,39 @@ async fn fixture_with_canonical_payloads(
     target_fits: bool,
     observer_fails: bool,
 ) -> Fixture {
+    fixture_with_canonical_payloads_and_observer(
+        payloads,
+        replies,
+        target_fits,
+        observer_fails,
+        None,
+    )
+    .await
+}
+
+async fn fixture_with_canonical_payloads_and_observer(
+    payloads: Vec<String>,
+    replies: Vec<Reply>,
+    target_fits: bool,
+    observer_fails: bool,
+    database_observer: Option<Arc<HistoryReadObserver>>,
+) -> Fixture {
     assert!(!payloads.is_empty());
     super::load_test_catalog();
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
-    let store = CrudStore::new(db);
+    let store = if let Some(observer) = database_observer {
+        CrudStore::new(
+            pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+                db.clone(),
+                pioneer_sqlite::SqliteWriteExecutor::with_observer(db, observer.clone()),
+                observer,
+            ),
+        )
+    } else {
+        CrudStore::new(db)
+    };
     for sql in [
         "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
@@ -3873,9 +4602,9 @@ async fn fixture_with_canonical_payloads(
         plan: CompactionPlan {
             mode: CompactionMode::Normal,
             coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
-            compact: vec![],
+            compact: vec![0],
             retain: vec![],
-            coverage: vec![],
+            coverage: sources.clone(),
             fingerprint: "fixture-fingerprint".into(),
         },
     };
@@ -3950,6 +4679,43 @@ async fn fixture_with_canonical_payloads(
 // activates its operation. Seed the already-active snapshot directly: the
 // production append API intentionally rejects changes after activation.
 async fn seed_active_manifest_entries(store: &CrudStore, entries: &[ManifestEntry]) {
+    // Model the original raw admission along with its replaced fixture
+    // manifest. An empty admission denotes frozen mode, not a legacy raw plan.
+    let record = store
+        .compaction_operation("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.next_portion, 0);
+    let mut admitted_entries = store
+        .compaction_manifest_page("operation", false, 0, 0)
+        .await
+        .unwrap();
+    assert!(admitted_entries.len() < pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize);
+    admitted_entries.extend_from_slice(entries);
+    let mut snapshot: OperationSnapshot = serde_json::from_str(&record.snapshot).unwrap();
+    snapshot.plan.coverage = admitted_entries
+        .iter()
+        .filter(|entry| !entry.reference_only)
+        .map(|entry| entry.source.clone())
+        .collect();
+    snapshot.plan.compact = admitted_entries
+        .iter()
+        .filter(|entry| !entry.reference_only)
+        .map(|entry| entry.unit as usize)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let updated = store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_operation SET snapshot=? WHERE id='operation' AND next_portion=0",
+            [serde_json::to_string(&snapshot).unwrap().into()],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
     for entry in entries {
         store
             .database_connection()
@@ -4898,6 +5664,7 @@ async fn admission_resumes_exact_plan_without_resetting_deadline() {
     let mut prepared = PreparedOperation {
         owner: "admission-owner".into(),
         execution_turn: "turn".into(),
+        user_initiated: true,
         source_projection: Some(projection.clone()),
         expected_checkpoint: None,
         summary_basis: None,
@@ -4924,6 +5691,16 @@ async fn admission_resumes_exact_plan_without_resetting_deadline() {
     )
     .await
     .unwrap();
+    assert!(first.plan.compact.is_empty());
+    assert!(first.plan.retain.is_empty());
+    assert!(first.plan.coverage.is_empty());
+    assert_eq!(
+        f.store
+            .compaction_bound_source_projection(&first.id)
+            .await
+            .unwrap(),
+        Some(projection.clone())
+    );
     let recaptured = super::frozen::capture(&f.store, "ws", "thread", &allowed, &[])
         .await
         .unwrap();
@@ -5072,6 +5849,7 @@ async fn admission_and_runner_remove_technical_compact_and_reference_only_payloa
     let prepared = PreparedOperation {
         owner: "typed-admission-filter-owner".into(),
         execution_turn: "turn".into(),
+        user_initiated: true,
         source_projection: Some(projection),
         expected_checkpoint: None,
         summary_basis: None,
@@ -5484,7 +6262,20 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
             );
             continue;
         }
-        // Operation and state must roll back together if the second write fails.
+        let before_resume = f
+            .store
+            .compaction_runner_state("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        let operation_before_resume = f
+            .store
+            .compaction_operation("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before_resume.portion_attempts, 1);
+        // Operation, state and portion budget must roll back together if the second write fails.
         f.store.database_connection().execute_raw(Statement::from_string(DbBackend::Sqlite,
             "CREATE TRIGGER reject_resume BEFORE UPDATE ON compaction_runner_state BEGIN SELECT RAISE(ABORT,'fixture'); END"
         )).await.unwrap();
@@ -5502,6 +6293,35 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
                 .unwrap()
                 .status,
             "failed"
+        );
+        assert_eq!(
+            f.store
+                .compaction_runner_state("operation")
+                .await
+                .unwrap()
+                .unwrap(),
+            before_resume
+        );
+        let rolled_back = f
+            .store
+            .compaction_operation("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rolled_back.deadline_ms, operation_before_resume.deadline_ms);
+        assert_eq!(rolled_back.snapshot, operation_before_resume.snapshot);
+        assert_eq!(rolled_back.outcome, operation_before_resume.outcome);
+        assert_eq!(
+            (
+                rolled_back.attempts,
+                rolled_back.transient_retries,
+                rolled_back.correction
+            ),
+            (
+                operation_before_resume.attempts,
+                operation_before_resume.transient_retries,
+                operation_before_resume.correction
+            )
         );
         f.store
             .database_connection()
@@ -5535,6 +6355,12 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
             (before.attempts, before.retries, before.corrections)
         );
         assert_eq!(after.deadline_ms, resumed_deadline);
+        assert_eq!(after.portion_attempts, 0);
+        assert_eq!(after.target_tokens, before.target_tokens);
+        assert_eq!(
+            after.source_text_projection_version,
+            before.source_text_projection_version
+        );
         let snapshot = serde_json::from_str(
             &f.store
                 .compaction_operation("operation")
@@ -5887,6 +6713,39 @@ async fn interrupted_execution_turn_fences_summary_commit_before_service_cancell
 }
 
 #[tokio::test]
+async fn cli_message_delivery_evidence_includes_historical_checkpoint_coverage() {
+    let f = fixture("covered Message history", vec![], true, false).await;
+    let CompactionExit::Applied(head) = f.runner.run(CancellationToken::new()).await.unwrap()
+    else {
+        panic!("checkpoint missing");
+    };
+    // The saved checkpoint remains valid after deletion of its covered turn.
+    // Its direct SourceRef does not name that turn; historical coverage does.
+    f.store.database_connection().execute_unprepared(
+        "UPDATE turn SET status='completed',send_mode='message',message_revision=1,message_deleted_at=CURRENT_TIMESTAMP WHERE id='turn'",
+    ).await.unwrap();
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    let root = f
+        .store
+        .compaction_checkpoint_source("ws", "thread", &head)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!root.scope.ends_with(":turn"));
+    let turns =
+        super::frozen::provider_history_source_turns(&f.store, "ws", &[("thread".into(), root)])
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(turns.contains(&("thread".into(), "turn".into())));
+    assert!(!turns.contains(&("thread".into(), "later-unsent-message".into())));
+}
+
+#[tokio::test]
 async fn expected_head_does_not_force_a_projection_basis_after_historical_edit() {
     let f = fixture("old source", vec![], true, false).await;
     let CompactionExit::Applied(head) = f.runner.run(CancellationToken::new()).await.unwrap()
@@ -5901,6 +6760,7 @@ async fn expected_head_does_not_force_a_projection_basis_after_historical_edit()
     let prepared = PreparedOperation {
         owner: "owner".into(),
         execution_turn: "turn".into(),
+        user_initiated: true,
         source_projection: None,
         expected_checkpoint: Some(head.clone()),
         summary_basis: None,
@@ -6086,7 +6946,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     }
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('run-c','task-c','ws','thread','turn',?,CURRENT_TIMESTAMP)",
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('run-c','task-c','ws','thread','turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         [parent_projection_json.clone().into()],
     ))
     .await
@@ -6117,20 +6977,17 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     }
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('run-d','task-d','ws','thread','turn',?,CURRENT_TIMESTAMP)",
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('run-d','task-d','ws','thread','turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         [parent_projection_json.clone().into()],
     ))
     .await
     .unwrap();
-    let d_projection_json = super::frozen::capture_execution_basis_json(
-        &f.store,
-        "ws",
-        "context-d",
-        Some("turn-d"),
-        Some("turn-d"),
-        None,
+    let d_projection_json = serde_json::to_string(
+        &super::frozen::prepare_exact_task_fixture(&f.store, "ws", "context-d", "turn-d", None)
+            .await
+            .unwrap()
+            .descriptor,
     )
-    .await
     .unwrap();
     let d_projection: pioneer_compaction::frozen::FrozenHistoryRef =
         serde_json::from_str(&d_projection_json).unwrap();
@@ -7878,30 +8735,67 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     }
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('run-e','task-e','ws','thread','next-parent-turn',?,CURRENT_TIMESTAMP)",
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('run-e','task-e','ws','thread','next-parent-turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         [next_parent_projection_json.clone().into()],
     ))
     .await
     .unwrap();
-    let e_projection_json = super::frozen::capture_execution_basis_json(
-        &f.store,
-        "ws",
-        "context-e",
-        Some("turn-e"),
-        Some("turn-e"),
-        None,
-    )
-    .await
-    .unwrap();
-    let e_projection: pioneer_compaction::frozen::FrozenHistoryRef =
-        serde_json::from_str(&e_projection_json).unwrap();
-    let e_allowed =
-        super::frozen::accepted_history_scopes(&f.store, "ws", "context-e", &e_projection_json)
+    let e_projection =
+        super::frozen::prepare_task_history_for_execution(&f.store, "ws", "context-e", "turn-e")
             .await
+            .unwrap()
             .unwrap();
-    let e_history = super::frozen::restore(&f.store, "ws", &e_allowed, &e_projection)
+    let e_history = e_projection.messages.clone();
+    let e_imports = f
+        .store
+        .compaction_frozen_import_page("ws", "context-e", &e_projection.descriptor.manifest_id, 0)
         .await
         .unwrap();
+    assert!(
+        e_imports.iter().any(|grant| {
+            grant.source == retained_import.source
+                && grant.source_thread == retained_import.source_thread
+                && grant.output_ordinal == retained_import.output_ordinal
+        }),
+        "the uncovered accepted own output keeps its forwarded grant"
+    );
+    assert!(
+        e_imports
+            .iter()
+            .all(|grant| grant.source.id != output_summary.id),
+        "the parent's own checkpoint is inherited, not a delivered own import"
+    );
+    let parent_summary = e_history
+        .iter()
+        .find_map(|message| {
+            message.provenance.as_ref().filter(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == output_summary.id)
+            })
+        })
+        .expect("the accepted parent checkpoint remains represented");
+    assert!(parent_summary.inherited);
+    assert!(e_history.iter().all(|message| {
+        let origin = message.provenance.as_ref().unwrap();
+        origin
+            .context_thread
+            .as_deref()
+            .unwrap_or(&origin.thread_id)
+            == "context-e"
+            || origin.inherited
+    }));
+    assert!(e_history.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            !origin.inherited
+                && origin.context_thread.as_deref() == Some("context-e")
+                && origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == d_retained_source.id)
+        })
+    }));
     assert_eq!(
         e_history
             .iter()
@@ -7916,17 +8810,40 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
             .count(),
         1
     );
-    assert!(e_history.iter().all(|message| {
-        message
-            .provenance
-            .as_ref()
-            .unwrap()
-            .sources
-            .iter()
-            .all(|source| {
-                Some(source.id.as_str()) != d_prepared.receipt.identity.checkpoint.as_deref()
+    let inherited_h = e_history
+        .iter()
+        .filter_map(|message| {
+            message.provenance.as_ref().filter(|origin| {
+                origin.sources.iter().any(|source| {
+                    Some(source.id.as_str()) == d_prepared.receipt.identity.checkpoint.as_deref()
+                })
             })
-    }));
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        inherited_h.len(),
+        1,
+        "frozen preparation must already reuse H's compatible checkpoint"
+    );
+    assert!(inherited_h[0].inherited);
+    assert!(
+        e_history.iter().all(|message| {
+            message
+                .provenance
+                .as_ref()
+                .unwrap()
+                .sources
+                .iter()
+                .all(|source| {
+                    !d_checkpoint.coverage.iter().any(|covered| {
+                        covered.scope == source.scope
+                            && covered.id == source.id
+                            && covered.version == source.version
+                    })
+                })
+        }),
+        "the reused checkpoint must not accompany raw covered H"
+    );
     let e_context = NativeContext {
         overflow_recovery: false,
         recovery_deadline_ms: None,
@@ -7941,7 +8858,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         events: Arc::new(ExecutionEventHub::new()),
         cancellation: CancellationToken::new(),
     };
-    let e_prepared = super::native::prepare_native_projection(
+    let e_prepared = super::native::prepare_native_projection_from_history(
         &f.store,
         &providers,
         &settings,
@@ -7960,12 +8877,9 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
             reasoning: None,
             compiled_prompt: None,
         },
-        None,
-        false,
+        e_projection,
         f.observer.clone(),
         f.clock.clone(),
-        Some(e_projection),
-        None,
     )
     .await
     .unwrap();
@@ -8234,15 +9148,12 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     // Production refresh recaptures the accepted Task basis for the current
     // execution and may replace it with the compatible WorkingContext K. K
     // remains inherited and therefore must not receive an OWN import record.
-    let execution_projection_json = super::frozen::capture_execution_basis_json(
-        &f.store,
-        "ws",
-        "context-c",
-        Some("turn-c"),
-        Some("turn-c"),
-        None,
+    let execution_projection_json = serde_json::to_string(
+        &super::frozen::prepare_exact_task_fixture(&f.store, "ws", "context-c", "turn-c", None)
+            .await
+            .unwrap()
+            .descriptor,
     )
-    .await
     .unwrap();
     let execution_projection: pioneer_compaction::frozen::FrozenHistoryRef =
         serde_json::from_str(&execution_projection_json).unwrap();
@@ -8285,6 +9196,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     // CLI must project the accepted raw snapshot before frame sizing, while
     // retaining its immutable authority and guarding only the sent summary.
     let mut cli_history = super::frozen::PreparedHistory {
+        frozen_hold: None,
         descriptor: frozen.clone(),
         messages: accepted.clone(),
         accepted_scopes: allowed.clone(),
@@ -8498,16 +9410,10 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
             .is_err(),
         "literal manifest verification must not invent a deleted raw source"
     );
-    let (recaptured_after_delete, covered_reads) =
-        super::history::with_payload_batch_stats(super::frozen::capture_execution_basis_prepared(
-            &f.store,
-            "ws",
-            "context-c",
-            Some("turn-c"),
-            Some("turn-c"),
-            None,
-        ))
-        .await;
+    let (recaptured_after_delete, covered_reads) = super::history::with_payload_batch_stats(
+        super::frozen::prepare_exact_task_fixture(&f.store, "ws", "context-c", "turn-c", None),
+    )
+    .await;
     let recaptured_after_delete = recaptured_after_delete
         .expect("WorkingContext checkpoint must replace the deleted accepted basis source");
     assert_eq!(
@@ -8574,11 +9480,25 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         assert_eq!(origin.sources[0].id, checkpoint.id);
         assert!(origin.inherited);
     }
+    assert!(
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM compaction_checkpoint WHERE id=?",
+                [checkpoint.id.clone().into()],
+            ))
+            .await
+            .is_err(),
+        "sealed historical identity must remain retained"
+    );
+    // Model an unavailable legacy summary without deleting its historical
+    // evidence. The actual sent reference must still invalidate continuity.
     f.store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "DELETE FROM compaction_checkpoint WHERE id=?",
+            "UPDATE compaction_checkpoint SET status='failed' WHERE id=?",
             [checkpoint.id.clone().into()],
         ))
         .await
@@ -8591,7 +9511,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
             &parent_projection_json,
         )
         .await
-        .expect("deleting the later summary must not rewrite the accepted Task boundary")
+        .expect("an unavailable later summary must not rewrite the accepted Task boundary")
     );
     assert!(
         !super::frozen::validate_direct_history_sources_current(
@@ -8905,6 +9825,33 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         .await
         .unwrap()
         .unwrap();
+    let published = f
+        .store
+        .compaction_checkpoint(&checkpoint_ref.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let admitted = f
+        .store
+        .compaction_operation(&published.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let original: OperationSnapshot = serde_json::from_str(&admitted.snapshot).unwrap();
+    assert!(!original.plan.compact.is_empty());
+    assert!(
+        published
+            .coverage
+            .iter()
+            .all(|source| original.plan.coverage.contains(source))
+    );
+    assert!(
+        f.store
+            .compaction_bound_source_projection(&published.operation_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let preparation_work = super::coverage::observe_preparation_work(&f.store, "ws");
     let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
     let mut resolver = super::coverage::CheckpointGraphResolver::default();
@@ -9340,22 +10287,39 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         "historical revision changes affected the published summary"
     );
     assert_eq!(f.provider.calls.lock().unwrap().len(), count);
-    f.store
+    let deletion = f
+        .store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "DELETE FROM compaction_checkpoint WHERE id=?",
             [checkpoint_ref.id.clone().into()],
         ))
-        .await
-        .unwrap();
+        .await;
+    assert!(
+        deletion
+            .unwrap_err()
+            .to_string()
+            .contains("sealed checkpoint retained"),
+        "published checkpoint identity must survive frozen input cleanup"
+    );
     assert!(
         resolver
             .resolve(&f.store, "ws", Some(&allowed), &checkpoint_ref)
             .await
             .unwrap()
+            .is_some(),
+        "rejected deletion invalidated the retained published root"
+    );
+    let mut missing_checkpoint = checkpoint_ref.clone();
+    missing_checkpoint.id = "missing-root-checkpoint".into();
+    assert!(
+        resolver
+            .resolve(&f.store, "ws", Some(&allowed), &missing_checkpoint)
+            .await
+            .unwrap()
             .is_none(),
-        "a cached graph invented a deleted root checkpoint"
+        "a cached graph invented a missing root checkpoint"
     );
 }
 
@@ -9413,7 +10377,7 @@ async fn prepared_graph_keeps_published_roots_after_historical_edit_and_delete()
             .database_connection()
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES (?,?,'ws','source-thread','source-turn',?,CURRENT_TIMESTAMP)",
+                "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES (?,?,'ws','source-thread','source-turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
                 [run.into(), task.into(), parent_json.clone().into()],
             ))
             .await
@@ -9441,12 +10405,11 @@ async fn prepared_graph_keeps_published_roots_after_historical_edit_and_delete()
             "delete-root-thread" => "delete-root-turn",
             _ => panic!("unexpected cross-thread root"),
         };
-        let accepted_basis = super::frozen::capture_execution_basis_prepared(
+        let accepted_basis = super::frozen::prepare_exact_task_fixture(
             &fixture.store,
             "ws",
             root_thread,
-            Some(execution_turn),
-            Some(execution_turn),
+            execution_turn,
             None,
         )
         .await
@@ -10067,6 +11030,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
             .await
             .unwrap();
         let envelope = CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: round.into(),
             termination: ProviderTermination::ToolCalls,
@@ -10383,10 +11347,15 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
     let snapshot = super::frozen::capture(&f.store, "ws", "thread", &allowed, &frozen)
         .await
         .unwrap();
-    let reused = super::frozen::capture(&f.store, "ws", "thread", &allowed, &frozen)
+    let observer = super::frozen::observe_store_restores(&f.store, "ws");
+    let reused = super::frozen::capture_prepared(&f.store, "ws", "thread", &allowed, &frozen)
         .await
         .unwrap();
-    assert_eq!(snapshot, reused);
+    assert_eq!(snapshot, reused.descriptor);
+    assert_eq!(reused.messages, frozen);
+    assert_eq!(observer.page_calls(), (1, 1));
+    drop(observer);
+    drop(reused);
     let descriptor_json = serde_json::to_string(&snapshot).unwrap();
     assert!(!descriptor_json.contains("original request"));
     assert!(!descriptor_json.contains("first completed result"));
@@ -10613,6 +11582,7 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
         }],
     );
     let envelope = CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "covered-round".into(),
         termination: ProviderTermination::ToolCalls,
@@ -10803,6 +11773,19 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
                     source: item_source.clone(),
                 },
             ],
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_activate_runner(
+            &operation.id,
+            &RunnerState::new(
+                operation.admission.deadline_ms,
+                &ModelBudget::new(None, None, None),
+                500,
+                None,
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -11000,6 +11983,7 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
         }],
     );
     let second_envelope = CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "new-round".into(),
         termination: ProviderTermination::ToolCalls,
@@ -12083,12 +13067,6 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         .await
         .unwrap()
         .unwrap();
-    let first_checkpoint = f
-        .store
-        .compaction_checkpoint(&first)
-        .await
-        .unwrap()
-        .unwrap();
     f.store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
@@ -12115,61 +13093,33 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         ))
         .await
         .unwrap();
-    f.store
-        .database_connection()
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "DELETE FROM compaction_checkpoint WHERE id=?",
-            [first.clone().into()],
-        ))
-        .await
-        .unwrap();
     assert!(
-        prepared_graph
-            .resolve(&f.store, "ws", Some(&allowed), &head_source)
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM compaction_checkpoint WHERE id=?",
+                [first.clone().into()],
+            ))
             .await
-            .unwrap()
-            .is_some(),
-        "deleting an ancestor invalidated the already prepared published head"
+            .is_err(),
+        "a sealed historical ancestor must remain durable"
     );
-    f.store
-        .database_connection()
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_operation SET status='running' WHERE id=?",
-            [first_checkpoint.operation_id.clone().into()],
-        ))
-        .await
-        .unwrap();
-    f.store
-        .compaction_save_candidate(&first_checkpoint, 0)
-        .await
-        .unwrap();
-    f.store
-        .database_connection()
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_checkpoint SET status='retained' WHERE id=?",
-            [first.clone().into()],
-        ))
-        .await
-        .unwrap();
-    f.store
-        .database_connection()
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_operation SET status='completed' WHERE id=?",
-            [first_checkpoint.operation_id.clone().into()],
-        ))
-        .await
-        .unwrap();
     assert!(
         prepared_graph
             .resolve(&f.store, "ws", Some(&allowed), &head_source)
             .await
             .unwrap()
             .is_some(),
-        "restoring historical metadata affected the published head"
+        "rejected ancestor deletion must preserve the prepared graph"
+    );
+    assert!(
+        super::coverage::CheckpointGraphResolver::default()
+            .resolve(&f.store, "ws", Some(&allowed), &head_source)
+            .await
+            .unwrap()
+            .is_some(),
+        "the full graph must also remain readable without the prepared cache"
     );
     let accepted_fence = at_sixty.unwrap();
     let raw =
@@ -12240,6 +13190,62 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
     assert!(excluded_turn.messages.iter().all(|message| {
         !message.content.contains("State through 100") && !message.content.contains("work 100")
     }));
+    // Unlike excluded_turn, the saved child-second cutoff also limits work
+    // inside an older parent turn. The newest whole checkpoint crosses it.
+    let cutoff = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() + 1, 0)
+        .unwrap()
+        .fixed_offset();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "UPDATE turn_event SET created_at=? WHERE turn_id='turn' AND json_extract(payload,'$.payload.item.id')>'work-060' AND json_extract(payload,'$.payload.item.id')<='work-100'",
+        [cutoff.into()],
+    )).await.unwrap();
+    let line = super::frozen::ConversationHistoryLine {
+        thread: "thread".into(),
+        before: Some(cutoff),
+        excluded_turn: None,
+        source_turn: None,
+        policy: None,
+    };
+    let current_outputs = super::delivered::AuthorizedOutputSet {
+        workspace: "ws".into(),
+        destination: "thread".into(),
+        branches: vec![],
+        checkpoint: Some(head.clone()),
+        fence: f.store.compaction_history_read_fence().await.unwrap(),
+        source_epochs: std::collections::BTreeMap::from([(
+            "thread".into(),
+            f.store
+                .compaction_projection_version("ws", "thread")
+                .await
+                .unwrap(),
+        )]),
+        authorization_revision: 0,
+    };
+    let bounded = super::frozen::capture_conversation_lines_prepared(
+        &f.store,
+        "ws",
+        &[line],
+        &[Some(&current_outputs)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(bounded.expected_checkpoint.as_deref(), Some(head.as_str()));
+    assert_eq!(bounded.checkpoint.as_deref(), Some(first.as_str()));
+    assert!(
+        bounded
+            .messages
+            .iter()
+            .any(|message| message.content.contains("State through 40"))
+    );
+    assert!(
+        bounded
+            .messages
+            .iter()
+            .any(|message| message.content == "work 60")
+    );
+    assert!(!bounded.messages.iter().any(
+        |message| message.content == "work 61" || message.content.contains("State through 100")
+    ));
     let raw_n = raw
         .iter()
         .find(|message| message.content.contains("new work after checkpoint H"))
@@ -12738,12 +13744,99 @@ async fn native_media_preparation_materializes_full_request_without_main_provide
 }
 
 #[tokio::test]
-async fn nested_task_basis_uses_accepted_h_manifest_without_live_ancestor_append() {
+async fn internal_capsule_lineage_is_not_a_task_history_boundary() {
+    let f = fixture("root must not be inherited", vec![], true, false).await;
+    let db = f.store.database_connection();
+    for sql in [
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('internal','ws','','agent','fixture','fixture','active','system','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at,origin_kind,created_by_thread_id,created_by_turn_id) VALUES ('internal','thread','thread',1,CURRENT_TIMESTAMP,'agent_action','thread','turn')",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('internal-turn','internal','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('internal-input','internal-turn',0,'text','internal own','{"type":"text","text":"internal own"}',CURRENT_TIMESTAMP)"#,
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    let internal = super::frozen::capture_execution_basis_prepared(
+        &f.store, "ws", "internal", None, None, None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(internal.messages.len(), 1);
+    assert_eq!(internal.messages[0].content, "internal own");
+    assert!(!internal.messages[0].provenance.as_ref().unwrap().inherited);
+    assert!(
+        super::frozen::capture_execution_basis_prepared(
+            &f.store, "other", "internal", None, None, None
+        )
+        .await
+        .is_err()
+    );
+    // Task lineage without its real run must still fail, not turn into the
+    // normal internal-thread case just because no Task rows were found.
+    db.execute_unprepared("UPDATE thread_lineage SET origin_kind='task_run' WHERE child_thread_id='internal'; UPDATE thread SET origin_kind='task_run' WHERE id='internal'").await.unwrap();
+    assert!(
+        super::frozen::capture_execution_basis_prepared(
+            &f.store, "ws", "internal", None, None, None
+        )
+        .await
+        .is_err()
+    );
+    db.execute_unprepared("UPDATE thread_lineage SET origin_kind='agent_action' WHERE child_thread_id='internal'; UPDATE thread SET origin_kind='system' WHERE id='internal'").await.unwrap();
+    for sql in [
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('internal-task-child','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at,origin_kind) VALUES ('internal-task-child','internal','thread',1,CURRENT_TIMESTAMP,'task_run')",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('internal-task-turn','internal-task-child','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('internal-task-input','internal-task-turn',0,'text','task own','{"type":"text","text":"task own"}',CURRENT_TIMESTAMP)"#,
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('internal-task','ws','thread','internal','internal','internal-turn','agent','completed','Internal task','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('internal-run','internal-task','internal-run',1,1,'succeeded','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('internal-run-turn','internal-task','internal-run','internal-task-child','internal-task-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,frozen_manifest_id,created_at) VALUES ('internal-run','internal-task','ws','internal','internal-turn',?,?,CURRENT_TIMESTAMP)",
+        [serde_json::to_string(&internal.descriptor).unwrap().into(), internal.descriptor.manifest_id.clone().into()],
+    )).await.unwrap();
+    let child = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "internal-task-child",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        child
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>(),
+        ["internal own", "task own"]
+    );
+    assert!(child.messages[0].provenance.as_ref().unwrap().inherited);
+    db.execute_unprepared("UPDATE thread_lineage SET parent_thread_id='internal-task-child' WHERE child_thread_id='internal-task-child'").await.unwrap();
+    assert!(
+        super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "internal-task-child",
+            None,
+            None,
+            None
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn nested_conversation_uses_bounded_history_without_rewriting_task_input() {
     check_nested_task_basis(false).await;
 }
 
 #[tokio::test]
-async fn active_legacy_task_basis_continues_by_reference_without_rewriting_snapshot() {
+async fn legacy_task_input_replay_is_distinct_from_new_bounded_conversation() {
     check_nested_task_basis(true).await;
 }
 
@@ -12795,7 +13888,7 @@ async fn check_nested_task_basis(legacy: bool) {
         db.execute_unprepared(sql).await.unwrap();
     }
     db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('run','task','ws','thread','turn',?,CURRENT_TIMESTAMP)", [h.clone().into()])).await.unwrap();
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('run','task','ws','thread','turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture", [h.clone().into()])).await.unwrap();
     let child = f.store.get_thread_model("child").await.unwrap().unwrap();
     let mut child_turn = template.clone();
     child_turn.id = "child-turn".into();
@@ -12812,6 +13905,64 @@ async fn check_nested_task_basis(legacy: bool) {
         )
         .await
         .unwrap();
+    let child_started = f
+        .store
+        .compaction_child_history_parent("ws", "child")
+        .await
+        .unwrap()
+        .unwrap()
+        .started_at
+        .timestamp();
+    let branch_start = chrono::DateTime::from_timestamp(child_started, 0)
+        .unwrap()
+        .fixed_offset();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE turn_input SET created_at=? WHERE turn_id='child-turn'",
+        [(branch_start + chrono::Duration::milliseconds(100)).into()],
+    ))
+    .await
+    .unwrap();
+    f.store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "root-boundary-reply".into(),
+                    text: "ROOT_BOUNDARY_REPLY".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            child_started,
+        )
+        .await
+        .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "UPDATE turn_event SET created_at=? WHERE turn_id='turn' AND json_extract(payload,'$.payload.item.id')='root-boundary-reply'",
+        [format!("{}.800Z", branch_start.format("%Y-%m-%dT%H:%M:%S")).into()],
+    )).await.unwrap();
+    if legacy {
+        let literal = crate::turn_runtime_snapshot::restore_history_json(
+            &f.store,
+            "ws",
+            &BTreeSet::from(["thread".into(), "child".into()]),
+            &h,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            literal
+                .iter()
+                .filter(|message| message.content == "independent identical observation")
+                .count(),
+            2,
+            "exact legacy Task replay retains its accepted array"
+        );
+    }
     let late_parent_body = format!("ancestor append after admission {}", "z".repeat(256_000));
     let mut later = template.clone();
     later.id = "later-root".into();
@@ -12828,6 +13979,7 @@ async fn check_nested_task_basis(legacy: bool) {
         )
         .await
         .unwrap();
+    db.execute_unprepared("UPDATE turn SET created_at=datetime((SELECT created_at FROM turn WHERE id='child-turn'),'+1 second') WHERE id='later-root'; UPDATE turn_input SET created_at=(SELECT created_at FROM turn WHERE id='later-root') WHERE turn_id='later-root'; UPDATE turn_event SET created_at=(SELECT created_at FROM turn WHERE id='later-root') WHERE turn_id='later-root'").await.unwrap();
     let (nested, capture_payload_reads) =
         super::history::with_payload_batch_stats(super::frozen::capture_execution_basis_json(
             &f.store,
@@ -12880,17 +14032,14 @@ async fn check_nested_task_basis(legacy: bool) {
                 .iter()
                 .filter(|message| message.content == "independent identical observation")
                 .count(),
-            2
+            0
         );
         assert!(!nested.contains("accepted root H"));
         assert!(
             history
                 .iter()
                 .filter(|message| message.content == "accepted root H")
-                .all(
-                    |message| message.provenance.as_ref().unwrap().sources[0].scope
-                        == "task-basis:run"
-                )
+                .all(|message| message.provenance.as_ref().unwrap().thread_id == "thread")
         );
         let mut hydrated = history.clone();
         super::frozen::hydrate_accepted_own(
@@ -12909,8 +14058,8 @@ async fn check_nested_task_basis(legacy: bool) {
                 .iter()
                 .filter(|message| message.content == "independent identical observation")
                 .count(),
-            2,
-            "duplicate legacy provenance entries remain distinct after new capture and hydration"
+            0,
+            "a new conversation does not inherit opaque copies of an old Task array"
         );
     }
 
@@ -12957,19 +14106,149 @@ async fn check_nested_task_basis(legacy: bool) {
         )
         .await
         .unwrap();
+    let manual_prepared = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "child",
+        Some("child-manual-turn"),
+        Some("child-manual-turn"),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        super::frozen::execution_history_scopes(
+        manual_prepared.accepted_scopes,
+        BTreeSet::from(["thread".into(), "child".into()])
+    );
+    let providers = pioneer_provider::ProviderRegistry::new(|_| "fixture-key".into());
+    providers
+        .insert("main-fixture", Arc::new(SmallWindowMain))
+        .unwrap();
+    let native_context = pioneer_agent::compaction::controller::NativeContext {
+        overflow_recovery: false,
+        recovery_deadline_ms: None,
+        workspace_id: "ws".into(),
+        thread_id: "child".into(),
+        turn_id: "child-manual-turn".into(),
+        conversation_thread_id: None,
+        provider_instance: "main-fixture".into(),
+        provider: providers
+            .get_or_create_for_workspace("ws", "main-fixture")
+            .unwrap(),
+        events: Arc::new(ExecutionEventHub::new()),
+        cancellation: CancellationToken::new(),
+    };
+    let native_request = ChatRequest {
+        model: "gpt-4".into(),
+        messages: manual_prepared.messages.clone(),
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let native = super::native::prepare_native_projection_from_history(
+        &f.store,
+        &providers,
+        &CompactionSettings::default(),
+        &native_context,
+        native_request,
+        manual_prepared,
+        f.observer.clone(),
+        f.clock.clone(),
+    )
+    .await
+    .unwrap();
+    let parent_pos = native
+        .request
+        .messages
+        .iter()
+        .position(|message| message.content == "ROOT_BOUNDARY_REPLY")
+        .unwrap();
+    let own_pos = native
+        .request
+        .messages
+        .iter()
+        .position(|message| message.content == "child own command")
+        .unwrap();
+    assert!(
+        parent_pos < own_pos,
+        "native preparation must preserve the ancestor prefix despite .800 > .100"
+    );
+    if !legacy {
+        // The same canonical .100 own / .800 inherited messages belong to an
+        // exact execution when its current turn has the durable Task binding.
+        // Attached routing deliberately supplies no conversation thread ID.
+        let task_turn = f.store.get_task_run_turn("rt").await.unwrap().unwrap();
+        let attached_hook = pioneer_agent::AgentTurnHookRuntimeContext::for_task_turn(
+            &task_turn.task_id,
+            pioneer_protocol::TaskAttachmentMode::Attached,
+            task_turn.kind,
+            "thread",
+        );
+        assert!(attached_hook.conversation_thread_id.is_none());
+        let mut task_context = native_context.clone();
+        task_context.turn_id = task_turn.turn_id.clone();
+        task_context.conversation_thread_id = attached_hook.conversation_thread_id;
+        let task_prepared = super::frozen::capture_execution_basis_prepared(
             &f.store,
             "ws",
             "child",
-            "child-manual-turn",
+            Some(&task_turn.turn_id),
+            Some("child-manual-turn"),
             None,
         )
         .await
-        .unwrap(),
-        BTreeSet::from(["thread".into(), "child".into()]),
-        "a manual follow-up must inherit the child's accepted basis scopes without importing a newer parent transcript"
-    );
+        .unwrap();
+        let task_request = ChatRequest {
+            messages: task_prepared.messages.clone(),
+            ..native.request.clone()
+        };
+        assert!(
+            task_request
+                .messages
+                .iter()
+                .any(|message| message.content == "ROOT_BOUNDARY_REPLY"
+                    && message.provenance.as_ref().unwrap().inherited)
+        );
+        assert!(
+            task_request
+                .messages
+                .iter()
+                .any(|message| message.content == "child own command"
+                    && !message.provenance.as_ref().unwrap().inherited)
+        );
+        let task_native = super::native::prepare_native_projection_from_history(
+            &f.store,
+            &providers,
+            &CompactionSettings::default(),
+            &task_context,
+            task_request,
+            task_prepared,
+            f.observer.clone(),
+            f.clock.clone(),
+        )
+        .await
+        .unwrap();
+        let own_pos = task_native
+            .request
+            .messages
+            .iter()
+            .position(|message| message.content == "child own command")
+            .unwrap();
+        let inherited_pos = task_native
+            .request
+            .messages
+            .iter()
+            .position(|message| message.content == "ROOT_BOUNDARY_REPLY")
+            .unwrap();
+        assert!(
+            own_pos < inherited_pos,
+            "attached Task execution must retain creation order despite a Prepared projection and no conversation scope"
+        );
+    }
     for sql in [
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('grand','ws','','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('grand-task','ws','thread','child','child','child-turn','agent','running','Nested','fixture')",
@@ -12980,7 +14259,89 @@ async fn check_nested_task_basis(legacy: bool) {
         db.execute_unprepared(sql).await.unwrap();
     }
     db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('grand-run','grand-task','ws','child','child-turn',?,CURRENT_TIMESTAMP)", [nested.clone().into()])).await.unwrap();
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('grand-run','grand-task','ws','child','child-turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture", [nested.clone().into()])).await.unwrap();
+    let grand = f.store.get_thread_model("grand").await.unwrap().unwrap();
+    let mut grand_turn = template.clone();
+    grand_turn.id = "grand-turn".into();
+    f.store
+        .materialize_turn_start(
+            &grand,
+            SandboxMode::FullAccess,
+            &grand_turn,
+            &[UserInput::Text {
+                text: "grand input".into(),
+                text_elements: vec![],
+            }],
+            PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    let grand_second: i64 = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+        "SELECT CAST(strftime('%s',created_at) AS INTEGER)+2 AS at FROM turn WHERE id='child-turn'".to_owned()))
+        .await.unwrap().unwrap().try_get("", "at").unwrap();
+    let grand_start = chrono::DateTime::from_timestamp(grand_second, 0)
+        .unwrap()
+        .fixed_offset();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE turn SET created_at=? WHERE id='grand-turn'",
+        [grand_start.into()],
+    ))
+    .await
+    .unwrap();
+    for (offset, marker) in [
+        (0, "CHILD_IN_GRAND_SECOND"),
+        (1, "CHILD_AFTER_GRAND_SECOND"),
+    ] {
+        f.store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "child".into(),
+                    turn_id: "child-turn".into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: marker.into(),
+                        text: marker.into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                grand_second + offset,
+            )
+            .await
+            .unwrap();
+    }
+    let grand_context = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "grand",
+        Some("grand-turn"),
+        Some("grand-turn"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        grand_context
+            .messages
+            .iter()
+            .any(|message| message.content.contains("accepted root H"))
+    );
+    assert!(
+        grand_context
+            .messages
+            .iter()
+            .any(|message| message.content == "CHILD_IN_GRAND_SECOND")
+    );
+    assert!(
+        !grand_context
+            .messages
+            .iter()
+            .any(|message| message.content == "CHILD_AFTER_GRAND_SECOND"
+                || message.content.contains("ancestor append after admission")
+                || message.content == "grand input")
+    );
     let grand_scopes =
         super::frozen::execution_history_scopes(&f.store, "ws", "grand", "grand-turn", None)
             .await
@@ -13013,11 +14374,20 @@ async fn check_nested_task_basis(legacy: bool) {
     })
         .await
         .unwrap();
-    assert!(
+    let after_edit =
         crate::turn_runtime_snapshot::restore_history_json(&f.store, "ws", &grand_scopes, &nested)
-            .await
-            .is_err()
-    );
+            .await;
+    if legacy {
+        assert!(
+            after_edit.is_ok(),
+            "the new context has no reference to the old Task array"
+        );
+    } else {
+        assert!(
+            after_edit.is_err(),
+            "literal raw references still validate their source revisions"
+        );
+    }
     assert!(
         !super::frozen::execution_history_scopes(&f.store, "other", "child", "child-turn", None)
             .await
@@ -13578,10 +14948,11 @@ async fn compaction_compatible_input_overlap_keeps_exact_steering_rows_once() {
 }
 
 #[tokio::test]
-async fn capture_carries_foreign_own_authority_onto_late_summary() {
+async fn exact_task_grants_survive_summary_projection_independently_of_new_conversation() {
     use pioneer_agent::compaction::composition::ScopedHistorySource;
     use pioneer_compaction::runner::{RunnerState, SourceCursor};
     use pioneer_crud::compaction::{CommitOutcome, SourceAssertion};
+    use sea_orm::TransactionTrait;
 
     let f = fixture("unused", vec![], true, false).await;
     let db = f.store.database_connection();
@@ -13714,6 +15085,110 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
     )
     .await
     .unwrap();
+    // Equal reference identities with different ordered imports cannot reuse
+    // the same manifest. Recapturing with the same grants must select existing.
+    let allowed = std::collections::BTreeSet::from(["thread".into(), "own-source".into()]);
+    let unclaimed =
+        super::frozen::capture_prepared(&f.store, "ws", "thread", &allowed, &output_messages)
+            .await
+            .unwrap();
+    assert_eq!(
+        unclaimed.descriptor.identity_sha256,
+        parent_projection.descriptor.identity_sha256
+    );
+    assert_ne!(
+        unclaimed.descriptor.manifest_id,
+        parent_projection.descriptor.manifest_id
+    );
+    let observer = super::frozen::observe_store_restores(&f.store, "ws");
+    let repeated = super::frozen::capture_with_imports_prepared(
+        &f.store,
+        "ws",
+        "thread",
+        &allowed,
+        &output_messages,
+        &imports,
+        super::coverage::CheckpointGraphResolver::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated.descriptor, parent_projection.descriptor);
+    assert_eq!(repeated.messages, parent_projection.messages);
+    assert_eq!(observer.page_calls(), (1, 1));
+    drop(observer);
+    drop(repeated);
+    drop(unclaimed);
+
+    // Authenticate actual stored proofs at their original message/output
+    // ordinals, even though lookup sees an unchanged matching import header.
+    let records = f
+        .store
+        .compaction_frozen_import_page("ws", "thread", &parent_projection.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    let original = serde_json::to_string(&records[0]).unwrap();
+    let backing: String = db.query_one_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT source_manifest FROM compaction_frozen_span WHERE manifest_id=? AND kind=1 AND start<=0 AND end>0 LIMIT 1",
+        [parent_projection.descriptor.manifest_id.clone().into()],
+    )).await.unwrap().map(|row| row.try_get("", "source_manifest").unwrap())
+        .unwrap_or_else(|| parent_projection.descriptor.manifest_id.clone());
+    for corruption in ["message_ordinal", "output_ordinal", "source", "bytes"] {
+        let mut record = records[0].clone();
+        match corruption {
+            "message_ordinal" => record.message_ordinal = output_messages.len() as u64,
+            "output_ordinal" => record.output_ordinal += 1,
+            "source" => record.source.id = "not-the-imported-source".into(),
+            "bytes" => {}
+            _ => unreachable!(),
+        }
+        let json = serde_json::to_string(&record).unwrap();
+        let bytes = json.len() as i64 + i64::from(corruption == "bytes");
+        let update = Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_frozen_import_data SET proof_json=?,bytes=? WHERE manifest_id=? AND ordinal=0",
+            [json.into(), bytes.into(), backing.clone().into()],
+        );
+        if corruption == "bytes" {
+            // Match CRUD's legacy-corruption fixtures: pin the writer and turn
+            // CHECK enforcement back on before exercising the restore path.
+            let tx = db.begin().await.unwrap();
+            tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
+                .await
+                .unwrap();
+            tx.execute_raw(update).await.unwrap();
+            tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        } else {
+            db.execute_raw(update).await.unwrap();
+        }
+        let observer = super::frozen::observe_store_restores(&f.store, "ws");
+        let error = super::frozen::capture_with_imports_prepared(
+            &f.store,
+            "ws",
+            "thread",
+            &allowed,
+            &output_messages,
+            &imports,
+            super::coverage::CheckpointGraphResolver::default(),
+        )
+        .await
+        .err()
+        .expect(corruption);
+        assert_eq!(observer.page_calls(), (0, 0), "{corruption}: {error:#}");
+        let count: i64 = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_frozen_history WHERE owner_thread='thread' AND identity_sha256=?",
+            [parent_projection.descriptor.identity_sha256.clone().into()],
+        )).await.unwrap().unwrap().try_get("", "n").unwrap();
+        assert_eq!(count, 2, "{corruption} silently created a replacement");
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "UPDATE compaction_frozen_import_data SET proof_json=?,bytes=? WHERE manifest_id=? AND ordinal=0",
+            [original.clone().into(), (original.len() as i64).into(), backing.clone().into()],
+        )).await.unwrap();
+    }
+
     let parent_json = serde_json::to_string(&parent_projection.descriptor).unwrap();
 
     async fn install_execution(db: &pioneer_sqlite::SqliteDatabase, id: &str, parent_json: &str) {
@@ -13741,7 +15216,7 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
         }
         db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            format!("INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('run-{id}','task-{id}','ws','thread','turn',?,CURRENT_TIMESTAMP)"),
+            format!("WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('run-{id}','task-{id}','ws','thread','turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture"),
             [parent_json.to_owned().into()],
         ))
         .await
@@ -13936,12 +15411,11 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
     );
     drop(graph_reads);
 
-    let capture = super::frozen::capture_execution_basis_prepared(
+    let capture = super::frozen::prepare_exact_task_fixture(
         &f.store,
         "ws",
         "consumer-one",
-        Some("turn-consumer-one"),
-        Some("turn-consumer-one"),
+        "turn-consumer-one",
         None,
     )
     .await
@@ -13999,34 +15473,15 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
         std::collections::BTreeSet::from([(source_a.clone(), 0), (source_b.clone(), 1)]),
         "checkpoint projection must preserve immutable output ordinals"
     );
-    // An output-aware capture can have no newly authorized delivery branches.
-    // The checkpoint already has accepted Task-basis proofs and must keep that
-    // authorization path instead of requesting a new delivery grant.
-    let mut accepted_output_epochs = capture.source_epochs.clone();
-    for (source_thread, epoch) in &mut accepted_output_epochs {
-        *epoch = f
-            .store
-            .compaction_projection_version("ws", source_thread)
-            .await
-            .unwrap();
-    }
-    let accepted_output_selection = super::delivered::AuthorizedOutputSet {
-        workspace: "ws".into(),
-        destination: "consumer-one".into(),
-        checkpoint: None,
-        fence: f.store.compaction_history_read_fence().await.unwrap(),
-        authorization_revision: 0,
-        source_epochs: accepted_output_epochs,
-        branches: vec![],
-    };
-    let recaptured = super::frozen::capture_execution_basis_prepared_with_outputs(
+    // Repeating the literal path needs no newly authorized delivery. It must
+    // preserve the old accepted grants even though a new conversation has no
+    // authority to treat them as its own work.
+    let recaptured = super::frozen::prepare_exact_task_fixture(
         &f.store,
         "ws",
         "consumer-one",
-        Some("turn-consumer-one"),
-        Some("turn-consumer-one"),
+        "turn-consumer-one",
         None,
-        Some(&accepted_output_selection),
     )
     .await
     .unwrap();
@@ -14041,8 +15496,44 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
             )
             .await
             .unwrap(),
-        carried,
-        "accepted checkpoint imports must survive output-aware recapture"
+        carried
+    );
+    let conversation = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "consumer-one",
+        Some("turn-consumer-one"),
+        Some("turn-consumer-one"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .any(|message| message.content.contains("accepted A"))
+    );
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .filter_map(|message| message.provenance.as_ref())
+            .filter(|origin| origin.thread_id != "consumer-one")
+            .all(|origin| origin.inherited)
+    );
+    assert!(
+        f.store
+            .compaction_frozen_import_page(
+                "ws",
+                "consumer-one",
+                &conversation.descriptor.manifest_id,
+                0,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+        "bounded conversation cannot promote old Task imports to its own grants"
     );
 
     async fn publish_capture(
@@ -14190,6 +15681,73 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
                 .await
                 .unwrap()
         );
+        if execution == "consumer-one" {
+            // Forwarding keeps the original delivery acceptance, even when
+            // the current capture belongs to a child. A changed delivery
+            // target that disagrees with its acknowledgement remains invalid.
+            let record = fixture
+                .store
+                .compaction_frozen_import_page("ws", execution, &capture.descriptor.manifest_id, 0)
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            let db = fixture.store.database_connection();
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT target_thread_id FROM task_delivery WHERE id=?",
+                    [record.delivery_id.clone().into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            let target: String = row.try_get("", "target_thread_id").unwrap();
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE task_delivery SET target_thread_id=? WHERE id=?",
+                [execution.into(), record.delivery_id.clone().into()],
+            ))
+            .await
+            .unwrap();
+            let error = fixture
+                .store
+                .compaction_apply_runner(&snapshot.id, &ready, None)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("original accepted import binding mismatch"),
+                "{error:#}"
+            );
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT proof_version FROM compaction_checkpoint WHERE id=?",
+                    [checkpoint.id.clone().into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.try_get::<i64>("", "proof_version").unwrap(), 0);
+            assert_eq!(
+                fixture
+                    .store
+                    .compaction_head(&snapshot.owner)
+                    .await
+                    .unwrap(),
+                snapshot.expected_checkpoint
+            );
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE task_delivery SET target_thread_id=? WHERE id=?",
+                [target.into(), record.delivery_id.into()],
+            ))
+            .await
+            .unwrap();
+        }
         fixture
             .store
             .compaction_apply_runner(&snapshot.id, &ready, None)
@@ -14343,7 +15901,7 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
         }
         db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            format!("INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('run-{id}','task-{id}','ws','consumer-one','turn-consumer-one',?,CURRENT_TIMESTAMP)"),
+            format!("WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('run-{id}','task-{id}','ws','consumer-one','turn-consumer-one',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture"),
             [history_json.to_owned().into()],
         ))
         .await
@@ -14352,12 +15910,11 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
 
     let captured_json = serde_json::to_string(&capture.descriptor).unwrap();
     install_recapture(&db, "repeat-before-delete", &captured_json).await;
-    let repeated_before_delete = super::frozen::capture_execution_basis_prepared(
+    let repeated_before_delete = super::frozen::prepare_exact_task_fixture(
         &f.store,
         "ws",
         "repeat-before-delete",
-        Some("turn-repeat-before-delete"),
-        Some("turn-repeat-before-delete"),
+        "turn-repeat-before-delete",
         None,
     )
     .await
@@ -14414,12 +15971,11 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
     .unwrap();
     install_recapture(&db, "repeat-after-delete", &captured_json).await;
     let (repeated_after_delete, repeated_reads) =
-        super::history::with_payload_batch_stats(super::frozen::capture_execution_basis_prepared(
+        super::history::with_payload_batch_stats(super::frozen::prepare_exact_task_fixture(
             &f.store,
             "ws",
             "repeat-after-delete",
-            Some("turn-repeat-after-delete"),
-            Some("turn-repeat-after-delete"),
+            "turn-repeat-after-delete",
             None,
         ))
         .await;
@@ -14467,12 +16023,11 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
         .unwrap();
     install_execution(&db, "consumer-two", &parent_json).await;
     let (after_delete, reads) =
-        super::history::with_payload_batch_stats(super::frozen::capture_execution_basis_prepared(
+        super::history::with_payload_batch_stats(super::frozen::prepare_exact_task_fixture(
             &f.store,
             "ws",
             "consumer-two",
-            Some("turn-consumer-two"),
-            Some("turn-consumer-two"),
+            "turn-consumer-two",
             None,
         ))
         .await;
@@ -14573,12 +16128,11 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
     f.store.compaction_save_candidate(&wider, 0).await.unwrap();
     db.execute_unprepared("UPDATE compaction_checkpoint SET status='applied' WHERE id='late-own-summary-with-unaccepted-x'; UPDATE compaction_context SET head='late-own-summary-with-unaccepted-x' WHERE owner=(SELECT owner FROM compaction_checkpoint WHERE id='late-own-summary-with-unaccepted-x'); UPDATE compaction_operation SET status='completed',outcome='applied' WHERE id='late-own-summary-with-x-operation'").await.unwrap();
     install_execution(&db, "consumer-three", &parent_json).await;
-    let bounded = super::frozen::capture_execution_basis_prepared(
+    let bounded = super::frozen::prepare_exact_task_fixture(
         &f.store,
         "ws",
         "consumer-three",
-        Some("turn-consumer-three"),
-        Some("turn-consumer-three"),
+        "turn-consumer-three",
         None,
     )
     .await
@@ -14607,12 +16161,11 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
     .unwrap();
     install_execution(&db, "consumer-four", &parent_json).await;
     assert!(
-        super::frozen::capture_execution_basis_prepared(
+        super::frozen::prepare_exact_task_fixture(
             &f.store,
             "ws",
             "consumer-four",
-            Some("turn-consumer-four"),
-            Some("turn-consumer-four"),
+            "turn-consumer-four",
             None
         )
         .await
@@ -14627,6 +16180,7 @@ async fn publish_projection_checkpoint(
     id: &str,
     inputs: &[(String, SourceRef)],
     coverage_domain: pioneer_compaction::CoverageDomain,
+    projection: Option<&pioneer_compaction::frozen::FrozenHistoryRef>,
 ) -> Checkpoint {
     let owner = super::native::native_owner("ws", source_thread);
     let projection_version = f
@@ -14654,12 +16208,28 @@ async fn publish_projection_checkpoint(
     operation.projection_version = projection_version;
     operation.source_epochs = source_epochs;
     operation.plan.coverage_domain = coverage_domain;
+    operation.plan.compact = (0..inputs.len()).collect();
     operation.plan.coverage = inputs.iter().map(|(_, source)| source.clone()).collect();
     operation.plan.fingerprint = format!("{id}-plan");
-    f.store
-        .compaction_admit("ws", source_thread, &operation)
-        .await
-        .unwrap();
+    if let Some(projection) = projection {
+        let (_, execution_turn) = inputs[0].1.scope.split_once(':').unwrap();
+        let mut admitted = operation.clone();
+        admitted.plan.compact.clear();
+        admitted.plan.coverage.clear();
+        f.store
+            .compaction_admit_for_turn("ws", source_thread, &admitted, Some(execution_turn))
+            .await
+            .unwrap();
+        f.store
+            .compaction_bind_source_projection(&operation.id, projection)
+            .await
+            .unwrap();
+    } else {
+        f.store
+            .compaction_admit("ws", source_thread, &operation)
+            .await
+            .unwrap();
+    }
     f.store
         .compaction_prepare_runner(
             &operation.id,
@@ -14686,6 +16256,21 @@ async fn publish_projection_checkpoint(
         )
         .await
         .unwrap();
+    if projection.is_some() {
+        f.store
+            .compaction_activate_runner(
+                &operation.id,
+                &RunnerState::new(
+                    operation.admission.deadline_ms,
+                    &ModelBudget::new(None, None, None),
+                    500,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
     let checkpoint = Checkpoint {
         id: id.into(),
         operation_id: operation.id.clone(),
@@ -14720,6 +16305,1074 @@ async fn publish_projection_checkpoint(
         .await
         .unwrap();
     checkpoint
+}
+
+/// A terminal output exports OWN only. Its late mixed head becomes usable
+/// only after the recipient composes that output with the accepted parent H.
+#[tokio::test]
+async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
+    use pioneer_compaction::CoverageDomain;
+    use pioneer_protocol::{TaskAgentContextMode, TaskAgentContextPolicy};
+    use pioneer_provider::{
+        CanonicalProviderRoundEnvelope, ChatMessage, ProviderCallIdentity, ProviderRegistry,
+        ProviderToolCall,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    async fn install_child(f: &Fixture, suffix: &str, source_turn: &str) {
+        let created_at = if suffix == "producer" {
+            "2021-01-01T00:00:00Z"
+        } else {
+            "2025-01-01T00:00:00Z"
+        };
+        for sql in [
+            format!(
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('mixed-{suffix}','ws','','agent','gpt-4','main-fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('mixed-{suffix}','thread','thread',1,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('mixed-{suffix}-turn','mixed-{suffix}','completed','conversation','system','{created_at}',CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('mixed-{suffix}-task','ws','thread','thread','thread','{source_turn}','agent','running','Mixed checkpoint','fixture')"
+            ),
+            format!(
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('mixed-{suffix}-run','mixed-{suffix}-task','mixed-{suffix}-run',1,1,'running','agent')"
+            ),
+            format!(
+                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('mixed-{suffix}-run-turn','mixed-{suffix}-task','mixed-{suffix}-run','mixed-{suffix}','mixed-{suffix}-turn','initial',0,1,'in_progress',CURRENT_TIMESTAMP)"
+            ),
+        ] {
+            f.store
+                .database_connection()
+                .execute_unprepared(&sql)
+                .await
+                .unwrap();
+        }
+    }
+    async fn assistant(f: &Fixture, thread: &str, turn: &str, id: &str, text: &str) {
+        let created_at = match turn {
+            "mixed-producer-turn" => "2021-01-01T00:00:00Z",
+            "mixed-delivery-turn" => "2022-01-01T00:00:00Z",
+            "mixed-tail-turn" => "2023-01-01T00:00:00Z",
+            _ => panic!("unexpected fixture turn: {turn}"),
+        };
+        f.store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: id.into(),
+                        text: text.into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                chrono::DateTime::parse_from_rfc3339(created_at)
+                    .unwrap()
+                    .timestamp(),
+            )
+            .await
+            .unwrap();
+    }
+    fn sources(messages: &[ChatMessage]) -> BTreeSet<String> {
+        messages
+            .iter()
+            .flat_map(|message| message.provenance.iter())
+            .flat_map(|origin| &origin.sources)
+            .map(|source| source.id.clone())
+            .collect()
+    }
+
+    fn assert_tail_round(messages: &[ChatMessage], expected_sources: &[SourceRef]) {
+        let calls = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|call| call.id == "mixed-tail-call"))
+            })
+            .collect::<Vec<_>>();
+        let results = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.tool_call_id.as_deref() == Some("mixed-tail-call"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the uncovered tool call must survive exactly once"
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "the matching uncovered tool result must survive exactly once"
+        );
+        assert!(
+            calls[0].0 < results[0].0,
+            "the tool result must follow its call"
+        );
+        assert_eq!(results[0].1.content, "uncovered tool result");
+        let actual_sources = calls
+            .iter()
+            .chain(&results)
+            .flat_map(|(_, message)| &message.provenance.as_ref().unwrap().sources)
+            .map(|source| {
+                (
+                    source.scope.clone(),
+                    source.id.clone(),
+                    source.version.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let expected_sources = expected_sources
+            .iter()
+            .map(|source| {
+                (
+                    source.scope.clone(),
+                    source.id.clone(),
+                    source.version.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual_sources, expected_sources,
+            "the uncovered round must retain exact source identities"
+        );
+    }
+
+    let f = fixture("raw accepted H", vec![], true, false).await;
+    let db = f.store.database_connection();
+    // Context selection orders original source rows, not turn or delivery
+    // timestamps. Keep their chronology explicit even across second boundaries.
+    for sql in [
+        "UPDATE turn SET status='completed',created_at='2020-01-01T00:00:00Z' WHERE id='turn'",
+        "UPDATE turn_event SET created_at='2020-01-01T00:00:00Z' WHERE id='source'",
+        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('mixed-original','turn',0,'text','accepted question','{"type":"text","text":"accepted question"}','2020-01-01T00:00:00Z')"#,
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    super::history::prepare_history(&f.store, "ws", "thread")
+        .await
+        .unwrap();
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let accepted = super::history::load_task_line_history_turns(
+        &f.store,
+        "ws",
+        "thread",
+        &BTreeSet::from(["turn".into()]),
+        &fence,
+    )
+    .await
+    .unwrap();
+    assert_eq!(accepted.len(), 2);
+    let parent_snapshot = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &BTreeSet::from(["thread".into()]),
+        &accepted,
+    )
+    .await
+    .unwrap();
+    let parent_manifest = f
+        .store
+        .compaction_frozen_history_page("ws", "thread", &parent_snapshot.manifest_id, 0)
+        .await
+        .unwrap();
+
+    install_child(&f, "producer", "turn").await;
+    db.execute_unprepared(r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('mixed-copy','mixed-producer-turn',0,'text','accepted question','{"type":"text","text":"accepted question"}','2021-01-01T00:00:00Z')"#).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE task SET metadata_json=? WHERE id='mixed-producer-task'",
+        [task_input_launch_metadata("thread", "turn", "accepted question").into()],
+    ))
+    .await
+    .unwrap();
+    save_task_input_snapshot(
+        &f,
+        "mixed-producer-run",
+        "mixed-producer-task",
+        "thread",
+        "turn",
+        &parent_snapshot,
+    )
+    .await;
+    assistant(
+        &f,
+        "mixed-producer",
+        "mixed-producer-turn",
+        "mixed-own",
+        "raw completed own work",
+    )
+    .await;
+    let task_turn = f
+        .store
+        .get_task_run_turn("mixed-producer-run-turn")
+        .await
+        .unwrap()
+        .unwrap();
+    let output = super::frozen::capture_task_output(&f.store, "ws", &task_turn)
+        .await
+        .unwrap();
+    let output_manifest = f
+        .store
+        .compaction_frozen_history_page("ws", "mixed-producer", &output.history.manifest_id, 0)
+        .await
+        .unwrap();
+    assert!(
+        output_manifest
+            .iter()
+            .flat_map(|entry| &entry.sources)
+            .all(|source| { source.id != "source" && source.id != "mixed-original" }),
+        "terminal output must never re-export inherited H"
+    );
+    assert!(
+        output_manifest
+            .iter()
+            .flat_map(|entry| &entry.sources)
+            .any(|source| source.id == "mixed-copy")
+    );
+    for sql in [
+        "UPDATE task_run_turn SET status='candidate_created' WHERE id='mixed-producer-run-turn'",
+        "UPDATE task_run SET status='succeeded' WHERE id='mixed-producer-run'",
+        "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ('mixed-candidate','mixed-producer-task','mixed-producer-run','mixed-producer-run-turn','mixed-producer','mixed-producer-turn',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('mixed-delivery-turn','thread','completed','conversation','system','2022-01-01T00:00:00Z',CURRENT_TIMESTAMP)",
+        "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('mixed-delivery','ws','mixed-producer-task','mixed-producer-run','mixed-delivery','thread','origin_thread','thread','delivered',1,1,'mixed-delivery-turn')",
+        "INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ('mixed-delivery','mixed-candidate','mixed-producer-run-turn')",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('mixed-tail-turn','thread','completed','conversation','user','2023-01-01T00:00:00Z',CURRENT_TIMESTAMP)",
+        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('mixed-tail','mixed-tail-turn',0,'text','uncovered tail question','{"type":"text","text":"uncovered tail question"}','2023-01-01T00:00:00Z')"#,
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('mixed-composer-current','thread','in_progress','conversation','user','2024-01-01T00:00:00Z',CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    assistant(
+        &f,
+        "thread",
+        "mixed-delivery-turn",
+        &pioneer_protocol::task_delivery_result_item_id("mixed-delivery"),
+        "raw completed own work",
+    )
+    .await;
+    assistant(
+        &f,
+        "thread",
+        "mixed-tail-turn",
+        "mixed-tail-answer",
+        "uncovered tail answer",
+    )
+    .await;
+    // Read the persisted envelope so optional metadata added by newer providers
+    // uses its serde default, just as it does when restoring historical rounds.
+    let tail_round: CanonicalProviderRoundEnvelope = serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "round_id": "mixed-tail-round",
+        "termination": ProviderTermination::ToolCalls,
+        "message": ChatMessage::assistant_tool_calls(
+            None::<String>,
+            vec![ProviderToolCall {
+                id: "mixed-tail-call".into(),
+                name: "mixed_tail_tool".into(),
+                arguments: "{}".into(),
+            }],
+        ),
+        "calls": vec![ProviderCallIdentity {
+            provider_call_id: "mixed-tail-call".into(),
+            turn_item_id: "mixed-tail-tool-item".into(),
+            ordinal: 0,
+        }],
+    }))
+    .unwrap();
+    let tail_result = pioneer_tools::ToolResultView::Json {
+        value: serde_json::to_value(ChatMessage::tool_result(
+            "mixed-tail-call",
+            "mixed_tail_tool",
+            "uncovered tool result",
+        ))
+        .unwrap(),
+        truncated: false,
+    };
+    for (id, item, sequence, kind, payload) in [
+        (
+            "mixed-tail-round",
+            "mixed-tail-round",
+            1_i64,
+            "assistant_round",
+            serde_json::to_string(&tail_round).unwrap(),
+        ),
+        (
+            "mixed-tail-result",
+            "mixed-tail-tool-item",
+            2_i64,
+            "tool_result_v2",
+            serde_json::to_string(&tail_result).unwrap(),
+        ),
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?,'mixed-tail-turn',?,?,?,?,'{}','2023-01-01T00:00:00Z')",
+            [id.into(), item.into(), sequence.into(), kind.into(), payload.into()],
+        )).await.unwrap();
+    }
+    super::history::prepare_history(&f.store, "ws", "thread")
+        .await
+        .unwrap();
+    let delivery = f
+        .store
+        .compaction_delivery_output("ws", "mixed-delivery")
+        .await
+        .unwrap()
+        .unwrap();
+    let acknowledgement = f
+        .store
+        .compaction_source_page("ws", "thread", "mixed-delivery-turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let allowed: BTreeSet<String> = BTreeSet::from(["thread".into(), "mixed-producer".into()]);
+    let mut epochs = BTreeMap::new();
+    for thread in &allowed {
+        epochs.insert(
+            thread.clone(),
+            f.store
+                .compaction_projection_version("ws", thread)
+                .await
+                .unwrap(),
+        );
+    }
+    let outputs = super::delivered::AuthorizedOutputSet {
+        workspace: "ws".into(),
+        destination: "thread".into(),
+        checkpoint: None,
+        fence: f.store.compaction_history_read_fence().await.unwrap(),
+        authorization_revision: 0,
+        source_epochs: epochs,
+        branches: vec![super::delivered::AuthorizedOutputBranch {
+            snapshot: delivery.clone(),
+            acknowledgement: acknowledgement.clone(),
+            acknowledgements: vec![acknowledgement],
+            source_threads: BTreeSet::from(["mixed-producer".into()]),
+        }],
+    };
+    let raw_composer = super::frozen::capture_execution_basis_prepared_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("mixed-composer-current"),
+        Some("mixed-composer-current"),
+        None,
+        Some(&outputs),
+    )
+    .await
+    .unwrap();
+    assert!(sources(&raw_composer.messages).contains("mixed-original"));
+    assert!(!sources(&raw_composer.messages).contains("mixed-copy"));
+    let representative = raw_composer
+        .messages
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "mixed-original")
+            })
+        })
+        .unwrap()
+        .provenance
+        .as_ref()
+        .unwrap();
+    assert!(
+        representative.source_aliases.iter().any(|alias| {
+            alias.represented_thread_id == "thread"
+                && alias.represented_source.id == "mixed-original"
+                && alias.thread_id == "mixed-producer"
+                && alias.source.id == "mixed-copy"
+        }),
+        "the launch-copy correspondence must be saved as exact source evidence"
+    );
+    let raw_manifest = f
+        .store
+        .compaction_frozen_history_page("ws", "thread", &raw_composer.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    let raw_imports = f
+        .store
+        .compaction_frozen_import_page("ws", "thread", &raw_composer.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+
+    install_child(&f, "raw-consumer", "mixed-composer-current").await;
+    save_task_input_snapshot(
+        &f,
+        "mixed-raw-consumer-run",
+        "mixed-raw-consumer-task",
+        "thread",
+        "mixed-composer-current",
+        &raw_composer.descriptor,
+    )
+    .await;
+
+    // Publication occurs after both immutable output and recipient raw basis.
+    // K covers the producer's distinct input identity, requiring saved aliases
+    // when the recipient presents the original canonical input instead.
+    let copy = output_manifest
+        .iter()
+        .flat_map(|entry| &entry.sources)
+        .find(|source| source.id == "mixed-copy")
+        .unwrap()
+        .clone();
+    let own = output_manifest
+        .iter()
+        .flat_map(|entry| &entry.sources)
+        .find(|source| source.id != "mixed-copy")
+        .unwrap()
+        .clone();
+    let inherited = parent_manifest
+        .iter()
+        .flat_map(|entry| &entry.sources)
+        .find(|source| source.id == "source")
+        .unwrap()
+        .clone();
+    let output_messages = super::frozen::restore(&f.store, "ws", &allowed, &output.history)
+        .await
+        .unwrap();
+    let mut publication_messages = accepted.clone();
+    publication_messages.extend(output_messages);
+    let publication_projection = super::frozen::capture(
+        &f.store,
+        "ws",
+        "mixed-producer",
+        &allowed,
+        &publication_messages,
+    )
+    .await
+    .unwrap();
+    let checkpoint = publish_projection_checkpoint(
+        &f,
+        "mixed-producer",
+        "late-mixed-working-context",
+        &[
+            ("mixed-producer".into(), copy.clone()),
+            ("thread".into(), inherited),
+            ("mixed-producer".into(), own),
+        ],
+        CoverageDomain::WorkingContext,
+        Some(&publication_projection),
+    )
+    .await;
+    let checkpoint_source = f
+        .store
+        .compaction_checkpoint_source("ws", "mixed-producer", &checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let composed = super::frozen::capture_execution_basis_prepared_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("mixed-composer-current"),
+        Some("mixed-composer-current"),
+        None,
+        Some(&outputs),
+    )
+    .await
+    .unwrap();
+    let mut expected = BTreeSet::from([
+        checkpoint.id.clone(),
+        "mixed-tail".into(),
+        f.store
+            .compaction_source_page("ws", "thread", "mixed-tail-turn", PagedSource::Event, 0)
+            .await
+            .unwrap()
+            .entries[0]
+            .reference
+            .id
+            .clone(),
+    ]);
+    let tail_sources = f
+        .store
+        .compaction_source_page(
+            "ws",
+            "thread",
+            "mixed-tail-turn",
+            PagedSource::ProviderContext,
+            0,
+        )
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|entry| entry.reference)
+        .collect::<Vec<_>>();
+    assert_eq!(tail_sources.len(), 2);
+    expected.extend(tail_sources.iter().map(|source| source.id.clone()));
+    assert_tail_round(&composed.messages, &tail_sources);
+    assert_eq!(
+        sources(&composed.messages),
+        expected,
+        "Composer must replace the whole covered H + OWN boundary"
+    );
+    let summary = composed
+        .messages
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == checkpoint.id)
+            })
+        })
+        .unwrap();
+    let origin = summary.provenance.as_ref().unwrap();
+    assert_eq!(
+        origin.sources,
+        vec![pioneer_provider::MessageSourceRef {
+            scope: checkpoint_source.scope.clone(),
+            id: checkpoint_source.id.clone(),
+            version: checkpoint_source.version.clone(),
+        }]
+    );
+    assert!(
+        origin.inherited,
+        "mixed WorkingContext must not acquire OWN authority from delivery grants"
+    );
+    assert_eq!(
+        composed
+            .messages
+            .iter()
+            .filter(
+                |message| message.provenance.as_ref().is_some_and(|origin| origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == checkpoint.id))
+            )
+            .count(),
+        1
+    );
+    assert!(
+        composed
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("raw accepted H")
+                && !message.content.contains("raw completed own work")
+                && message.content != "accepted question")
+    );
+    assert_eq!(
+        f.store
+            .compaction_task_output("ws", "mixed-producer-run-turn")
+            .await
+            .unwrap()
+            .unwrap(),
+        output
+    );
+    assert_eq!(
+        f.store
+            .compaction_delivery_output("ws", "mixed-delivery")
+            .await
+            .unwrap()
+            .unwrap(),
+        delivery
+    );
+    assert_eq!(
+        f.store
+            .compaction_frozen_history_page("ws", "thread", &parent_snapshot.manifest_id, 0)
+            .await
+            .unwrap(),
+        parent_manifest
+    );
+    assert_eq!(
+        f.store
+            .compaction_frozen_history_page("ws", "thread", &raw_composer.descriptor.manifest_id, 0)
+            .await
+            .unwrap(),
+        raw_manifest
+    );
+    assert_eq!(
+        f.store
+            .compaction_frozen_import_page("ws", "thread", &raw_composer.descriptor.manifest_id, 0)
+            .await
+            .unwrap(),
+        raw_imports
+    );
+    assert_eq!(
+        f.store
+            .compaction_frozen_history_page("ws", "mixed-producer", &output.history.manifest_id, 0)
+            .await
+            .unwrap(),
+        output_manifest
+    );
+
+    install_child(&f, "consumer", "mixed-composer-current").await;
+    save_task_input_snapshot(
+        &f,
+        "mixed-consumer-run",
+        "mixed-consumer-task",
+        "thread",
+        "mixed-composer-current",
+        &composed.descriptor,
+    )
+    .await;
+    let last_one = TaskAgentContextPolicy {
+        mode: TaskAgentContextMode::LastNTurns,
+        max_turns: Some(1),
+        ..super::frozen::default_task_context_policy()
+    };
+    // A Task that already accepted the raw Composer basis receives the same
+    // compatible late representation without rewriting that literal snapshot.
+    let raw_child = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-raw-consumer",
+        "mixed-raw-consumer-turn",
+        Some(&last_one),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sources(&raw_child.messages), expected);
+    assert_eq!(raw_child.messages.len(), 5);
+    assert_tail_round(&raw_child.messages, &tail_sources);
+    assert!(
+        raw_child
+            .messages
+            .iter()
+            .all(|message| message.provenance.as_ref().unwrap().inherited)
+    );
+    let raw_again = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-raw-consumer",
+        "mixed-raw-consumer-turn",
+        Some(&last_one),
+    )
+    .await
+    .unwrap();
+    assert_eq!(raw_again.messages, raw_child.messages);
+    assert_eq!(
+        raw_again.descriptor.identity_sha256,
+        raw_child.descriptor.identity_sha256
+    );
+    let accepted_raw_binding = f
+        .store
+        .compaction_task_basis_snapshot("ws", "mixed-raw-consumer", "mixed-raw-consumer-turn")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        accepted_raw_binding.history_json,
+        serde_json::to_string(&raw_composer.descriptor).unwrap()
+    );
+    assert_eq!(f.store.compaction_frozen_history_page(
+        "ws", "thread", &raw_composer.descriptor.manifest_id, 0,
+    ).await.unwrap(), raw_manifest);
+
+    let child = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-consumer",
+        "mixed-consumer-turn",
+        Some(&last_one),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sources(&child.messages),
+        expected,
+        "last-N must see the projected summary before selecting the complete tail round"
+    );
+    assert_eq!(child.messages.len(), 5);
+    assert_tail_round(&child.messages, &tail_sources);
+    assert!(
+        child
+            .messages
+            .iter()
+            .all(|message| message.provenance.as_ref().unwrap().inherited)
+    );
+    let again = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-consumer",
+        "mixed-consumer-turn",
+        Some(&last_one),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.messages, child.messages);
+    assert_eq!(
+        again.descriptor.identity_sha256,
+        child.descriptor.identity_sha256
+    );
+    let raw_without_summary_policy = TaskAgentContextPolicy {
+        include_parent_summary: false,
+        max_turns: Some(20),
+        ..last_one.clone()
+    };
+    let raw_without_summary = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-raw-consumer",
+        "mixed-raw-consumer-turn",
+        Some(&raw_without_summary_policy),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sources(&raw_without_summary.messages),
+        sources(&raw_composer.messages),
+        "disabling summaries must retain every selected raw covered input rather than project K then discard it"
+    );
+    assert!(sources(&raw_without_summary.messages).contains("mixed-original"));
+    assert!(!sources(&raw_without_summary.messages).contains(&checkpoint.id));
+    assert!(
+        raw_without_summary
+            .messages
+            .iter()
+            .any(|message| message.content == "accepted question")
+    );
+    assert!(
+        raw_without_summary
+            .messages
+            .iter()
+            .any(|message| message.content == "raw completed own work")
+    );
+
+    for (mode, include, expected_ids) in [
+        (
+            TaskAgentContextMode::LastNTurns,
+            false,
+            expected
+                .iter()
+                .filter(|id| **id != checkpoint.id)
+                .cloned()
+                .collect(),
+        ),
+        (
+            TaskAgentContextMode::SummaryOnly,
+            true,
+            BTreeSet::from([checkpoint.id.clone()]),
+        ),
+        (TaskAgentContextMode::SummaryOnly, false, BTreeSet::new()),
+        (TaskAgentContextMode::Empty, true, BTreeSet::new()),
+        (TaskAgentContextMode::Custom, true, BTreeSet::new()),
+    ] {
+        let policy = TaskAgentContextPolicy {
+            mode,
+            include_parent_summary: include,
+            custom_context: None,
+            ..last_one.clone()
+        };
+        for (thread, turn) in [
+            ("mixed-consumer", "mixed-consumer-turn"),
+            ("mixed-raw-consumer", "mixed-raw-consumer-turn"),
+        ] {
+            let selected = super::frozen::prepare_exact_task_fixture(
+                &f.store,
+                "ws",
+                thread,
+                turn,
+                Some(&policy),
+            )
+            .await
+            .unwrap();
+            // Raw and projected bases both end with the uncovered tail;
+            // Last-N must retain its complete tool round in either case.
+            if mode == TaskAgentContextMode::LastNTurns {
+                assert_tail_round(&selected.messages, &tail_sources);
+            }
+            assert_eq!(
+                sources(&selected.messages),
+                expected_ids,
+                "policy on {thread}"
+            );
+        }
+    }
+
+    let providers = ProviderRegistry::new(|_| "fixture-key".into());
+    providers
+        .insert("summary-fixture", f.provider.clone())
+        .unwrap();
+    providers
+        .insert("main-fixture", Arc::new(SmallWindowMain))
+        .unwrap();
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-fixture".into(),
+            model: "summary-model".into(),
+            effort: None,
+        }),
+    };
+    let context = pioneer_agent::compaction::controller::NativeContext {
+        overflow_recovery: false,
+        recovery_deadline_ms: None,
+        workspace_id: "ws".into(),
+        thread_id: "mixed-consumer".into(),
+        turn_id: "mixed-consumer-turn".into(),
+        conversation_thread_id: Some("thread".into()),
+        provider_instance: "main-fixture".into(),
+        provider: providers
+            .get_or_create_for_workspace("ws", "main-fixture")
+            .unwrap(),
+        events: Arc::new(ExecutionEventHub::new()),
+        cancellation: CancellationToken::new(),
+    };
+    let mut request_messages = child.messages.clone();
+    request_messages.push(ChatMessage::user("new protected consumer input"));
+    let prepared = super::native::prepare_native_projection(
+        &f.store,
+        &providers,
+        &settings,
+        &context,
+        ChatRequest {
+            model: "gpt-4".into(),
+            messages: request_messages,
+            temperature: None,
+            max_tokens: Some(512),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        },
+        None,
+        false,
+        f.observer.clone(),
+        f.clock.clone(),
+        Some(child.descriptor),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(sources(&prepared.request.messages), expected);
+    assert_tail_round(&prepared.request.messages, &tail_sources);
+    assert!(
+        prepared
+            .request
+            .messages
+            .iter()
+            .any(|message| message.content == "new protected consumer input")
+    );
+    assert_eq!(
+        prepared
+            .request
+            .messages
+            .iter()
+            .filter(
+                |message| message.provenance.as_ref().is_some_and(|origin| origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == checkpoint.id))
+            )
+            .count(),
+        1
+    );
+    assert!(
+        f.provider.calls.lock().unwrap().is_empty(),
+        "a fitting request with reused K must not ask the summarizer to recompress H"
+    );
+
+    // The same accepted composition can contain a separately authorized OWN
+    // checkpoint. A later mixed head may consume that atomic root only when
+    // its published graph names the exact root, and must remain inherited.
+    let mut own_publication = super::frozen::restore(&f.store, "ws", &allowed, &output.history)
+        .await
+        .unwrap();
+    own_publication.extend(accepted.clone());
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut own_publication)
+        .await
+        .unwrap();
+    own_publication
+        .retain(|message| message.provenance.as_ref().unwrap().thread_id == "mixed-producer");
+    let own_projection =
+        super::frozen::capture(&f.store, "ws", "mixed-producer", &allowed, &own_publication)
+            .await
+            .unwrap();
+    let own_source = output_manifest
+        .iter()
+        .flat_map(|entry| &entry.sources)
+        .find(|source| source.id != "mixed-copy")
+        .unwrap()
+        .clone();
+    let own_checkpoint = publish_projection_checkpoint(
+        &f,
+        "mixed-producer",
+        "accepted-pure-own-checkpoint",
+        &[
+            ("mixed-producer".into(), copy),
+            ("mixed-producer".into(), own_source),
+        ],
+        CoverageDomain::OwnContribution,
+        Some(&own_projection),
+    )
+    .await;
+    let own_root = f
+        .store
+        .compaction_checkpoint_source("ws", "mixed-producer", &own_checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let own_composer = super::frozen::capture_execution_basis_prepared_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("mixed-composer-current"),
+        Some("mixed-composer-current"),
+        None,
+        Some(&outputs),
+    )
+    .await
+    .unwrap();
+    assert!(sources(&own_composer.messages).contains(&own_checkpoint.id));
+    assert!(!sources(&own_composer.messages).contains("mixed-original"));
+    let own_imports = f
+        .store
+        .compaction_frozen_import_page("ws", "thread", &own_composer.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    let own_manifest = f
+        .store
+        .compaction_frozen_history_page("ws", "thread", &own_composer.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    // Grants keep the immutable output sources and ordinals. Their message
+    // ordinal binds those sources to the exact replacing checkpoint root.
+    let expected_own_grants = output_manifest
+        .iter()
+        .enumerate()
+        .flat_map(|(ordinal, entry)| {
+            entry
+                .sources
+                .iter()
+                .map(move |source| (entry.source_thread.clone(), source.clone(), ordinal as u64))
+        })
+        .filter(|(_, source, _)| own_checkpoint.coverage.contains(source))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected_own_grants.len(), own_checkpoint.coverage.len());
+    assert_eq!(own_imports.len(), expected_own_grants.len());
+    assert_eq!(
+        own_imports
+            .iter()
+            .map(|record| {
+                (
+                    record.source_thread.clone(),
+                    record.source.clone(),
+                    record.output_ordinal,
+                )
+            })
+            .collect::<BTreeSet<_>>(),
+        expected_own_grants,
+        "the accepted parent basis must preserve every exact immutable OWN output grant"
+    );
+    for record in &own_imports {
+        assert_eq!(record.delivery_id, delivery.delivery_id);
+        assert_eq!(record.candidate_id, delivery.candidate_id);
+        assert_eq!(record.output_manifest, output.history.manifest_id);
+        assert_eq!(record.acknowledgement, outputs.branches[0].acknowledgement);
+        assert_eq!(record.render_source(), &record.source);
+        let target = &own_manifest[usize::try_from(record.message_ordinal).unwrap()];
+        assert_eq!(target.source_thread, "mixed-producer");
+        assert_eq!(target.sources, vec![own_root.clone()]);
+        assert_eq!(target.context_thread.as_deref(), Some("thread"));
+        assert!(target.complete && !target.inherited && !target.protected_input);
+    }
+    install_child(&f, "own-consumer", "mixed-composer-current").await;
+    save_task_input_snapshot(
+        &f,
+        "mixed-own-consumer-run",
+        "mixed-own-consumer-task",
+        "thread",
+        "mixed-composer-current",
+        &own_composer.descriptor,
+    )
+    .await;
+    let inherited_source = parent_manifest
+        .iter()
+        .flat_map(|entry| &entry.sources)
+        .find(|source| source.id == "source")
+        .unwrap()
+        .clone();
+    // This standard helper's None path supplies synthetic applied historical
+    // checkpoint metadata. Runtime scope and accepted-boundary validation still
+    // run through the real frozen Task preparation below.
+    let mixed_own = publish_projection_checkpoint(
+        &f,
+        "mixed-producer",
+        "mixed-including-exact-own-root",
+        &[
+            ("mixed-producer".into(), own_root),
+            ("thread".into(), inherited_source),
+        ],
+        CoverageDomain::WorkingContext,
+        None,
+    )
+    .await;
+    let inherited_own = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-own-consumer",
+        "mixed-own-consumer-turn",
+        Some(&last_one),
+    )
+    .await
+    .unwrap();
+    let mut expected_mixed_own = expected.clone();
+    expected_mixed_own.remove(&checkpoint.id);
+    expected_mixed_own.insert(mixed_own.id.clone());
+    assert_eq!(sources(&inherited_own.messages), expected_mixed_own);
+    assert_eq!(inherited_own.messages.len(), 5);
+    assert_tail_round(&inherited_own.messages, &tail_sources);
+    assert!(
+        inherited_own
+            .messages
+            .iter()
+            .all(|message| message.provenance.as_ref().unwrap().inherited)
+    );
+    assert!(
+        f.store
+            .compaction_frozen_import_page(
+                "ws",
+                "mixed-own-consumer",
+                &inherited_own.descriptor.manifest_id,
+                0,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+        "mixed WorkingContext must not inherit the narrower OWN grants"
+    );
+    let own_again = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-own-consumer",
+        "mixed-own-consumer-turn",
+        Some(&last_one),
+    )
+    .await
+    .unwrap();
+    assert_eq!(own_again.messages, inherited_own.messages);
+    assert_eq!(
+        own_again.descriptor.identity_sha256,
+        inherited_own.descriptor.identity_sha256
+    );
+    assert_eq!(
+        f.store
+            .compaction_frozen_import_page("ws", "thread", &own_composer.descriptor.manifest_id, 0,)
+            .await
+            .unwrap(),
+        own_imports
+    );
+    assert!(f.provider.calls.lock().unwrap().is_empty());
 }
 
 struct ContainedCheckpointFixture {
@@ -14822,6 +17475,7 @@ async fn contained_checkpoint_fixture(
         &format!("summary-a-{b_thread}"),
         &[("thread".into(), source_a.clone())],
         coverage_domain,
+        None,
     )
     .await;
     let a_source = f
@@ -14839,6 +17493,7 @@ async fn contained_checkpoint_fixture(
             (b_thread.into(), source_b.clone()),
         ],
         coverage_domain,
+        None,
     )
     .await;
     let inherited = coverage_domain == pioneer_compaction::CoverageDomain::WorkingContext;
@@ -15131,6 +17786,7 @@ async fn accepted_frozen_restore_prefers_contained_working_checkpoint_with_equal
             &format!("equal-a-{child}"),
             &[("thread".into(), a_leaf)],
             pioneer_compaction::CoverageDomain::WorkingContext,
+            None,
         )
         .await;
         let a_source = f
@@ -15165,6 +17821,7 @@ async fn accepted_frozen_restore_prefers_contained_working_checkpoint_with_equal
             &format!("equal-b-{child}"),
             &[("thread".into(), a_source.clone())],
             pioneer_compaction::CoverageDomain::WorkingContext,
+            None,
         )
         .await;
         let b_source = f
@@ -15271,6 +17928,7 @@ async fn accepted_frozen_restore_applies_working_checkpoint_containing_inherited
             ("thread".into(), a_input.clone()),
         ],
         pioneer_compaction::CoverageDomain::OwnContribution,
+        None,
     )
     .await;
     let a_source = f
@@ -15358,6 +18016,7 @@ async fn accepted_frozen_restore_applies_working_checkpoint_containing_inherited
         "cross-domain-working-b",
         &[("thread".into(), a_source.clone())],
         pioneer_compaction::CoverageDomain::WorkingContext,
+        None,
     )
     .await;
     let b_source = f
@@ -15412,6 +18071,7 @@ async fn accepted_frozen_restore_applies_working_checkpoint_containing_inherited
             ("nested-copy".into(), copy_input),
         ],
         pioneer_compaction::CoverageDomain::WorkingContext,
+        None,
     )
     .await;
     let bounded = super::frozen::restore_accepted_history_for_execution(
@@ -15468,6 +18128,7 @@ async fn accepted_checkpoint_projection_keeps_partial_and_independent_summaries(
             (partial_thread.into(), partial_source.clone()),
         ],
         pioneer_compaction::CoverageDomain::OwnContribution,
+        None,
     )
     .await;
     let independent = publish_projection_checkpoint(
@@ -15476,6 +18137,7 @@ async fn accepted_checkpoint_projection_keeps_partial_and_independent_summaries(
         "summary-independent",
         &[(independent_thread.into(), independent_source.clone())],
         pioneer_compaction::CoverageDomain::OwnContribution,
+        None,
     )
     .await;
     let raw = |thread: &str, unit: &str, source: &SourceRef| {
@@ -15577,6 +18239,7 @@ async fn absorbed_checkpoint_still_requires_its_exact_saved_revision() {
         "summary-outside-frozen-boundary",
         &[("thread".into(), a_source), ("child".into(), outside)],
         pioneer_compaction::CoverageDomain::OwnContribution,
+        None,
     )
     .await;
     let before_boundary_check = projected.clone();
@@ -15658,6 +18321,7 @@ async fn compaction_checkpoint_projects_accepted_foreign_own_dag_without_coverin
     let mut snapshot = f.runner.snapshot.clone();
     snapshot.id = "c-operation".into();
     snapshot.owner = "c-owner".into();
+    snapshot.plan.coverage = vec![a_source.clone()];
     snapshot.plan.fingerprint = "c-plan".into();
     f.store
         .compaction_admit("ws", "c", &snapshot)
@@ -15981,6 +18645,11 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
     mixed_snapshot.expected_checkpoint = Some(checkpoint.id.clone());
     mixed_snapshot.plan.coverage_domain = pioneer_compaction::CoverageDomain::WorkingContext;
     mixed_snapshot.plan.fingerprint = mixed_snapshot.id.clone();
+    mixed_snapshot.plan.coverage = vec![SourceRef {
+        scope: "event:turn".into(),
+        id: "accepted-h".into(),
+        version: "event-revision:1".into(),
+    }];
     f.store
         .compaction_admit("ws", "thread", &mixed_snapshot)
         .await
@@ -16077,12 +18746,33 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
         version: "event-revision:1".into(),
     }];
     later.summary = "work beyond the accepted boundary".into();
+    // Later work needs its own original admission, rather than expanding the
+    // already sealed child's assertion plan.
+    let mut later_snapshot = snapshot.clone();
+    later_snapshot.id = "later-child-operation".into();
+    later_snapshot.expected_checkpoint = Some(checkpoint.id.clone());
+    later_snapshot.plan.fingerprint = later_snapshot.id.clone();
+    later_snapshot.plan.coverage = later.coverage.clone();
+    later.operation_id = later_snapshot.id.clone();
+    f.store
+        .compaction_admit("ws", "thread", &later_snapshot)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(
+            &later.operation_id,
+            &ModelBudget::new(None, None, None),
+            1,
+            0,
+        )
+        .await
+        .unwrap();
     f.store
         .compaction_append_manifest(
             &later.operation_id,
             &[ManifestEntry {
-                ordinal: 1,
-                unit: 1,
+                ordinal: 0,
+                unit: 0,
                 reference_only: false,
                 thread_id: "thread".into(),
                 source: later.coverage[0].clone(),
@@ -16090,7 +18780,7 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
         )
         .await
         .unwrap();
-    f.store.compaction_save_candidate(&later, 1).await.unwrap();
+    f.store.compaction_save_candidate(&later, 0).await.unwrap();
     db.execute_unprepared(
         "UPDATE compaction_checkpoint SET status='applied' WHERE id='later-child-summary'",
     )
@@ -16215,11 +18905,13 @@ impl Summarizer for CleanupGateSummarizer {
 
 #[tokio::test]
 async fn service_cleanup_precedes_publication_backoff_and_stop_reconciliation() {
-    for scenario in 0..3 {
+    for scenario in 0..4 {
         let mut f = fixture(
             "completed history",
             vec![if scenario == 2 {
                 Reply::Hang
+            } else if scenario == 3 {
+                Reply::Invalid
             } else {
                 Reply::Success
             }],
@@ -16264,7 +18956,7 @@ async fn service_cleanup_precedes_publication_backoff_and_stop_reconciliation() 
         assert_eq!(*f.provider.count.borrow(), 1);
         assert!(!work.is_finished());
         cleanup.release.add_permits(1);
-        if scenario == 2 {
+        if scenario == 2 || scenario == 3 {
             wait_backoff(&f.store).await;
             cancel.cancel();
         }
@@ -16964,6 +19656,19 @@ async fn covered_input_rows_keep_their_mixed_ui_copy_suppressed_across_frozen_ro
         )
         .await
         .unwrap();
+    f.store
+        .compaction_activate_runner(
+            &operation.id,
+            &RunnerState::new(
+                operation.admission.deadline_ms,
+                &ModelBudget::new(None, None, None),
+                500,
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
     let checkpoint = Checkpoint {
         id: "covered-input-row-checkpoint".into(),
         operation_id: operation.id.clone(),
@@ -17553,6 +20258,19 @@ async fn covered_event_input_still_suppresses_its_uncovered_mixed_ui_copy() {
                 thread_id: "thread".into(),
                 source: source.clone(),
             }],
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_activate_runner(
+            &operation.id,
+            &RunnerState::new(
+                operation.admission.deadline_ms,
+                &ModelBudget::new(None, None, None),
+                500,
+                None,
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -18886,10 +21604,14 @@ struct StaleCommitTarget(CrudStore);
 #[async_trait]
 impl CompactionTarget for StaleCommitTarget {
     async fn fits(&self, _: &str) -> Result<bool> {
-        // Provider succeeded; invalidate only the selected revision before commit.
-        self.0.database_connection().execute_unprepared(
-            "UPDATE compaction_manifest SET source_version='stale' WHERE operation_id='operation'"
-        ).await?;
+        // Historical ownership is already closed. A competing control change
+        // still invalidates publication without rewriting the saved evidence.
+        self.0
+            .database_connection()
+            .execute_unprepared(
+                "UPDATE compaction_operation SET expected_head='stale-head' WHERE id='operation'",
+            )
+            .await?;
         Ok(true)
     }
 }
@@ -19027,6 +21749,7 @@ async fn new_task_output_ignores_cleanup_context_before_payload_and_aliases() {
         .unwrap();
     }
     let round = CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "allowed-round".into(),
         termination: ProviderTermination::ToolCalls,
@@ -19190,7 +21913,7 @@ async fn new_task_output_ignores_cleanup_context_before_payload_and_aliases() {
 }
 
 #[tokio::test]
-async fn accepted_task_policy_uses_composed_exact_source_order() {
+async fn conversation_policy_keeps_own_child_turn_after_bounded_ancestors() {
     let f = fixture("unused", vec![], true, false).await;
     for sql in [
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('policy-parent','ws','','agent','fixture','fixture','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
@@ -19255,20 +21978,23 @@ async fn accepted_task_policy_uses_composed_exact_source_order() {
     .await
     .unwrap();
     for (suffix, turn) in [("one", "policy-basis-one"), ("two", "policy-basis-two")] {
-        let task = format!("policy-task-{suffix}");
-        let run = format!("policy-run-{suffix}");
+        let task = "policy-task";
+        let run = "policy-run";
+        let sequence = if suffix == "one" { 1 } else { 2 };
         for sql in [
             format!(
                 "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('{turn}','policy-child','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
             ),
             format!(
-                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('{task}','ws','thread','policy-parent','policy-parent','policy-parent-create','agent','running','Policy','Check composition')"
+                "INSERT OR IGNORE INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('{task}','ws','thread','policy-parent','policy-parent','policy-parent-create','agent','running','Policy','Check composition')"
             ),
             format!(
-                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('{run}','{task}','{run}',1,1,'running','agent')"
+                "INSERT OR IGNORE INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('{run}','{task}','{run}',1,1,'running','agent')"
             ),
             format!(
-                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('{run}-turn','{task}','{run}','policy-child','{turn}','initial',0,1,'completed',CURRENT_TIMESTAMP)"
+                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('{run}-{suffix}-turn','{task}','{run}','policy-child','{turn}','{kind}',{round},{sequence},'completed',CURRENT_TIMESTAMP)",
+                round = sequence - 1,
+                kind = if sequence == 1 { "initial" } else { "revision" },
             ),
         ] {
             f.store
@@ -19279,7 +22005,7 @@ async fn accepted_task_policy_uses_composed_exact_source_order() {
         }
         f.store.database_connection().execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES (?,?, 'ws','policy-parent','policy-parent-create',?,CURRENT_TIMESTAMP)",
+            "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES (?,?, 'ws','policy-parent','policy-parent-create',?,CURRENT_TIMESTAMP)) INSERT OR IGNORE INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
             [run.into(), task.into(), serde_json::to_string(&accepted).unwrap().into()],
         )).await.unwrap();
     }
@@ -19305,7 +22031,8 @@ async fn accepted_task_policy_uses_composed_exact_source_order() {
         assert_eq!(first.messages.len(), 1);
         assert_eq!(
             first.messages[0].provenance.as_ref().unwrap().sources[0].id,
-            "policy-c"
+            "policy-a",
+            "the child's own turn follows even same-second parent records"
         );
         let repeated = super::frozen::capture_execution_basis_prepared(
             &f.store,
@@ -19331,8 +22058,8 @@ async fn accepted_task_policy_uses_composed_exact_source_order() {
         .messages;
         assert_eq!(roundtrip, first.messages);
     }
-    // A later independent source in A's physical turn survives composition;
-    // unlike the exact duplicate A, it really moves that turn to the tail.
+    // A later independent source in the child's physical turn survives the
+    // same bounded ancestry and policy selection without duplicating its input.
     f.store
         .materialize_item_completed(
             pioneer_protocol::ItemCompletedNotification {
@@ -19700,6 +22427,12 @@ async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs
         .await
         .unwrap();
         if !reverse {
+            // This branch tests NEW conversation policy, so C must actually
+            // exist in the ordinary parent line rather than only in Task input.
+            f.store.database_connection().execute_unprepared(
+                r#"INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('ordinary-c-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+                INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('ordinary-c-input','ordinary-c-turn',0,'text','independent C','{"type":"text","text":"independent C"}',CURRENT_TIMESTAMP)"#
+            ).await.unwrap();
             // The delivery acknowledgement is a turn, but its authorized
             // output is a checkpoint (not a turn). Policy selection must see
             // the replacement before deciding whether inherited C survives.
@@ -19851,7 +22584,7 @@ async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs
                     .collect::<std::collections::BTreeSet<_>>();
                 assert_eq!(
                     ids,
-                    std::collections::BTreeSet::from(["alias-c-input", "checkpoint-alias-a",])
+                    std::collections::BTreeSet::from(["ordinary-c-input", "checkpoint-alias-a",])
                 );
                 let repeated = super::frozen::capture_execution_basis_prepared_with_outputs(
                     &f.store,
@@ -19914,12 +22647,11 @@ async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs
         last_turn.mode = pioneer_protocol::TaskAgentContextMode::LastNTurns;
         last_turn.max_turns = Some(1);
         last_turn.include_parent_summary = false;
-        let tail = super::frozen::capture_execution_basis_prepared(
+        let tail = super::frozen::prepare_exact_task_fixture(
             &f.store,
             "ws",
             "execution",
-            Some("policy-alias-turn"),
-            None,
+            "policy-alias-turn",
             Some(&last_turn),
         )
         .await
@@ -19931,12 +22663,11 @@ async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs
                 .iter()
                 .any(|source| source.id == "alias-b-input")
         }));
-        let repeated_tail = super::frozen::capture_execution_basis_prepared(
+        let repeated_tail = super::frozen::prepare_exact_task_fixture(
             &f.store,
             "ws",
             "execution",
-            Some("policy-alias-turn"),
-            None,
+            "policy-alias-turn",
             Some(&last_turn),
         )
         .await
@@ -19955,12 +22686,11 @@ async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs
         .messages;
         assert_eq!(tail_roundtrip, tail.messages);
         last_turn.include_parent_summary = true;
-        let represented = super::frozen::capture_execution_basis_prepared(
+        let represented = super::frozen::prepare_exact_task_fixture(
             &f.store,
             "ws",
             "execution",
-            Some("policy-alias-turn"),
-            None,
+            "policy-alias-turn",
             Some(&last_turn),
         )
         .await
@@ -19971,12 +22701,11 @@ async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs
             "checkpoint-alias-a",
             "omitting last-turn B must not backfill older turn C"
         );
-        let represented_again = super::frozen::capture_execution_basis_prepared(
+        let represented_again = super::frozen::prepare_exact_task_fixture(
             &f.store,
             "ws",
             "execution",
-            Some("policy-alias-turn"),
-            None,
+            "policy-alias-turn",
             Some(&last_turn),
         )
         .await
@@ -19995,12 +22724,11 @@ async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs
         .messages;
         assert_eq!(represented_roundtrip, represented.messages);
         last_turn.mode = pioneer_protocol::TaskAgentContextMode::InheritParent;
-        let inherited_tail = super::frozen::capture_execution_basis_prepared(
+        let inherited_tail = super::frozen::prepare_exact_task_fixture(
             &f.store,
             "ws",
             "execution",
-            Some("policy-alias-turn"),
-            None,
+            "policy-alias-turn",
             Some(&last_turn),
         )
         .await
@@ -20128,12 +22856,11 @@ async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs
         .unwrap()
         .messages;
         assert!(b_visible(&again));
-        let prepared = super::frozen::capture_execution_basis_prepared(
+        let prepared = super::frozen::prepare_exact_task_fixture(
             &f.store,
             "ws",
             "execution",
-            Some("execution-alias-turn"),
-            None,
+            "execution-alias-turn",
             None,
         )
         .await
@@ -20159,12 +22886,11 @@ async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs
                     && alias.represented_source.id == represented
             }));
         }
-        let prepared_again = super::frozen::capture_execution_basis_prepared(
+        let prepared_again = super::frozen::prepare_exact_task_fixture(
             &f.store,
             "ws",
             "execution",
-            Some("execution-alias-turn"),
-            None,
+            "execution-alias-turn",
             None,
         )
         .await
@@ -20297,12 +23023,11 @@ async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs
                 let mut selected_summary = super::frozen::default_task_context_policy();
                 selected_summary.mode = mode;
                 selected_summary.max_turns = Some(1);
-                let without_deleted_payload = super::frozen::capture_execution_basis_prepared(
+                let without_deleted_payload = super::frozen::prepare_exact_task_fixture(
                     &f.store,
                     "ws",
                     "execution-policy-deleted",
-                    Some("policy-deleted-turn"),
-                    None,
+                    "policy-deleted-turn",
                     Some(&selected_summary),
                 )
                 .await
@@ -20320,12 +23045,11 @@ async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs
                         assistant_source.id.as_str(),
                     ])
                 );
-                let repeated = super::frozen::capture_execution_basis_prepared(
+                let repeated = super::frozen::prepare_exact_task_fixture(
                     &f.store,
                     "ws",
                     "execution-policy-deleted",
-                    Some("policy-deleted-turn"),
-                    None,
+                    "policy-deleted-turn",
                     Some(&selected_summary),
                 )
                 .await
@@ -20390,7 +23114,7 @@ async fn save_task_input_snapshot(
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES (?,?,'ws',?,?,?,CURRENT_TIMESTAMP)",
+            "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES (?,?,'ws',?,?,?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
             [
                 run.into(),
                 task.into(),
@@ -20509,7 +23233,8 @@ async fn prepare_task_input_checkpoint_runner(
             .compaction_manifest_sources_current(&operation.id)
             .await
             .unwrap(),
-        "Task-input checkpoint manifest must be current before activation"
+        "Task-input checkpoint manifest for {} must be current before activation",
+        operation.id
     );
     let initial =
         RunnerState::new(operation.admission.deadline_ms, budget, runner_tokens, None).unwrap();
@@ -21256,13 +23981,37 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
     );
     assert!(both_selected.contains(&child_answer));
 
-    let prepared = super::frozen::capture_execution_basis_prepared(
+    let accepted = super::frozen::prepare_exact_task_fixture(
         &f.store,
         "ws",
         "child-thread",
-        Some("child-turn"),
+        "child-turn",
         None,
-        None,
+    )
+    .await
+    .unwrap();
+    let own = super::history::load_task_line_history(&f.store, "ws", "child-thread", None, &fence)
+        .await
+        .unwrap();
+    let mut messages = super::frozen::compose_frozen_basis(
+        &f.store,
+        "ws",
+        "child-thread",
+        &accepted.accepted_scopes,
+        &accepted.messages,
+        &own,
+    )
+    .await
+    .unwrap();
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut messages)
+        .await
+        .unwrap();
+    let prepared = super::frozen::capture_prepared(
+        &f.store,
+        "ws",
+        "child-thread",
+        &accepted.accepted_scopes,
+        &messages,
     )
     .await
     .unwrap();
@@ -21962,19 +24711,9 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         "ambiguous source input identity must preserve the copy"
     );
 
-    // The independent ambiguity run remains intact. The following checkpoint
-    // scenario still uses the original unambiguous launch-copy run.
-    let prepared = super::frozen::capture_execution_basis_prepared(
-        &f.store,
-        "ws",
-        "child-thread",
-        Some("child-turn"),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-
+    // Use the normalized accepted Task projection prepared above. This
+    // checkpoint proves its original input and launch-copy alias; a new
+    // conversation intentionally excludes the Composer launch from its parent.
     let represented_source = original.provenance.as_ref().unwrap().sources[0].clone();
     let represented_source = SourceRef {
         scope: represented_source.scope,
@@ -22032,29 +24771,11 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
     )
     .await
     .unwrap();
-    // A separate accepted Task basis freezes A and B before the child head
-    // exists. Its immutable descriptor is used again after B is replaced.
-    for statement in [
-        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('external-basis-turn','child-thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('external-basis-task','ws','thread','thread','thread','turn','agent','running','External basis','same question')",
-        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('external-basis-run','external-basis-task','external-basis-run',1,1,'running','agent')",
-        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('external-basis-run-turn','external-basis-task','external-basis-run','child-thread','external-basis-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
-    ] {
-        f.store
-            .database_connection()
-            .execute_unprepared(statement)
-            .await
-            .unwrap();
-    }
-    save_task_input_snapshot(
-        &f,
-        "external-basis-run",
-        "external-basis-task",
-        "thread",
-        "turn",
-        &copy_v1_basis,
-    )
-    .await;
+    // A following conversation turn does not install another Task run in
+    // this child. The separate copy_v1_basis remains the literal replay fixture.
+    f.store.database_connection().execute_unprepared(
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('external-basis-turn','child-thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+    ).await.unwrap();
     let reference_source = prepared
         .messages
         .iter()
@@ -22079,7 +24800,18 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         .compaction_projection_version("ws", "child-thread")
         .await
         .unwrap();
-    operation.source_epochs = prepared.source_epochs.clone();
+    // capture_prepared freezes canonical references; the admission caller
+    // supplies epochs, as production execution/conversation preparation does.
+    operation.source_epochs.clear();
+    for scope in &prepared.accepted_scopes {
+        operation.source_epochs.insert(
+            scope.clone(),
+            f.store
+                .compaction_projection_version("ws", scope)
+                .await
+                .unwrap(),
+        );
+    }
     let runner_budget = ModelBudget::new(Some(4096), None, Some(512));
     let manifest = [
         ManifestEntry {
@@ -22168,12 +24900,45 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
             .iter()
             .any(|edge| edge.replay.source.id == "copy-input")
     );
-    let exact_capture = super::frozen::capture_execution_basis_prepared(
+    // CLI reuses the current execution's checkpoint against its already
+    // accepted projection, including the launch-copy proof. Its immutable
+    // descriptor remains the authority when only the sent messages change.
+    let mut cli_projection = super::frozen::capture_prepared(
         &f.store,
         "ws",
         "child-thread",
-        Some("child-turn"),
-        None,
+        &prepared.accepted_scopes,
+        &prepared.messages,
+    )
+    .await
+    .unwrap();
+    let accepted_descriptor = cli_projection.descriptor.clone();
+    cli_projection.expected_checkpoint = Some(checkpoint_id.clone());
+    cli_projection
+        .project_accepted_checkpoints(&f.store, "ws", "child-thread")
+        .await
+        .unwrap();
+    assert_eq!(
+        cli_projection.checkpoint.as_deref(),
+        Some(checkpoint_id.as_str())
+    );
+    assert_eq!(cli_projection.descriptor, accepted_descriptor);
+    assert!(cli_projection.messages.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == checkpoint_id)
+        })
+    }));
+
+    // This assertion concerns replay of the accepted Task basis. A new
+    // conversation excludes the parent Composer launch and reads its child copy.
+    let exact_capture = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "child-thread",
+        "child-turn",
         None,
     )
     .await
@@ -22210,7 +24975,7 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         None,
     )
     .await
-    .expect("head alias must precede hydration of removed B");
+    .expect("new conversation must read current own input without the removed launch copy");
     assert!(!external_capture.messages.iter().any(|message| {
         message.provenance.as_ref().is_some_and(|origin| {
             origin
@@ -22373,13 +25138,15 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         super::history::prepare_history(&f.store, "ws", &nested_thread)
             .await
             .unwrap();
-        let nested = super::frozen::capture_execution_basis_prepared(
+        let mut nested_allowed = alias_allowed.clone();
+        nested_allowed.insert(nested_thread.clone());
+        let nested = super::frozen::restore_accepted_history_for_execution(
             &f.store,
             "ws",
+            Some("child-thread"),
             &nested_thread,
-            Some(&nested_turn),
-            None,
-            None,
+            &nested_allowed,
+            &serde_json::to_string(basis).unwrap(),
         )
         .await
         .unwrap();
@@ -24370,6 +27137,7 @@ async fn foreground_native_projection_reuses_one_owner_across_model_windows() {
         }),
     ));
     let canonical = serde_json::to_string(&CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "historical-round".into(),
         termination: ProviderTermination::Complete,
@@ -24558,6 +27326,7 @@ async fn durable_context_cursor_finishes_old_text_before_portable_next_source() 
                 }),
             ));
             serde_json::to_string(&CanonicalProviderRoundEnvelope {
+                ui_copies: None,
                 version: 1,
                 round_id: id.into(),
                 termination: ProviderTermination::Complete,
@@ -24866,6 +27635,7 @@ async fn partially_read_portable_context_survives_checkpoint_and_restart() {
             serde_json::json!({"reasoning_details":[{"type":"reasoning.encrypted","data":"opaque-secret"}]}),
         ));
         serde_json::to_string(&CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: id.into(),
             termination: ProviderTermination::Complete,
@@ -25249,6 +28019,7 @@ async fn runner_projects_provider_reasoning_for_compact_and_reference_only_witho
             )
         };
         serde_json::to_string(&CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: round.into(),
             termination: ProviderTermination::Complete,
@@ -25307,6 +28078,7 @@ async fn runner_projects_provider_reasoning_for_compact_and_reference_only_witho
         "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES('operation',1,1,1,'thread',?,?,?)",
         [reference_source.scope.into(), reference_source.id.into(), reference_source.version.into()],
     )).await.unwrap();
+    seed_active_manifest_entries(&f.store, &[]).await;
 
     assert!(matches!(
         f.runner.run(CancellationToken::new()).await.unwrap(),
@@ -25352,6 +28124,7 @@ async fn alternating_source_projections_share_one_summarizer_request() {
     let db = f.store.database_connection();
     let context_payload = |id: &str| {
         serde_json::to_string(&CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: id.into(),
             termination: ProviderTermination::Complete,
@@ -25491,7 +28264,7 @@ async fn legacy_task_basis_compact_and_reference_use_portable_source_text() {
         }
         db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('basis-run','task','ws','thread','turn',?,CURRENT_TIMESTAMP)",
+            "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('basis-run','task','ws','thread','turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
             [history.into()],
         ))
         .await
@@ -25969,6 +28742,7 @@ async fn new_admission_omits_service_sources_from_compact_and_reference_only() {
         PreparedOperation {
             owner: "filtered-admission".into(),
             execution_turn: "turn".into(),
+            user_initiated: true,
             source_projection: None,
             expected_checkpoint: None,
             summary_basis: None,
@@ -26311,6 +29085,7 @@ async fn published_checkpoint_keeps_coverage_of_newly_hidden_service_event() {
         "service-covered-checkpoint",
         &covered,
         pioneer_compaction::CoverageDomain::OwnContribution,
+        None,
     )
     .await;
     assert_eq!(checkpoint.coverage.len(), 2);
@@ -26382,4 +29157,52 @@ async fn published_checkpoint_keeps_coverage_of_newly_hidden_service_event() {
         .unwrap();
     assert_eq!(after_operations, before_operations);
     assert!(f.provider.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn completed_history_retains_media_estimates_for_candidate_projection() {
+    use pioneer_agent::compaction::request::{MediaEstimate, NativeRequestProjection};
+    use pioneer_provider::{ChatMessage, MessageAttachment, MessageContentPart};
+    let mut retained = ChatMessage::user("retained");
+    retained
+        .content_parts
+        .push(MessageContentPart::image(MessageAttachment::from_url(
+            "https://fixture.invalid/image",
+            "image/png",
+        )));
+    let request = ChatRequest {
+        model: "fixture".into(),
+        messages: vec![ChatMessage::user("old"), retained.clone()],
+        temperature: None,
+        max_tokens: Some(128),
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let media = vec![MediaEstimate {
+        message: 1,
+        part: 0,
+        input_tokens: 875,
+    }];
+    let budget = ModelBudget::new(Some(8192), None, Some(128));
+    let full = super::background_history::completed_history_request_projection(
+        request.clone(),
+        media.clone(),
+        budget.clone(),
+    )
+    .unwrap();
+    let candidate = NativeRequestProjection::new(request, [0], media, budget, false)
+        .unwrap()
+        .evaluate("summary")
+        .unwrap();
+    assert_eq!(full.request.messages[1], retained);
+    assert_eq!(candidate.request.messages[1], retained);
+    assert_eq!(
+        full.message_input_tokens[1],
+        candidate.message_input_tokens[1]
+    );
+    assert!(full.message_input_tokens[1] > 875);
+    assert!(full.message_input_tokens[1] < 1200);
 }

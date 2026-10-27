@@ -92,7 +92,9 @@ struct UserMessageTimelineBatch {
 
 #[derive(Default)]
 struct AssistantMessageTimelineBatch {
+    statuses: HashMap<(String, String), TurnWorkItemStatus>,
     items: HashMap<(String, String), TurnItem>,
+    html: HashMap<(String, String), Vec<pioneer_protocol::HtmlPublication>>,
     authors: HashMap<String, pioneer_protocol::TurnAuthorSnapshot>,
 }
 
@@ -143,6 +145,9 @@ impl MessageProcessor {
         if authorization.thread_id() != thread_id
             || thread_id.is_empty()
             || through_turn_id.is_empty()
+            || params.through_block.as_ref().is_some_and(|position| {
+                position.block_id.trim().is_empty() || position.sort_key.is_empty()
+            })
         {
             log_thread_read_outcome(thread_id, through_turn_id, "rejected", 0, started);
             self.send_error(
@@ -153,9 +158,28 @@ impl MessageProcessor {
             return;
         }
 
+        // One persisted row for this operation, before any peer keys/ready ack.
+        // Hidden reads remain valid; sidebar membership is separate from ThreadRead.
+        let sidebar_visible = match self.crud_store.get_thread_by_id(thread_id).await {
+            Ok(Some(thread)) if thread.workspace_id == authorization.workspace_id() => {
+                thread.sidebar_visibility == "visible"
+            }
+            _ => {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::Unavailable.response(request_id),
+                )
+                .await;
+                return;
+            }
+        };
+        let push_mutation = sidebar_visible
+            .then(|| self.begin_push_mutation(connection_id, authorization.workspace_id(), true))
+            .flatten();
         let response_payload = match self
             .crud_store
             .mark_thread_read(pioneer_crud::MarkThreadReadRequest {
+                through_block: params.through_block.clone(),
                 workspace_id: authorization.workspace_id().to_owned(),
                 thread_id: thread_id.to_owned(),
                 principal_id: request_context.principal().principal_id.clone(),
@@ -194,6 +218,23 @@ impl MessageProcessor {
                 return;
             }
         };
+        if sidebar_visible {
+            self.dirty_push_peers(
+                request_context,
+                &response_payload.workspace_id,
+                Some(&response_payload.thread_id),
+                None,
+            );
+        }
+        if let Some(mutation) = push_mutation {
+            mutation.finish(
+                Some((
+                    response_payload.thread_id.clone(),
+                    response_payload.unread_count,
+                )),
+                None,
+            );
+        }
         log_thread_read_outcome(
             thread_id,
             through_turn_id,
@@ -511,6 +552,22 @@ impl MessageProcessor {
                 return;
             }
         };
+        if let Err(error) = self
+            .enrich_codex_retry_notices(request_context, &mut blocks)
+            .await
+        {
+            self.send_error(
+                connection_id,
+                timeline_public_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("failed to load Codex retry notices: {error:#}"),
+                ),
+            )
+            .await;
+            trace.finish_failure();
+            return;
+        }
         trace.record_items(
             pioneer_observability::GatewayOperationItemKind::ThreadTimelineMaterializedBlocks,
             u64::try_from(blocks.len()).unwrap_or(u64::MAX),
@@ -1752,27 +1809,67 @@ impl MessageProcessor {
             HashMap::new()
         } else {
             self.crud_store
-                .list_turn_items_by_type_for_turns(item_turn_ids.as_slice(), "agent_message")
+                .list_turn_items_with_status_by_type_for_turns(
+                    item_turn_ids.as_slice(),
+                    "agent_message",
+                )
                 .await?
         };
         let mut items = HashMap::new();
+        let mut statuses = HashMap::new();
+        let mut html = HashMap::new();
         for (turn_id, item_id) in &item_targets {
-            let item = turn_items
+            let (item, status) = turn_items
                 .get(turn_id.as_str())
-                .and_then(|items| items.iter().find(|item| item.item_id() == item_id))
+                .and_then(|items| items.iter().find(|(item, _)| item.item_id() == item_id))
                 .with_context(|| {
                     format!("assistant message item `{item_id}` for turn `{turn_id}` was not found")
                 })?;
             if !matches!(item, TurnItem::AgentMessage { .. }) {
                 bail!("assistant message timeline target is not an Agent message");
             }
+            let is_final = turn_items
+                .get(turn_id)
+                .and_then(|items| {
+                    items.iter().rev().find(|(item, _)| {
+                        matches!(
+                            item,
+                            TurnItem::AgentMessage {
+                                phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                                ..
+                            }
+                        )
+                    })
+                })
+                .is_some_and(|(final_item, _)| final_item.item_id() == item_id);
+            if is_final || pioneer_protocol::task_delivery_id_from_result_item_id(item_id).is_some()
+            {
+                let publications = self
+                    .html_publications_for_agent_response(
+                        &rows[0].workspace_id,
+                        thread_id,
+                        turn_id,
+                        item_id,
+                    )
+                    .await?;
+                html.insert((turn_id.clone(), item_id.clone()), publications);
+            }
+            statuses.insert(
+                (turn_id.clone(), item_id.clone()),
+                parse_turn_work_item_status(status.as_deref().unwrap_or("running")),
+            );
             items.insert((turn_id.clone(), item_id.clone()), item.clone());
         }
 
         let authors = self
             .timeline_row_authors(&turns, turn_ids.as_slice())
             .await?;
-        Ok(AssistantMessageTimelineBatch { items, authors })
+        Ok(AssistantMessageTimelineBatch {
+            statuses,
+            items,
+            authors,
+            html,
+        })
     }
 
     async fn timeline_row_authors(
@@ -1792,6 +1889,8 @@ impl MessageProcessor {
             .into_iter()
             .map(|execution| (execution.turn_id.clone(), execution))
             .collect::<HashMap<_, _>>();
+        let runtime_kinds_by_turn =
+            pioneer_crud::load_cli_runtime_kinds_for_turns(&database, turn_ids).await?;
         let direct_authors_by_turn = turn_ids
             .iter()
             .filter_map(|turn_id| {
@@ -1872,18 +1971,6 @@ impl MessageProcessor {
                         )
                         .await?
                         .map(|presentation| {
-                            let runtime_marker = presentation
-                                .role_label
-                                .as_deref()
-                                .unwrap_or(presentation.nickname.as_str());
-                            let runtime_avatar_revision =
-                                if runtime_marker.eq_ignore_ascii_case("codex") {
-                                    Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION.to_owned())
-                                } else if runtime_marker.eq_ignore_ascii_case("claude") {
-                                    Some(pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION.to_owned())
-                                } else {
-                                    presentation.avatar_revision.clone()
-                                };
                             pioneer_protocol::TurnAuthorSnapshot {
                                 // Foreground CLI turns have a real runtime executor but no
                                 // AgentExecution. Keep that distinction explicit instead of
@@ -1891,10 +1978,8 @@ impl MessageProcessor {
                                 actor: pioneer_protocol::PersistedActorRef::System,
                                 display_name: presentation.display_name,
                                 nickname: presentation.nickname,
-                                // Reserved runtime avatar revisions are the existing
-                                // cross-client presentation discriminator for a real
-                                // CLI executor without an AgentExecution association.
-                                avatar_revision: runtime_avatar_revision,
+                                avatar_revision: presentation.avatar_revision,
+                                cli_runtime_kind: None,
                                 agent: None,
                             }
                         })
@@ -1907,7 +1992,10 @@ impl MessageProcessor {
             } else {
                 None
             };
-            if let Some(author) = author {
+            if let Some(mut author) = author {
+                author.cli_runtime_kind = author
+                    .cli_runtime_kind
+                    .or_else(|| runtime_kinds_by_turn.get(turn_id).copied());
                 authors.insert(turn_id.clone(), author);
             }
         }
@@ -2153,13 +2241,91 @@ impl MessageProcessor {
         let markdown = markdown.or_else(|| Some(markdown::parse_markdown_document(text.as_str())));
 
         Ok(TimelineBlockKind::AssistantMessage {
+            html_publications: batch
+                .html
+                .get(&(turn_id.to_owned(), item_id.to_owned()))
+                .cloned()
+                .unwrap_or_default(),
             item_id: id,
             text,
-            status: TurnWorkItemStatus::Completed,
+            status: *batch
+                .statuses
+                .get(&(turn_id.to_owned(), item_id.to_owned()))
+                .context("assistant message status was not batched")?,
             markdown,
             author,
             route: action_projection.and_then(|projection| projection.route.clone()),
         })
+    }
+
+    async fn enrich_codex_retry_notices(
+        &self,
+        request_context: &RequestContext,
+        blocks: &mut [TimelineBlock],
+    ) -> Result<()> {
+        use crate::authorization::{
+            AuthorizationResolver, AuthorizationService, ProofResolution, ResourceAction,
+        };
+        let principal = request_context.principal();
+        // The resolver authorizes this read through the root and separately
+        // requires ChildObserve for the internal execution child.
+        let action = ResourceAction::ThreadRead;
+        let gate = AuthorizationService::new().authorize_action(
+            principal.kind,
+            principal.role_key.as_ref(),
+            action,
+        );
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        for block in blocks {
+            let TimelineBlockKind::DetachedTaskRun {
+                task,
+                codex_retry_notices,
+                ..
+            } = &mut block.kind
+            else {
+                continue;
+            };
+            let (Some(child), Some(turn_id)) =
+                (task.child_thread_id.as_deref(), block.turn_id.as_deref())
+            else {
+                continue;
+            };
+            let Some(child_turn) = task.child_turn_id.as_deref() else {
+                continue;
+            };
+            if !self
+                .crud_store
+                .get_cli_runtime_turn_binding(child_turn)
+                .await?
+                .is_some_and(|binding| {
+                    binding.runtime_kind == "codex"
+                        && binding.thread_id == child
+                        && binding.workspace_id == block.workspace_id
+                })
+            {
+                continue;
+            }
+            // Reading the presentation thread alone is not a child-observation grant.
+            if !matches!(
+                resolver
+                    .authorize_internal_thread_via_root(
+                        principal,
+                        &gate,
+                        action,
+                        child,
+                        Some(&block.workspace_id)
+                    )
+                    .await?,
+                ProofResolution::Authorized(_)
+            ) {
+                continue;
+            }
+            *codex_retry_notices = self
+                .crud_store
+                .codex_retry_notices_for_task(&block.workspace_id, &block.thread_id, turn_id, task)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn detached_task_run_timeline_block_kind(
@@ -2186,7 +2352,11 @@ impl MessageProcessor {
                 row.block_id
             ));
         };
-        Ok(TimelineBlockKind::DetachedTaskRun { task, author })
+        Ok(TimelineBlockKind::DetachedTaskRun {
+            task,
+            author,
+            codex_retry_notices: Vec::new(),
+        })
     }
 
     async fn turn_work_items_from_rows(
@@ -2223,8 +2393,9 @@ impl MessageProcessor {
 
     fn turn_work_item_from_row(
         row: &turn_work_item_projection::Model,
-        item: TurnItem,
+        mut item: TurnItem,
     ) -> Result<TurnWorkItem> {
+        pioneer_protocol::compact_html_timeline_item(&mut item);
         Ok(TurnWorkItem {
             work_item_id: row.work_item_id.clone(),
             item_id: row.item_id.clone(),
@@ -2277,6 +2448,7 @@ impl MessageProcessor {
             .get_agent_work_graph_projection_for_turn(projection.turn_id.as_str())
             .await?;
         Ok(TurnWorkBlock {
+            html_publications: Vec::new(),
             turn_id: projection.turn_id,
             presentation: parse_turn_work_presentation(projection.presentation.as_str()),
             state: parse_turn_work_state(projection.state.as_str()),
@@ -2613,9 +2785,9 @@ fn parse_turn_work_state(value: &str) -> TurnWorkState {
 
 fn parse_turn_work_item_status(value: &str) -> TurnWorkItemStatus {
     match value {
-        "running" => TurnWorkItemStatus::Running,
+        "running" | "in_progress" => TurnWorkItemStatus::Running,
         "blocked" => TurnWorkItemStatus::Blocked,
-        "failed" => TurnWorkItemStatus::Failed,
+        "failed" | "timed_out" => TurnWorkItemStatus::Failed,
         "cancelled" | "canceled" => TurnWorkItemStatus::Cancelled,
         "completed" => TurnWorkItemStatus::Completed,
         _ => TurnWorkItemStatus::Completed,

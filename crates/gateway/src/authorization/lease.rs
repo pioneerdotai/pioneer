@@ -697,8 +697,32 @@ async fn project_lease(store: &CrudStore, mut lease: ExecutionLease) -> Result<E
                 continue;
             }
             let gate = policy.authorize_action(principal.kind, role_key.as_ref(), action);
+            let resource = if action.is_thread_creation() {
+                // Creation cannot borrow a different collaborator's authority.
+                if principal_id != lease.actor_principal_id {
+                    continue;
+                }
+                let source_gate = policy.authorize_action(
+                    principal.kind,
+                    role_key.as_ref(),
+                    ResourceAction::ThreadRead,
+                );
+                if !policy
+                    .authorize_resource(
+                        &source_gate,
+                        ResourceAction::ThreadRead,
+                        ResolvedResourceAccess::Thread(facts),
+                    )
+                    .is_allowed()
+                {
+                    continue;
+                }
+                ResolvedResourceAccess::Workspace(facts.workspace)
+            } else {
+                ResolvedResourceAccess::Thread(facts)
+            };
             if policy
-                .authorize_resource(&gate, action, ResolvedResourceAccess::Thread(facts))
+                .authorize_resource(&gate, action, resource)
                 .is_allowed()
             {
                 projected_actions.insert(action);
@@ -725,7 +749,7 @@ async fn project_lease(store: &CrudStore, mut lease: ExecutionLease) -> Result<E
     Ok(lease)
 }
 
-async fn collaboration_authority_principal(
+pub(super) async fn collaboration_authority_principal(
     store: &CrudStore,
     principal_id: &PrincipalId,
 ) -> Result<AuthenticatedSessionPrincipal> {
@@ -1302,5 +1326,91 @@ mod tests {
             .await
             .expect("remaining thread Member keeps shared Task authority");
         assert_eq!(revalidated.principal().principal_id.as_str(), MEMBER_B_ID);
+    }
+    #[tokio::test]
+    async fn optional_creation_admission_uses_workspace_and_cannot_borrow_collaborator_rights() {
+        use crate::authorization::{
+            ExecutionAdmissionEntryPoint, ExecutionAdmissionRequest, ExecutionAdmissionService,
+        };
+        let harness = IsolatedEpic4Harness::new().await.unwrap();
+        let store = CrudStore::new(harness.database.clone());
+        let mut member = principal(
+            MEMBER_A_ID,
+            PrincipalKind::User,
+            Some(RoleKey::member()),
+            "D0000000000000000000A",
+            "S0000000000000000000A",
+        );
+        let params: pioneer_protocol::TurnStartParams = serde_json::from_value(serde_json::json!({
+            "thread_id":THREAD_RED_PRIVATE_A_ID, "turn_id":"V00000000000000000008", "input":[],
+        }))
+        .unwrap();
+        let mut request = ExecutionAdmissionRequest::for_turn(
+            ExecutionAdmissionEntryPoint::InteractiveTurn,
+            ResourceAction::AgentTurnStart,
+            Vec::new(),
+            WORKSPACE_RED_ID,
+            THREAD_RED_PRIVATE_A_ID,
+            "openai",
+            "model",
+            &params,
+            &[],
+            Some("a".repeat(64)),
+        )
+        .unwrap();
+        let admission = ExecutionAdmissionService::new(store.clone());
+        let context = admission
+            .admit_context(&member, 1, &request, None)
+            .await
+            .unwrap();
+        let registry = ExecutionLeaseRegistry::default();
+        for action in [
+            ResourceAction::ThreadCreatePrivate,
+            ResourceAction::ThreadCreateWorkspace,
+        ] {
+            assert!(context.grants_action(action));
+            registry
+                .revalidate_context(&store, &context, action, 1)
+                .await
+                .unwrap();
+        }
+        request.workspace_id = crate::tests::authorization::WORKSPACE_GREEN_ID.into();
+        assert!(admission.admit(&member, 1, &request).await.is_err());
+        request.workspace_id = WORKSPACE_RED_ID.into();
+        // A role with ordinary execution authority but no create action still
+        // admits a conversation. No extra create grant is required to start it.
+        member.role_key = Some(RoleKey::new("synthetic_executor").unwrap());
+        harness.database.execute_unprepared(&format!("UPDATE gateway_principal SET role_key='synthetic_executor' WHERE id='{MEMBER_A_ID}'")).await.unwrap();
+        request.provider = "allowed-provider".into();
+        request.model = "allowed-model".into();
+        let restricted = admission
+            .admit_context(&member, 1, &request, None)
+            .await
+            .unwrap();
+        assert!(restricted.grants_action(ResourceAction::AgentTurnStart));
+        assert!(!restricted.grants_action(ResourceAction::ThreadCreatePrivate));
+        assert!(!restricted.grants_action(ResourceAction::ThreadCreateWorkspace));
+        // Restore Member, then revoke membership. A Superuser in the same
+        // gateway must not lend creation authority to this admitted initiator.
+        harness.database.execute_unprepared(&format!("UPDATE gateway_principal SET role_key='member' WHERE id='{MEMBER_A_ID}'; DELETE FROM workspace_membership WHERE principal_id='{MEMBER_A_ID}' AND workspace_id='{WORKSPACE_RED_ID}'")).await.unwrap();
+        for action in [
+            ResourceAction::ThreadCreatePrivate,
+            ResourceAction::ThreadCreateWorkspace,
+        ] {
+            assert!(
+                registry
+                    .revalidate_context(&store, &context, action, 1)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                context.grants_action(action),
+                "revocation must not rewrite immutable grants"
+            );
+            assert!(
+                !restricted.grants_action(action),
+                "current wider rights cannot expand an older grant"
+            );
+        }
     }
 }

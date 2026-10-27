@@ -198,6 +198,40 @@
       ]
     },
     {
+      "description": "Dispatch claim committed; execution may still be preparing.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "run_starting"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "claimed_at": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "task_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "task_id",
+            "run_id",
+            "claimed_at"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "kind": {
@@ -1804,6 +1838,33 @@
           "required": [
             "exact"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "object",
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                },
+                "provider_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "model_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "model"
+          ]
         }
       ]
     },
@@ -2075,7 +2136,8 @@
       "type": "string",
       "enum": [
         "codex",
-        "claude"
+        "claude",
+        "opencode"
       ]
     },
     "McpScopeKind": {
@@ -2171,7 +2233,7 @@
     "ProviderRequestId": {
       "type": "string",
       "maxLength": 128,
-      "pattern": "^(gen-|req-|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
+      "pattern": "^(gen-|req-|req_|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
     },
     "ProviderTransportKind": {
       "type": "string",
@@ -3587,6 +3649,31 @@
         }
       }
     },
+    "TaskFinishRequest": {
+      "description": "A user-directed final soft stop; this is not evidence that the goal succeeded.",
+      "type": "object",
+      "properties": {
+        "firstRunNumber": {
+          "description": "Earliest admitted run whose real outcome contributes to the final state.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestedAt": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "requestedAt",
+        "firstRunNumber"
+      ]
+    },
     "TaskLifecyclePolicy": {
       "type": "object",
       "properties": {
@@ -3636,6 +3723,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/TaskValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "finishRequest": {
+          "description": "Server-owned durable decision to stop future runs.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskFinishRequest"
             },
             {
               "type": "null"
@@ -4235,6 +4333,17 @@
             "null"
           ]
         },
+        "triggerInput": {
+          "description": "External data accepted for this occurrence, preserved across retries.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskRunTriggerInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "updatedAt": {
           "type": "integer",
           "format": "int64"
@@ -4250,6 +4359,13 @@
         "executorKind",
         "createdAt",
         "updatedAt"
+      ]
+    },
+    "TaskRunInputEncoding": {
+      "type": "string",
+      "enum": [
+        "utf8",
+        "base64"
       ]
     },
     "TaskRunStatus": {
@@ -4311,6 +4427,27 @@
         "primary_executor",
         "reviewer",
         "recovery"
+      ]
+    },
+    "TaskRunTriggerInput": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "contentType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "encoding": {
+          "$ref": "#/$defs/TaskRunInputEncoding"
+        }
+      },
+      "required": [
+        "encoding",
+        "body"
       ]
     },
     "TaskRunTurn": {
@@ -4571,6 +4708,13 @@
         "updatedAt": {
           "type": "integer",
           "format": "int64"
+        },
+        "webhookSecretRef": {
+          "description": "Opaque keystore reference; the bearer secret is never persisted here.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

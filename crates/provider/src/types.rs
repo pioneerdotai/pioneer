@@ -1,3 +1,11 @@
+/// Safe identity of the operation selected before dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderUsageProfile {
+    pub api: String,
+    pub api_version: Option<String>,
+    pub route: Option<String>,
+}
+
 use pioneer_protocol::ProviderFailureClass;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -61,11 +69,25 @@ impl ProviderStreamDiagnostics {
     }
 }
 
+/// How live result text may be projected into the consumer UI. Semantic phase
+/// still comes exclusively from message events; previews never accept history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProviderMessageDelivery {
+    /// Preserve the existing incremental result-item delivery.
+    #[default]
+    Incremental,
+    /// Show typed message text as previews and publish the result only after
+    /// successful request termination, including messages whose phase is already
+    /// known. StartProvisional also opts into this behavior when first observed.
+    Provisional,
+}
+
 /// A provider stream and its request-owned facts, consumed by agent deadlines.
 /// Facts do not produce chunks or reset the first/inter-chunk deadline.
 pub struct ProviderStream {
     pub stream: futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>,
     pub diagnostics: ProviderStreamDiagnostics,
+    pub message_delivery: ProviderMessageDelivery,
 }
 
 impl ProviderStream {
@@ -75,6 +97,7 @@ impl ProviderStream {
         Self {
             stream,
             diagnostics: ProviderStreamDiagnostics::default(),
+            message_delivery: ProviderMessageDelivery::default(),
         }
     }
 }
@@ -437,7 +460,7 @@ impl MessageContentPart {
 /// provider/model target. The payload remains provider-owned; the history
 /// projection may extract explicitly typed human-readable fields when a
 /// completed round is moved to an incompatible target.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderReplayState {
     pub provider: String,
     /// Exact model whose continuation contract produced this state. Legacy
@@ -447,6 +470,12 @@ pub struct ProviderReplayState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub payload: JsonValue,
+}
+
+impl std::fmt::Debug for ProviderReplayState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProviderReplayState { opaque: true }")
+    }
 }
 
 impl ProviderReplayState {
@@ -849,6 +878,10 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub temperature: Option<f32>,
+    /// Prepared generation reserve. Adapters must preserve this bound in their
+    /// native field. For inclusive APIs it covers thinking + visible output;
+    /// visible-only APIs need a separate prepared thinking reserve or an
+    /// explicit restriction. Qualitative effort never invents token budgets.
     pub max_tokens: Option<u32>,
     pub tools: Option<Vec<ToolDefinition>>,
     pub tool_choice: Option<ToolChoice>,
@@ -882,7 +915,9 @@ pub struct EmbeddingResponse {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningConfig {
+    /// Explicit off; differs from an omitted setting (server default).
     Disabled,
+    /// Includes explicit `None`, serialized as the protocol's off control.
     Effort(ReasoningEffort),
 }
 
@@ -979,6 +1014,8 @@ pub struct ProviderCallIdentity {
 /// identity of every requested operation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalProviderRoundEnvelope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_copies: Option<Vec<crate::messages::ProviderRoundUiCopy>>,
     pub version: u8,
     pub round_id: String,
     pub termination: ProviderTermination,
@@ -1025,28 +1062,116 @@ impl ProviderTermination {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(default)]
 pub struct TokenUsage {
-    /// Full effective input, including cache reads/writes exactly once.
-    /// None means unreported, never zero by implication.
+    /// Effective input including cache reads/writes once. Missing is not zero.
     pub input_tokens: Option<u64>,
+    /// Output including reasoning once, according to the API category rules.
     pub output_tokens: Option<u64>,
+    pub uncached_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub reported_total_tokens: Option<u64>,
+    pub semantics: Option<String>,
+    pub raw_usage: Option<serde_json::Value>,
+    pub generation_id: Option<String>,
+    pub reported_model: Option<String>,
+    pub service_tier: Option<String>,
+    pub request_id: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub api: Option<String>,
+    pub api_version: Option<String>,
+    pub route: Option<String>,
+    pub physical_attempt_id: Option<String>,
+    pub accounting: Option<serde_json::Value>,
 }
 
 impl TokenUsage {
-    /// Stream usage fields are cumulative snapshots, not increments.
+    /// Stream fields are cumulative snapshots. Duplicate events replace values;
+    /// partial native deltas preserve previously reported categories.
     pub fn update(&mut self, snapshot: &Self) {
-        if snapshot.input_tokens.is_some() {
-            self.input_tokens = snapshot.input_tokens;
+        macro_rules! update {
+            ($($field:ident),*) => {$(if snapshot.$field.is_some() {
+                self.$field = snapshot.$field.clone();
+            })*};
         }
-        if snapshot.output_tokens.is_some() {
-            self.output_tokens = snapshot.output_tokens;
+        update!(
+            input_tokens,
+            output_tokens,
+            uncached_input_tokens,
+            cache_read_input_tokens,
+            cache_write_input_tokens,
+            reasoning_tokens,
+            reported_total_tokens,
+            reported_model,
+            service_tier,
+            semantics,
+            generation_id,
+            request_id,
+            provider,
+            model,
+            api,
+            api_version,
+            route,
+            physical_attempt_id,
+            accounting
+        );
+        if let Some(raw) = &snapshot.raw_usage {
+            let target = self.raw_usage.get_or_insert_with(|| serde_json::json!({}));
+            if let (Some(target), Some(raw)) = (target.as_object_mut(), raw.as_object()) {
+                fn merge(
+                    target: &mut serde_json::Map<String, serde_json::Value>,
+                    raw: &serde_json::Map<String, serde_json::Value>,
+                ) {
+                    for (key, value) in raw {
+                        if let (Some(existing), Some(incoming)) = (
+                            target
+                                .get_mut(key)
+                                .and_then(serde_json::Value::as_object_mut),
+                            value.as_object(),
+                        ) {
+                            merge(existing, incoming);
+                        } else {
+                            target.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+                merge(target, raw);
+            }
+            self.raw_usage = self.raw_usage.as_ref().map(crate::usage::bounded_usage);
+        }
+        // Gemini thoughts are separate from candidates. A partial cumulative
+        // snapshot must not replace the earlier candidate count with thoughts.
+        if self.semantics.as_deref() == Some("inclusive_cache_separate_thoughts") {
+            if let Some(raw) = &self.raw_usage {
+                let candidates = raw
+                    .get("candidatesTokenCount")
+                    .and_then(serde_json::Value::as_u64);
+                let thoughts = raw
+                    .get("thoughtsTokenCount")
+                    .and_then(serde_json::Value::as_u64);
+                self.output_tokens = match (candidates, thoughts) {
+                    (Some(c), t) => c.checked_add(t.unwrap_or(0)),
+                    (None, Some(t)) => Some(t),
+                    _ => None,
+                };
+            }
+        }
+        if self.semantics.as_deref() == Some("exclusive_cache") {
+            self.input_tokens = self.uncached_input_tokens.and_then(|i| {
+                i.checked_add(self.cache_read_input_tokens.unwrap_or(0))?
+                    .checked_add(self.cache_write_input_tokens.unwrap_or(0))
+            });
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
+    pub messages: Vec<crate::messages::ProviderMessage>,
     pub text: String,
     pub usage: Option<TokenUsage>,
     pub termination: ProviderTermination,
@@ -1063,6 +1188,7 @@ pub struct ChatResponse {
 
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
+    pub message: Option<crate::messages::ProviderMessageMetadata>,
     pub usage: Option<TokenUsage>,
     pub delta: String,
     pub reasoning_delta: Option<String>,
@@ -1077,6 +1203,7 @@ pub struct StreamChunk {
 impl StreamChunk {
     pub fn usage(usage: TokenUsage) -> Self {
         Self {
+            message: None,
             usage: Some(usage),
             ..Self::delta("")
         }
@@ -1089,6 +1216,7 @@ impl StreamChunk {
 
     pub fn delta(text: impl Into<String>) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: text.into(),
             reasoning_delta: None,
@@ -1101,6 +1229,7 @@ impl StreamChunk {
 
     pub fn reasoning(text: impl Into<String>) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: String::new(),
             reasoning_delta: Some(text.into()),
@@ -1113,6 +1242,7 @@ impl StreamChunk {
 
     pub fn tool_calls(tool_calls: Vec<ProviderToolCall>) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: String::new(),
             reasoning_delta: None,
@@ -1125,6 +1255,7 @@ impl StreamChunk {
 
     pub fn provider_replay_state(state: ProviderReplayState) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: String::new(),
             reasoning_delta: None,
@@ -1137,6 +1268,7 @@ impl StreamChunk {
 
     pub fn final_chunk_with(termination: ProviderTermination) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: String::new(),
             reasoning_delta: None,
@@ -1181,6 +1313,30 @@ impl ProviderResponseLimits {
         &self,
         response: &ChatResponse,
     ) -> Result<(), ProviderResponseTooLarge> {
+        if response.messages.len() > crate::ProviderMessageCollector::MAX_MESSAGES {
+            return Err(ProviderResponseTooLarge::new(
+                "response_messages",
+                crate::ProviderMessageCollector::MAX_MESSAGES,
+                response.messages.len(),
+            ));
+        }
+        let bytes = crate::messages::message_bytes(&response.messages);
+        self.validate_text_bytes(
+            response.messages.iter().map(|m| m.text.len()).sum(),
+            "message_text",
+        )?;
+        self.validate_retained_bytes(
+            bytes
+                .saturating_add(response.text.len())
+                .saturating_add(response.reasoning_content.as_deref().map_or(0, str::len))
+                .saturating_add(tool_calls_bytes(&response.tool_calls))
+                .saturating_add(
+                    response
+                        .provider_replay_state
+                        .as_ref()
+                        .map_or(0, replay_state_bytes),
+                ),
+        )?;
         self.validate_accumulated(
             response.text.as_str(),
             response.reasoning_content.as_deref().unwrap_or_default(),
@@ -1543,6 +1699,7 @@ mod tests {
     #[test]
     fn chat_response_default_usage() {
         let resp = ChatResponse {
+            messages: Vec::new(),
             text: "Hello".into(),
             usage: None,
             reasoning_content: None,
@@ -1624,6 +1781,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: Some(100),
             output_tokens: Some(50),
+            ..Default::default()
         };
         assert_eq!(usage.input_tokens, Some(100));
         assert_eq!(usage.output_tokens, Some(50));

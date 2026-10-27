@@ -15,7 +15,8 @@
       "type": "string",
       "enum": [
         "codex",
-        "claude"
+        "claude",
+        "opencode"
       ]
     },
     "GatewayCliRuntimeInstanceSettings": {
@@ -567,6 +568,7 @@
       "enum": [
         "openai",
         "openrouter",
+        "vercel-ai-gateway",
         "local"
       ]
     },
@@ -656,7 +658,8 @@
       "enum": [
         "api",
         "codex",
-        "claude"
+        "claude",
+        "opencode"
       ]
     }
   }

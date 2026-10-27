@@ -9,7 +9,10 @@ use crate::{
     },
     message::MessageProcessor,
 };
-use pioneer_crud::compaction::{HistoryReadFence, TaskDeliveryOutputSnapshot};
+use pioneer_crud::compaction::{
+    DeliveredTaskOutputCursor, HistoryReadFence, TaskDeliveryOutputSnapshot,
+};
+use pioneer_observability::turn_startup::{Stage, Work, record_work, scope_current_stage};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) struct AuthorizedOutputBranch {
@@ -33,7 +36,7 @@ pub(crate) struct AuthorizedOutputSet {
     pub(super) branches: Vec<AuthorizedOutputBranch>,
 }
 
-async fn can_read_originals(
+pub(super) async fn can_read_originals(
     resolver: &AuthorizationResolver,
     principal: &AuthenticatedSessionPrincipal,
     workspace: &str,
@@ -75,67 +78,101 @@ impl MessageProcessor {
     /// Select only a queue-bound manifest acknowledged before the common fence,
     /// then authorize every original source scope before reading any payload.
     /// A denied branch leaves its previously delivered summary in the context.
-    pub(crate) async fn authorize_delivered_output_branches(
+    async fn authorize_delivered_output_branches_before(
         &self,
         store: &CrudStore,
         principal: &AuthenticatedSessionPrincipal,
         workspace: &str,
         destination: &str,
+        before: Option<chrono::DateTime<chrono::FixedOffset>>,
+        excluded_turn: Option<&str>,
     ) -> Result<AuthorizedOutputSet> {
-        let authorization_revision = self.current_authorization_revision().await?;
-        let resolver = AuthorizationResolver::new(store.clone());
-        let mut access = BTreeMap::new();
-        let mut branches: Vec<AuthorizedOutputBranch> = Vec::new();
-        let mut seen = BTreeMap::<String, Option<usize>>::new();
-        let mut after = 0;
-        let destination_read =
-            can_read_originals(&resolver, principal, workspace, destination).await?;
-        ensure!(
-            destination_read,
-            "destination history is unavailable or access is denied"
-        );
-        super::history::prepare_history(&store, workspace, destination).await?;
-        let epoch = store
-            .compaction_projection_version(workspace, destination)
-            .await?;
-        let checkpoint = store
-            .compaction_head(&super::native::native_owner(workspace, destination))
-            .await?;
-        let fence = store.compaction_history_read_fence().await?;
-        let mut source_epochs = BTreeMap::from([(destination.to_owned(), epoch)]);
-        access.insert(destination.to_owned(), true);
-        loop {
-            let mut page = store
-                .compaction_delivered_output_page(workspace, destination, after, &fence)
+        scope_current_stage(Stage::HistoryOutputs, async {
+            let authorization_revision = self.current_authorization_revision().await?;
+            let resolver = AuthorizationResolver::new(store.clone());
+            let mut access = BTreeMap::new();
+            let mut branches: Vec<AuthorizedOutputBranch> = Vec::new();
+            let mut seen = BTreeMap::<String, Option<usize>>::new();
+            let mut cursor = DeliveredTaskOutputCursor::default();
+            let mut references = Vec::new();
+            let destination_read =
+                can_read_originals(&resolver, principal, workspace, destination).await?;
+            ensure!(
+                destination_read,
+                "destination history is unavailable or access is denied"
+            );
+            super::history::prepare_history(&store, workspace, destination).await?;
+            let epoch = store
+                .compaction_projection_version(workspace, destination)
                 .await?;
-            if !page.unprojected_events.is_empty() {
-                for source in &page.unprojected_events {
-                    let payload =
-                        super::history::reference_payload(&store, workspace, destination, source)
-                            .await?;
-                    let event: pioneer_crud::CanonicalTurnEventPayload =
-                        serde_json::from_str(&payload)?;
-                    ensure!(
-                        store
-                            .compaction_record_event_projection(
-                                workspace,
-                                destination,
-                                source,
-                                &event
-                            )
-                            .await?,
-                        "delivery event changed while refreshing its metadata"
-                    );
-                }
-                page = store
-                    .compaction_delivered_output_page(workspace, destination, after, &fence)
+            let checkpoint = store
+                .compaction_head(&super::native::native_owner(workspace, destination))
+                .await?;
+            let mut fence = store.compaction_history_read_fence().await?;
+            fence.before = before;
+            let mut source_epochs = BTreeMap::from([(destination.to_owned(), epoch)]);
+            access.insert(destination.to_owned(), true);
+            loop {
+                let mut page = store
+                    .compaction_delivered_output_page(workspace, destination, &cursor, &fence)
                     .await?;
+                record_work(Work::Pages, 1);
+                page.unprojected_events
+                    .retain(|source| source.scope.strip_prefix("event:") != excluded_turn);
+                page.entries.retain(|entry| {
+                    entry.acknowledgement.scope.strip_prefix("event:") != excluded_turn
+                });
+                if !page.unprojected_events.is_empty() {
+                    for source in &page.unprojected_events {
+                        let payload = super::history::reference_payload(
+                            &store,
+                            workspace,
+                            destination,
+                            source,
+                        )
+                        .await?;
+                        let event: pioneer_crud::CanonicalTurnEventPayload =
+                            serde_json::from_str(&payload)?;
+                        ensure!(
+                            store
+                                .compaction_record_event_projection(
+                                    workspace,
+                                    destination,
+                                    source,
+                                    &event
+                                )
+                                .await?,
+                            "delivery event changed while refreshing its metadata"
+                        );
+                    }
+                    page = store
+                        .compaction_recheck_delivered_output_page(
+                            workspace,
+                            destination,
+                            &page,
+                            &fence,
+                        )
+                        .await?;
+                    record_work(Work::Pages, 1);
+                    page.entries.retain(|entry| {
+                        entry.acknowledgement.scope.strip_prefix("event:") != excluded_turn
+                    });
+                }
+                references.extend(page.entries);
+                if page.done {
+                    break;
+                }
                 ensure!(
-                    page.unprojected_events.is_empty(),
-                    "delivery metadata changed during discovery"
+                    page.next_cursor != cursor,
+                    "Task output discovery made no progress"
                 );
+                cursor = page.next_cursor;
             }
-            for reference in page.entries {
+            // Delivery Turn/sequence order is unrelated to capture order. Retain
+            // only necessary output references, then recover the original global
+            // acknowledgement ordering without loading or sorting event history.
+            references.sort_by_key(|reference| reference.capture_order);
+            for reference in references {
                 if let Some(accepted) = seen.get(&reference.delivery_id) {
                     if let Some(index) = accepted {
                         branches[*index]
@@ -199,40 +236,35 @@ impl MessageProcessor {
                     source_threads,
                 });
             }
-            if page.done {
-                break;
-            }
             ensure!(
-                page.scanned_through > after,
-                "Task output discovery made no progress"
+                self.current_authorization_revision().await? == authorization_revision,
+                "authorization changed while selecting Task originals"
             );
-            after = page.scanned_through;
-        }
-        ensure!(
-            self.current_authorization_revision().await? == authorization_revision,
-            "authorization changed while selecting Task originals"
-        );
-        ensure!(
-            store
-                .compaction_projection_version(workspace, destination)
-                .await?
-                == epoch,
-            "delivery history changed while selecting Task originals"
-        );
-        Ok(AuthorizedOutputSet {
-            workspace: workspace.into(),
-            destination: destination.into(),
-            checkpoint,
-            fence,
-            authorization_revision,
-            source_epochs,
-            branches,
+            ensure!(
+                store
+                    .compaction_projection_version(workspace, destination)
+                    .await?
+                    == epoch,
+                "delivery history changed while selecting Task originals"
+            );
+            record_work(Work::Branches, branches.len() as u64);
+            Ok(AuthorizedOutputSet {
+                workspace: workspace.into(),
+                destination: destination.into(),
+                checkpoint,
+                fence,
+                authorization_revision,
+                source_epochs,
+                branches,
+            })
         })
+        .await
     }
     /// Return the descriptor only after rechecking the same authorization
     /// generation that admitted all foreign originals. Runtime callers switch
     /// to this entry point together with accepted-source CAS support.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) async fn capture_authorized_task_basis(
         &self,
         store: &CrudStore,
@@ -268,41 +300,63 @@ impl MessageProcessor {
         excluded_turn: Option<&str>,
         policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
     ) -> Result<super::frozen::PreparedHistory> {
-        if policy.is_some_and(|policy| {
-            matches!(
-                policy.mode,
-                pioneer_protocol::TaskAgentContextMode::Empty
-                    | pioneer_protocol::TaskAgentContextMode::Custom
-            ) || (policy.mode == pioneer_protocol::TaskAgentContextMode::SummaryOnly
-                && !policy.include_parent_summary)
-        }) {
-            return super::frozen::capture_execution_basis_prepared(
+        // Keep fresh canonical preview dependencies through admission of the
+        // existing frozen read hold, including CLI and background preparation.
+        let _preview_activity = self.artifact_service.html_preview_activity().await;
+        scope_current_stage(Stage::HistoryAuthority, async {
+            let authorization_revision = self.current_authorization_revision().await?;
+            let resolver = AuthorizationResolver::new(store.clone());
+            let mut lines = super::frozen::conversation_history_lines(
                 store,
                 workspace,
                 destination,
-                basis_turn,
                 excluded_turn,
                 policy,
+                Some((&resolver, principal)),
             )
-            .await;
-        }
-        let outputs = self
-            .authorize_delivered_output_branches(store, principal, workspace, destination)
             .await?;
-        let prepared = super::frozen::capture_execution_basis_prepared_with_outputs(
-            store,
-            workspace,
-            destination,
-            basis_turn,
-            excluded_turn,
-            policy,
-            Some(&outputs),
-        )
-        .await?;
-        ensure!(
-            self.current_authorization_revision().await? == outputs.authorization_revision,
-            "authorization changed while freezing Task originals"
-        );
-        Ok(prepared)
+            lines.last_mut().expect("destination line").source_turn = basis_turn.map(str::to_owned);
+            let mut outputs = Vec::with_capacity(lines.len());
+            for line in &lines {
+                outputs.push(
+                    if super::frozen::policy_omits_history(line.policy.as_ref()) {
+                        None
+                    } else {
+                        Some(
+                            self.authorize_delivered_output_branches_before(
+                                store,
+                                principal,
+                                workspace,
+                                &line.thread,
+                                line.before,
+                                line.excluded_turn.as_deref(),
+                            )
+                            .await?,
+                        )
+                    },
+                );
+            }
+            ensure!(
+                outputs
+                    .iter()
+                    .flatten()
+                    .all(|outputs| outputs.authorization_revision == authorization_revision),
+                "authorization changed between history lines"
+            );
+            let selections = outputs.iter().map(Option::as_ref).collect::<Vec<_>>();
+            let prepared = super::frozen::capture_conversation_lines_prepared(
+                store,
+                workspace,
+                &lines,
+                &selections,
+            )
+            .await?;
+            ensure!(
+                self.current_authorization_revision().await? == authorization_revision,
+                "authorization changed while freezing conversation history"
+            );
+            Ok(prepared)
+        })
+        .await
     }
 }

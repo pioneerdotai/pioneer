@@ -31,6 +31,17 @@ impl std::fmt::Display for CancellationSnapshotChanged {
 }
 impl std::error::Error for CancellationSnapshotChanged {}
 
+/// No cancellation event committed in this quantum. A concurrent webhook run
+/// arrived after preparation; rebuild the cancellation plan from durable state.
+#[derive(Debug)]
+pub struct TaskCancellationRunsChanged;
+impl std::fmt::Display for TaskCancellationRunsChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("webhook cancellation run set changed before commit")
+    }
+}
+impl std::error::Error for TaskCancellationRunsChanged {}
+
 impl CrudStore {
     pub async fn get_task_delivery_attempt(
         &self,
@@ -290,15 +301,26 @@ impl CrudStore {
         at: i64,
         action: Option<crate::AgentCommitInput>,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        self.append_task_cancellation_events_as(events, at, action, None)
+            .await
+    }
+
+    pub async fn append_task_cancellation_events_as(
+        &self,
+        events: Vec<TaskEventPayload>,
+        at: i64,
+        action: Option<crate::AgentCommitInput>,
+        actor_id: Option<String>,
+    ) -> Result<Vec<AppendedTaskEvent>> {
         let mut appended = Vec::new();
         if action.is_some() {
             return self
-                .append_task_cancellation_quantum(events, at, action)
+                .append_task_cancellation_quantum(events, at, action, actor_id)
                 .await;
         }
         for chunk in events.chunks(crate::MAX_ATOMIC_TASK_EVENT_BATCH_SIZE) {
             appended.extend(
-                self.append_task_cancellation_quantum(chunk.to_vec(), at, None)
+                self.append_task_cancellation_quantum(chunk.to_vec(), at, None, actor_id.clone())
                     .await?,
             );
         }
@@ -310,11 +332,17 @@ impl CrudStore {
         events: Vec<TaskEventPayload>,
         at: i64,
         action: Option<crate::AgentCommitInput>,
+        actor_id: Option<String>,
     ) -> Result<Vec<AppendedTaskEvent>> {
         crate::retry_with_backoff(
             || {
                 self.run_serialized_write(|| {
-                    self.append_task_cancellation_events_once(events.clone(), at, action.clone())
+                    self.append_task_cancellation_events_once(
+                        events.clone(),
+                        at,
+                        action.clone(),
+                        actor_id.clone(),
+                    )
                 })
             },
             |error| {
@@ -335,6 +363,7 @@ impl CrudStore {
         events: Vec<TaskEventPayload>,
         at: i64,
         action: Option<crate::AgentCommitInput>,
+        actor_id: Option<String>,
     ) -> Result<Vec<AppendedTaskEvent>> {
         let mut refreshed = Vec::with_capacity(events.len());
         for event in events {
@@ -408,14 +437,124 @@ impl CrudStore {
                 event.set_delivery_boundary(boundary);
             }
         }
+        // Build bounded existence queries outside writer admission. Only the
+        // final TaskCancelled quantum needs this fence: prior quanta may already
+        // have cancelled their runs, which are excluded by terminal status.
+        // The transaction rechecks both webhook capability and unmatched live
+        // runs, so no POST can land between this decision and cancellation.
+        use pioneer_entity::{task_run as fenced_run, task_trigger as fenced_trigger};
+        use sea_orm::sea_query::{Expr, ExprTrait, Query};
+        let mut run_fences = Vec::new();
+        for event in &prepared {
+            let TaskEventPayload::TaskCancelled { task_id, .. } = event.payload() else {
+                continue;
+            };
+            let webhook = Query::select()
+                .expr(Expr::val(1))
+                .from(fenced_trigger::Entity)
+                .and_where(Expr::col(fenced_trigger::Column::TaskId).eq(task_id.as_str()))
+                .and_where(Expr::col(fenced_trigger::Column::WebhookSecretRef).is_not_null())
+                .limit(1)
+                .to_owned();
+            let covered = prepared
+                .iter()
+                .filter_map(|event| match event.payload() {
+                    TaskEventPayload::RunCancelled {
+                        task_id: owner,
+                        run_id,
+                        ..
+                    } if owner == task_id => Some(run_id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let mut unmatched = Query::select()
+                .expr(Expr::val(1))
+                .from(fenced_run::Entity)
+                .and_where(Expr::col(fenced_run::Column::TaskId).eq(task_id.as_str()))
+                .and_where(Expr::col(fenced_run::Column::Status).is_not_in([
+                    "succeeded",
+                    "failed",
+                    "blocked",
+                    "cancelled",
+                    "timed_out",
+                ]))
+                .limit(1)
+                .to_owned();
+            if !covered.is_empty() {
+                unmatched.and_where(Expr::col(fenced_run::Column::Id).is_not_in(covered));
+            }
+            run_fences.push((webhook, unmatched));
+        }
         #[cfg(any(test, feature = "test-support"))]
         self.pause_delivery_commit_for_test(TaskDeliveryCommitTestKind::Cancellation)
             .await;
         let tx = self.connection.begin().await?;
         let result = async {
+            for (webhook, unmatched) in &run_fences {
+                if tx.query_one(webhook).await?.is_some()
+                    && tx.query_one(unmatched).await?.is_some()
+                {
+                    return Err(anyhow::Error::new(TaskCancellationRunsChanged));
+                }
+            }
+            // Revalidate the actual transition inside the writer. A cancellation
+            // losing to an earlier terminal commit must not read that result.
+            use pioneer_entity::task_run as run;
+            use sea_orm::sea_query::{Expr, ExprTrait, Query};
+            let mut transitioning = std::collections::HashSet::new();
+            if actor_id.is_some() {
+                for event in &prepared {
+                    if let TaskEventPayload::RunCancelled {
+                        task_id, run_id, ..
+                    } = event.payload()
+                    {
+                        let query = Query::select()
+                            .expr(Expr::val(1))
+                            .from(run::Entity)
+                            .and_where(Expr::col(run::Column::Id).eq(run_id.as_str()))
+                            .and_where(Expr::col(run::Column::TaskId).eq(task_id.as_str()))
+                            .and_where(Expr::col(run::Column::Status).is_not_in([
+                                "succeeded",
+                                "failed",
+                                "blocked",
+                                "cancelled",
+                                "timed_out",
+                            ]))
+                            .to_owned();
+                        if tx.query_one(&query).await?.is_some() {
+                            transitioning.insert(run_id.clone());
+                        }
+                    }
+                }
+            }
             let appended = self
                 .append_task_events_with_delivery_cancellation(&tx, prepared, at)
                 .await?;
+            // Receipts commit with the exact transition and fanout journal.
+            if let Some(actor) = actor_id.as_deref() {
+                for event in &appended {
+                    if event.append_status.is_inserted()
+                        && let TaskEventPayload::RunCancelled {
+                            task_id, run_id, ..
+                        } = &event.payload
+                        && transitioning.contains(run_id)
+                    {
+                        let workspace = event
+                            .workspace_id
+                            .as_deref()
+                            .context("cancelled run has no durable workspace")?;
+                        crate::repositories::task_completion_inbox::mark_cancelled_task_run_read(
+                            &tx,
+                            actor,
+                            workspace,
+                            task_id,
+                            run_id,
+                            &chrono::Utc::now().to_rfc3339(),
+                        )
+                        .await?;
+                    }
+                }
+            }
             if let Some(action) = &action {
                 crate::repositories::agent_domain::commit_agent_action(&tx, action).await?;
             }

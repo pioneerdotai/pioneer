@@ -84,6 +84,14 @@ struct QueryMetricSeries {
     failed: bool,
 }
 
+/// Both identities come from the same bounded lookup. Zero remains the
+/// existing metric overflow bucket, never a canonical SQL identity.
+#[derive(Clone, Copy, Debug)]
+struct QueryFingerprints {
+    canonical: Option<u64>,
+    metric: u64,
+}
+
 #[derive(Debug, Default)]
 struct QueryFingerprintState {
     raw_query_cache: HashMap<u64, u64>,
@@ -118,7 +126,7 @@ impl QueryFingerprintLimiter {
         operation: pioneer_observability::DatabaseOperation,
         workload: pioneer_observability::DatabaseWorkload,
         failed: bool,
-    ) -> u64 {
+    ) -> QueryFingerprints {
         let raw_query_key = transient_sql_cache_key(sql);
         {
             let mut state = self
@@ -126,7 +134,7 @@ impl QueryFingerprintLimiter {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(fingerprint) = state.raw_query_cache.get(&raw_query_key).copied() {
-                return self.admit_metric_series(
+                let metric = self.admit_metric_series(
                     &mut state,
                     fingerprint,
                     role,
@@ -134,6 +142,10 @@ impl QueryFingerprintLimiter {
                     workload,
                     failed,
                 );
+                return QueryFingerprints {
+                    canonical: (fingerprint != 0).then_some(fingerprint),
+                    metric,
+                };
             }
         }
 
@@ -169,7 +181,12 @@ impl QueryFingerprintLimiter {
                 }
                 fingerprint
             });
-        self.admit_metric_series(&mut state, fingerprint, role, operation, workload, failed)
+        let metric =
+            self.admit_metric_series(&mut state, fingerprint, role, operation, workload, failed);
+        QueryFingerprints {
+            canonical: (fingerprint != 0).then_some(fingerprint),
+            metric,
+        }
     }
 
     fn admit_metric_series(
@@ -203,6 +220,55 @@ impl QueryFingerprintLimiter {
     }
 }
 
+/// Existing DB owner boundary for installer preflight. No writable connection,
+/// migration execution, extension registration, startup repair or journal changes.
+pub(crate) async fn inspect_applied_migration_names(
+    runtime_home: &Path,
+    app_config: &AppConfig,
+) -> Result<Option<Vec<String>>> {
+    let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
+    let path = gateway_database_path(runtime_home, app_config)?;
+    // Only a positively absent database is a new installation. Metadata errors
+    // (including denied access) must not become an empty applied set.
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("migration inspection metadata unavailable"),
+        Ok(metadata) => anyhow::ensure!(metadata.is_file(), "database is not a regular file"),
+    }
+    let mut options = connect_options(
+        sqlite_read_only_connection_url(&path),
+        1,
+        &config,
+        "pioneer-sqlite-reader-",
+    );
+    options.sqlx_logging(false);
+    options.map_sqlx_sqlite_opts(|options| {
+        options
+            .read_only(true)
+            .create_if_missing(false)
+            .pragma("query_only", "ON")
+            .thread_name(|id| format!("pioneer-sqlite-reader-{id}"))
+    });
+    let reader = Database::connect(options)
+        .await
+        .context("migration inspection unavailable")?;
+    // Both handles are physically read-only; even an accidentally routed write
+    // is rejected by SQLite. There is no additional writable executor/pool.
+    let database = SqliteDatabase::new(reader.clone(), reader).maintenance();
+    let result = async {
+        database.validate_reader().await?;
+        pioneer_crud::CrudStore::new(database.clone())
+            .with_maintenance_access()
+            .inspect_applied_migration_names()
+            .await
+    }
+    .await;
+    let closed = database.close().await;
+    let names = result?;
+    closed.context("failed to close migration inspection")?;
+    Ok(Some(names))
+}
+
 pub async fn initialize(runtime_home: &Path, app_config: &AppConfig) -> Result<SqliteDatabase> {
     initialize_inner(runtime_home, app_config, None).await
 }
@@ -234,6 +300,7 @@ async fn initialize_inner(
         writer_url.clone(),
         WRITER_MAX_CONNECTIONS,
         &config,
+        "pioneer-sqlite-writer-",
     ))
     .await
     .with_context(|| format!("failed to connect to gateway writer `{writer_url}`"))?;
@@ -285,12 +352,18 @@ async fn initialize_inner(
     }
 
     let reader_url = sqlite_read_only_connection_url(database_path.as_path());
-    let mut reader_options = connect_options(reader_url.clone(), config.max_connections, &config);
+    let mut reader_options = connect_options(
+        reader_url.clone(),
+        config.max_connections,
+        &config,
+        "pioneer-sqlite-reader-",
+    );
     reader_options.map_sqlx_sqlite_opts(|options| {
         options
             .read_only(true)
             .create_if_missing(false)
             .pragma("query_only", "ON")
+            .thread_name(|id| format!("pioneer-sqlite-reader-{id}"))
     });
     let reader_open_stage = startup
         .map(|trace| trace.stage(pioneer_observability::GatewayStartupStage::DatabaseReaderOpen));
@@ -344,6 +417,7 @@ fn connect_options(
     database_url: String,
     max_connections: u32,
     config: &GatewayDatabaseRuntimeConfig,
+    worker_prefix: &'static str,
 ) -> ConnectOptions {
     let mut options = ConnectOptions::new(database_url);
     options.max_connections(max_connections);
@@ -356,8 +430,10 @@ fn connect_options(
     options.map_sqlx_sqlite_pool_opts(|pool_options| {
         pool_options.acquire_time_level(log::LevelFilter::Trace)
     });
-    options.map_sqlx_sqlite_opts(|sqlite_options| {
-        sqlite_options.busy_timeout(Duration::from_millis(DEFAULT_SQLITE_BUSY_TIMEOUT_MS))
+    options.map_sqlx_sqlite_opts(move |sqlite_options| {
+        sqlite_options
+            .busy_timeout(Duration::from_millis(DEFAULT_SQLITE_BUSY_TIMEOUT_MS))
+            .thread_name(move |id| format!("{worker_prefix}{id}"))
     });
     options
 }
@@ -376,13 +452,15 @@ fn configure_observability(
         let workload = super::attribution::current_database_workload();
         let workload_name =
             workload.unwrap_or(pioneer_observability::DatabaseWorkload::Unclassified);
-        let query_fingerprint = query_fingerprints.metric_fingerprint(
+        let fingerprints = query_fingerprints.metric_fingerprint(
             info.statement.sql.as_str(),
             role,
             operation,
             workload_name,
             info.failed,
         );
+        pioneer_observability::query_cpu::record_fingerprint(fingerprints.canonical);
+        let query_fingerprint = fingerprints.metric;
         super::attribution::record_database_query(
             query_fingerprint,
             database_query_kind(operation),
@@ -623,6 +701,55 @@ mod tests {
     use sea_orm::{ConnectionTrait, DbBackend, Statement, StreamTrait, TransactionTrait};
     use std::path::Path;
 
+    #[tokio::test]
+    async fn installer_inspection_reads_history_without_migrations_or_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = pioneer_config::AppConfig::load().unwrap();
+        let path = super::gateway_database_path(temp.path(), &config).unwrap();
+        assert_eq!(
+            super::inspect_applied_migration_names(temp.path(), &config)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(!path.exists(), "inspection must not create a DB");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let writer = sea_orm::Database::connect(sqlite_connection_url(&path))
+            .await
+            .unwrap();
+        let db = pioneer_sqlite::SqliteDatabase::from_single_connection(writer);
+        db.execute_unprepared(
+            "CREATE TABLE seaql_migrations (version TEXT PRIMARY KEY, applied_at BIGINT NOT NULL)",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO seaql_migrations VALUES ('future_unknown_to_installer', 1)",
+        )
+        .await
+        .unwrap();
+        db.close().await.unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            super::inspect_applied_migration_names(temp.path(), &config)
+                .await
+                .unwrap(),
+            Some(vec!["future_unknown_to_installer".into()])
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "no migrations/history writes"
+        );
+        // A malformed history is unknown, never an empty compatible set.
+        std::fs::write(&path, b"not a SQLite database").unwrap();
+        assert!(
+            super::inspect_applied_migration_names(temp.path(), &config)
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn rejects_empty_database_file_name() {
         let error = normalize_relative_database_file_name("   ", "gateway.database.file_name")
@@ -725,13 +852,15 @@ mod tests {
             state: std::sync::Mutex::new(super::QueryFingerprintState::default()),
         };
         let fingerprint = |sql, workload| {
-            limiter.metric_fingerprint(
-                sql,
-                pioneer_observability::DatabaseRole::Reader,
-                pioneer_observability::DatabaseOperation::Select,
-                workload,
-                false,
-            )
+            limiter
+                .metric_fingerprint(
+                    sql,
+                    pioneer_observability::DatabaseRole::Reader,
+                    pioneer_observability::DatabaseOperation::Select,
+                    workload,
+                    false,
+                )
+                .metric
         };
         let first = fingerprint(
             "SELECT one FROM probe",
@@ -766,6 +895,26 @@ mod tests {
             0,
             "a new attribute combination must use overflow after the series cap"
         );
+        // Metric-series overflow preserves canonical identity; shape overflow
+        // remains unknown, without a second normalization or SQL hash.
+        let rejected = limiter.metric_fingerprint(
+            "SELECT one FROM probe",
+            pioneer_observability::DatabaseRole::Reader,
+            pioneer_observability::DatabaseOperation::Select,
+            pioneer_observability::DatabaseWorkload::ThreadTreeLoad,
+            false,
+        );
+        assert_eq!(rejected.canonical, Some(first));
+        assert_eq!(rejected.metric, 0);
+        let unknown = limiter.metric_fingerprint(
+            "SELECT three FROM probe",
+            pioneer_observability::DatabaseRole::Reader,
+            pioneer_observability::DatabaseOperation::Select,
+            pioneer_observability::DatabaseWorkload::TimelinePage,
+            false,
+        );
+        assert_eq!(unknown.canonical, None);
+        assert_eq!(unknown.metric, 0);
         assert_eq!(
             limiter
                 .state
@@ -786,13 +935,15 @@ mod tests {
             state: std::sync::Mutex::new(super::QueryFingerprintState::default()),
         };
         let fingerprint = |sql| {
-            limiter.metric_fingerprint(
-                sql,
-                pioneer_observability::DatabaseRole::Reader,
-                pioneer_observability::DatabaseOperation::Select,
-                pioneer_observability::DatabaseWorkload::TimelinePage,
-                false,
-            )
+            limiter
+                .metric_fingerprint(
+                    sql,
+                    pioneer_observability::DatabaseRole::Reader,
+                    pioneer_observability::DatabaseOperation::Select,
+                    pioneer_observability::DatabaseWorkload::TimelinePage,
+                    false,
+                )
+                .metric
         };
 
         let first = fingerprint("SELECT payload FROM turn_event WHERE sequence = 42");
@@ -934,6 +1085,89 @@ mod tests {
         transaction.rollback().await.expect("rollback writer probe");
 
         database.close().await.expect("close both Gateway pools");
+    }
+
+    // The production Gateway initialization, fingerprint callback, wrappers,
+    // and SQLx worker transport are exercised together. This test is NOT_RUN
+    // until external acceptance of the entire changed tree.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn sql_cpu_capture_measures_workers_and_excludes_consumer_wait() {
+        use crate::database::attribution::scope_database_workload_result;
+        use pioneer_observability::{DatabaseOperationSite as Site, DatabaseWorkload as Workload};
+        use std::time::Duration;
+        pioneer_observability::init_tracing(false);
+        let runtime = tempfile::tempdir().unwrap();
+        let mut config = pioneer_config::AppConfig::load().unwrap();
+        config.gateway.database.file_name = "sql-cpu-test.db".into();
+        let database = super::initialize(runtime.path(), &config).await.unwrap();
+        let session = pioneer_observability::query_cpu::Session::start(
+            60,
+            pioneer_observability::telemetry_consent_snapshot().1,
+        )
+        .unwrap();
+        let (sum, maximum) = tokio::join!(
+            scope_database_workload_result(Workload::ThreadTreeLoad, Site::ThreadTreeLoad,
+                database.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+                    "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<400000) SELECT sum(x) AS value FROM n"))),
+            scope_database_workload_result(Workload::TimelinePage, Site::TimelinePage,
+                database.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+                    "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<400000) SELECT max(x) AS value FROM n"))),
+        );
+        assert_eq!(
+            sum.unwrap().unwrap().try_get::<i64>("", "value").unwrap(),
+            80_000_200_000
+        );
+        assert_eq!(
+            maximum
+                .unwrap()
+                .unwrap()
+                .try_get::<i64>("", "value")
+                .unwrap(),
+            400_000
+        );
+        scope_database_workload_result(Workload::SkillsWatch, Site::SkillsWatch, async {
+            let mut stream = database.stream_raw(Statement::from_string(DbBackend::Sqlite,
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000) SELECT x FROM n"))
+                .await?;
+            assert!(stream.next().await.transpose()?.is_some());
+            // Deliberately stalled consumer: SQLx blocks on its bounded row
+            // channel. This wait must not be charged as SQLite worker CPU.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(stream);
+            Ok::<_, sea_orm::DbErr>(())
+        }).await.unwrap();
+        database.close().await.unwrap(); // drain physical worker references
+        let snapshot = session.finish();
+        assert_eq!(snapshot.coverage.clock_api_errors, 0);
+        assert_eq!(snapshot.coverage.clock_regressions, 0);
+        assert_eq!(snapshot.coverage.scopes_without_callback, 0);
+        assert!(snapshot.coverage.measured_segments >= 3);
+        assert!(snapshot.coverage.cpu_clock_reads <= 40_000);
+        let json = serde_json::to_value(&snapshot).unwrap();
+        let groups = json["groups"].as_array().unwrap();
+        let group = |site: &str| {
+            groups
+                .iter()
+                .find(|g| g["site"].as_str() == Some(site))
+                .unwrap()
+        };
+        let sum = group("thread_tree_load");
+        let maximum = group("timeline_page");
+        let waiting = group("skills_watch");
+        assert!(sum["fingerprint"].is_string());
+        assert!(maximum["fingerprint"].is_string());
+        assert_ne!(sum["fingerprint"], maximum["fingerprint"]);
+        for completed in [sum, maximum] {
+            assert_eq!(completed["completed_calls"], 1);
+            assert!(completed["cpu_ns"].as_u64().unwrap() > 0);
+        }
+        assert_eq!(waiting["cancelled"], 1);
+        assert!(
+            waiting["cpu_ns"].as_u64().unwrap() < 150_000_000,
+            "a 300 ms blocked row consumer must not be charged as await duration"
+        );
+        assert_eq!(snapshot.measured_unknown.cpu_ns, None);
     }
 
     #[test]

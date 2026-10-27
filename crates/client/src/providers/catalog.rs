@@ -41,6 +41,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
     ProviderCatalogEntry::new("ollama", &[]),
     ProviderCatalogEntry::new("openai", &[]),
     ProviderCatalogEntry::new("openrouter", &[]),
+    ProviderCatalogEntry::new("vercel-ai-gateway", &["vercel", "vercel-gateway"]),
     ProviderCatalogEntry::new("telnyx", &[]),
     ProviderCatalogEntry::new("xai", &["grok"]),
     ProviderCatalogEntry::new("together", &["together-ai"]),
@@ -105,6 +106,15 @@ mod tests {
         assert_eq!(canonical_provider_id("azure openai"), "azure-openai");
         assert_eq!(canonical_provider_id("google-gemini"), "gemini");
         assert_eq!(canonical_provider_id("lm_studio"), "lmstudio");
+        for alias in [
+            "vercel-ai-gateway",
+            "Vercel AI Gateway",
+            "vercel_ai_gateway",
+            "vercel",
+            "vercel-gateway",
+        ] {
+            assert_eq!(canonical_provider_id(alias), "vercel-ai-gateway");
+        }
         assert_eq!(canonical_provider_id("custom provider"), "customprovider");
         for alias in ["glm", "zhipu", "bigmodel", "glm-cn", "zhipu-cn"] {
             assert_eq!(canonical_provider_id(alias), "glm");

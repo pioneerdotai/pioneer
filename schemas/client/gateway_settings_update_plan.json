@@ -22,6 +22,9 @@
         "claude"
       ]
     },
+    "GatewayBaseUrl": {
+      "type": "string"
+    },
     "GatewayCliRuntimeInstanceSettings": {
       "type": "object",
       "properties": {
@@ -429,6 +432,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "public_base_url": {
+          "description": "Present only for the currently authenticated relay connection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayBaseUrl"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "state": {
@@ -1041,6 +1055,7 @@
       "enum": [
         "openai",
         "openrouter",
+        "vercel-ai-gateway",
         "local"
       ]
     },

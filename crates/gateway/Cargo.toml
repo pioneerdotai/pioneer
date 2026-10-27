@@ -9,9 +9,10 @@ authors.workspace = true
 # Compile only deterministic native OAuth audit fixtures.
 oauth-test-support = ["pioneer-mcp-oauth/test-support"]
 default = []
-computer-use = ["pioneer-tools/computer-use"]
+computer-use = ["dep:cua-driver-sdk", "pioneer-tools/computer-use"]
 
 [dependencies]
+cua-driver-sdk = { workspace = true, optional = true }
 pioneer-compaction.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
@@ -43,9 +44,13 @@ pioneer-tasks.workspace = true
 pioneer-tools.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+notify.workspace = true
+same-file.workspace = true
+async-stream.workspace = true
 futures-util.workspace = true
 keepawake.workspace = true
 libc.workspace = true
+process-wrap.workspace = true
 log.workspace = true
 memvid-core.workspace = true
 tracing.workspace = true
@@ -71,12 +76,18 @@ zstd.workspace = true
 subtle.workspace = true
 hex.workspace = true
 hmac.workspace = true
+# Confidential stateless read cursors must not disclose filtered candidate IDs.
+ring = "0.17.14"
 image.workspace = true
 fs4.workspace = true
 transcribe-rs.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 tempfile.workspace = true
+tokio-tungstenite.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [build-dependencies]
 pioneer-protocol.workspace = true
@@ -84,7 +95,6 @@ serde.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-tokio-tungstenite.workspace = true
 sentry = { workspace = true, features = ["test"] }
 pioneer-sqlite = { workspace = true, features = ["test-support"] }
 pioneer-client.workspace = true

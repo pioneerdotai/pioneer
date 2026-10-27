@@ -114,6 +114,7 @@ pub(crate) fn catalog_provider(provider: &str) -> String {
 pub struct ModelCatalog {
     models: BTreeMap<String, BTreeMap<String, CatalogModel>>,
     origins: BTreeMap<String, BTreeMap<String, ModelOrigins>>,
+    snapshot_id: String,
     tool_capabilities: Option<ToolCapabilities>,
 }
 
@@ -146,11 +147,54 @@ impl ModelCatalog {
         origins: &str,
         tool_capabilities: Option<ToolCapabilities>,
     ) -> anyhow::Result<Self> {
-        let catalog = Self {
+        let mut catalog = Self {
             models: serde_json::from_str(models)?,
             origins: serde_json::from_str(origins)?,
+            snapshot_id: {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(models.as_bytes()))
+            },
             tool_capabilities,
         };
+        // Old Vercel cache records describe a different wire contract. Isolate
+        // only those records; last-good evidence for every other source survives.
+        if let Some(models) = catalog.models.get_mut("vercel-ai-gateway") {
+            let stale: Vec<String> = models
+                .iter()
+                .filter(|(_, m)| {
+                    m.api != "openai-responses" || m.base_url != "https://ai-gateway.vercel.sh/v1"
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in stale {
+                models.remove(&id);
+                if let Some(origins) = catalog.origins.get_mut("vercel-ai-gateway") {
+                    origins.remove(&id);
+                }
+                if let Some(capabilities) = catalog
+                    .tool_capabilities
+                    .as_mut()
+                    .and_then(|c| c.get_mut("vercel-ai-gateway"))
+                {
+                    capabilities.remove(&id);
+                }
+            }
+        }
+        if let Some(capabilities) = catalog
+            .tool_capabilities
+            .as_mut()
+            .and_then(|c| c.get_mut("vercel-ai-gateway"))
+        {
+            // A tool-only legacy supplement carries no Responses route proof.
+            // Preserve explicit denials; positives require a current model.
+            capabilities.retain(|id, supported| {
+                !*supported
+                    || catalog
+                        .models
+                        .get("vercel-ai-gateway")
+                        .is_some_and(|models| models.contains_key(id))
+            });
+        }
         anyhow::ensure!(!catalog.models.is_empty(), "empty model catalog");
         for (provider, models) in &catalog.models {
             for (id, model) in models {
@@ -180,6 +224,10 @@ impl ModelCatalog {
             }
         }
         Ok(catalog)
+    }
+
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
     }
 
     pub fn model(&self, provider: &str, id: &str) -> Option<&CatalogModel> {
@@ -237,6 +285,11 @@ impl ModelCatalog {
                 model.capabilities.tool_calling =
                     merge_tool_support(model.capabilities.tool_calling, source);
             }
+            enrich_reasoning(
+                provider,
+                model,
+                self.model(provider, &model.id).filter(|_| use_tool_sources),
+            );
             let Some(entry) = self.model(provider, &model.id) else {
                 continue;
             };
@@ -253,7 +306,6 @@ impl ModelCatalog {
             if model.name.is_none() {
                 model.name = Some(entry.name.clone());
             }
-            model.capabilities.thinking.get_or_insert(entry.reasoning);
             let effective = effective_input_model(provider, &model.id, Some(entry), Some(model))
                 .expect("catalog model");
             let input = model
@@ -310,6 +362,236 @@ impl ModelCatalog {
     }
 }
 
+/// Field priority: native facts > matching catalog keys > documented fallback.
+/// Actual adapter/mode restrictions always bound the result. A partial map
+/// overrides only present keys; omitted off cannot erase known mandatory.
+fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option<&CatalogModel>) {
+    use pioneer_protocol::ReasoningCapabilitySource as Source;
+    if provider == "vercel-ai-gateway"
+        && model
+            .capabilities
+            .reasoning
+            .as_ref()
+            .is_some_and(|reasoning| {
+                matches!(reasoning.source.as_ref(), Some(Source::ProviderMetadata))
+            })
+    {
+        // Vercel discovery already applied the real Responses mapper to its
+        // authority-native model. A missing/stale public entry cannot erase or
+        // widen that validated enum after the discovery scope has ended.
+        return;
+    }
+    // Discovery-only/private models have no public record. Preserve the same
+    // authority-scoped source facts used by runtime request validation.
+    let scoped = (provider == "vercel-ai-gateway")
+        .then(|| crate::generation::native_model(provider, &model.id))
+        .flatten();
+    let entry = scoped.as_ref().or(entry);
+    let fallback = crate::reasoning_registry::reasoning_capabilities_for_model(provider, &model.id);
+    let documented_off = fallback
+        .as_ref()
+        .is_some_and(|r| r.effort_options.iter().any(|e| e == "none"));
+    let native = model
+        .capabilities
+        .reasoning
+        .as_ref()
+        .map(|r| r.native.clone())
+        .unwrap_or_default();
+    let catalog_thinking = entry.map(|e| e.reasoning);
+    let catalog_off = entry
+        .and_then(|e| e.metadata.get("thinkingLevelMap"))
+        .and_then(|m| m.get("off"));
+    let entry = crate::generation::reasoning_model(provider, entry, &native);
+    if model.capabilities.reasoning.is_none()
+        && fallback.is_none()
+        && entry.as_ref().is_none_or(|e| {
+            !e.metadata.contains_key("thinkingLevelMap")
+                && e.metadata
+                    .get("sourceGeneration")
+                    .is_none_or(|s| s.get("reasoningOptions").is_none())
+        })
+    {
+        if let Some(entry) = entry {
+            model.capabilities.thinking.get_or_insert(entry.reasoning);
+        }
+        return;
+    }
+    let mut reasoning = model
+        .capabilities
+        .reasoning
+        .clone()
+        .or(fallback.clone())
+        .unwrap_or_default();
+    if let Some(fallback) = fallback {
+        for effort in fallback.effort_options {
+            if !reasoning.effort_options.contains(&effort) {
+                reasoning.effort_options.push(effort);
+            }
+        }
+        reasoning.default_effort = reasoning.default_effort.or(fallback.default_effort);
+        reasoning.mandatory = reasoning.mandatory.or(fallback.mandatory);
+        reasoning.supported = reasoning.supported.or(fallback.supported);
+    }
+    if let Some(entry) = entry.as_ref() {
+        reasoning.supported = Some(entry.reasoning);
+        model.capabilities.thinking = native
+            .get("thinking.supported")
+            .copied()
+            .flatten()
+            // Keep the pre-existing discovery bool for adapters outside the
+            // native profiles changed here (for example OpenRouter).
+            .or_else(|| {
+                (!matches!(provider, "anthropic" | "gemini" | "bedrock"))
+                    .then_some(model.capabilities.thinking)
+                    .flatten()
+            })
+            .or(if provider == "openrouter" {
+                catalog_thinking
+            } else {
+                Some(entry.reasoning)
+            });
+        let source_efforts = entry
+            .metadata
+            .get("sourceGeneration")
+            .and_then(|s| s["reasoningOptions"].as_array())
+            .map(|options| {
+                options
+                    .iter()
+                    .filter(|o| o["type"] == "effort")
+                    .flat_map(|o| o["values"].as_array().into_iter().flatten())
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        // Source options supply positive candidates, not a native closed enum.
+        // Keep documented platform controls; explicit denials and the actual
+        // protocol mapper still filter the combined candidates below.
+        for effort in source_efforts {
+            if !reasoning.effort_options.contains(&effort) {
+                reasoning.effort_options.push(effort);
+            }
+        }
+        if let Some(map) = entry
+            .metadata
+            .get("thinkingLevelMap")
+            .and_then(Value::as_object)
+        {
+            for (key, value) in map {
+                let effort = if key == "off" { "none" } else { key };
+                reasoning.effort_options.retain(|e| e != effort);
+                if value.is_string() {
+                    reasoning.effort_options.push(effort.into());
+                }
+            }
+            // Native effort denials projected into this map do not establish
+            // mandatory thinking. Only the original catalog off fact can do so;
+            // a separately published native mandatory fact wins below.
+            if let Some(off) = catalog_off {
+                if provider != "vercel-ai-gateway" || off.is_string() {
+                    reasoning.mandatory = Some(off.is_null());
+                }
+            }
+        }
+        if entry
+            .metadata
+            .get("compat")
+            .is_some_and(|c| c["supportsReasoningEffort"] == false)
+        {
+            reasoning.effort_options.retain(|e| e == "none");
+        }
+        // Catalog/mixed fields do not originate in StaticRegistry.
+        reasoning.source = Some(Source::Unknown);
+    }
+    // Qualitative source enums do not describe the separate disabled mode.
+    // Fill that documented control only for bounded optional native profiles;
+    // explicit off vetoes and native mode denials still win below.
+    if documented_off
+        && entry.as_ref().is_none_or(|e| {
+            e.metadata
+                .get("thinkingLevelMap")
+                .is_none_or(|m| m.get("off") != Some(&Value::Null))
+        })
+        && !reasoning.effort_options.iter().any(|e| e == "none")
+    {
+        reasoning.effort_options.push("none".into());
+    }
+    // Restore native sublevels after catalog replacement. Native thinking and
+    // effort support are independent; mode denials are checked by the mapper.
+    for (key, supported) in &native {
+        let Some(level) = key
+            .strip_prefix("effort.")
+            .filter(|e| crate::ReasoningEffort::from_str(e).is_some())
+        else {
+            continue;
+        };
+        if let Some(supported) = supported {
+            reasoning.effort_options.retain(|e| e != level);
+            if *supported {
+                reasoning.effort_options.push(level.into());
+            }
+        }
+    }
+    if native.get("effort.supported") == Some(&Some(false)) {
+        reasoning.effort_options.retain(|e| e == "none");
+    }
+    if provider == "gemini" && model.id.starts_with("gemini-2.5-") {
+        reasoning.effort_options.retain(|e| e == "none");
+        reasoning.default_effort = None;
+        reasoning.supports_token_budget = Some(false); // no numeric product control
+    }
+    if provider == "openrouter" {
+        crate::providers::openrouter::preserve_native_reasoning(&mut reasoning);
+    }
+    reasoning.effort_options.retain(|e| {
+        crate::ReasoningEffort::from_str(e).is_some_and(|e| {
+            crate::generation::effort_supported_with_native(
+                provider,
+                &model.id,
+                entry.as_ref(),
+                e,
+                &native,
+            )
+        })
+    });
+    reasoning.effort_options.sort_by_key(|e| {
+        ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            .iter()
+            .position(|v| *v == e)
+            .unwrap_or(usize::MAX)
+    });
+    reasoning.effort_options.dedup();
+    if !native.iter().any(|(k, v)| {
+        k.strip_prefix("default_effort.")
+            .is_some_and(|e| crate::ReasoningEffort::from_str(e).is_some())
+            && *v == Some(true)
+    }) && reasoning
+        .default_effort
+        .as_ref()
+        .is_some_and(|e| !reasoning.effort_options.contains(e))
+    {
+        reasoning.default_effort = None;
+    }
+    if crate::generation::protocol_mandatory(provider, &model.id) {
+        reasoning.mandatory = Some(true);
+    }
+    if provider == "gemini" && native.get("thinking.supported") == Some(&Some(false))
+        || native.get("thinking.supported") == Some(&Some(false))
+            && native.get("effort.supported") == Some(&Some(false))
+    {
+        reasoning.supported = Some(false);
+    } else if provider != "openrouter" && native.values().any(|v| *v == Some(true)) {
+        reasoning.supported = Some(true);
+    }
+    if !native.is_empty() && reasoning.source == Some(Source::StaticRegistry) {
+        reasoning.source = Some(Source::Unknown);
+    }
+    // Unknown remains absent rather than advertising reasoning from an ID.
+    if reasoning != Default::default() {
+        model.capabilities.reasoning = Some(reasoning);
+    }
+}
+
 /// Explicit negatives from discovery or metadata/source veto permission.
 /// Otherwise discovery wins, then catalog; missing remains unknown.
 pub(crate) fn merge_tool_support(discovery: Option<bool>, catalog: Option<bool>) -> Option<bool> {
@@ -320,6 +602,17 @@ pub(crate) fn merge_tool_support(discovery: Option<bool>, catalog: Option<bool>)
     }
 }
 
+/// Local catalog bootstrap has not supplied a validated snapshot yet.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelCatalogUnavailable;
+
+impl std::fmt::Display for ModelCatalogUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Model catalog is not loaded yet. Retry after the catalog has loaded.")
+    }
+}
+impl std::error::Error for ModelCatalogUnavailable {}
+
 #[derive(Default)]
 struct CatalogStore(RwLock<Option<Arc<ModelCatalog>>>);
 impl CatalogStore {
@@ -328,11 +621,7 @@ impl CatalogStore {
             .read()
             .expect("model catalog lock")
             .clone()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Model catalog is not loaded yet. Retry after the catalog has loaded."
-                )
-            })
+            .ok_or_else(|| ModelCatalogUnavailable.into())
     }
     fn publish(&self, catalog: ModelCatalog) {
         *self.0.write().expect("model catalog lock") = Some(Arc::new(catalog));

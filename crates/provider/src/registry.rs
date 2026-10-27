@@ -176,6 +176,7 @@ struct AuthorityBoundProvider {
     redact_endpoint_errors: bool,
     input_admission: Arc<crate::attachments::admission::AdmissionState>,
     discovery_tools: RwLock<BTreeMap<String, bool>>,
+    discovery_reasoning: RwLock<BTreeMap<String, crate::generation::NativeReasoning>>,
     use_public_catalog: bool,
 }
 
@@ -243,6 +244,10 @@ fn redacted_endpoint_error(
         // Keep only the controlled diagnostic, dropping any raw context chain.
         return rejection.clone().into();
     }
+    if error.is::<crate::catalog::ModelCatalogUnavailable>() {
+        // Preserve the local category, discarding any uncontrolled outer context.
+        return crate::catalog::ModelCatalogUnavailable.into();
+    }
     // Adapters can supply structured status even when their error does not
     // contain a reqwest source or the usual `API error (...)` prefix.
     let adapter_classification = inner.classify_failure(&error);
@@ -291,13 +296,18 @@ fn redacted_endpoint_error(
     } else {
         "provider request failed"
     };
-    RedactedEndpointError {
+    let observed = crate::usage::error_usage(&error).cloned();
+    let redacted: anyhow::Error = RedactedEndpointError {
         message,
         classification,
         incomplete: crate::failure::provider_stream_incomplete(&error),
         native: crate::failure::anthropic_stream_error(&error),
     }
-    .into()
+    .into();
+    match observed {
+        Some(usage) => crate::usage::with_error_usage(redacted, &usage),
+        None => redacted,
+    }
 }
 
 impl AuthorityBoundProvider {
@@ -306,6 +316,12 @@ impl AuthorityBoundProvider {
         model: &str,
         catalog: Option<&crate::catalog::ModelCatalog>,
     ) -> bool {
+        if self.inner.model_catalog_entry(model).is_some() {
+            // Connection-owned facts include the provider's model-specific
+            // tool decision. Public/discovery fallback below remains unchanged
+            // for providers that do not own a native model snapshot.
+            return self.inner.model_tool_calling(model);
+        }
         let discovery = self
             .discovery_tools
             .read()
@@ -325,6 +341,15 @@ impl AuthorityBoundProvider {
         catalog: &crate::catalog::ModelCatalog,
         models: &mut [ProviderModelInfo],
     ) {
+        self.remember_discovery(models);
+        // Vercel discovery is authority-owned source evidence. A
+        // public row must not fill native unknown limits, modalities or tariffs.
+        if self.inner.name() != "vercel-ai-gateway" {
+            catalog.enrich_for_tool_scope(self.inner.name(), models, self.use_public_catalog);
+        }
+    }
+
+    fn remember_discovery(&self, models: &[ProviderModelInfo]) {
         // Keep raw media evidence before any catalog enrichment, in this same
         // authority instance. A refresh replaces both capability snapshots.
         self.input_admission.replace_discovery(models.to_vec());
@@ -334,7 +359,26 @@ impl AuthorityBoundProvider {
             .iter()
             .filter_map(|m| m.capabilities.tool_calling.map(|v| (m.id.clone(), v)))
             .collect();
-        catalog.enrich_for_tool_scope(self.inner.name(), models, self.use_public_catalog);
+        *self
+            .discovery_reasoning
+            .write()
+            .expect("discovery reasoning lock") = models
+            .iter()
+            .filter_map(|m| {
+                m.capabilities
+                    .reasoning
+                    .as_ref()
+                    .filter(|r| !r.native.is_empty())
+                    .map(|r| (m.id.clone(), r.native.clone()))
+            })
+            .collect();
+    }
+
+    fn discovery_reasoning_snapshot(&self) -> BTreeMap<String, crate::generation::NativeReasoning> {
+        self.discovery_reasoning
+            .read()
+            .expect("discovery reasoning lock")
+            .clone()
     }
 
     fn discovery_tool_snapshot(&self) -> BTreeMap<String, bool> {
@@ -371,6 +415,19 @@ impl AuthorityBoundProvider {
 
 #[async_trait]
 impl Provider for AuthorityBoundProvider {
+    fn request_usage_profile(&self, request: &ChatRequest) -> Result<crate::ProviderUsageProfile> {
+        self.inner.request_usage_profile(request)
+    }
+    fn usage_api(&self) -> &'static str {
+        self.inner.usage_api()
+    }
+    fn usage_api_version(&self) -> Option<String> {
+        self.inner.usage_api_version()
+    }
+    fn usage_route(&self) -> Option<String> {
+        self.inner.usage_route()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -412,7 +469,12 @@ impl Provider for AuthorityBoundProvider {
                 self.input_admission.clone(),
                 crate::attachments::runtime::with_async_authority_scope(
                     self.authority_fingerprint.as_str().to_owned(),
-                    self.inner.prepare_input_budget(request),
+                    crate::generation::with_native_reasoning(
+                        self.name(),
+                        self.use_public_catalog,
+                        self.discovery_reasoning_snapshot(),
+                        self.inner.prepare_input_budget(request),
+                    ),
                 ),
             )
             .await,
@@ -421,21 +483,39 @@ impl Provider for AuthorityBoundProvider {
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         self.ensure_not_revoked()?;
-        self.public_result(
-            crate::attachments::admission::scope(
-                self.input_admission.clone(),
-                crate::attachments::runtime::with_async_authority_scope(
-                    self.authority_fingerprint.as_str().to_owned(),
-                    crate::tools::policy::with_discovery_tools(
-                        self.name(),
-                        self.use_public_catalog,
-                        self.discovery_tool_snapshot(),
-                        self.inner.chat(request),
+        if self.inner.name() == "vercel-ai-gateway" {
+            self.public_result(self.inner.model_limits(&request.model).await)?;
+            self.ensure_not_revoked()?;
+        }
+        let context = crate::usage::UsageContext::capture_request(self.inner.as_ref(), &request)?;
+        let mut response = self
+            .public_result(
+                crate::attachments::admission::scope(
+                    self.input_admission.clone(),
+                    crate::attachments::runtime::with_async_authority_scope(
+                        self.authority_fingerprint.as_str().to_owned(),
+                        crate::tools::policy::with_discovery_tools(
+                            self.name(),
+                            self.use_public_catalog,
+                            self.discovery_tool_snapshot(),
+                            crate::generation::with_native_reasoning(
+                                self.name(),
+                                self.use_public_catalog,
+                                self.discovery_reasoning_snapshot(),
+                                self.inner.chat(request),
+                            ),
+                        ),
                     ),
-                ),
+                )
+                .await,
             )
-            .await,
-        )
+            .map_err(|error| context.enrich_error(error))?;
+        let usage = response.usage.get_or_insert_with(Default::default);
+        context.enrich(usage);
+        crate::ProviderMessageCollector::validate_response(&response).map_err(|error| {
+            crate::usage::with_error_usage(error, response.usage.as_ref().expect("usage enriched"))
+        })?;
+        Ok(response)
     }
 
     async fn stream_chat(
@@ -450,37 +530,95 @@ impl Provider for AuthorityBoundProvider {
         request: ChatRequest,
     ) -> Result<crate::ProviderStream> {
         self.ensure_not_revoked()?;
-        let mut response = self.public_result(
-            crate::attachments::admission::scope(
-                self.input_admission.clone(),
-                crate::attachments::runtime::with_async_authority_scope(
-                    self.authority_fingerprint.as_str().to_owned(),
-                    crate::tools::policy::with_discovery_tools(
-                        self.name(),
-                        self.use_public_catalog,
-                        self.discovery_tool_snapshot(),
-                        self.inner.stream_chat_with_diagnostics(request),
+        if self.inner.name() == "vercel-ai-gateway" {
+            self.public_result(self.inner.model_limits(&request.model).await)?;
+            self.ensure_not_revoked()?;
+        }
+        let context = crate::usage::UsageContext::capture_request(self.inner.as_ref(), &request)?;
+        let mut response = self
+            .public_result(
+                crate::attachments::admission::scope(
+                    self.input_admission.clone(),
+                    crate::attachments::runtime::with_async_authority_scope(
+                        self.authority_fingerprint.as_str().to_owned(),
+                        crate::tools::policy::with_discovery_tools(
+                            self.name(),
+                            self.use_public_catalog,
+                            self.discovery_tool_snapshot(),
+                            crate::generation::with_native_reasoning(
+                                self.name(),
+                                self.use_public_catalog,
+                                self.discovery_reasoning_snapshot(),
+                                self.inner.stream_chat_with_diagnostics(request),
+                            ),
+                        ),
                     ),
-                ),
+                )
+                .await,
             )
-            .await,
-        )?;
-        if self.redact_endpoint_errors {
-            let inner = self.inner.clone();
-            response.stream = Box::pin(response.stream.map(move |result| {
+            .map_err(|error| context.enrich_error(error))?;
+        let inner = self.inner.clone();
+        let redact = self.redact_endpoint_errors;
+        let mut accumulated = crate::TokenUsage::default();
+        response.stream = Box::pin(response.stream.map(move |result| {
+            let result = if redact {
                 result.map_err(|error| {
                     redacted_endpoint_error(inner.as_ref(), error, ProviderFailureStage::MidStream)
                 })
-            }));
-        }
+            } else {
+                result
+            };
+            let result = result.map_err(|error| {
+                if let Some(snapshot) = crate::usage::error_usage(&error) {
+                    accumulated.update(snapshot);
+                }
+                if accumulated != crate::TokenUsage::default() {
+                    context.enrich(&mut accumulated);
+                    crate::usage::with_error_usage(error, &accumulated)
+                } else {
+                    error
+                }
+            });
+            result.map(|mut chunk| {
+                if let Some(snapshot) = &chunk.usage {
+                    accumulated.update(snapshot);
+                }
+                if chunk.usage.is_some() || chunk.is_final {
+                    context.enrich(&mut accumulated);
+                    chunk.usage = Some(accumulated.clone());
+                }
+                chunk
+            })
+        }));
         Ok(response)
+    }
+
+    async fn prepare_model(&self, model: &str) -> Result<()> {
+        self.ensure_not_revoked()?;
+        self.public_result(self.inner.prepare_model(model).await)
+    }
+
+    async fn model_limits(&self, model: &str) -> Result<crate::catalog::CatalogLimits> {
+        self.ensure_not_revoked()?;
+        self.public_result(self.inner.model_limits(model).await)
+    }
+    fn model_catalog_entry(&self, model: &str) -> Option<crate::catalog::CatalogModel> {
+        if self.ensure_not_revoked().is_err() {
+            return None;
+        }
+        self.inner.model_catalog_entry(model)
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
         self.ensure_not_revoked()?;
-        let catalog = crate::catalog::model_catalog()?;
         let mut models = self.public_result(self.inner.list_models().await)?;
-        self.enrich_discovery(&catalog, &mut models);
+        if let Ok(catalog) = crate::catalog::model_catalog() {
+            self.enrich_discovery(&catalog, &mut models);
+        } else {
+            // Native discovery is usable before bootstrap and during catalog
+            // outages. Keep authority-local evidence even without enrichment.
+            self.remember_discovery(&models);
+        }
         Ok(models)
     }
 
@@ -744,6 +882,46 @@ impl ProviderRegistry {
         Ok(fingerprint)
     }
 
+    /// Resolve current connection authority for a new durable execution.
+    /// Unlike an immutable execution's fingerprint check, this must also
+    /// reject a removed credential or retired/unconfigured endpoint before
+    /// creating a fresh lease. Injected adapters own their availability.
+    pub fn available_authority_fingerprint_for_workspace(
+        &self,
+        workspace_id: &str,
+        provider_name: &str,
+    ) -> Result<ProviderAuthorityFingerprint> {
+        let provider_name = normalize_provider_name(provider_name);
+        let expected = {
+            let _scope = self.lock_authority_scope(Some(workspace_id), &provider_name);
+            let (key, proxy, base_url, fingerprint) =
+                self.resolve_authority(Some(workspace_id), &provider_name)?;
+            let injected = self
+                .injected
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&provider_name);
+            if !injected
+                && !crate::provider_definition(&provider_name).is_some_and(|definition| {
+                    crate::provider_is_available(
+                        !key.is_empty(),
+                        proxy.is_some(),
+                        base_url.is_some(),
+                        definition,
+                    )
+                })
+            {
+                return Err(ProviderAuthorityRevoked.into());
+            }
+            fingerprint
+        };
+        let current = self.authority_fingerprint_for_workspace(workspace_id, &provider_name)?;
+        if current != expected {
+            return Err(ProviderAuthorityRevoked.into());
+        }
+        Ok(current)
+    }
+
     /// Build and immediately discard a candidate adapter before its
     /// credential/configuration is published. This catches unsupported
     /// providers, malformed proxy configuration, and local client-construction
@@ -888,6 +1066,7 @@ impl ProviderRegistry {
             input_admission: Arc::new(Default::default()),
             use_public_catalog,
             discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
         });
         if !cache.make_room_for_insert(self.limits.max_cached_instances) {
             return Err(ProviderRegistryCapacityExceeded {
@@ -1015,6 +1194,7 @@ impl ProviderRegistry {
             input_admission: Arc::new(Default::default()),
             use_public_catalog,
             discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
         });
         cache.prune_expired(now, self.limits.idle_ttl);
         if cache.make_room_for_insert(self.limits.max_cached_instances) {
@@ -1189,6 +1369,41 @@ mod tests {
     use crate::{ProviderTermination, TokenUsage};
     use futures_util::stream;
 
+    #[test]
+    fn new_durable_authority_rotates_key_but_refuses_removed_credentials_and_retired_provider() {
+        let key = Arc::new(RwLock::new("first-key".to_owned()));
+        let registry = ProviderRegistry::new({
+            let key = key.clone();
+            move |_| key.read().unwrap().clone()
+        });
+        let first = registry
+            .available_authority_fingerprint_for_workspace("workspace", "openai")
+            .unwrap();
+        *key.write().unwrap() = "second-key".to_owned();
+        let second = registry
+            .available_authority_fingerprint_for_workspace("workspace", "openai")
+            .unwrap();
+        assert_ne!(first, second);
+        assert_ne!(
+            second,
+            registry
+                .available_authority_fingerprint_for_workspace("other-workspace", "openai")
+                .unwrap()
+        );
+        *key.write().unwrap() = String::new();
+        assert!(
+            registry
+                .available_authority_fingerprint_for_workspace("workspace", "openai")
+                .is_err()
+        );
+        *key.write().unwrap() = "saved-key".to_owned();
+        assert!(
+            registry
+                .available_authority_fingerprint_for_workspace("workspace", "hyperbolic")
+                .is_err()
+        );
+    }
+
     fn chat_request() -> ChatRequest {
         ChatRequest {
             model: "test-model".to_owned(),
@@ -1204,12 +1419,548 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_requires_loaded_catalog_but_direct_chat_does_not() {
-        let registry = ProviderRegistry::with_provider("echo", Arc::new(EchoProvider::new()));
-        let provider = registry.get_or_create("echo").unwrap();
-        let error = provider.list_models().await.unwrap_err();
-        assert!(error.to_string().contains("Model catalog is not loaded"));
-        assert!(provider.chat(chat_request()).await.is_ok());
+    async fn native_discovery_and_direct_chat_do_not_require_a_loaded_catalog() {
+        let registry = ProviderRegistry::with_provider("openai", Arc::new(ToolDiscoveryProvider));
+        let provider = registry.get_or_create("openai").unwrap();
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "g03-positive");
+        assert_eq!(models[0].capabilities.tool_calling, Some(false));
+        assert!(!provider.model_tool_calling("g03-positive"));
+        let echo = ProviderRegistry::with_provider("echo", Arc::new(EchoProvider::new()));
+        assert!(
+            echo.get_or_create("echo")
+                .unwrap()
+                .chat(chat_request())
+                .await
+                .is_ok()
+        );
+        // Native errors are also preserved rather than replaced by a catalog
+        // bootstrap error. Echo intentionally has no native model listing.
+        let error = echo
+            .get_or_create("echo")
+            .unwrap()
+            .list_models()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support listing models")
+        );
+    }
+
+    #[test]
+    fn endpoint_redaction_preserves_local_catalog_category_without_raw_context() {
+        let error = anyhow::Error::new(crate::catalog::ModelCatalogUnavailable)
+            .context("sensitive endpoint and credential context");
+        let redacted = redacted_endpoint_error(
+            &NativeListFixture("connection-facts-provider"),
+            error,
+            ProviderFailureStage::Connect,
+        );
+        assert!(redacted.is::<crate::catalog::ModelCatalogUnavailable>());
+        assert!(!format!("{redacted:#}").contains("sensitive"));
+    }
+
+    struct NativeListFixture(&'static str);
+    #[async_trait]
+    impl Provider for NativeListFixture {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn model_tool_calling(&self, _model: &str) -> bool {
+            // Authority-owned adapters expose the same explicit negative fact
+            // synchronously as through discovery; the adapter ceiling is wider.
+            false
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                tool_calling: true,
+                ..Default::default()
+            }
+        }
+        async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+            let mut model =
+                crate::catalog::tool_tests::discovered("fixture-native-model", Some(false));
+            model.provider = self.0.into();
+            model.capabilities.reasoning =
+                Some(pioneer_protocol::ProviderModelReasoningCapabilities {
+                    native: BTreeMap::from([("supported".into(), Some(false))]),
+                    ..Default::default()
+                });
+            Ok(vec![model])
+        }
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse> {
+            anyhow::bail!("fixture model boundary")
+        }
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            anyhow::bail!("fixture model boundary")
+        }
+    }
+    #[tokio::test]
+    async fn shared_discovery_boundary_keeps_native_evidence_for_every_active_provider() {
+        // Inventory coverage of the common authority wrapper, not a claim that
+        // mocked transports certify each vendor's Models API.
+        for definition in crate::definition::provider_definitions() {
+            if definition.retirement_reason().is_some() {
+                continue;
+            }
+            let wrapper = AuthorityBoundProvider {
+                inner: Arc::new(NativeListFixture(definition.name)),
+                authority_fingerprint: ProviderAuthorityFingerprint(definition.name.into()),
+                revoked: Arc::new(AtomicBool::new(false)),
+                redact_endpoint_errors: false,
+                input_admission: Arc::new(Default::default()),
+                use_public_catalog: true,
+                discovery_tools: RwLock::new(BTreeMap::new()),
+                discovery_reasoning: RwLock::new(BTreeMap::new()),
+            };
+            let models = wrapper.list_models().await.unwrap();
+            assert_eq!(models[0].provider, definition.name);
+            assert_eq!(models[0].capabilities.tool_calling, Some(false));
+            assert!(!wrapper.model_tool_calling_with_catalog("fixture-native-model", None));
+            assert_eq!(
+                wrapper.discovery_reasoning_snapshot()["fixture-native-model"]["supported"],
+                Some(false)
+            );
+            assert_eq!(
+                wrapper
+                    .input_admission
+                    .model("fixture-native-model")
+                    .unwrap()
+                    .capabilities
+                    .tool_calling,
+                Some(false)
+            );
+            wrapper.revoked.store(true, Ordering::Release);
+            assert!(
+                wrapper
+                    .list_models()
+                    .await
+                    .unwrap_err()
+                    .is::<ProviderAuthorityRevoked>()
+            );
+        }
+    }
+
+    struct RouterReasoningFixture {
+        discovery: String,
+        catalog: Arc<crate::catalog::ModelCatalog>,
+        bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+    #[async_trait]
+    impl Provider for RouterReasoningFixture {
+        fn name(&self) -> &str {
+            "openrouter"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+        async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+            Ok(crate::providers::openrouter::models_from_native_discovery_fixture(&self.discovery))
+        }
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+            let body = crate::providers::openrouter::render_chat_request_mode_for_test(
+                &self.catalog,
+                &request,
+                false,
+            )
+            .await?;
+            self.bodies.lock().unwrap().push(body);
+            Ok(ChatResponse {
+                messages: Vec::new(),
+                text: String::new(),
+                usage: None,
+                termination: ProviderTermination::Complete,
+                reasoning_content: None,
+                tool_calls: vec![],
+                provider_replay_state: None,
+            })
+        }
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            let body = crate::providers::openrouter::render_chat_request_mode_for_test(
+                &self.catalog,
+                &request,
+                true,
+            )
+            .await?;
+            self.bodies.lock().unwrap().push(body);
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn router_native_fields_survive_catalog_conflicts_and_actual_authority_requests() {
+        use crate::{ReasoningConfig, ReasoningEffort};
+        let id = "openai/gpt-5.4";
+        // Each case has a distinct real authority instance/cache. These facts
+        // enter through the production parser, never with_native_reasoning.
+        for (metadata, expected, supported, mandatory, default, budget) in [
+            (
+                serde_json::json!({"supported_efforts":["low","high"], "default_effort":"high", "default_enabled":true,"mandatory":true,"supports_max_tokens":false}),
+                vec!["low", "high"],
+                Some(true),
+                Some(true),
+                Some("high"),
+                Some(false),
+            ),
+            (
+                serde_json::json!({"supported_efforts":["none","low","high"], "mandatory":false}),
+                vec!["none", "low", "high"],
+                Some(true),
+                Some(false),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts":[], "default_enabled":false}),
+                vec![],
+                Some(true),
+                Some(false),
+                None,
+                None,
+            ),
+            // An explicit aggregate negative remains independent of a positive enum.
+            (
+                serde_json::json!({"supported":false,"supported_efforts":["low","high"],"mandatory":true}),
+                vec![],
+                Some(false),
+                Some(true),
+                None,
+                None,
+            ),
+            // Documented omission within the object denies effort selection,
+            // but does not turn budget support or a default into effort support.
+            (
+                serde_json::json!({"default_effort":"high","supports_max_tokens":true}),
+                vec![],
+                Some(true),
+                Some(false),
+                Some("high"),
+                Some(true),
+            ),
+            (
+                serde_json::json!({"supported_efforts":null,"default_effort":"none","default_enabled":false,"mandatory":false}),
+                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                Some(false),
+                Some("none"),
+                None,
+            ),
+            // Absent or malformed enum carries no confirmed per-model enum;
+            // matching catalog fallback remains visible as mixed/unknown source.
+            (
+                serde_json::Value::Null,
+                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                Some(false),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts":[null],"mandatory":null,"supports_max_tokens":null}),
+                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                Some(false),
+                None,
+                None,
+            ),
+        ] {
+            let mut catalog_metadata = serde_json::json!({"thinkingLevelMap":{"off":"none","medium":"high","xhigh":"xhigh","max":"max","minimal":"minimal","low":"low","high":"high"}});
+            if metadata["mandatory"] == true && metadata.get("supported").is_none() {
+                catalog_metadata["reasoning"] = serde_json::json!(false);
+                catalog_metadata["compat"] = serde_json::json!({"supportsReasoningEffort":false});
+            }
+            let catalog = Arc::new(crate::generation::test_catalog_model(
+                "openrouter",
+                id,
+                id,
+                catalog_metadata,
+            ));
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let wrapper = AuthorityBoundProvider {
+                inner: Arc::new(RouterReasoningFixture {
+                    discovery: serde_json::json!({"data":[{"id":id,"reasoning":metadata}]})
+                        .to_string(),
+                    catalog: catalog.clone(),
+                    bodies: bodies.clone(),
+                }),
+                authority_fingerprint: ProviderAuthorityFingerprint(
+                    "router-reasoning-fixture".into(),
+                ),
+                revoked: Arc::new(AtomicBool::new(false)),
+                redact_endpoint_errors: false,
+                input_admission: Arc::new(Default::default()),
+                use_public_catalog: true,
+                discovery_tools: RwLock::new(BTreeMap::new()),
+                discovery_reasoning: RwLock::new(BTreeMap::new()),
+            };
+            let mut models = wrapper.inner.list_models().await.unwrap();
+            let raw_native = models[0]
+                .capabilities
+                .reasoning
+                .as_ref()
+                .map(|r| r.native.clone())
+                .unwrap_or_default();
+            wrapper.enrich_discovery(&catalog, &mut models);
+            let r = models[0].capabilities.reasoning.as_ref().unwrap();
+            assert_eq!(r.native, raw_native);
+            for (field, fact) in [
+                ("mandatory", "mandatory"),
+                ("default_enabled", "default_enabled"),
+                ("supports_max_tokens", "supports_token_budget"),
+                ("supported", "reasoning.supported"),
+            ] {
+                assert_eq!(
+                    raw_native.get(fact).copied(),
+                    metadata.get(field).map(serde_json::Value::as_bool)
+                );
+            }
+
+            assert_eq!(
+                models[0].capabilities.thinking,
+                Some(!(metadata["mandatory"] == true && metadata.get("supported").is_none()))
+            );
+            assert_eq!(r.effort_options, expected);
+            assert_eq!(r.supported, supported);
+            assert_eq!(r.mandatory, mandatory);
+            assert_eq!(r.default_effort.as_deref(), default);
+            assert_eq!(r.supports_token_budget, budget);
+            let mut request = crate::generation::test_request(id);
+            for setting in [
+                None,
+                Some(ReasoningConfig::Disabled),
+                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Minimal)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Low)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Medium)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::XHigh)),
+                Some(ReasoningConfig::Effort(ReasoningEffort::Max)),
+            ] {
+                request.reasoning = setting;
+                let effort = setting.map(|s| match s {
+                    ReasoningConfig::Disabled => "none",
+                    ReasoningConfig::Effort(e) => e.as_str(),
+                });
+                let allowed = effort.is_none_or(|e| expected.contains(&e));
+                for stream in [false, true] {
+                    let result = if stream {
+                        wrapper.stream_chat(request.clone()).await.map(|_| ())
+                    } else {
+                        wrapper.chat(request.clone()).await.map(|_| ())
+                    };
+                    if allowed {
+                        result.unwrap();
+                        let body = bodies.lock().unwrap().last().unwrap().clone();
+                        assert_eq!(body["stream"], stream);
+                        assert_eq!(body["max_tokens"], 1024);
+                        if let Some(effort) = effort {
+                            let expected_wire = if effort == "medium"
+                                && raw_native.get("effort.medium") != Some(&Some(true))
+                            {
+                                "high"
+                            } else {
+                                effort
+                            };
+                            assert_eq!(body["reasoning"]["effort"], expected_wire);
+                        } else {
+                            assert!(body.get("reasoning").is_none());
+                        }
+                    } else {
+                        let error = result.unwrap_err().to_string();
+                        assert!(error.contains("native OpenRouter"), "{error}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn router_budget_support_is_independent_of_effort_selection_and_catalog() {
+        use crate::{ReasoningConfig, ReasoningEffort};
+        let id = "openai/gpt-5.4";
+        for (enum_case, enum_value) in [
+            ("empty", serde_json::json!([])),
+            ("omitted", serde_json::Value::Null),
+            ("gateway", serde_json::Value::Null),
+            ("malformed", serde_json::json!([null])),
+        ] {
+            for budget in [
+                None,
+                Some(serde_json::Value::Null),
+                Some(serde_json::json!(false)),
+                Some(serde_json::json!(true)),
+            ] {
+                for catalog_support in [false, true] {
+                    for aggregate_negative in [false, true] {
+                        let mut metadata = serde_json::json!({"default_enabled":true,"default_effort":"high","mandatory":true});
+                        if enum_case != "omitted" {
+                            metadata["supported_efforts"] = enum_value.clone();
+                        }
+                        if let Some(budget) = &budget {
+                            metadata["supports_max_tokens"] = budget.clone();
+                        }
+                        if aggregate_negative {
+                            metadata["supported"] = serde_json::json!(false);
+                        }
+                        let catalog = Arc::new(crate::generation::test_catalog_model(
+                            "openrouter",
+                            id,
+                            id,
+                            serde_json::json!({"reasoning":catalog_support,"thinkingLevelMap":{"off":"none","low":"low","high":"high"}}),
+                        ));
+                        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+                        let authority = AuthorityBoundProvider {
+                            inner: Arc::new(RouterReasoningFixture {
+                                discovery:
+                                    serde_json::json!({"data":[{"id":id,"reasoning":metadata}]})
+                                        .to_string(),
+                                catalog: catalog.clone(),
+                                bodies: bodies.clone(),
+                            }),
+                            authority_fingerprint: ProviderAuthorityFingerprint(
+                                "router-budget-fixture".into(),
+                            ),
+                            revoked: Arc::new(AtomicBool::new(false)),
+                            redact_endpoint_errors: false,
+                            input_admission: Arc::new(Default::default()),
+                            use_public_catalog: true,
+                            discovery_tools: RwLock::new(BTreeMap::new()),
+                            discovery_reasoning: RwLock::new(BTreeMap::new()),
+                        };
+                        let mut models = authority.inner.list_models().await.unwrap();
+                        let raw = models[0].capabilities.reasoning.as_ref().unwrap();
+                        let positive_budget =
+                            budget.as_ref().and_then(serde_json::Value::as_bool) == Some(true);
+                        let native_support = if aggregate_negative {
+                            Some(false)
+                        } else if positive_budget || enum_case == "gateway" {
+                            Some(true)
+                        } else {
+                            None
+                        };
+                        // Empty/omitted enums and default-on/mandatory by themselves
+                        // are not an aggregate negative (or an invented positive).
+                        assert_eq!(raw.supported, native_support);
+                        assert_eq!(
+                            raw.supports_token_budget,
+                            budget.as_ref().and_then(serde_json::Value::as_bool)
+                        );
+                        let native = raw.native.clone();
+                        authority.enrich_discovery(&catalog, &mut models);
+                        let effective = models[0].capabilities.reasoning.as_ref().unwrap();
+                        assert_eq!(effective.native, native);
+                        assert_eq!(
+                            effective.supported,
+                            native_support.or(Some(catalog_support))
+                        );
+                        assert_eq!(models[0].capabilities.thinking, Some(catalog_support));
+                        assert_eq!(
+                            effective.supports_token_budget,
+                            budget.as_ref().and_then(serde_json::Value::as_bool)
+                        );
+                        assert_eq!(effective.mandatory, Some(true));
+                        assert_eq!(effective.default_effort.as_deref(), Some("high"));
+                        assert_eq!(native.get("default_enabled"), Some(&Some(true)));
+                        assert_eq!(
+                            native.get("supports_token_budget").copied(),
+                            budget.as_ref().map(serde_json::Value::as_bool)
+                        );
+                        let effort_allowed = !aggregate_negative
+                            && (enum_case == "gateway"
+                                || enum_case == "malformed" && catalog_support);
+                        assert_eq!(
+                            effective.effort_options.iter().any(|e| e == "high"),
+                            effort_allowed
+                        );
+                        if matches!(enum_case, "empty" | "omitted") || aggregate_negative {
+                            assert!(effective.effort_options.is_empty());
+                        }
+                        for setting in [
+                            None,
+                            Some(ReasoningConfig::Disabled),
+                            Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                        ] {
+                            let mut request = crate::generation::test_request(id);
+                            request.reasoning = setting;
+                            for stream in [false, true] {
+                                let result = if stream {
+                                    authority.stream_chat(request.clone()).await.map(|_| ())
+                                } else {
+                                    authority.chat(request.clone()).await.map(|_| ())
+                                };
+                                if setting.is_none()
+                                    || setting
+                                        == Some(ReasoningConfig::Effort(ReasoningEffort::High))
+                                        && effort_allowed
+                                {
+                                    result.unwrap();
+                                    let body = bodies.lock().unwrap().last().unwrap().clone();
+                                    assert_eq!(body["stream"], stream);
+                                    assert_eq!(body["max_tokens"], 1024);
+                                    if setting.is_none() {
+                                        assert!(body.get("reasoning").is_none());
+                                    } else {
+                                        assert_eq!(body["reasoning"]["effort"], "high");
+                                    }
+                                } else {
+                                    let error = result.unwrap_err().to_string();
+                                    assert!(
+                                        error.contains("native OpenRouter")
+                                            || error.contains(
+                                                "selected catalog model does not support reasoning"
+                                            ),
+                                        "{error}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vercel_authority_discovery_preserves_unknowns_against_public_catalog() {
+        let raw = serde_json::json!({"id":"private/model","type":"language","tags":["tool-use"],"context_window":12345,"max_tokens":500,"modalities":{"input":["text","image"],"output":["text"]},"pricing":{"input":"0.000002"}});
+        let model = crate::catalog::generator::vercel_model(&raw).unwrap();
+        let catalog = crate::catalog::ModelCatalog::parse(
+            &serde_json::json!({"vercel-ai-gateway":{"private/model":model}}).to_string(),
+            &serde_json::json!({"vercel-ai-gateway":{"private/model":{"contextWindow":{"kind":"source","expression":"fixture"},"maxTokens":{"kind":"source","expression":"fixture"}}}}).to_string(),
+        ).unwrap();
+        let wrapper = AuthorityBoundProvider {
+            inner: Arc::new(crate::providers::VercelAiGatewayProvider::new(
+                "fixture-key",
+            )),
+            authority_fingerprint: ProviderAuthorityFingerprint("fixture-authority".into()),
+            revoked: Arc::new(AtomicBool::new(false)),
+            redact_endpoint_errors: false,
+            input_admission: Arc::new(Default::default()),
+            use_public_catalog: true,
+            discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
+        };
+        let mut native = crate::catalog::tool_tests::discovered("private/model", Some(false));
+        native.provider = "vercel-ai-gateway".into();
+        native.limits = Default::default();
+        native.pricing = None;
+        native.capabilities.input_modalities = None;
+        let mut models = vec![native];
+        wrapper.enrich_discovery(&catalog, &mut models);
+        assert!(models[0].limits.context_window.is_none());
+        assert!(models[0].pricing.is_none());
+        assert!(models[0].capabilities.input_modalities.is_none());
+        assert_eq!(models[0].capabilities.tool_calling, Some(false));
     }
 
     struct ToolDiscoveryProvider;
@@ -1254,6 +2005,7 @@ mod tests {
             input_admission: Arc::new(Default::default()),
             use_public_catalog: false,
             discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
         };
         let mut public = wrapper("public-authority");
         public.use_public_catalog = true;
@@ -1354,6 +2106,7 @@ mod tests {
                 Some(&self.catalog),
             )?;
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "local boundary".into(),
                 usage: None,
                 reasoning_content: None,
@@ -1716,6 +2469,7 @@ mod tests {
                 .expect("release semaphore should remain open")
                 .forget();
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "done".to_owned(),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -3143,6 +3897,40 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_error_retention_tests {
+    #[test]
+    fn endpoint_redaction_retains_explicit_usage_context_without_original_error() {
+        let provider = crate::providers::OpenRouterProvider::with_base_url(
+            "fixture",
+            "https://private.example/SECRET",
+        );
+        let snapshot = crate::TokenUsage::default().with_native_id(Some("gen-header"));
+        let error = crate::usage::with_error_usage(
+            anyhow::anyhow!("HTTP request failed: private.example/SECRET"),
+            &snapshot,
+        );
+        let redacted = super::redacted_endpoint_error(
+            &provider,
+            error,
+            pioneer_protocol::ProviderFailureStage::Connect,
+        );
+        assert_eq!(
+            crate::usage::error_usage(&redacted)
+                .unwrap()
+                .generation_id
+                .as_deref(),
+            Some("gen-header")
+        );
+        assert_eq!(
+            crate::usage::error_usage(&redacted).unwrap().input_tokens,
+            None
+        );
+        assert!(!format!("{redacted:#}").contains("SECRET"));
+        assert!(!format!("{redacted:#}").contains("private.example"));
     }
 }
 

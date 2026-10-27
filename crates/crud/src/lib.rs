@@ -1,5 +1,9 @@
 mod plugins;
 pub use plugins::{PluginNativeWrite, PluginOwnershipWrite, validate_standalone_mcp_name};
+mod codex_retry_notice;
+pub use codex_retry_notice::{CodexRetryNoticeTarget, codex_retry_notice_item_id};
+mod frozen_lifetime;
+pub use frozen_lifetime::FrozenReadHold;
 mod tool_output;
 pub use repositories::compaction;
 mod compaction_store;
@@ -9,6 +13,7 @@ mod memory;
 mod model_history;
 mod projector;
 mod repositories;
+pub use repositories::provider_usage::ProviderUsageObservation;
 mod task_delivery_lifecycle;
 mod task_delivery_recovery;
 mod task_event_context;
@@ -28,7 +33,9 @@ pub use repositories::task_occurrence_reconcile::{
     TaskOccurrenceClaimFailure, TaskOccurrenceClaimFailurePhase, TaskOccurrenceClock,
     TaskOccurrenceReconcileCandidate, TaskOccurrenceReconcileClaim,
 };
+mod task_finish;
 mod task_terminal;
+mod task_webhook;
 pub use repositories::task_run_occurrence_reconcile::{
     OCCURRENCE_RECONCILE_BUDGET, OCCURRENCE_RECONCILE_INITIAL_BACKOFF_SECS,
     OCCURRENCE_RECONCILE_MAX_ATTEMPT_COUNT, OCCURRENCE_RECONCILE_MAX_BACKOFF_SECS,
@@ -38,13 +45,19 @@ pub use repositories::task_run_occurrence_reconcile::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use task_delivery_lifecycle::TaskDeliveryCommitTestKind;
-pub use task_delivery_lifecycle::{TaskDeliveryTransition, TaskDeliveryTransitionOutcome};
+pub use task_delivery_lifecycle::{
+    TaskCancellationRunsChanged, TaskDeliveryTransition, TaskDeliveryTransitionOutcome,
+};
+pub use task_run_occurrence::{TaskRunOccurrenceRepairPhase, TaskRunOccurrenceRepairReason};
 pub use task_terminal::{
     PreparedTaskTerminalTransition, TaskTerminalCommitOutcome, TaskTerminalCommitStatus,
     TaskTerminalConflict,
 };
+pub use task_webhook::TaskWebhookAdmissionSnapshot;
 mod task_projector;
 mod thread_episodic;
+pub mod thread_episodic_source;
+mod thread_episodic_source_store;
 mod timeline_live_projection;
 mod timeline_projection;
 mod timeline_projection_model;
@@ -71,38 +84,39 @@ pub use repositories::administrative_audit::{
     insert_administrative_audit_event,
 };
 pub use repositories::agent_domain::{
-    ACTIVE_AGENT_IDENTITY_CATALOG_LIMIT, AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS,
-    AGENT_ACTION_OUTBOX_MAX_ATTEMPTS, AgentActionInput, AgentActionLedgerCompactionSummary,
-    AgentActionOutboxClaimBatch, AgentActionTimelineProjection, AgentCommitInput,
-    AgentDelegationRouteInput, AgentExecutionAuthorProjection, AgentExecutionGrantInput,
-    AgentExecutionGraphCommitInput, AgentExecutionGraphCommitResult, AgentExecutionInput,
-    AgentIdentityInput, AgentQueueEntryInput, AgentResourceCommitInput, AgentResourceStateInput,
-    AgentThreadCreationCommitInput, AgentTurnResponseInput, AgentWorkGraphCancellationTarget,
-    AgentWorkGraphProjectionTarget, NativeAgentConfigInput, PresentationSnapshotInput,
-    PromotedAgentExecution, SOURCE_CLI_RUNTIME_INSTANCE, SOURCE_EPHEMERAL, SOURCE_NATIVE_AGENT,
-    TerminalTaskDeliveryCommitError, acquire_agent_running_permit,
-    agent_delegation_route_projection, agent_execution_grant_fingerprint,
-    agent_presentation_snapshot_from_rows, cancel_agent_work_graph, canonical_agent_id,
-    claim_actor_nickname, claim_agent_action_outbox, commit_agent_action,
-    commit_agent_delivery_action, commit_agent_execution_graph, commit_agent_thread_creation,
-    commit_native_agent_config_mutation, compact_terminal_agent_action_ledger,
-    defer_agent_action_outbox_for_permit, defer_agent_action_outbox_for_runtime,
-    enqueue_agent_execution, ensure_agent_identity, ensure_native_agent_config,
-    ensure_root_resource_scope, finalize_agent_execution, heartbeat_agent_execution,
-    insert_agent_action_idempotent, insert_agent_delegation_route, insert_agent_execution,
-    insert_agent_execution_grant, insert_agent_resource_state, insert_agent_turn_response,
-    insert_presentation_snapshot, list_active_agent_identities, list_agent_delegation_routes,
-    list_agent_delegation_routes_for_source, load_active_agent_identity,
-    load_active_agent_identity_by_source, load_agent_action, load_agent_action_outbox,
-    load_agent_action_receipt, load_agent_action_timeline_projections_for_targets,
-    load_agent_delegation_route, load_agent_execution, load_agent_execution_grant,
-    load_agent_execution_resource_state, load_agent_identity, load_agent_identity_by_source,
-    load_agent_presentation_snapshot, load_agent_turn_response,
-    load_agent_turn_responses_for_turns, load_agent_work_graph_projection_for_turn,
-    load_agent_work_graph_projection_target, load_current_agent_authors_for_executions,
-    load_current_agent_presentation_snapshot, load_native_agent_config,
-    load_native_agent_config_by_system_key, mark_agent_action_outbox_delivered,
-    mark_agent_action_outbox_failed, promote_queued_agent_executions,
+    AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS, AGENT_ACTION_OUTBOX_MAX_ATTEMPTS,
+    AGENT_START_RECONCILIATION_REQUIRED, AgentActionInput, AgentActionLedgerCompactionSummary,
+    AgentActionOutboxClaimBatch, AgentActionOutboxFailure, AgentActionTimelineProjection,
+    AgentCommitInput, AgentDelegationRouteInput, AgentExecutionAuthorProjection,
+    AgentExecutionGrantInput, AgentExecutionGraphCommitInput, AgentExecutionGraphCommitResult,
+    AgentExecutionInput, AgentIdentityInput, AgentQueueEntryInput, AgentResourceCommitInput,
+    AgentResourceStateInput, AgentThreadCreationCommitInput, AgentTurnResponseInput,
+    AgentWorkGraphCancellationTarget, AgentWorkGraphProjectionTarget, NativeAgentConfigInput,
+    PresentationSnapshotInput, PromotedAgentExecution, SOURCE_CLI_RUNTIME_INSTANCE,
+    SOURCE_EPHEMERAL, SOURCE_NATIVE_AGENT, TerminalTaskDeliveryCommitError,
+    acquire_agent_running_permit, agent_delegation_route_projection,
+    agent_execution_grant_fingerprint, agent_presentation_snapshot_from_rows,
+    cancel_agent_work_graph, canonical_agent_id, claim_actor_nickname, claim_agent_action_outbox,
+    commit_agent_action, commit_agent_delivery_action, commit_agent_execution_graph,
+    commit_agent_thread_creation, commit_native_agent_config_mutation,
+    compact_terminal_agent_action_ledger, defer_agent_action_outbox_for_permit,
+    defer_agent_action_outbox_for_runtime, enqueue_agent_execution, ensure_agent_identity,
+    ensure_native_agent_config, ensure_root_resource_scope, finalize_agent_execution,
+    heartbeat_agent_execution, insert_agent_action_idempotent, insert_agent_delegation_route,
+    insert_agent_execution, insert_agent_execution_grant, insert_agent_resource_state,
+    insert_agent_turn_response, insert_presentation_snapshot, list_active_agent_identities_page,
+    list_agent_delegation_routes, list_agent_delegation_routes_for_source,
+    load_active_agent_identity, load_active_agent_identity_by_source, load_agent_action,
+    load_agent_action_outbox, load_agent_action_receipt,
+    load_agent_action_timeline_projections_for_targets, load_agent_delegation_route,
+    load_agent_execution, load_agent_execution_grant, load_agent_execution_resource_state,
+    load_agent_identity, load_agent_identity_by_source, load_agent_presentation_snapshot,
+    load_agent_turn_response, load_agent_turn_responses_for_turns,
+    load_agent_work_graph_projection_for_turn, load_agent_work_graph_projection_target,
+    load_current_agent_authors_for_executions, load_current_agent_presentation_snapshot,
+    load_native_agent_config, load_native_agent_config_by_system_key,
+    mark_agent_action_outbox_delivered, mark_agent_action_outbox_failed,
+    mark_agent_action_outbox_failed_with_cause, promote_queued_agent_executions,
     record_agent_execution_progress, reopen_agent_execution_for_retry,
     revoke_agent_delegation_route, upgrade_agent_execution_grant_model_to_current, utc_now,
     wake_agent_action_outbox_for_execution,
@@ -136,11 +150,11 @@ pub use repositories::authorization_persistence::{
 };
 pub use repositories::authorization_scope::{
     ArtifactAuthorizationScope, CapabilityAuthorizationScope, PersistedCapabilityScopeKind,
-    RuntimeDraftArtifactAuthorizationScope, SessionAuthorizationScope, TaskAuthorizationScope,
-    ThreadAuthorizationScope, ThreadStartAuthorizationScope, TurnAuthorizationScope,
-    WorkspaceAuthorizationScope, list_abandoned_runtime_draft_artifact_ids,
-    resolve_artifact_authorization_scope, resolve_artifact_binding_authorization_root,
-    resolve_persisted_capability_authorization_scope,
+    RunningTaskScopePage, RuntimeDraftArtifactAuthorizationScope, SessionAuthorizationScope,
+    TaskAuthorizationScope, ThreadAuthorizationScope, ThreadStartAuthorizationScope,
+    TurnAuthorizationScope, WorkspaceAuthorizationScope, list_abandoned_runtime_draft_artifact_ids,
+    list_running_task_scopes, resolve_artifact_authorization_scope,
+    resolve_artifact_binding_authorization_root, resolve_persisted_capability_authorization_scope,
     resolve_runtime_draft_artifact_authorization_scope, resolve_session_authorization_scope,
     resolve_task_authorization_scope, resolve_thread_authorization_scope,
     resolve_thread_start_authorization_scope, resolve_turn_authorization_scope,
@@ -207,6 +221,12 @@ pub use repositories::task_actor_contract::{
     list_terminal_task_occurrence_mismatches, scan_terminal_task_occurrence_mismatches,
     upgrade_task_actor_contract_model_to_current, upsert_task_actor_contract,
     upsert_task_occurrence_contract,
+};
+pub use repositories::task_completion_inbox::{
+    TaskCompletionInboxAccess, TaskCompletionInboxRow, count_unread_task_completion_inbox,
+    find_task_completion_inbox_entry, find_unread_task_completion_inbox_entries,
+    list_task_completion_inbox, mark_all_task_completion_inbox_read,
+    mark_task_completion_inbox_read, mark_viewed_task_completion_inbox_read,
 };
 pub use repositories::thread::{
     ThreadManagementChange, advance_thread_read_cursor, find_thread_read_cursor,
@@ -295,6 +315,32 @@ use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
 use crate::repositories::cli_runtime_binding::NewCliRuntimeTurnAttempt;
 
+/// Safe operation boundary; SQLite does not identify main/WAL/temp file here.
+#[derive(Debug, Clone, Copy)]
+pub enum NativeFinalizationPhase {
+    Scan,
+    Preparation,
+    WriterBegin,
+    WriterApply,
+    WriterCommit,
+}
+impl NativeFinalizationPhase {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Scan => "finalization_scan",
+            Self::Preparation => "finalization_preparation",
+            Self::WriterBegin => "finalization_writer_begin",
+            Self::WriterApply => "finalization_writer_apply",
+            Self::WriterCommit => "finalization_writer_commit",
+        }
+    }
+}
+impl fmt::Display for NativeFinalizationPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 #[derive(Debug)]
 pub struct TurnEventProjectionAfterAppendError {
     event_id: String,
@@ -302,6 +348,7 @@ pub struct TurnEventProjectionAfterAppendError {
     sequence: i64,
     projection_error: String,
     projection_failure_record_error: Option<String>,
+    pending: bool,
 }
 
 impl TurnEventProjectionAfterAppendError {
@@ -318,7 +365,20 @@ impl TurnEventProjectionAfterAppendError {
             sequence,
             projection_error,
             projection_failure_record_error,
+            pending: false,
         }
+    }
+
+    fn pending(event_id: String, turn_id: String, sequence: i64, message: String) -> Self {
+        let mut error = Self::new(event_id, turn_id, sequence, message, None);
+        error.pending = true;
+        error
+    }
+
+    /// A durable append whose authoritative receipt is owned by projection replay.
+    /// This never acknowledges completion and never describes a failed projector.
+    pub fn is_pending(&self) -> bool {
+        self.pending
     }
 }
 
@@ -913,7 +973,7 @@ pub use crate::repositories::cli_runtime_binding::{
     PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionBinding,
     PreparedClaudeProviderSessionMode, ResolveCliRuntimePendingRequest,
     TransitionCliRuntimePendingRequestDelivery, deserialize_cli_runtime_json,
-    serialize_cli_runtime_json,
+    load_runtime_kinds_for_turns as load_cli_runtime_kinds_for_turns, serialize_cli_runtime_json,
 };
 /// Facts used by terminal projection repair. Captured in one reader snapshot;
 /// validated again in the binding/attempt/projection writer transaction.
@@ -1044,6 +1104,14 @@ async fn ack_cli_runtime_recovery_outcome<C: ConnectionTrait>(
     connection: &C,
     source: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
 ) -> Result<()> {
+    ack_cli_runtime_outcome(connection, source, "gateway/terminal_recovery_ack").await
+}
+
+async fn ack_cli_runtime_outcome<C: ConnectionTrait>(
+    connection: &C,
+    source: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    method: &str,
+) -> Result<()> {
     let Some(id) = source.and_then(|source| source.terminal_delivery_id.as_deref()) else {
         return Ok(());
     };
@@ -1061,7 +1129,7 @@ async fn ack_cli_runtime_recovery_outcome<C: ConnectionTrait>(
             turn_id: saved.turn_id,
             native_thread_id: saved.native_thread_id,
             native_turn_id: saved.native_turn_id,
-            native_method: "gateway/terminal_recovery_ack".into(),
+            native_method: method.into(),
             payload_redacted_json: "{}".into(),
             sequence: saved.sequence,
             created_at: saved.created_at,
@@ -1122,6 +1190,61 @@ async fn cli_runtime_recovery_transition_allowed<C: ConnectionTrait>(
     .await?)
 }
 
+async fn native_recovery_start_transition_allowed<C: ConnectionTrait>(
+    db: &C,
+    expected: &TurnExecutionRecord,
+    recovery: &pioneer_protocol::RecoveryAttemptContext,
+    now_unix: i64,
+) -> Result<bool> {
+    use pioneer_entity::{thread, turn};
+    let Some(job) = recovery_job::find_job_by_id(db, &recovery.job_id).await? else {
+        return Ok(false);
+    };
+    if job.turn_id != expected.turn_id
+        || job.status != "active"
+        || job.active_attempt_id.as_deref() != Some(recovery.attempt_id.as_str())
+    {
+        return Ok(false);
+    }
+    let Some(current) = turn_execution::find(db, &expected.turn_id).await? else {
+        return Ok(false);
+    };
+    if current.owner_id != expected.owner_id
+        || current.owner_generation != expected.owner_generation
+        || current.thread_id != expected.thread_id
+        || current.workspace_id != expected.workspace_id
+        || current.executor_kind != expected.executor_kind
+        || !current.status.is_active()
+        || current.lease_until.timestamp() <= now_unix
+        || !matches!(
+            current.executor_kind,
+            TurnExecutorKind::NativeAgent | TurnExecutorKind::ApiProvider
+        )
+    {
+        return Ok(false);
+    }
+    let turn = turn::Entity::find_by_id(expected.turn_id.clone())
+        .filter(turn::Column::ThreadId.eq(expected.thread_id.clone()))
+        .filter(turn::Column::Status.eq("in_progress"))
+        .select_only()
+        .column(turn::Column::Id)
+        .into_tuple::<String>()
+        .one(db)
+        .await?;
+    let thread = thread::Entity::find_by_id(expected.thread_id.clone())
+        .filter(thread::Column::WorkspaceId.eq(expected.workspace_id.clone()))
+        .select_only()
+        .column(thread::Column::Id)
+        .into_tuple::<String>()
+        .one(db)
+        .await?;
+    Ok(turn.is_some()
+        && thread.is_some()
+        && !turn_event_projection_stream_state::has_accepted_terminal(db, &expected.turn_id)
+            .await?
+        && !repositories::native_cancellation_context::has_accepted(db, &expected.turn_id).await?)
+}
+
 fn cli_runtime_blocked_guard_from_snapshot(
     snapshot: &CliRuntimeTurnTerminalGuard,
 ) -> Option<pioneer_protocol::CliRuntimeBlockedTurnGuard> {
@@ -1138,10 +1261,18 @@ fn cli_runtime_blocked_guard_from_snapshot(
 fn cli_runtime_event_guard_from_snapshot(
     snapshot: &CliRuntimeTurnTerminalGuard,
 ) -> Option<pioneer_protocol::CliRuntimeBlockedTurnGuard> {
+    cli_runtime_continuation_guard_from_snapshot(snapshot, false)
+}
+
+fn cli_runtime_continuation_guard_from_snapshot(
+    snapshot: &CliRuntimeTurnTerminalGuard,
+    allow_completed: bool,
+) -> Option<pioneer_protocol::CliRuntimeBlockedTurnGuard> {
     let binding = &snapshot.binding;
     let attempt = snapshot.attempt.as_ref()?;
     if snapshot.turn_status != TurnStatus::InProgress
-        || !attempt.status.is_active()
+        || !(attempt.status.is_active()
+            || (allow_completed && attempt.status == CliRuntimeTurnAttemptStatus::Completed))
         || attempt.turn_id != binding.turn_id
         || attempt.runtime_id != binding.runtime_id
         || attempt.runtime_kind != binding.runtime_kind
@@ -1193,7 +1324,7 @@ pub use crate::repositories::thread_timeline_projection::{
     SEMANTIC_TIMELINE_PROJECTION_VERSION, ThreadTimelineApprovalScope, ThreadTimelineBlockRecord,
     TurnWorkItemProjectionRecord, TurnWorkProjectionRecord, WORK_VISIBILITY_HIDDEN,
     WORK_VISIBILITY_VISIBLE, count_thread_timeline_blocks, count_turn_work_items,
-    count_unread_user_message_blocks, count_unread_user_message_blocks_for_threads,
+    count_unread_message_blocks, count_unread_message_blocks_for_threads,
     delete_thread_timeline_block, delete_thread_timeline_blocks_for_thread,
     delete_thread_timeline_blocks_for_turn, delete_turn_work_items_for_turn,
     delete_turn_work_projection, find_projection_meta, find_thread_timeline_block_by_sort_key,
@@ -1237,7 +1368,7 @@ pub use crate::repositories::execution_admission_lease::{
     ExecutionQuotaCeilings, NewExecutionAdmissionLease,
 };
 pub use crate::repositories::native_cancellation_context::{
-    NativeCancellationContext, NativeCancellationContextUnavailable,
+    NativeCancellationContext, NativeCancellationContextUnavailable, UnactivatedTurnPhaseChanged,
 };
 pub use crate::repositories::native_terminal_effect_outbox::{
     HandlerCheckpointInvalid, NativeTerminalEffectStats,
@@ -1522,7 +1653,8 @@ pub struct ClaimedTurnEventDeliveryRecord {
 }
 
 /// A terminal task-owned child Turn whose TaskRun aggregate has not yet
-/// consumed the terminal outcome. The row itself is the durable retry token:
+/// consumed the terminal outcome, or whose terminal aggregate has a received
+/// parent projection and a retained capsule. The rows are durable retry tokens:
 /// reconciliation can be repeated without depending on a process-local
 /// completion callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1666,7 +1798,7 @@ pub use crate::thread_episodic::{
     NewThreadEpisodicCapsuleRecord, NewThreadEpisodicEmbeddingArtifactRecord,
     NewThreadEpisodicExclusionRecord, NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
     NewThreadEpisodicRecallEventRecord, NewThreadEpisodicThreadDirectoryRecord,
-    THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR,
+    THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR, THREAD_EPISODIC_PROJECTION_CHANGED_ERROR,
     THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, THREAD_EPISODIC_USER_DELETED_ERROR,
     THREAD_EPISODIC_USER_EXCLUDED_ERROR, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
     THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES, ThreadEpisodicActiveWriteSegmentRequest,
@@ -1674,10 +1806,11 @@ pub use crate::thread_episodic::{
     ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
     ThreadEpisodicEmbeddingArtifactRecord, ThreadEpisodicExclusionReason,
     ThreadEpisodicExclusionRecord, ThreadEpisodicGraphEnrichmentState,
-    ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexJobCompletionUpdate,
-    ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
-    ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate, ThreadEpisodicItemRecord,
-    ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility, ThreadEpisodicRecallEventRecord,
+    ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexClaimBatch,
+    ThreadEpisodicIndexJobCompletionUpdate, ThreadEpisodicIndexJobFailureUpdate,
+    ThreadEpisodicIndexJobRecord, ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate,
+    ThreadEpisodicItemRecord, ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
+    ThreadEpisodicProjectionResetProgress, ThreadEpisodicRecallEventRecord,
     ThreadEpisodicRefillSourceCounts, ThreadEpisodicRefillThread, ThreadEpisodicRepairStatus,
     ThreadEpisodicSourceActorRole, ThreadEpisodicSourceReconcileOutcome,
     ThreadEpisodicSourceRuntimeKind, ThreadEpisodicThreadDirectoryRecord,
@@ -1685,9 +1818,10 @@ pub use crate::thread_episodic::{
     ThreadEpisodicThreadDirectoryVisibility, ThreadEpisodicWorkspaceActiveWriteSegmentRequest,
     deterministic_thread_episodic_capsule_id, deterministic_thread_episodic_workspace_capsule_id,
     thread_episodic_capsule_ref, thread_episodic_capsule_storage_uri, thread_episodic_frame_uri,
-    thread_episodic_item_uri, thread_episodic_key_hash, thread_episodic_thread_uri_prefix,
-    thread_episodic_turn_uri_prefix, thread_episodic_workspace_capsule_ref,
-    thread_episodic_workspace_capsule_storage_uri, thread_episodic_workspace_uri_prefix,
+    thread_episodic_item_uri, thread_episodic_key_hash, thread_episodic_projection_reset_key,
+    thread_episodic_thread_uri_prefix, thread_episodic_turn_uri_prefix,
+    thread_episodic_workspace_capsule_ref, thread_episodic_workspace_capsule_storage_uri,
+    thread_episodic_workspace_uri_prefix,
 };
 use crate::util::{optional_typed_json_from_db, typed_json_from_db, unix_to_datetime};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -1954,6 +2088,10 @@ struct TurnEventProjectionContext {
     enqueue_optional_deliveries: bool,
     #[serde(skip)]
     native_cancellation: Option<PreparedNativeCancellation>,
+    #[serde(skip)]
+    unactivated_terminal: Option<TurnExecutionRecord>,
+    #[serde(skip)]
+    cancellation_actor_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2304,6 +2442,57 @@ pub struct SkillInstallationRecord {
     pub pack_member_key: Option<String>,
 }
 
+/// Exact row facts captured before filesystem preparation, including subsecond
+/// timestamps. Ordinary foreground records retain their existing wire shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillReconciliationSnapshot {
+    pub record: SkillInstallationRecord,
+    model: pioneer_entity::skill_installation::Model,
+}
+
+/// Outcome of a failed prepared publication. An error before a transaction's
+/// mutation or after acknowledged rollback proves that no commit took place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillReconciliationFailure {
+    NotCommitted,
+    Unknown,
+}
+
+#[derive(Debug)]
+pub struct SkillReconciliationError {
+    pub outcome: SkillReconciliationFailure,
+    pub error: anyhow::Error,
+}
+impl std::fmt::Display for SkillReconciliationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "skill reconciliation {:?}: {}", self.outcome, self.error)
+    }
+}
+impl std::error::Error for SkillReconciliationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+fn reconciliation_error(
+    error: impl Into<anyhow::Error>,
+    outcome: SkillReconciliationFailure,
+) -> anyhow::Error {
+    SkillReconciliationError {
+        outcome,
+        error: error.into(),
+    }
+    .into()
+}
+
+impl SkillReconciliationSnapshot {
+    fn from_model(model: pioneer_entity::skill_installation::Model) -> Result<Self> {
+        Ok(Self {
+            record: skill_installation_record_from_model(model.clone())?,
+            model,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SkillInstallationPatch {
     pub owner: Option<Option<String>>,
@@ -2504,6 +2693,29 @@ fn validate_skill_pack_child_diff(
         }
     }
     Ok(())
+}
+
+async fn revalidate_skill_source_workspace<C: ConnectionTrait>(
+    db: &C,
+    record: &SkillInstallationRecord,
+    expected: Option<&pioneer_entity::workspace::Model>,
+) -> Result<bool> {
+    if record.source_kind == "system" {
+        return Ok(record.scope_key == "system" && expected.is_none());
+    }
+    if !matches!(record.source_kind.as_str(), "user" | "registry") {
+        return Ok(false);
+    }
+    let Some(expected) = expected else {
+        return Ok(false);
+    };
+    if !expected.is_active || expected.id != record.scope_key {
+        return Ok(false);
+    }
+    let current = pioneer_entity::workspace::Entity::find_by_id(record.scope_key.clone())
+        .one(db)
+        .await?;
+    Ok(current.as_ref() == Some(expected))
 }
 
 #[derive(Clone)]
@@ -2821,6 +3033,14 @@ pub struct CrudStore {
     delivery_commit_test_gate: std::sync::Arc<
         std::sync::Mutex<Option<task_delivery_lifecycle::TaskDeliveryCommitTestGate>>,
     >,
+    #[cfg(any(test, feature = "test-support"))]
+    episodic_ambiguous_claim_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(any(test, feature = "test-support"))]
+    episodic_claim_fault: std::sync::Arc<std::sync::Mutex<Option<(String, &'static str)>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    episodic_claim_discoveries: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    episodic_work: std::sync::Arc<tokio::sync::Notify>,
+    frozen_readers: frozen_lifetime::ReaderCounts,
     connection: SqliteDatabase,
     projector: TurnProjector,
     task_projector: TaskProjector,
@@ -2899,6 +3119,7 @@ pub struct DeleteTurnMessageRequest {
 
 #[derive(Debug, Clone)]
 pub struct MarkThreadReadRequest {
+    pub through_block: Option<pioneer_protocol::ThreadReadPosition>,
     pub workspace_id: String,
     pub thread_id: String,
     pub principal_id: PrincipalId,
@@ -3361,8 +3582,15 @@ fn completed_message_turn_events(
             sandbox_mode: write.sandbox_mode,
             turn: write.started_turn.clone(),
             input: write.input.to_vec(),
+            // An agent-authored Message does not select or run a model. Preserve
+            // the destination's configuration, including an intentional None,
+            // so single-thread and list snapshots restore the same selection.
+            reasoning_effort: if matches!(&write.actor, PersistedActorRef::AgentExecution(_)) {
+                write.thread.reasoning_effort.clone()
+            } else {
+                None
+            },
             actor: Some(write.actor),
-            reasoning_effort: None,
             work_owner: Default::default(),
         }),
         TurnEventPayload::TurnCompleted(write.completed),
@@ -4405,11 +4633,58 @@ impl CrudStore {
     pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
         Self {
             connection: connection.into(),
+            episodic_work: std::sync::Arc::new(tokio::sync::Notify::new()),
+            frozen_readers: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            episodic_claim_fault: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            episodic_claim_discoveries: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            episodic_ambiguous_claim_commit: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
             #[cfg(any(test, feature = "test-support"))]
             delivery_commit_test_gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
             projector: TurnProjector::new(),
             task_projector: TaskProjector::new(),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn make_next_episodic_claim_commit_ambiguous_for_test(&self) {
+        self.episodic_ambiguous_claim_commit
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inject_episodic_claim_fault_for_test(&self, job_id: &str, point: &'static str) {
+        *self.episodic_claim_fault.lock().unwrap() = Some((job_id.to_owned(), point));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn episodic_claim_discoveries_for_test(&self) -> u64 {
+        self.episodic_claim_discoveries
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn take_episodic_claim_fault_for_test(&self, id: &str, point: &str) -> bool {
+        let mut fault = self.episodic_claim_fault.lock().unwrap();
+        if fault
+            .as_ref()
+            .is_some_and(|(job, stage)| job == id && *stage == point)
+        {
+            fault.take();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Coalesced post-commit wake shared by scoped handles. Durable jobs remain
+    /// the recovery obligation; this notification only advances a live runtime.
+    pub fn thread_episodic_work_notification(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.episodic_work.clone()
     }
 
     /// Returns a store whose reads and writes are both classified as
@@ -4708,9 +4983,22 @@ impl CrudStore {
         entry: NewTurnLlmContextEntry,
         delivery_key: &str,
     ) -> Result<TurnLlmContextAppendOutcome> {
+        let preview_archive = if entry.source == "tool_result_v2"
+            && entry.tool_name.as_deref() == Some("html_preview")
+        {
+            Some(repositories::html_preview_retention::archive_result(
+                &entry.payload,
+            ))
+        } else {
+            None
+        };
+        // Prepare outside writer admission. An invalid/unknown preview remains
+        // unchanged unless the commit finds an authoritative release marker.
+        let preview_archive = preview_archive.map(|result| result.ok());
         let delivery_key = delivery_key.to_owned();
         self.run_serialized_write(|| {
-            let entry = entry.clone();
+            let mut entry = entry.clone();
+            let preview_archive = preview_archive.clone();
             let delivery_key = delivery_key.clone();
             async move {
                 let transaction = self
@@ -4718,6 +5006,19 @@ impl CrudStore {
                     .begin()
                     .await
                     .context("failed to begin turn_llm_context append transaction")?;
+                if let Some(prepared) = preview_archive {
+                    if repositories::html_preview_retention::preview_result_was_released(
+                        &transaction,
+                        &entry.turn_id,
+                        entry.item_id.as_deref().unwrap_or_default(),
+                    )
+                    .await?
+                    {
+                        entry.payload = prepared.ok_or_else(|| {
+                            anyhow::anyhow!("released HTML preview result cannot be reintroduced")
+                        })?;
+                    }
+                }
                 let outcome =
                     turn_llm_context::append_turn_llm_context(&transaction, entry, &delivery_key)
                         .await;
@@ -4762,27 +5063,33 @@ impl CrudStore {
             .connection
             .query_all_raw(Statement::from_sql_and_values(
                 self.connection.get_database_backend(),
-                "SELECT t.thread_id, t.id AS turn_id, t.status, t.error \
+                format!("SELECT t.thread_id, t.id AS turn_id, t.status, t.error \
                  FROM task_run r \
                  INNER JOIN task task_row ON task_row.id = r.task_id \
-                 INNER JOIN task_run_turn trt ON trt.run_id = r.id \
+                 INNER JOIN task_run_turn trt ON trt.run_id = r.id AND trt.task_id = r.task_id \
                  INNER JOIN \"turn\" t \
                     ON t.id = trt.turn_id AND t.thread_id = trt.thread_id \
-                 WHERE r.status IN ('queued', 'starting', 'running', 'waiting', 'waiting_review') \
-                   AND task_row.status IN \
-                       ('draft', 'scheduled', 'queued', 'running', 'waiting', 'waiting_review') \
-                   AND (trt.status = 'in_progress' \
-                        OR (trt.status = 'candidate_created' AND r.status <> 'waiting_review')) \
-                   AND t.turn_kind = 'conversation' \
+                 WHERE t.turn_kind = 'conversation' \
                    AND t.status IN ('completed', 'failed', 'interrupted', 'blocked') \
-                 ORDER BY t.updated_at ASC, t.id ASC LIMIT ?"
-                    .to_owned(),
+                   AND ((r.status IN ('queued', 'starting', 'running', 'waiting', 'waiting_review') \
+                     AND task_row.status IN \
+                       ('draft', 'scheduled', 'queued', 'running', 'waiting', 'waiting_review') \
+                     AND (trt.status = 'in_progress' \
+                        OR (trt.status = 'candidate_created' AND r.status <> 'waiting_review') \
+                        OR (trt.status = 'cancelled' AND t.status = 'interrupted'))) \
+                    OR (r.status IN ('succeeded', 'failed', 'cancelled', 'timed_out') \
+                      AND ({ready}) \
+                      AND (EXISTS (SELECT 1 FROM turn_runtime_snapshot c WHERE c.turn_id = t.id) \
+                        OR EXISTS (SELECT 1 FROM turn_llm_context c WHERE c.turn_id = t.id AND c.source NOT IN ('assistant_round', 'tool_result_v2'))))) \
+                 ORDER BY t.updated_at ASC, t.id ASC LIMIT ?",
+                    ready = repositories::task_child_cleanup::READY),
                 [i64::try_from(limit).unwrap_or(i64::MAX).into()],
             ))
             .await
             .context(
                 "failed to list terminal task child turns awaiting aggregate reconciliation",
             )?;
+
         rows.into_iter()
             .map(|row| {
                 let status = row.try_get::<String>("", "status")?;
@@ -4796,6 +5103,54 @@ impl CrudStore {
                 })
             })
             .collect()
+    }
+
+    /// Installer inspection only: never create the migration table or run
+    /// migrations. A missing/unreadable history is an unknown compatibility.
+    pub async fn inspect_applied_migration_names(&self) -> Result<Vec<String>> {
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_string(
+                self.connection.get_database_backend(),
+                "SELECT version FROM seaql_migrations ORDER BY version LIMIT 4097",
+            ))
+            .await
+            .context("failed to inspect applied migration history")?;
+        anyhow::ensure!(
+            rows.len() <= 4096,
+            "migration history exceeds inspection bound"
+        );
+        rows.into_iter()
+            .map(|row| row.try_get("", "version").map_err(Into::into))
+            .collect()
+    }
+
+    pub async fn terminal_task_child_cleanup_ready(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<bool>> {
+        repositories::task_child_cleanup::ready(&self.connection, thread_id, turn_id).await
+    }
+
+    /// Revalidate under the serialized writer and delete both capsule parts
+    /// atomically. Until commit, their presence is the durable retry token.
+    pub async fn cleanup_terminal_task_child_capsule(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<bool>> {
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            let ready = repositories::task_child_cleanup::ready(&tx, thread_id, turn_id).await?;
+            if ready == Some(true) {
+                turn_llm_context::delete_turn_llm_context_for_turn(&tx, turn_id).await?;
+                turn_runtime_snapshot::delete_turn_runtime_snapshot(&tx, turn_id).await?;
+            }
+            tx.commit().await?;
+            Ok(ready)
+        })
+        .await
     }
 
     pub async fn list_active_execution_authorities(
@@ -4896,42 +5251,44 @@ impl CrudStore {
         limit: u64,
     ) -> Result<Vec<ClaimedTurnEventDeliveryRecord>> {
         let consumer = consumer.to_owned();
-        self.run_serialized_write(|| {
-            let consumer = consumer.clone();
-            async move {
-                let now = unix_to_datetime(now_unix);
-                let claim_expires_at = unix_to_datetime(now_unix.saturating_add(120));
-                let claimed = turn_event_delivery::claim_due(
-                    &self.connection,
-                    consumer.as_str(),
-                    now,
-                    claim_expires_at,
-                    limit,
-                )
-                .await?;
-                let mut records = Vec::with_capacity(claimed.len());
-                for claim in claimed {
-                    let event =
-                        turn_event::find_event_by_id(&self.connection, claim.row.event_id.as_str())
-                            .await?
-                            .with_context(|| {
-                                format!(
-                                    "turn event `{}` is missing for delivery `{}`",
-                                    claim.row.event_id, claim.row.id
-                                )
-                            })?;
-                    records.push(ClaimedTurnEventDeliveryRecord {
-                        id: claim.row.id,
-                        consumer: claim.row.consumer,
-                        attempt_count: claim.row.attempt_count,
-                        claim_token: claim.claim_token,
-                        event,
-                    });
+        let claimed = self
+            .run_serialized_write(|| {
+                let consumer = consumer.clone();
+                async move {
+                    let now = unix_to_datetime(now_unix);
+                    let claim_expires_at = unix_to_datetime(now_unix.saturating_add(120));
+                    turn_event_delivery::claim_due(
+                        &self.connection,
+                        &consumer,
+                        now,
+                        claim_expires_at,
+                        limit,
+                    )
+                    .await
                 }
-                Ok(records)
-            }
-        })
-        .await
+            })
+            .await?;
+        // Claim writes are committed before event reads/JSON decoding. A read
+        // error leaves the durable lease recoverable and dispatches no claim.
+        let mut records = Vec::with_capacity(claimed.len());
+        for claim in claimed {
+            let event = turn_event::find_event_by_id(&self.connection, claim.row.event_id.as_str())
+                .await?
+                .with_context(|| {
+                    format!(
+                        "turn event `{}` is missing for delivery `{}`",
+                        claim.row.event_id, claim.row.id
+                    )
+                })?;
+            records.push(ClaimedTurnEventDeliveryRecord {
+                id: claim.row.id,
+                consumer: claim.row.consumer,
+                attempt_count: claim.row.attempt_count,
+                claim_token: claim.claim_token,
+                event,
+            });
+        }
+        Ok(records)
     }
 
     pub async fn complete_turn_event_delivery(
@@ -4996,9 +5353,45 @@ impl CrudStore {
         &self,
         snapshot: NewTurnRuntimeSnapshot,
     ) -> Result<TurnRuntimeSnapshotRecord> {
+        self.upsert_turn_runtime_snapshot_with_source_epochs(
+            snapshot,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+    }
+
+    pub async fn upsert_turn_runtime_snapshot_with_source_epochs(
+        &self,
+        snapshot: NewTurnRuntimeSnapshot,
+        source_epochs: &std::collections::BTreeMap<String, u64>,
+    ) -> Result<TurnRuntimeSnapshotRecord> {
+        let root = frozen_lifetime::PreparedFrozenRoot::history(&snapshot.history_json)?;
+        // Preparation reads these epochs without writer capacity. Edits can
+        // race the handoff, so revalidate them in the runtime-root transaction.
+        let source_epochs_json = serde_json::to_string(source_epochs)?;
+        anyhow::ensure!(
+            source_epochs_json.len() <= compaction::SOURCE_PAGE_BYTES,
+            "runtime source epochs exceed metadata byte bound"
+        );
         self.run_serialized_write(|| async {
-            turn_runtime_snapshot::upsert_turn_runtime_snapshot(&self.connection, snapshot.clone())
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                turn_runtime_snapshot::verify_source_epochs(
+                    &transaction,
+                    &snapshot.workspace_id,
+                    &source_epochs_json,
+                )
+                .await?;
+                turn_runtime_snapshot::upsert_turn_runtime_snapshot(
+                    &transaction,
+                    snapshot.clone(),
+                    &root,
+                )
                 .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5083,8 +5476,16 @@ impl CrudStore {
         &self,
         binding: NewCliRuntimeThreadBinding,
     ) -> Result<CliRuntimeThreadBindingRecord> {
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.resume_cursor_json, true)?;
         self.run_serialized_write(|| async {
-            cli_runtime_binding::upsert_thread_binding(&self.connection, binding.clone()).await
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                cli_runtime_binding::upsert_thread_binding(&transaction, binding.clone(), &root)
+                    .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5093,9 +5494,20 @@ impl CrudStore {
         &self,
         pending: NewCliRuntimeThreadBinding,
     ) -> Result<bool> {
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(&pending.resume_cursor_json, true)?;
         self.run_serialized_write(|| async {
-            cli_runtime_binding::insert_fork_intent_if_absent(&self.connection, pending.clone())
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                cli_runtime_binding::insert_fork_intent_if_absent(
+                    &transaction,
+                    pending.clone(),
+                    &root,
+                )
                 .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5137,17 +5549,25 @@ impl CrudStore {
         resume_cursor_json: String,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<CliRuntimeThreadBindingRecord> {
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(&resume_cursor_json, true)?;
         self.run_serialized_write(|| async {
-            cli_runtime_binding::confirm_marked_fork_intent(
-                &self.connection,
-                pending,
-                fork_native_thread_id,
-                native_cwd.clone(),
-                native_model.clone(),
-                resume_cursor_json.clone(),
-                updated_at,
-            )
-            .await
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                cli_runtime_binding::confirm_marked_fork_intent(
+                    &transaction,
+                    pending,
+                    fork_native_thread_id,
+                    native_cwd.clone(),
+                    native_model.clone(),
+                    resume_cursor_json.clone(),
+                    updated_at,
+                    &root,
+                )
+                .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5163,16 +5583,24 @@ impl CrudStore {
         let thread_id = thread_id.to_owned();
         let expected_native_thread_id = expected_native_thread_id.to_owned();
         let expected_cursor_json = expected_cursor_json.to_owned();
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(&resume_cursor_json, true)?;
         self.run_serialized_write(|| async {
-            cli_runtime_binding::update_thread_resume_cursor(
-                &self.connection,
-                thread_id.as_str(),
-                expected_native_thread_id.as_str(),
-                expected_cursor_json.as_str(),
-                resume_cursor_json.clone(),
-                updated_at,
-            )
-            .await
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                cli_runtime_binding::update_thread_resume_cursor(
+                    &transaction,
+                    thread_id.as_str(),
+                    expected_native_thread_id.as_str(),
+                    expected_cursor_json.as_str(),
+                    resume_cursor_json.clone(),
+                    updated_at,
+                    &root,
+                )
+                .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5181,12 +5609,23 @@ impl CrudStore {
         &self,
         request: PrepareClaudeProviderSessionBinding,
     ) -> Result<PreparedClaudeProviderSessionBinding> {
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(
+            &request.thread_binding.resume_cursor_json,
+            true,
+        )?;
         self.run_serialized_write(|| async {
-            cli_runtime_binding::prepare_claude_provider_session_binding(
-                &self.connection,
-                request.clone(),
-            )
-            .await
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                cli_runtime_binding::prepare_claude_provider_session_binding(
+                    &transaction,
+                    request.clone(),
+                    &root,
+                )
+                .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5265,10 +5704,18 @@ impl CrudStore {
         &self,
         binding: NewCliRuntimeTurnBinding,
     ) -> Result<CliRuntimeTurnBindingRecord> {
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.input_mapping_json, false)?;
         self.run_serialized_write(|| async {
-            let stored =
-                cli_runtime_binding::upsert_turn_binding(&self.connection, binding.clone()).await?;
-            Ok(stored)
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                let stored =
+                    cli_runtime_binding::upsert_turn_binding(&transaction, binding.clone(), &root)
+                        .await?;
+                Ok::<_, anyhow::Error>(stored)
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5279,6 +5726,13 @@ impl CrudStore {
     ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
         let turn_id = turn_id.to_owned();
         cli_runtime_binding::find_turn_binding(&self.connection, turn_id.as_str()).await
+    }
+
+    pub async fn has_cli_runtime_dispatch_at_or_after(
+        &self,
+        source: &CliRuntimeTurnBindingRecord,
+    ) -> Result<bool> {
+        cli_runtime_binding::has_dispatch_at_or_after(&self.connection, source).await
     }
 
     pub async fn set_cli_runtime_turn_mcp_metadata(
@@ -5764,12 +6218,21 @@ impl CrudStore {
         attempt_id: String,
         execution_window_index: u32,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.input_mapping_json, false)?;
         self.run_serialized_write(|| async {
             let transaction = self
                 .connection
                 .begin()
                 .await
                 .context("failed to begin CLI runtime initial attempt transaction")?;
+            anyhow::ensure!(
+                !turn_event_projection_stream_state::has_accepted_terminal(
+                    &transaction,
+                    &binding.turn_id
+                )
+                .await?,
+                "CLI initial attempt cannot activate an accepted terminal Turn"
+            );
             let existing_binding =
                 cli_runtime_binding::find_turn_binding(&transaction, binding.turn_id.as_str())
                     .await?;
@@ -5824,9 +6287,12 @@ impl CrudStore {
                             binding.turn_id
                         );
                     }
-                    let stored_binding =
-                        cli_runtime_binding::upsert_turn_binding(&transaction, binding.clone())
-                            .await?;
+                    let stored_binding = cli_runtime_binding::upsert_turn_binding(
+                        &transaction,
+                        binding.clone(),
+                        &root,
+                    )
+                    .await?;
                     cli_runtime_binding::create_turn_attempt(
                         &transaction,
                         NewCliRuntimeTurnAttempt {
@@ -5866,6 +6332,194 @@ impl CrudStore {
                 .await
                 .context("failed to commit CLI runtime initial attempt transaction")?;
             Ok((stored_binding, attempt))
+        })
+        .await
+    }
+
+    /// Transfer a completed native attempt to task orchestration without
+    /// completing the logical Turn. The next attempt and source ACK are atomic.
+    /// All input serialization and task snapshot work happens before this call.
+    pub async fn prepare_cli_runtime_task_continuation(
+        &self,
+        source: pioneer_protocol::CliRuntimeBlockedTurnGuard,
+        owner_id: String,
+        attempt_id: String,
+        continuation: NewCliRuntimeNativeEvent,
+        ack: NewCliRuntimeNativeEvent,
+    ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+        let source_terminal_id = source.terminal_delivery_id();
+        let expected_ack_id = format!("{source_terminal_id}:ack");
+        let expected_continuation_id = format!("{attempt_id}:task-continuation");
+        self.run_serialized_write(|| {
+            let source = source.clone();
+            let source_terminal_id = source_terminal_id.clone();
+            let expected_ack_id = expected_ack_id.clone();
+            let expected_continuation_id = expected_continuation_id.clone();
+            let owner_id = owner_id.clone();
+            let attempt_id = attempt_id.clone();
+            let continuation = continuation.clone();
+            let ack = ack.clone();
+            async move {
+                let tx = self.connection.begin().await?;
+                let now = continuation.created_at;
+                let binding = cli_runtime_binding::find_turn_binding(&tx, &source.turn_id)
+                    .await?
+                    .context("task continuation binding disappeared")?;
+                let latest = cli_runtime_binding::latest_turn_attempt(&tx, &source.turn_id)
+                    .await?
+                    .context("task continuation attempt disappeared")?;
+                let owner = turn_execution::find(&tx, &source.turn_id)
+                    .await?
+                    .context("task continuation owner disappeared")?;
+                anyhow::ensure!(
+                    owner.owner_id == owner_id
+                        && owner.executor_kind == TurnExecutorKind::CliRuntime
+                        && owner.executor_key.as_deref() == Some(source.runtime_id.as_str())
+                        && owner.status.is_active()
+                        && owner.lease_until > chrono::Utc::now().fixed_offset(),
+                    "task continuation execution authority unavailable"
+                );
+                let turn =
+                    turn::find_turn_by_thread_and_id(&tx, &binding.thread_id, &source.turn_id)
+                        .await?
+                        .context("task continuation Turn disappeared")?;
+                anyhow::ensure!(
+                    turn_status_from_db(&turn.status) == Some(TurnStatus::InProgress)
+                        && binding.workspace_id == source.workspace_id
+                        && binding.thread_id == source.thread_id
+                        && binding.continuation_thread_id == source.continuation_thread_id
+                        && binding.runtime_id == source.runtime_id
+                        && binding.runtime_kind == source.runtime_kind
+                        && binding.native_thread_id == source.native_thread_id,
+                    "task continuation execution is no longer current"
+                );
+                if latest.id == attempt_id {
+                    tx.commit().await?;
+                    return Ok((binding, latest));
+                }
+                let snapshot = cli_runtime_turn_terminal_snapshot(&tx, &source.turn_id).await?;
+                let current = snapshot.as_ref().and_then(|snapshot| {
+                    cli_runtime_continuation_guard_from_snapshot(snapshot, true)
+                });
+                anyhow::ensure!(
+                    current
+                        .as_ref()
+                        .is_some_and(|current| current.same_execution(&source)),
+                    "CLI source changed before task continuation"
+                );
+                let snapshot = snapshot
+                    .as_ref()
+                    .context("task continuation snapshot disappeared")?;
+                anyhow::ensure!(
+                    snapshot.turn_status == TurnStatus::InProgress,
+                    "task continuation Turn is no longer active"
+                );
+                anyhow::ensure!(
+                    latest.status == CliRuntimeTurnAttemptStatus::Completed
+                        || cli_runtime_terminal_outcome_pending(&tx, snapshot, &source_terminal_id)
+                            .await?,
+                    "task continuation has no pending accepted terminal outcome"
+                );
+                anyhow::ensure!(
+                    latest.id == source.attempt_id,
+                    "task continuation source attempt changed"
+                );
+                anyhow::ensure!(
+                    ack.id == expected_ack_id
+                        && ack.native_method == "gateway/terminal_ack"
+                        && continuation.id == expected_continuation_id
+                        && continuation.turn_id.as_deref() == Some(source.turn_id.as_str()),
+                    "invalid task continuation identity"
+                );
+                // The saved terminal outcome remains durable, but this ACK
+                // records that its effect is a continuation, never TurnCompleted.
+                cli_runtime_binding::append_native_event_if_absent(&tx, continuation).await?;
+                if cli_runtime_binding::find_native_event(&tx, &source_terminal_id)
+                    .await?
+                    .is_some()
+                    && cli_runtime_binding::find_native_event(&tx, &expected_ack_id)
+                        .await?
+                        .is_none()
+                {
+                    cli_runtime_binding::append_native_event_if_absent(&tx, ack).await?;
+                }
+                if latest.status.is_active() {
+                    anyhow::ensure!(
+                        cli_runtime_binding::mark_turn_attempt_terminal(
+                            &tx,
+                            &latest.id,
+                            CliRuntimeTurnAttemptStatus::Completed,
+                            None,
+                            now
+                        )
+                        .await?,
+                        "source attempt changed"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        latest.status == CliRuntimeTurnAttemptStatus::Completed,
+                        "task continuation requires a completed attempt"
+                    );
+                }
+                let next_index = latest
+                    .attempt_index
+                    .checked_add(1)
+                    .context("task continuation attempt overflow")?;
+                let attempt = cli_runtime_binding::create_turn_attempt(
+                    &tx,
+                    NewCliRuntimeTurnAttempt {
+                        id: attempt_id,
+                        turn_id: source.turn_id.clone(),
+                        attempt_index: next_index,
+                        runtime_id: binding.runtime_id.clone(),
+                        runtime_kind: binding.runtime_kind.clone(),
+                        native_thread_id: binding.native_thread_id.clone(),
+                        native_turn_id: None,
+                        recovery_job_id: None,
+                        recovery_attempt_id: None,
+                        // Orchestration continues the current execution window;
+                        // waiting for children is not budget exhaustion or failure.
+                        execution_window_index: latest.execution_window_index,
+                        status: CliRuntimeTurnAttemptStatus::Starting,
+                        failure_reason: None,
+                        started_at: None,
+                        completed_at: None,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )
+                .await?;
+                cli_runtime_binding::update_turn_control(
+                    &tx,
+                    NewCliRuntimeTurnBinding {
+                        turn_id: binding.turn_id.clone(),
+                        thread_id: binding.thread_id,
+                        continuation_thread_id: binding.continuation_thread_id,
+                        workspace_id: binding.workspace_id,
+                        runtime_id: binding.runtime_id,
+                        runtime_kind: binding.runtime_kind,
+                        native_thread_id: binding.native_thread_id,
+                        native_turn_id: None,
+                        request_id: binding.request_id,
+                        status: "starting".to_owned(),
+                        model: binding.model,
+                        cwd: binding.cwd,
+                        sandbox_json: binding.sandbox_json,
+                        approval_policy: binding.approval_policy,
+                        input_mapping_json: binding.input_mapping_json,
+                        created_at: binding.created_at,
+                        updated_at: now,
+                    },
+                )
+                .await?;
+                let binding =
+                    cli_runtime_binding::clear_turn_native_goal_state(&tx, &source.turn_id, now)
+                        .await?;
+                self.project_cli_runtime_turn_binding_state(&tx, &source.turn_id, now)
+                    .await?;
+                tx.commit().await?;
+                Ok((binding, attempt))
+            }
         })
         .await
     }
@@ -6039,7 +6693,7 @@ impl CrudStore {
             binding.native_turn_id = None;
             binding.status = "starting".to_owned();
             binding.updated_at = prepared_at;
-            let stored_binding = cli_runtime_binding::upsert_turn_binding(
+            let stored_binding = cli_runtime_binding::update_turn_control(
                 &transaction,
                 NewCliRuntimeTurnBinding {
                     turn_id: binding.turn_id,
@@ -6242,7 +6896,7 @@ impl CrudStore {
                 transaction.rollback().await.ok();
                 bail!("CLI runtime turn attempt `{attempt_id}` is no longer starting");
             }
-            let stored_binding = cli_runtime_binding::upsert_turn_binding(
+            let stored_binding = cli_runtime_binding::update_turn_control(
                 &transaction,
                 NewCliRuntimeTurnBinding {
                     turn_id: binding.turn_id,
@@ -6322,6 +6976,27 @@ impl CrudStore {
     ) -> Result<Option<CliRuntimeTurnTerminalGuard>> {
         let snapshot = self.connection.begin_read().await?;
         cli_runtime_turn_terminal_snapshot(&snapshot, turn_id).await
+    }
+
+    /// A previously completed native attempt can still belong to an unfinished
+    /// logical Turn. Only Task orchestration uses this source; ordinary terminal
+    /// event admission remains restricted to active attempts.
+    pub async fn cli_runtime_completed_task_continuation_source(
+        &self,
+        binding: &CliRuntimeTurnBindingRecord,
+    ) -> Result<Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>> {
+        Ok(self
+            .cli_runtime_turn_terminal_guard(binding)
+            .await?
+            .as_ref()
+            .filter(|snapshot| {
+                snapshot.attempt.as_ref().is_some_and(|attempt| {
+                    attempt.status == CliRuntimeTurnAttemptStatus::Completed
+                        && attempt.native_turn_id.is_some()
+                        && attempt.native_turn_id == snapshot.binding.native_turn_id
+                })
+            })
+            .and_then(|snapshot| cli_runtime_continuation_guard_from_snapshot(snapshot, true)))
     }
 
     /// Coherent provenance of an ordinary native terminal event. Unlike a
@@ -6561,6 +7236,12 @@ impl CrudStore {
             "Blocked event does not match its native source"
         );
         let outcome_id = expected.terminal_delivery_id();
+        let accepted_outcome = expected.terminal_delivery_id.is_some();
+        if let Some(id) = expected.terminal_delivery_id.as_deref() {
+            anyhow::ensure!(id == outcome_id, "Blocked source outcome identity changed");
+        }
+        let mut expected_execution = expected.clone();
+        expected_execution.terminal_delivery_id = None;
         let event = TurnEventPayload::TurnBlocked(notification);
         let mut envelope =
             prepare_turn_event_envelope_for_permanent_storage(&self.connection, event).await?;
@@ -6628,9 +7309,13 @@ impl CrudStore {
                         execution_owner,
                         turn_status,
                     });
-            let actual = actual_snapshot
-                .as_ref()
-                .and_then(cli_runtime_blocked_guard_from_snapshot);
+            let actual = actual_snapshot.as_ref().and_then(|snapshot| {
+                if accepted_outcome {
+                    cli_runtime_event_guard_from_snapshot(snapshot)
+                } else {
+                    cli_runtime_blocked_guard_from_snapshot(snapshot)
+                }
+            });
             let recovery_is_current = if expected.recovery_confirmed {
                 // Existing durable confirmation ends recovery authority. The
                 // attempt identity and confirmation are still checked above.
@@ -6647,17 +7332,20 @@ impl CrudStore {
             } else {
                 expected.recovery_job_id.is_none() && expected.recovery_attempt_id.is_none()
             };
-            if actual.as_ref() != Some(expected) || !recovery_is_current {
+            if actual.as_ref() != Some(&expected_execution) || !recovery_is_current {
                 transaction.rollback().await?;
                 return Ok(false);
             }
-            if cli_runtime_terminal_outcome_pending(
+            let outcome_pending = cli_runtime_terminal_outcome_pending(
                 &transaction,
                 actual_snapshot.as_ref().expect("source checked"),
                 &outcome_id,
             )
-            .await?
-            {
+            .await?;
+            // Observational Blocked cannot consume a saved outcome. An explicit
+            // accepted-outcome delivery must still own that exact pending row;
+            // ACK and Blocked commit together, preserving restart/replay fencing.
+            if outcome_pending != accepted_outcome {
                 transaction.rollback().await?;
                 return Ok(false);
             }
@@ -6681,6 +7369,10 @@ impl CrudStore {
             {
                 transaction.rollback().await?;
                 return Ok(false);
+            }
+            if accepted_outcome {
+                ack_cli_runtime_outcome(&transaction, Some(expected), "gateway/terminal_ack")
+                    .await?;
             }
             self.append_and_project_turn_event_in_transaction(
                 &transaction,
@@ -6811,7 +7503,7 @@ impl CrudStore {
                     attempt.id
                 );
             }
-            let stored_binding = cli_runtime_binding::upsert_turn_binding(
+            let stored_binding = cli_runtime_binding::update_turn_control(
                 &transaction,
                 NewCliRuntimeTurnBinding {
                     turn_id: binding.turn_id,
@@ -8177,9 +8869,31 @@ impl CrudStore {
         binding: Option<ArtifactBindingTargetRecord>,
         version_metadata: BTreeMap<String, serde_json::Value>,
     ) -> Result<IngestedArtifactRecord> {
+        self.ingest_artifact_metadata_with_identity(
+            blob,
+            artifact,
+            binding,
+            version_metadata,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn ingest_artifact_metadata_with_identity(
+        &self,
+        blob: NewArtifactBlobRecord,
+        artifact: IngestArtifactMetadataRecord,
+        binding: Option<ArtifactBindingTargetRecord>,
+        version_metadata: BTreeMap<String, serde_json::Value>,
+        identity: Option<String>,
+        limits: Option<(u64, u64)>,
+        commit_guard: Option<(u64, tokio_util::sync::CancellationToken)>,
+    ) -> Result<IngestedArtifactRecord> {
         let prepared_at = chrono::Utc::now().fixed_offset();
         let blob_id = generate_id(DB_ID_LEN);
-        let artifact_id = generate_id(DB_ID_LEN);
+        let artifact_id = identity.clone().unwrap_or_else(|| generate_id(DB_ID_LEN));
         let version_id = generate_id(DB_ID_LEN);
         let binding_id = generate_id(DB_ID_LEN);
         let blob_size_bytes = artifact_repository::checked_size_bytes(blob.size_bytes)?;
@@ -8188,9 +8902,11 @@ impl CrudStore {
         let version_metadata_json = artifact_repository::metadata_to_db(&version_metadata)?;
         let binding_metadata_json = artifact_repository::metadata_to_db(&BTreeMap::new())?;
         self.run_serialized_write(|| {
+            let identity = identity.clone();
+            let commit_guard = commit_guard.clone();
             let blob = blob.clone();
             let artifact = artifact.clone();
-            let binding = binding.clone();
+            let mut binding = binding.clone();
             let blob_id = blob_id.clone();
             let artifact_id = artifact_id.clone();
             let version_id = version_id.clone();
@@ -8206,7 +8922,24 @@ impl CrudStore {
                     .await
                     .context("failed to begin artifact ingest transaction")?;
                 let repository = artifact_repository::ArtifactRepository::new();
+                let publication = identity.is_some() && artifact.created_by_actor_id.as_deref() == Some("html_render");
                 let result = async {
+                    if let Some((generation, cancel)) = &commit_guard {
+                        if cancel.is_cancelled() {
+                            return Err(ArtifactCrudError::InvalidRequest { message: "HTML invocation cancelled before commit".into() });
+                        }
+                        let current = current_policy_generation_on(&transaction).await.map_err(|error| ArtifactCrudError::InvalidRequest { message: format!("HTML authorization unavailable: {error}") })?;
+                        if current.get() != *generation {
+                            return Err(ArtifactCrudError::InvalidRequest { message: "HTML authorization changed before commit; retry under current policy".into() });
+                        }
+                    }
+                    if identity.is_some() {
+                        let target = binding.as_mut().ok_or_else(|| ArtifactCrudError::InvalidRequest { message:"tool artifact requires owner binding".into() })?;
+                        repository.validate_tool_ingest_owner(&transaction, &artifact.workspace_id, target).await?;
+                        if let Some(existing) = repository.find_idempotent_ingest(&transaction, &artifact_id, &blob, &artifact_metadata_json).await? { return Ok(existing); }
+                        let (bytes, files) = limits.ok_or_else(|| ArtifactCrudError::InvalidRequest { message:"tool artifact requires quotas".into() })?;
+                        target.item_index = Some(repository.reserve_tool_artifact_index(&transaction, &artifact.workspace_id, target, blob.size_bytes, bytes, files, artifact.created_by_actor_id.as_deref() == Some("html_render")).await?);
+                    }
                     let blob = repository
                         .find_or_create_blob_prepared(
                             &transaction,
@@ -8254,6 +8987,10 @@ impl CrudStore {
                             )
                             .await?;
                     }
+                    if publication {
+                        let target = binding.as_ref().expect("tool binding validated");
+                        repository.touch_html_turn_projection(&transaction, &artifact.workspace_id,target.thread_id.as_deref().unwrap_or_default(),target.turn_id.as_deref().unwrap_or_default(),prepared_at).await?;
+                    }
                     Ok::<_, ArtifactCrudError>(IngestedArtifactRecord {
                         artifact,
                         version,
@@ -8270,6 +9007,21 @@ impl CrudStore {
                     }
                 };
 
+                if publication {
+                    let target = binding.as_ref().expect("tool binding validated");
+                    let turn_id = target.turn_id.as_deref().unwrap_or_default();
+                    if find_turn_work_projection(&transaction, turn_id).await?.is_none() {
+                        crate::timeline_live_projection::project_cli_runtime_turn_binding_state(
+                            &transaction, turn_id, prepared_at,
+                        ).await?;
+                        repository.touch_html_turn_projection(&transaction, &record.artifact.workspace_id,
+                            target.thread_id.as_deref().unwrap_or_default(), turn_id, prepared_at).await?;
+                    }
+                }
+                if commit_guard.as_ref().is_some_and(|(_, cancel)| cancel.is_cancelled()) {
+                    transaction.rollback().await?;
+                    bail!("HTML invocation cancelled before commit");
+                }
                 transaction
                     .commit()
                     .await
@@ -8284,11 +9036,17 @@ impl CrudStore {
         &self,
         blob: NewArtifactBlobRecord,
     ) -> Result<ArtifactBlobRecord> {
+        let id = generate_id(DB_ID_LEN);
+        let at = chrono::Utc::now().fixed_offset();
+        let size = artifact_repository::checked_size_bytes(blob.size_bytes)?;
+        let metadata = artifact_repository::metadata_to_db(&blob.metadata)?;
         self.run_serialized_write(|| {
             let blob = blob.clone();
+            let id = id.clone();
+            let metadata = metadata.clone();
             async move {
                 artifact_repository::ArtifactRepository::new()
-                    .find_or_create_blob(&self.connection, blob)
+                    .find_or_create_blob_prepared(&self.connection, blob, id, at, size, metadata)
                     .await
                     .map_err(Into::into)
             }
@@ -8523,21 +9281,45 @@ impl CrudStore {
         status: ArtifactStatus,
         deleted_at: Option<DateTimeWithTimeZone>,
     ) -> Result<ArtifactRecord> {
+        let at = chrono::Utc::now().fixed_offset();
         self.run_serialized_write(|| {
             let workspace_id = workspace_id.to_owned();
             let artifact_id = artifact_id.to_owned();
             let deleted_at = deleted_at.clone();
             async move {
-                artifact_repository::ArtifactRepository::new()
-                    .update_artifact_status(
-                        &self.connection,
-                        &workspace_id,
-                        &artifact_id,
-                        status,
-                        deleted_at,
-                    )
-                    .await
-                    .map_err(Into::into)
+                let transaction = self.connection.begin().await?;
+                let repository = artifact_repository::ArtifactRepository::new();
+                let result = async {
+                    let artifact = repository
+                        .update_artifact_status(
+                            &transaction,
+                            &workspace_id,
+                            &artifact_id,
+                            status,
+                            deleted_at,
+                        )
+                        .await?;
+                    repository
+                        .touch_html_artifact_projection(
+                            &transaction,
+                            &workspace_id,
+                            &artifact_id,
+                            at,
+                        )
+                        .await?;
+                    Ok::<_, artifact_repository::ArtifactCrudError>(artifact)
+                }
+                .await;
+                match result {
+                    Ok(artifact) => {
+                        transaction.commit().await?;
+                        Ok(artifact)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error.into())
+                    }
+                }
             }
         })
         .await
@@ -10885,12 +11667,31 @@ impl CrudStore {
     pub async fn reconcile_thread_episodic_source_version(
         &self,
         expected_source_payload: &str,
-        item: NewThreadEpisodicItemRecord,
+        mut item: NewThreadEpisodicItemRecord,
         now_unix: i64,
     ) -> Result<ThreadEpisodicSourceReconcileOutcome> {
+        let source_item: TurnItem = serde_json::from_str(expected_source_payload)?;
+        let committed = thread_episodic_source::committed_item_ingestion_input_from_parts(
+            &item.workspace_id,
+            &item.thread_id,
+            &item.turn_id,
+            source_item,
+        )
+        .context("invalid episodic source identity")?;
+        let context = thread_episodic_repository::load_source_projection_context(
+            &self.connection,
+            &item.thread_id,
+            &item.turn_id,
+            &item.item_id,
+            committed.item_type,
+        )
+        .await?;
+        item.projection_group_id = context.projection_group_id(&committed, &item.source_text_hash);
         self.run_serialized_write(|| {
             let expected_source_payload = expected_source_payload.to_owned();
             let item = item.clone();
+            let context = context.clone();
+            let item_type = committed.item_type;
             async move {
                 let transaction =
                     self.connection.begin().await.context(
@@ -10926,7 +11727,20 @@ impl CrudStore {
                     else {
                         return Ok(ThreadEpisodicSourceReconcileOutcome::SourceChanged);
                     };
-                    if source.payload != expected_source_payload {
+                    if source.payload != expected_source_payload
+                        || !thread_episodic_source::source_status_is_committed(
+                            source.status.as_deref(),
+                        )
+                        || context
+                            != thread_episodic_repository::load_source_projection_context(
+                                &transaction,
+                                &item.thread_id,
+                                &item.turn_id,
+                                &item.item_id,
+                                item_type,
+                            )
+                            .await?
+                    {
                         return Ok(ThreadEpisodicSourceReconcileOutcome::SourceChanged);
                     }
                     thread_episodic_repository::reconcile_item_source_version(
@@ -11059,6 +11873,24 @@ impl CrudStore {
         .await?
         .into_iter()
         .map(crate::thread_episodic::thread_episodic_item_record_from_model)
+        .collect()
+    }
+
+    pub async fn list_thread_episodic_capsules_for_workspace_after(
+        &self,
+        workspace_id: &str,
+        after: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicCapsuleRecord>> {
+        thread_episodic_repository::list_capsules_for_workspace_after(
+            &self.connection,
+            workspace_id,
+            after,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::thread_episodic::thread_episodic_capsule_record_from_model)
         .collect()
     }
 
@@ -11369,6 +12201,28 @@ impl CrudStore {
         .await
     }
 
+    pub async fn terminal_thread_episodic_index_job_exists_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<bool> {
+        thread_episodic_repository::terminal_index_job_exists_for_workspace(
+            &self.connection,
+            workspace_id,
+        )
+        .await
+    }
+
+    pub async fn unfinished_thread_episodic_index_job_exists_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<bool> {
+        thread_episodic_repository::unfinished_index_job_exists_for_workspace(
+            &self.connection,
+            workspace_id,
+        )
+        .await
+    }
+
     pub async fn thread_episodic_index_job_exists_for_workspace(
         &self,
         workspace_id: &str,
@@ -11540,24 +12394,193 @@ impl CrudStore {
         .await
     }
 
+    /// Recover only under exclusive workspace ownership or before runtime
+    /// admission. Each bounded transaction confirms durable results, closes
+    /// exhausted attempts, and requeues only the remaining execution budget.
+    /// The count includes all three recovery outcomes.
     pub async fn requeue_running_thread_episodic_index_jobs_for_workspace(
         &self,
         workspace_id: &str,
-        interrupted_before_unix: i64,
         now_unix: i64,
+        max_attempts: i64,
     ) -> Result<u64> {
-        self.run_serialized_write(|| {
-            let workspace_id = workspace_id.to_owned();
-            async move {
-                thread_episodic_repository::requeue_running_index_jobs_for_workspace(
-                    &self.connection,
-                    workspace_id.as_str(),
-                    unix_to_datetime(interrupted_before_unix),
-                    unix_to_datetime(now_unix),
-                )
-                .await
+        let mut total = 0u64;
+        loop {
+            let requeued = self
+                .run_serialized_write(|| {
+                    let workspace_id = workspace_id.to_owned();
+                    async move {
+                        let transaction = self.connection.begin().await?;
+                        let recovered =
+                            thread_episodic_repository::requeue_running_index_jobs_for_workspace(
+                                &transaction,
+                                workspace_id.as_str(),
+                                unix_to_datetime(now_unix),
+                                max_attempts,
+                            )
+                            .await?;
+                        transaction.commit().await?;
+                        Ok(recovered)
+                    }
+                })
+                .await?;
+            total = total.saturating_add(requeued);
+            if requeued == 0 {
+                return Ok(total);
             }
-        })
+        }
+    }
+
+    pub async fn list_due_thread_episodic_index_jobs_after(
+        &self,
+        now_unix: i64,
+        after: Option<&ThreadEpisodicIndexJobRecord>,
+        through: Option<&ThreadEpisodicIndexJobRecord>,
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicIndexJobRecord>> {
+        thread_episodic_repository::list_due_index_jobs_after(
+            &self.connection,
+            unix_to_datetime(now_unix),
+            after,
+            through,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
+        .collect()
+    }
+
+    pub async fn thread_episodic_discovery_round_end(
+        &self,
+        now_unix: i64,
+    ) -> Result<Option<ThreadEpisodicIndexJobRecord>> {
+        thread_episodic_repository::discovery_round_end(
+            &self.connection,
+            unix_to_datetime(now_unix),
+        )
+        .await?
+        .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
+        .transpose()
+    }
+
+    pub async fn next_scheduled_thread_episodic_index_job_at(&self) -> Result<Option<i64>> {
+        Ok(
+            thread_episodic_repository::next_scheduled_index_job_at(&self.connection, None)
+                .await?
+                .map(|at| at.timestamp()),
+        )
+    }
+
+    /// Round-to-wait handoff: use the frozen discovery time as the lower bound,
+    /// so deadlines crossed while processing the round are still returned.
+    pub async fn next_future_thread_episodic_index_job_at(
+        &self,
+        after_unix: i64,
+    ) -> Result<Option<i64>> {
+        Ok(thread_episodic_repository::next_scheduled_index_job_at(
+            &self.connection,
+            Some(unix_to_datetime(after_unix)),
+        )
+        .await?
+        .map(|at| at.timestamp()))
+    }
+
+    pub async fn claim_thread_episodic_index_job_if_due(
+        &self,
+        job_id: &str,
+        now_unix: i64,
+        max_attempts: i64,
+    ) -> Result<Option<ThreadEpisodicIndexJobRecord>> {
+        let Some(snapshot) = self.find_thread_episodic_index_job(job_id).await? else {
+            return Ok(None);
+        };
+        self.claim_thread_episodic_index_job_from_snapshot(
+            &snapshot,
+            now_unix,
+            max_attempts,
+            None,
+            None,
+        )
+        .await
+    }
+
+    // The caller owns the workspace and records this exact prospective attempt
+    // before awaiting admission. Unknown commit/cancellation can therefore be
+    // settled by ID/attempt only after reading its actual durable state.
+    pub async fn claim_thread_episodic_index_job_from_snapshot(
+        &self,
+        snapshot: &ThreadEpisodicIndexJobRecord,
+        now_unix: i64,
+        max_attempts: i64,
+        mutation_started: Option<&std::sync::atomic::AtomicBool>,
+        accepting_claims: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<ThreadEpisodicIndexJobRecord>> {
+        // Do not replay this transaction after an ambiguous commit. Physical
+        // serialization is provided by SqliteDatabase at begin/statement level.
+        async {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                if self.take_episodic_claim_fault_for_test(&snapshot.id, "panic_poll") {
+                    panic!("controlled claim polling unwind");
+                }
+                if self.take_episodic_claim_fault_for_test(&snapshot.id, "storage") {
+                    anyhow::bail!("controlled claim storage failure");
+                }
+                if self.take_episodic_claim_fault_for_test(&snapshot.id, "lock") {
+                    anyhow::bail!("database is locked");
+                }
+            }
+            let now = unix_to_datetime(now_unix);
+            let transaction = self.connection.begin().await?;
+            let current =
+                thread_episodic_repository::find_index_job_by_id(&transaction, &snapshot.id)
+                    .await?
+                    .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
+                    .transpose()?;
+            if current.as_ref() != Some(snapshot)
+                || snapshot.next_run_at > now
+                || !matches!(
+                    snapshot.status,
+                    ThreadEpisodicIndexJobStatus::Queued | ThreadEpisodicIndexJobStatus::Failed
+                )
+                || accepting_claims
+                    .is_some_and(|accepting| !accepting.load(std::sync::atomic::Ordering::Acquire))
+            {
+                transaction.rollback().await?;
+                return Ok(None);
+            }
+            if let Some(started) = mutation_started {
+                started.store(true, std::sync::atomic::Ordering::Release);
+            }
+            let claimed = thread_episodic_repository::mark_index_job_running(
+                &transaction,
+                &snapshot.id,
+                now,
+                max_attempts,
+            )
+            .await?;
+            transaction.commit().await?;
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                if self.take_episodic_claim_fault_for_test(&snapshot.id, "panic_commit") {
+                    panic!("controlled claim acknowledgement unwind");
+                }
+                if self.take_episodic_claim_fault_for_test(&snapshot.id, "commit_unknown") {
+                    anyhow::bail!("controlled loss of claim acknowledgement");
+                }
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            if self
+                .episodic_ambiguous_claim_commit
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                anyhow::bail!("controlled loss of episodic claim commit acknowledgement");
+            }
+            claimed
+                .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
+                .transpose()
+        }
         .await
     }
 
@@ -11565,6 +12588,7 @@ impl CrudStore {
         &self,
         now_unix: i64,
         limit: u64,
+        max_attempts: i64,
     ) -> Result<Vec<ThreadEpisodicIndexJobRecord>> {
         self.run_serialized_write(|| async move {
             let now = unix_to_datetime(now_unix);
@@ -11582,6 +12606,7 @@ impl CrudStore {
                     &transaction,
                     row.id.as_str(),
                     now,
+                    max_attempts,
                 )
                 .await?;
                 transaction
@@ -11599,49 +12624,56 @@ impl CrudStore {
         .await
     }
 
+    /// Discover one bounded portion under a reader, then commit each candidate
+    /// separately. Do not replay the portion after a lock/ambiguous commit error.
+    /// Caller owns workspace execution; failures carry input snapshots only.
     pub async fn claim_due_thread_episodic_index_jobs_for_workspace(
         &self,
         workspace_id: &str,
         now_unix: i64,
         limit: u64,
-    ) -> Result<Vec<ThreadEpisodicIndexJobRecord>> {
-        self.run_serialized_write(|| {
-            let workspace_id = workspace_id.to_owned();
-            async move {
-                let now = unix_to_datetime(now_unix);
-                let rows = thread_episodic_repository::list_due_index_jobs_for_workspace(
-                    &self.connection,
-                    workspace_id.as_str(),
-                    now,
-                    limit,
-                )
-                .await?;
-                let mut claimed = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let transaction = self.connection.begin().await.context(
-                        "failed to begin workspace thread episodic index claim transaction",
-                    )?;
-                    let claimed_row = thread_episodic_repository::mark_index_job_running(
-                        &transaction,
-                        row.id.as_str(),
-                        now,
-                    )
-                    .await?;
-                    transaction.commit().await.context(
-                        "failed to commit workspace thread episodic index claim transaction",
-                    )?;
-                    if let Some(row) = claimed_row {
-                        claimed.push(
-                            crate::thread_episodic::thread_episodic_index_job_record_from_model(
-                                row,
-                            )?,
-                        );
-                    }
+        max_attempts: i64,
+    ) -> Result<ThreadEpisodicIndexClaimBatch> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.episodic_claim_discoveries
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let candidates = thread_episodic_repository::list_due_index_jobs_for_workspace(
+            &self.connection,
+            workspace_id,
+            unix_to_datetime(now_unix),
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
+        .collect::<Result<Vec<_>>>()?;
+        let mut batch = ThreadEpisodicIndexClaimBatch::default();
+        for candidate in candidates {
+            use futures_util::FutureExt;
+            let result = std::panic::AssertUnwindSafe(async {
+                #[cfg(any(test, feature = "test-support"))]
+                if self.take_episodic_claim_fault_for_test(&candidate.id, "panic_create") {
+                    panic!("controlled claim creation unwind");
                 }
-                Ok(claimed)
+                self.claim_thread_episodic_index_job_from_snapshot(
+                    &candidate,
+                    now_unix,
+                    max_attempts,
+                    None,
+                    None,
+                )
+                .await
+            })
+            .catch_unwind()
+            .await;
+            match result {
+                Ok(Ok(Some(claim))) => batch.claimed.push(claim),
+                Ok(Ok(None)) => {}
+                Ok(Err(_)) => batch.failures.push((candidate, "claim_storage")),
+                Err(_) => batch.failures.push((candidate, "claim_unwind")),
             }
-        })
-        .await
+        }
+        Ok(batch)
     }
 
     pub async fn complete_thread_episodic_index_job(
@@ -11773,17 +12805,32 @@ impl CrudStore {
         job_id: &str,
         expected_attempt_count: i64,
         now_unix: i64,
+        last_error: Option<&str>,
     ) -> Result<ThreadEpisodicIndexAttemptOutcome> {
         self.run_serialized_write(|| {
             let job_id = job_id.to_owned();
             async move {
-                thread_episodic_repository::requeue_index_attempt(
-                    &self.connection,
+                // Canonical source saves do not acquire workspace ownership.
+                // Reserve the writer across the attempt guard and transition so
+                // their Superseded/deletion outcomes cannot be overwritten.
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin thread episodic attempt requeue")?;
+                let outcome = thread_episodic_repository::requeue_index_attempt(
+                    &transaction,
                     job_id.as_str(),
                     expected_attempt_count,
                     unix_to_datetime(now_unix),
+                    last_error,
                 )
-                .await
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit thread episodic attempt requeue")?;
+                Ok(outcome)
             }
         })
         .await
@@ -11840,6 +12887,77 @@ impl CrudStore {
                     "failed to commit thread episodic reconciliation failure transaction",
                 )?;
                 Ok(outcome)
+            }
+        })
+        .await
+    }
+
+    /// Writer-side state observation serializes with a possibly ambiguous claim
+    /// commit. A reader-pool snapshot alone could still precede that commit.
+    /// An unchanged input may only receive scheduling backoff; an observed
+    /// Running attempt is settled using its exact identity and attempt fence.
+    pub async fn settle_thread_episodic_owned_index_attempt(
+        &self,
+        expected: &ThreadEpisodicIndexJobRecord,
+        input: Option<&ThreadEpisodicIndexJobRecord>,
+        update: ThreadEpisodicIndexJobFailureUpdate,
+        now_unix: i64,
+    ) -> Result<()> {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+        self.run_serialized_write(|| {
+            let expected = expected.clone();
+            let input = input.cloned();
+            let update = update.clone();
+            async move {
+                let transaction = self.connection.begin().await?;
+                let current =
+                    thread_episodic_repository::find_index_job_by_id(&transaction, &expected.id)
+                        .await?;
+                if current.as_ref().is_some_and(|current| {
+                    current.status == "running"
+                        && current.attempt_count == expected.attempt_count
+                        && current.index_item_id == expected.index_item_id
+                        && current.updated_at == expected.updated_at
+                }) {
+                    if !thread_episodic_repository::confirm_index_job_if_indexed(
+                        &transaction,
+                        current.as_ref().unwrap(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?
+                    {
+                        thread_episodic_repository::recover_index_attempt_after_persistence_error(
+                            &transaction,
+                            &expected.id,
+                            expected.attempt_count,
+                            update,
+                            unix_to_datetime(now_unix),
+                        )
+                        .await?;
+                    }
+                } else if let (Some(input), Some(row)) = (input, current)
+                    && matches!(row.status.as_str(), "queued" | "failed")
+                    && crate::thread_episodic::thread_episodic_index_job_record_from_model(
+                        row.clone(),
+                    )? == input
+                {
+                    // Writer observation proves this exact input was not
+                    // claimed. Defer only its scheduling; never spend budget or
+                    // assume rollback from the error alone.
+                    if let Some(next) = update.next_run_at_unix {
+                        let mut active = row.into_active_model();
+                        active.next_run_at = Set(unix_to_datetime(next));
+                        if input.last_error.as_deref()
+                            != Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR)
+                        {
+                            active.last_error = Set(update.last_error);
+                        }
+                        active.updated_at = Set(unix_to_datetime(now_unix));
+                        active.update(&transaction).await?;
+                    }
+                }
+                transaction.commit().await?;
+                Ok(())
             }
         })
         .await
@@ -12792,17 +13910,35 @@ impl CrudStore {
             .response
             .as_ref()
             .context("agent Turn transaction requires an exact response binding")?;
-        if execution_graph
-            .child_execution
-            .parent_execution_id
-            .as_deref()
-            != Some(input_execution_id.as_str())
-            || execution_graph.child_execution.parent_thread_id.as_deref()
-                != Some(thread_model.id.as_str())
+        let response_execution = &execution_graph.child_execution;
+        let independent_root = response_execution.parent_execution_id.is_none()
+            && response_execution.id == response_execution.work_graph_root_execution_id
+            && execution_graph
+                .root_execution
+                .as_ref()
+                .is_some_and(|root| root.id == response_execution.id)
+            && response_execution.home_root_thread_id == thread_model.id;
+        let grant: serde_json::Value = serde_json::from_str(&execution_graph.grant.grant_json)?;
+        let input_bound = if independent_root {
+            grant
+                .get("source_execution_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(input_execution_id.as_str())
+                && grant
+                    .get("source_action_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(agent_action.action.id.as_str())
+        } else {
+            response_execution.parent_execution_id.as_deref() == Some(input_execution_id.as_str())
+        };
+        if !input_bound
+            || agent_action.action.execution_id != input_execution_id.as_str()
+            || agent_action.action.action_kind != "start_agent"
+            || response_execution.parent_thread_id.as_deref() != Some(thread_model.id.as_str())
             || graph_response.turn_id != turn_model.id
-            || graph_response.execution_id != execution_graph.child_execution.id
+            || graph_response.execution_id != response_execution.id
         {
-            bail!("agent Turn input/response actors differ from its execution graph");
+            bail!("agent Turn input/response actors differ from its execution graph and action");
         }
         let authority_envelope_json = authority_envelope_json.trim();
         if authority_envelope_json.is_empty() {
@@ -13275,21 +14411,17 @@ impl CrudStore {
         turn_execution::find(&self.connection, turn_id).await
     }
 
+    /// Extend active receipts using SQLite's time at the physical UPDATE,
+    /// including after writer admission and each storage retry.
     pub async fn heartbeat_turn_executions_owned_by(
         &self,
         owner_id: &str,
-        heartbeat_at_unix: i64,
-        lease_until_unix: i64,
+        lease_seconds: i64,
     ) -> Result<u64> {
         let owner_id = owner_id.to_owned();
         self.run_serialized_write(|| async {
-            turn_execution::heartbeat_owner(
-                &self.connection,
-                owner_id.as_str(),
-                unix_to_datetime(heartbeat_at_unix),
-                unix_to_datetime(lease_until_unix),
-            )
-            .await
+            turn_execution::heartbeat_owner(&self.connection, owner_id.as_str(), lease_seconds)
+                .await
         })
         .await
     }
@@ -13312,6 +14444,31 @@ impl CrudStore {
                 unix_to_datetime(lease_until_unix),
             )
             .await
+        })
+        .await
+    }
+
+    /// Fence duplicate outbox activations using the starting receipt's timestamp.
+    /// This CAS precedes runtime registration, while canonical
+    /// terminal acceptance shares the same serialized writer.
+    pub async fn claim_unactivated_agent_turn(
+        &self,
+        expected: &TurnExecutionRecord,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            if turn_event_projection_stream_state::has_accepted_terminal(&tx, &expected.turn_id)
+                .await?
+            {
+                return Ok(false);
+            }
+            // Writer admission (and a storage retry) may outlive the lease.
+            // Read the clock in this attempt, after acquiring the writer and
+            // immediately before evaluating the activation fence.
+            let claimed =
+                repositories::turn_execution::claim_unactivated(&tx, expected, utc_now()).await?;
+            tx.commit().await?;
+            Ok(claimed)
         })
         .await
     }
@@ -13562,7 +14719,10 @@ impl CrudStore {
         limit: u64,
         event_timestamp_secs: i64,
     ) -> Result<TurnFinalizationReconciliationSummary> {
-        let turn_ids = self.list_prepared_turn_finalization_ids(limit).await?;
+        let turn_ids = self
+            .list_prepared_turn_finalization_ids(limit)
+            .await
+            .context(NativeFinalizationPhase::Scan)?;
         let mut summary = TurnFinalizationReconciliationSummary::default();
         for turn_id in turn_ids {
             summary.scanned = summary.scanned.saturating_add(1);
@@ -13602,7 +14762,8 @@ impl CrudStore {
             // revalidates their durable identities before committing them.
             let prepared_intent =
                 turn_finalization::find_by_turn_id(&self.connection, turn_id.as_str())
-                    .await?
+                    .await
+                    .context(NativeFinalizationPhase::Preparation)?
                     .with_context(|| format!("turn `{turn_id}` has no finalization intent"))?;
             let final_item = turn_finalization::notification_from_model(&prepared_intent)?;
             let prepared_turn = turn::find_turn_by_thread_and_id(
@@ -13610,11 +14771,13 @@ impl CrudStore {
                 prepared_intent.thread_id.as_str(),
                 turn_id.as_str(),
             )
-            .await?
+            .await
+            .context(NativeFinalizationPhase::Preparation)?
             .with_context(|| format!("turn `{turn_id}` disappeared during finalization"))?;
             let prepared_thread =
                 thread::find_thread_by_id(&self.connection, prepared_intent.thread_id.as_str())
-                    .await?
+                    .await
+                    .context(NativeFinalizationPhase::Preparation)?
                     .with_context(|| {
                         format!(
                             "thread `{}` disappeared during finalization",
@@ -13652,19 +14815,21 @@ impl CrudStore {
                 TurnEventPayload::ItemCompleted(final_item.clone()),
                 unix_to_datetime(event_timestamp_secs),
             )
-            .await?;
+            .await
+            .context(NativeFinalizationPhase::Preparation)?;
             let prepared_completed_event = prepare_projected_turn_event_for_permanent_storage(
                 &self.connection,
                 TurnEventPayload::TurnCompleted(turn_completed.clone()),
                 unix_to_datetime(event_timestamp_secs),
             )
-            .await?;
+            .await
+            .context(NativeFinalizationPhase::Preparation)?;
 
             let transaction = self
                 .connection
                 .begin()
                 .await
-                .context("failed to begin turn finalization transaction")?;
+                .context(NativeFinalizationPhase::WriterBegin)?;
             let result = async {
                 let intent = turn_finalization::find_by_turn_id(&transaction, turn_id.as_str())
                     .await?
@@ -13818,7 +14983,8 @@ impl CrudStore {
                     },
                 ))
             }
-            .await;
+            .await
+            .context(NativeFinalizationPhase::WriterApply);
             match result {
                 Ok(TurnFinalizationCommitOutcome::DeferredByPredecessor) => {
                     let _ = transaction.rollback().await;
@@ -13828,7 +14994,7 @@ impl CrudStore {
                     transaction
                         .commit()
                         .await
-                        .context("failed to commit turn finalization transaction")?;
+                        .context(NativeFinalizationPhase::WriterCommit)?;
                     Ok(outcome)
                 }
                 Err(error) => {
@@ -13897,10 +15063,19 @@ impl CrudStore {
             updated_at,
             updated_at,
         )?;
+        let episodic_source = self
+            .prepare_episodic_source_save(
+                &notification.workspace_id,
+                &notification.thread_id,
+                &notification.turn_id,
+                &notification.item,
+            )
+            .await?;
         self.run_serialized_write(|| {
             let notification = notification.clone();
             let connection = self.connection.clone();
-            let prepared_item = prepared_item.clone();
+            let mut prepared_item = prepared_item.clone();
+            let episodic_source = episodic_source.clone();
             async move {
                 let transaction = connection
                     .begin()
@@ -13946,7 +15121,9 @@ impl CrudStore {
                     .await?
                     .map(|event| event.sequence)
                     .unwrap_or(0);
+                    prepared_item.preserve_uncommitted_source_status(&transaction).await?;
                     turn::upsert_prepared_turn_item(&transaction, prepared_item).await?;
+                    self.commit_episodic_source_save(&transaction, &episodic_source, updated_at).await?;
                     self.project_semantic_timeline_snapshot_turn_item(
                         &transaction,
                         notification.turn_id.as_str(),
@@ -13986,7 +15163,9 @@ impl CrudStore {
                 }
             }
         })
-        .await
+        .await?;
+        self.episodic_work.notify_one();
+        Ok(())
     }
 
     pub async fn materialize_item_timeout_detected(
@@ -14326,7 +15505,12 @@ impl CrudStore {
         &self,
         input: TaskCreationCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        self.run_serialized_write(|| self.commit_task_creation_once(input.clone()))
+        let root = input
+            .conversation_snapshot
+            .as_ref()
+            .map(|s| frozen_lifetime::PreparedFrozenRoot::history(&s.history_json))
+            .transpose()?;
+        self.run_serialized_write(|| self.commit_task_creation_once(input.clone(), root.clone()))
             .await
     }
 
@@ -14358,18 +15542,27 @@ impl CrudStore {
 
     pub async fn append_due_trigger_task_events(
         &self,
-        trigger_id: &str,
-        expected_next_fire_at: i64,
+        trigger: &TaskTrigger,
         now: i64,
         events: Vec<TaskEventPayload>,
         occurrence_contracts: Vec<pioneer_protocol::TaskOccurrenceContract>,
         reserve_executions: Vec<(String, TaskExecutorKind)>,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        if trigger.status != TaskTriggerStatus::Active {
+            return Ok(Vec::new());
+        }
+        let Some(expected_next_fire_at) = trigger.next_fire_at else {
+            return Ok(Vec::new());
+        };
+        // Schedule calculation and observation happen outside the writer.
+        // Revalidate their complete input, including same-time reschedules,
+        // in the existing atomic trigger + occurrence + Run transaction.
+        let expected_snapshot = (trigger.clone(), serde_json::to_string(&trigger.spec)?);
         self.run_serialized_write(|| {
             self.append_due_trigger_task_events_once(
-                trigger_id.to_owned(),
+                trigger.id.clone(),
                 expected_next_fire_at,
-                None,
+                Some(expected_snapshot.clone()),
                 now,
                 events.clone(),
                 occurrence_contracts.clone(),
@@ -14393,10 +15586,7 @@ impl CrudStore {
         let Some(expected_next_fire_at) = trigger.next_fire_at else {
             return Ok(Vec::new());
         };
-        let expected_snapshot = (
-            trigger.task_id.clone(),
-            serde_json::to_string(&trigger.spec)?,
-        );
+        let expected_snapshot = (trigger.clone(), serde_json::to_string(&trigger.spec)?);
         let events = vec![TaskEventPayload::TaskBlocked {
             task_id: trigger.task_id.clone(),
             error: Some(error),
@@ -14681,8 +15871,20 @@ impl CrudStore {
         &self,
         snapshot: NewTaskRunConversationSnapshot,
     ) -> Result<TaskRunConversationSnapshotRecord> {
-        self.run_serialized_write(|| {
-            task_run_conversation_snapshot::insert_if_absent(&self.connection, snapshot.clone())
+        let root = frozen_lifetime::PreparedFrozenRoot::history(&snapshot.history_json)?;
+        self.run_serialized_write(|| async {
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                task_run_conversation_snapshot::insert_if_absent(
+                    &transaction,
+                    snapshot.clone(),
+                    &root,
+                )
+                .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -15567,11 +16769,83 @@ impl CrudStore {
         .await
     }
 
+    /// Outbox replay may release only the exact terminal Turn generation it
+    /// observed. An explicit resume/recovery must not lose its new resources
+    /// to a delayed delivery ACK or failure-cleanup callback.
+    pub async fn finalize_terminal_agent_turn_owned(
+        &self,
+        expected: &TurnExecutionRecord,
+        execution_id: &str,
+        now: DateTimeWithTimeZone,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            let Some(current) = turn_execution::find(&tx, &expected.turn_id).await? else {
+                return Ok(false);
+            };
+            if current.owner_id != expected.owner_id
+                || current.owner_generation != expected.owner_generation
+                || current.thread_id != expected.thread_id
+                || current.workspace_id != expected.workspace_id
+                || !turn_event_projection_stream_state::has_accepted_terminal(
+                    &tx,
+                    &expected.turn_id,
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+            let (turn_status, graph_status) = match current.status {
+                TurnExecutionStatus::Completed => (TurnStatus::Completed, "completed"),
+                TurnExecutionStatus::Failed => (TurnStatus::Failed, "failed"),
+                TurnExecutionStatus::Interrupted => (TurnStatus::Interrupted, "cancelled"),
+                TurnExecutionStatus::Blocked => (TurnStatus::Blocked, "blocked"),
+                _ => return Ok(false),
+            };
+            let saved = turn::find_turn_by_thread_and_id(&tx, &current.thread_id, &current.turn_id)
+                .await?
+                .context("terminal Agent Turn disappeared")?;
+            let response =
+                repositories::agent_domain::load_agent_turn_response(&tx, &current.turn_id)
+                    .await?
+                    .context("terminal Agent Turn response disappeared")?;
+            if turn_status_from_db(&saved.status) != Some(turn_status)
+                || response.execution_id != execution_id
+            {
+                return Ok(false);
+            }
+            repositories::agent_domain::finalize_agent_execution(
+                &tx,
+                execution_id,
+                graph_status,
+                now,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        })
+        .await
+    }
+
     pub async fn cancel_agent_work_graph(
         &self,
         root_execution_id: &str,
         terminal_reason: &str,
         finished_at: sea_orm::prelude::DateTimeWithTimeZone,
+    ) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
+        self.cancel_agent_work_graph_as(root_execution_id, terminal_reason, finished_at, None)
+            .await
+    }
+
+    /// Fence the graph and retain authenticated Stop attribution together.
+    /// `initiator` is (principal, originating thread, originating turn).
+    /// System/agent cancellation leaves it absent; replay never rebinds runs.
+    pub async fn cancel_agent_work_graph_as(
+        &self,
+        root_execution_id: &str,
+        terminal_reason: &str,
+        finished_at: sea_orm::prelude::DateTimeWithTimeZone,
+        initiator: Option<(&str, &str, &str)>,
     ) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
         self.run_serialized_write(|| {
             let finished_at = finished_at.clone();
@@ -15581,6 +16855,16 @@ impl CrudStore {
                     .begin()
                     .await
                     .context("failed to begin Agent work-graph cancellation transaction")?;
+                if let Some((actor, thread, turn)) = initiator {
+                    repositories::task_cancellation_actor::record_graph(
+                        &transaction,
+                        actor,
+                        thread,
+                        turn,
+                        root_execution_id,
+                    )
+                    .await?;
+                }
                 match crate::repositories::agent_domain::cancel_agent_work_graph(
                     &transaction,
                     root_execution_id,
@@ -16646,8 +17930,44 @@ impl CrudStore {
         run_id: &str,
         claimed_at: i64,
     ) -> Result<Option<TaskRun>> {
+        Ok(self
+            .claim_task_run_for_dispatch_with_event(run_id, claimed_at)
+            .await?
+            .map(|(run, _)| run))
+    }
+
+    /// Claim and durable activity notification commit together. The caller may
+    /// wake the existing event fanout only after this operation has committed.
+    pub async fn claim_task_run_for_dispatch_with_event(
+        &self,
+        run_id: &str,
+        claimed_at: i64,
+    ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
         self.run_serialized_write(|| {
-            self.claim_task_run_for_dispatch_once(run_id.to_owned(), claimed_at)
+            self.claim_task_run_for_dispatch_once(run_id.to_owned(), claimed_at, None)
+        })
+        .await
+    }
+
+    /// Retry occurrence rebinding and admission share one writer boundary.
+    /// A finish can observe either the failed source or an admitted successor,
+    /// never a queued retry that has already stolen the source's occurrence.
+    pub async fn claim_task_retry_for_dispatch_with_event(
+        &self,
+        run_id: &str,
+        claimed_at: i64,
+        occurrence: pioneer_protocol::TaskOccurrenceContract,
+    ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
+        anyhow::ensure!(
+            occurrence.run_id == run_id,
+            "retry occurrence belongs to another run"
+        );
+        self.run_serialized_write(|| {
+            self.claim_task_run_for_dispatch_once(
+                run_id.to_owned(),
+                claimed_at,
+                Some(occurrence.clone()),
+            )
         })
         .await
     }
@@ -16656,32 +17976,108 @@ impl CrudStore {
         &self,
         run_id: String,
         claimed_at: i64,
-    ) -> Result<Option<TaskRun>> {
+        retry_occurrence: Option<pioneer_protocol::TaskOccurrenceContract>,
+    ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
+        // Prepare serialization before reserving the writer. Task identity is
+        // revalidated inside the atomic claim + durable fanout write set.
+        let Some(candidate) = task_run::find_run_by_id(&self.connection, &run_id).await? else {
+            return Ok(None);
+        };
+        // The optional body can be large. Decode on the reader path, then
+        // compare its immutable serialized representation during the claim.
+        let trigger_input = optional_typed_json_from_db(candidate.trigger_input_json.clone())?;
+        let prepared = self
+            .prepare_task_events_for_write(vec![TaskEventPayload::RunStarting {
+                task_id: candidate.task_id.clone(),
+                run_id: run_id.clone(),
+                claimed_at,
+            }])
+            .await?;
         let transaction = self
             .connection
             .begin()
             .await
             .context("failed to begin Task dispatch claim transaction")?;
         let result = async {
-            let Some(_) = task_run::find_run_by_id(&transaction, run_id.as_str()).await? else {
+            let Some(current) = task_run::find_run_by_id(&transaction, run_id.as_str()).await?
+            else {
                 return Ok(None);
             };
-            task_run::claim_run_for_dispatch(
+            anyhow::ensure!(
+                current.task_id == candidate.task_id,
+                "dispatch claim task identity changed"
+            );
+            if task_repository::finish_requested(&transaction, &current.task_id).await? {
+                return Ok(None);
+            }
+            let Some(task) =
+                task_repository::find_task_by_id(&transaction, &current.task_id).await?
+            else {
+                return Ok(None);
+            };
+            if task_status_from_db(&task.status).is_none_or(|status| status.is_terminal()) {
+                return Ok(None);
+            }
+            let max_parallel_runs = optional_typed_json_from_db::<
+                pioneer_protocol::TaskConcurrencyPolicy,
+            >(task.concurrency_policy_json)?
+            .map(|policy| policy.max_parallel_runs)
+            .unwrap_or(1);
+            if !task_run::has_dispatch_capacity(
+                &transaction,
+                &current,
+                max_parallel_runs,
+                unix_to_datetime(claimed_at),
+            )
+            .await?
+            {
+                return Ok(None);
+            }
+            let claimed = task_run::claim_run_for_dispatch(
                 &transaction,
                 run_id.as_str(),
                 unix_to_datetime(claimed_at),
             )
             .await?
-            .map(task_run_from_db_model)
-            .transpose()
+            .map(|mut model| {
+                anyhow::ensure!(
+                    model.trigger_input_json == candidate.trigger_input_json,
+                    "queued run input changed during claim"
+                );
+                model.trigger_input_json = None;
+                task_run_from_db_model(model)
+            })
+            .transpose()?;
+            let Some(run) = claimed else { return Ok(None) };
+            if let Some(occurrence) = retry_occurrence {
+                anyhow::ensure!(
+                    occurrence.task_id == current.task_id && current.retry_of_run_id.is_some(),
+                    "invalid retry admission"
+                );
+                task_actor_contract::upsert_task_occurrence_contract(
+                    &transaction,
+                    &occurrence,
+                    claimed_at,
+                )
+                .await?;
+            }
+            let event = self
+                .append_task_events_in_connection(&transaction, prepared, claimed_at)
+                .await?
+                .pop()
+                .context("dispatch claim event missing")?;
+            Ok(Some((run, event)))
         }
         .await;
         match result {
-            Ok(run) => {
+            Ok(mut run) => {
                 transaction
                     .commit()
                     .await
                     .context("failed to commit Task dispatch claim transaction")?;
+                if let Some((run, _)) = run.as_mut() {
+                    run.trigger_input = trigger_input;
+                }
                 Ok(run)
             }
             Err(error) => {
@@ -16752,6 +18148,13 @@ impl CrudStore {
                 .rollback()
                 .await
                 .context("failed to rollback non-startable task run started transaction")?;
+            return Ok(None);
+        }
+
+        if status == TaskRunStatus::Queued
+            && task_repository::finish_requested(&transaction, &run_model.task_id).await?
+        {
+            transaction.rollback().await?;
             return Ok(None);
         }
 
@@ -17072,6 +18475,27 @@ impl CrudStore {
         Ok(row.map(task_thread_lineage_from_db_model))
     }
 
+    /// Bounded direct edges for child listing and resumable subtree traversal.
+    /// Callers must authorize each child and guard cycles along the DFS path.
+    pub async fn list_thread_child_lineage_page(
+        &self,
+        parent_thread_id: &str,
+        after_child_thread_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<TaskThreadLineage>> {
+        let rows = thread_lineage::list_children_page(
+            &self.connection,
+            parent_thread_id,
+            after_child_thread_id,
+            limit,
+        )
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(task_thread_lineage_from_db_model)
+            .collect())
+    }
+
     pub async fn list_task_thread_lineage_for_parent(
         &self,
         parent_thread_id: &str,
@@ -17097,21 +18521,20 @@ impl CrudStore {
             .collect())
     }
 
-    pub async fn list_task_thread_lineage_by_root_thread_bounded(
+    pub async fn list_task_thread_lineage_by_root_thread_page(
         &self,
         root_thread_id: &str,
-        limit: u64,
+        after: Option<&str>,
     ) -> Result<Vec<TaskThreadLineage>> {
-        let rows = thread_lineage::list_lineage_by_root_thread_bounded(
+        Ok(thread_lineage::list_lineage_by_root_thread_page(
             &self.connection,
             root_thread_id,
-            limit,
+            after,
         )
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(task_thread_lineage_from_db_model)
-            .collect())
+        .await?
+        .into_iter()
+        .map(task_thread_lineage_from_db_model)
+        .collect())
     }
 
     pub async fn mark_thread_read(
@@ -17130,7 +18553,7 @@ impl CrudStore {
         principal_id: &PrincipalId,
         thread_ids: &[String],
     ) -> Result<HashMap<String, u64>> {
-        count_unread_user_message_blocks_for_threads(
+        count_unread_message_blocks_for_threads(
             &self.connection,
             thread_ids,
             principal_id.to_string().as_str(),
@@ -17165,13 +18588,26 @@ impl CrudStore {
                 .await?
                 .filter(|thread| thread.workspace_id == request.workspace_id)
                 .ok_or_else(|| anyhow::Error::new(ThreadReadFailure::InvalidTarget))?;
-            let block = find_user_message_block_by_turn_id(
-                &transaction,
-                request.thread_id.as_str(),
-                request.through_turn_id.as_str(),
-            )
-            .await?
-            .filter(|block| block.workspace_id == request.workspace_id)
+            let block = if let Some(position) = &request.through_block {
+                repositories::thread_timeline_projection::find_thread_timeline_block_by_id(
+                    &transaction,
+                    request.thread_id.as_str(),
+                    &position.block_id,
+                )
+                .await?
+                .filter(|block| block.sort_key == position.sort_key)
+            } else {
+                find_user_message_block_by_turn_id(
+                    &transaction,
+                    request.thread_id.as_str(),
+                    request.through_turn_id.as_str(),
+                )
+                .await?
+            }
+            .filter(|block| {
+                block.workspace_id == request.workspace_id
+                    && block.turn_id.as_deref() == Some(request.through_turn_id.as_str())
+            })
             .ok_or_else(|| anyhow::Error::new(ThreadReadFailure::InvalidTarget))?;
             let turn_model = turn::find_turn_by_thread_and_id(
                 &transaction,
@@ -17179,15 +18615,30 @@ impl CrudStore {
                 request.through_turn_id.as_str(),
             )
             .await?
-            .filter(|turn| {
-                turn.turn_kind == "conversation"
-                    && turn.origin == "user"
-                    && turn.initiated_by_actor_kind.as_deref() == Some("principal")
-                    && turn.initiated_by_actor_id.is_some()
-            })
             .ok_or_else(|| anyhow::Error::new(ThreadReadFailure::InvalidTarget))?;
-
-            if block.turn_id.as_deref() != Some(turn_model.id.as_str()) {
+            let valid = match block.block_kind.as_str() {
+                BLOCK_KIND_USER_MESSAGE => {
+                    // An exact canonical message is a viewed position even
+                    // when authored by an agent. Unread eligibility is separate.
+                    request.through_block.is_some()
+                        || (turn_model.turn_kind == "conversation"
+                            && turn_model.origin == "user"
+                            && turn_model.initiated_by_actor_kind.as_deref() == Some("principal")
+                            && turn_model.initiated_by_actor_id.is_some())
+                }
+                BLOCK_KIND_ASSISTANT_MESSAGE
+                    if block.source_kind.as_deref() == Some("turn_item") =>
+                {
+                    if let Some(item_id) = block.source_key.as_deref() {
+                        turn::is_completed_agent_message(&transaction, &turn_model.id, item_id)
+                            .await?
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if !valid {
                 return Err(anyhow::Error::new(ThreadReadFailure::InvalidTarget));
             }
 
@@ -17222,7 +18673,7 @@ impl CrudStore {
                 // cursor mutation above is the only atomic write; perform the
                 // derived response count through the reader after releasing
                 // the physical writer.
-                let unread_count = count_unread_user_message_blocks(
+                let unread_count = count_unread_message_blocks(
                     &self.connection,
                     request.thread_id.as_str(),
                     principal_id.as_str(),
@@ -18098,6 +19549,7 @@ impl CrudStore {
             );
         }
         Ok(Some(ThreadEpisodicCanonicalItem {
+            committed: thread_episodic_source::source_status_is_committed(model.status.as_deref()),
             item,
             source_payload: model.payload,
         }))
@@ -18149,6 +19601,20 @@ impl CrudStore {
         turn_ids: &[String],
         item_type: &str,
     ) -> Result<HashMap<String, Vec<TurnItem>>> {
+        Ok(self
+            .list_turn_items_with_status_by_type_for_turns(turn_ids, item_type)
+            .await?
+            .into_iter()
+            .map(|(turn, items)| (turn, items.into_iter().map(|(item, _)| item).collect()))
+            .collect())
+    }
+
+    /// Returns payload and lifecycle status from the same bounded source read.
+    pub async fn list_turn_items_with_status_by_type_for_turns(
+        &self,
+        turn_ids: &[String],
+        item_type: &str,
+    ) -> Result<HashMap<String, Vec<(TurnItem, Option<String>)>>> {
         let rows =
             turn::list_turn_items_by_type_for_turns(&self.connection, turn_ids, item_type).await?;
         let mut items_by_turn = turn_ids
@@ -18165,7 +19631,10 @@ impl CrudStore {
                         model.item_id
                     )
                 })?;
-            items_by_turn.entry(turn_id).or_default().push(item);
+            items_by_turn
+                .entry(turn_id)
+                .or_default()
+                .push((item, model.status));
         }
         Ok(items_by_turn)
     }
@@ -18182,6 +19651,67 @@ impl CrudStore {
                 })
             })
             .collect()
+    }
+
+    /// The answer accepted by the completed Turn's finalization commit. Legacy
+    /// workers have no intent: only an unambiguous FinalAnswer is usable there.
+    /// Read through this store's scheduling scope; decode after fetching rows.
+    pub async fn completed_turn_final_answer(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<TurnItem>> {
+        let Some(completed_turn) =
+            turn::find_turn_by_thread_and_id(&self.connection, thread_id, turn_id).await?
+        else {
+            return Ok(None);
+        };
+        let Some(owner) = thread::find_thread_by_id(&self.connection, thread_id).await? else {
+            return Ok(None);
+        };
+        if completed_turn.status != "completed" || owner.workspace_id != workspace_id {
+            return Ok(None);
+        }
+        if let Some(intent) = turn_finalization::find_by_turn_id(&self.connection, turn_id).await? {
+            if intent.status != turn_finalization::STATUS_COMMITTED
+                || intent.committed_at.is_none()
+                || intent.turn_id != turn_id
+                || intent.thread_id != thread_id
+                || intent.workspace_id != workspace_id
+            {
+                return Ok(None);
+            }
+            let notification = turn_finalization::notification_from_model(&intent)?;
+            return Ok(matches!(
+                &notification.item,
+                TurnItem::AgentMessage { id, phase: pioneer_protocol::AgentMessagePhase::FinalAnswer, .. }
+                    if id == &intent.item_id
+            )
+            .then_some(notification.item));
+        }
+        // Expand/migrate/contract compatibility with older workers. Neither
+        // created_at ties nor item-id sorting establish which of several finals
+        // was accepted, so ambiguity retains the existing missing-result path.
+        let mut finals = self
+            .list_completed_agent_messages(turn_id)
+            .await?
+            .into_iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    TurnItem::AgentMessage {
+                        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                        ..
+                    }
+                )
+            });
+        let answer = finals.next();
+        Ok(if finals.next().is_none() {
+            answer
+        } else {
+            None
+        })
     }
 
     pub async fn get_turn_item_events(
@@ -18900,7 +20430,7 @@ impl CrudStore {
 
     pub async fn get_first_thread_user_text(&self, thread_id: &str) -> Result<Option<String>> {
         let Some(turn_model) =
-            turn::find_oldest_turn_for_thread(&self.connection, thread_id).await?
+            turn::find_oldest_user_conversation_turn(&self.connection, thread_id).await?
         else {
             return Ok(None);
         };
@@ -19329,21 +20859,163 @@ impl CrudStore {
         patch: &SkillInstallationPatch,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
-        let fence = prepare_generic_skill_update_fence(&self.connection, skill_id, patch).await?;
+        self.update_skill_installation_guarded(skill_id, patch, event_timestamp_secs, None, true)
+            .await
+    }
+
+    /// Reconciliation validates the row used for FS preparation, not a later reread.
+    pub async fn reconcile_skill_installation(
+        &self,
+        expected: &SkillReconciliationSnapshot,
+        patch: &SkillInstallationPatch,
+        now: i64,
+        workspace: Option<&pioneer_entity::workspace::Model>,
+        still_current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<bool> {
+        self.reconcile_skill_installation_with_progress(
+            expected,
+            patch,
+            now,
+            workspace,
+            still_current,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+    }
+
+    pub async fn reconcile_skill_installation_with_progress(
+        &self,
+        expected: &SkillReconciliationSnapshot,
+        patch: &SkillInstallationPatch,
+        now: i64,
+        workspace: Option<&pioneer_entity::workspace::Model>,
+        still_current: &(dyn Fn() -> bool + Send + Sync),
+        mutation_started: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool> {
+        // The public view cannot substitute scope/metadata for the exact facts
+        // captured by this snapshot. Validate it before acquiring DB capacity.
+        if skill_installation_record_from_model(expected.model.clone())
+            .map_err(|e| reconciliation_error(e, SkillReconciliationFailure::NotCommitted))?
+            != expected.record
+        {
+            return Err(reconciliation_error(
+                anyhow::anyhow!("prepared skill snapshot view changed"),
+                SkillReconciliationFailure::NotCommitted,
+            ));
+        }
+        self.update_skill_installation_guarded(
+            &expected.record.skill_id,
+            patch,
+            now,
+            Some((expected, workspace, still_current, mutation_started)),
+            true,
+        )
+        .await
+    }
+
+    /// Resolve an uncertain publication against current full facts without a
+    /// second metadata UPDATE/WAL write. Uses the same short writer guards.
+    pub async fn confirm_skill_reconciliation(
+        &self,
+        expected: &SkillReconciliationSnapshot,
+        workspace: Option<&pioneer_entity::workspace::Model>,
+        still_current: &(dyn Fn() -> bool + Send + Sync),
+        transaction_started: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool> {
+        if skill_installation_record_from_model(expected.model.clone())
+            .map_err(|e| reconciliation_error(e, SkillReconciliationFailure::NotCommitted))?
+            != expected.record
+        {
+            return Err(reconciliation_error(
+                anyhow::anyhow!("prepared skill snapshot view changed"),
+                SkillReconciliationFailure::NotCommitted,
+            ));
+        }
+        self.update_skill_installation_guarded(
+            &expected.record.skill_id,
+            &SkillInstallationPatch::default(),
+            expected.record.updated_at_unix,
+            Some((expected, workspace, still_current, transaction_started)),
+            false,
+        )
+        .await
+    }
+
+    async fn update_skill_installation_guarded(
+        &self,
+        skill_id: &SkillId,
+        patch: &SkillInstallationPatch,
+        event_timestamp_secs: i64,
+        expected: Option<(
+            &SkillReconciliationSnapshot,
+            Option<&pioneer_entity::workspace::Model>,
+            &(dyn Fn() -> bool + Send + Sync),
+            &std::sync::atomic::AtomicBool,
+        )>,
+        write: bool,
+    ) -> Result<bool> {
+        let failure = |error: anyhow::Error, outcome| {
+            if expected.is_some() {
+                reconciliation_error(error, outcome)
+            } else {
+                error
+            }
+        };
+        let fence = prepare_generic_skill_update_fence(&self.connection, skill_id, patch)
+            .await
+            .map_err(|e| failure(e, SkillReconciliationFailure::NotCommitted))?;
         let now = unix_to_datetime(event_timestamp_secs);
-        self.run_serialized_write(|| {
+        let operation = || {
             let fence = fence.clone();
             async move {
                 let transaction = self
                     .connection
                     .begin()
                     .await
-                    .context("failed to begin skill installation update transaction")?;
+                    .context("failed to begin skill installation update transaction")
+                    .map_err(|e| failure(e, SkillReconciliationFailure::NotCommitted))?;
                 let result: Result<bool> = async {
                     if !revalidate_generic_skill_update_fence(&transaction, skill_id, &fence)
                         .await?
                     {
                         return Ok(false);
+                    }
+                    if let Some((expected, workspace, still_current, _)) = expected {
+                        if !still_current() {
+                            return Ok(false);
+                        }
+                        let current =
+                            skill_installation::find_skill_installation(&transaction, skill_id)
+                                .await?;
+                        if current.as_ref() != Some(&expected.model) {
+                            return Ok(false);
+                        }
+                        if !revalidate_skill_source_workspace(
+                            &transaction,
+                            &expected.record,
+                            workspace,
+                        )
+                        .await?
+                        {
+                            return Ok(false);
+                        }
+                        if patch
+                            .source_kind
+                            .as_ref()
+                            .is_some_and(|kind| kind != &expected.record.source_kind)
+                            || patch
+                                .scope_key
+                                .as_ref()
+                                .is_some_and(|scope| scope != &expected.record.scope_key)
+                        {
+                            bail!("reconciliation cannot change skill source scope");
+                        }
+                    }
+                    if !write {
+                        return Ok(true);
+                    }
+                    if let Some((_, _, _, started)) = expected {
+                        started.store(true, std::sync::atomic::Ordering::Release);
                     }
                     skill_installation::update_skill_installation(
                         &transaction,
@@ -19355,21 +21027,42 @@ impl CrudStore {
                 }
                 .await;
                 match result {
-                    Ok(updated) => {
+                    Ok(updated)
+                        if expected.is_none_or(|(_, _, current, _)| current()) && updated =>
+                    {
+                        if let Some((_, _, _, started)) = expected {
+                            started.store(true, std::sync::atomic::Ordering::Release);
+                        }
                         transaction
                             .commit()
                             .await
-                            .context("failed to commit skill installation update")?;
-                        Ok(updated)
+                            .context("failed to acknowledge skill installation commit")
+                            .map_err(|e| failure(e, SkillReconciliationFailure::Unknown))?;
+                        Ok(true)
                     }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
+                    Ok(_) => {
+                        transaction
+                            .rollback()
+                            .await
+                            .context("failed to acknowledge stale skill rollback")
+                            .map_err(|e| failure(e, SkillReconciliationFailure::Unknown))?;
+                        Ok(false)
                     }
+                    Err(error) => match transaction.rollback().await {
+                        Ok(()) => Err(failure(error, SkillReconciliationFailure::NotCommitted)),
+                        Err(rollback) => Err(failure(
+                            error.context(format!("rollback acknowledgement failed: {rollback}")),
+                            SkillReconciliationFailure::Unknown,
+                        )),
+                    },
                 }
             }
-        })
-        .await
+        };
+        if expected.is_some() {
+            operation().await
+        } else {
+            self.run_serialized_write(operation).await
+        }
     }
 
     pub async fn update_skill_lifecycle(
@@ -19627,6 +21320,110 @@ impl CrudStore {
             .await?
             .map(skill_installation_record_from_model)
             .transpose()
+    }
+
+    pub async fn list_active_workspace_page(
+        &self,
+        after: Option<&str>,
+    ) -> Result<Vec<pioneer_entity::workspace::Model>> {
+        repositories::membership::list_active_workspace_page(&self.connection, after).await
+    }
+
+    /// Pending import registration is fenced by the same Workspace snapshot as
+    /// its later projection. System imports have no Workspace owner.
+    pub async fn register_skill_import_pending(
+        &self,
+        record: &SkillInstallationRecord,
+        workspace: Option<&pioneer_entity::workspace::Model>,
+        now: i64,
+    ) -> Result<Option<SkillReconciliationSnapshot>> {
+        if record.pack_id.is_some() || record.pack_member_key.is_some() {
+            bail!("pack members must be inserted through a pack transaction");
+        }
+        let created_at = unix_to_datetime(now);
+        let prepared =
+            skill_installation::prepare_skill_installation(record, created_at, created_at);
+        async {
+            let transaction = self.connection.begin().await?;
+            if !revalidate_skill_source_workspace(&transaction, record, workspace).await? {
+                transaction.rollback().await?;
+                return Ok(None);
+            }
+            if skill_installation::has_skill_import_provenance(&transaction, record).await? {
+                transaction.rollback().await?;
+                return Ok(None);
+            }
+            skill_installation::insert_prepared_skill_installations(
+                &transaction,
+                std::slice::from_ref(&prepared),
+            )
+            .await?;
+            let snapshot =
+                skill_installation::find_skill_installation(&transaction, &record.skill_id)
+                    .await?
+                    .map(SkillReconciliationSnapshot::from_model)
+                    .transpose()?;
+            transaction.commit().await?;
+            Ok(snapshot)
+        }
+        .await
+    }
+
+    pub async fn find_skill_import_provenance(
+        &self,
+        kind: &str,
+        scope: &str,
+        reference: &str,
+    ) -> Result<Option<SkillReconciliationSnapshot>> {
+        let mut rows =
+            skill_installation::find_import_provenance(&self.connection, kind, scope, reference)
+                .await?;
+        if rows.len() > 1 {
+            bail!("ambiguous exact skill import provenance");
+        }
+        rows.pop()
+            .map(SkillReconciliationSnapshot::from_model)
+            .transpose()
+    }
+
+    pub async fn list_skill_reconciliation_page(
+        &self,
+        source_kind: &str,
+        scope_key: &str,
+        after: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<SkillReconciliationSnapshot>> {
+        skill_installation::list_skill_installations_scope_page(
+            &self.connection,
+            source_kind,
+            scope_key,
+            after,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(SkillReconciliationSnapshot::from_model)
+        .collect()
+    }
+
+    pub async fn list_skill_installations_scope_page(
+        &self,
+        source_kind: &str,
+        scope_key: &str,
+        after: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<SkillInstallationRecord>> {
+        skill_installation::list_skill_installations_scope_page(
+            &self.connection,
+            source_kind,
+            scope_key,
+            after,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(skill_installation_record_from_model)
+        .collect()
     }
 
     pub async fn list_skill_installations(&self) -> Result<Vec<SkillInstallationRecord>> {
@@ -21801,6 +23598,22 @@ impl CrudStore {
         list_turn_work_items_page(&self.connection, turn_id, visibility, anchor, limit).await
     }
 
+    /// One addressed packet: canonical total and <=100 exact memberships share
+    /// one reader snapshot. Scheduling is inherited from this scoped store.
+    /// The snapshot is released before the caller transforms/serializes/fans out.
+    pub async fn task_completion_inbox_patch(
+        &self,
+        access: &TaskCompletionInboxAccess<'_>,
+        run_ids: &[String],
+    ) -> Result<(Vec<TaskCompletionInboxRow>, u64)> {
+        anyhow::ensure!(run_ids.len() <= 100, "inbox addressed batch exceeds limit");
+        let snapshot = self.connection.begin_read().await?;
+        let total = count_unread_task_completion_inbox(&snapshot, access).await?;
+        let entries = find_unread_task_completion_inbox_entries(&snapshot, access, run_ids).await?;
+        snapshot.commit().await?;
+        Ok((entries, total))
+    }
+
     pub async fn get_thread_sandbox_mode(&self, thread_id: &str) -> Result<Option<SandboxMode>> {
         policy::find_thread_sandbox_mode(&self.connection, thread_id).await
     }
@@ -22284,14 +24097,37 @@ impl CrudStore {
         )
         .await?;
         let mut threads = Vec::with_capacity(models.len());
+        let mut creator_executions = HashMap::new();
         for model in models {
-            let Some(mut thread) = thread_from_db_model(model)? else {
+            if model.created_by_actor_kind.as_deref() == Some("agent_execution") {
+                creator_executions.insert(
+                    model.id.clone(),
+                    model
+                        .created_by_actor_id
+                        .clone()
+                        .context("agent-created thread has no creator execution")?,
+                );
+            }
+            let Some(thread) = thread_from_db_model(model)? else {
                 continue;
             };
-            self.attach_latest_thread_turn_snapshot(&mut thread).await?;
             threads.push(thread);
         }
+        self.attach_latest_thread_turn_snapshots(&mut threads, &creator_executions)
+            .await?;
         Ok(threads)
+    }
+
+    /// Unfiltered storage candidates for authorized thread observation.
+    /// Does not hydrate turns or change read cursors/subscriptions.
+    pub async fn list_thread_read_candidates_page(
+        &self,
+        workspace_id: &str,
+        after_thread_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        thread::list_read_candidates_page(&self.connection, workspace_id, after_thread_id, limit)
+            .await
     }
 
     pub async fn list_threads_for_workspace(
@@ -22302,24 +24138,108 @@ impl CrudStore {
         let models =
             thread::list_threads_by_workspace(&self.connection, workspace_id, limit).await?;
         let mut threads = Vec::with_capacity(models.len());
+        let mut creator_executions = HashMap::new();
 
         for model in models {
-            let Some(mut thread) = thread_from_db_model(model)? else {
+            if model.created_by_actor_kind.as_deref() == Some("agent_execution") {
+                creator_executions.insert(
+                    model.id.clone(),
+                    model
+                        .created_by_actor_id
+                        .clone()
+                        .context("agent-created thread has no creator execution")?,
+                );
+            }
+            let Some(thread) = thread_from_db_model(model)? else {
                 continue;
             };
-
-            self.attach_latest_thread_turn_snapshot(&mut thread).await?;
-
             threads.push(thread);
         }
 
+        self.attach_latest_thread_turn_snapshots(&mut threads, &creator_executions)
+            .await?;
         Ok(threads)
+    }
+
+    async fn attach_latest_thread_turn_snapshots(
+        &self,
+        threads: &mut [Thread],
+        creator_executions: &HashMap<String, String>,
+    ) -> Result<()> {
+        for batch in threads.chunks_mut(turn::THREAD_TURN_SNAPSHOT_BATCH_SIZE) {
+            let thread_ids = batch
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>();
+            let latest =
+                turn::find_latest_turns_for_threads(&self.connection, &thread_ids, false).await?;
+            // Only non-Conversation history markers need a Composer fallback.
+            // Keep NULL from the newest Conversation; never seek a non-NULL value.
+            let conversation_ids = latest
+                .iter()
+                .filter(|model| model.turn_kind != turn_kind_to_db(TurnKind::Conversation))
+                .map(|model| model.thread_id.as_str())
+                .collect::<Vec<_>>();
+            let mut conversations =
+                turn::find_latest_turns_for_threads(&self.connection, &conversation_ids, true)
+                    .await?
+                    .into_iter()
+                    .map(|model| (model.thread_id, model.reasoning_effort))
+                    .collect::<HashMap<_, _>>();
+            let mut latest = latest
+                .into_iter()
+                .map(|model| (model.thread_id.clone(), model))
+                .collect::<HashMap<_, _>>();
+            let empty_creator_ids = batch
+                .iter()
+                .filter(|thread| !latest.contains_key(&thread.id))
+                .filter_map(|thread| creator_executions.get(&thread.id).map(String::as_str))
+                .collect::<Vec<_>>();
+            let creator_reasoning = repositories::agent_domain::agent_thread_creator_reasoning(
+                &self.connection,
+                &empty_creator_ids,
+            )
+            .await?;
+
+            // All DB capacity has been released. Attach in original list order
+            // using the same snapshot conversion as the single-thread caller.
+            for thread in batch {
+                let Some(model) = latest.remove(thread.id.as_str()) else {
+                    if let Some((workspace, reasoning)) = creator_executions
+                        .get(&thread.id)
+                        .and_then(|id| creator_reasoning.get(id))
+                    {
+                        if workspace != &thread.workspace_id {
+                            bail!("thread creator execution workspace differs");
+                        }
+                        thread.reasoning_effort = reasoning.clone();
+                    }
+                    continue;
+                };
+                let reasoning_effort = if model.turn_kind == turn_kind_to_db(TurnKind::Conversation)
+                {
+                    model.reasoning_effort.clone()
+                } else {
+                    conversations.remove(thread.id.as_str()).flatten()
+                };
+                if let Some(turn) = thread_snapshot_turn_from_db_model(model)? {
+                    thread.reasoning_effort = reasoning_effort;
+                    thread.turns.push(turn);
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn attach_latest_thread_turn_snapshot(&self, thread: &mut Thread) -> Result<()> {
         let Some(turn_model) =
             turn::find_latest_turn_for_thread(&self.connection, thread.id.as_str()).await?
         else {
+            thread.reasoning_effort = repositories::agent_domain::empty_agent_thread_reasoning(
+                &self.connection,
+                &thread.id,
+            )
+            .await?;
             return Ok(());
         };
 
@@ -22774,6 +24694,28 @@ impl CrudStore {
         self.run_serialized_write(|| async {
             let now = unix_to_datetime(chrono::Utc::now().timestamp());
             thread::update_thread_name_if_changed(&self.connection, thread_id, name, now).await
+        })
+        .await
+    }
+
+    pub async fn update_automatic_thread_name(
+        &self,
+        thread_id: &str,
+        name: &str,
+        fallback: Option<&str>,
+        binding: Option<&CliRuntimeThreadBindingRecord>,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let now = unix_to_datetime(chrono::Utc::now().timestamp());
+            thread::update_automatic_thread_name(
+                &self.connection,
+                thread_id,
+                name,
+                fallback,
+                binding,
+                now,
+            )
+            .await
         })
         .await
     }
@@ -23887,7 +25829,15 @@ impl CrudStore {
             )?;
             summary.detected = summary.detected.saturating_add(repairs.len());
 
-            let repairs_for_write = repairs.clone();
+            let repair_count = repairs.len();
+            let mut prepared_repairs = Vec::with_capacity(repair_count);
+            for (row, payload_json) in repairs {
+                let episodic = self
+                    .prepare_terminal_payload_episodic_save(&row, &payload_json)
+                    .await?;
+                prepared_repairs.push((row, payload_json, episodic));
+            }
+            let repairs_for_write = prepared_repairs;
             let cursor_for_write = next_cursor.clone();
             let repaired = timings
                 .observe(
@@ -23918,9 +25868,12 @@ impl CrudStore {
                 )
                 .await?;
             summary.repaired = summary.repaired.saturating_add(repaired);
+            if repaired > 0 {
+                self.episodic_work.notify_one();
+            }
             summary.remaining = summary
                 .remaining
-                .saturating_add(repairs.len().saturating_sub(repaired));
+                .saturating_add(repair_count.saturating_sub(repaired));
             cursor = Some(next_cursor);
         }
 
@@ -24077,6 +26030,14 @@ impl CrudStore {
             )?;
             summary.detected = summary.detected.saturating_add(repairs.len());
 
+            let mut prepared_repairs = HashMap::with_capacity(repairs.len());
+            for (id, (row, payload_json)) in repairs {
+                let episodic = self
+                    .prepare_terminal_payload_episodic_save(&row, &payload_json)
+                    .await?;
+                prepared_repairs.insert(id, (row, payload_json, episodic));
+            }
+            let repairs = prepared_repairs;
             let dirty_for_write = dirty_rows.clone();
             let repairs_for_write = repairs.clone();
             let previous_cursor = cursor;
@@ -24092,12 +26053,13 @@ impl CrudStore {
                             )?;
                             let mut repaired = 0usize;
                             for dirty in &dirty_rows {
-                                if let Some((row, payload_json)) = repairs.get(&dirty.turn_item_id) {
+                                if let Some((row, payload_json, episodic)) = repairs.get(&dirty.turn_item_id) {
                                     let applied = self
                                         .apply_one_terminal_turn_item_payload_repair(
                                             &transaction,
                                             row,
                                             payload_json,
+                                            episodic.as_ref(),
                                         )
                                         .await?;
                                     if applied {
@@ -24150,6 +26112,9 @@ impl CrudStore {
                 )
                 .await?;
             summary.repaired = summary.repaired.saturating_add(repaired);
+            if repaired > 0 {
+                self.episodic_work.notify_one();
+            }
             summary.remaining = summary
                 .remaining
                 .saturating_add(repairs.len().saturating_sub(repaired));
@@ -24186,12 +26151,21 @@ impl CrudStore {
     async fn apply_terminal_turn_item_payload_repairs(
         &self,
         transaction: &DatabaseTransaction,
-        repairs: Vec<(pioneer_entity::turn_item::Model, String)>,
+        repairs: Vec<(
+            pioneer_entity::turn_item::Model,
+            String,
+            Option<thread_episodic_source_store::PreparedSourceSave>,
+        )>,
     ) -> Result<usize> {
         let mut repaired = 0usize;
-        for (row, payload_json) in repairs {
+        for (row, payload_json, episodic) in repairs {
             let applied = self
-                .apply_one_terminal_turn_item_payload_repair(transaction, &row, &payload_json)
+                .apply_one_terminal_turn_item_payload_repair(
+                    transaction,
+                    &row,
+                    &payload_json,
+                    episodic.as_ref(),
+                )
                 .await?;
             if applied {
                 repaired = repaired.saturating_add(1);
@@ -24200,11 +26174,32 @@ impl CrudStore {
         Ok(repaired)
     }
 
+    async fn prepare_terminal_payload_episodic_save(
+        &self,
+        row: &pioneer_entity::turn_item::Model,
+        payload_json: &str,
+    ) -> Result<Option<thread_episodic_source_store::PreparedSourceSave>> {
+        let item: TurnItem = serde_json::from_str(payload_json)?;
+        // Terminalization of private tool output changes no admissible indexed
+        // source. Do not discover the surrounding history for such repairs.
+        if thread_episodic_source::committed_item_source_actor_role(&item).is_none() {
+            return Ok(None);
+        }
+        let (thread_id, workspace_id) = self
+            .get_turn_location(&row.turn_id)
+            .await?
+            .context("payload repair source ownership missing")?;
+        self.prepare_episodic_source_save(&workspace_id, &thread_id, &row.turn_id, &item)
+            .await
+            .map(Some)
+    }
+
     async fn apply_one_terminal_turn_item_payload_repair(
         &self,
         transaction: &DatabaseTransaction,
         row: &pioneer_entity::turn_item::Model,
         payload_json: &str,
+        episodic: Option<&thread_episodic_source_store::PreparedSourceSave>,
     ) -> Result<bool> {
         let now: DateTimeWithTimeZone = chrono::Utc::now().into();
         pioneer_entity::turn_item::Entity::update_many()
@@ -24234,6 +26229,10 @@ impl CrudStore {
                 current.status.as_deref() == row.status.as_deref()
                     && current.payload == payload_json
             });
+        if applied && let Some(episodic) = episodic {
+            self.commit_episodic_source_save(transaction, episodic, now)
+                .await?;
+        }
         Ok(applied)
     }
 
@@ -25688,6 +27687,119 @@ impl CrudStore {
         .await
     }
 
+    /// Admission and a late pre-start failure share the exact attempt/owner fence.
+    pub async fn mark_native_recovery_start_running_owned(
+        &self,
+        execution: &TurnExecutionRecord,
+        recovery: &pioneer_protocol::RecoveryAttemptContext,
+        now_unix: i64,
+        lease_until_unix: i64,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            if !native_recovery_start_transition_allowed(&tx, execution, recovery, now_unix).await?
+            {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            let applied = turn_execution::mark_running_owned(
+                &tx,
+                &execution.turn_id,
+                &execution.owner_id,
+                unix_to_datetime(now_unix),
+                unix_to_datetime(lease_until_unix),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(applied)
+        })
+        .await
+    }
+
+    /// Policy is computed on owned data before writer admission. Revalidate its
+    /// exact source in the transaction, so cancellation, terminal acceptance,
+    /// ownership takeover and a newer attempt all win over a late refusal.
+    pub async fn record_native_recovery_start_failure_owned(
+        &self,
+        execution: &TurnExecutionRecord,
+        recovery: &pioneer_protocol::RecoveryAttemptContext,
+        status: RecoveryJobStatus,
+        next_run_at_unix: Option<i64>,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            matches!(
+                status,
+                RecoveryJobStatus::Pending | RecoveryJobStatus::Exhausted
+            ),
+            "unexpected native pre-start recovery outcome"
+        );
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            if !native_recovery_start_transition_allowed(&tx, execution, recovery, now_unix).await?
+            {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            let now = unix_to_datetime(now_unix);
+            let applied = if status == RecoveryJobStatus::Pending {
+                let applied = recovery_job::mark_job_retrying(
+                    &tx,
+                    &recovery.job_id,
+                    &recovery.attempt_id,
+                    unix_to_datetime(next_run_at_unix.context("native retry deadline is missing")?),
+                    None,
+                    last_error.clone(),
+                    diagnostic_json.clone(),
+                    now,
+                )
+                .await?;
+                if applied {
+                    anyhow::ensure!(
+                        turn_execution::mark_recovering_owned(
+                            &tx,
+                            &execution.turn_id,
+                            &execution.owner_id,
+                            now
+                        )
+                        .await?,
+                        "native recovery execution changed during refusal"
+                    );
+                }
+                applied
+            } else {
+                let applied = recovery_job::mark_job_terminal_after_attempt(
+                    &tx,
+                    &recovery.job_id,
+                    &recovery.attempt_id,
+                    status,
+                    last_error.clone(),
+                    now,
+                )
+                .await?;
+                if applied {
+                    if let Some(value) = &diagnostic_json {
+                        recovery_job::set_diagnostic(&tx, &recovery.job_id, value.clone()).await?;
+                    }
+                    enqueue_recovery_terminalization_if_required(&tx, &recovery.job_id, now)
+                        .await?;
+                }
+                applied
+            };
+            tx.commit().await?;
+            Ok(applied)
+        })
+        .await
+    }
+
+    /// Bounded durable acceptance proof for a local terminal pending projection.
+    pub async fn native_turn_has_accepted_terminal(&self, turn_id: &str) -> Result<bool> {
+        turn_event_projection_stream_state::has_accepted_terminal(&self.connection, turn_id).await
+    }
+
     /// Persist only a bounded immutable cancellation description, before provider work.
     pub async fn persist_native_cancellation_context(
         &self,
@@ -25695,6 +27807,52 @@ impl CrudStore {
         owner_id: &str,
         now_unix: i64,
         initial_turn: bool,
+    ) -> Result<()> {
+        self.persist_native_cancellation_context_with_source(
+            preparation,
+            owner_id,
+            now_unix,
+            initial_turn,
+            None,
+        )
+        .await
+    }
+
+    pub async fn confirm_native_recovery_cancellation_context(
+        &self,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        execution: &TurnExecutionRecord,
+        recovery: &pioneer_protocol::RecoveryAttemptContext,
+        owner_id: &str,
+        now_unix: i64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            execution.owner_id == owner_id
+                && execution.turn_id == preparation.turn_id
+                && execution.thread_id == preparation.thread_id
+                && execution.workspace_id == preparation.workspace_id,
+            "native recovery source scope changed"
+        );
+        self.persist_native_cancellation_context_with_source(
+            preparation,
+            owner_id,
+            now_unix,
+            false,
+            Some((execution, recovery)),
+        )
+        .await
+    }
+
+    async fn persist_native_cancellation_context_with_source(
+        &self,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        owner_id: &str,
+        now_unix: i64,
+        initial_turn: bool,
+        recovery_source: Option<(
+            &TurnExecutionRecord,
+            &pioneer_protocol::RecoveryAttemptContext,
+        )>,
     ) -> Result<()> {
         native_terminal_effect_outbox::prepare_input(preparation.clone())?;
         let candidate = repositories::native_cancellation_context::prepare_registration(
@@ -25705,10 +27863,28 @@ impl CrudStore {
         self.run_serialized_write(|| async {
             let candidate = candidate.clone();
             let tx = self.connection.begin().await?;
+            if let Some((execution, recovery)) = recovery_source {
+                anyhow::ensure!(
+                    native_recovery_start_transition_allowed(&tx, execution, recovery, now_unix)
+                        .await?,
+                    "native recovery start source changed before ACK"
+                );
+            }
+            anyhow::ensure!(
+                !turn_event_projection_stream_state::has_accepted_terminal(
+                    &tx,
+                    &preparation.turn_id,
+                )
+                .await?,
+                "native cancellation context cannot confirm an accepted terminal Turn"
+            );
             if let Some(execution) = turn_execution::find(&tx, &preparation.turn_id).await? {
                 anyhow::ensure!(
-                    execution.owner_id == owner_id,
-                    "native cancellation context has stale execution owner"
+                    execution.owner_id == owner_id
+                        && execution.thread_id == preparation.thread_id
+                        && execution.workspace_id == preparation.workspace_id
+                        && execution.status.is_active(),
+                    "native cancellation context has stale execution scope or owner"
                 );
             }
             repositories::native_cancellation_context::insert_once(
@@ -25716,6 +27892,7 @@ impl CrudStore {
                 &preparation,
                 candidate,
                 initial_turn,
+                owner_id,
             )
             .await?;
             tx.commit().await?;
@@ -25798,6 +27975,73 @@ impl CrudStore {
         preparation: pioneer_protocol::NativeTerminalEffectPreparation,
         owner_id: &str,
     ) -> Result<()> {
+        self.materialize_native_cancellation_owned_as(
+            event,
+            now_unix,
+            context,
+            preparation,
+            owner_id,
+            None,
+        )
+        .await
+    }
+
+    /// Accept the authenticated Stop actor with the canonical interruption.
+    /// The saved per-run intent survives projection receipt compaction/restart;
+    /// the personal receipt is deferred to the actual RunCancelled transaction.
+    pub async fn materialize_native_cancellation_owned_as(
+        &self,
+        event: CanonicalTurnEventPayload,
+        now_unix: i64,
+        context: NativeCancellationContext,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        owner_id: &str,
+        cancellation_actor_id: Option<String>,
+    ) -> Result<()> {
+        self.materialize_native_cancellation_with_generation(
+            event,
+            now_unix,
+            context,
+            preparation,
+            owner_id,
+            cancellation_actor_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn materialize_native_cancellation_owned_at_generation(
+        &self,
+        event: CanonicalTurnEventPayload,
+        now_unix: i64,
+        context: NativeCancellationContext,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        owner_id: &str,
+        cancellation_actor_id: Option<String>,
+        expected_generation: u64,
+    ) -> Result<()> {
+        self.materialize_native_cancellation_with_generation(
+            event,
+            now_unix,
+            context,
+            preparation,
+            owner_id,
+            cancellation_actor_id,
+            Some(expected_generation),
+        )
+        .await
+    }
+
+    async fn materialize_native_cancellation_with_generation(
+        &self,
+        event: CanonicalTurnEventPayload,
+        now_unix: i64,
+        context: NativeCancellationContext,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        owner_id: &str,
+        cancellation_actor_id: Option<String>,
+        expected_generation: Option<u64>,
+    ) -> Result<()> {
         anyhow::ensure!(
             matches!(&event, CanonicalTurnEventPayload::TurnFailed(n)
             if n.turn.status == pioneer_protocol::TurnStatus::Interrupted
@@ -25828,18 +28072,28 @@ impl CrudStore {
         let effects = native_terminal_effect_outbox::prepare_input(preparation)?;
         let revalidation =
             repositories::native_cancellation_context::prepare_revalidation(&context, owner_id);
-        self.materialize_turn_event_with_projection_context_and_owner(
+        let generation_guard = expected_generation.map(|generation| -> Result<_> {
+            Ok(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT 1 FROM turn_execution WHERE turn_id = ? AND owner_id = ? AND owner_generation = ?",
+                [context.preparation.turn_id.clone().into(), owner_id.to_owned().into(), i64::try_from(generation)?.into()],
+            ))
+        }).transpose()?;
+        self.materialize_turn_event_with_projection_context_and_guard(
             event,
             now_unix,
             TurnEventProjectionContext {
                 item_started_deadlines: None,
                 enqueue_optional_deliveries: true,
+                cancellation_actor_id,
+                unactivated_terminal: None,
                 native_cancellation: Some(PreparedNativeCancellation {
                     revalidation,
                     effects,
                 }),
             },
             Some(owner_id),
+            generation_guard,
         )
         .await
     }
@@ -28248,6 +30502,20 @@ impl CrudStore {
                 run.id
             );
 
+            // A Stop that lost to Blocked must not attribute a later
+            // cancellation after this run/turn is reopened. Retire only that
+            // operation's pending attribution, atomically with actual resume;
+            // durable personal read receipts remain untouched.
+            {
+                use pioneer_entity::task_run_cancellation_actor as stop;
+                stop::Entity::delete_many()
+                    .filter(stop::Column::RunId.eq(&run.id))
+                    .filter(stop::Column::TaskId.eq(&task_model.id))
+                    .filter(stop::Column::WorkspaceId.eq(&task_model.workspace_id))
+                    .exec(&tx)
+                    .await?;
+            }
+
             if let Some(execution) = execution_model.as_ref() {
                 let execution_update = pioneer_entity::task_run_execution::Entity::update_many()
                     .filter(pioneer_entity::task_run_execution::Column::Id.eq(execution.id.clone()))
@@ -28534,6 +30802,8 @@ impl CrudStore {
             item_started_deadlines,
             enqueue_optional_deliveries: false,
             native_cancellation: None,
+            unactivated_terminal: None,
+            cancellation_actor_id: None,
         };
         self.materialize_turn_event_with_projection_context(
             event,
@@ -28580,6 +30850,218 @@ impl CrudStore {
         .await
     }
 
+    /// CLI/legacy equivalent of native cancellation attribution. Attribution is
+    /// saved only for a newly accepted Interrupted event and exact active runs.
+    pub async fn materialize_native_agent_turn_event_owned_as(
+        &self,
+        event: CanonicalTurnEventPayload,
+        event_timestamp_secs: i64,
+        item_started_deadlines: Option<TurnItemAttemptDeadlines>,
+        execution_owner_id: &str,
+        cancellation_actor_id: Option<String>,
+    ) -> Result<()> {
+        self.materialize_turn_event_with_projection_context_and_owner(
+            event,
+            event_timestamp_secs,
+            TurnEventProjectionContext {
+                item_started_deadlines,
+                enqueue_optional_deliveries: true,
+                cancellation_actor_id,
+                native_cancellation: None,
+                unactivated_terminal: None,
+            },
+            Some(execution_owner_id),
+        )
+        .await
+    }
+
+    /// Accepted-but-unactivated cancellation uses the same canonical event
+    /// pipeline. The writer revalidates ownership/generation and activation
+    /// evidence atomically with acceptance; no synthetic native context exists.
+    pub async fn materialize_unactivated_turn_cancellation_owned_as(
+        &self,
+        event: CanonicalTurnEventPayload,
+        event_timestamp_secs: i64,
+        expected: TurnExecutionRecord,
+        execution_owner_id: &str,
+        cancellation_actor_id: Option<String>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(&event, CanonicalTurnEventPayload::TurnFailed(n)
+            if n.turn.status == TurnStatus::Interrupted && n.turn.id == expected.turn_id
+                && n.thread_id == expected.thread_id && n.workspace_id == expected.workspace_id)
+                && expected.owner_id == execution_owner_id,
+            "unactivated cancellation differs from its accepted execution"
+        );
+        self.materialize_turn_event_with_projection_context_and_owner(
+            event,
+            event_timestamp_secs,
+            TurnEventProjectionContext {
+                enqueue_optional_deliveries: true,
+                cancellation_actor_id,
+                unactivated_terminal: Some(expected),
+                ..Default::default()
+            },
+            Some(execution_owner_id),
+        )
+        .await
+    }
+
+    /// Continue an early Stop after the initial CLI attempt won admission.
+    /// The caller holds the existing CLI transition gate through cleanup.
+    pub async fn materialize_cli_runtime_cancellation_owned_as(
+        &self,
+        notification: pioneer_protocol::TurnFailedNotification,
+        expected: &TurnExecutionRecord,
+        source: &CliRuntimeTurnTerminalGuard,
+        cancellation_actor_id: Option<String>,
+        now_unix: i64,
+    ) -> Result<()> {
+        let attempt = source
+            .attempt
+            .as_ref()
+            .context("CLI cancellation attempt is missing")?;
+        anyhow::ensure!(
+            expected.executor_kind == TurnExecutorKind::CliRuntime
+                && source.turn_status == TurnStatus::InProgress
+                && attempt.status.is_active()
+                && attempt.turn_id == expected.turn_id
+                && attempt.runtime_id == source.binding.runtime_id
+                && attempt.runtime_kind == source.binding.runtime_kind
+                && notification.turn.status == TurnStatus::Interrupted
+                && notification.turn.id == expected.turn_id
+                && notification.thread_id == expected.thread_id
+                && notification.workspace_id == expected.workspace_id
+                && source.binding.turn_id == expected.turn_id
+                && source.binding.thread_id == expected.thread_id
+                && source.binding.workspace_id == expected.workspace_id
+                && source.execution_owner.as_ref()
+                    == Some(&(expected.owner_id.clone(), expected.owner_generation)),
+            UnactivatedTurnPhaseChanged
+        );
+        // The canonical append pipeline accepts a Statement guard, evaluated
+        // inside its writer transaction. A prior repository read cannot fence
+        // an ownership transfer between gate acquisition and canonical append.
+        let guard = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT 1 FROM turn_execution e JOIN turn_cli_runtime_binding b ON b.turn_id = e.turn_id JOIN turn_cli_runtime_attempt a ON a.turn_id = e.turn_id WHERE e.turn_id = ? AND e.owner_id = ? AND e.owner_generation = ? AND e.thread_id = ? AND e.workspace_id = ? AND b.runtime_id = ? AND b.continuation_thread_id = ? AND a.id = ? AND a.status = ?",
+            [
+                expected.turn_id.clone().into(),
+                expected.owner_id.clone().into(),
+                i64::try_from(expected.owner_generation)?.into(),
+                expected.thread_id.clone().into(),
+                expected.workspace_id.clone().into(),
+                source.binding.runtime_id.clone().into(),
+                source.binding.continuation_thread_id.clone().into(),
+                attempt.id.clone().into(),
+                attempt.status.as_str().into(),
+            ],
+        );
+        self.materialize_turn_event_with_projection_context_and_guard(
+            CanonicalTurnEventPayload::TurnFailed(notification),
+            now_unix,
+            TurnEventProjectionContext {
+                enqueue_optional_deliveries: true,
+                cancellation_actor_id,
+                ..Default::default()
+            },
+            Some(&expected.owner_id),
+            Some(guard),
+        )
+        .await
+    }
+
+    /// Definitive pre-activation refusals use the canonical terminal pipeline
+    /// and the same owner/generation/activation fence as early cancellation.
+    pub async fn materialize_unactivated_turn_refusal_owned(
+        &self,
+        event: CanonicalTurnEventPayload,
+        event_timestamp_secs: i64,
+        expected: TurnExecutionRecord,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(&event,
+            CanonicalTurnEventPayload::TurnFailed(n) if n.turn.status == TurnStatus::Failed)
+                || matches!(&event, CanonicalTurnEventPayload::TurnBlocked(n) if n.turn.status == TurnStatus::Blocked),
+            "unactivated refusal requires a Failed or Blocked event"
+        );
+        anyhow::ensure!(
+            event.turn_id() == expected.turn_id
+                && event.thread_id() == expected.thread_id
+                && event.workspace_id() == expected.workspace_id,
+            "unactivated refusal differs from its execution scope"
+        );
+        let owner_id = expected.owner_id.clone();
+        self.materialize_turn_event_with_projection_context_and_owner(
+            event,
+            event_timestamp_secs,
+            TurnEventProjectionContext {
+                enqueue_optional_deliveries: true,
+                unactivated_terminal: Some(expected),
+                ..Default::default()
+            },
+            Some(&owner_id),
+        )
+        .await
+    }
+
+    /// Pause the ordinary parent's projector after durable acceptance. The
+    /// production claim is retained, so duplicate materialization is pending.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn accept_turn_event_before_projection_for_test(
+        &self,
+        event: CanonicalTurnEventPayload,
+        timestamp: i64,
+    ) -> Result<()> {
+        self.append_claimed_turn_event_projection_once(
+            event,
+            unix_to_datetime(timestamp),
+            TurnEventProjectionContext {
+                item_started_deadlines: None,
+                enqueue_optional_deliveries: true,
+                cancellation_actor_id: None,
+                native_cancellation: None,
+                unactivated_terminal: None,
+            },
+            generate_id(DB_ID_LEN),
+            unix_to_datetime(timestamp + 60),
+            None,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Reproduce process loss after canonical acceptance and before projection,
+    /// retaining the production owner fences and replay/delivery obligations.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn accept_native_turn_event_without_projection_for_test(
+        &self,
+        event: CanonicalTurnEventPayload,
+        event_timestamp_secs: i64,
+        execution_owner_id: &str,
+    ) -> Result<()> {
+        let now = unix_to_datetime(event_timestamp_secs);
+        self.append_claimed_turn_event_projection_once(
+            event,
+            now,
+            TurnEventProjectionContext {
+                item_started_deadlines: None,
+                enqueue_optional_deliveries: true,
+                native_cancellation: None,
+                unactivated_terminal: None,
+                cancellation_actor_id: None,
+            },
+            generate_id(DB_ID_LEN),
+            // An expired claim models the lost projector, without a timed wait.
+            now,
+            Some(execution_owner_id),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn materialize_native_agent_turn_event_with_owner(
         &self,
         event: CanonicalTurnEventPayload,
@@ -28591,6 +31073,8 @@ impl CrudStore {
             item_started_deadlines,
             enqueue_optional_deliveries: true,
             native_cancellation: None,
+            unactivated_terminal: None,
+            cancellation_actor_id: None,
         };
         self.materialize_turn_event_with_projection_context_and_owner(
             event,
@@ -28740,12 +31224,11 @@ impl CrudStore {
                         "failed to release deferred turn event projection claim; lease expiry will retry it"
                     ),
                 }
-                return Err(TurnEventProjectionAfterAppendError::new(
+                return Err(TurnEventProjectionAfterAppendError::pending(
                     appended_event.id,
                     appended_event.turn_id,
                     appended_event.sequence,
                     "authoritative projection is waiting for an earlier turn event".to_owned(),
-                    None,
                 )
                 .into());
             }
@@ -29256,10 +31739,13 @@ impl CrudStore {
         )
         .await?;
         turn_event_projection_stream_state::accept_terminal(transaction, &appended_event).await?;
-        if enqueue_optional_deliveries {
-            turn_event_delivery::insert_pending_for_event(transaction, &appended_event, created_at)
-                .await?;
-        }
+        turn_event_delivery::insert_pending_for_event(
+            transaction,
+            &appended_event,
+            created_at,
+            enqueue_optional_deliveries,
+        )
+        .await?;
         if !turn_event_projection_state::is_next_projection_sequence(
             transaction,
             appended_event.turn_id.as_str(),
@@ -29383,6 +31869,42 @@ impl CrudStore {
             );
         }
 
+        if let Some(expected) = projection_context.unactivated_terminal.as_ref()
+            && !turn_event::prepared_event_already_exists(&transaction, &event).await?
+        {
+            let current = turn_execution::find(&transaction, &expected.turn_id)
+                .await?
+                .context("unactivated terminal execution disappeared")?;
+            anyhow::ensure!(
+                current.owner_id == expected.owner_id
+                    && current.owner_generation == expected.owner_generation
+                    && current.thread_id == expected.thread_id
+                    && current.workspace_id == expected.workspace_id
+                    && matches!(
+                        current.status,
+                        TurnExecutionStatus::Starting
+                            | TurnExecutionStatus::Queued
+                            | TurnExecutionStatus::Running
+                    )
+                    && (current.started_at.is_none()
+                        || current.status == TurnExecutionStatus::Starting)
+                    && !repositories::native_cancellation_context::is_registered(
+                        &transaction,
+                        &expected.turn_id
+                    )
+                    .await?
+                    && cli_runtime_binding::latest_turn_attempt(&transaction, &expected.turn_id)
+                        .await?
+                        .is_none()
+                    && !turn_event_projection_stream_state::has_accepted_terminal(
+                        &transaction,
+                        &expected.turn_id
+                    )
+                    .await?,
+                UnactivatedTurnPhaseChanged
+            );
+        }
+
         let cancellation_turn_id = if let Some(cancellation) = native_cancellation {
             if !turn_event::prepared_event_already_exists(&transaction, &event).await? {
                 repositories::native_cancellation_context::revalidate(
@@ -29445,10 +31967,31 @@ impl CrudStore {
             if projected || projection_context.native_cancellation.is_some() {
                 return Ok(appended_event);
             }
-            anyhow::bail!(
-                "idempotent turn event `{}` exists but its authoritative projection is incomplete",
-                appended_event.id
-            );
+            // Another producer may have committed this exact canonical event
+            // and still be projecting it. Its durable append is just as
+            // authoritative as our own: callers must not roll back local
+            // terminal state while the original projection is in flight.
+            return Err(TurnEventProjectionAfterAppendError::pending(
+                appended_event.id,
+                appended_event.turn_id,
+                appended_event.sequence,
+                "idempotent canonical event is waiting for its authoritative projection".to_owned(),
+            )
+            .into());
+        }
+
+        if let Some(actor) = projection_context.cancellation_actor_id.as_deref()
+            && let TurnEventPayload::TurnFailed(n) = &appended_event.payload
+            && n.turn.status == pioneer_protocol::TurnStatus::Interrupted
+        {
+            repositories::task_cancellation_actor::record_turn(
+                &transaction,
+                actor,
+                &n.workspace_id,
+                &n.thread_id,
+                &n.turn.id,
+            )
+            .await?;
         }
 
         if let Err(error) = turn_event_projection_state::insert_claimed(
@@ -29470,13 +32013,49 @@ impl CrudStore {
             return Err(error);
         }
         turn_event_projection_stream_state::accept_terminal(&transaction, &appended_event).await?;
-        if projection_context.enqueue_optional_deliveries
-            && let Err(error) = turn_event_delivery::insert_pending_for_event(
+        if let Some(expected) = projection_context.unactivated_terminal.as_ref() {
+            let status = terminal_turn_execution_status_for_event(&appended_event.payload)
+                .context("unactivated terminal event has no terminal execution status")?;
+            let graph_status = match status {
+                TurnExecutionStatus::Interrupted => "cancelled",
+                TurnExecutionStatus::Blocked => "blocked",
+                TurnExecutionStatus::Failed => "failed",
+                _ => bail!("unsupported unactivated terminal event"),
+            };
+            turn_execution::mark_terminal(&transaction, &expected.turn_id, status, created_at)
+                .await?;
+            if let Some(response) = crate::repositories::agent_domain::load_agent_turn_response(
                 &transaction,
-                &appended_event,
-                created_at,
+                &expected.turn_id,
             )
-            .await
+            .await?
+            {
+                let execution = crate::repositories::agent_domain::load_agent_execution(
+                    &transaction,
+                    &response.execution_id,
+                )
+                .await?
+                .context("unactivated cancellation response execution disappeared")?;
+                // True Task occurrences retain their own candidate/run cleanup.
+                if execution.parent_task_id.is_none() {
+                    crate::repositories::agent_domain::finalize_agent_execution(
+                        &transaction,
+                        &response.execution_id,
+                        graph_status,
+                        created_at,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        if let Err(error) = turn_event_delivery::insert_pending_for_event(
+            &transaction,
+            &appended_event,
+            created_at,
+            projection_context.enqueue_optional_deliveries,
+        )
+        .await
         {
             let _ = transaction.rollback().await;
             return Err(error);
@@ -30675,6 +33254,7 @@ impl CrudStore {
     async fn commit_task_creation_once(
         &self,
         input: TaskCreationCommitInput,
+        root: Option<frozen_lifetime::PreparedFrozenRoot>,
     ) -> Result<Vec<AppendedTaskEvent>> {
         let prepared_events = self
             .prepare_task_events_for_write(input.events.clone())
@@ -30695,9 +33275,12 @@ impl CrudStore {
 
             if let Some(snapshot) = input.conversation_snapshot {
                 let expected = snapshot.clone();
-                let persisted =
-                    task_run_conversation_snapshot::insert_if_absent(&transaction, snapshot)
-                        .await?;
+                let persisted = task_run_conversation_snapshot::insert_if_absent(
+                    &transaction,
+                    snapshot,
+                    root.as_ref().context("missing prepared Task root")?,
+                )
+                .await?;
                 if persisted.run_id != expected.run_id
                     || persisted.task_id != expected.task_id
                     || persisted.workspace_id != expected.workspace_id
@@ -30935,7 +33518,7 @@ impl CrudStore {
         &self,
         trigger_id: String,
         expected_next_fire_at: i64,
-        expected_snapshot: Option<(String, String)>,
+        expected_snapshot: Option<(TaskTrigger, String)>,
         now: i64,
         events: Vec<TaskEventPayload>,
         occurrence_contracts: Vec<pioneer_protocol::TaskOccurrenceContract>,
@@ -30967,13 +33550,21 @@ impl CrudStore {
                 || expected_next_fire_at > now
                 || expected_snapshot
                     .as_ref()
-                    .is_some_and(|(task_id, spec_json)| {
-                        &trigger.task_id != task_id || &trigger.spec_json != spec_json
+                    .is_some_and(|(expected, spec_json)| {
+                        trigger.task_id != expected.task_id
+                            || &trigger.spec_json != spec_json
+                            || trigger.last_fire_at.map(|value| value.timestamp())
+                                != expected.last_fire_at
+                            || trigger.created_at.timestamp() != expected.created_at
+                            || trigger.updated_at.timestamp() != expected.updated_at
                     })
             {
                 return Ok(Vec::new());
             }
 
+            if task_repository::finish_requested(&transaction, &trigger.task_id).await? {
+                return Ok(Vec::new());
+            }
             let appended_events = self
                 .append_task_events_in_connection(&transaction, events, now)
                 .await?;
@@ -31296,6 +33887,25 @@ impl CrudStore {
             } else {
                 event
             };
+            let needs_open_task = match event.payload() {
+                TaskEventPayload::RunCreated { .. }
+                | TaskEventPayload::RunRetryScheduled { .. }
+                | TaskEventPayload::TaskQueued { .. }
+                | TaskEventPayload::TriggerCreated { .. }
+                | TaskEventPayload::TaskUpdated { .. }
+                | TaskEventPayload::TaskResumed { .. }
+                | TaskEventPayload::TaskPaused { .. } => true,
+                TaskEventPayload::TaskDetached { task, .. } => task.finish_request().is_none(),
+                TaskEventPayload::TaskRescheduled { trigger, .. } => {
+                    trigger.status != TaskTriggerStatus::Cancelled
+                }
+                _ => false,
+            };
+            if needs_open_task
+                && task_repository::finish_requested(db, event.payload().task_id()).await?
+            {
+                anyhow::bail!("task_finish_requested: task cannot admit new work or be reopened");
+            }
             // Only state-independent work (validation, serialization and CPU
             // projection preparation) is performed before writer admission.
             // Database-dependent preparation is deliberately sequential here:
@@ -31939,6 +34549,7 @@ fn task_trigger_from_db_model(model: pioneer_entity::task_trigger::Model) -> Res
     );
 
     Ok(TaskTrigger {
+        webhook_secret_ref: model.webhook_secret_ref,
         id: model.id,
         task_id: model.task_id,
         status,
@@ -31957,6 +34568,7 @@ fn task_run_from_db_model(model: pioneer_entity::task_run::Model) -> Result<Task
         .with_context(|| format!("unknown task run executor kind `{}`", model.executor_kind))?;
 
     Ok(TaskRun {
+        trigger_input: optional_typed_json_from_db(model.trigger_input_json)?,
         id: model.id,
         task_id: model.task_id,
         trigger_id: model.trigger_id,
@@ -33011,6 +35623,20 @@ mod plugin_ownership_tests;
 
 #[cfg(test)]
 mod tests {
+    mod saved_history_read;
+    mod task_webhook;
+    mod thread_read_pages;
+    mod unread_start;
+    use crate::{
+        NewThreadEpisodicExclusionRecord, PROJECTION_META_STATUS_PENDING,
+        ProjectionMetaConfigRecord, ProjectionMetaRecord, THREAD_EPISODIC_PROJECTION_CHANGED_ERROR,
+        THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, THREAD_EPISODIC_USER_DELETED_ERROR,
+        THREAD_EPISODIC_USER_EXCLUDED_ERROR, ThreadEpisodicExclusionReason,
+        ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexJobFailureUpdate,
+        ThreadEpisodicIndexJobRecord, ThreadEpisodicIndexJobStatus,
+        ThreadEpisodicProjectionResetProgress, find_projection_meta,
+        thread_episodic_projection_reset_key, upsert_projection_meta_with_config,
+    };
     #[path = "cli_runtime_active_bindings.rs"]
     mod cli_runtime_active_bindings;
     #[path = "task_event_fanout.rs"]
@@ -33059,7 +35685,7 @@ mod tests {
         WORK_ITEM_STATUS_RUNNING, WORK_VISIBILITY_VISIBLE, WorkspaceSkillPolicyRecord,
         create_gateway_singleton, create_member_principal, create_superuser,
         delete_workspace_membership, ensure_pioneer_for_workspace, insert_workspace_membership,
-        list_abandoned_runtime_draft_artifact_ids,
+        list_abandoned_runtime_draft_artifact_ids, list_running_task_scopes,
         message_mutation_actor_current_thread_write_kind, principal_current_thread_access_kind,
         resolve_artifact_authorization_scope, resolve_runtime_draft_artifact_authorization_scope,
         tool_call_status, upsert_thread_timeline_block, work_item_projection_id,
@@ -33116,7 +35742,7 @@ mod tests {
         ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait,
         QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, Statement, TransactionTrait,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -33229,17 +35855,137 @@ mod tests {
         }
     }
 
+    // Some rollback guards exercise today's projector on a deliberately older
+    // migration prefix. Add only its unrelated inbox runtime dependencies, not
+    // migration records or historical grants. Webhook input columns are also
+    // required by today's task entities. Pure upgrade fixtures must not
+    // call this helper: they retain the exact historical schema under test.
+    async fn add_inbox_runtime_fields_to_legacy_projector_fixture(store: &CrudStore) {
+        use migration::{ColumnDef, SchemaManager, Table};
+        use sea_orm::sea_query::Alias;
+
+        let transaction = store.connection.begin().await.unwrap();
+        let schema = SchemaManager::new(&*transaction);
+        for (table, column) in [
+            ("thread", "inbox_workspace_after_sequence"),
+            ("task_run", "inbox_sequence"),
+        ] {
+            schema
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new(table))
+                        .add_column(ColumnDef::new(Alias::new(column)).big_integer().null())
+                        .to_owned(),
+                )
+                .await
+                .unwrap();
+        }
+        for (table, column) in [
+            ("task_trigger", "webhook_secret_ref"),
+            ("task_run", "trigger_input_json"),
+            ("turn", "plugin_selection_json"),
+        ] {
+            if !schema.has_column(table, column).await.unwrap() {
+                schema
+                    .alter_table(
+                        Table::alter()
+                            .table(Alias::new(table))
+                            .add_column(ColumnDef::new(Alias::new(column)).text().null())
+                            .to_owned(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        schema
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("inbox_workspace_started_at"))
+                            .timestamp_with_time_zone()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        // Real current terminal commits allocate a sequence, even though these
+        // tests do not exercise inbox eligibility or notification history.
+        schema
+            .create_table(
+                sea_orm::Schema::new(DatabaseBackend::Sqlite)
+                    .create_table_from_entity(pioneer_entity::task_inbox_activation::Entity),
+            )
+            .await
+            .unwrap();
+        pioneer_entity::task_inbox_activation::Entity::insert(
+            pioneer_entity::task_inbox_activation::ActiveModel {
+                id: Set(1),
+                started_at: Set(0),
+                completion_sequence: Set(0),
+            },
+        )
+        .exec(&transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+    }
+
     pub(super) async fn test_store_with_workspace(workspace_id: &str) -> CrudStore {
         test_store_with_workspace_migrator::<Migrator>(workspace_id).await
+    }
+
+    // Empty-input projector fixtures exercise old migration boundaries with
+    // today's Thread Entity. Add only its later metadata column, without
+    // applying/registering unread or changing which migration down() tests.
+    async fn add_thread_unread_column_to_legacy_fixture(store: &CrudStore) {
+        use migration::{ColumnDef, SchemaManager, Table};
+
+        let transaction = store.connection.begin().await.unwrap();
+        let schema = SchemaManager::new(&*transaction);
+        assert!(
+            !schema
+                .has_column("thread", "workspace_unread_started_at")
+                .await
+                .unwrap()
+        );
+        schema
+            .alter_table(
+                Table::alter()
+                    .table(pioneer_entity::thread::Entity)
+                    .add_column(
+                        ColumnDef::new(pioneer_entity::thread::Column::WorkspaceUnreadStartedAt)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
     }
 
     async fn test_store_with_workspace_migrator<M: MigratorTrait>(workspace_id: &str) -> CrudStore {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
-        M::up(&connection, None)
+        // This private fixture has no published state yet. Pin its initial
+        // migration chain to one connection instead of reacquiring the pool
+        // for each schema statement. Runtime/domain transactions are unchanged.
+        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection.clone());
+        let migration = database
+            .begin()
+            .await
+            .expect("fixture migration transaction");
+        M::up(&*migration, None)
             .await
             .expect("migrations must succeed");
+        migration
+            .commit()
+            .await
+            .expect("fixture schema must commit");
 
         let timestamp = unix_to_datetime(1_700_000_000);
         pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
@@ -33647,6 +36393,9 @@ mod tests {
 
     #[path = "native_terminal_effect_gates.rs"]
     mod terminal_effect_gates;
+
+    #[path = "episodic_delivery_tests.rs"]
+    mod episodic_delivery_tests;
 
     async fn test_store_with_started_turn(
         workspace_id: &str,
@@ -34896,6 +37645,65 @@ mod tests {
             observer.events.lock().unwrap().clear();
         }
 
+        let source = |text: &str| TurnItem::UserMessage {
+            id: "route_source".to_owned(),
+            text: text.to_owned(),
+            attachments: vec![],
+        };
+        interactive
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: source("initial"),
+                },
+                1_700_000_120,
+            )
+            .await
+            .unwrap();
+        for (store, text, read, write) in [
+            (
+                &interactive,
+                "interactive save",
+                SqliteReadClass::Interactive,
+                SqliteWriteClass::Interactive,
+            ),
+            (
+                &maintenance,
+                "maintenance save",
+                SqliteReadClass::Maintenance,
+                SqliteWriteClass::Maintenance,
+            ),
+        ] {
+            observer.reads.lock().unwrap().clear();
+            observer.events.lock().unwrap().clear();
+            store
+                .materialize_item_snapshot_updated(
+                    ItemUpdatedNotification {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn.id.clone(),
+                        item: source(text),
+                    },
+                    1_700_000_121,
+                )
+                .await
+                .unwrap();
+            assert!(
+                observer
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|class| *class == read)
+            );
+            let events = observer.events.lock().unwrap();
+            assert!(events.iter().any(
+                |event| matches!(event, SqliteWriteEvent::Acquired { class, .. } if *class == write)
+            ));
+            assert!(events.iter().all(|event| !matches!(event, SqliteWriteEvent::Acquired { class, .. } if *class != write)));
+        }
         let transaction = database.with_critical_writes().begin().await.unwrap();
         observer.events.lock().unwrap().clear();
         let cancelled = tokio::spawn({
@@ -34917,6 +37725,31 @@ mod tests {
                 ..
             } if queue.maintenance == 0
         )));
+        let snapshot_cancelled = tokio::spawn({
+            let store = maintenance.clone();
+            let update = ItemUpdatedNotification {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: turn.id.clone(),
+                item: source("cancelled save"),
+            };
+            async move {
+                store
+                    .materialize_item_snapshot_updated(update, 1_700_000_122)
+                    .await
+            }
+        });
+        observer.wait_for_enqueued(2).await;
+        snapshot_cancelled.abort();
+        assert!(snapshot_cancelled.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            interactive
+                .get_turn_item(&turn.id, "route_source")
+                .await
+                .unwrap()
+                .unwrap(),
+            source("maintenance save")
+        );
         let mut pending = Vec::new();
         for (store, consumer) in [
             (interactive, "live_notification"),
@@ -34928,7 +37761,7 @@ mod tests {
                     .await
             }));
         }
-        observer.wait_for_enqueued(3).await;
+        observer.wait_for_enqueued(4).await;
         transaction.rollback().await.unwrap();
         for claim in pending {
             assert_eq!(claim.await.unwrap().unwrap().len(), 1);
@@ -34950,7 +37783,235 @@ mod tests {
                 if queue.interactive == 0 && queue.maintenance == 0 && queue.critical == 0
         ));
         drop(events);
+        let recovery_store = CrudStore::new(database.clone()).with_maintenance_access();
+        let running = recovery_store
+            .claim_due_thread_episodic_index_jobs(1_700_000_130, 1, 5)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let transaction = database.with_critical_writes().begin().await.unwrap();
+        observer.events.lock().unwrap().clear();
+        let recovery = tokio::spawn({
+            let store = recovery_store.clone();
+            let workspace_id = thread.workspace_id.clone();
+            async move {
+                store
+                    .requeue_running_thread_episodic_index_jobs_for_workspace(
+                        &workspace_id,
+                        1_700_000_131,
+                        5,
+                    )
+                    .await
+            }
+        });
+        observer.wait_for_enqueued(1).await;
+        recovery.abort();
+        assert!(recovery.await.unwrap_err().is_cancelled());
+        assert!(observer.events.lock().unwrap().iter().any(|event| matches!(event, SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. } if queue.maintenance == 0)));
+        transaction.rollback().await.unwrap();
+        assert_eq!(
+            recovery_store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            running
+        );
+        assert_eq!(
+            recovery_store
+                .requeue_running_thread_episodic_index_jobs_for_workspace(
+                    &thread.workspace_id,
+                    1_700_000_131,
+                    5
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        let recovered = recovery_store
+            .claim_due_thread_episodic_index_jobs(1_700_000_131, 1, 5)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(recovered.id, running.id);
+        assert_eq!(recovered.attempt_count, running.attempt_count + 1);
+        let events = observer.events.lock().unwrap();
+        assert!(events.iter().all(|event| !matches!(event, SqliteWriteEvent::Acquired { class, .. } if *class == SqliteWriteClass::Interactive)));
+        assert!(
+            matches!(events.last(), Some(SqliteWriteEvent::Released { queue, .. }) if queue.maintenance == 0 && queue.critical == 0 && queue.interactive == 0)
+        );
+        drop(events);
         database.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_final_selector_uses_committed_intent_and_checks_ownership() {
+        for final_id in ["a_final", "z_final"] {
+            let (store, _, _) =
+                test_store_with_started_turn("ws_select", "thr_select", "turn_select").await;
+            let notification = |id: &str, phase, text: &str| ItemCompletedNotification {
+                workspace_id: "ws_select".into(),
+                thread_id: "thr_select".into(),
+                turn_id: "turn_select".into(),
+                item: TurnItem::AgentMessage {
+                    id: id.into(),
+                    text: text.into(),
+                    phase,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            };
+            let answer = notification(
+                final_id,
+                AgentMessagePhase::FinalAnswer,
+                "accepted substantive answer",
+            );
+            store
+                .materialize_item_completed(
+                    notification(
+                        "old_partial_final",
+                        AgentMessagePhase::FinalAnswer,
+                        "old attempt",
+                    ),
+                    1_700_000_100,
+                )
+                .await
+                .unwrap();
+            for (id, phase) in [
+                ("0_commentary", AgentMessagePhase::Commentary),
+                ("old_partial_final", AgentMessagePhase::Commentary),
+                ("zz_commentary", AgentMessagePhase::Commentary),
+            ] {
+                store
+                    .materialize_item_completed(
+                        notification(id, phase, "not the answer"),
+                        1_700_000_100,
+                    )
+                    .await
+                    .unwrap();
+            }
+            store
+                .prepare_turn_finalization(&answer, 1, None, 1_700_000_100)
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .completed_turn_final_answer("ws_select", "thr_select", "turn_select")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            store
+                .commit_prepared_turn_finalization("turn_select", 1_700_000_100)
+                .await
+                .unwrap();
+            store
+                .materialize_item_completed(
+                    notification(
+                        "late_commentary",
+                        AgentMessagePhase::Commentary,
+                        "not a final",
+                    ),
+                    1_700_000_100,
+                )
+                .await
+                .unwrap();
+            let restarted = CrudStore::new(store.database_connection()).with_maintenance_access();
+            assert_eq!(
+                restarted
+                    .completed_turn_final_answer("ws_select", "thr_select", "turn_select")
+                    .await
+                    .unwrap(),
+                Some(answer.item)
+            );
+            assert!(
+                restarted
+                    .completed_turn_final_answer("foreign", "thr_select", "turn_select")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                restarted
+                    .completed_turn_final_answer("ws_select", "foreign", "turn_select")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_final_selector_rejects_commentary_and_ambiguous_finals() {
+        for final_count in 0..=2 {
+            for final_id in ["a_final", "z_final"] {
+                let (store, _, mut turn) = test_store_with_started_turn(
+                    "ws_legacy_select",
+                    "thr_legacy_select",
+                    "turn_legacy_select",
+                )
+                .await;
+                let item = |id: &str, phase| TurnItem::AgentMessage {
+                    id: id.into(),
+                    text: id.into(),
+                    phase,
+                    markdown: None,
+                    markdown_version: None,
+                };
+                let answer = item(final_id, AgentMessagePhase::FinalAnswer);
+                let mut items = vec![
+                    item("0_commentary", AgentMessagePhase::Commentary),
+                    item("old_partial_final", AgentMessagePhase::Commentary),
+                    item("zz_commentary", AgentMessagePhase::Commentary),
+                ];
+                if final_count > 0 {
+                    items.push(answer.clone());
+                }
+                if final_count > 1 {
+                    items.push(item("other_final", AgentMessagePhase::FinalAnswer));
+                }
+                items.push(item("late_commentary", AgentMessagePhase::Commentary));
+                for item in items {
+                    store
+                        .materialize_item_completed(
+                            ItemCompletedNotification {
+                                workspace_id: "ws_legacy_select".into(),
+                                thread_id: "thr_legacy_select".into(),
+                                turn_id: "turn_legacy_select".into(),
+                                item,
+                            },
+                            1_700_000_100,
+                        )
+                        .await
+                        .unwrap();
+                }
+                turn.status = TurnStatus::Completed;
+                store
+                    .materialize_turn_completed(
+                        TurnCompletedNotification {
+                            workspace_id: "ws_legacy_select".into(),
+                            thread_id: "thr_legacy_select".into(),
+                            turn,
+                        },
+                        1_700_000_100,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .completed_turn_final_answer(
+                            "ws_legacy_select",
+                            "thr_legacy_select",
+                            "turn_legacy_select"
+                        )
+                        .await
+                        .unwrap(),
+                    (final_count == 1).then_some(answer)
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -37832,12 +40893,15 @@ mod tests {
             )
             .await
             .expect("fault trigger should install");
-        assert!(
-            store
-                .commit_prepared_turn_finalization("turn_native_fault", 1_700_000_101)
-                .await
-                .is_err()
-        );
+        let error = store
+            .commit_prepared_turn_finalization("turn_native_fault", 1_700_000_101)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<super::NativeFinalizationPhase>(),
+            Some(super::NativeFinalizationPhase::WriterApply)
+        ));
+
         assert!(
             turn::find_turn_item(
                 &store.connection,
@@ -39715,6 +42779,17 @@ mod tests {
         actor_id: Option<&str>,
         deleted: bool,
     ) {
+        // This fixture's synthetic event times predate wall-clock migration.
+        // Set its rollout explicitly; never manufacture a read receipt.
+        pioneer_entity::gateway_identity::Entity::update_many()
+            .col_expr(
+                pioneer_entity::gateway_identity::Column::UnreadStartedAt,
+                Expr::val(0),
+            )
+            .filter(pioneer_entity::gateway_identity::Column::SingletonKey.eq(1))
+            .exec(&store.connection)
+            .await
+            .unwrap();
         let created_at = unix_to_datetime(1_700_000_100);
         pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
             id: Set(turn_id.to_owned()),
@@ -39764,6 +42839,26 @@ mod tests {
         .exec(&store.connection)
         .await
         .expect("unread test Turn should persist");
+        pioneer_entity::unread_message_position::Entity::insert(
+            pioneer_entity::unread_message_position::ActiveModel {
+                thread_id: Set(thread_id.into()),
+                block_id: Set(format!("user:{turn_id}")),
+                turn_id: Set(turn_id.into()),
+                sort_key: Set(sort_key.into()),
+                published_at: Set(created_at.timestamp()),
+            },
+        )
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::columns([
+                pioneer_entity::unread_message_position::Column::ThreadId,
+                pioneer_entity::unread_message_position::Column::BlockId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(&store.connection)
+        .await
+        .unwrap();
         upsert_thread_timeline_block(
             &store.connection,
             ThreadTimelineBlockRecord {
@@ -40547,7 +43642,7 @@ mod tests {
             capabilities_json: "[]".to_owned(),
             resolved_artifacts_json: "[]".to_owned(),
             runtime_environment_json: r#"{"PIONEER_ARTIFACT_OUTPUT_DIR":"/tmp/a"}"#.to_owned(),
-            history_json: r#"[{"role":"User","content":"hello"}]"#.to_owned(),
+            history_json: r#"[{"role":"user","content":"hello"}]"#.to_owned(),
             created_at,
             updated_at: created_at,
         };
@@ -42698,6 +45793,20 @@ mod tests {
             .await
             .expect("task recovery job should become blocked");
 
+        // A previous Stop can lose its terminal race to Blocked. Reopening
+        // the same run ID must not carry that actor into a future cancellation.
+        pioneer_entity::task_run_cancellation_actor::Entity::insert(
+            pioneer_entity::task_run_cancellation_actor::ActiveModel {
+                run_id: Set(run.id.clone()),
+                task_id: Set(task.id.clone()),
+                workspace_id: Set(task.workspace_id.clone()),
+                principal_id: Set("P00000000000000000001".into()),
+                origin_turn_id: Set(turn_id.into()),
+            },
+        )
+        .exec(&store.connection)
+        .await
+        .unwrap();
         let outcome = store
             .resume_task_owned_turn(
                 thread_id,
@@ -42719,6 +45828,14 @@ mod tests {
         else {
             panic!("expected aggregate resume outcome");
         };
+        assert!(
+            pioneer_entity::task_run_cancellation_actor::Entity::find_by_id(run.id.clone())
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .is_none(),
+            "a resumed execution cannot inherit a retired Stop actor"
+        );
         assert_eq!(resumed_task.status, TaskStatus::Running);
         assert_eq!(resumed_run.status, TaskRunStatus::Running);
         assert_eq!(resumed_turn.status, TaskRunTurnStatus::InProgress);
@@ -44444,6 +47561,7 @@ mod tests {
                     "city".to_owned(),
                     TaskValue::String("Berlin".to_owned()),
                 )]))),
+                finish_request: None,
                 composer_work: None,
             }),
             result: None,
@@ -44457,6 +47575,7 @@ mod tests {
 
     fn sample_task_trigger(timestamp: i64) -> TaskTrigger {
         TaskTrigger {
+            webhook_secret_ref: None,
             id: "trg_00000000000000001".to_owned(),
             task_id: "task_0000000000000001".to_owned(),
             status: TaskTriggerStatus::Active,
@@ -44474,6 +47593,7 @@ mod tests {
 
     fn sample_task_run(timestamp: i64) -> TaskRun {
         TaskRun {
+            trigger_input: None,
             id: "run_00000000000000001".to_owned(),
             task_id: "task_0000000000000001".to_owned(),
             trigger_id: Some("trg_00000000000000001".to_owned()),
@@ -44631,6 +47751,75 @@ mod tests {
         }
 
         (store, thread, run)
+    }
+
+    #[tokio::test]
+    async fn tree_task_activity_is_a_bounded_read_without_history_or_conversation_status() {
+        let (store, counter) = test_store_with_workspace_and_query_counter("ws_task").await;
+        let (store, mut thread, _) =
+            terminal_task_run_occurrence_fixture_with_store(store, None).await;
+        thread.status = ThreadStatus::Idle;
+        store
+            .upsert_thread_model(&thread, PersistedActorRef::System)
+            .await
+            .unwrap();
+        // The fixture's task has a legacy creating-turn reference. Make this
+        // background task thread-owned, without a foreground turn.
+        store
+            .connection
+            .execute_unprepared(
+                "UPDATE task SET created_by_turn_id=NULL; UPDATE task_run SET status='running'",
+            )
+            .await
+            .unwrap();
+        let principal = PrincipalId::new("P00000000000000000001").unwrap();
+        counter.store(0, Ordering::Relaxed);
+        let page = list_running_task_scopes(
+            &store.connection,
+            "ws_task",
+            &[thread.id.clone(), "missing-thread".into()],
+            &principal,
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "thin discovery and one bounded scope SELECT"
+        );
+        let filtered = list_running_task_scopes(
+            &store.connection,
+            "ws_task",
+            &["missing-thread".into()],
+            &principal,
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(filtered.scopes.is_empty());
+        assert_eq!(
+            filtered.after_task_id, page.after_task_id,
+            "discovery must progress even when every scope is filtered"
+        );
+        assert_eq!(page.scopes.len(), 1);
+        assert_eq!(
+            page.scopes[0].0.root_thread_id.as_deref(),
+            Some(thread.id.as_str())
+        );
+        assert!(
+            list_running_task_scopes(
+                &store.with_maintenance_access().connection,
+                "ws_task",
+                &[thread.id],
+                &principal,
+                page.after_task_id.as_deref().unwrap()
+            )
+            .await
+            .unwrap()
+            .scopes
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -45255,6 +48444,1414 @@ mod tests {
             outcome: None,
             observation: None,
         }
+    }
+
+    async fn episodic_requeue_source_fixture() -> (
+        CrudStore,
+        Thread,
+        Turn,
+        ThreadEpisodicIndexJobRecord,
+        Arc<OptionalDeliveryDatabaseObserver>,
+        OptionalDeliveryDatabasePath,
+    ) {
+        use pioneer_sqlite::{
+            SqliteDatabase, SqliteWriteExecutor, sqlite_read_only_connection_url,
+        };
+        use sea_orm::ConnectOptions;
+        let path = OptionalDeliveryDatabasePath(std::env::temp_dir().join(format!(
+            "pioneer-requeue-source-{}.sqlite",
+            uuid::Uuid::new_v4()
+        )));
+        let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.0.display()));
+        options.max_connections(1);
+        let writer = Database::connect(options).await.unwrap();
+        Migrator::up(&writer, None).await.unwrap();
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        let mut options = ConnectOptions::new(sqlite_read_only_connection_url(&path.0));
+        options.max_connections(2);
+        options.map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+        });
+        let reader = Database::connect(options).await.unwrap();
+        let observer = Arc::new(OptionalDeliveryDatabaseObserver::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            observer.clone(),
+        );
+        database.validate_reader().await.unwrap();
+        let store = CrudStore::new(database);
+        let now = unix_to_datetime(1_700_000_000);
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set("ws_requeue_source".to_owned()),
+            name: Set("Requeue source fixture".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(&store.connection)
+        .await
+        .unwrap();
+        let (store, thread, turn) = start_test_turn(
+            store,
+            "ws_requeue_source",
+            "thr_requeue_source",
+            "turn_requeue_source",
+        )
+        .await;
+        let item = TurnItem::UserMessage {
+            id: "requeue_source".to_owned(),
+            text: "A".to_owned(),
+            attachments: vec![],
+        };
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item.clone(),
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item,
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        let job = store
+            .list_thread_episodic_index_jobs_for_thread(&thread.workspace_id, &thread.id, 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let running = store
+            .with_maintenance_access()
+            .claim_thread_episodic_index_job_if_due(&job.id, 1_700_000_010, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.attempt_count, 1);
+        (store, thread, turn, running, observer, path)
+    }
+
+    #[tokio::test]
+    async fn episodic_requeue_and_canonical_snapshot_commits_are_serialized_in_both_orders() {
+        use pioneer_sqlite::{SqliteWriteClass, SqliteWriteEvent};
+        for snapshot_first in [true, false] {
+            let (store, thread, turn, running, observer, _path) =
+                episodic_requeue_source_fixture().await;
+            // Both contenders inherit Maintenance, so their explicit queue
+            // barriers establish FIFO order without timing or priority changes.
+            let maintenance = store.with_maintenance_access();
+            let blocker = store
+                .connection
+                .with_critical_writes()
+                .begin()
+                .await
+                .unwrap();
+            observer.events.lock().unwrap().clear();
+            observer.reads.lock().unwrap().clear();
+            let snapshot = async {
+                maintenance
+                    .materialize_item_snapshot_updated(
+                        ItemUpdatedNotification {
+                            workspace_id: thread.workspace_id.clone(),
+                            thread_id: thread.id.clone(),
+                            turn_id: turn.id.clone(),
+                            item: TurnItem::UserMessage {
+                                id: "requeue_source".to_owned(),
+                                text: "B".to_owned(),
+                                attachments: vec![],
+                            },
+                        },
+                        1_700_000_011,
+                    )
+                    .await
+            };
+            let requeue = async {
+                maintenance
+                    .requeue_thread_episodic_index_attempt(
+                        &running.id,
+                        running.attempt_count,
+                        1_700_000_012,
+                        Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                    )
+                    .await
+            };
+            tokio::pin!(snapshot, requeue);
+            // Poll the first contender until its writer reservation is known.
+            // Pending readers/CPU preparation complete outside that reservation.
+            if snapshot_first {
+                tokio::select! { biased;
+                    result = snapshot.as_mut() => panic!("snapshot bypassed occupied writer: {result:?}"),
+                    _ = observer.wait_for_enqueued(1) => {},
+                }
+                observer.reads.lock().unwrap().clear();
+                tokio::select! { biased;
+                    result = requeue.as_mut() => panic!("requeue bypassed occupied writer: {result:?}"),
+                    _ = observer.wait_for_enqueued(2) => {},
+                }
+            } else {
+                tokio::select! { biased;
+                    result = requeue.as_mut() => panic!("requeue bypassed occupied writer: {result:?}"),
+                    _ = observer.wait_for_enqueued(1) => {},
+                }
+                assert!(
+                    observer.reads.lock().unwrap().is_empty(),
+                    "the attempt guard must read under writer ownership, never the reader pool"
+                );
+                tokio::select! { biased;
+                    result = snapshot.as_mut() => panic!("snapshot bypassed occupied writer: {result:?}"),
+                    _ = observer.wait_for_enqueued(2) => {},
+                }
+            }
+            if snapshot_first {
+                assert!(
+                    observer.reads.lock().unwrap().is_empty(),
+                    "queued requeue must not read Running before the preceding source commit"
+                );
+            }
+            blocker.rollback().await.unwrap();
+            let (saved, requeued) = tokio::join!(snapshot, requeue);
+            saved.unwrap();
+            assert_eq!(
+                requeued.unwrap(),
+                if snapshot_first {
+                    ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+                } else {
+                    ThreadEpisodicIndexAttemptOutcome::Applied
+                }
+            );
+            let acquired = observer
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| {
+                    if let SqliteWriteEvent::Acquired { class, .. } = event {
+                        Some(*class)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                acquired,
+                vec![SqliteWriteClass::Maintenance; 2],
+                "each contender must keep a single writer reservation through its commit"
+            );
+            let current = store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut expected = running.clone();
+            if !snapshot_first {
+                expected.next_run_at = unix_to_datetime(1_700_000_012);
+            }
+            expected.status = ThreadEpisodicIndexJobStatus::Canceled;
+            expected.last_error = Some(THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR.to_owned());
+            expected.updated_at = unix_to_datetime(1_700_000_011);
+            expected.completed_at = Some(expected.updated_at);
+            assert_eq!(
+                current, expected,
+                "late requeue must preserve the entire canceled record"
+            );
+            let sources = store
+                .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 10)
+                .await
+                .unwrap();
+            assert_eq!(sources.len(), 2);
+            assert_eq!(
+                sources
+                    .iter()
+                    .find(|source| source.id == running.index_item_id)
+                    .unwrap()
+                    .status,
+                ThreadEpisodicItemStatus::Superseded
+            );
+            let replacement = sources
+                .iter()
+                .find(|source| source.status == ThreadEpisodicItemStatus::PendingIndex)
+                .unwrap();
+            let job = store
+                .find_thread_episodic_index_job_by_item(&replacement.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(job.id, running.id);
+            assert_eq!(job.status, ThreadEpisodicIndexJobStatus::Queued);
+            assert_eq!(job.attempt_count, 0);
+            assert_eq!(
+                store
+                    .get_turn_item(&turn.id, "requeue_source")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                TurnItem::UserMessage {
+                    id: "requeue_source".to_owned(),
+                    text: "B".to_owned(),
+                    attachments: vec![]
+                }
+            );
+            assert_eq!(
+                maintenance
+                    .requeue_thread_episodic_index_attempt(
+                        &running.id,
+                        running.attempt_count,
+                        1_700_000_013,
+                        Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                    )
+                    .await
+                    .unwrap(),
+                ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+            );
+            assert_eq!(
+                store
+                    .find_thread_episodic_index_job(&running.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                current
+            );
+            store.database_connection().close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn episodic_late_requeue_cannot_revive_user_exclusion_or_deletion() {
+        for deletion in [false, true] {
+            let (store, thread, turn, running, observer, _path) =
+                episodic_requeue_source_fixture().await;
+            let maintenance = store.with_maintenance_access();
+            let blocker = store
+                .connection
+                .with_critical_writes()
+                .begin()
+                .await
+                .unwrap();
+            observer.events.lock().unwrap().clear();
+            let suppress = async {
+                if deletion {
+                    maintenance
+                        .tombstone_thread_episodic_items_for_item(
+                            &thread.workspace_id,
+                            &thread.id,
+                            &turn.id,
+                            "requeue_source",
+                            1_700_000_011,
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    maintenance
+                        .exclude_thread_episodic_item(
+                            NewThreadEpisodicExclusionRecord {
+                                id: None,
+                                workspace_id: thread.workspace_id.clone(),
+                                thread_id: thread.id.clone(),
+                                index_item_id: running.index_item_id.clone(),
+                                reason: ThreadEpisodicExclusionReason::UserRequested,
+                                created_by: "test-user".to_owned(),
+                            },
+                            1_700_000_011,
+                        )
+                        .await
+                        .unwrap();
+                }
+            };
+            let requeue = maintenance.requeue_thread_episodic_index_attempt(
+                &running.id,
+                running.attempt_count,
+                1_700_000_012,
+                Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+            );
+            tokio::pin!(suppress, requeue);
+            tokio::select! { biased;
+                _ = suppress.as_mut() => panic!("suppression bypassed occupied writer"),
+                _ = observer.wait_for_enqueued(1) => {},
+            }
+            observer.reads.lock().unwrap().clear();
+            tokio::select! { biased;
+                result = requeue.as_mut() => panic!("requeue bypassed occupied writer: {result:?}"),
+                _ = observer.wait_for_enqueued(2) => {},
+            }
+            assert!(observer.reads.lock().unwrap().is_empty());
+            blocker.rollback().await.unwrap();
+            let (_, outcome) = tokio::join!(suppress, requeue);
+            assert_eq!(
+                outcome.unwrap(),
+                ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+            );
+            let mut expected = running.clone();
+            expected.status = ThreadEpisodicIndexJobStatus::Canceled;
+            expected.last_error = Some(
+                if deletion {
+                    THREAD_EPISODIC_USER_DELETED_ERROR
+                } else {
+                    THREAD_EPISODIC_USER_EXCLUDED_ERROR
+                }
+                .to_owned(),
+            );
+            expected.updated_at = unix_to_datetime(1_700_000_011);
+            expected.completed_at = Some(expected.updated_at);
+            assert_eq!(
+                store
+                    .find_thread_episodic_index_job(&running.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                expected
+            );
+            let source = store
+                .find_thread_episodic_item(&running.index_item_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                source.status,
+                if deletion {
+                    ThreadEpisodicItemStatus::Deleted
+                } else {
+                    ThreadEpisodicItemStatus::Excluded
+                }
+            );
+            assert!(
+                maintenance
+                    .list_due_thread_episodic_index_jobs_after(1_700_000_013, None, None, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            store.database_connection().close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn episodic_requeue_reason_is_atomic_and_cancellation_and_rollback_preserve_running() {
+        use pioneer_sqlite::{SqliteWriteClass, SqliteWriteEvent};
+        let (store, _thread, _turn, running, observer, _path) =
+            episodic_requeue_source_fixture().await;
+        let maintenance = store.with_maintenance_access();
+        let blocker = store
+            .connection
+            .with_critical_writes()
+            .begin()
+            .await
+            .unwrap();
+        observer.events.lock().unwrap().clear();
+        let work = tokio::spawn({
+            let store = maintenance.clone();
+            let running = running.clone();
+            async move {
+                store
+                    .requeue_thread_episodic_index_attempt(
+                        &running.id,
+                        running.attempt_count,
+                        1_700_000_012,
+                        Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                    )
+                    .await
+            }
+        });
+        observer.wait_for_enqueued(1).await;
+        work.abort();
+        assert!(work.await.unwrap_err().is_cancelled());
+        assert!(
+            observer
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event,
+            SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. }
+                if queue.maintenance == 0))
+        );
+        blocker.rollback().await.unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            running
+        );
+        assert_eq!(
+            maintenance
+                .requeue_thread_episodic_index_attempt(
+                    &running.id,
+                    running.attempt_count + 1,
+                    1_700_000_012,
+                    Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                )
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            running
+        );
+        // AFTER UPDATE makes the status/reason mutation occur before the forced
+        // rollback. No test-only pause or non-DB await is added inside the writer.
+        store.connection.execute_unprepared(
+            "CREATE TRIGGER reject_requeue_after_update AFTER UPDATE ON thread_episodic_index_jobs WHEN NEW.status = 'queued' BEGIN SELECT RAISE(ROLLBACK, 'controlled requeue rollback'); END"
+        ).await.unwrap();
+        assert!(
+            maintenance
+                .requeue_thread_episodic_index_attempt(
+                    &running.id,
+                    running.attempt_count,
+                    1_700_000_012,
+                    Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            running
+        );
+        store
+            .connection
+            .execute_unprepared("DROP TRIGGER reject_requeue_after_update")
+            .await
+            .unwrap();
+        observer.events.lock().unwrap().clear();
+        observer.reads.lock().unwrap().clear();
+        assert_eq!(
+            maintenance
+                .requeue_thread_episodic_index_attempt(
+                    &running.id,
+                    running.attempt_count,
+                    1_700_000_012,
+                    Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                )
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::Applied
+        );
+        assert!(
+            observer.reads.lock().unwrap().is_empty(),
+            "guarded reads use the transaction's writer"
+        );
+        let acquired = observer
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| {
+                if let SqliteWriteEvent::Acquired { class, .. } = event {
+                    Some(*class)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(acquired, vec![SqliteWriteClass::Maintenance]);
+        let mut expected = running.clone();
+        expected.status = ThreadEpisodicIndexJobStatus::Queued;
+        expected.next_run_at = unix_to_datetime(1_700_000_012);
+        expected.updated_at = expected.next_run_at;
+        expected.last_error = Some(THREAD_EPISODIC_PROJECTION_CHANGED_ERROR.to_owned());
+        expected.last_attempt_latency_ms = None;
+        expected.completed_at = None;
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+        // A stale repeated callback cannot reset delay, count or transition reason.
+        assert_eq!(
+            maintenance
+                .requeue_thread_episodic_index_attempt(
+                    &running.id,
+                    running.attempt_count,
+                    1_700_000_013,
+                    None,
+                )
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&running.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+        store
+            .connection
+            .begin()
+            .await
+            .unwrap()
+            .rollback()
+            .await
+            .unwrap();
+        store.database_connection().close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn episodic_direct_snapshot_is_atomic_and_idempotent_without_callback() {
+        let (store, thread, turn) =
+            test_store_with_started_turn("ws_source_save", "thr_source_save", "turn_source_save")
+                .await;
+        let make_item = |text: &str| TurnItem::UserMessage {
+            id: "source_save_item".to_owned(),
+            text: text.to_owned(),
+            attachments: vec![],
+        };
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: make_item("A"),
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        // No ingestor/callback is run. Snapshot save itself leaves durable work.
+        let update = |text: &str| ItemUpdatedNotification {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            item: make_item(text),
+        };
+        store
+            .materialize_item_snapshot_updated(update("B"), 1_700_000_011)
+            .await
+            .unwrap();
+        let rows = store
+            .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let job = store
+            .find_thread_episodic_index_job_by_item(&rows[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, ThreadEpisodicIndexJobStatus::Queued);
+        store
+            .materialize_item_snapshot_updated(update("B"), 1_700_000_099)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job_by_item(&rows[0].id)
+                .await
+                .unwrap()
+                .unwrap(),
+            job
+        );
+        store
+            .materialize_item_snapshot_updated(update("C"), 1_700_000_100)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_item(&rows[0].id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ThreadEpisodicItemStatus::Superseded
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ThreadEpisodicIndexJobStatus::Canceled
+        );
+        let current = store
+            .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.status == ThreadEpisodicItemStatus::PendingIndex)
+            .unwrap();
+        assert_eq!(
+            current.text_hash,
+            crate::thread_episodic_source::item_text_hash(
+                &crate::thread_episodic_source::committed_item_ingestion_input_from_parts(
+                    &thread.workspace_id,
+                    &thread.id,
+                    &turn.id,
+                    make_item("C")
+                )
+                .unwrap(),
+                "C"
+            )
+        );
+        assert!(
+            store
+                .find_thread_episodic_index_job_by_item(&current.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn episodic_direct_save_bookkeeping_failure_rolls_back_source_and_projection() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_source_rollback",
+            "thr_source_rollback",
+            "turn_source_rollback",
+        )
+        .await;
+        let item = |text: &str| TurnItem::UserMessage {
+            id: "rollback_source".to_owned(),
+            text: text.to_owned(),
+            attachments: vec![],
+        };
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item("before"),
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        let before = store
+            .get_turn_item(&turn.id, "rollback_source")
+            .await
+            .unwrap()
+            .unwrap();
+        // Fault injection belongs only to this fixture; production guards remain intact.
+        store.connection.execute_unprepared("CREATE TRIGGER fail_episodic_job BEFORE INSERT ON thread_episodic_index_jobs BEGIN SELECT RAISE(ABORT, 'bookkeeping failure'); END").await.unwrap();
+        store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item("after"),
+                },
+                1_700_000_011,
+            )
+            .await
+            .expect_err("source and job must be one atomic write set");
+        assert_eq!(
+            store
+                .get_turn_item(&turn.id, "rollback_source")
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert!(
+            store
+                .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_thread_episodic_index_jobs_for_thread(&thread.workspace_id, &thread.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn episodic_direct_save_revalidates_group_context_and_rolls_back() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_context_guard",
+            "thr_context_guard",
+            "turn_context_guard",
+        )
+        .await;
+        let item = |text: &str| TurnItem::AgentMessage {
+            id: "context_source".to_owned(),
+            text: text.to_owned(),
+            phase: AgentMessagePhase::FinalAnswer,
+            markdown: None,
+            markdown_version: None,
+        };
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item("before"),
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        let after = item("after");
+        let prepared = store
+            .prepare_episodic_source_save(&thread.workspace_id, &thread.id, &turn.id, &after)
+            .await
+            .unwrap();
+        let now = unix_to_datetime(1_700_000_011);
+        let projected = crate::repositories::turn::prepare_turn_item_projection(
+            &turn.id,
+            &after,
+            Some("completed"),
+            now,
+            now,
+        )
+        .unwrap();
+        let transaction = store.connection.begin().await.unwrap();
+        // A preceding write in the same transaction changes the causal group.
+        pioneer_entity::task_run_turn::Entity::insert(pioneer_entity::task_run_turn::ActiveModel {
+            id: Set("new_context_link".to_owned()),
+            task_id: Set("context_task".to_owned()),
+            run_id: Set("context_run".to_owned()),
+            execution_id: Set(None),
+            thread_id: Set(thread.id.clone()),
+            turn_id: Set(turn.id.clone()),
+            kind: Set("initial".to_owned()),
+            round: Set(0),
+            sequence: Set(0),
+            status: Set("candidate_created".to_owned()),
+            reviews_candidate_id: Set(None),
+            requested_by_candidate_id: Set(None),
+            requested_by_review_event_id: Set(None),
+            created_at: Set(now),
+            started_at: Set(None),
+            completed_at: Set(None),
+        })
+        .exec(&transaction)
+        .await
+        .unwrap();
+        crate::repositories::turn::upsert_prepared_turn_item(&transaction, projected)
+            .await
+            .unwrap();
+        let error = store
+            .commit_episodic_source_save(&transaction, &prepared, now)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("context changed before commit"));
+        transaction.rollback().await.unwrap();
+        assert_eq!(
+            store
+                .get_turn_item(&turn.id, "context_source")
+                .await
+                .unwrap()
+                .unwrap(),
+            item("before")
+        );
+        assert!(
+            store
+                .get_task_run_turn_by_turn(&thread.id, &turn.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .list_thread_episodic_index_jobs_for_thread(&thread.workspace_id, &thread.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn episodic_updated_delivery_and_task_projection_survive_missing_callback() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_source_delivery",
+            "thr_source_delivery",
+            "turn_source_delivery",
+        )
+        .await;
+        let item = |text: &str| TurnItem::AgentMessage {
+            id: "durable_source".to_owned(),
+            text: text.to_owned(),
+            phase: AgentMessagePhase::FinalAnswer,
+            markdown: None,
+            markdown_version: None,
+        };
+        let completed = ItemCompletedNotification {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            item: item("first"),
+        };
+        store
+            .materialize_task_delivery_item(
+                ItemStartedNotification {
+                    workspace_id: completed.workspace_id.clone(),
+                    thread_id: completed.thread_id.clone(),
+                    turn_id: completed.turn_id.clone(),
+                    item: completed.item.clone(),
+                },
+                completed,
+                1_700_000_010,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .materialize_item_updated(
+                ItemUpdatedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item("changed"),
+                },
+                1_700_000_011,
+            )
+            .await
+            .unwrap();
+        let maintenance = store.with_maintenance_access();
+        let first = maintenance
+            .claim_due_turn_event_deliveries("thread_episodic", 1_700_000_100, 10)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1); // Causal predecessor blocks the update delivery.
+        assert!(matches!(
+            first[0].event.payload,
+            CanonicalTurnEventPayload::ItemCompleted(_)
+        ));
+        let repeat = maintenance
+            .claim_due_turn_event_deliveries("thread_episodic", 1_700_001_100, 10)
+            .await
+            .unwrap();
+        assert_eq!(repeat.len(), 1);
+        assert_eq!(repeat[0].id, first[0].id);
+        assert_ne!(repeat[0].claim_token, first[0].claim_token);
+        assert!(
+            !maintenance
+                .complete_turn_event_delivery(&first[0].id, &first[0].claim_token, 1_700_001_100)
+                .await
+                .unwrap()
+        );
+        assert!(
+            maintenance
+                .complete_turn_event_delivery(&repeat[0].id, &repeat[0].claim_token, 1_700_001_100)
+                .await
+                .unwrap()
+        );
+        let next = maintenance
+            .claim_due_turn_event_deliveries("thread_episodic", 1_700_001_101, 10)
+            .await
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert!(matches!(
+            next[0].event.payload,
+            CanonicalTurnEventPayload::ItemUpdated(_)
+        ));
+        assert_eq!(
+            store
+                .get_turn_item(&turn.id, "durable_source")
+                .await
+                .unwrap()
+                .unwrap(),
+            item("changed")
+        );
+    }
+
+    #[tokio::test]
+    async fn episodic_delivery_waits_for_projection_replay() {
+        use pioneer_entity::{
+            turn_event_projection_state as receipt, turn_event_projection_stream_state as stream,
+        };
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_delivery_replay",
+            "thr_delivery_replay",
+            "turn_delivery_replay",
+        )
+        .await;
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: TurnItem::UserMessage {
+                        id: "replay_source".to_owned(),
+                        text: "durable source".to_owned(),
+                        attachments: vec![],
+                    },
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        let event =
+            crate::repositories::turn_event::latest_event_for_turn(&store.connection, &turn.id)
+                .await
+                .unwrap()
+                .unwrap();
+        receipt::Entity::update_many()
+            .filter(receipt::Column::EventId.eq(event.id.clone()))
+            .col_expr(receipt::Column::Status, Expr::value("pending"))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        stream::Entity::update_many()
+            .filter(stream::Column::TurnId.eq(turn.id.clone()))
+            .col_expr(
+                stream::Column::ProjectedThroughSequence,
+                Expr::value(event.sequence - 1),
+            )
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .claim_due_turn_event_deliveries("thread_episodic", 1_700_000_100, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .replay_due_turn_event_projections(1_700_000_100, 10)
+                .await
+                .unwrap()
+                .projected,
+            1
+        );
+        let delivered = store
+            .claim_due_turn_event_deliveries("thread_episodic", 1_700_000_101, 10)
+            .await
+            .unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].event.id, event.id);
+    }
+
+    #[tokio::test]
+    async fn episodic_canonical_payload_repair_commits_job_and_fences_stale_payload() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_source_repair",
+            "thr_source_repair",
+            "turn_source_repair",
+        )
+        .await;
+        let item = |text: &str| TurnItem::UserMessage {
+            id: "repair_source".to_owned(),
+            text: text.to_owned(),
+            attachments: vec![],
+        };
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item("before"),
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        let row =
+            crate::repositories::turn::find_turn_item(&store.connection, &turn.id, "repair_source")
+                .await
+                .unwrap()
+                .unwrap();
+        let payload = serde_json::to_string(&item("repaired")).unwrap();
+        let episodic = store
+            .prepare_terminal_payload_episodic_save(&row, &payload)
+            .await
+            .unwrap()
+            .unwrap();
+        let transaction = store.connection.begin().await.unwrap();
+        assert!(
+            store
+                .apply_one_terminal_turn_item_payload_repair(
+                    &transaction,
+                    &row,
+                    &payload,
+                    Some(&episodic)
+                )
+                .await
+                .unwrap()
+        );
+        transaction.commit().await.unwrap();
+        let jobs = store
+            .list_thread_episodic_index_jobs_for_thread(&thread.workspace_id, &thread.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Queued);
+        let stale_payload = serde_json::to_string(&item("stale repair")).unwrap();
+        let stale = store
+            .prepare_terminal_payload_episodic_save(&row, &stale_payload)
+            .await
+            .unwrap()
+            .unwrap();
+        let transaction = store.connection.begin().await.unwrap();
+        assert!(
+            !store
+                .apply_one_terminal_turn_item_payload_repair(
+                    &transaction,
+                    &row,
+                    &stale_payload,
+                    Some(&stale)
+                )
+                .await
+                .unwrap()
+        );
+        transaction.commit().await.unwrap();
+        assert_eq!(
+            store
+                .get_turn_item(&turn.id, "repair_source")
+                .await
+                .unwrap()
+                .unwrap(),
+            item("repaired")
+        );
+        assert_eq!(
+            store
+                .list_thread_episodic_index_jobs_for_thread(&thread.workspace_id, &thread.id, 10)
+                .await
+                .unwrap(),
+            jobs
+        );
+    }
+
+    #[tokio::test]
+    async fn episodic_model_reset_commits_cursor_with_replacement_and_preserves_budget_on_restart()
+    {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_reset_cursor",
+            "thr_reset_cursor",
+            "turn_reset_cursor",
+        )
+        .await;
+        let mut originals = Vec::new();
+        for index in 0..34 {
+            let item = TurnItem::UserMessage {
+                id: format!("reset_{index:02}"),
+                text: format!("reset source {index}"),
+                attachments: vec![],
+            };
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn.id.clone(),
+                        item: item.clone(),
+                    },
+                    1_700_010_000,
+                )
+                .await
+                .unwrap();
+            store
+                .materialize_item_snapshot_updated(
+                    ItemUpdatedNotification {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn.id.clone(),
+                        item,
+                    },
+                    1_700_010_001,
+                )
+                .await
+                .unwrap();
+        }
+        let sources = store
+            .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 100)
+            .await
+            .unwrap();
+        for source in &sources {
+            originals.push(
+                store
+                    .find_thread_episodic_index_job_by_item(&source.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let key = thread_episodic_projection_reset_key(&thread.workspace_id).unwrap();
+        let now = unix_to_datetime(1_700_010_002);
+        upsert_projection_meta_with_config(
+            &store.database_connection(),
+            ProjectionMetaRecord {
+                projection_key: key.clone(),
+                projection_version: 1,
+                status: PROJECTION_META_STATUS_PENDING.to_owned(),
+                source_thread_count: 0,
+                source_turn_count: 0,
+                source_turn_item_count: 0,
+                source_turn_event_count: 0,
+                last_error: None,
+                backfill_started_at: Some(now),
+                backfilled_at: None,
+                created_at: now,
+                updated_at: now,
+            },
+            ProjectionMetaConfigRecord {
+                projection_config_hash: Some("model-b-reset".to_owned()),
+                projection_config_json: Some(
+                    serde_json::to_string(&ThreadEpisodicProjectionResetProgress::default())
+                        .unwrap(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+        // The first quantum commits. The next source forces rollback of its
+        // replacement and cursor together, simulating interruption mid-reset.
+        store.database_connection().execute_unprepared("CREATE TRIGGER reject_second_reset_batch BEFORE UPDATE ON thread_episodic_items WHEN OLD.item_id = 'reset_32' BEGIN SELECT RAISE(ABORT, 'controlled reset bookkeeping failure'); END").await.unwrap();
+        assert!(
+            store
+                .with_maintenance_access()
+                .reset_thread_episodic_projection(&thread.workspace_id, 1_700_010_002)
+                .await
+                .is_err()
+        );
+        let progress: ThreadEpisodicProjectionResetProgress = serde_json::from_str(
+            find_projection_meta(&store.database_connection(), &key)
+                .await
+                .unwrap()
+                .unwrap()
+                .projection_config_json
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(progress.files_cleaned);
+        assert_eq!(progress.after_source.as_ref().unwrap()[2], "reset_31");
+        let mut prefix = Vec::new();
+        for source in &sources {
+            let job = store
+                .find_thread_episodic_index_job_by_item(&source.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let original = originals
+                .iter()
+                .find(|old| old.index_item_id == source.id)
+                .unwrap();
+            if source.item_id.as_str() < "reset_32" {
+                assert_ne!(job.id, original.id);
+                assert_eq!(job.attempt_count, 0);
+                prefix.push(job);
+            } else {
+                assert_eq!(&job, original);
+            }
+        }
+        assert_eq!(prefix.len(), 32);
+        store
+            .database_connection()
+            .execute_unprepared("DROP TRIGGER reject_second_reset_batch")
+            .await
+            .unwrap();
+        store
+            .with_maintenance_access()
+            .reset_thread_episodic_projection(&thread.workspace_id, 1_700_010_003)
+            .await
+            .unwrap();
+        for job in &prefix {
+            assert_eq!(
+                store
+                    .find_thread_episodic_index_job(&job.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                *job
+            );
+        }
+        let replacement = store
+            .find_thread_episodic_index_job_by_item(&originals[0].index_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(replacement.id, originals[0].id);
+        let claim = store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                &thread.workspace_id,
+                1_700_010_004,
+                1,
+                5,
+            )
+            .await
+            .unwrap()
+            .assert_no_failures_for_test()
+            .pop()
+            .unwrap();
+        store
+            .fail_thread_episodic_index_attempt_without_source_validation(
+                &claim.id,
+                claim.attempt_count,
+                ThreadEpisodicIndexJobFailureUpdate {
+                    retryable: false,
+                    next_run_at_unix: None,
+                    last_error: Some("new model exhausted".to_owned()),
+                    capacity_error: false,
+                    last_attempt_latency_ms: None,
+                },
+                1_700_010_004,
+            )
+            .await
+            .unwrap();
+        let exhausted = store
+            .find_thread_episodic_index_job(&claim.id)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .with_maintenance_access()
+            .reset_thread_episodic_projection(&thread.workspace_id, 1_700_010_005)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&claim.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            exhausted
+        );
+        assert_eq!(exhausted.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(exhausted.attempt_count, 1);
+        assert_eq!(
+            store
+                .fail_thread_episodic_index_attempt_without_source_validation(
+                    &originals[0].id,
+                    1,
+                    ThreadEpisodicIndexJobFailureUpdate {
+                        retryable: true,
+                        next_run_at_unix: Some(1_700_010_100),
+                        last_error: Some("old callback".to_owned()),
+                        capacity_error: false,
+                        last_attempt_latency_ms: None
+                    },
+                    1_700_010_005
+                )
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+    }
+
+    #[tokio::test]
+    async fn episodic_started_update_does_not_complete_or_index_draft() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_source_draft",
+            "thr_source_draft",
+            "turn_source_draft",
+        )
+        .await;
+        let item = TurnItem::AgentMessage {
+            id: "draft_source".to_owned(),
+            text: "unfinished final answer".to_owned(),
+            phase: AgentMessagePhase::FinalAnswer,
+            markdown: None,
+            markdown_version: None,
+        };
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: item.clone(),
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        let update = ItemUpdatedNotification {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            item: item.clone(),
+        };
+        store
+            .materialize_item_updated(update.clone(), 1_700_000_011)
+            .await
+            .unwrap();
+        store
+            .materialize_item_snapshot_updated(update, 1_700_000_012)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .get_thread_episodic_canonical_item(
+                    &thread.workspace_id,
+                    &thread.id,
+                    &turn.id,
+                    "draft_source"
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .committed
+        );
+        assert!(
+            store
+                .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item,
+                },
+                1_700_000_013,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_thread_episodic_canonical_item(
+                    &thread.workspace_id,
+                    &thread.id,
+                    &turn.id,
+                    "draft_source"
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .committed
+        );
     }
 
     #[tokio::test]
@@ -45986,6 +50583,212 @@ mod tests {
                 .count(),
             2,
             "turn/items must still read full durable item events"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_interruption_during_projection_preserves_canonical_acceptance() {
+        let workspace_id = "ws_interruption_projection_race";
+        let thread_id = "thr_interruption_projection_race";
+        let turn_id = "turn_interruption_projection_race";
+        let store = test_store_with_workspace(workspace_id).await;
+        let timestamp = 1_700_000_000;
+        let thread = sample_thread(workspace_id, thread_id, timestamp);
+        let turn = sample_turn(turn_id);
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .unwrap();
+        let db = store.database_connection();
+        db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal,priority,revision,created_at,updated_at) VALUES('stop-task',?1,'workspace',?1,'system','running','Stop task','Goal',0,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [workspace_id.into()])).await.unwrap();
+        db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,created_at,updated_at) VALUES('stop-run','stop-task','stop-run',1,1,'running','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('stop-binding','stop-task','stop-run',?,?,'initial',0,0,'in_progress',CURRENT_TIMESTAMP)", [thread_id.into(),turn_id.into()])).await.unwrap();
+        let mut turn = store.get_turn(thread_id, turn_id).await.unwrap().unwrap().1;
+        turn.status = TurnStatus::Interrupted;
+        turn.error = Some("cancel with pending heartbeat writer".to_owned());
+        let event = CanonicalTurnEventPayload::TurnFailed(TurnFailedNotification {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn: turn.clone(),
+        });
+        let context = super::TurnEventProjectionContext {
+            item_started_deadlines: None,
+            enqueue_optional_deliveries: true,
+            native_cancellation: None,
+            unactivated_terminal: None,
+            cancellation_actor_id: Some("P00000000000000000001".into()),
+        };
+        // Stop the first producer at the real append/projection boundary.
+        // A CLI cancellation before runtime binding has no native receipt;
+        // cleanup can concurrently replay this same terminal notification.
+        let appended = store
+            .append_claimed_turn_event_projection_once(
+                event.clone(),
+                unix_to_datetime(timestamp + 1),
+                context.clone(),
+                "interruption_projection_owner".to_owned(),
+                unix_to_datetime(timestamp + 61),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(appended.was_inserted);
+        let saved = pioneer_entity::task_run_cancellation_actor::Entity::find_by_id("stop-run")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.principal_id, "P00000000000000000001");
+        assert!(
+            pioneer_entity::task_run_read::Entity::find()
+                .all(&db)
+                .await
+                .unwrap()
+                .is_empty(),
+            "canonical interruption alone is not a terminal run receipt"
+        );
+
+        assert_eq!(appended.sequence, 2);
+        assert!(
+            store
+                .native_cancellation_context(turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let duplicate_error = store
+            .materialize_native_agent_turn_event(event.clone(), timestamp + 2, None)
+            .await
+            .expect_err("projection remains pending behind the original producer");
+        assert!(
+            duplicate_error
+                .downcast_ref::<super::TurnEventProjectionAfterAppendError>()
+                .expect("typed after-append outcome")
+                .is_pending()
+        );
+        assert!(
+            super::turn_event_was_appended_before_error(&duplicate_error),
+            "Gateway must preserve the terminal state and ACK the already committed event"
+        );
+        assert_eq!(
+            store
+                .get_turn(thread_id, turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::InProgress,
+            "duplicate acceptance must not pretend the read model was projected"
+        );
+        assert_eq!(
+            pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
+                .count(&store.connection)
+                .await
+                .unwrap(),
+            2,
+            "duplicate cancellation must not append a second terminal event"
+        );
+
+        let mut conflicting_turn = turn.clone();
+        conflicting_turn.status = TurnStatus::Completed;
+        conflicting_turn.error = None;
+        let conflict_error = store
+            .materialize_native_agent_turn_event(
+                CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: conflicting_turn,
+                }),
+                timestamp + 3,
+                None,
+            )
+            .await
+            .expect_err("a different terminal result must still fail before append");
+        assert!(!super::turn_event_was_appended_before_error(
+            &conflict_error
+        ));
+
+        assert!(matches!(
+            store
+                .project_claimed_turn_event_once(
+                    appended,
+                    context,
+                    "interruption_projection_owner".to_owned(),
+                    unix_to_datetime(timestamp + 4),
+                )
+                .await
+                .unwrap(),
+            super::TurnEventProjectionOutcome::Projected
+        ));
+        assert_eq!(
+            store.get_turn(thread_id, turn_id).await.unwrap().unwrap().1,
+            turn,
+            "original producer must retain its projection claim and finish normally"
+        );
+        store
+            .materialize_native_agent_turn_event_owned_as(
+                event,
+                timestamp + 5,
+                None,
+                "synthetic-owner",
+                Some("P00000000000000000002".into()),
+            )
+            .await
+            .expect("replay cannot replace the accepted cancellation actor");
+        let replayed_actor =
+            pioneer_entity::task_run_cancellation_actor::Entity::find_by_id("stop-run")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            replayed_actor.principal_id, saved.principal_id,
+            "replay cannot reattribute the accepted Stop"
+        );
+        // Model a crash after per-turn reconciliation and before terminal Run
+        // commit. Discovery and the subsequent commit use only durable state.
+        db.execute_unprepared(
+            "UPDATE task_run_turn SET status='cancelled' WHERE id='stop-binding'",
+        )
+        .await
+        .unwrap();
+        let pending = store
+            .list_unreconciled_terminal_task_child_turns(10)
+            .await
+            .unwrap();
+        assert!(pending.iter().any(|pending| pending.turn_id == turn_id));
+        store
+            .append_task_cancellation_events(
+                vec![pioneer_protocol::TaskEventPayload::RunCancelled {
+                    task_id: "stop-task".into(),
+                    run_id: "stop-run".into(),
+                    reason: Some("durable replay".into()),
+                    cancelled_at: timestamp + 6,
+                }],
+                timestamp + 6,
+                None,
+            )
+            .await
+            .unwrap();
+        let receipts = pioneer_entity::task_run_read::Entity::find()
+            .all(&db)
+            .await
+            .unwrap();
+        assert!(
+            receipts.is_empty(),
+            "an independent TaskService system cancellation cannot inherit a pending Stop actor; only deferred terminal reconciliation uses that attribution"
         );
     }
 
@@ -48398,6 +53201,7 @@ mod tests {
                 &transaction,
                 &stale_row,
                 stale_repair.as_str(),
+                None,
             )
             .await
             .expect("stale conditional repair should execute safely");
@@ -53045,6 +57849,7 @@ mod tests {
 
         let actor = PersistedActorRef::Principal(principal_id.clone());
         let author = pioneer_protocol::TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: actor.clone(),
             display_name: "Author".to_owned(),
             nickname: "author".to_owned(),
@@ -53158,6 +57963,7 @@ mod tests {
             PrincipalId::new("P00000000000000000001").expect("principal id should be valid");
         let principal_actor = PersistedActorRef::Principal(principal_id.clone());
         let principal_author = pioneer_protocol::TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: principal_actor.clone(),
             display_name: "Principal".to_owned(),
             nickname: "principal".to_owned(),
@@ -53190,6 +57996,7 @@ mod tests {
             event_thread.preview = format!("message from {suffix}");
             let expected_read_author = match (&actor, &author) {
                 (PersistedActorRef::System, None) => Some(pioneer_protocol::TurnAuthorSnapshot {
+                    cli_runtime_kind: None,
                     actor: PersistedActorRef::System,
                     display_name: "System".to_owned(),
                     nickname: "system".to_owned(),
@@ -53336,6 +58143,7 @@ mod tests {
         thread.updated_at = timestamp + 1;
         let permission_profile = pioneer_protocol::default_turn_permission_profile_snapshot();
         let author_snapshot = pioneer_protocol::TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(author.clone()),
             display_name: "Author".to_owned(),
             nickname: "author".to_owned(),
@@ -54070,6 +58878,7 @@ mod tests {
 
         let error = store
             .mark_thread_read(super::MarkThreadReadRequest {
+                through_block: None,
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 principal_id: member_id,
@@ -54211,6 +59020,75 @@ mod tests {
             permission_profile.effective_policy,
             ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
         );
+    }
+
+    #[tokio::test]
+    async fn agent_activation_claim_rechecks_lease_after_waiting_for_writer() {
+        use crate::{
+            NewTurnExecution, TurnExecutionStatus, TurnExecutorKind, repositories::turn_execution,
+            utc_now,
+        };
+
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_activation_lease",
+            "thr_activation_lease",
+            "turn_activation_lease",
+        )
+        .await;
+        let now = utc_now();
+        let owner = turn_execution::insert_immutable(
+            &store.connection,
+            NewTurnExecution {
+                turn_id: turn.id.clone(),
+                thread_id: thread.id,
+                workspace_id: thread.workspace_id,
+                executor_kind: TurnExecutorKind::ApiProvider,
+                executor_key: Some("openai".to_owned()),
+                status: TurnExecutionStatus::Starting,
+                owner_id: "activation-owner".to_owned(),
+                lease_until: now + chrono::Duration::seconds(2),
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        let writer = store.connection.begin().await.unwrap();
+        let mut claim = Box::pin(store.claim_unactivated_agent_turn(&owner));
+        // Use the existing queued-future synchronization pattern: first prove
+        // that activation is waiting for the occupied writer with a live lease.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(claim.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(utc_now() < owner.lease_until);
+        // Deliberately retain this fixture's writer across the lease boundary;
+        // the waiter must evaluate time only after that writer is released.
+        tokio::time::sleep(
+            (owner.lease_until - utc_now()).to_std().unwrap_or_default()
+                + std::time::Duration::from_millis(1),
+        )
+        .await;
+        writer.rollback().await.unwrap();
+        assert!(!claim.await.unwrap());
+        let unchanged = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.status, TurnExecutionStatus::Starting);
+        assert_eq!(unchanged.owner_generation, owner.owner_generation);
+        assert!(unchanged.started_at.is_none());
+
+        // An actually renewed lease can be claimed once; a duplicate claim
+        // still cannot reuse the starting receipt.
+        store
+            .heartbeat_turn_executions_owned_by("activation-owner", 2)
+            .await
+            .unwrap();
+        let renewed = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert!(store.claim_unactivated_agent_turn(&renewed).await.unwrap());
+        let activated = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert_eq!(activated.status, TurnExecutionStatus::Starting);
+        assert!(activated.started_at.is_some());
+        assert_eq!(activated.owner_generation, renewed.owner_generation);
+        assert!(!store.claim_unactivated_agent_turn(&renewed).await.unwrap());
     }
 
     #[tokio::test]
@@ -54944,6 +59822,13 @@ mod tests {
             .await
             .expect("default-effort conversation turn should persist");
 
+        let listed = store
+            .list_threads_for_workspace(workspace_id, 10)
+            .await
+            .unwrap();
+        assert!(listed[0].reasoning_effort.is_none());
+        assert_eq!(listed[0].turns[0].id, default_effort_turn.id);
+
         let latest_task_run_thread = Thread {
             updated_at: second_timestamp + 3,
             ..default_effort_thread
@@ -54987,6 +59872,573 @@ mod tests {
         assert_eq!(fetched.turns.len(), 1);
         assert_eq!(fetched.turns[0].id, latest_task_run_turn.id);
         assert_eq!(fetched.turns[0].turn_kind, TurnKind::TaskRun);
+        let listed = store
+            .list_threads_for_workspace(workspace_id, 10)
+            .await
+            .unwrap();
+        assert!(listed[0].reasoning_effort.is_none());
+        assert_eq!(listed[0].turns[0].id, latest_task_run_turn.id);
+        assert_eq!(listed[0].turns[0].turn_kind, TurnKind::TaskRun);
+    }
+
+    pub(crate) fn assert_thread_turn_snapshot_statements(
+        statements: &[Statement],
+        threads: &[Thread],
+    ) {
+        // The only other statement is the original thread-list selector. Any
+        // per-thread selector, history/event load or transaction is a failure.
+        let mut statements = statements.iter();
+        assert!(statements.next().unwrap().sql.contains("thread"));
+        for batch in threads.chunks(turn::THREAD_TURN_SNAPSHOT_BATCH_SIZE) {
+            let latest = statements.next().expect("one latest-Turn batch query");
+            assert_thread_turn_snapshot_statement(latest, false);
+            assert_eq!(
+                latest.values.as_ref().unwrap().0,
+                batch
+                    .iter()
+                    .map(|thread| thread.id.clone().into())
+                    .collect::<Vec<sea_orm::Value>>()
+            );
+            let fallback_ids = batch
+                .iter()
+                .filter(|thread| {
+                    thread
+                        .turns
+                        .first()
+                        .is_some_and(|turn| turn.turn_kind != TurnKind::Conversation)
+                })
+                .map(|thread| thread.id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            if !fallback_ids.is_empty() {
+                let fallback = statements
+                    .next()
+                    .expect("one Conversation fallback batch query");
+                assert_thread_turn_snapshot_statement(fallback, true);
+                let values = &fallback.values.as_ref().unwrap().0;
+                assert_eq!(values.last(), Some(&sea_orm::Value::from("conversation")));
+                assert_eq!(values.len(), fallback_ids.len() + 1);
+                // SQL result order is deliberately irrelevant to list order.
+                for id in fallback_ids {
+                    assert!(values[..values.len() - 1].contains(&id.into()));
+                }
+            }
+        }
+        assert!(
+            statements.next().is_none(),
+            "no individual Turn or extra history queries"
+        );
+    }
+
+    fn assert_thread_turn_snapshot_statement(statement: &Statement, conversation_only: bool) {
+        let sql = &statement.sql;
+        assert!(sql.starts_with("WITH selected(thread_id) AS (VALUES "));
+        assert!(sql.contains("SELECT latest.* FROM selected CROSS JOIN turn AS latest"));
+        assert!(sql.contains("INDEXED BY idx_turn_thread_created_id"));
+        assert!(sql.contains("candidate.thread_id = selected.thread_id"));
+        assert!(sql.contains("ORDER BY candidate.created_at DESC, candidate.id DESC LIMIT 1"));
+        assert_eq!(
+            sql.contains("AND candidate.turn_kind = ?"),
+            conversation_only
+        );
+        assert!(!sql.contains("reasoning_effort IS NOT NULL"));
+        let id_count = statement.values.as_ref().unwrap().0.len() - usize::from(conversation_only);
+        assert!((1..=128).contains(&id_count));
+        assert_eq!(sql.matches("(?)").count(), id_count);
+    }
+
+    #[tokio::test]
+    async fn thread_list_batches_preserve_order_limit_effort_and_snapshot_metadata() {
+        let mut connection = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+        let statements = Arc::new(std::sync::Mutex::new(Vec::<Statement>::new()));
+        connection.set_metric_callback({
+            let statements = statements.clone();
+            move |info| statements.lock().unwrap().push(info.statement.clone())
+        });
+        let store = CrudStore::new(connection);
+        store.connection.execute_unprepared(
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws_batch','Batch',1,1)"
+        ).await.unwrap();
+        for index in 0..231 {
+            let thread_id = format!("H{index:020}");
+            store.connection.execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,created_at,updated_at) \
+                 VALUES (?,'ws_batch','preview','agent','model','provider','idle',?,?)",
+                vec![thread_id.clone().into(), unix_to_datetime(1_700_000_000 + index).into(),
+                     unix_to_datetime(1_700_000_000 + index).into()],
+            )).await.unwrap();
+            let turns: Vec<(&str, &str, Option<&str>, i64)> = match index % 6 {
+                0 => vec![],
+                1 => vec![
+                    ("z", "conversation", Some("low"), 0),
+                    ("a", "conversation", Some("high"), 0),
+                    ("t", "task_run", Some("high"), 2),
+                ],
+                2 => vec![
+                    ("a", "conversation", Some("high"), 0),
+                    ("b", "conversation", None, 1),
+                    ("t", "task_run", Some("high"), 2),
+                ],
+                3 => vec![("t", "task_run", Some("high"), 2)],
+                // Insert z before a: equal timestamps must use ID DESC, not insertion order.
+                4 => vec![
+                    ("z", "conversation", Some("low"), 1),
+                    ("a", "conversation", Some("high"), 1),
+                ],
+                _ => vec![("a", "conversation", Some("high"), 0)],
+            };
+            for (suffix, kind, effort, offset) in turns {
+                store.connection.execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO turn(id,thread_id,status,turn_kind,origin,reasoning_effort,created_at,updated_at) \
+                     VALUES (?,?,'in_progress',?,'user',?,?,?)",
+                    vec![format!("T{index:019}{suffix}").into(), thread_id.clone().into(), kind.into(), effort.into(),
+                         unix_to_datetime(1_700_000_000 + offset).into(), unix_to_datetime(1_700_000_000 + offset).into()],
+                )).await.unwrap();
+            }
+        }
+        let permission_profile = TurnPermissionProfileSnapshot::from_mode(
+            TurnPermissionMode::Supervised,
+            TurnPermissionProfileSource::Composer,
+        );
+        let rich_turn_id = format!("T{:019}t", 229);
+        let reply_id = format!("T{:019}a", 229);
+        let mention = TurnMention {
+            principal_id: PrincipalId::new("P00000000000000000001").unwrap(),
+            nickname: "member".to_owned(),
+        };
+        store.connection.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE turn SET origin='detached_task', send_mode='message', \
+             initiated_by_actor_kind='system', author_display_name_snapshot='Batch Author', \
+             author_nickname_snapshot='batch_author', author_avatar_revision_snapshot='avatar-7', \
+             reply_to_turn_id=?, mentions_json=?, message_revision=3, message_deleted_at=created_at, \
+             error='snapshot error', prompt_manifest_json='broken ignored manifest', \
+             permission_profile_snapshot_json=? WHERE id=?",
+            vec![reply_id.clone().into(), serde_json::to_string(&vec![mention.clone()]).unwrap().into(),
+                 serde_json::to_string(&permission_profile).unwrap().into(), rich_turn_id.clone().into()],
+        )).await.unwrap();
+
+        // At 129, the second batch contains only thread 102, which has no Turns.
+        // At 130, it also contains thread 101, whose latest Turn is Conversation.
+        // Neither needs a fallback query; at 132, TaskRun thread 99 does.
+        for (limit, expected_turn_queries) in [
+            (0, 0),
+            (1, 2),
+            (128, 2),
+            (129, 3),
+            (130, 3),
+            (132, 4),
+            (231, 4),
+        ] {
+            statements.lock().unwrap().clear();
+            let threads = store
+                .list_threads_for_workspace("ws_batch", limit)
+                .await
+                .unwrap();
+            assert_eq!(threads.len(), limit as usize);
+            let recorded = statements.lock().unwrap().clone();
+            assert_eq!(
+                recorded.len(),
+                1 + expected_turn_queries,
+                "unexpected query count for limit {limit}"
+            );
+            assert_thread_turn_snapshot_statements(&recorded, &threads);
+            for (position, thread) in threads.iter().enumerate() {
+                let index = 230 - position;
+                assert_eq!(thread.id, format!("H{index:020}"));
+                assert_eq!(thread.model, "model");
+                assert_eq!(thread.model_provider, "provider");
+                assert_eq!(
+                    thread.status,
+                    ThreadStatus::Idle,
+                    "TaskRun must not activate foreground"
+                );
+                let (suffix, effort, kind) = match index % 6 {
+                    0 => {
+                        assert!(thread.turns.is_empty());
+                        assert!(thread.reasoning_effort.is_none());
+                        continue;
+                    }
+                    1 => ("t", Some("low"), TurnKind::TaskRun),
+                    2 | 3 => ("t", None, TurnKind::TaskRun),
+                    4 => ("z", Some("low"), TurnKind::Conversation),
+                    _ => ("a", Some("high"), TurnKind::Conversation),
+                };
+                assert_eq!(thread.reasoning_effort.as_deref(), effort);
+                assert_eq!(thread.turns.len(), 1);
+                assert_eq!(thread.turns[0].id, format!("T{index:019}{suffix}"));
+                assert_eq!(thread.turns[0].turn_kind, kind);
+                assert!(thread.turns[0].prompt_manifest.is_none());
+                if index == 229 {
+                    let snapshot = &thread.turns[0];
+                    assert_eq!(snapshot.permission_profile, permission_profile);
+                    assert_eq!(snapshot.origin, TurnOrigin::DetachedTask);
+                    assert_eq!(snapshot.mode, ThreadMode::Message);
+                    let author = snapshot.author.as_ref().unwrap();
+                    assert_eq!(author.actor, PersistedActorRef::System);
+                    assert_eq!(author.display_name, "Batch Author");
+                    assert_eq!(author.nickname, "batch_author");
+                    assert_eq!(author.avatar_revision.as_deref(), Some("avatar-7"));
+                    assert_eq!(
+                        snapshot.reply_to_turn_id.as_deref(),
+                        Some(reply_id.as_str())
+                    );
+                    assert_eq!(snapshot.mentions, vec![mention.clone()]);
+                    assert_eq!(snapshot.message_revision, 3);
+                    assert!(snapshot.message_deleted);
+                    assert_eq!(snapshot.error.as_deref(), Some("snapshot error"));
+                }
+            }
+        }
+        statements.lock().unwrap().clear();
+        assert!(
+            store
+                .list_threads_for_workspace("missing", 231)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(statements.lock().unwrap().len(), 1);
+
+        // A skipped thread model must never be included in the selected-ID batch.
+        store
+            .connection
+            .execute_unprepared("UPDATE thread SET mode='unknown' WHERE id='H00000000000000000230'")
+            .await
+            .unwrap();
+        statements.lock().unwrap().clear();
+        let threads = store
+            .list_threads_for_workspace("ws_batch", 1)
+            .await
+            .unwrap();
+        assert!(threads.is_empty());
+        assert_eq!(statements.lock().unwrap().len(), 1);
+
+        // Unknown Turn status still suppresses its snapshot, including effort;
+        // malformed selected snapshot metadata still fails through the old decoder.
+        store
+            .connection
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE turn SET status='unknown' WHERE id=?",
+                [rich_turn_id.clone().into()],
+            ))
+            .await
+            .unwrap();
+        let threads = store
+            .list_threads_for_workspace("ws_batch", 2)
+            .await
+            .unwrap();
+        assert_eq!(threads.len(), 1);
+        assert!(threads[0].turns.is_empty());
+        assert!(threads[0].reasoning_effort.is_none());
+        for corrupt_column in ["permission_profile_snapshot_json", "mentions_json"] {
+            store
+                .connection
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    format!(
+                        "UPDATE turn SET status='in_progress', {corrupt_column}='broken' WHERE id=?"
+                    ),
+                    [rich_turn_id.clone().into()],
+                ))
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .list_threads_for_workspace("ws_batch", 2)
+                    .await
+                    .is_err()
+            );
+            store.connection.execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE turn SET permission_profile_snapshot_json=?, mentions_json='[]' WHERE id=?",
+                [serde_json::to_string(&permission_profile).unwrap().into(), rich_turn_id.clone().into()],
+            )).await.unwrap();
+        }
+    }
+
+    #[derive(Default)]
+    struct ThreadSnapshotReadObserver {
+        events: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>,
+        enqueued: tokio::sync::Notify,
+    }
+
+    impl pioneer_sqlite::SqliteReadObserver for ThreadSnapshotReadObserver {
+        fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+            self.events.lock().unwrap().push(event);
+            if matches!(
+                event,
+                pioneer_sqlite::SqliteReadEvent::AdmissionEnqueued { .. }
+            ) {
+                self.enqueued.notify_one();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_turn_snapshot_batches_use_scoped_readers_and_release_cancelled_capacity() {
+        use pioneer_sqlite::{
+            SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadOutcome,
+            SqliteWriteExecutor, sqlite_connection_url, sqlite_read_only_connection_url,
+        };
+        use sea_orm::{ConnectOptions, StreamTrait};
+        use std::time::Duration;
+        let path = OptionalDeliveryDatabasePath(std::env::temp_dir().join(format!(
+            "pioneer-thread-snapshot-{}.sqlite",
+            generate_id(12),
+        )));
+        let mut options = ConnectOptions::new(sqlite_connection_url(&path.0));
+        options.max_connections(1);
+        let mut writer = Database::connect(options).await.unwrap();
+        Migrator::up(&writer, None).await.unwrap();
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        writer.execute_unprepared(
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','Snapshot',1,1); \
+             INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status) \
+             VALUES ('thread','ws','','agent','model','provider','idle'); \
+             INSERT INTO turn(id,thread_id,status,turn_kind,origin,reasoning_effort,created_at,updated_at) \
+             VALUES ('conversation','thread','completed','conversation','user','low','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'), \
+                    ('task','thread','in_progress','task_run','scheduled_task','high','2026-01-01T00:00:01Z','2026-01-01T00:00:01Z')"
+        ).await.unwrap();
+        let reader_statements = Arc::new(std::sync::Mutex::new(Vec::<Statement>::new()));
+        let writer_statements = Arc::new(std::sync::Mutex::new(Vec::<Statement>::new()));
+        writer.set_metric_callback({
+            let statements = writer_statements.clone();
+            move |info| statements.lock().unwrap().push(info.statement.clone())
+        });
+        let mut options = ConnectOptions::new(sqlite_read_only_connection_url(&path.0));
+        options.max_connections(2);
+        options.map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+        });
+        let mut reader = Database::connect(options).await.unwrap();
+        reader.set_metric_callback({
+            let statements = reader_statements.clone();
+            move |info| statements.lock().unwrap().push(info.statement.clone())
+        });
+        let reads = Arc::new(ThreadSnapshotReadObserver::default());
+        let writes = Arc::new(OptionalDeliveryDatabaseObserver::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            SqliteWriteExecutor::with_observer(writer, writes.clone()),
+            reads.clone(),
+        );
+        database.validate_reader().await.unwrap();
+        let interactive = CrudStore::new(database.clone());
+        let maintenance = interactive.with_maintenance_access();
+        let critical = interactive.with_maintenance_reads_and_critical_writes();
+        let held_writer = database.begin().await.unwrap();
+        let mut selected = Vec::new();
+        for (store, class) in [
+            (&interactive, SqliteReadClass::Interactive),
+            (&maintenance, SqliteReadClass::Maintenance),
+            (&critical, SqliteReadClass::Maintenance),
+        ] {
+            reader_statements.lock().unwrap().clear();
+            writer_statements.lock().unwrap().clear();
+            writes.events.lock().unwrap().clear();
+            reads.events.lock().unwrap().clear();
+            selected = tokio::time::timeout(
+                Duration::from_secs(5),
+                store.list_threads_for_workspace("ws", 1),
+            )
+            .await
+            .expect("list must finish while the writer is occupied")
+            .unwrap();
+            assert_eq!(selected[0].turns[0].id, "task");
+            assert_eq!(selected[0].reasoning_effort.as_deref(), Some("low"));
+            assert_eq!(selected[0].status, ThreadStatus::Idle);
+            assert_thread_turn_snapshot_statements(&reader_statements.lock().unwrap(), &selected);
+            assert!(writer_statements.lock().unwrap().is_empty());
+            assert!(
+                writes.events.lock().unwrap().is_empty(),
+                "no writer reservation"
+            );
+            let events = reads.events.lock().unwrap();
+            let finished = events
+                .iter()
+                .filter_map(|event| match event {
+                    SqliteReadEvent::OperationFinished { class, outcome, .. } => {
+                        Some((*class, *outcome))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(finished, vec![(class, SqliteReadOutcome::Ok); 3]);
+            if class == SqliteReadClass::Maintenance {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(
+                            event,
+                            SqliteReadEvent::AdmissionReleased {
+                                active: 0,
+                                queue_depth: 0,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    3,
+                    "each bounded read must release capacity"
+                );
+            }
+        }
+        // Tree task activity uses the same physical readers and scheduling
+        // classes, even while the writer is occupied by another operation.
+        for (store, class) in [
+            (&interactive, SqliteReadClass::Interactive),
+            (&maintenance, SqliteReadClass::Maintenance),
+            (&critical, SqliteReadClass::Maintenance),
+        ] {
+            reader_statements.lock().unwrap().clear();
+            writer_statements.lock().unwrap().clear();
+            reads.events.lock().unwrap().clear();
+            let page = tokio::time::timeout(
+                Duration::from_secs(5),
+                list_running_task_scopes(
+                    &store.connection,
+                    "ws",
+                    &["thread".into()],
+                    &PrincipalId::new("P00000000000000000001").unwrap(),
+                    "",
+                ),
+            )
+            .await
+            .expect("task activity must not wait for the writer")
+            .unwrap();
+            assert!(page.scopes.is_empty());
+            assert_eq!(reader_statements.lock().unwrap().len(), 1);
+            assert!(writer_statements.lock().unwrap().is_empty());
+            assert_eq!(
+                reads
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|event| match event {
+                        SqliteReadEvent::OperationFinished { class, outcome, .. } =>
+                            Some((*class, *outcome)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![(class, SqliteReadOutcome::Ok)]
+            );
+        }
+        held_writer.rollback().await.unwrap();
+
+        for thread in &mut selected {
+            thread.turns.clear();
+            thread.reasoning_effort = None;
+        }
+        let scoped = database.maintenance();
+        let held_reader = scoped
+            .stream_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT 1 AS value".to_owned(),
+            ))
+            .await
+            .unwrap();
+        reads.events.lock().unwrap().clear();
+        reader_statements.lock().unwrap().clear();
+        let cancelled = tokio::spawn({
+            let store = critical.clone();
+            let mut selected = selected.clone();
+            async move {
+                store
+                    .attach_latest_thread_turn_snapshots(&mut selected, &HashMap::new())
+                    .await
+            }
+        });
+        // Wait for actual admission state, not a sleep or performance threshold.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if reads.events.lock().unwrap().iter().any(|event| {
+                    matches!(
+                        event,
+                        SqliteReadEvent::AdmissionEnqueued {
+                            active: 1,
+                            queue_depth: 1,
+                            ..
+                        }
+                    )
+                }) {
+                    break;
+                }
+                reads.enqueued.notified().await;
+            }
+        })
+        .await
+        .expect("batch selector should queue behind the held reader");
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert!(
+            reader_statements.lock().unwrap().is_empty(),
+            "queued batch must not execute SQL"
+        );
+        {
+            let events = reads.events.lock().unwrap();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                SqliteReadEvent::AdmissionCancelled {
+                    class: SqliteReadClass::Maintenance,
+                    active: 1,
+                    queue_depth: 0,
+                    ..
+                }
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                SqliteReadEvent::OperationFinished {
+                    class: SqliteReadClass::Maintenance,
+                    outcome: SqliteReadOutcome::Cancelled,
+                    ..
+                }
+            )));
+        }
+        drop(held_reader);
+        // SeaORM emits the held stream's metric on drop; isolate the resumed
+        // batch statements from that deliberately occupied test reader.
+        reader_statements.lock().unwrap().clear();
+        reads.events.lock().unwrap().clear();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            critical.attach_latest_thread_turn_snapshots(&mut selected, &HashMap::new()),
+        )
+        .await
+        .expect("cancelled batch must not leak reader capacity")
+        .unwrap();
+        assert_eq!(selected[0].turns[0].id, "task");
+        assert_eq!(selected[0].reasoning_effort.as_deref(), Some("low"));
+        let recorded = reader_statements.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_thread_turn_snapshot_statement(&recorded[0], false);
+        assert_thread_turn_snapshot_statement(&recorded[1], true);
+        assert_eq!(
+            reads
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SqliteReadEvent::AdmissionReleased {
+                        active: 0,
+                        queue_depth: 0,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -55225,6 +60677,876 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_agent_replies_are_exact_read_positions_even_after_a_later_turn() {
+        let workspace_id = "ws_unread_agent";
+        let thread_id = "T00000000000000000001";
+        let gateway_id = GatewayId::new("G00000000000000000001").expect("gateway id");
+        let reader_id = PrincipalId::new("P00000000000000000001").expect("principal id");
+        let store = test_store_with_workspace(workspace_id).await;
+        let now = unix_to_datetime(1_700_000_000);
+        super::create_gateway_singleton(&store.connection, &gateway_id, 0, now)
+            .await
+            .expect("gateway identity should persist");
+        super::create_superuser(
+            &store.connection,
+            &reader_id,
+            &gateway_id,
+            "Reader",
+            "reader",
+            "reader",
+            now,
+        )
+        .await
+        .expect("reader principal should persist");
+        let thread = Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            preview_author: None,
+            mode: ThreadMode::Agent,
+            model: String::new(),
+            model_provider: String::new(),
+            reasoning_effort: None,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::Collaborative,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: Some(pioneer_protocol::ThreadVisibility::Workspace),
+            turns: Vec::new(),
+        };
+        store
+            .upsert_thread_model(&thread, PersistedActorRef::Principal(reader_id.clone()))
+            .await
+            .expect("thread should persist");
+
+        let old_turn = "A00000000000000000001";
+        let later_turn = "B00000000000000000001";
+        for (turn_id, key) in [
+            (
+                old_turn,
+                "00000001700000100000:A00000000000000000001:000:user",
+            ),
+            (
+                later_turn,
+                "00000001700000101000:B00000000000000000001:000:user",
+            ),
+        ] {
+            insert_unread_test_turn(
+                &store,
+                workspace_id,
+                thread_id,
+                turn_id,
+                key,
+                "agent",
+                Some(reader_id.as_ref()),
+                false,
+            )
+            .await;
+        }
+        // Model an active execution whose beginning is already behind the cursor.
+        pioneer_entity::turn::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn::Column::Status,
+                Expr::value("in_progress"),
+            )
+            .filter(pioneer_entity::turn::Column::Id.eq(old_turn))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        async fn position(
+            store: &CrudStore,
+            thread: &str,
+            block: &str,
+        ) -> pioneer_protocol::ThreadReadPosition {
+            let row =
+                super::repositories::thread_timeline_projection::find_thread_timeline_block_by_id(
+                    &store.connection,
+                    thread,
+                    block,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            pioneer_protocol::ThreadReadPosition {
+                block_id: row.block_id,
+                sort_key: row.sort_key,
+            }
+        }
+        let request = |turn: &str, block: Option<pioneer_protocol::ThreadReadPosition>| {
+            super::MarkThreadReadRequest {
+                workspace_id: workspace_id.into(),
+                thread_id: thread_id.into(),
+                principal_id: reader_id.clone(),
+                through_turn_id: turn.into(),
+                through_block: block,
+                read_at_unix: 1_700_000_200,
+            }
+        };
+        let initial = store
+            .mark_thread_read(request(later_turn, None))
+            .await
+            .unwrap();
+        assert_eq!(initial.unread_count, 0, "own prompts remain excluded");
+        let historical = store
+            .mark_thread_read(request(
+                later_turn,
+                Some(position(&store, thread_id, &format!("user:{later_turn}")).await),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            historical.cursor, initial.cursor,
+            "exact reads preserve historical user-message anchors too"
+        );
+        let item = |id: &str, text: &str, phase| pioneer_protocol::TurnItem::AgentMessage {
+            id: id.into(),
+            text: text.into(),
+            phase,
+            markdown: None,
+            markdown_version: None,
+        };
+        let answer = pioneer_protocol::TurnItem::AgentMessage {
+            id: "first-final".into(),
+            text: "Markdown fallback".into(),
+            markdown: Some(pioneer_protocol::MarkdownDocument::from_plain_text(
+                "Markdown answer",
+            )),
+            markdown_version: None,
+            phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        };
+        store
+            .materialize_item_started(
+                pioneer_protocol::ItemStartedNotification {
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: old_turn.into(),
+                    item: answer.clone(),
+                },
+                1_700_000_201,
+            )
+            .await
+            .unwrap();
+        store
+            .materialize_item_updated(
+                pioneer_protocol::ItemUpdatedNotification {
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: old_turn.into(),
+                    item: answer.clone(),
+                },
+                1_700_000_201,
+            )
+            .await
+            .unwrap();
+        let first_id = super::assistant_block_id(old_turn, answer.item_id());
+        assert_eq!(
+            store
+                .unread_counts_for_threads(&reader_id, &[thread_id.into()])
+                .await
+                .unwrap()
+                .get(thread_id),
+            None
+        );
+        let streaming_position = position(&store, thread_id, &first_id).await;
+        assert!(
+            store
+                .mark_thread_read(request(old_turn, Some(streaming_position.clone())))
+                .await
+                .is_err(),
+            "a streaming block is not a readable answer"
+        );
+        let completed = pioneer_protocol::ItemCompletedNotification {
+            workspace_id: workspace_id.into(),
+            thread_id: thread_id.into(),
+            turn_id: old_turn.into(),
+            item: answer,
+        };
+        store
+            .materialize_item_completed(completed.clone(), 1_700_000_202)
+            .await
+            .unwrap();
+        let counts = store
+            .unread_counts_for_threads(&reader_id, &[thread_id.into()])
+            .await
+            .unwrap();
+        assert_eq!(counts.get(thread_id), Some(&1));
+        assert_eq!(
+            super::count_unread_message_blocks(
+                &store.connection,
+                thread_id,
+                reader_id.as_ref(),
+                &initial.cursor.sort_key
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .mark_thread_read(request(old_turn, Some(streaming_position)))
+                .await
+                .is_err(),
+            "a speculative pre-completion sort key cannot acknowledge the moved answer"
+        );
+        let first = store
+            .mark_thread_read(request(
+                old_turn,
+                Some(position(&store, thread_id, &first_id).await),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            first.cursor.sort_key > initial.cursor.sort_key,
+            "late completion must escape the saved cursor"
+        );
+        assert_eq!(first.unread_count, 0);
+        store
+            .materialize_item_completed(completed.clone(), 1_700_000_202)
+            .await
+            .unwrap();
+        // A pre-upgrade completed block has no completion marker. Its content
+        // refresh must preserve an already-read historical position.
+        pioneer_entity::thread_timeline_block::Entity::update_many()
+            .col_expr(
+                pioneer_entity::thread_timeline_block::Column::MetadataJson,
+                Expr::value("{}"),
+            )
+            .filter(pioneer_entity::thread_timeline_block::Column::BlockId.eq(first_id.clone()))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        store
+            .materialize_item_updated(
+                pioneer_protocol::ItemUpdatedNotification {
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: old_turn.into(),
+                    item: completed.item.clone(),
+                },
+                1_700_000_203,
+            )
+            .await
+            .unwrap();
+        store
+            .materialize_item_snapshot_updated(
+                pioneer_protocol::ItemUpdatedNotification {
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: old_turn.into(),
+                    item: completed.item,
+                },
+                1_700_000_203,
+            )
+            .await
+            .unwrap();
+        let replay = store
+            .mark_thread_read(request(
+                old_turn,
+                Some(position(&store, thread_id, &first_id).await),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            first, replay,
+            "completion redelivery and reads are idempotent"
+        );
+        // Task deliveries are standalone final answers, even on a non-user Turn,
+        // and an empty final text is valid (HTML is attached by the reader).
+        pioneer_entity::turn::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn::Column::Origin,
+                Expr::value("scheduled_task"),
+            )
+            .col_expr(
+                pioneer_entity::turn::Column::InitiatedByActorKind,
+                Expr::value("system"),
+            )
+            .col_expr(
+                pioneer_entity::turn::Column::InitiatedByActorId,
+                Expr::value(Option::<String>::None),
+            )
+            .filter(pioneer_entity::turn::Column::Id.eq(old_turn))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        let task_item = item(
+            &pioneer_protocol::task_delivery_result_item_id("unread-delivery"),
+            "",
+            pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        );
+        let task_id = super::assistant_block_id(old_turn, task_item.item_id());
+        store
+            .materialize_task_delivery_item(
+                pioneer_protocol::ItemStartedNotification {
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: old_turn.into(),
+                    item: task_item.clone(),
+                },
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: old_turn.into(),
+                    item: task_item.clone(),
+                },
+                1_700_000_202,
+                None,
+            )
+            .await
+            .unwrap();
+        let commentary = item(
+            "commentary",
+            "still working",
+            pioneer_protocol::AgentMessagePhase::Commentary,
+        );
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: old_turn.into(),
+                    item: commentary,
+                },
+                1_700_000_202,
+            )
+            .await
+            .unwrap();
+        let stale = store
+            .mark_thread_read(request(
+                old_turn,
+                Some(position(&store, thread_id, &first_id).await),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            stale.unread_count, 1,
+            "same-Turn final answers are independent; commentary is excluded"
+        );
+        let mut foreign_thread = thread.clone();
+        foreign_thread.id = "foreign-thread".into();
+        store
+            .upsert_thread_model(
+                &foreign_thread,
+                PersistedActorRef::Principal(reader_id.clone()),
+            )
+            .await
+            .unwrap();
+        insert_unread_test_turn(
+            &store,
+            workspace_id,
+            &foreign_thread.id,
+            "foreign-turn",
+            "001",
+            "agent",
+            Some(reader_id.as_ref()),
+            false,
+        )
+        .await;
+        let task_position = position(&store, thread_id, &task_id).await;
+        let work_position = position(&store, thread_id, &super::work_block_id(old_turn)).await;
+        for (turn, block) in [
+            (later_turn, task_position.clone()),
+            (
+                old_turn,
+                pioneer_protocol::ThreadReadPosition {
+                    block_id: "missing".into(),
+                    sort_key: "missing".into(),
+                },
+            ),
+            (
+                old_turn,
+                position(&store, &foreign_thread.id, "user:foreign-turn").await,
+            ),
+            (old_turn, work_position),
+            (
+                old_turn,
+                pioneer_protocol::ThreadReadPosition {
+                    block_id: task_id.clone(),
+                    sort_key: first.cursor.sort_key.clone(),
+                },
+            ),
+        ] {
+            assert!(
+                store
+                    .mark_thread_read(request(turn, Some(block)))
+                    .await
+                    .is_err(),
+                "mismatched, foreign, service and forged positions fail closed"
+            );
+        }
+        let second = store
+            .mark_thread_read(request(old_turn, Some(task_position)))
+            .await
+            .unwrap();
+        assert!(
+            second.cursor.sort_key > first.cursor.sort_key,
+            "same-second completions still advance"
+        );
+        assert_eq!(second.unread_count, 0);
+        store
+            .materialize_task_delivery_item(
+                pioneer_protocol::ItemStartedNotification {
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: old_turn.into(),
+                    item: task_item.clone(),
+                },
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: old_turn.into(),
+                    item: task_item,
+                },
+                1_700_000_204,
+                None,
+            )
+            .await
+            .unwrap();
+        let redelivered = store
+            .mark_thread_read(request(
+                old_turn,
+                Some(position(&store, thread_id, &task_id).await),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.cursor, redelivered.cursor);
+        assert_eq!(redelivered.unread_count, 0);
+        let stale_user = store
+            .mark_thread_read(request(later_turn, None))
+            .await
+            .unwrap();
+        assert_eq!(second.cursor, stale_user.cursor);
+
+        // A subsequent prompt in the same clock tick must follow the reply,
+        // with its work still following the prompt in the usual rank order.
+        let (_, mut next_turn) = store
+            .get_turn(thread_id, later_turn)
+            .await
+            .unwrap()
+            .unwrap();
+        next_turn.id = "C00000000000000000001".into();
+        next_turn.status = TurnStatus::InProgress;
+        let mut next_thread = thread.clone();
+        next_thread.updated_at = 1_700_000_101;
+        store
+            .materialize_turn_start(
+                &next_thread,
+                SandboxMode::FullAccess,
+                &next_turn,
+                &[UserInput::Text {
+                    text: "Next request".into(),
+                    text_elements: Vec::new(),
+                }],
+                PersistedActorRef::Principal(reader_id.clone()),
+            )
+            .await
+            .unwrap();
+        let prompt = position(&store, thread_id, &super::user_block_id(&next_turn.id)).await;
+        let work = position(&store, thread_id, &super::work_block_id(&next_turn.id)).await;
+        assert!(prompt.sort_key > second.cursor.sort_key);
+        assert!(work.sort_key > prompt.sort_key);
+        assert_eq!(
+            work.sort_key.split(':').next(),
+            prompt.sort_key.split(':').next(),
+            "work remains anchored to its prompt's published domain"
+        );
+        let millis = second
+            .cursor
+            .sort_key
+            .split(':')
+            .next()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        let request_time = chrono::DateTime::from_timestamp_millis(millis)
+            .unwrap()
+            .fixed_offset();
+        assert_eq!(
+            prompt
+                .sort_key
+                .split(':')
+                .next()
+                .unwrap()
+                .parse::<i64>()
+                .unwrap(),
+            millis + 1
+        );
+        let mut approval = super::NewCliRuntimePendingRequest {
+            request_id: "shifted-prompt-approval".into(),
+            runtime_id: "codex".into(),
+            runtime_kind: "codex".into(),
+            workspace_id: workspace_id.into(),
+            thread_id: thread_id.into(),
+            turn_id: Some(next_turn.id.clone()),
+            native_thread_id: None,
+            native_turn_id: None,
+            native_item_id: None,
+            request_kind: "command_approval".into(),
+            payload_json: r#"{"command":"echo ready","cwd":"/tmp"}"#.into(),
+            created_at: request_time,
+            updated_at: request_time,
+        };
+        store
+            .create_cli_runtime_pending_request(approval.clone())
+            .await
+            .unwrap();
+        let approval_id = super::approval_block_id(&next_turn.id, &approval.request_id);
+        let pending = position(&store, thread_id, &approval_id).await;
+        assert!(prompt.sort_key < work.sort_key && work.sort_key < pending.sort_key);
+        assert!(
+            store
+                .mark_thread_read(request(&next_turn.id, Some(pending.clone())))
+                .await
+                .is_err(),
+            "an exact approval position is still not a message read anchor"
+        );
+        assert_eq!(
+            prompt.sort_key.split(':').next(),
+            pending.sort_key.split(':').next()
+        );
+        approval.updated_at += chrono::Duration::seconds(1);
+        approval.payload_json = r#"{"command":"echo updated","cwd":"/tmp"}"#.into();
+        let updated = store
+            .create_cli_runtime_pending_request(approval.clone())
+            .await
+            .unwrap();
+        assert_eq!(updated.created_at, request_time);
+        assert_eq!(
+            position(&store, thread_id, &approval_id).await,
+            pending,
+            "metadata updates preserve approval identity and position"
+        );
+        store
+            .resolve_cli_runtime_pending_request(super::ResolveCliRuntimePendingRequest {
+                request_id: approval.request_id.clone(),
+                status: super::CliRuntimePendingRequestStatus::Answered,
+                response_json: Some(r#"{"approved":true,"scope":"once"}"#.into()),
+                updated_at: approval.updated_at,
+                resolved_at: approval.updated_at,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            super::repositories::thread_timeline_projection::find_thread_timeline_block_by_id(
+                &store.connection,
+                thread_id,
+                &approval_id,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "completed approval leaves no stale row"
+        );
+        assert_eq!(
+            position(&store, thread_id, &super::work_block_id(&next_turn.id)).await,
+            work
+        );
+        // A later request already has the correct time domain: retain it.
+        approval.request_id = "later-approval".into();
+        approval.created_at += chrono::Duration::seconds(10);
+        approval.updated_at = approval.created_at;
+        store
+            .create_cli_runtime_pending_request(approval.clone())
+            .await
+            .unwrap();
+        let later_approval = position(
+            &store,
+            thread_id,
+            &super::approval_block_id(&next_turn.id, &approval.request_id),
+        )
+        .await;
+        assert_eq!(
+            later_approval.sort_key,
+            format!(
+                "{:020}:{}:150:approval:{}",
+                approval.created_at.timestamp_millis(),
+                next_turn.id,
+                approval.request_id
+            )
+        );
+
+        // Agent-authored Message Turns are visible UserBlocks, but are not
+        // unread units. Their exact viewed position can acknowledge an answer
+        // immediately before them without broadening the old Turn-only RPC.
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: old_turn.into(),
+                    item: item(
+                        "last-final",
+                        "Unread answer",
+                        pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    ),
+                },
+                1_700_000_205,
+            )
+            .await
+            .unwrap();
+        let last = position(
+            &store,
+            thread_id,
+            &super::assistant_block_id(old_turn, "last-final"),
+        )
+        .await;
+        let agent_turn = "D00000000000000000001";
+        let agent_key = super::repositories::thread_timeline_projection::new_message_sort_key(
+            &store.connection,
+            thread_id,
+            &format!("user:{agent_turn}"),
+            agent_turn,
+            format!("00000001700000101000:{agent_turn}:000:user"),
+            1_700_000_205,
+        )
+        .await
+        .unwrap();
+        insert_unread_test_turn(
+            &store,
+            workspace_id,
+            thread_id,
+            agent_turn,
+            &agent_key,
+            "message",
+            Some("E00000000000000000001"),
+            false,
+        )
+        .await;
+        pioneer_entity::turn::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn::Column::InitiatedByActorKind,
+                Expr::value("agent_execution"),
+            )
+            .filter(pioneer_entity::turn::Column::Id.eq(agent_turn))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(agent_key > last.sort_key);
+        assert_eq!(
+            store
+                .unread_counts_for_threads(&reader_id, &[thread_id.into()])
+                .await
+                .unwrap()
+                .get(thread_id),
+            Some(&1),
+            "agent-authored UserBlock does not add unread"
+        );
+        assert!(
+            store
+                .mark_thread_read(request(agent_turn, None))
+                .await
+                .is_err(),
+            "legacy Turn-only rules stay unchanged"
+        );
+        let read = store
+            .mark_thread_read(request(
+                agent_turn,
+                Some(position(&store, thread_id, &format!("user:{agent_turn}")).await),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            read.unread_count, 0,
+            "the visible exact agent message clears the earlier completed answer"
+        );
+        assert_eq!(read.cursor.sort_key, agent_key);
+    }
+
+    #[tokio::test]
+    async fn unread_batch_seeks_positions_and_preserves_sparse_distinct_membership() {
+        // This isolated fixture must match the runtime's FK OFF semantics;
+        // the ordinary test helper uses SQLx defaults instead.
+        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+        options
+            .max_connections(1)
+            .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
+        let connection = Database::connect(options).await.unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+        let store = CrudStore::new(connection);
+        let reader = PrincipalId::new("P00000000000000000001").unwrap();
+        let gateway = GatewayId::new("G00000000000000000001").unwrap();
+        let now = unix_to_datetime(1_700_000_000);
+        super::create_gateway_singleton(&store.connection, &gateway, 0, now)
+            .await
+            .unwrap();
+        super::create_superuser(
+            &store.connection,
+            &reader,
+            &gateway,
+            "Reader",
+            "reader",
+            "reader",
+            now,
+        )
+        .await
+        .unwrap();
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set("batch-unread".into()),
+            name: Set("Batch".into()),
+            is_active: Set(true),
+            is_current: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(&store.connection)
+        .await
+        .unwrap();
+        let mut ids = Vec::new();
+        // Span more than one bounded SQL batch. Runtime FK OFF must not turn
+        // orphan blocks or missing access parents into unread history.
+        for index in 0..130 {
+            let id = format!("batch-{index:03}");
+            store
+                .upsert_thread_model(
+                    &sample_thread("batch-unread", &id, 1_700_000_000),
+                    PersistedActorRef::Principal(reader.clone()),
+                )
+                .await
+                .unwrap();
+            for key in ["001", "002"] {
+                insert_unread_test_turn(
+                    &store,
+                    "batch-unread",
+                    &id,
+                    &format!("{id}-{key}"),
+                    key,
+                    "message",
+                    Some("P00000000000000000002"),
+                    false,
+                )
+                .await;
+            }
+            if index % 3 != 0 {
+                pioneer_entity::thread_read_cursor::Entity::insert(
+                    pioneer_entity::thread_read_cursor::ActiveModel {
+                        principal_id: Set(reader.to_string()),
+                        thread_id: Set(id.clone()),
+                        last_read_sort_key: Set(if index % 3 == 1 { "001" } else { "" }.into()),
+                        last_read_turn_id: Set(format!("{id}-001")),
+                        updated_at: Set(unix_to_datetime(1_700_000_200)),
+                    },
+                )
+                .exec(&store.connection)
+                .await
+                .unwrap();
+            }
+            ids.push(id);
+        }
+        let counts = store
+            .unread_counts_for_threads(&reader, &ids)
+            .await
+            .unwrap();
+        for (index, id) in ids.iter().enumerate() {
+            assert_eq!(counts.get(id), Some(&(if index % 3 == 1 { 1 } else { 2 })));
+        }
+        ids.extend([
+            ids[0].clone(),
+            ids[129].clone(),
+            ids[0].clone(),
+            "no-blocks".into(),
+        ]);
+        assert_eq!(
+            store
+                .unread_counts_for_threads(&reader, &ids)
+                .await
+                .unwrap(),
+            counts
+        );
+        assert!(
+            store
+                .unread_counts_for_threads(&reader, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // An orphan/mismatched block must not become unread, even without FKs.
+        store
+            .upsert_thread_model(
+                &sample_thread("batch-unread", "mismatch", 1_700_000_000),
+                PersistedActorRef::Principal(reader.clone()),
+            )
+            .await
+            .unwrap();
+        pioneer_entity::thread_timeline_block::Entity::update_many()
+            .col_expr(
+                pioneer_entity::thread_timeline_block::Column::ThreadId,
+                Expr::value("mismatch"),
+            )
+            .filter(pioneer_entity::thread_timeline_block::Column::BlockId.eq("user:batch-000-001"))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unread_counts_for_threads(&reader, &["mismatch".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        pioneer_entity::thread_read_cursor::Entity::update_many()
+            .col_expr(
+                pioneer_entity::thread_read_cursor::Column::LastReadSortKey,
+                Expr::value("999"),
+            )
+            .filter(pioneer_entity::thread_read_cursor::Column::ThreadId.eq("batch-001"))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unread_counts_for_threads(&reader, &["batch-001".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Parent checks may be deferred until after the range seek, but
+        // FK OFF must never expose orphan or hidden message counts to owners.
+        pioneer_entity::thread::Entity::delete_by_id("batch-002")
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unread_counts_for_threads(&reader, &["batch-002".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        pioneer_entity::thread::Entity::update_many()
+            .col_expr(
+                pioneer_entity::thread::Column::SidebarVisibility,
+                Expr::val("hidden"),
+            )
+            .filter(pioneer_entity::thread::Column::Id.eq("batch-004"))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unread_counts_for_threads(&reader, &["batch-004".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        pioneer_entity::workspace::Entity::delete_by_id("batch-unread")
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unread_counts_for_threads(&reader, &["batch-003".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn thread_read_cursor_is_monotonic_and_unread_is_authoritative() {
         let workspace_id = "ws_unread_authoritative";
         let thread_id = "T00000000000000000001";
@@ -55331,6 +61653,7 @@ mod tests {
 
         let read_chat = store
             .mark_thread_read(super::MarkThreadReadRequest {
+                through_block: None,
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 principal_id: reader_id.clone(),
@@ -55344,6 +61667,7 @@ mod tests {
 
         let stale = store
             .mark_thread_read(super::MarkThreadReadRequest {
+                through_block: None,
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 principal_id: reader_id.clone(),
@@ -55356,6 +61680,7 @@ mod tests {
         assert_eq!(stale.unread_count, 1);
 
         let older = store.mark_thread_read(super::MarkThreadReadRequest {
+            through_block: None,
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
             principal_id: reader_id.clone(),
@@ -55363,6 +61688,7 @@ mod tests {
             read_at_unix: 1_700_000_202,
         });
         let newer = store.mark_thread_read(super::MarkThreadReadRequest {
+            through_block: None,
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
             principal_id: reader_id.clone(),
@@ -55380,6 +61706,7 @@ mod tests {
 
         let deleted = store
             .mark_thread_read(super::MarkThreadReadRequest {
+                through_block: None,
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 principal_id: reader_id.clone(),
@@ -55393,6 +61720,7 @@ mod tests {
 
         let error = store
             .mark_thread_read(super::MarkThreadReadRequest {
+                through_block: None,
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 principal_id: reader_id,
@@ -55405,5 +61733,108 @@ mod tests {
             error.downcast_ref::<super::ThreadReadFailure>(),
             Some(&super::ThreadReadFailure::InvalidTarget)
         );
+    }
+}
+
+/// Private per-worker lifetime reconciliation state; constructing it does not activate cleanup.
+pub use repositories::frozen_storage_lifetime::FrozenStorageLifetimeProgress;
+
+pub use repositories::html_preview_retention::HtmlPreviewRetentionProgress;
+
+pub use repositories::html_preview_retention::archive_result as archive_html_preview_result;
+
+pub use repositories::html_preview_retention::HtmlPreviewArchiveWitness;
+
+pub use repositories::thread_history_read::{
+    SavedHistoryKey, SavedHistoryRow, SavedHistorySnapshot,
+};
+
+impl CrudStore {
+    pub async fn saved_history_snapshot(&self, thread_id: &str) -> Result<SavedHistorySnapshot> {
+        repositories::thread_history_read::snapshot(&self.connection, thread_id).await
+    }
+
+    pub async fn saved_history_page_at_snapshot(
+        &self,
+        thread_id: &str,
+        boundary: Option<&SavedHistoryKey>,
+        before: Option<&SavedHistoryKey>,
+        limit: u64,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<Vec<SavedHistoryRow>> {
+        repositories::thread_history_read::page(
+            &self.connection,
+            thread_id,
+            boundary,
+            before,
+            limit,
+            snapshot,
+        )
+        .await
+    }
+
+    /// Directional metadata-only keyset page within the frozen saved set.
+    pub async fn saved_history_page_direction_at_snapshot(
+        &self,
+        thread_id: &str,
+        boundary: Option<&SavedHistoryKey>,
+        position: Option<&SavedHistoryKey>,
+        inclusive: bool,
+        newer: bool,
+        limit: u64,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<Vec<SavedHistoryRow>> {
+        repositories::thread_history_read::page_direction(
+            &self.connection,
+            thread_id,
+            boundary,
+            position,
+            inclusive,
+            newer,
+            limit,
+            snapshot,
+        )
+        .await
+    }
+
+    pub async fn saved_history_anchor(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: Option<&str>,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<Option<SavedHistoryRow>> {
+        repositories::thread_history_read::anchor(
+            &self.connection,
+            thread_id,
+            turn_id,
+            item_id,
+            snapshot,
+        )
+        .await
+    }
+
+    pub async fn saved_history_revision_at_snapshot(
+        &self,
+        thread_id: &str,
+        boundary: &SavedHistoryKey,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<String> {
+        repositories::thread_history_read::revision(&self.connection, thread_id, boundary, snapshot)
+            .await
+    }
+
+    pub async fn saved_history_input(
+        &self,
+        turn_id: &str,
+        input_id: &str,
+    ) -> Result<Option<UserInput>> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        pioneer_entity::turn_input::Entity::find_by_id(input_id.to_owned())
+            .filter(pioneer_entity::turn_input::Column::TurnId.eq(turn_id))
+            .one(&self.connection)
+            .await?
+            .map(decode_turn_input_model)
+            .transpose()
     }
 }

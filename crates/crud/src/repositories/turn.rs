@@ -741,6 +741,7 @@ pub fn collaboration_from_model(model: &turn::Model) -> Result<PersistedTurnColl
                 })
                 .transpose()?;
             let snapshot = TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor,
                 display_name: display_name.clone(),
                 nickname: nickname.clone(),
@@ -762,6 +763,7 @@ pub fn collaboration_from_model(model: &turn::Model) -> Result<PersistedTurnColl
                 PersistedActorRef::System => ("System".to_owned(), "system".to_owned()),
             };
             Some(TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor,
                 display_name,
                 nickname,
@@ -1136,6 +1138,7 @@ pub async fn replace_turn_input<C: ConnectionTrait>(
 pub(crate) struct PreparedTurnInputProjection {
     turn_id: String,
     rows: Vec<turn_input::ActiveModel>,
+    preview_adoptions: Vec<super::html_preview_retention::PreparedPreviewInputAdoption>,
 }
 
 pub(crate) fn prepare_turn_input_projection(
@@ -1144,7 +1147,23 @@ pub(crate) fn prepare_turn_input_projection(
     created_at: DateTimeWithTimeZone,
 ) -> Result<PreparedTurnInputProjection> {
     let mut rows = Vec::with_capacity(input.len());
+    let mut preview_adoptions = Vec::new();
     for (index, item) in input.iter().enumerate() {
+        if let UserInput::Artifact {
+            artifact_id,
+            version_id,
+        } = item
+        {
+            preview_adoptions.push(
+                super::html_preview_retention::PreparedPreviewInputAdoption::new(
+                    turn_id,
+                    artifact_id,
+                    version_id.as_deref(),
+                    i64::try_from(index).unwrap_or(i64::MAX),
+                    created_at,
+                ),
+            );
+        }
         let (input_type, text) = input_type_and_text(item);
         rows.push(turn_input::ActiveModel {
             id: Set(generate_id(DB_ID_LEN)),
@@ -1161,6 +1180,7 @@ pub(crate) fn prepare_turn_input_projection(
     Ok(PreparedTurnInputProjection {
         turn_id: turn_id.to_owned(),
         rows,
+        preview_adoptions,
     })
 }
 
@@ -1168,6 +1188,9 @@ pub(crate) async fn replace_prepared_turn_input<C: ConnectionTrait>(
     db: &C,
     prepared: PreparedTurnInputProjection,
 ) -> Result<()> {
+    for adoption in &prepared.preview_adoptions {
+        super::html_preview_retention::retain_preview_input(db, adoption).await?;
+    }
     turn_input::Entity::delete_many()
         .filter(turn_input::Column::TurnId.eq(prepared.turn_id))
         .exec(db)
@@ -1299,6 +1322,26 @@ pub(crate) struct PreparedTurnItemProjection {
 }
 
 impl PreparedTurnItemProjection {
+    /// An update carries content, not a completion transition. Check the
+    /// transaction's current item so event B observes event A in atomic batches.
+    pub(crate) async fn preserve_uncommitted_source_status<C: ConnectionTrait>(
+        &mut self,
+        db: &C,
+    ) -> Result<()> {
+        if matches!(
+            self.item_type.as_str(),
+            "user_message" | "agent_message" | "task"
+        ) {
+            let current = find_turn_item(db, &self.turn_id, &self.item_id).await?;
+            if current.as_ref().is_none_or(|row| {
+                !crate::thread_episodic_source::source_status_is_committed(row.status.as_deref())
+            }) {
+                self.status = Some(crate::convention::TURN_ITEM_STATUS_IN_PROGRESS.to_owned());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn payload_json(&self) -> &str {
         self.payload_json.as_str()
     }
@@ -1483,6 +1526,24 @@ pub async fn find_turn_item<C: ConnectionTrait>(
         .context("failed to query turn item row")
 }
 
+pub(crate) async fn is_completed_agent_message<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+) -> Result<bool> {
+    // The canonical assistant block supplies final-answer placement. Check
+    // lifecycle state without fetching/parsing its potentially large payload.
+    Ok(turn_item::Entity::find()
+        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item::Column::ItemId.eq(item_id.to_owned()))
+        .filter(turn_item::Column::ItemType.eq("agent_message"))
+        .filter(turn_item::Column::Status.eq("completed"))
+        .count(db)
+        .await
+        .context("failed to validate completed response position")?
+        > 0)
+}
+
 pub async fn list_turn_items_by_ids<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -1597,6 +1658,65 @@ pub async fn find_latest_turn_for_thread<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to query latest turn for thread")
+}
+
+pub(crate) const THREAD_TURN_SNAPSHOT_BATCH_SIZE: usize = 128;
+
+/// Only the already selected thread IDs are visited. Each correlated seek
+/// walks the existing history index backwards and stops at its first match;
+/// the outer primary-key lookup fetches at most one model per selected ID.
+/// CROSS JOIN keeps selected IDs as the outer loop in SQLite.
+/// This is deliberately not a ranking/aggregation over the turn catalogue.
+pub(crate) async fn find_latest_turns_for_threads<C: ConnectionTrait>(
+    db: &C,
+    thread_ids: &[&str],
+    conversation_only: bool,
+) -> Result<Vec<turn::Model>> {
+    anyhow::ensure!(
+        thread_ids.len() <= THREAD_TURN_SNAPSHOT_BATCH_SIZE,
+        "thread turn snapshot batch exceeds its limit"
+    );
+    if thread_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = vec!["(?)"; thread_ids.len()].join(", ");
+    let kind_filter = if conversation_only {
+        "AND candidate.turn_kind = ?"
+    } else {
+        ""
+    };
+    let mut values = thread_ids
+        .iter()
+        .map(|id| (*id).into())
+        .collect::<Vec<sea_orm::Value>>();
+    if conversation_only {
+        values.push(turn_kind_to_db(TurnKind::Conversation).into());
+    }
+    let statement = Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        format!(
+            "WITH selected(thread_id) AS (VALUES {placeholders}) \
+             SELECT latest.* FROM selected CROSS JOIN turn AS latest \
+             WHERE latest.id = (\
+                 SELECT candidate.id FROM turn AS candidate \
+                 INDEXED BY idx_turn_thread_created_id \
+                 WHERE candidate.thread_id = selected.thread_id {kind_filter} \
+                 ORDER BY candidate.created_at DESC, candidate.id DESC LIMIT 1\
+             )"
+        ),
+        values,
+    );
+    let rows = db
+        .query_all_raw(statement)
+        .await
+        .context("failed to query latest thread turn snapshot batch")?;
+    // query_all_raw returns the bounded rows and releases reader capacity
+    // before model decoding or any snapshot/JSON transformation.
+    rows.iter()
+        .map(|row| turn::Model::from_query_result(row, ""))
+        .collect::<Result<Vec<_>, _>>()
+        .context("failed to decode latest thread turn snapshot batch")
 }
 
 /// The shared history order is timestamp, durable creation sequence, legacy
@@ -1839,6 +1959,23 @@ pub async fn find_latest_conversation_turn_for_thread<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to query latest conversation turn for thread")
+}
+
+/// A Composer TaskRun occurrence can sort before its source in the same
+/// timestamp bucket. It is not the first user message used for an automatic name.
+pub async fn find_oldest_user_conversation_turn<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+) -> Result<Option<turn::Model>> {
+    turn::Entity::find()
+        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(turn::Column::TurnKind.eq("conversation"))
+        .filter(turn::Column::Origin.eq("user"))
+        .order_by_asc(turn::Column::CreatedAt)
+        .order_by_asc(turn::Column::Id)
+        .one(db)
+        .await
+        .context("failed to query first user conversation turn")
 }
 
 pub async fn find_oldest_turn_for_thread<C: ConnectionTrait>(
@@ -2250,6 +2387,7 @@ mod tests {
             origin: pioneer_protocol::TurnOrigin::User,
             mode: ThreadMode::Message,
             author: Some(TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor: actor.clone(),
                 display_name: "System".to_owned(),
                 nickname: "system".to_owned(),

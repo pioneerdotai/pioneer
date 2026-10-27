@@ -7,9 +7,10 @@ authors.workspace = true
 
 [features]
 default = []
-test-support = ["dep:tokio"]
+test-support = []
 
 [dependencies]
+tokio-util.workspace = true
 pioneer-compaction.workspace = true
 anyhow.workspace = true
 futures-util.workspace = true
@@ -25,7 +26,7 @@ hex.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
-tokio = { workspace = true, optional = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

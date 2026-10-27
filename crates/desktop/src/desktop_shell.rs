@@ -75,6 +75,13 @@ pub(crate) struct DesktopShellView {
     mounted_route: Arc<DesktopRouteSnapshot>,
 }
 impl DesktopShellView {
+    pub(crate) fn startup_thread(&self) -> Option<Entity<pioneer_desktop_thread::ThreadView>> {
+        self.navigation
+            .is_visible(MainRoute::Threads)
+            .then(|| self.thread.as_ref().map(|(_, view)| view.clone()))
+            .flatten()
+    }
+
     fn selected_screen(&self) -> Option<AnyView> {
         let route = self.navigation.snapshot();
         if route.window_route() != WindowRoute::Main {
@@ -441,7 +448,24 @@ impl DesktopShellView {
                 t!("tasks.notifications.empty").to_string(),
                 t!("tasks.notifications.completed").to_string(),
                 t!("tasks.notifications.mark_read").to_string(),
-            ),
+            )
+            .history(
+                t!("tasks.notifications.open").to_string(),
+                t!("tasks.notifications.mark_all_read").to_string(),
+                t!("tasks.notifications.read").to_string(),
+                t!("tasks.notifications.unread").to_string(),
+                t!("tasks.notifications.retry").to_string(),
+                t!("tasks.notifications.loading_failed").to_string(),
+            )
+            .terminal_statuses(
+                t!("timeline.task.status.failed").to_string(),
+                t!("timeline.task.status.blocked").to_string(),
+                t!("timeline.task.status.cancelled").to_string(),
+                t!("tasks.notifications.timed_out").to_string(),
+            )
+            .time_formatter(|at| {
+                pioneer_desktop_thread::format_local_timestamp(at.saturating_mul(1000))
+            }),
         );
         let task_notifications =
             cx.new(|cx| pioneer_desktop_task_notifications::TaskNotificationView::new(config, cx));
@@ -639,6 +663,15 @@ impl DesktopShellView {
         view.mount_thread(window, cx);
         view
     }
+    fn retire_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.thread_events.take();
+        if let Some((_, thread)) = self.thread.take() {
+            // Retained frame/element references may outlive this shell owner.
+            // Hide native children while the old feature is still addressable.
+            thread.update(cx, |thread, cx| thread.set_visible(false, window, cx));
+        }
+    }
+
     fn mount_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let visible = self.navigation.is_visible(MainRoute::Threads);
         let (client, registrar) = {
@@ -647,13 +680,14 @@ impl DesktopShellView {
         };
         let target = thread_view_target(&self.navigation, &client, window.is_window_active());
         if self.thread.as_ref().map(|(id, _)| id) == target.as_ref() {
-            if let Some((_, thread)) = &self.thread {
+            if let Some((_, thread)) = &self.thread
+                && thread.read(cx).is_visible() != visible
+            {
                 thread.update(cx, |thread, cx| thread.set_visible(visible, window, cx));
             }
             return;
         }
-        self.thread_events.take();
-        self.thread.take();
+        self.retire_thread(window, cx);
         let Some(thread_id) = target.filter(|_| visible) else {
             return;
         };
@@ -825,8 +859,7 @@ impl DesktopShellView {
         self.layout
             .update(cx, |layout, cx| layout.persist(window, cx));
         self.route_task.take();
-        self.thread_events.take();
-        self.thread.take();
+        self.retire_thread(window, cx);
         self.identity_task.take();
         self.identity.take();
         self.gateway_switcher.take();
@@ -928,7 +961,7 @@ impl Render for DesktopShellView {
             .into_any_element()
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct TitleBarSurface {
     content: AnyElement,
 }
@@ -937,7 +970,7 @@ impl RenderOnce for TitleBarSurface {
         self.content
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct BottomBarSurface {
     content: AnyElement,
 }
@@ -946,7 +979,7 @@ impl RenderOnce for BottomBarSurface {
         self.content
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct ScreenHostView {
     selected: Option<AnyView>,
 }
@@ -1010,7 +1043,7 @@ impl Render for SidebarHostView {
             .into_any_element()
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct DesktopBody {
     sidebar: AnyElement,
     screen: AnyElement,

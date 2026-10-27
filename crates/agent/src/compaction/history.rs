@@ -342,6 +342,12 @@ mod tests {
         use pioneer_provider::ProviderReplayState;
         for (provider, model, payload, required) in [
             (
+                "openai",
+                "gpt-6.1-sol",
+                serde_json::json!({"schema_version":1,"wire_api":"responses","authority_scope":"synthetic","output":[{"type":"reasoning","id":"rs","summary":[],"encrypted_content":"SYNTHETIC_CIPHERTEXT"}]}),
+                true,
+            ),
+            (
                 "bedrock",
                 "anthropic.claude-sonnet-4-6",
                 serde_json::json!({"blocks":[{"reasoningText":{"text":"","signature":"signed"}},{"redactedContent":"opaque"}]}),

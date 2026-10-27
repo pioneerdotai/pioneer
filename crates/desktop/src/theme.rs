@@ -9,7 +9,7 @@ use gpui_kit::{App, SharedString};
 const THEME_LIGHT: &str = "Pioneer Light";
 const THEME_DARK: &str = "Pioneer Dark";
 const BUNDLED_THEME_FILE_NAME: &str = "pioneer.json";
-const BUNDLED_THEME: &str = include_str!("../themes/pioneer.json");
+const BUNDLED_THEME: &str = include_str!("../../../resources/themes/pioneer.json");
 
 pub fn init(cx: &mut App) {
     if let Err(error) = settings::ensure_loaded(cx) {
@@ -47,7 +47,8 @@ pub fn init(cx: &mut App) {
 }
 
 fn themes_dir() -> PathBuf {
-    let source_themes_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("themes");
+    let source_themes_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../resources/themes");
 
     if cfg!(debug_assertions) {
         return source_themes_dir;

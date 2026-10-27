@@ -243,6 +243,8 @@ impl MessageProcessor {
                 return;
             }
         };
+        self.notify_task_completion_inbox_read(request_context, workspace.workspace_id())
+            .await;
         let response = pioneer_protocol::TaskUserNotificationAcknowledgeResponse { notification };
         match JsonRpcResponse::from_result(request_id.clone(), &response) {
             Ok(response) => {
@@ -558,6 +560,7 @@ impl MessageProcessor {
         http_status: Option<u16>,
         response_fingerprint: Option<String>,
     ) -> Result<pioneer_crud::TaskDeliveryTransitionOutcome<()>> {
+        let title_recovery = self.composer_title_recovery_target(&delivery).await;
         let outcome = self
             .task_runtime
             .background_control_service()
@@ -574,12 +577,50 @@ impl MessageProcessor {
             .map_err(|error| anyhow!("{error:#}"))?;
         Ok(match outcome {
             pioneer_crud::TaskDeliveryTransitionOutcome::Applied(_) => {
+                if let Some(thread_id) = title_recovery {
+                    self.recover_thread_title(thread_id).await;
+                }
                 pioneer_crud::TaskDeliveryTransitionOutcome::Applied(())
             }
             pioneer_crud::TaskDeliveryTransitionOutcome::Superseded => {
                 pioneer_crud::TaskDeliveryTransitionOutcome::Superseded
             }
         })
+    }
+
+    async fn composer_title_recovery_target(&self, delivery: &TaskDelivery) -> Option<String> {
+        if delivery.mode != TaskDeliveryMode::Thread || delivery.error_snapshot.is_some() {
+            return None;
+        }
+        let target = delivery.target_thread_id.as_deref()?;
+        if !matches!(
+            self.title_job_runtime.lock().await.get(target),
+            Some(ThreadTitleJobState::AwaitingSuccessfulTurn(_))
+        ) {
+            return None;
+        }
+        let background = self.crud_store.with_maintenance_access();
+        let task = background.get_task(&delivery.task_id).await.ok()??;
+        if !task.runs.iter().any(|run| {
+            run.id == delivery.run_id && run.status == pioneer_protocol::TaskRunStatus::Succeeded
+        }) {
+            return None;
+        }
+        let work = task.task.metadata.as_ref()?.composer_work.as_ref()?;
+        // Only the saved Composer launch identifies the user conversation.
+        // Arbitrary task lineage and the hidden execution thread do not.
+        let launch = &work.launch;
+        if target != launch.thread_id {
+            return None;
+        }
+        let (_, turn) = background
+            .get_turn(&launch.thread_id, &launch.turn_id)
+            .await
+            .ok()??;
+        (turn.status == TurnStatus::Completed
+            && turn.origin == pioneer_protocol::TurnOrigin::User
+            && turn.turn_kind == pioneer_protocol::TurnKind::Conversation)
+            .then(|| launch.thread_id.clone())
     }
 
     async fn prepare_task_delivery_agent_action(
@@ -1000,6 +1041,8 @@ impl MessageProcessor {
                     .await?
             }
         };
+        let sidebar_visible = turn_outcome.materialization.thread.sidebar_visibility
+            == pioneer_protocol::ThreadSidebarVisibility::Visible;
         let profile_selected_audit = match self.turn_profile_selected_audit_event(&turn_outcome) {
             Ok(event) => event,
             Err(error) => {
@@ -1098,6 +1141,16 @@ impl MessageProcessor {
                         .await;
                     return Err(error);
                 }
+                if sidebar_visible {
+                    self.dirty_push(
+                        &delivery.workspace_id,
+                        Some(thread_id),
+                        None,
+                        None,
+                        false,
+                        None,
+                    );
+                }
                 self.send_notification_to_authorized_thread_connections(
                     thread_id,
                     events::TURN_STARTED,
@@ -1119,19 +1172,19 @@ impl MessageProcessor {
                     Some("in_progress"),
                 )
                 .await;
-                self.ingest_committed_thread_item(&item_completed).await;
+                self.kick_native_turn_event_deliveries();
                 self.send_notification_to_thread_subscribers(
                     thread_id,
                     events::ITEM_COMPLETED,
                     &item_completed,
                 )
                 .await;
-                self.notify_semantic_timeline_item_changed(
+                self.notify_semantic_timeline_item_changed_after_indicator_commit(
                     item_completed.workspace_id.as_str(),
                     item_completed.thread_id.as_str(),
                     item_completed.turn_id.as_str(),
                     &item_completed.item,
-                    None,
+                    Some("completed"),
                 )
                 .await;
                 self.send_notification_to_thread_subscribers(
@@ -1170,6 +1223,16 @@ impl MessageProcessor {
                         .await;
                     return Err(error);
                 }
+                if sidebar_visible {
+                    self.dirty_push(
+                        &delivery.workspace_id,
+                        Some(thread_id),
+                        None,
+                        None,
+                        false,
+                        None,
+                    );
+                }
                 self.send_notification_to_authorized_thread_connections(
                     thread_id,
                     events::TURN_STARTED,
@@ -1191,8 +1254,10 @@ impl MessageProcessor {
                 .await;
             }
         }
-        self.notify_thread_tree_changed(delivery.workspace_id.clone())
-            .await;
+        if sidebar_visible {
+            self.notify_thread_unread_legacy(&delivery.workspace_id, thread_id)
+                .await;
+        }
         Ok(turn_id)
     }
 
@@ -1242,6 +1307,27 @@ impl MessageProcessor {
         item: TurnItem,
         agent_action: Option<pioneer_crud::AgentCommitInput>,
     ) -> Result<()> {
+        // The destination was loaded above. Reuse its materialized visibility;
+        // only an unloaded target needs a single row in this operation's scope.
+        let sidebar_visible = match self
+            .thread_manager
+            .loaded_thread_sidebar_visibility(workspace_id, thread_id)
+            .await
+        {
+            Some(visibility) => visibility == pioneer_protocol::ThreadSidebarVisibility::Visible,
+            None => {
+                let thread = self
+                    .crud_store
+                    .get_thread_by_id(thread_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("delivery target thread not found"))?;
+                anyhow::ensure!(
+                    thread.workspace_id == workspace_id,
+                    "delivery workspace changed"
+                );
+                thread.sidebar_visibility == "visible"
+            }
+        };
         let started = pioneer_protocol::ItemStartedNotification {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
@@ -1258,6 +1344,9 @@ impl MessageProcessor {
         self.crud_store
             .materialize_task_delivery_item(started.clone(), completed.clone(), now, agent_action)
             .await?;
+        if sidebar_visible {
+            self.dirty_push(workspace_id, Some(thread_id), None, None, false, None);
+        }
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_STARTED, &started)
             .await;
         self.notify_semantic_timeline_item_changed(
@@ -1269,19 +1358,23 @@ impl MessageProcessor {
         )
         .await;
 
-        // Delivery projects an already-produced result into the target conversation. Index the
-        // committed projection directly; do not run another turn or post-turn memory extractor.
-        self.ingest_committed_thread_item(&completed).await;
+        // The canonical transaction already saved an episodic delivery. Wake
+        // that consumer once; a direct ingest here would duplicate delivery.
+        self.kick_native_turn_event_deliveries();
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_COMPLETED, &completed)
             .await;
-        self.notify_semantic_timeline_item_changed(
+        self.notify_semantic_timeline_item_changed_after_indicator_commit(
             completed.workspace_id.as_str(),
             completed.thread_id.as_str(),
             completed.turn_id.as_str(),
             &completed.item,
-            None,
+            Some("completed"),
         )
         .await;
+        if sidebar_visible {
+            self.notify_thread_unread_legacy(workspace_id, thread_id)
+                .await;
+        }
         Ok(())
     }
 

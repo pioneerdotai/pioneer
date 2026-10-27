@@ -15,6 +15,7 @@ impl TurnItemHandler for AgentMessageHandler {
         let TurnItem::AgentMessage {
             id,
             text,
+            phase,
             markdown,
             markdown_version,
             ..
@@ -22,6 +23,11 @@ impl TurnItemHandler for AgentMessageHandler {
         else {
             return;
         };
+        projector.resolve_provider_previews(
+            turn_id,
+            id,
+            *phase == pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        );
         let markdown = if Self::is_supported_markdown_version(*markdown_version) {
             markdown.clone()
         } else {
@@ -64,13 +70,14 @@ impl TurnItemHandler for AgentMessageHandler {
     fn on_completed(
         &self,
         projector: &mut ConversationProjector,
-        _turn_id: &str,
+        turn_id: &str,
         item: &TurnItem,
         ts_unix_ms: i64,
     ) {
         let TurnItem::AgentMessage {
             id,
             text,
+            phase,
             markdown,
             markdown_version,
             ..
@@ -78,6 +85,11 @@ impl TurnItemHandler for AgentMessageHandler {
         else {
             return;
         };
+        projector.resolve_provider_previews(
+            turn_id,
+            id,
+            *phase == pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        );
         let markdown = if Self::is_supported_markdown_version(*markdown_version) {
             markdown.clone()
         } else {
@@ -98,6 +110,6 @@ impl TurnItemHandler for AgentMessageHandler {
 
 impl AgentMessageHandler {
     fn is_supported_markdown_version(version: Option<u16>) -> bool {
-        version.is_none_or(|version| version == MARKDOWN_AST_VERSION)
+        version.is_none_or(|version| version == 1 || version == MARKDOWN_AST_VERSION)
     }
 }

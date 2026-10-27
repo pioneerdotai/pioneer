@@ -20,11 +20,11 @@ use pioneer_entity::{
 };
 use pioneer_protocol::{
     AgentDelegationRouteId, AgentDelegationRouteProjection, AgentExecutionId,
-    AgentExecutionProfileId, AgentExecutionProfileProjection, AgentIdentityId,
-    AgentIdentityProjection, AgentIdentitySourceKind, AgentPresentationSnapshot, AgentRouteAction,
-    AgentRouteDisclosurePolicy, AgentRouteKind, AgentRouteStatus, AgentWorkGraphProjection,
-    AgentWorkNodeProjection, AgentWorkNodeState, PersistedActorRef, SafeRouteProvenance,
-    TaskActorContract, TaskOccurrenceContract, TaskOccurrenceStatus, Thread,
+    AgentExecutionProfileId, AgentIdentityId, AgentIdentityProjection, AgentIdentitySourceKind,
+    AgentPresentationSnapshot, AgentRouteAction, AgentRouteDisclosurePolicy, AgentRouteKind,
+    AgentRouteStatus, AgentWorkGraphProjection, AgentWorkNodeProjection, AgentWorkNodeState,
+    PersistedActorRef, SafeRouteProvenance, TaskActorContract, TaskOccurrenceContract,
+    TaskOccurrenceStatus, Thread,
 };
 #[cfg(test)]
 use sea_orm::DatabaseConnection;
@@ -54,13 +54,28 @@ pub const AGENT_ACTION_OUTBOX_MAX_ATTEMPTS: i64 = 8;
 const _: () = assert!(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS == 8);
 const AGENT_ACTION_OUTBOX_BATCH_LIMIT: u64 = 64;
 const AGENT_ACTION_OUTBOX_RANGE_LIMIT: u64 = 32;
-const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 ORDER BY created_at,id LIMIT ?";
+const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 AND (status='pending' OR last_error IS NULL OR last_error NOT IN ('outbox_start_integrity_rejected','outbox_start_authority_denied','outbox_start_runtime_unavailable','outbox_foreground_conflict','outbox_start_outcome_unknown')) ORDER BY created_at,id LIMIT ?";
 const AGENT_ACTION_OUTBOX_TIMED_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NOT NULL AND (status='pending' OR (status='failed' AND attempts<8)) AND next_attempt_at<=? ORDER BY next_attempt_at,created_at,id LIMIT ?";
 const AGENT_ACTION_OUTBOX_FAILURE_CLASS: &str = "outbox_delivery_failed";
+// An exhausted StartAgent still owes outcome reconciliation, never delivery.
+pub const AGENT_START_RECONCILIATION_REQUIRED: &str = "outbox_start_reconciliation_required";
+// Reconciliation claims bounded candidates before checking canonical proof.
+// Legacy failed/8/NULL terminal receipts must be ACKed once, not filtered while
+// remaining forever in the working index. The dispatcher validates their exact
+// terminal generation/resources and never redelivers an exhausted model start.
+// The immutable payload kind narrows the index; missing/invalid kind remains a
+// candidate. The action join remains authoritative, never payload authorization.
+const AGENT_START_RECONCILIATION_SQL: &str = "SELECT o.id FROM agent_action_outbox o JOIN agent_action a ON a.id=o.action_id WHERE a.action_kind='start_agent' AND o.status IN ('pending','failed') AND o.attempts=8 AND COALESCE(CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.kind') END,'start_agent')='start_agent' AND (o.next_attempt_at IS NULL OR o.next_attempt_at<=?) ORDER BY o.next_attempt_at,o.created_at,o.id LIMIT ?";
+
+const AGENT_START_TERMINAL_FAILURE_CLASSES: [&str; 5] = [
+    "outbox_start_integrity_rejected",
+    "outbox_start_authority_denied",
+    "outbox_start_runtime_unavailable",
+    "outbox_foreground_conflict",
+    "outbox_start_outcome_unknown",
+];
 pub const AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS: i64 = 30;
 pub const AGENT_ROUTE_GRAPH_MAX_EDGES: usize = 2_048;
-pub const ACTIVE_AGENT_IDENTITY_CATALOG_LIMIT: u64 =
-    pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES as u64;
 const AGENT_PROJECTION_BATCH_LIMIT: usize = 200;
 // Independent of graph nodes: one Task occurrence may have many revision Turns.
 const AGENT_GRAPH_RESPONSE_BINDING_LIMIT: usize = 65_536;
@@ -374,6 +389,8 @@ pub struct AgentResourceStateInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentExecutionGraphCommitInput {
+    /// Current source fence checked atomically at commit. On replay this may
+    /// be newer than the immutable execution/presentation source below.
     pub identity: AgentIdentityInput,
     pub presentation: PresentationSnapshotInput,
     pub root_execution_id: String,
@@ -580,16 +597,21 @@ pub async fn load_active_agent_identity_by_source<C: ConnectionTrait>(
         .context("failed to resolve exact active agent identity source")
 }
 
-pub async fn list_active_agent_identities<C: ConnectionTrait>(
+pub async fn list_active_agent_identities_page<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
+    after: Option<&str>,
 ) -> Result<Vec<agent_identity::Model>> {
-    agent_identity::Entity::find()
+    let mut query = agent_identity::Entity::find()
         .filter(agent_identity::Column::WorkspaceId.eq(workspace_id.to_owned()))
         .filter(agent_identity::Column::Status.eq("active"))
-        .filter(agent_identity::Column::RetiredAt.is_null())
+        .filter(agent_identity::Column::RetiredAt.is_null());
+    if let Some(after) = after {
+        query = query.filter(agent_identity::Column::Id.gt(after));
+    }
+    query
         .order_by_asc(agent_identity::Column::Id)
-        .limit(ACTIVE_AGENT_IDENTITY_CATALOG_LIMIT)
+        .limit(AGENT_PROJECTION_BATCH_LIMIT as u64)
         .all(db)
         .await
         .context("failed to list active workspace agent identities")
@@ -812,6 +834,8 @@ pub async fn ensure_agent_identity<C: ConnectionTrait>(
     if identity.id != input.id
         || identity.source_revision != input.source_revision
         || identity.source_fingerprint != input.source_fingerprint
+        || identity.status != "active"
+        || identity.retired_at.is_some()
     {
         bail!("agent identity source was reused with different immutable facts");
     }
@@ -2193,6 +2217,73 @@ pub(crate) async fn apply_prepared_agent_delegation_route_expiry_batch(
     Ok(expected_updated)
 }
 
+/// An empty agent-created thread has no Conversation turn from which to
+/// restore composer reasoning. Its creator execution stores the immutable
+/// applied selection; reading it neither creates identity nor grants authority.
+pub(crate) async fn empty_agent_thread_reasoning<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+) -> Result<Option<String>> {
+    let Some(thread) = thread::Entity::find_by_id(thread_id.to_owned())
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(PersistedActorRef::AgentExecution(execution_id)) =
+        crate::repositories::identity::actor_ref_from_db(
+            thread.created_by_actor_kind.as_deref(),
+            thread.created_by_actor_id.as_deref(),
+        )?
+    else {
+        return Ok(None);
+    };
+    let Some(execution) = agent_execution::Entity::find_by_id(execution_id.to_string())
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if execution.workspace_id != thread.workspace_id {
+        bail!("thread creator execution workspace differs");
+    }
+    let selection: pioneer_protocol::AgentExecutionSelection =
+        serde_json::from_str(&execution.requested_profile_selection_json)
+            .context("thread creator execution selection is invalid")?;
+    Ok(selection.reasoning.map(|reasoning| reasoning.effort))
+}
+
+/// Bounded list projection counterpart of empty_agent_thread_reasoning. The
+/// caller already read the immutable thread creators in its list query.
+pub(crate) async fn agent_thread_creator_reasoning<C: ConnectionTrait>(
+    db: &C,
+    execution_ids: &[&str],
+) -> Result<BTreeMap<String, (String, Option<String>)>> {
+    if execution_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let executions = agent_execution::Entity::find()
+        .filter(agent_execution::Column::Id.is_in(execution_ids.iter().copied()))
+        .all(db)
+        .await?;
+    // The query released its reader before parsing the saved selections.
+    executions
+        .into_iter()
+        .map(|execution| {
+            let selection: pioneer_protocol::AgentExecutionSelection =
+                serde_json::from_str(&execution.requested_profile_selection_json)
+                    .context("thread creator execution selection is invalid")?;
+            Ok((
+                execution.id,
+                (
+                    execution.workspace_id,
+                    selection.reasoning.map(|reasoning| reasoning.effort),
+                ),
+            ))
+        })
+        .collect()
+}
+
 /// Atomically materialize a server-resolved thread and its execution-scoped
 /// continuation route. Callers pass a DatabaseTransaction when this is part
 /// of an AgentAction commit; no user-selected participant/ACL data is accepted
@@ -2386,19 +2477,12 @@ fn agent_execution_launch_grant_matches_child_identity(
     child_identity_id: &str,
 ) -> bool {
     identity.id.as_str() == child_identity_id
-        && child_launch_grant
-            .identities
-            .iter()
-            .any(|candidate| candidate == identity)
-        && child_launch_grant
-            .profiles
-            .iter()
-            .any(|candidate| candidate == profile)
-        && (identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::Ephemeral
-            || profile
-                .compatible_agent_identity_ids
-                .iter()
-                .any(|candidate| candidate == &identity.id))
+        && pioneer_protocol::validate_selected_agent_launch_profile(
+            identity,
+            profile,
+            &child_launch_grant.identities,
+        )
+        .is_ok()
 }
 
 fn parse_agent_execution_launch_grant(
@@ -2537,6 +2621,46 @@ pub async fn load_current_agent_authors_for_executions<C: ConnectionTrait>(
     if execution_ids.len() > AGENT_PROJECTION_BATCH_LIMIT {
         bail!("Agent author projection batch exceeds its bounded limit");
     }
+    // A CLI occurrence's provider is an execution fact, not its avatar or label.
+    // DISTINCT bounds the result by execution/provider pairs, including retries.
+    let placeholders = vec!["?"; execution_ids.len()].join(",");
+    let runtime_rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            format!(
+                "SELECT DISTINCT e.id AS execution_id, b.runtime_kind \
+                 FROM agent_execution e \
+                 JOIN agent_identity i ON i.id = e.agent_identity_id \
+                 JOIN task_run_execution r ON r.id = e.id AND r.task_id = e.parent_task_id \
+                 JOIN task_run_turn t ON t.run_id = r.task_run_id AND t.execution_id = r.id \
+                 JOIN turn_cli_runtime_binding b ON b.turn_id = t.turn_id \
+                 WHERE i.source_kind = 'cli_runtime_instance' \
+                 AND b.workspace_id = e.workspace_id AND b.runtime_id = i.source_id \
+                 AND e.id IN ({placeholders}) LIMIT ?"
+            ),
+            execution_ids
+                .iter()
+                .cloned()
+                .map(sea_orm::Value::from)
+                .chain(std::iter::once(sea_orm::Value::from(
+                    execution_ids.len() as i64 * 3 + 1,
+                ))),
+        ))
+        .await?;
+    let mut runtime_kinds = BTreeMap::new();
+    for row in runtime_rows {
+        let execution_id: String = row.try_get("", "execution_id")?;
+        let kind: String = row.try_get("", "runtime_kind")?;
+        let kind: pioneer_protocol::CLIAgentRuntimeKind =
+            serde_json::from_value(serde_json::Value::String(kind))
+                .context("invalid CLI provider kind in Agent execution binding")?;
+        if runtime_kinds
+            .insert(execution_id, kind)
+            .is_some_and(|old| old != kind)
+        {
+            bail!("Agent execution has conflicting CLI provider identities");
+        }
+    }
     let executions = agent_execution::Entity::find()
         .filter(agent_execution::Column::Id.is_in(execution_ids.iter().cloned()))
         .all(db)
@@ -2617,7 +2741,7 @@ pub async fn load_current_agent_authors_for_executions<C: ConnectionTrait>(
         let snapshot = snapshots_by_id
             .get(snapshot_id)
             .context("author AgentExecution presentation snapshot is missing")?;
-        let author = if let Some(current_snapshot) =
+        let mut author = if let Some(current_snapshot) =
             current_snapshots_by_identity_id.get(identity.id.as_str())
         {
             current_agent_author_from_rows(identity, &execution, snapshot, current_snapshot)?
@@ -2625,6 +2749,7 @@ pub async fn load_current_agent_authors_for_executions<C: ConnectionTrait>(
             agent_presentation_snapshot_from_rows(identity, &execution, snapshot)?
                 .to_turn_author_snapshot()
         };
+        author.cli_runtime_kind = runtime_kinds.get(&execution.id).copied();
         result.insert(
             execution.id,
             AgentExecutionAuthorProjection {
@@ -4036,7 +4161,10 @@ async fn revalidate_agent_execution_for_commit(
         .await
         .context("failed to revalidate committing Agent identity")?
         .context("committing Agent identity disappeared")?;
-    if identity.workspace_id != execution.workspace_id || identity.status != "active" {
+    if identity.workspace_id != execution.workspace_id
+        || identity.status != "active"
+        || identity.retired_at.is_some()
+    {
         bail!("committing Agent identity is unavailable");
     }
     if identity.source_revision != input.expected_current_identity_source_revision
@@ -4705,7 +4833,41 @@ where
         .add(
             Condition::all()
                 .add(agent_action_outbox::Column::Status.eq("failed"))
-                .add(agent_action_outbox::Column::Attempts.gte(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS))
+                .add(
+                    Condition::any()
+                        .add(
+                            Condition::all()
+                                .add(
+                                    agent_action_outbox::Column::Attempts
+                                        .gte(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS),
+                                )
+                                // Exclude unresolved starts before LIMIT using
+                                // a point lookup of the canonical action.
+                                .add(sea_orm::sea_query::Expr::exists(
+                                    Query::select()
+                                        .column(agent_action::Column::Id)
+                                        .from(agent_action::Entity)
+                                        .and_where(
+                                            sea_orm::sea_query::Expr::col((
+                                                agent_action::Entity,
+                                                agent_action::Column::Id,
+                                            ))
+                                            .equals((
+                                                agent_action_outbox::Entity,
+                                                agent_action_outbox::Column::ActionId,
+                                            )),
+                                        )
+                                        .and_where(
+                                            agent_action::Column::ActionKind.ne("start_agent"),
+                                        )
+                                        .to_owned(),
+                                )),
+                        )
+                        .add(
+                            agent_action_outbox::Column::LastError
+                                .is_in(AGENT_START_TERMINAL_FAILURE_CLASSES),
+                        ),
+                )
                 .add(agent_action_outbox::Column::NextAttemptAt.is_null()),
         );
     let candidates = agent_action_outbox::Entity::find()
@@ -4728,6 +4890,44 @@ where
             .await
             .context("failed to load compactable agent domain action")?
             .context("compactable agent domain outbox has no action")?;
+        if action.action_kind == "start_agent"
+            && candidate.status == "failed"
+            && !candidate
+                .last_error
+                .as_deref()
+                .is_some_and(|cause| AGENT_START_TERMINAL_FAILURE_CLASSES.contains(&cause))
+        {
+            continue; // exhaustion is a reconciliation obligation, not a terminal receipt
+        }
+        if action.action_kind == "start_agent" && candidate.status == "failed" {
+            let payload: serde_json::Value = serde_json::from_str(&candidate.payload_json)?;
+            let Some(turn_id) = payload
+                .pointer("/dispatch/turn_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(execution_id) = payload
+                .get("spawned_execution_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let response = load_agent_turn_response(db, turn_id).await?;
+            let resource = load_agent_execution_resource_state(db, execution_id).await?;
+            if response.is_none_or(|response| response.execution_id != execution_id)
+                || !super::turn_event_projection_stream_state::has_accepted_terminal(db, turn_id)
+                    .await?
+                || resource.is_none_or(|resource| {
+                    !matches!(
+                        resource.status.as_str(),
+                        "completed" | "failed" | "blocked" | "cancelled" | "timed_out"
+                    )
+                })
+            {
+                continue;
+            }
+        }
         let receipt = agent_action_receipt::Entity::find()
             .filter(agent_action_receipt::Column::ActionId.eq(candidate.action_id.clone()))
             .one(db)
@@ -4884,6 +5084,27 @@ fn compacted_agent_action_outbox_payload(
             spawned_execution_id.clone(),
         );
     }
+    if action.action_kind == "start_agent" {
+        // Keep only the immutable binding required for terminal reconciliation;
+        // input, launch parameters and the runtime dispatch payload are released.
+        let turn_id = original
+            .pointer("/dispatch/turn_id")
+            .and_then(serde_json::Value::as_str)
+            .context("compactable StartAgent has no terminal Turn binding")?;
+        let generation = original
+            .pointer("/dispatch/execution_generation")
+            .and_then(serde_json::Value::as_i64)
+            .context("compactable StartAgent has no execution generation")?;
+        retained.insert(
+            "dispatch".to_owned(),
+            serde_json::json!({"turn_id":turn_id, "execution_generation":generation}),
+        );
+    }
+    // Replay must distinguish the original launch choice from its resolved
+    // profile even after the dispatch envelope has been released.
+    if let Some(fingerprint) = original.get("launch_request_fingerprint") {
+        retained.insert("launch_request_fingerprint".to_owned(), fingerprint.clone());
+    }
     Ok(agent_action_compaction_marker(
         AGENT_ACTION_OUTBOX_COMPACTION_FORMAT,
         outbox.payload_json.as_str(),
@@ -4967,8 +5188,30 @@ struct AgentActionOutboxId {
     id: String,
 }
 
-// Keep these predicates literally aligned with the partial indexes in
-// m20261004_000007_agent_action_outbox_ranges. Only clocks and limits are binds.
+// Predicates and ordering match the existing due indexes and the exhausted
+// expression index added by m20261026_000001_agent_start_reconciliation_index.
+// SeaORM/SeaQuery do not expose SQLite INDEXED BY on the bounded UNION arm;
+// keep that discovery statement here, with only clocks and limits as binds.
+fn agent_action_outbox_timed_discovery_sql() -> String {
+    // Empty text sorts before every stored timestamp. This makes NULL and timed
+    // exhausted deadlines one searchable range with the unchanged input quota.
+    let exhausted = AGENT_START_RECONCILIATION_SQL.replace(
+        "SELECT o.id FROM agent_action_outbox o",
+        "SELECT o.id,o.next_attempt_at,o.created_at FROM agent_action_outbox o INDEXED BY idx_agent_action_outbox_exhausted",
+    ).replace("(o.next_attempt_at IS NULL OR o.next_attempt_at<=?)",
+        "COALESCE(o.next_attempt_at,'')<=?")
+     .replace("ORDER BY o.next_attempt_at,o.created_at,o.id",
+        "ORDER BY COALESCE(o.next_attempt_at,''),o.created_at,o.id");
+    format!(
+        "SELECT id FROM (SELECT id,next_attempt_at,created_at FROM ({}) UNION SELECT id,next_attempt_at,created_at FROM ({})) ORDER BY next_attempt_at,created_at,id LIMIT ?",
+        AGENT_ACTION_OUTBOX_TIMED_SQL.replace(
+            "SELECT id FROM",
+            "SELECT id,next_attempt_at,created_at FROM"
+        ),
+        exhausted,
+    )
+}
+
 async fn discover_agent_action_outbox<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
@@ -4984,15 +5227,25 @@ async fn discover_agent_action_outbox<C: ConnectionTrait>(
     .all(db)
     .await
     .context("failed to list immediate agent action outbox IDs")?;
+    // The original timed predicate retains its partial-index access. A second
+    // bounded range supplies exhausted StartAgent reconciliation; their merged
+    // due order shares the existing timed quantum, including limit=2 callers.
+    let timed_sql = agent_action_outbox_timed_discovery_sql();
     ids.extend(
         AgentActionOutboxId::find_by_statement(Statement::from_sql_and_values(
             db.get_database_backend(),
-            AGENT_ACTION_OUTBOX_TIMED_SQL,
-            [now.into(), timed_limit.into()],
+            timed_sql,
+            [
+                now.clone().into(),
+                timed_limit.into(),
+                now.into(),
+                timed_limit.into(),
+                timed_limit.into(),
+            ],
         ))
         .all(db)
         .await
-        .context("failed to list timed agent action outbox IDs")?,
+        .context("failed to list timed agent start delivery/reconciliation IDs")?,
     );
     // A concurrent source transition can move an ID between these two reads.
     // Retain range order but never transition the same input twice per quantum.
@@ -5176,8 +5429,27 @@ async fn transition_agent_action_outbox<C: ConnectionTrait>(
         return Ok(false);
     }
     let exhausted = candidate.attempts >= AGENT_ACTION_OUTBOX_MAX_ATTEMPTS;
-    if exhausted && (candidate.status != "pending" || candidate.next_attempt_at.is_none()) {
-        // Final attempt with a NULL lease was never supported closure eligibility.
+    let reconcile_start = exhausted
+        && agent_action::Entity::find_by_id(candidate.action_id.clone())
+            .one(db)
+            .await?
+            .is_some_and(|action| action.action_kind == "start_agent");
+    // Only locally finalized StartAgent refusals add an early terminal case.
+    // Legacy immediate failures and other action kinds retain their behavior.
+    if !reconcile_start
+        && candidate.status == "failed"
+        && candidate.next_attempt_at.is_none()
+        && candidate
+            .last_error
+            .as_deref()
+            .is_some_and(|cause| AGENT_START_TERMINAL_FAILURE_CLASSES.contains(&cause))
+    {
+        return Ok(false);
+    }
+    if exhausted
+        && !reconcile_start
+        && (candidate.status != "pending" || candidate.next_attempt_at.is_none())
+    {
         return Ok(false);
     }
     let lease_guard = match candidate.next_attempt_at.clone() {
@@ -5189,7 +5461,14 @@ async fn transition_agent_action_outbox<C: ConnectionTrait>(
         .filter(agent_action_outbox::Column::Status.eq(candidate.status.clone()))
         .filter(agent_action_outbox::Column::Attempts.eq(candidate.attempts))
         .filter(lease_guard);
-    let (status, attempts, next_attempt_at, last_error) = if exhausted {
+    let (status, attempts, next_attempt_at, last_error) = if reconcile_start {
+        (
+            "pending",
+            candidate.attempts,
+            Some(now + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS)),
+            Some(AGENT_START_RECONCILIATION_REQUIRED.to_owned()),
+        )
+    } else if exhausted {
         (
             "failed",
             candidate.attempts,
@@ -5224,7 +5503,7 @@ async fn transition_agent_action_outbox<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to transition agent action outbox input")?;
-    if result.rows_affected != 1 || exhausted {
+    if result.rows_affected != 1 || (exhausted && !reconcile_start) {
         return Ok(false);
     }
     candidate.status = status.to_owned();
@@ -5262,13 +5541,89 @@ pub async fn mark_agent_action_outbox_delivered<C: ConnectionTrait>(
     Ok(result.rows_affected == 1)
 }
 
+/// Fixed diagnostics only: provider errors and user payloads never enter the ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentActionOutboxFailure {
+    DeliveryFailed,
+    StorageUnavailable,
+    InvalidStart,
+    AuthorityDenied,
+    RuntimeUnavailable,
+    PreparationUnavailable,
+    ControlUnavailable,
+    OutcomeUnknown,
+    ForegroundConflict,
+}
+impl AgentActionOutboxFailure {
+    pub const fn safe_name(self) -> &'static str {
+        match self {
+            Self::DeliveryFailed => "outbox_delivery_failed",
+            Self::StorageUnavailable => "outbox_storage_unavailable",
+            Self::InvalidStart => "outbox_start_integrity_rejected",
+            Self::AuthorityDenied => "outbox_start_authority_denied",
+            Self::RuntimeUnavailable => "outbox_start_runtime_unavailable",
+            Self::PreparationUnavailable => "outbox_start_preparation_unavailable",
+            Self::ControlUnavailable => "outbox_runtime_control_unavailable",
+            Self::OutcomeUnknown => "outbox_start_outcome_unknown",
+            Self::ForegroundConflict => "outbox_foreground_conflict",
+        }
+    }
+}
+impl std::fmt::Display for AgentActionOutboxFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.safe_name())
+    }
+}
+impl std::error::Error for AgentActionOutboxFailure {}
+
 pub async fn mark_agent_action_outbox_failed<C: ConnectionTrait>(
     db: &C,
     outbox_id: &str,
     expected_attempts: i64,
     failed_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    let next_attempt_at = agent_action_outbox_retry_at(expected_attempts, failed_at.clone())?;
+    mark_agent_action_outbox_failed_with_cause(
+        db,
+        outbox_id,
+        expected_attempts,
+        failed_at,
+        AgentActionOutboxFailure::DeliveryFailed,
+        false,
+    )
+    .await
+}
+
+pub async fn mark_agent_action_outbox_failed_with_cause<C: ConnectionTrait>(
+    db: &C,
+    outbox_id: &str,
+    expected_attempts: i64,
+    failed_at: DateTimeWithTimeZone,
+    failure: AgentActionOutboxFailure,
+    terminal: bool,
+) -> Result<bool> {
+    let exhausted_start = if !terminal && expected_attempts == AGENT_ACTION_OUTBOX_MAX_ATTEMPTS {
+        match agent_action_outbox::Entity::find_by_id(outbox_id.to_owned())
+            .one(db)
+            .await?
+        {
+            Some(row) if row.attempts == expected_attempts => {
+                agent_action::Entity::find_by_id(row.action_id)
+                    .one(db)
+                    .await?
+                    .is_some_and(|action| action.action_kind == "start_agent")
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    let next_attempt_at = if terminal {
+        None
+    } else if exhausted_start {
+        Some(failed_at.clone() + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS))
+    } else {
+        agent_action_outbox_retry_at(expected_attempts, failed_at.clone())?
+    };
     let result = agent_action_outbox::Entity::update_many()
         .col_expr(
             agent_action_outbox::Column::Status,
@@ -5276,7 +5631,15 @@ pub async fn mark_agent_action_outbox_failed<C: ConnectionTrait>(
         )
         .col_expr(
             agent_action_outbox::Column::LastError,
-            sea_orm::sea_query::Expr::value(Some(AGENT_ACTION_OUTBOX_FAILURE_CLASS.to_owned())),
+            sea_orm::sea_query::Expr::value(Some(
+                if exhausted_start
+                    && AGENT_START_TERMINAL_FAILURE_CLASSES.contains(&failure.safe_name())
+                {
+                    AGENT_START_RECONCILIATION_REQUIRED.to_owned()
+                } else {
+                    failure.safe_name().to_owned()
+                },
+            )),
         )
         .col_expr(
             agent_action_outbox::Column::NextAttemptAt,
@@ -5556,10 +5919,137 @@ pub async fn commit_agent_execution_graph(
     }
     let (grant_identity, grant_profile, child_launch_grant) =
         parse_agent_execution_launch_grant(input.grant.grant_json.as_str())?;
+    let existing = load_agent_execution(db, &input.child_execution.id).await?;
     let identity = ensure_agent_identity(db, &input.identity).await?;
+    if identity.workspace_id != input.child_execution.workspace_id
+        || agent_identity_source_kind(&identity.source_kind)? != grant_identity.source_kind
+        || match (&grant_identity.source_kind, &grant_profile.backend) {
+            (
+                AgentIdentitySourceKind::NativeAgent,
+                pioneer_protocol::AgentExecutionProfileBackend::ApiProvider,
+            ) => false,
+            (
+                AgentIdentitySourceKind::CliRuntimeInstance,
+                pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+                    runtime_instance_id,
+                },
+            ) => {
+                runtime_instance_id != &identity.source_id
+                    || grant_profile.provider_id != format!("cli_runtime:{runtime_instance_id}")
+            }
+            (AgentIdentitySourceKind::Ephemeral, _) => false,
+            _ => true,
+        }
+    {
+        bail!("execution graph changed its workspace or launch source");
+    }
+    if identity.source_kind == SOURCE_NATIVE_AGENT {
+        let config = load_native_agent_config(db, &identity.source_id)
+            .await?
+            .context("native Agent source disappeared before graph commit")?;
+        if config.workspace_id != identity.workspace_id
+            || !config.enabled
+            || config.config_revision != identity.source_revision
+        {
+            bail!("native Agent source changed before graph commit");
+        }
+    }
+    // An ephemeral actor has no CLI kind of its own. Its profile must retain
+    // the registered runtime source from the admitted ceiling, rather than
+    // treating an execution-local identity as authority to change engines.
+    if grant_identity.source_kind == AgentIdentitySourceKind::Ephemeral
+        && let pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+            runtime_instance_id,
+        } = &grant_profile.backend
+    {
+        let source = load_agent_identity_by_source(
+            db,
+            &identity.workspace_id,
+            SOURCE_CLI_RUNTIME_INSTANCE,
+            runtime_instance_id,
+        )
+        .await?
+        .context("ephemeral CLI profile source disappeared before commit")?;
+        let backing = child_launch_grant
+            .identities
+            .iter()
+            .find(|candidate| {
+                candidate.id.as_str() == source.id
+                    && candidate.source_kind == AgentIdentitySourceKind::CliRuntimeInstance
+                    && grant_profile
+                        .compatible_agent_identity_ids
+                        .contains(&candidate.id)
+            })
+            .context("ephemeral CLI profile has no admitted registered source")?;
+        if source.status != "active"
+            || source.retired_at.is_some()
+            || grant_profile.provider_id != format!("cli_runtime:{runtime_instance_id}")
+            || (existing.is_none()
+                && (u64::try_from(source.source_revision).ok() != Some(backing.source_revision)
+                    || source.source_fingerprint != backing.source_fingerprint))
+        {
+            bail!("ephemeral CLI profile source changed before commit");
+        }
+        let historical = load_current_agent_presentation_snapshot(
+            db,
+            &source.id,
+            i64::try_from(backing.source_revision).unwrap_or(-1),
+            &backing.source_fingerprint,
+        )
+        .await?
+        .context("ephemeral CLI profile source snapshot is missing")?;
+        let current = load_current_agent_presentation_snapshot(
+            db,
+            &source.id,
+            source.source_revision,
+            &source.source_fingerprint,
+        )
+        .await?
+        .context("ephemeral CLI profile current source snapshot is missing")?;
+        if historical.display_name != backing.display_name
+            || historical.nickname != backing.nickname
+            || historical.avatar_revision != backing.avatar_revision
+            || historical.role_label != backing.role_label
+            || current.role_label != backing.role_label
+        {
+            bail!("ephemeral CLI profile changed its admitted runtime kind");
+        }
+    }
+    let presentation_matches_source = if let Some(existing) = existing.as_ref() {
+        existing.agent_identity_id == identity.id
+            && existing.presentation_snapshot_id.as_deref() == Some(input.presentation.id.as_str())
+            && existing.identity_source_revision == input.presentation.source_revision
+            && existing.identity_source_fingerprint == input.presentation.source_fingerprint
+    } else {
+        identity.source_revision == input.presentation.source_revision
+            && identity.source_fingerprint == input.presentation.source_fingerprint
+    };
+    if identity.source_kind == SOURCE_CLI_RUNTIME_INSTANCE && existing.is_some() {
+        // Replay keeps its historical presentation, but the registered source
+        // must still implement the admitted CLI engine. Technical revisions
+        // and display-name changes do not change that engine.
+        let current = load_current_agent_presentation_snapshot(
+            db,
+            &identity.id,
+            identity.source_revision,
+            &identity.source_fingerprint,
+        )
+        .await?
+        .context("CLI execution current source snapshot is missing")?;
+        if current.role_label.is_none() || current.role_label != input.presentation.role_label {
+            bail!("CLI execution source changed its admitted runtime kind");
+        }
+    }
     if identity.id != input.presentation.agent_identity_id
-        || identity.source_revision != input.presentation.source_revision
-        || identity.source_fingerprint != input.presentation.source_fingerprint
+        || !presentation_matches_source
+        || grant_identity.id.as_str() != input.presentation.agent_identity_id
+        || i64::try_from(grant_identity.source_revision).ok()
+            != Some(input.presentation.source_revision)
+        || grant_identity.source_fingerprint != input.presentation.source_fingerprint
+        || grant_identity.display_name != input.presentation.display_name
+        || grant_identity.nickname != input.presentation.nickname
+        || grant_identity.avatar_revision != input.presentation.avatar_revision
+        || grant_identity.role_label != input.presentation.role_label
     {
         bail!("agent presentation snapshot is not pinned to the exact identity source");
     }
@@ -5571,15 +6061,17 @@ pub async fn commit_agent_execution_graph(
     } else {
         (NICKNAME_OWNER_AGENT, identity.id.clone())
     };
-    claim_actor_nickname(
-        db,
-        input.identity.workspace_id.as_str(),
-        input.presentation.nickname.as_str(),
-        nickname_owner_kind,
-        nickname_owner_id.as_str(),
-        input.presentation.now.clone(),
-    )
-    .await?;
+    if existing.is_none() {
+        claim_actor_nickname(
+            db,
+            input.identity.workspace_id.as_str(),
+            input.presentation.nickname.as_str(),
+            nickname_owner_kind,
+            nickname_owner_id.as_str(),
+            input.presentation.now.clone(),
+        )
+        .await?;
+    }
     let _presentation = insert_presentation_snapshot(db, &input.presentation).await?;
 
     if input.root_execution_id != input.child_execution.work_graph_root_execution_id {
@@ -5628,14 +6120,27 @@ pub async fn commit_agent_execution_graph(
     {
         bail!("agent execution graph grant differs from its exact child execution");
     }
-    if let Some(parent_execution_id) = child.parent_execution_id.as_deref() {
+    // Independent roots retain the source's launch ceiling without inheriting
+    // its lifecycle. The canonical StartAgent action proves that source at commit.
+    #[derive(serde::Deserialize)]
+    struct LaunchSource {
+        #[serde(default)]
+        source_execution_id: Option<String>,
+    }
+    let source_grant: LaunchSource = serde_json::from_str(&input.grant.grant_json)?;
+    let launch_source = child
+        .parent_execution_id
+        .as_deref()
+        .or(source_grant.source_execution_id.as_deref());
+    if let Some(parent_execution_id) = launch_source {
         let parent = agent_execution::Entity::find_by_id(parent_execution_id.to_owned())
             .one(db)
             .await
             .context("failed to load exact parent execution")?
             .context("exact parent execution does not exist")?;
         if parent.workspace_id != child.workspace_id
-            || parent.work_graph_root_execution_id != input.root_execution_id
+            || (child.parent_execution_id.is_some()
+                && parent.work_graph_root_execution_id != input.root_execution_id)
         {
             bail!("exact parent execution is outside the child work graph");
         }
@@ -5646,25 +6151,10 @@ pub async fn commit_agent_execution_graph(
             parse_agent_execution_launch_grant(parent_grant.grant_json.as_str())?;
         let ephemeral_child =
             grant_identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::Ephemeral;
-        let ephemeral_profile_is_monotonic = ephemeral_child
-            && derived_ephemeral_profile_is_no_wider(
-                &grant_profile,
-                parent_launch_grant.profiles.as_slice(),
-                &grant_identity.id,
-            );
         let identity_ceiling_is_monotonic = child_launch_grant.identities.iter().all(|candidate| {
-            parent_launch_grant
-                .identities
-                .iter()
-                .any(|parent| parent == candidate)
-                || (ephemeral_child && candidate == &grant_identity)
-        });
-        let profile_ceiling_is_monotonic = child_launch_grant.profiles.iter().all(|candidate| {
-            parent_launch_grant
-                .profiles
-                .iter()
-                .any(|parent| parent == candidate)
-                || (ephemeral_profile_is_monotonic && candidate == &grant_profile)
+            parent_launch_grant.identities.iter().any(|parent| {
+                pioneer_protocol::agent_identity_has_same_launch_source(candidate, parent)
+            }) || (ephemeral_child && candidate == &grant_identity)
         });
         let capability_ceiling_is_monotonic = child_launch_grant
             .skill_ids
@@ -5686,7 +6176,6 @@ pub async fn commit_agent_execution_graph(
             pioneer_protocol::TurnPermissionProfileSource::TaskPermissionCap,
         ) == child_permission;
         if !identity_ceiling_is_monotonic
-            || !profile_ceiling_is_monotonic
             || !capability_ceiling_is_monotonic
             || !permission_ceiling_is_monotonic
             || (ephemeral_child && !parent_launch_grant.allow_server_derived_ephemeral)
@@ -6105,40 +6594,6 @@ pub async fn commit_agent_execution_graph(
         },
     )
     .await
-}
-
-fn derived_ephemeral_profile_is_no_wider(
-    derived: &AgentExecutionProfileProjection,
-    parent_profiles: &[AgentExecutionProfileProjection],
-    ephemeral_identity_id: &AgentIdentityId,
-) -> bool {
-    parent_profiles.iter().any(|parent| {
-        let mut compatible_agent_identity_ids = parent.compatible_agent_identity_ids.clone();
-        if !compatible_agent_identity_ids.contains(ephemeral_identity_id) {
-            compatible_agent_identity_ids.push(ephemeral_identity_id.clone());
-            compatible_agent_identity_ids.sort();
-        }
-        let expected_fingerprint = hex::encode(Sha256::digest(
-            format!(
-                "agent-derived-profile\0{}\0{}",
-                parent.fingerprint,
-                ephemeral_identity_id.as_str()
-            )
-            .as_bytes(),
-        ));
-        derived.id == parent.id
-            && derived.compatible_agent_identity_ids == compatible_agent_identity_ids
-            && derived.backend == parent.backend
-            && derived.provider_id == parent.provider_id
-            && derived.model_id == parent.model_id
-            && derived.provider_display_name == parent.provider_display_name
-            && derived.model_display_name == parent.model_display_name
-            && derived.allowed_reasoning == parent.allowed_reasoning
-            && derived.allowed_permission_profiles == parent.allowed_permission_profiles
-            && derived.catalog_generation == parent.catalog_generation
-            && derived.policy_generation == parent.policy_generation
-            && derived.fingerprint == expected_fingerprint
-    })
 }
 
 async fn validate_agent_graph_bounds(
@@ -6575,7 +7030,16 @@ async fn cancel_agent_work_graph_targets(
     let target_executions = if collect_owners {
         executions.iter().collect::<Vec<_>>()
     } else {
-        active.clone()
+        // A prior graph fence may have committed before its direct response Turn
+        // was interrupted. Rediscover that response on retry, while real Tasks
+        // retain their aggregate cancellation/reconciliation protocol.
+        executions
+            .iter()
+            .filter(|execution| {
+                !terminal_statuses.contains(&execution.status.as_str())
+                    || (execution.status == "cancelled" && execution.parent_task_id.is_none())
+            })
+            .collect::<Vec<_>>()
     };
     let target_ids = target_executions
         .iter()
@@ -6654,7 +7118,7 @@ async fn cancel_agent_work_graph_targets(
         }
         targets
     } else {
-        // Preserve the standalone active-only contract, including its validation.
+        // Preserve direct-response retries and the standalone binding validation.
         let response_turns = if target_ids.is_empty() {
             Vec::new()
         } else {
@@ -6685,6 +7149,10 @@ async fn cancel_agent_work_graph_targets(
         }
         target_executions
             .iter()
+            .filter(|execution| {
+                !terminal_statuses.contains(&execution.status.as_str())
+                    || responses.contains_key(&execution.id)
+            })
             .map(|execution| AgentWorkGraphCancellationTarget {
                 execution_id: execution.id.clone(),
                 turn_id: responses.get(&execution.id).cloned(),
@@ -7219,6 +7687,10 @@ pub fn utc_now() -> DateTimeWithTimeZone {
 }
 
 #[cfg(test)]
+#[path = "agent_domain_launch_continuity_tests.rs"]
+mod launch_continuity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use migration::{Migrator, MigratorTrait};
@@ -7317,6 +7789,47 @@ mod tests {
             .grant_json
             .replace("model-opaque", "tampered-model");
         assert!(upgrade_agent_execution_grant_model_to_current(tampered).is_err());
+    }
+
+    #[test]
+    fn persisted_execution_grant_projection_restores_large_authenticated_snapshot() {
+        let migrated = pioneer_protocol::migrate_embedded_child_launch_grant_json_to_current(
+            &serde_json::json!({"child_launch_grant":version_one_child_launch_grant()}).to_string(),
+        )
+        .unwrap();
+        let migrated: serde_json::Value = serde_json::from_str(&migrated).unwrap();
+        let seed: pioneer_protocol::ChildAgentLaunchGrantSet =
+            serde_json::from_value(migrated["child_launch_grant"].clone()).unwrap();
+        let identities = (0..140)
+            .map(|n| {
+                let mut identity = seed.identities[0].clone();
+                identity.id = pioneer_protocol::AgentIdentityId::new(format!("A{n:020}")).unwrap();
+                identity
+            })
+            .collect::<Vec<_>>();
+        let mut profile: pioneer_protocol::AgentExecutionProfileProjection =
+            serde_json::from_value(version_one_child_launch_grant()["profiles"][0].clone())
+                .unwrap();
+        profile.compatible_agent_identity_ids = vec![identities[0].id.clone()];
+        let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(identities.clone()).unwrap();
+        let grant_json = serde_json::json!({"identity":identities[0],"profile":profile,"child_launch_grant":ceiling}).to_string();
+        let model = agent_execution_grant::Model {
+            id: "G00000000000000000001".into(),
+            execution_id: "E00000000000000000001".into(),
+            parent_execution_id: None,
+            child_identity_id: identities[0].id.to_string(),
+            grant_fingerprint: agent_execution_grant_fingerprint(&grant_json).unwrap(),
+            grant_json,
+            created_at: utc_now(),
+        };
+        let restored = upgrade_agent_execution_grant_model_to_current(model.clone()).unwrap();
+        assert_eq!(restored.grant_json, model.grant_json);
+        assert_eq!(restored.grant_fingerprint, model.grant_fingerprint);
+        let (_, _, recovered) = parse_agent_execution_launch_grant(&restored.grant_json).unwrap();
+        assert_eq!(recovered, ceiling);
+        let mut foreign = model;
+        foreign.child_identity_id = "Z00000000000000000001".into();
+        assert!(upgrade_agent_execution_grant_model_to_current(foreign).is_err());
     }
 
     #[test]
@@ -8156,7 +8669,8 @@ mod tests {
             "execution_id": "execution-old",
             "kind": "start_agent",
             "spawned_execution_id": "spawned-old",
-            "dispatch": {"opaque": "y".repeat(8192)},
+            "launch_request_fingerprint": "a".repeat(64),
+            "dispatch": {"turn_id":"turn-old", "execution_generation":1, "opaque": "y".repeat(8192)},
         })
         .to_string();
         insert_compaction_test_tuple(
@@ -8168,6 +8682,26 @@ mod tests {
             Some(old.clone()),
             old_response.clone(),
             old_payload.clone(),
+        )
+        .await;
+        // An older exhausted StartAgent still owes reconciliation. It must not
+        // consume the compaction quantum forever ahead of closed action tuples.
+        insert_compaction_test_tuple(
+            &db,
+            "unresolved",
+            "failed",
+            AGENT_ACTION_OUTBOX_MAX_ATTEMPTS,
+            old - Duration::days(1),
+            None,
+            "unresolved-response".to_owned(),
+            serde_json::json!({
+                "action_id": "action-unresolved",
+                "execution_id": "execution-unresolved",
+                "kind": "start_agent",
+                "spawned_execution_id": "spawned-unresolved",
+                "dispatch": {"turn_id":"turn-unresolved", "execution_generation":1},
+            })
+            .to_string(),
         )
         .await;
         insert_compaction_test_tuple(
@@ -8203,12 +8737,18 @@ mod tests {
         )
         .await;
 
-        let summary = compact_terminal_agent_action_ledger(&db, now, 100)
+        let summary = compact_terminal_agent_action_ledger(&db, now, 1)
             .await
             .unwrap();
         assert_eq!(summary.candidate_rows, 1);
         assert_eq!(summary.compacted_rows, 1);
         assert!(summary.payload_bytes_released > 0);
+        let unresolved = agent_action_outbox::Entity::find_by_id("outbox-unresolved")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!unresolved.payload_json.contains("_pioneer_compacted"));
 
         let action = agent_action::Entity::find_by_id("action-old")
             .one(&db)
@@ -8247,6 +8787,14 @@ mod tests {
                 .get("spawned_execution_id")
                 .and_then(serde_json::Value::as_str),
             Some("spawned-old")
+        );
+        assert_eq!(
+            compacted_payload["dispatch"],
+            serde_json::json!({"turn_id":"turn-old", "execution_generation":1})
+        );
+        assert_eq!(
+            compacted_payload["launch_request_fingerprint"],
+            "a".repeat(64)
         );
         assert_eq!(
             agent_action_outbox::Entity::find_by_id("outbox-recent")
@@ -8400,58 +8948,6 @@ mod tests {
             "send_message",
         );
         assert!(invalid_generation.is_err());
-    }
-
-    #[test]
-    fn derived_ephemeral_profile_cannot_widen_parent_runtime_or_reasoning() {
-        let parent_identity = AgentIdentityId::new("A12345678901234567890").unwrap();
-        let ephemeral_identity = AgentIdentityId::new("A02345678901234567890").unwrap();
-        let parent = AgentExecutionProfileProjection {
-            id: AgentExecutionProfileId::new("P12345678901234567890").unwrap(),
-            compatible_agent_identity_ids: vec![parent_identity],
-            backend: pioneer_protocol::AgentExecutionProfileBackend::ApiProvider,
-            provider_id: "provider".to_owned(),
-            model_id: "model".to_owned(),
-            provider_display_name: "Provider".to_owned(),
-            model_display_name: "Model".to_owned(),
-            allowed_reasoning: vec![pioneer_protocol::TurnReasoningSelection {
-                effort: "medium".to_owned(),
-            }],
-            allowed_permission_profiles: vec![pioneer_protocol::TurnPermissionMode::Supervised],
-            catalog_generation: 4,
-            policy_generation: 7,
-            fingerprint: "parent-profile-fingerprint".to_owned(),
-        };
-        let mut derived = parent.clone();
-        derived
-            .compatible_agent_identity_ids
-            .push(ephemeral_identity.clone());
-        derived.compatible_agent_identity_ids.sort();
-        derived.fingerprint = hex::encode(Sha256::digest(
-            format!(
-                "agent-derived-profile\0{}\0{}",
-                parent.fingerprint,
-                ephemeral_identity.as_str()
-            )
-            .as_bytes(),
-        ));
-        assert!(derived_ephemeral_profile_is_no_wider(
-            &derived,
-            std::slice::from_ref(&parent),
-            &ephemeral_identity,
-        ));
-
-        let mut widened = derived;
-        widened
-            .allowed_reasoning
-            .push(pioneer_protocol::TurnReasoningSelection {
-                effort: "high".to_owned(),
-            });
-        assert!(!derived_ephemeral_profile_is_no_wider(
-            &widened,
-            std::slice::from_ref(&parent),
-            &ephemeral_identity,
-        ));
     }
 }
 

@@ -44,6 +44,7 @@ pub enum MessageRevisionIntent {
 }
 #[derive(Clone)]
 struct RevisionRequest {
+    work_context: pioneer_observability::work::WorkCarrier,
     identity: MessageRevisionIdentity,
     request_generation: u64,
     workspace_id: String,
@@ -57,6 +58,7 @@ pub(crate) struct MessageRevisionController {
     publications: BTreeMap<String, Arc<MessageRevisionPublication>>,
     subscriptions: BTreeMap<String, usize>,
     sender: Option<mpsc::SyncSender<RevisionRequest>>,
+    observer: Option<pioneer_observability::queues::QueueObserver>,
     task: Option<std::thread::JoinHandle<()>>,
 }
 impl MessageRevisionController {
@@ -228,6 +230,12 @@ impl ClientCore {
         next.request_generation = owner.generation();
         next.state = MessageRevisionReadState::Loading;
         let request = RevisionRequest {
+            work_context: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
             identity: next.identity.clone(),
             request_generation: next.request_generation,
             workspace_id: coordinator.expect("validated thread").workspace_id.clone(),
@@ -237,8 +245,16 @@ impl ClientCore {
         };
         let transition = self.publish_message_revisions(&mut owner, next);
         let sender = owner.sender.clone();
+        let queue_observer = owner.observer.clone();
         drop(owner);
-        if sender.is_none_or(|sender| sender.try_send(request.clone()).is_err()) {
+        if sender.is_none_or(|sender| {
+            pioneer_observability::queues::observe_try_send(
+                queue_observer.as_ref(),
+                pioneer_observability::queues::QueueBytes::Unsupported,
+                || sender.try_send(request.clone()),
+            )
+            .is_err()
+        }) {
             self.complete_message_revisions(&request, Err(()));
         }
         transition
@@ -367,11 +383,29 @@ impl ClientCore {
     }
     pub(crate) fn start_message_revision_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel::<RevisionRequest>(64);
+        let queue_observer = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(64),
+            "unsupported: controller request payload/shared references are not serialized",
+        );
+        let worker_queue = queue_observer.clone();
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-message-revisions".into())
             .spawn(move || {
                 while let Ok(request) = receiver.recv() {
+                    worker_queue.dequeued(pioneer_observability::queues::QueueBytes::Unsupported);
+                    let mut processing = worker_queue.processing();
+                    let carrier = request.work_context.clone().received(
+                        pioneer_observability::work::Boundary::StdThread,
+                        pioneer_observability::work::WorkKind::ClientCommand,
+                        pioneer_observability::work::ExecutorRole::ClientController,
+                    );
+                    let _scope = carrier.enter();
+                    let mut active_work = pioneer_observability::live::WorkGuard::start(
+                        pioneer_observability::work::current(),
+                        false,
+                    );
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
@@ -394,9 +428,16 @@ impl ClientCore {
                     )
                     .map(project_message_revision_page)
                     .map_err(|_| ());
+                    let outcome = if result.is_ok() {
+                        pioneer_observability::work::Outcome::Completed
+                    } else {
+                        pioneer_observability::work::Outcome::Failed
+                    };
                     if let Some(core) = weak.upgrade() {
                         core.complete_message_revisions(&request, result);
                     }
+                    processing.processed();
+                    active_work.finish(outcome);
                 }
             })
             .expect("message revision worker");
@@ -404,6 +445,7 @@ impl ClientCore {
             .message_revisions
             .lock()
             .expect("message revisions poisoned");
+        owner.observer = Some(queue_observer);
         owner.sender = Some(sender);
         owner.task = Some(task);
     }
@@ -424,6 +466,12 @@ mod tests {
             generation,
         };
         let request = RevisionRequest {
+            work_context: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
             identity: identity.clone(),
             request_generation: generation + 1,
             workspace_id: "ws".into(),

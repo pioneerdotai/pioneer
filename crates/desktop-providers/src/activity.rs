@@ -45,6 +45,7 @@ impl Render for RefreshButton {
                 let _ = owner.update(cx, |view, cx| {
                     view.refresh_configured_providers(cx);
                     view.load_cli_provider_snapshot(cx);
+                    view.refresh_gateway_settings(cx);
                 });
             })
     }

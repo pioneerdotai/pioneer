@@ -46,6 +46,18 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::plugins::runtime::PluginPublication
         ),
         schema_doc!(
+            "workspace_push_params.json",
+            pioneer_protocol::WorkspacePushParams
+        ),
+        schema_doc!(
+            "workspace_push_response.json",
+            pioneer_protocol::WorkspacePushResponse
+        ),
+        schema_doc!(
+            "workspace_push_notification.json",
+            pioneer_protocol::WorkspacePushNotification
+        ),
+        schema_doc!(
             "settings_model_picker_publication.json",
             crate::settings::model_picker::SettingsModelPickerPublication
         ),
@@ -1369,6 +1381,38 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "task_cancel_response.json",
             pioneer_protocol::TaskCancelResponse
+        ),
+        schema_doc!(
+            "task_finish_params.json",
+            pioneer_protocol::TaskFinishParams
+        ),
+        schema_doc!(
+            "task_finish_response.json",
+            pioneer_protocol::TaskFinishResponse
+        ),
+        schema_doc!(
+            "task_completion_inbox_entry.json",
+            pioneer_protocol::TaskCompletionInboxEntry
+        ),
+        schema_doc!(
+            "task_completion_inbox_list_params.json",
+            pioneer_protocol::TaskCompletionInboxListParams
+        ),
+        schema_doc!(
+            "task_completion_inbox_list_response.json",
+            pioneer_protocol::TaskCompletionInboxListResponse
+        ),
+        schema_doc!(
+            "task_completion_inbox_entry_params.json",
+            pioneer_protocol::TaskCompletionInboxEntryParams
+        ),
+        schema_doc!(
+            "task_completion_inbox_entry_response.json",
+            pioneer_protocol::TaskCompletionInboxEntryResponse
+        ),
+        schema_doc!(
+            "task_completion_inbox_changed_notification.json",
+            pioneer_protocol::TaskCompletionInboxChangedNotification
         ),
         schema_doc!(
             "task_user_notification.json",

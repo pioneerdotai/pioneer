@@ -6,7 +6,9 @@ use std::pin::Pin;
 use std::time::Duration;
 
 mod database;
+mod query_scope;
 mod reader;
+pub use query_scope::DiagnosticStream;
 mod writer;
 
 pub use database::{SqliteDatabase, SqliteReadTransaction};
@@ -19,6 +21,36 @@ pub use writer::{
     SqliteQueryStream, SqliteTransaction, SqliteWriteClass, SqliteWriteEvent, SqliteWriteExecutor,
     SqliteWriteGrantReason, SqliteWriteObserver, SqliteWritePolicy, SqliteWriteQueueSnapshot,
 };
+
+/// Current admission state captured under its native owner lock. This is not
+/// a milestone/histogram sample. Revision is local to that owner; time is the
+/// shared process monotonic clock, milliseconds. Reader oldest remains absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqliteAdmissionSnapshot {
+    pub revision: u64,
+    pub sampled_monotonic_ms: u64,
+    pub consent_generation: u64,
+    pub depth: usize,
+    pub oldest_waited_ms: Option<u64>,
+}
+impl SqliteAdmissionSnapshot {
+    fn capture(revision: u64, depth: usize, oldest: Option<std::time::Instant>) -> Self {
+        let consent_generation = pioneer_observability::telemetry_consent_snapshot().1;
+        let at = std::time::Instant::now();
+        let sampled_monotonic_ms = pioneer_observability::work::clock_ms();
+        Self {
+            revision,
+            sampled_monotonic_ms,
+            consent_generation,
+            depth,
+            oldest_waited_ms: oldest.map(|head| {
+                at.saturating_duration_since(head)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64
+            }),
+        }
+    }
+}
 
 pub mod zstd;
 
@@ -37,9 +69,16 @@ where
     Fut: Future<Output = Result<T, E>>,
     P: Fn(&E) -> bool,
 {
+    let parent = pioneer_observability::work::capture();
     for attempt in 0..=retry_attempts {
+        let carrier = parent
+            .execution_child(
+                pioneer_observability::work::WorkKind::Database,
+                pioneer_observability::work::ExecutorRole::Foreign,
+            )
+            .with_attempt(attempt.saturating_add(1).min(u16::MAX as usize) as u16);
         let operation: Pin<Box<Fut>> = Box::pin(operation());
-        match operation.await {
+        match carrier.scope_result(operation).await {
             Ok(value) => return Ok(value),
             Err(error) if attempt < retry_attempts && is_retryable(&error) => {
                 let multiplier = 1u64 << attempt;
@@ -47,7 +86,12 @@ where
                     .as_millis()
                     .saturating_mul(multiplier as u128)
                     .min(u64::MAX as u128) as u64;
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                pioneer_observability::live::retry(delay_ms);
+                pioneer_observability::live::sleeping(
+                    Duration::from_millis(delay_ms),
+                    tokio::time::sleep(Duration::from_millis(delay_ms)),
+                )
+                .await;
             }
             Err(error) => return Err(error),
         }

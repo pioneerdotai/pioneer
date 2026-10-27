@@ -4,6 +4,7 @@ use crate::cli_runtime::session_instance::CliSessionInstanceId;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use pioneer_cli_agent_runtime::process::CLIAgentProcess;
+use pioneer_observability::work::{Boundary, ExecutorRole, WorkKind};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -115,6 +116,7 @@ struct CallbackCompletion {
 }
 pub(super) struct CliSessionOwner {
     pub(super) instance: CliSessionInstanceId,
+    pub(super) metadata_commit: Arc<Mutex<()>>,
     pub(super) startup: Arc<CLIAgentRuntimeSessionStartup>,
     startup_completion: Mutex<StartupCompletion>,
     pub(super) closing: AtomicBool,
@@ -150,6 +152,7 @@ impl CliSessionOwner {
     pub(super) fn new(instance: CliSessionInstanceId) -> Arc<Self> {
         Arc::new(Self {
             instance,
+            metadata_commit: Arc::new(Mutex::new(())),
             admitted_turns: StdMutex::new(std::collections::HashSet::new()),
             startup: Arc::default(),
             startup_completion: Mutex::new(StartupCompletion::default()),
@@ -175,7 +178,13 @@ impl CliSessionOwner {
             .startup_completion
             .try_lock()
             .expect("startup task publication is synchronous");
-        completion.task = Some(tokio::spawn(future));
+        let startup_key = pioneer_observability::turn_startup::current_key();
+        completion.task = Some(tokio::spawn(pioneer_observability::work::inherit_result(
+            Boundary::Child,
+            WorkKind::Child,
+            ExecutorRole::Child,
+            pioneer_observability::turn_startup::scope(startup_key, future),
+        )));
     }
     pub(super) async fn finish_startup(&self) -> Result<()> {
         let mut completion = self.startup_completion.lock().await;
@@ -248,9 +257,14 @@ impl CliSessionOwner {
             self.cancellation.cancel();
             return false;
         }
-        callbacks.tasks.push(tokio::spawn(
-            CLI_CALLBACK_INSTANCE.scope(self.instance.clone(), future),
-        ));
+        callbacks
+            .tasks
+            .push(tokio::spawn(pioneer_observability::work::inherit(
+                Boundary::Child,
+                WorkKind::WorkerLifecycle,
+                ExecutorRole::Event,
+                CLI_CALLBACK_INSTANCE.scope(self.instance.clone(), future),
+            )));
         true
     }
     pub(super) fn record_callback_failure(&self, error: String) {
@@ -310,9 +324,12 @@ impl CliSessionOwner {
                 .is_none()
         {
             let owner = self.clone();
-            *close = Some(tokio::spawn(async move {
-                owner.drain(lifecycle).await.map_err(|e| format!("{e:#}"))
-            }));
+            *close = Some(tokio::spawn(pioneer_observability::work::inherit_result(
+                Boundary::Child,
+                WorkKind::Child,
+                ExecutorRole::Child,
+                async move { owner.drain(lifecycle).await.map_err(|e| format!("{e:#}")) },
+            )));
         }
     }
     pub(super) async fn close_and_wait(
@@ -354,12 +371,14 @@ impl CliSessionOwner {
         lifecycle: Arc<dyn CLIAgentRuntimeSessionLifecycle>,
     ) -> Result<()> {
         let _startup_outcome = self.finish_startup().await;
+        let metadata = self.metadata_commit.lock().await;
         lifecycle.before_session_close(&self.instance).await;
         let session = self.startup.session();
         let native_result = match &session {
             Some(session) => session.stop_and_wait().await,
             None => Ok(()),
         };
+        drop(metadata);
         let callbacks_result = self.join_callbacks().await;
         native_result?;
         callbacks_result?;

@@ -28,7 +28,7 @@ use crate::cli_runtime::permissions::{
     ClaudeMcpPermissionFallbackDecision, claude_mcp_permission_fallback_response,
 };
 use crate::cli_runtime::session_instance::{CliSessionGenerationAllocator, CliSessionInstanceId};
-use crate::cli_runtime::skills::CliRuntimeSelectedSkill;
+use crate::cli_runtime::skills::{CliRuntimeSelectedSkill, normalize_cli_runtime_selected_skills};
 use crate::turn_mcp::invoker::{
     TurnMcpInvocation, TurnMcpInvocationError, TurnMcpInvocationErrorCode, TurnMcpInvoker,
 };
@@ -142,19 +142,17 @@ struct ClaudeNativeMcpItemKey {
 struct ClaudeNativeMcpItemCorrelation {
     canonical_callable_name: String,
     arguments_fingerprint: String,
-    sequence: u64,
     facade_request_id: Option<String>,
 }
 
 #[derive(Default)]
-struct ClaudeNativeMcpCorrelationLedger {
+pub(crate) struct ClaudeNativeMcpCorrelationLedger {
     items: std::sync::Mutex<HashMap<ClaudeNativeMcpItemKey, ClaudeNativeMcpItemCorrelation>>,
-    next_sequence: AtomicU64,
     changed: tokio::sync::Notify,
 }
 
 impl ClaudeNativeMcpCorrelationLedger {
-    fn register(
+    pub(crate) fn register(
         &self,
         binding: &crate::cli_runtime::claude_mcp::ClaudeNativeMcpItemBinding,
     ) -> Result<()> {
@@ -180,7 +178,6 @@ impl ClaudeNativeMcpCorrelationLedger {
             ClaudeNativeMcpItemCorrelation {
                 canonical_callable_name: binding.canonical_callable_name.clone(),
                 arguments_fingerprint: binding.arguments_fingerprint.clone(),
-                sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
                 facade_request_id: None,
             },
         );
@@ -189,52 +186,56 @@ impl ClaudeNativeMcpCorrelationLedger {
         Ok(())
     }
 
-    async fn claim(
+    fn claim_exact(
         &self,
-        canonical_callable_name: &str,
-        arguments_fingerprint: &str,
-        facade_request_id: &str,
-    ) -> Option<ClaudeNativeMcpItemKey> {
-        let notified = self.changed.notified();
-        if let Some(key) = self.claim_now(
-            canonical_callable_name,
-            arguments_fingerprint,
-            facade_request_id,
-        ) {
-            return Some(key);
-        }
-        let _ = tokio_timeout(Duration::from_secs(2), notified).await;
-        self.claim_now(
-            canonical_callable_name,
-            arguments_fingerprint,
-            facade_request_id,
-        )
-    }
-
-    fn claim_now(
-        &self,
-        canonical_callable_name: &str,
-        arguments_fingerprint: &str,
-        facade_request_id: &str,
-    ) -> Option<ClaudeNativeMcpItemKey> {
+        invocation: &TurnMcpInvocation,
+        fingerprint: &str,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<bool, TurnMcpInvocationError> {
+        let identity = invocation.native_call.as_ref().ok_or_else(|| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "Claude native identity is missing",
+            )
+        })?;
+        let key = ClaudeNativeMcpItemKey {
+            native_thread_id: identity.native_thread_id.clone(),
+            native_turn_id: identity.native_turn_id.clone(),
+            native_item_id: identity.native_item_id.clone(),
+        };
         let mut items = self
             .items
             .lock()
-            .expect("Claude native MCP correlation ledger should not be poisoned");
-        let key = items
-            .iter()
-            .filter(|(_, item)| {
-                item.facade_request_id.is_none()
-                    && item.canonical_callable_name == canonical_callable_name
-                    && item.arguments_fingerprint == arguments_fingerprint
-            })
-            .min_by_key(|(_, item)| item.sequence)
-            .map(|(key, _)| key.clone())?;
-        items
-            .get_mut(&key)
-            .expect("selected Claude MCP correlation must exist")
-            .facade_request_id = Some(facade_request_id.to_owned());
-        Some(key)
+            .expect("Claude native MCP ledger should not be poisoned");
+        if cancellation.is_cancelled() {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled,
+                "Claude MCP admission cancelled",
+            ));
+        }
+        if invocation
+            .admission_deadline
+            .is_none_or(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::TimedOut,
+                "Claude MCP admission timed out",
+            ));
+        }
+        let Some(item) = items.get_mut(&key) else {
+            return Ok(false);
+        };
+        if item.canonical_callable_name != invocation.canonical_callable_name
+            || item.arguments_fingerprint != fingerprint
+            || item.facade_request_id.is_some()
+        {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "Claude native item mismatches this invocation or is already used",
+            ));
+        }
+        item.facade_request_id = Some(invocation.provider_call_id.clone());
+        Ok(true)
     }
 
     fn contains_exact_permission(&self, request: &ClaudeNativeMcpPermissionRequest) -> bool {
@@ -270,9 +271,11 @@ trait ClaudeMcpPermissionAuthorizer: Send + Sync {
     ) -> Result<bool>;
 }
 
-struct ClaudeCorrelatingTurnMcpInvoker {
-    inner: Arc<dyn TurnMcpInvoker>,
-    native_items: Arc<ClaudeNativeMcpCorrelationLedger>,
+pub(crate) struct ClaudeCorrelatingTurnMcpInvoker {
+    pub(crate) inner: Arc<dyn TurnMcpInvoker>,
+    pub(crate) native_items: Arc<ClaudeNativeMcpCorrelationLedger>,
+    pub(crate) coordinator: Arc<crate::cli_runtime::mcp::coordinator::CliMcpCoordinator>,
+    pub(crate) bound_grant: crate::cli_runtime::mcp::grants::CliMcpBoundGrant,
 }
 
 #[async_trait]
@@ -293,23 +296,48 @@ impl TurnMcpInvoker for ClaudeCorrelatingTurnMcpInvoker {
                         "Claude MCP invocation arguments are not canonicalizable",
                     )
                 })?;
-        let facade_request_id = invocation.provider_call_id.clone();
-        let native_item = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => None,
-            native_item = self.native_items.claim(
-                invocation.canonical_callable_name.as_str(),
-                arguments_fingerprint.as_str(),
-                facade_request_id.as_str(),
-            ) => native_item,
-        }
-        .ok_or_else(|| {
-            crate::turn_mcp::invoker::TurnMcpInvocationError::new(
-                crate::turn_mcp::invoker::TurnMcpInvocationErrorCode::SessionBindingUnavailable,
-                "Claude MCP facade call has no matching native tool_use item",
+        let deadline = invocation.admission_deadline.ok_or_else(|| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "Claude admission deadline is missing",
             )
         })?;
-        invocation.provider_call_id = native_item.native_item_id;
+        loop {
+            let notified = self.native_items.changed.notified();
+            let claim = self.coordinator.claim_correlated_call(
+                &self.bound_grant,
+                &invocation,
+                &cancellation,
+                || {
+                    self.native_items.claim_exact(
+                        &invocation,
+                        &arguments_fingerprint,
+                        &cancellation,
+                    )
+                },
+            );
+            let claimed = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::Cancelled, "Claude MCP admission cancelled")),
+                () = tokio::time::sleep_until(deadline) => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::TimedOut, "Claude MCP confirmation timed out")),
+                claimed = claim => claimed?,
+            };
+            if claimed {
+                break;
+            }
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::Cancelled, "Claude MCP admission cancelled")),
+                () = tokio::time::sleep_until(deadline) => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::TimedOut, "Claude MCP confirmation timed out")),
+                () = notified => {},
+            }
+        }
+        invocation.provider_call_id = invocation
+            .native_call
+            .as_ref()
+            .expect("claimed Claude identity")
+            .native_item_id
+            .clone();
         self.inner.invoke(invocation, cancellation).await
     }
 }
@@ -380,10 +408,13 @@ impl ClaudeRequiredMcpBridge {
                         Arc::new(ClaudeCorrelatingTurnMcpInvoker {
                             inner: self.invoker.clone(),
                             native_items: self.native_items.clone(),
+                            coordinator: self.supervisor.coordinator(),
+                            bound_grant: attachment.bound_grant.clone(),
                         }),
                         self.projection_generation,
                         self.projection.clone(),
                         self.facade_limits.clone(),
+                        crate::cli_runtime::mcp::facade::CliMcpCallContract::Claude,
                     )
                     .map_err(|error| anyhow!("Claude MCP facade build failed: {error}"))?;
                     let server = tokio::spawn(server.run());
@@ -732,8 +763,8 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
         let launch_projection = match &launch_spec.mcp {
             CliMcpSessionLaunch::Disabled | CliMcpSessionLaunch::ManagementOnly => None,
             CliMcpSessionLaunch::Claude(projection) => Some(projection),
-            CliMcpSessionLaunch::Codex(_) => {
-                bail!("Claude CLI runtime cannot consume a Codex MCP launch projection")
+            CliMcpSessionLaunch::Codex(_) | CliMcpSessionLaunch::OpenCode(_) => {
+                bail!("Claude CLI runtime cannot consume another provider's MCP launch projection")
             }
         };
         let provider_session_id = launch_spec
@@ -1044,6 +1075,9 @@ fn materialize_claude_selected_skill_plugins(
     managed_mcp_config: &ClaudeManagedMcpConfigDescriptor,
     selected_skills: &[CliRuntimeSelectedSkill],
 ) -> Result<Vec<PathBuf>> {
+    // Normalize before assigning index-based namespaces (and before touching
+    // snapshots), even for callers outside the turn admission/restore paths.
+    let selected_skills = normalize_cli_runtime_selected_skills(selected_skills.iter().cloned())?;
     let plugins_root = managed_mcp_config
         .session_root_path
         .join("selected-skill-plugins");
@@ -1233,6 +1267,22 @@ fn claude_process_config_from_instance_with_managed_mcp(
         "pioneer".to_owned(),
     );
     env.extend_from(&options.env);
+    if allowed_tool_names
+        .iter()
+        .any(|name| name == "mcp__pioneer__task_wait")
+    {
+        // TaskService owns the durable observation/activity budget. Claude's
+        // stdio idle timer and automatic backgrounding must not reinterpret it.
+        env.insert_plain(
+            "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT".to_owned(),
+            "0".to_owned(),
+        );
+        env.insert_plain(
+            "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS".to_owned(),
+            "0".to_owned(),
+        );
+    }
+
     let permission_mode = options
         .approval_policy
         .as_deref()
@@ -1325,7 +1375,8 @@ fn claude_process_config_from_instance_with_managed_mcp(
             .context("invalid Claude bounded fork continuation")?
             .append_process_args(&mut args);
         }
-        CliProviderContinuation::CodexRpcThread { .. } => {
+        CliProviderContinuation::CodexRpcThread { .. }
+        | CliProviderContinuation::OpenCodeServerSession { .. } => {
             bail!("Claude process launch requires a typed Claude continuation");
         }
     }
@@ -2219,7 +2270,7 @@ impl ClaudeStreamWorkers {
 impl ClaudeStreamClient {
     fn new(
         stdin: ChildStdin,
-        event_tx: mpsc::Sender<RuntimeEvent>,
+        event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
         provider_session_verifier: ClaudeProviderSessionVerifier,
         mcp: Option<ClaudeMcpEventContext>,
         native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
@@ -2248,7 +2299,7 @@ impl ClaudeStreamClient {
 
     fn new_for_local_probe(
         stdin: ChildStdin,
-        event_tx: mpsc::Sender<RuntimeEvent>,
+        event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
         expected_provider_session_id: uuid::Uuid,
     ) -> Self {
         let (event_ingress, ingress_worker) =
@@ -2275,7 +2326,7 @@ impl ClaudeStreamClient {
     #[cfg(test)]
     fn new_for_test_with_mcp(
         stdin: ChildStdin,
-        event_tx: mpsc::Sender<RuntimeEvent>,
+        event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
         expected_provider_session_id: uuid::Uuid,
         mcp: Option<ClaudeMcpEventContext>,
     ) -> Self {
@@ -2586,7 +2637,7 @@ impl ClaudeStreamClient {
                     Self::decode_complete_stdout_frame(frame)
                 }
                 pioneer_cli_agent_runtime::SpooledNativeFrame::Oversized { file, .. } => {
-                    match tokio::task::spawn_blocking(move || {
+                    match pioneer_observability::work::spawn_blocking(move || {
                         Self::decode_spooled_stdout_frame(file)
                     })
                     .await
@@ -3459,6 +3510,21 @@ impl ClaudeStreamClient {
                 "message".to_owned(),
                 ToolMetadataValue::from_json(JsonValue::String(output.clone())),
             );
+            if matches!(
+                tool.binding.canonical_callable_name.as_str(),
+                "task_wait" | "task_get" | "task_cancel" | "task_finish" | "task_accept"
+            ) && tool
+                .binding
+                .metadata
+                .get("serverInstallationId")
+                .and_then(ToolMetadataValue::as_str)
+                == Some("pioneer-task-tools-v1")
+                && let Some(payload) = crate::task_tools::delivered_task_payload(&json!({
+                    "content": block.get("content"), "isError": is_error,
+                }))
+            {
+                metadata.insert("taskResult", ToolMetadataValue::from_json(payload));
+            }
             if let Some(result) = value.get("tool_use_result") {
                 metadata.insert("result", ToolMetadataValue::from_json(result.clone()));
             }
@@ -4313,6 +4379,7 @@ pub(crate) mod tests {
                 thread_id: "t".into(),
                 turn_id: "u".into(),
                 recovery: None,
+                codex_retry_attempt_id: None,
             },
             &RuntimeEvent::ItemCompleted(item.clone()),
         );
@@ -4348,6 +4415,7 @@ pub(crate) mod tests {
             thread_id: "t".into(),
             turn_id: "u".into(),
             recovery: None,
+            codex_retry_attempt_id: None,
         };
         for (success, text) in [(true, "ok\n"), (false, "shell failed\n")] {
             let e = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
@@ -4794,7 +4862,7 @@ pub(crate) mod tests {
     ) -> (
         Arc<ClaudeStreamClient>,
         tokio::process::Child,
-        mpsc::Receiver<RuntimeEvent>,
+        mpsc::Receiver<pioneer_observability::work::WorkItem<RuntimeEvent>>,
     ) {
         let script = r#"
 while IFS= read -r line; do
@@ -5043,6 +5111,93 @@ done
     }
 
     #[tokio::test]
+    async fn claude_task_result_survives_typed_metadata_redaction_only_on_received_success() {
+        use crate::turn_mcp::native_tools::NativeToolFamily;
+        let projection = ResolvedMcpTurnProjection::empty("workspace", "provider-turn")
+            .with_native_tools(
+                NativeToolFamily::Tasks
+                    .definitions()
+                    .into_iter()
+                    .map(|spec| (NativeToolFamily::Tasks, spec))
+                    .collect(),
+                McpProjectionLimits::default(),
+            )
+            .unwrap();
+        let projection =
+            build_claude_mcp_session_launch_projection(projection, "a".repeat(64)).unwrap();
+        let session = uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000031").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (client, mut child, _) = fake_claude_stream_client_with_mcp(
+            &temp.path().join("task-result.log"),
+            session,
+            Some(claude_mcp_event_context(projection, 7)),
+        )
+        .await;
+        bind_claude_mcp_test_turn(&client, session, "provider-turn").await;
+        let mut fixture: JsonValue = serde_json::from_str(include_str!(
+            "../../../cli-agent-runtime/tests/fixtures/claude_mcp/lifecycle.json"
+        ))
+        .unwrap();
+        let payload = json!({"accepted":true,"taskId":"accepted_task","runId":"run","candidateId":"candidate","status":"completed","taskTerminal":true,"finalAnswerAllowed":true});
+        for block in fixture["messages"][0]["message"]["content"]
+            .as_array_mut()
+            .unwrap()
+        {
+            block["name"] = json!("mcp__pioneer__task_accept");
+            block["input"] =
+                json!({"taskId":"accepted_task","runId":"run","candidateId":"candidate"});
+        }
+        for block in fixture["messages"][1]["message"]["content"]
+            .as_array_mut()
+            .unwrap()
+        {
+            block["content"] = json!([{"type":"text","text":payload.to_string()}]);
+        }
+        client.map_message(fixture["messages"][0].clone()).await;
+        let outcomes = client.map_message(fixture["messages"][1].clone()).await;
+        assert_eq!(outcomes.len(), 2);
+        for event in outcomes {
+            let RuntimeEvent::ItemCompleted(item) = &event else {
+                panic!("native completion");
+            };
+            let projected = project_cli_runtime_event(
+                &CLIRuntimeProjectorContext {
+                    workspace_id: "workspace".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    recovery: None,
+                    codex_retry_attempt_id: None,
+                },
+                &event,
+            );
+            let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
+                panic!("durable completion");
+            };
+            let TurnItem::DynamicToolCall {
+                storage: pioneer_protocol::ToolStoragePayload::Metadata { metadata },
+                ..
+            } = &notification.item
+            else {
+                panic!("stored metadata");
+            };
+            let metadata = metadata.to_json();
+            let ids = pioneer_agent::observed_terminal_task_outcomes_from_payload(
+                "task_accept",
+                &metadata["taskResult"],
+            );
+            assert_eq!(
+                ids.contains(&pioneer_agent::ObservedTaskOutcome::AcceptedCandidate {
+                    task_id: "accepted_task".into(),
+                    run_id: "run".into(),
+                    candidate_id: "candidate".into()
+                }),
+                item.native_item_id == "call-a"
+            );
+        }
+        child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn claude_mcp_timeline_parallel_success_error_and_replay_is_idempotent() {
         let temp = tempfile::tempdir().expect("tempdir");
         let provider_session_id =
@@ -5101,6 +5256,7 @@ done
             thread_id: "thread".to_owned(),
             turn_id: "turn".to_owned(),
             recovery: None,
+            codex_retry_attempt_id: None,
         };
         let projected_start = project_cli_runtime_event(&projector_context, &started[0]);
         let projected_terminal = project_cli_runtime_event(&projector_context, &completed[0]);
@@ -5163,49 +5319,6 @@ done
             "zero/unknown process generation must fail closed"
         );
 
-        let ledger = ClaudeNativeMcpCorrelationLedger::default();
-        let first_parallel = projection
-            .bind_native_tool_use(
-                "claude",
-                7,
-                provider_session_id.to_string().as_str(),
-                "provider-turn",
-                "same-signature-a",
-                "mcp__pioneer__mcp_server_tool_a",
-                &json!({"value": 8}),
-            )
-            .expect("first parallel binding");
-        let second_parallel = projection
-            .bind_native_tool_use(
-                "claude",
-                7,
-                provider_session_id.to_string().as_str(),
-                "provider-turn",
-                "same-signature-b",
-                "mcp__pioneer__mcp_server_tool_a",
-                &json!({"value": 8}),
-            )
-            .expect("second parallel binding");
-        ledger.register(&first_parallel).expect("register first");
-        ledger.register(&second_parallel).expect("register second");
-        let first_claim = ledger
-            .claim(
-                first_parallel.canonical_callable_name.as_str(),
-                first_parallel.arguments_fingerprint.as_str(),
-                "facade-a",
-            )
-            .await
-            .expect("claim first parallel item");
-        let second_claim = ledger
-            .claim(
-                second_parallel.canonical_callable_name.as_str(),
-                second_parallel.arguments_fingerprint.as_str(),
-                "facade-b",
-            )
-            .await
-            .expect("claim second parallel item");
-        assert_eq!(first_claim.native_item_id, "same-signature-a");
-        assert_eq!(second_claim.native_item_id, "same-signature-b");
         let _ = child.kill().await;
     }
 
@@ -5275,7 +5388,7 @@ done
             .expect("session mismatch event timeout")
             .expect("session mismatch event");
         assert!(matches!(
-            mismatch,
+            mismatch.value,
             RuntimeEvent::Error(RuntimeErrorEvent { code: Some(code), .. })
                 if code == "claude_session_identity_invalid"
         ));
@@ -5315,7 +5428,7 @@ done
                 .await
                 .expect("EOF reconciliation event timeout")
                 .expect("EOF reconciliation event");
-            match event {
+            match event.value {
                 RuntimeEvent::ItemCompleted(item) if item.native_item_id == "call-eof" => {
                     eof_terminal_count += 1;
                     assert_eq!(item.metadata.unwrap()["status"], json!("failed"));
@@ -5811,6 +5924,97 @@ done
                 "Pioneer must not replace Claude's provider-owned tool sandbox"
             );
         }
+    }
+
+    #[test]
+    fn claude_selected_skill_plugins_keep_orchestration_aliases_separate_from_user_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let instance = claude_instance(temp.path().join("home").display().to_string());
+        let mut selected = Vec::new();
+        for name in [
+            "html",
+            "tasks",
+            "subagents",
+            "pioneer-system-html",
+            "pioneer-system-tasks",
+            "pioneer-system-subagents",
+        ] {
+            let path = temp.path().join("exports").join(name);
+            std::fs::create_dir_all(path.join("references")).unwrap();
+            std::fs::write(
+                path.join("SKILL.md"),
+                format!("---\nname: {name}\n---\n# {name}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                path.join("references/guide.txt"),
+                format!("reference for {name}"),
+            )
+            .unwrap();
+            selected.push(selected_skill_fixture(&path, name));
+        }
+        let expected_names = [
+            "html",
+            "pioneer-system-html",
+            "pioneer-system-subagents",
+            "pioneer-system-tasks",
+            "subagents",
+            "tasks",
+        ];
+        let mut previous_bindings = None;
+        for projection in [selected.clone(), selected.iter().rev().cloned().collect()] {
+            let config = claude_process_config_from_instance(
+                &instance,
+                &CLIAgentRuntimeSessionStartOptions {
+                    selected_skills: projection,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let plugins = arg_values_after(&config.args, "--plugin-dir");
+            assert_eq!(plugins.len(), 6);
+            let mut bindings = Vec::new();
+            for (index, (plugin, name)) in plugins.iter().zip(expected_names).enumerate() {
+                let skill = selected
+                    .iter()
+                    .find(|skill| skill.install_name == name)
+                    .unwrap();
+                let manifest: JsonValue = serde_json::from_slice(
+                    &std::fs::read(plugin.join(".claude-plugin/plugin.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(manifest["name"], format!("pioneer-selected-skill-{index}"));
+                assert_eq!(manifest["skills"], json!([format!("./skills/{name}")]));
+                bindings.push((manifest["name"].clone(), manifest["skills"].clone()));
+                let snapshot = plugin.join("skills").join(name);
+                assert_eq!(
+                    compute_skill_folder_hash(&snapshot).unwrap(),
+                    skill.source_folder_hash
+                );
+                assert_eq!(
+                    std::fs::read(snapshot.join("SKILL.md")).unwrap(),
+                    std::fs::read(skill.installed_path.join("SKILL.md")).unwrap()
+                );
+                assert_eq!(
+                    std::fs::read(snapshot.join("references/guide.txt")).unwrap(),
+                    format!("reference for {name}").as_bytes()
+                );
+                assert_eq!(std::fs::read_dir(plugin.join("skills")).unwrap().count(), 1);
+            }
+            if let Some(previous) = previous_bindings {
+                assert_eq!(bindings, previous);
+            }
+            previous_bindings = Some(bindings);
+        }
+        let duplicate = claude_process_config_from_instance(
+            &instance,
+            &CLIAgentRuntimeSessionStartOptions {
+                selected_skills: vec![selected[0].clone(), selected[0].clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("installation names collide"));
     }
 
     #[test]

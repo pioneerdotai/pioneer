@@ -18,6 +18,17 @@ impl std::fmt::Display for NativeCancellationContextUnavailable {
 }
 impl std::error::Error for NativeCancellationContextUnavailable {}
 
+/// An early Stop must re-observe the same execution before using an activated
+/// runtime's immutable context. This never authorizes a different generation.
+#[derive(Debug)]
+pub struct UnactivatedTurnPhaseChanged;
+impl std::fmt::Display for UnactivatedTurnPhaseChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unactivated terminal lost its owner, generation or activation fence")
+    }
+}
+impl std::error::Error for UnactivatedTurnPhaseChanged {}
+
 #[derive(Clone, Debug)]
 pub struct NativeCancellationContext {
     pub preparation: NativeTerminalEffectPreparation,
@@ -51,6 +62,16 @@ pub fn prepare_registration(
         created_at: Set(now),
         ..Default::default()
     })
+}
+
+pub async fn is_registered<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<bool> {
+    Ok(context::Entity::find_by_id(turn_id.to_owned())
+        .select_only()
+        .column(context::Column::TurnId)
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_some())
 }
 
 pub async fn load<C: ConnectionTrait>(
@@ -138,22 +159,10 @@ pub async fn insert_once<C: ConnectionTrait>(
     preparation: &NativeTerminalEffectPreparation,
     candidate: context::ActiveModel,
     initial_turn: bool,
+    owner: &str,
 ) -> Result<()> {
-    let exists = context::Entity::find_by_id(preparation.turn_id.clone())
-        .filter(context::Column::ThreadId.eq(preparation.thread_id.clone()))
-        .filter(context::Column::WorkspaceId.eq(preparation.workspace_id.clone()))
-        .select_only()
-        .column(context::Column::TurnId)
-        .into_tuple::<String>()
-        .one(db)
-        .await?
-        .is_some();
-    if exists {
-        return Ok(());
-    }
-    if !initial_turn {
-        return Err(NativeCancellationContextUnavailable.into());
-    }
+    // Confirmation is a pre-start fence too. An immutable row from an earlier
+    // execution cannot authorize a terminal Turn or an accepted cancellation.
     let turn_scope = turn::Entity::find_by_id(preparation.turn_id.clone())
         .filter(turn::Column::ThreadId.eq(preparation.thread_id.clone()))
         .filter(turn::Column::Status.eq("in_progress"))
@@ -173,6 +182,27 @@ pub async fn insert_once<C: ConnectionTrait>(
         turn_scope.is_some() && workspace.is_some(),
         "native cancellation context registration lost its turn scope"
     );
+    let mut existing = owned_query(&preparation.turn_id, owner);
+    existing
+        .expr(Expr::val(1))
+        .and_where(
+            Expr::col((context::Entity, context::Column::ThreadId)).eq(&preparation.thread_id),
+        )
+        .and_where(
+            Expr::col((context::Entity, context::Column::WorkspaceId))
+                .eq(&preparation.workspace_id),
+        )
+        .and_where(Expr::col((context::Entity, context::Column::AcceptedEventId)).is_null());
+    if db
+        .query_one_raw(DbBackend::Sqlite.build(&existing))
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    if !initial_turn {
+        return Err(NativeCancellationContextUnavailable.into());
+    }
     context::Entity::insert(candidate)
         .exec_without_returning(db)
         .await?;

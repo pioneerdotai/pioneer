@@ -1,11 +1,10 @@
 use anyhow::{Context, Result, bail};
-use flate2::read::GzDecoder;
 use pioneer_config::{AppConfig, InstallManagedBy, InstallState, save_install_state};
 use reqwest::{StatusCode, blocking::Client, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::error::Error;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
@@ -141,6 +140,14 @@ struct StartOutput {
 #[derive(Debug, Deserialize)]
 struct VersionOutput {
     version: String,
+    #[serde(default)]
+    compiled_database_migrations: Option<Vec<String>>,
+    #[serde(default)]
+    os: Option<String>,
+    #[serde(default)]
+    arch: Option<String>,
+    #[serde(default)]
+    computer_use: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,12 +317,28 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             if staged_binary.exists() {
                 let _ = fs::remove_file(&staged_binary);
             }
+            if bin_dir.join("cua.rollback").exists() {
+                bail!("CUA rollback payload exists; explicit recovery is required before updating");
+            }
             unpack_asset_to_binary(&source.asset_path, &staged_binary)?;
             make_binary_executable(&staged_binary)
         },
     )?;
 
-    let existing = target_binary.is_file();
+    // Keep the exact candidate that will be activated beside its own libraries
+    // during schema admission; live libraries must remain untouched until then.
+    #[cfg(target_os = "macos")]
+    let (_candidate_layout, staged_binary) = prepare_candidate_probe_layout(&staged_binary)?;
+
+    let existing = match fs::symlink_metadata(&target_binary) {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(_) => bail!("installed binary has unexpected file type; installation unchanged"),
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error)
+                .context("installed binary metadata unavailable; installation unchanged");
+        }
+    };
     let (was_active, runtime_home) = observe_install_stage(
         &mut stage_timings,
         install_started,
@@ -329,6 +352,49 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 .unwrap_or((false, None)))
         },
     )?;
+    observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.schema.preflight",
+        || {
+            // A failed status probe must not silently inspect another home.
+            if existing && runtime_home.is_none() {
+                bail!(
+                    "schema compatibility unknown: installed runtime home unavailable; installation unchanged"
+                );
+            }
+            let home = match runtime_home.clone() {
+                Some(home) => home,
+                None => config.runtime_home_dir()?,
+            };
+            let candidate = query_binary_version_output(&staged_binary)?;
+            let config = config.clone();
+            let applied = thread::spawn(move || {
+                let runtime = pioneer_observability::runtime::ObservedRuntime::new(
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?,
+                    pioneer_observability::runtime::RuntimeRole::CliHelper,
+                );
+                runtime.block_on(pioneer_gateway::inspect_applied_database_migrations(
+                    &home, &config,
+                ))
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("schema inspection worker failed"))??;
+            let applied = match applied {
+                Some(applied) => applied,
+                None if !existing => Vec::new(),
+                None => bail!(
+                    "schema compatibility unknown: installed database missing; installation unchanged"
+                ),
+            };
+            ensure_candidate_schema_compatible(
+                &applied,
+                candidate.compiled_database_migrations.as_deref(),
+            )
+        },
+    )?;
     let config_backup_dir = observe_install_stage(
         &mut stage_timings,
         install_started,
@@ -338,11 +404,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 return Ok(None);
             };
             let backup_dir = bin_dir.join(format!("config.rollback.{}", unix_timestamp_secs()?));
-            if backup_runtime_toml(home, &backup_dir)? {
-                Ok(Some(backup_dir))
-            } else {
-                Ok(None)
-            }
+            backup_runtime_toml(home, &backup_dir)
         },
     )?;
 
@@ -379,19 +441,22 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 })?;
             }
 
-            if let Err(error) = fs::rename(&staged_binary, &target_binary) {
-                restore_binary_and_config(
+            if let Err(error) = activate_install_companions(&bin_dir)
+                .and_then(|()| fs::rename(&staged_binary, &target_binary).map_err(Into::into))
+            {
+                let rollback = rollback_and_restore(
                     &target_binary,
                     &rollback_binary,
                     runtime_home.as_deref(),
-                    config_backup_dir.as_deref(),
+                    config_backup_dir.as_ref(),
+                    was_active,
+                    &options.managed_by,
+                    RollbackSafety::BeforeGatewayStart,
                 );
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to replace binary with staged file `{}`",
-                        target_binary.display()
-                    )
-                });
+                return Err(InstallRecoveryFailure::error(
+                    error.context("failed to replace staged Gateway payload"),
+                    rollback,
+                ));
             }
             Ok(())
         },
@@ -405,19 +470,19 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
     ) {
         Ok(version) => version,
         Err(error) => {
-            restore_binary_and_config(
+            let rollback = rollback_and_restore(
                 &target_binary,
                 &rollback_binary,
                 runtime_home.as_deref(),
-                config_backup_dir.as_deref(),
-            );
-            maybe_restore_service_after_rollback(
-                &target_binary,
-                &rollback_binary,
+                config_backup_dir.as_ref(),
                 was_active,
                 &options.managed_by,
+                RollbackSafety::BeforeGatewayStart,
             );
-            bail!("installed binary failed version probe: {error:#}; update rolled back");
+            return Err(InstallRecoveryFailure::error(
+                error.context("installed binary failed version probe"),
+                rollback,
+            ));
         }
     };
 
@@ -429,19 +494,19 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
     ) {
         Ok(result) => result,
         Err(error) => {
-            restore_binary_and_config(
+            let rollback = rollback_and_restore(
                 &target_binary,
                 &rollback_binary,
                 runtime_home.as_deref(),
-                config_backup_dir.as_deref(),
-            );
-            maybe_restore_service_after_rollback(
-                &target_binary,
-                &rollback_binary,
+                config_backup_dir.as_ref(),
                 was_active,
                 &options.managed_by,
+                RollbackSafety::BeforeGatewayStart,
             );
-            bail!("failed to expose command globally: {error:#}; update rolled back");
+            return Err(InstallRecoveryFailure::error(
+                error.context("failed to expose command globally"),
+                rollback,
+            ));
         }
     };
     let command_link_created = link_result.link_created;
@@ -465,36 +530,42 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 }));
             }
             Err(error) => {
-                rollback_and_restore(
+                let rollback = rollback_and_restore(
                     &target_binary,
                     &rollback_binary,
                     runtime_home.as_deref(),
-                    config_backup_dir.as_deref(),
+                    config_backup_dir.as_ref(),
                     was_active,
                     &options.managed_by,
+                    RollbackSafety::SchemaMayHaveAdvanced,
                 );
-                bail!("failed to start gateway after update: {error:#}; update rolled back");
+                return Err(InstallRecoveryFailure::error(
+                    error.context("failed to start gateway after update"),
+                    rollback,
+                ));
             }
         };
 
         let stage_started = Instant::now();
-        if !wait_for_gateway_health(&target_binary, Duration::from_secs(30)) {
-            let _ = run_gateway_command(
+        if let Err(health) = wait_for_gateway_health(&target_binary, Duration::from_secs(30)) {
+            let stop = run_gateway_command(
                 &target_binary,
                 &["stop"],
                 &options.managed_by,
-                true,
+                false,
                 "stop during rollback",
             );
-            rollback_and_restore(
+            let mut rollback = rollback_and_restore(
                 &target_binary,
                 &rollback_binary,
                 runtime_home.as_deref(),
-                config_backup_dir.as_deref(),
+                config_backup_dir.as_ref(),
                 was_active,
                 &options.managed_by,
+                RollbackSafety::SchemaMayHaveAdvanced,
             );
-            bail!("gateway failed health check after update; update rolled back");
+            rollback.candidate_stop = Some(restore_outcome(stop));
+            return Err(InstallRecoveryFailure::error(health.into(), rollback));
         }
         stage_timings.push(successful_stage_timing(
             "health.wait",
@@ -516,15 +587,23 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             )
         },
     ) {
-        rollback_and_restore(
+        let rollback = rollback_and_restore(
             &target_binary,
             &rollback_binary,
             runtime_home.as_deref(),
-            config_backup_dir.as_deref(),
+            config_backup_dir.as_ref(),
             was_active,
             &options.managed_by,
+            if should_start {
+                RollbackSafety::SchemaMayHaveAdvanced
+            } else {
+                RollbackSafety::BeforeGatewayStart
+            },
         );
-        bail!("failed to persist install-state: {error:#}; update rolled back");
+        return Err(InstallRecoveryFailure::error(
+            error.context("failed to persist install-state"),
+            rollback,
+        ));
     }
 
     observe_install_stage(
@@ -535,8 +614,9 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             if rollback_binary.exists() {
                 let _ = fs::remove_file(&rollback_binary);
             }
+            let _ = fs::remove_dir_all(bin_dir.join("cua.rollback"));
             if let Some(backup_dir) = config_backup_dir.as_ref() {
-                let _ = fs::remove_dir_all(backup_dir);
+                let _ = fs::remove_dir_all(&backup_dir.directory);
             }
             Ok(())
         },
@@ -947,30 +1027,36 @@ fn retry_after_delay(response: &reqwest::blocking::Response) -> Option<Duration>
 }
 
 fn gateway_asset_file_name() -> Result<String> {
-    let arch = match std::env::consts::ARCH {
+    gateway_asset_file_name_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(feature = "computer-use"),
+    )
+}
+
+fn gateway_asset_file_name_for(os: &str, arch: &str, computer_use: bool) -> Result<String> {
+    let arch = match arch {
         "x86_64" | "amd64" => "x86_64",
         "aarch64" | "arm64" => "aarch64",
         other => bail!("unsupported architecture `{other}` for release installer source"),
     };
-
-    let os = match std::env::consts::OS {
+    let os = match os {
         "linux" => "linux",
         "macos" => "macos",
         "windows" => "windows",
         other => bail!("unsupported OS `{other}` for release installer source"),
     };
-
-    let variant = if cfg!(feature = "computer-use") {
-        "-computer-use"
+    let suffix = if computer_use {
+        "-computer-use-package"
     } else {
         ""
     };
-    let ext = if os == "windows" || (os == "macos" && arch == "x86_64") {
+    let extension = if computer_use || os == "windows" || (os == "macos" && arch == "x86_64") {
         "zip"
     } else {
         "gz"
     };
-    Ok(format!("pioneer-gateway-{os}-{arch}{variant}.{ext}"))
+    Ok(format!("pioneer-gateway-{os}-{arch}{suffix}.{extension}"))
 }
 
 fn persist_install_state(
@@ -999,97 +1085,240 @@ fn persist_install_state(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackSafety {
+    BeforeGatewayStart,
+    SchemaMayHaveAdvanced,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RestoreOutcome {
+    NotRequired,
+    Restored,
+    Failed { kind: &'static str },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GatewayHealthFailure {
+    NotObserved,
+    MissingBinary,
+    StatusCommand,
+    CommandRejected,
+    InvalidStatus,
+    ServiceInactive,
+    GatewayUnreachable,
+}
+impl fmt::Display for GatewayHealthFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "gateway health check failed ({self:?})")
+    }
+}
+impl Error for GatewayHealthFailure {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RollbackOutcome {
+    pub blocked_compatibility_unknown: bool,
+    pub binary: RestoreOutcome,
+    pub config: RestoreOutcome,
+    pub service_start: RestoreOutcome,
+    pub health: Option<GatewayHealthFailure>,
+    pub candidate_stop: Option<RestoreOutcome>,
+}
+impl RollbackOutcome {
+    fn blocked() -> Self {
+        Self {
+            blocked_compatibility_unknown: true,
+            binary: RestoreOutcome::NotRequired,
+            config: RestoreOutcome::NotRequired,
+            service_start: RestoreOutcome::NotRequired,
+            health: None,
+            candidate_stop: None,
+        }
+    }
+    pub(crate) fn performed(&self) -> bool {
+        !self.blocked_compatibility_unknown
+            && self.binary == RestoreOutcome::Restored
+            && !matches!(self.config, RestoreOutcome::Failed { .. })
+    }
+    pub(crate) fn healthy(&self) -> bool {
+        self.performed() && self.service_start == RestoreOutcome::Restored && self.health.is_none()
+    }
+}
+impl fmt::Display for RollbackOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "rollback outcome: {self:?}")
+    }
+}
+/// Carries original failure and actual recovery result to text/JSON reporting.
+#[derive(Debug)]
+pub(crate) struct InstallRecoveryFailure {
+    pub rollback: RollbackOutcome,
+    source: anyhow::Error,
+}
+impl InstallRecoveryFailure {
+    fn error(source: anyhow::Error, rollback: RollbackOutcome) -> anyhow::Error {
+        Self { source, rollback }.into()
+    }
+}
+impl fmt::Display for InstallRecoveryFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}; {}", self.source, self.rollback)
+    }
+}
+impl Error for InstallRecoveryFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn restore_error_kind(error: &anyhow::Error) -> &'static str {
+    match error
+        .downcast_ref::<std::io::Error>()
+        .map(std::io::Error::kind)
+    {
+        Some(ErrorKind::NotFound) => "not_found",
+        Some(ErrorKind::PermissionDenied) => "permission_denied",
+        Some(ErrorKind::AlreadyExists) => "already_exists",
+        Some(ErrorKind::StorageFull) => "storage_full",
+        _ => "other",
+    }
+}
+fn restore_outcome(result: Result<()>) -> RestoreOutcome {
+    match result {
+        Ok(()) => RestoreOutcome::Restored,
+        Err(error) => RestoreOutcome::Failed {
+            kind: restore_error_kind(&error),
+        },
+    }
+}
 fn rollback_and_restore(
     target_binary: &Path,
     rollback_binary: &Path,
     runtime_home: Option<&Path>,
-    config_backup_dir: Option<&Path>,
+    config_backup_dir: Option<&RuntimeConfigBackup>,
     was_active: bool,
     managed_by: &InstallManagedBy,
-) {
-    restore_binary_and_config(
+    safety: RollbackSafety,
+) -> RollbackOutcome {
+    // No filesystem replacement before actual schema compatibility is known.
+    if safety == RollbackSafety::SchemaMayHaveAdvanced {
+        return RollbackOutcome::blocked();
+    }
+    let mut outcome = restore_binary_and_config(
         target_binary,
         rollback_binary,
         runtime_home,
         config_backup_dir,
     );
-    maybe_restore_service_after_rollback(target_binary, rollback_binary, was_active, managed_by);
+    if let Some(directory) = target_binary.parent() {
+        if let Err(error) = restore_cua_payload(directory) {
+            outcome.binary = RestoreOutcome::Failed {
+                kind: restore_error_kind(&error),
+            };
+        }
+    }
+    // A failed binary/config restore must not start the candidate as if it were
+    // the old installation. No backup is deleted on partial recovery.
+    if was_active && outcome.performed() {
+        outcome.service_start = restore_outcome(run_gateway_command(
+            target_binary,
+            &["start"],
+            managed_by,
+            false,
+            "rollback start",
+        ));
+        if outcome.service_start == RestoreOutcome::Restored {
+            outcome.health = wait_for_gateway_health(target_binary, Duration::from_secs(30)).err();
+        }
+    }
+    outcome
 }
-
 fn restore_binary_and_config(
     target_binary: &Path,
     rollback_binary: &Path,
     runtime_home: Option<&Path>,
-    config_backup_dir: Option<&Path>,
-) {
-    if rollback_binary.is_file() {
-        let _ = fs::rename(rollback_binary, target_binary);
-    }
-    if let (Some(home), Some(backup_dir)) = (runtime_home, config_backup_dir) {
-        let _ = restore_runtime_toml(home, backup_dir);
-    }
-}
-
-fn maybe_restore_service_after_rollback(
-    target_binary: &Path,
-    rollback_binary: &Path,
-    was_active: bool,
-    managed_by: &InstallManagedBy,
-) {
-    if !was_active || !target_binary.is_file() || rollback_binary.is_file() {
-        return;
-    }
-
-    let _ = run_gateway_command(
+    config_backup_dir: Option<&RuntimeConfigBackup>,
+) -> RollbackOutcome {
+    // Copy through a same-directory temporary file and atomically replace the
+    // target. Keep the sole rollback artifact for partial recovery and retry.
+    let binary = restore_outcome(restore_binary_preserving_backup(
         target_binary,
-        &["start"],
-        managed_by,
-        true,
-        "rollback start",
-    );
-}
-
-fn query_gateway_status(binary: &Path) -> Result<Option<ServiceSnapshot>> {
-    let output = match Command::new(binary).arg("status").arg("--json").output() {
-        Ok(output) => output,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to run `{}` status --json", binary.display()));
-        }
+        rollback_binary,
+    ));
+    let config = match (runtime_home, config_backup_dir) {
+        (Some(home), Some(backup)) => restore_outcome(restore_runtime_toml(home, backup)),
+        (None, Some(_)) => RestoreOutcome::Failed {
+            kind: "runtime_home_missing",
+        },
+        _ => RestoreOutcome::NotRequired,
     };
-
-    if !output.status.success() {
-        return Ok(None);
+    RollbackOutcome {
+        blocked_compatibility_unknown: false,
+        binary,
+        config,
+        service_start: RestoreOutcome::NotRequired,
+        health: None,
+        candidate_stop: None,
     }
-
-    let parsed: StatusOutput = match serde_json::from_slice(&output.stdout) {
-        Ok(parsed) => parsed,
-        Err(_) => return Ok(None),
-    };
-
-    let runtime_home = {
-        let trimmed = parsed.runtime_home.trim();
-        if trimmed.is_empty() {
-            None
+}
+fn probe_gateway_status(
+    binary: &Path,
+) -> std::result::Result<ServiceSnapshot, GatewayHealthFailure> {
+    let output = pioneer_observability::resources::captured_output(
+        Command::new(binary).arg("status").arg("--json"),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            GatewayHealthFailure::MissingBinary
         } else {
-            Some(PathBuf::from(trimmed))
+            GatewayHealthFailure::StatusCommand
         }
-    };
-
-    Ok(Some(ServiceSnapshot {
+    })?;
+    if !output.status.success() {
+        return Err(GatewayHealthFailure::CommandRejected);
+    }
+    let parsed: StatusOutput =
+        serde_json::from_slice(&output.stdout).map_err(|_| GatewayHealthFailure::InvalidStatus)?;
+    let runtime_home =
+        (!parsed.runtime_home.trim().is_empty()).then(|| PathBuf::from(parsed.runtime_home.trim()));
+    Ok(ServiceSnapshot {
         service_active: parsed.service_active,
         gateway_reachable: parsed.gateway_reachable,
         runtime_home,
-    }))
+    })
+}
+fn query_gateway_status(binary: &Path) -> Result<Option<ServiceSnapshot>> {
+    match probe_gateway_status(binary) {
+        Ok(status) => Ok(Some(status)),
+        Err(GatewayHealthFailure::StatusCommand) => Err(GatewayHealthFailure::StatusCommand.into()),
+        Err(_) => Ok(None), // Preserve existing initial-install inspection semantics.
+    }
 }
 
-fn query_binary_version(binary: &Path) -> Result<String> {
-    let output = Command::new(binary)
-        .arg("version")
-        .arg("--json")
-        .output()
-        .with_context(|| format!("failed to run `{}` version --json", binary.display()))?;
+#[cfg(target_os = "macos")]
+fn prepare_candidate_probe_layout(binary: &Path) -> Result<(tempfile::TempDir, PathBuf)> {
+    let directory = binary.parent().context("candidate binary has no parent")?;
+    let layout = tempfile::Builder::new()
+        .prefix(".pioneer-candidate-")
+        .tempdir_in(directory)
+        .context("failed to create isolated candidate probe layout")?;
+    restore_bootstrap_libraries(&directory.join("cua.next"), layout.path())?;
+    let candidate = layout
+        .path()
+        .join(binary.file_name().context("candidate binary has no name")?);
+    // Move rather than choose another packaged executable: probe and activation
+    // use this same file, with its existing executable permissions preserved.
+    fs::rename(binary, &candidate).context("failed to stage candidate for version probe")?;
+    Ok((layout, candidate))
+}
+
+fn query_binary_version_output(binary: &Path) -> Result<VersionOutput> {
+    let output = pioneer_observability::resources::captured_output(
+        Command::new(binary).arg("version").arg("--json"),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .with_context(|| format!("failed to run `{}` version --json", binary.display()))?;
 
     if !output.status.success() {
         bail!(
@@ -1106,35 +1335,53 @@ fn query_binary_version(binary: &Path) -> Result<String> {
         bail!("version probe output did not include a version");
     }
 
-    Ok(version.to_owned())
+    Ok(parsed)
 }
 
-fn wait_for_gateway_health(binary: &Path, timeout: Duration) -> bool {
-    let started = std::time::Instant::now();
-    while started.elapsed() < timeout {
-        if let Ok(Some(status)) = query_gateway_status(binary)
-            && status.service_active
-        {
-            let reachable = Command::new(binary)
-                .arg("status")
-                .arg("--json")
-                .output()
-                .ok()
-                .and_then(|output| {
-                    if !output.status.success() {
-                        return None;
-                    }
-                    serde_json::from_slice::<StatusOutput>(&output.stdout).ok()
-                })
-                .is_some_and(|status| status.service_active && status.gateway_reachable);
+fn query_binary_version(binary: &Path) -> Result<String> {
+    Ok(query_binary_version_output(binary)?
+        .version
+        .trim()
+        .to_owned())
+}
 
-            if reachable {
-                return true;
-            }
-        }
-        thread::sleep(Duration::from_secs(1));
+fn ensure_candidate_schema_compatible(
+    applied: &[String],
+    compiled: Option<&[String]>,
+) -> Result<()> {
+    let compiled = compiled.context("schema compatibility unknown: candidate does not expose compiled migrations; installation unchanged")?;
+    anyhow::ensure!(
+        !compiled.is_empty() && compiled.len() <= 4096,
+        "schema compatibility unknown: invalid candidate migration set; installation unchanged"
+    );
+    let names: std::collections::HashSet<_> = compiled.iter().collect();
+    anyhow::ensure!(
+        names.len() == compiled.len() && compiled.iter().all(|name| !name.trim().is_empty()),
+        "schema compatibility unknown: invalid candidate migration names; installation unchanged"
+    );
+    anyhow::ensure!(
+        applied.iter().all(|name| names.contains(name)),
+        "candidate is incompatible with applied migration history; installation unchanged"
+    );
+    Ok(())
+}
+
+fn wait_for_gateway_health(
+    binary: &Path,
+    timeout: Duration,
+) -> std::result::Result<(), GatewayHealthFailure> {
+    let started = Instant::now();
+    let mut last = GatewayHealthFailure::NotObserved;
+    while started.elapsed() < timeout {
+        last = match probe_gateway_status(binary) {
+            Ok(status) if status.service_active && status.gateway_reachable => return Ok(()),
+            Ok(status) if !status.service_active => GatewayHealthFailure::ServiceInactive,
+            Ok(_) => GatewayHealthFailure::GatewayUnreachable,
+            Err(reason) => reason,
+        };
+        thread::sleep(Duration::from_secs(1).min(timeout.saturating_sub(started.elapsed())));
     }
-    false
+    Err(last)
 }
 
 fn run_gateway_start_command(binary: &Path, managed_by: &InstallManagedBy) -> Result<StartOutput> {
@@ -1143,7 +1390,11 @@ fn run_gateway_start_command(binary: &Path, managed_by: &InstallManagedBy) -> Re
     command.args(args.as_slice());
     command.env("PIONEER_MANAGED_BY", managed_by_label(managed_by));
 
-    let output = command.output().with_context(|| {
+    let output = pioneer_observability::resources::captured_output(
+        &mut command,
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .with_context(|| {
         format!(
             "failed to run `{}`",
             render_binary_command(binary, args.as_slice())
@@ -1182,7 +1433,10 @@ fn run_gateway_command(
     command.args(args);
     command.env("PIONEER_MANAGED_BY", managed_by_label(managed_by));
 
-    let output = match command.output() {
+    let output = match pioneer_observability::resources::captured_output(
+        &mut command,
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    ) {
         Ok(output) => output,
         Err(error) if ignore_failure => {
             let _ = error;
@@ -1286,28 +1540,28 @@ fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<()>
 
     if is_zip {
         unpack_zip_asset(asset_path, target_binary)
+    } else if !cfg!(feature = "computer-use")
+        && !cfg!(windows)
+        && !cfg!(all(target_os = "macos", target_arch = "x86_64"))
+        && asset_path.extension().and_then(OsStr::to_str) == Some("gz")
+    {
+        let payload = target_binary
+            .parent()
+            .context("candidate has no parent")?
+            .join("cua.next");
+        if payload.exists() {
+            fs::remove_dir_all(&payload)?;
+        }
+        let input = File::open(asset_path)?;
+        let mut decoder = flate2::read::GzDecoder::new(input).take(512 * 1024 * 1024 + 1);
+        let mut output = File::create(target_binary)?;
+        if std::io::copy(&mut decoder, &mut output)? > 512 * 1024 * 1024 {
+            bail!("Gateway archive exceeds binary budget");
+        }
+        Ok(())
     } else {
-        unpack_gzip_asset(asset_path, target_binary)
+        bail!("Gateway archive format does not match this build variant and target")
     }
-}
-
-fn unpack_gzip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
-    let input = File::open(asset_path)
-        .with_context(|| format!("failed to open asset `{}`", asset_path.display()))?;
-    let mut decoder = GzDecoder::new(input);
-    let mut output = File::create(target_binary).with_context(|| {
-        format!(
-            "failed to create staged binary `{}`",
-            target_binary.display()
-        )
-    })?;
-    std::io::copy(&mut decoder, &mut output).with_context(|| {
-        format!(
-            "failed to unpack gateway archive into `{}`",
-            target_binary.display()
-        )
-    })?;
-    Ok(())
 }
 
 fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
@@ -1321,10 +1575,16 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
     } else {
         "pioneer"
     };
-    #[cfg(target_os = "macos")]
     let target_dir = target_binary
         .parent()
         .context("staged binary path has no parent directory")?;
+    let payload = target_dir.join("cua.next");
+    if payload.exists() {
+        fs::remove_dir_all(&payload).context("failed to clear staged CUA payload")?;
+    }
+    fs::create_dir(&payload).context("failed to create staged CUA payload")?;
+    let mut total_bytes = 0u64;
+    let mut seen = std::collections::BTreeSet::new();
     let mut found = false;
     #[cfg(target_os = "macos")]
     let mut companion_dylibs = 0usize;
@@ -1335,6 +1595,47 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
                 asset_path.display()
             )
         })?;
+        let relative = entry
+            .enclosed_name()
+            .context("invalid Gateway archive path")?;
+        if !seen.insert(relative.to_path_buf()) {
+            bail!("duplicate Gateway archive member");
+        }
+        if entry.is_dir() {
+            continue;
+        }
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            bail!("Gateway archive symlinks are not permitted");
+        }
+        total_bytes = total_bytes.saturating_add(entry.size());
+        if entry.size() > 512 * 1024 * 1024 || total_bytes > 2 * 1024 * 1024 * 1024 {
+            bail!("Gateway archive exceeds payload budget");
+        }
+        if let Ok(companion) = relative.strip_prefix("cua") {
+            if !cfg!(feature = "computer-use") {
+                bail!("server archive must not contain a CUA payload");
+            }
+            if companion.as_os_str().is_empty() {
+                bail!("invalid CUA payload member");
+            }
+            let destination = payload.join(companion);
+            fs::create_dir_all(destination.parent().context("CUA member has no parent")?)?;
+            let mut output = File::create(&destination)?;
+            std::io::copy(&mut entry, &mut output)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = entry.unix_mode().unwrap_or(0o644) & 0o777;
+                fs::set_permissions(&destination, fs::Permissions::from_mode(mode))?;
+            }
+            continue;
+        }
+        if relative.components().count() != 1 {
+            bail!("unexpected Gateway archive member outside CUA payload");
+        }
         let file_name = Path::new(entry.name())
             .file_name()
             .and_then(OsStr::to_str)
@@ -1361,7 +1662,9 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             if file_name.starts_with("libonnxruntime") && file_name.ends_with(".dylib") {
-                let dylib_path = target_dir.join(file_name.as_str());
+                let libraries = payload.join("bootstrap-libs");
+                fs::create_dir_all(&libraries)?;
+                let dylib_path = libraries.join(file_name.as_str());
                 let mut output = File::create(&dylib_path).with_context(|| {
                     format!(
                         "failed to create companion dylib `{}`",
@@ -1393,6 +1696,290 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
         );
     }
 
+    if cfg!(feature = "computer-use") {
+        validate_cua_payload(&payload)?;
+    }
+    Ok(())
+}
+
+// Used only by the legacy CU bridge. No live binary/payload, service, runtime
+// home, config or database is changed here. The package hash is compiled into
+// the checksum-authenticated compatibility executable, not read from the network.
+#[cfg(feature = "computer-use")]
+pub(crate) fn prepare_legacy_cu_package(directory: &Path, package: &[u8]) -> Result<PathBuf> {
+    if package.is_empty() || package.len() > 2 * 1024 * 1024 * 1024 {
+        bail!("invalid embedded CU package size");
+    }
+    let generation = directory.join(format!(
+        ".pioneer-cu-{}",
+        hex::encode(Sha256::digest(package))
+    ));
+    let binary_name = if cfg!(windows) {
+        "pioneer.exe"
+    } else {
+        "pioneer"
+    };
+    match fs::symlink_metadata(&generation) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => bail!("CU package generation must be a real directory"),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let staging = tempfile::Builder::new()
+                .prefix(".pioneer-cu-prepare-")
+                .tempdir_in(directory)?;
+            let asset = staging.path().join("package.zip");
+            fs::write(&asset, package)?;
+            let candidate = staging.path().join(binary_name);
+            unpack_asset_to_binary(&asset, &candidate)?;
+            make_binary_executable(&candidate)?;
+            activate_cua_payload(staging.path())?;
+            fs::remove_dir_all(staging.path().join("cua.rollback"))?;
+            #[cfg(target_os = "macos")]
+            if staging.path().join("cua/bootstrap-libs").exists() {
+                fs::remove_dir_all(staging.path().join("cua/bootstrap-libs"))?;
+            }
+            fs::remove_file(asset)?;
+            // A single rename publishes a complete generation. On races never
+            // replace a published generation; validate the winner below.
+            if let Err(error) = fs::rename(staging.path(), &generation) {
+                if !generation.is_dir() {
+                    return Err(error).context("publish legacy CU package generation");
+                }
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    validate_legacy_cu_generation(&generation, package)?;
+    Ok(generation.join(binary_name))
+}
+
+// Kept immediately before command delegation by the bridge. File preparation
+// remains platform-neutral; this phase executes only the exact verified Gateway.
+#[cfg(feature = "computer-use")]
+pub(crate) fn probe_legacy_cu_package(gateway: &Path) -> Result<()> {
+    let version = query_binary_version_output(gateway)?;
+    if version.version != env!("CARGO_PKG_VERSION")
+        || version.os.as_deref() != Some(std::env::consts::OS)
+        || version.arch.as_deref() != Some(std::env::consts::ARCH)
+        || version.computer_use != Some(true)
+        || version.compiled_database_migrations.is_none()
+    {
+        bail!("embedded Gateway version/target/variant mismatch");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "computer-use")]
+fn validate_legacy_cu_generation(generation: &Path, package: &[u8]) -> Result<()> {
+    if !fs::symlink_metadata(generation)?.is_dir() {
+        bail!("CU package generation must be a real directory");
+    }
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(package))?;
+    let mut expected = std::collections::BTreeSet::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let relative = entry.enclosed_name().context("invalid embedded CU path")?;
+        if entry.is_dir() {
+            continue;
+        }
+        expected.insert(relative.to_path_buf());
+        let mut path = generation.to_owned();
+        for component in relative.components() {
+            path.push(component.as_os_str());
+            if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                bail!("CU package generation contains a symlink");
+            }
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.len() != entry.size() {
+            bail!("CU package generation member mismatch");
+        }
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = entry.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        if sha256_file(&path)? != hex::encode(digest.finalize()) {
+            bail!("CU package generation hash mismatch");
+        }
+    }
+    let mut pending = vec![generation.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if !kind.is_file() || !expected.remove(entry.path().strip_prefix(generation)?) {
+                bail!("unexpected CU package generation member");
+            }
+        }
+    }
+    if !expected.is_empty() {
+        bail!("incomplete CU package generation");
+    }
+    validate_cua_payload(&generation.join("cua"))
+}
+
+// Server installs do not require a CUA package. A transition from CU still
+// retires its managed payload in the same recovery unit as the executable.
+fn activate_install_companions(directory: &Path) -> Result<()> {
+    if cfg!(feature = "computer-use") {
+        return activate_cua_payload(directory);
+    }
+    let current = directory.join("cua");
+    let next = directory.join("cua.next");
+    if !current.exists() && !next.join("bootstrap-libs").exists() {
+        if next.exists() {
+            fs::remove_dir_all(next)?;
+        }
+        return Ok(());
+    }
+    if !next.exists() {
+        fs::create_dir(&next)?;
+    }
+    replace_install_companions(directory)
+}
+
+fn validate_cua_payload(payload: &Path) -> Result<()> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(payload.join("manifest.json"))?)?;
+    let daemon = if cfg!(target_os = "macos") {
+        "Pioneer Gateway.app/Contents/Helpers/cua-driver"
+    } else if cfg!(windows) {
+        "cua-driver.exe"
+    } else {
+        "cua-driver"
+    };
+    let os = match std::env::consts::OS {
+        "macos" => "apple-darwin",
+        "linux" => "unknown-linux-gnu",
+        "windows" => "pc-windows-msvc",
+        _ => bail!("unsupported Gateway CUA platform"),
+    };
+    let target = format!("{}-{os}", std::env::consts::ARCH);
+    if manifest["schema_version"] != 1
+        || manifest["repository"] != "https://github.com/trycua/cua"
+        || manifest["target"].as_str() != Some(target.as_str())
+        || manifest["daemon"] != daemon
+        || manifest["permission_owner"] != "gateway"
+        || manifest["sha256"].as_str() != Some(sha256_file(&payload.join(daemon))?.as_str())
+        || !payload.join("LICENSE.cua-driver.md").is_file()
+        || !payload.join("THIRD_PARTY_NOTICES.md").is_file()
+    {
+        bail!("Gateway CUA package identity or contents mismatch");
+    }
+    #[cfg(windows)]
+    if !payload.join("cua-driver-uia.exe").is_file() {
+        bail!("Gateway CUA Windows UIA companion is missing");
+    }
+    #[cfg(target_os = "macos")]
+    if !payload
+        .join("Pioneer Gateway.app/Contents/MacOS/pioneer")
+        .is_file()
+        || !payload
+            .join("Pioneer Gateway.app/Contents/Info.plist")
+            .is_file()
+    {
+        bail!("Gateway responsible application is missing");
+    }
+    Ok(())
+}
+
+fn activate_cua_payload(directory: &Path) -> Result<()> {
+    let next = directory.join("cua.next");
+    validate_cua_payload(&next)?;
+    replace_install_companions(directory)
+}
+
+fn replace_install_companions(directory: &Path) -> Result<()> {
+    let current = directory.join("cua");
+    let backup = directory.join("cua.rollback");
+    let next = directory.join("cua.next");
+    if backup.exists() {
+        bail!("CUA rollback payload exists; retain it for explicit recovery before updating");
+    }
+    if current.exists() {
+        fs::rename(&current, &backup)?;
+    } else {
+        // An empty backup represents an installation that previously had no CUA.
+        fs::create_dir(&backup)?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Root bootstrap libraries belong to the same recovery unit. Do not
+        // overwrite a running installation while merely unpacking an archive.
+        let libraries = backup.join("bootstrap-libs");
+        fs::create_dir_all(&libraries)?;
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("libonnxruntime") && name.ends_with(".dylib") {
+                fs::copy(entry.path(), libraries.join(name.as_ref()))?;
+            }
+        }
+    }
+    fs::rename(next, &current).context("failed to activate staged CUA payload")?;
+    #[cfg(target_os = "macos")]
+    restore_bootstrap_libraries(&current, directory)?;
+    Ok(())
+}
+
+fn restore_cua_payload(directory: &Path) -> Result<()> {
+    let backup = directory.join("cua.rollback");
+    if backup.exists() {
+        let current = directory.join("cua");
+        if current.exists() {
+            #[cfg(target_os = "macos")]
+            if current.join("bootstrap-libs").is_dir() {
+                for entry in fs::read_dir(current.join("bootstrap-libs"))? {
+                    let path = directory.join(entry?.file_name());
+                    if path.is_file() {
+                        fs::remove_file(path)?;
+                    }
+                }
+            }
+            fs::remove_dir_all(&current)?;
+        }
+        // Preserve the sole known-good payload if a later config/service restore
+        // fails, just as restore_binary_preserving_backup retains the executable.
+        copy_cua_payload(&backup, &current).context("failed to restore CUA rollback payload")?;
+        #[cfg(target_os = "macos")]
+        restore_bootstrap_libraries(&backup, directory)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn restore_bootstrap_libraries(payload: &Path, directory: &Path) -> Result<()> {
+    let libraries = payload.join("bootstrap-libs");
+    if libraries.is_dir() {
+        for entry in fs::read_dir(libraries)? {
+            let entry = entry?;
+            fs::copy(entry.path(), directory.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_cua_payload(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if kind.is_dir() {
+            copy_cua_payload(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), target)?;
+        } else {
+            bail!("invalid CUA rollback payload member");
+        }
+    }
     Ok(())
 }
 
@@ -1420,75 +2007,120 @@ fn make_binary_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn backup_runtime_toml(runtime_home: &Path, backup_dir: &Path) -> Result<bool> {
-    if !runtime_home.is_dir() {
-        return Ok(false);
-    }
-
-    fs::create_dir_all(backup_dir)
-        .with_context(|| format!("failed to create backup dir `{}`", backup_dir.display()))?;
-    let mut copied = 0usize;
-
-    for entry in fs::read_dir(runtime_home)
-        .with_context(|| format!("failed to list `{}`", runtime_home.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let is_toml = path
-            .extension()
-            .and_then(OsStr::to_str)
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
-        if !is_toml {
-            continue;
-        }
-
-        let target = backup_dir.join(entry.file_name());
-        fs::copy(&path, &target).with_context(|| {
-            format!(
-                "failed to backup config `{}` to `{}`",
-                path.display(),
-                target.display()
-            )
-        })?;
-        copied += 1;
-    }
-
-    if copied == 0 {
-        let _ = fs::remove_dir(backup_dir);
-        Ok(false)
-    } else {
-        Ok(true)
-    }
+#[derive(Debug)]
+struct RuntimeConfigBackup {
+    directory: PathBuf,
+    // The actual files selected by the existing TOML backup owner. Keep their
+    // content digests so missing/truncated/replaced backups cannot report success.
+    files: Vec<(OsString, String)>,
 }
 
-fn restore_runtime_toml(runtime_home: &Path, backup_dir: &Path) -> Result<()> {
-    if !backup_dir.is_dir() {
-        return Ok(());
-    }
-    fs::create_dir_all(runtime_home)
-        .with_context(|| format!("failed to create runtime home `{}`", runtime_home.display()))?;
+fn restore_binary_preserving_backup(target: &Path, backup: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(backup).context("binary backup metadata unavailable")?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() > 0,
+        "invalid binary backup"
+    );
+    let parent = target.parent().context("binary target has no parent")?;
+    let temporary = tempfile::NamedTempFile::new_in(parent)?;
+    fs::copy(backup, temporary.path()).context("failed to copy binary backup")?;
+    temporary
+        .as_file()
+        .sync_all()
+        .context("failed to sync restored binary")?;
+    temporary
+        .persist(target)
+        .map_err(|error| error.error)
+        .context("failed to replace binary from retained backup")?;
+    Ok(())
+}
 
-    for entry in fs::read_dir(backup_dir)
-        .with_context(|| format!("failed to list `{}`", backup_dir.display()))?
-    {
+fn backup_runtime_toml(
+    runtime_home: &Path,
+    backup_dir: &Path,
+) -> Result<Option<RuntimeConfigBackup>> {
+    match fs::symlink_metadata(runtime_home) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("runtime config metadata unavailable"),
+        Ok(metadata) => anyhow::ensure!(metadata.is_dir(), "runtime home is not a directory"),
+    }
+    let mut selected = Vec::new();
+    for entry in fs::read_dir(runtime_home).context("failed to list runtime config")? {
         let entry = entry?;
-        let src = entry.path();
-        if !src.is_file() {
+        let path = entry.path();
+        if !path
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+        {
             continue;
         }
-        let dst = runtime_home.join(entry.file_name());
-        fs::copy(&src, &dst).with_context(|| {
-            format!(
-                "failed to restore config `{}` to `{}`",
-                src.display(),
-                dst.display()
-            )
-        })?;
+        let metadata = fs::symlink_metadata(&path).context("config entry metadata unavailable")?;
+        anyhow::ensure!(metadata.is_file(), "config entry is not a regular file");
+        selected.push(entry.file_name());
     }
+    if selected.is_empty() {
+        // Proven absence, unlike an unexpectedly empty expected backup.
+        return Ok(None);
+    }
+    fs::create_dir(backup_dir).context("failed to create unique config backup directory")?;
+    let mut backup = RuntimeConfigBackup {
+        directory: backup_dir.to_owned(),
+        files: Vec::new(),
+    };
+    for name in selected {
+        let src = runtime_home.join(&name);
+        let expected_digest = sha256_file(&src)?;
+        let dst = backup_dir.join(&name);
+        fs::copy(&src, &dst).context("failed to backup config")?;
+        anyhow::ensure!(
+            sha256_file(&dst)? == expected_digest,
+            "config changed during backup"
+        );
+        backup.files.push((name, expected_digest));
+    }
+    Ok(Some(backup))
+}
 
+fn restore_runtime_toml(runtime_home: &Path, backup: &RuntimeConfigBackup) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(&backup.directory).context("configuration backup unavailable")?;
+    anyhow::ensure!(metadata.is_dir(), "configuration backup is not a directory");
+    anyhow::ensure!(
+        !backup.files.is_empty(),
+        "expected configuration backup is empty"
+    );
+    // Validate the complete expected set before the first config mutation.
+    // Metadata errors are propagated; no is_file() branch silently skips them.
+    for (name, digest) in &backup.files {
+        let src = backup.directory.join(name);
+        let metadata =
+            fs::symlink_metadata(&src).context("config backup entry metadata unavailable")?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "config backup entry is not a regular file"
+        );
+        anyhow::ensure!(
+            sha256_file(&src)? == *digest,
+            "config backup content mismatch"
+        );
+    }
+    fs::create_dir_all(runtime_home).context("failed to create runtime home for config restore")?;
+    for (name, digest) in &backup.files {
+        // Atomic per-file restore keeps retries safe after any partial copy.
+        let temporary = tempfile::NamedTempFile::new_in(runtime_home)?;
+        fs::copy(backup.directory.join(name), temporary.path())
+            .context("failed to restore config")?;
+        anyhow::ensure!(
+            sha256_file(temporary.path())? == *digest,
+            "config backup changed during restore"
+        );
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(runtime_home.join(name))
+            .map_err(|error| error.error)
+            .context("failed to replace restored config")?;
+    }
     Ok(())
 }
 
@@ -1683,17 +2315,18 @@ fn ensure_windows_path(config: &AppConfig, target_binary: &Path) -> Result<Comma
         [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')"#
     );
 
-    let output = Command::new("powershell")
-        .args([
+    let output = pioneer_observability::resources::captured_output(
+        Command::new("powershell").args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
             &script,
-        ])
-        .output()
-        .context("failed to update user PATH")?;
+        ]),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .context("failed to update user PATH")?;
 
     let mut path_updated = true;
     if !output.status.success() {
@@ -1987,6 +2620,283 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn schema_uncertainty_blocks_binary_only_rollback_before_any_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("candidate");
+        let rollback = dir.path().join("old");
+        fs::write(&target, "candidate-with-new-schema").unwrap();
+        fs::write(&rollback, "older-binary").unwrap();
+        let outcome = super::rollback_and_restore(
+            &target,
+            &rollback,
+            None,
+            None,
+            true,
+            &pioneer_config::InstallManagedBy::Manual,
+            super::RollbackSafety::SchemaMayHaveAdvanced,
+        );
+        assert!(outcome.blocked_compatibility_unknown);
+        assert!(!outcome.performed());
+        assert_eq!(
+            fs::read_to_string(target).unwrap(),
+            "candidate-with-new-schema"
+        );
+        assert_eq!(fs::read_to_string(rollback).unwrap(), "older-binary");
+    }
+
+    #[test]
+    fn failed_restore_preserves_candidate_and_reports_missing_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("candidate");
+        fs::write(&target, "candidate").unwrap();
+        let backup = super::RuntimeConfigBackup {
+            directory: dir.path().join("missing-config"),
+            files: vec![("config.toml".into(), "missing".into())],
+        };
+        let outcome = super::restore_binary_and_config(
+            &target,
+            &dir.path().join("missing"),
+            Some(dir.path()),
+            Some(&backup),
+        );
+        assert_eq!(
+            outcome.binary,
+            super::RestoreOutcome::Failed { kind: "not_found" }
+        );
+        assert_eq!(
+            outcome.config,
+            super::RestoreOutcome::Failed { kind: "not_found" }
+        );
+        assert!(!outcome.performed());
+        assert!(!outcome.healthy());
+        assert_eq!(fs::read_to_string(target).unwrap(), "candidate");
+    }
+
+    #[test]
+    fn partial_config_restore_retains_binary_backup_and_can_continue_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_home = dir.path().join("source");
+        fs::create_dir(&source_home).unwrap();
+        fs::write(source_home.join("config.toml"), "setting = true\n").unwrap();
+        let backup = super::backup_runtime_toml(&source_home, &dir.path().join("config-backup"))
+            .unwrap()
+            .unwrap();
+        let target = dir.path().join("candidate");
+        let old = dir.path().join("rollback");
+        fs::write(&target, "candidate").unwrap();
+        fs::write(&old, "old-binary").unwrap();
+        let home = dir.path().join("restore-home");
+        fs::write(&home, "blocks directory creation").unwrap();
+        let partial = super::rollback_and_restore(
+            &target,
+            &old,
+            Some(&home),
+            Some(&backup),
+            true,
+            &pioneer_config::InstallManagedBy::Manual,
+            super::RollbackSafety::BeforeGatewayStart,
+        );
+        assert_eq!(partial.binary, super::RestoreOutcome::Restored);
+        assert!(matches!(
+            partial.config,
+            super::RestoreOutcome::Failed { .. }
+        ));
+        assert_eq!(
+            partial.service_start,
+            super::RestoreOutcome::NotRequired,
+            "must not execute the restored service after incomplete config"
+        );
+        assert!(!partial.performed());
+        assert_eq!(fs::read(&target).unwrap(), b"old-binary");
+        assert_eq!(fs::read(&old).unwrap(), b"old-binary");
+        assert!(backup.directory.join("config.toml").is_file());
+        let original = super::InstallRecoveryFailure::error(
+            anyhow::anyhow!("original replacement failure"),
+            partial,
+        );
+        let mut bytes = Vec::new();
+        crate::print_install_failure_json(super::InstallCommand::Update, &original, &mut bytes)
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["rollback_performed"], false);
+        assert_eq!(payload["rollback_outcome"]["binary"], "restored");
+        assert!(
+            original
+                .chain()
+                .any(|cause| cause.to_string() == "original replacement failure")
+        );
+        fs::remove_file(&home).unwrap();
+        for _ in 0..2 {
+            let restored = super::rollback_and_restore(
+                &target,
+                &old,
+                Some(&home),
+                Some(&backup),
+                false,
+                &pioneer_config::InstallManagedBy::Manual,
+                super::RollbackSafety::BeforeGatewayStart,
+            );
+            assert!(restored.performed());
+            assert!(
+                !restored.healthy(),
+                "restored artifacts alone are not health proof"
+            );
+            assert_eq!(
+                fs::read(home.join("config.toml")).unwrap(),
+                b"setting = true\n"
+            );
+            assert_eq!(fs::read(&old).unwrap(), b"old-binary");
+        }
+    }
+
+    #[test]
+    fn expected_config_backup_must_be_complete_and_match_captured_contents() {
+        for damage in [
+            "missing-directory",
+            "empty-directory",
+            "missing-file",
+            "directory-entry",
+            "empty-file",
+            "corrupt-file",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("a.toml"), "original = true\n").unwrap();
+            fs::write(source.join("b.toml"), "second = true\n").unwrap();
+            let backup = super::backup_runtime_toml(&source, &dir.path().join("backup"))
+                .unwrap()
+                .unwrap();
+            let file = backup.directory.join("b.toml");
+            match damage {
+                "missing-directory" => fs::remove_dir_all(&backup.directory).unwrap(),
+                "empty-directory" => {
+                    fs::remove_file(backup.directory.join("a.toml")).unwrap();
+                    fs::remove_file(&file).unwrap();
+                }
+                "missing-file" => fs::remove_file(&file).unwrap(),
+                "directory-entry" => {
+                    fs::remove_file(&file).unwrap();
+                    fs::create_dir(&file).unwrap();
+                }
+                "empty-file" => fs::write(&file, "").unwrap(),
+                "corrupt-file" => fs::write(&file, "tampered = true\n").unwrap(),
+                _ => unreachable!(),
+            }
+            let home = dir.path().join("restored");
+            fs::create_dir(&home).unwrap();
+            fs::write(home.join("a.toml"), "candidate config").unwrap();
+            let error = super::restore_runtime_toml(&home, &backup).unwrap_err();
+            if matches!(
+                damage,
+                "missing-directory" | "empty-directory" | "missing-file"
+            ) {
+                assert!(
+                    error.downcast_ref::<std::io::Error>().is_some(),
+                    "metadata error source survives"
+                );
+            }
+            assert_eq!(
+                fs::read(home.join("a.toml")).unwrap(),
+                b"candidate config",
+                "validate full set before any restore"
+            );
+        }
+    }
+
+    #[test]
+    fn absence_of_config_is_distinct_from_unexpected_empty_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            super::backup_runtime_toml(dir.path(), &dir.path().join("unused"))
+                .unwrap()
+                .is_none()
+        );
+        let backup = super::RuntimeConfigBackup {
+            directory: dir.path().to_owned(),
+            files: Vec::new(),
+        };
+        assert!(super::restore_runtime_toml(&dir.path().join("restored"), &backup).is_err());
+        // A deliberately empty source TOML can be restored only if captured as
+        // such; corruption means disagreement with the captured source bytes.
+        fs::write(dir.path().join("config.toml"), "").unwrap();
+        let captured = super::backup_runtime_toml(dir.path(), &dir.path().join("captured"))
+            .unwrap()
+            .unwrap();
+        let home = dir.path().join("restored");
+        super::restore_runtime_toml(&home, &captured).unwrap();
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), b"");
+    }
+
+    #[test]
+    fn restored_files_require_separate_service_health_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("candidate");
+        let backup = dir.path().join("rollback");
+        fs::write(&target, "candidate").unwrap();
+        fs::write(&backup, "old-binary").unwrap();
+        let outcome = super::rollback_and_restore(
+            &target,
+            &backup,
+            None,
+            None,
+            false,
+            &pioneer_config::InstallManagedBy::Manual,
+            super::RollbackSafety::BeforeGatewayStart,
+        );
+        assert!(outcome.performed());
+        assert!(!outcome.healthy());
+        assert_eq!(fs::read_to_string(target).unwrap(), "old-binary");
+    }
+
+    #[test]
+    fn install_failure_json_uses_typed_recovery_instead_of_error_text() {
+        let mut bytes = Vec::new();
+        crate::print_install_failure_json(
+            super::InstallCommand::Update,
+            &anyhow::anyhow!("untrusted claim: update rolled back"),
+            &mut bytes,
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["rollback_performed"], false);
+        bytes.clear();
+        let error = super::InstallRecoveryFailure::error(
+            anyhow::anyhow!("original start failure"),
+            super::RollbackOutcome::blocked(),
+        )
+        .context("outer report context");
+        crate::print_install_failure_json(super::InstallCommand::Update, &error, &mut bytes)
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["rollback_performed"], false);
+        assert_eq!(payload["rollback_healthy"], false);
+        assert_eq!(
+            payload["rollback_outcome"]["blocked_compatibility_unknown"],
+            true
+        );
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("original start failure")
+        );
+    }
+
+    #[test]
+    fn health_failure_distinguishes_missing_status_command_from_no_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            super::probe_gateway_status(&dir.path().join("missing")),
+            Err(super::GatewayHealthFailure::MissingBinary)
+        ));
+        assert_eq!(
+            super::wait_for_gateway_health(&dir.path().join("missing"), Duration::ZERO),
+            Err(super::GatewayHealthFailure::NotObserved)
+        );
+    }
+
+    #[test]
     fn install_reports_preserve_transient_download_classification_after_output_failure() {
         struct FailedWriter(std::io::ErrorKind);
 
@@ -2047,11 +2957,11 @@ mod tests {
         let path = unique_temp_path("checksum-prefixed");
         fs::write(
             &path,
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa pioneer-gateway-linux-x86_64.gz\n",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa pioneer-gateway-linux-x86_64.zip\n",
         )
         .expect("write checksums file");
 
-        let parsed = expected_checksum_for_asset(&path, "pioneer-gateway-linux-x86_64.gz")
+        let parsed = expected_checksum_for_asset(&path, "pioneer-gateway-linux-x86_64.zip")
             .expect("parse checksum");
 
         assert_eq!(
@@ -2066,11 +2976,11 @@ mod tests {
         let path = unique_temp_path("checksum-missing");
         fs::write(
             &path,
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb pioneer-gateway-linux-aarch64.gz\n",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb pioneer-gateway-linux-aarch64.zip\n",
         )
         .expect("write checksums file");
 
-        let error = expected_checksum_for_asset(&path, "pioneer-gateway-linux-x86_64.gz")
+        let error = expected_checksum_for_asset(&path, "pioneer-gateway-linux-x86_64.zip")
             .expect_err("missing asset should fail");
 
         assert!(format!("{error:#}").contains("checksum for"));
@@ -2078,38 +2988,550 @@ mod tests {
     }
 
     #[test]
-    fn release_asset_name_matches_build_variant() {
-        let asset_name = super::gateway_asset_file_name().expect("asset name");
-
-        let expected_os = match std::env::consts::OS {
-            "linux" => "linux",
-            "macos" => "macos",
-            "windows" => "windows",
-            other => panic!("unexpected test OS: {other}"),
-        };
-        let expected_arch = match std::env::consts::ARCH {
-            "x86_64" | "amd64" => "x86_64",
-            "aarch64" | "arm64" => "aarch64",
-            other => panic!("unexpected test arch: {other}"),
-        };
-        let expected_variant = if cfg!(feature = "computer-use") {
-            "-computer-use"
-        } else {
-            ""
-        };
-        let expected_ext =
-            if cfg!(windows) || (std::env::consts::OS == "macos" && expected_arch == "x86_64") {
-                "zip"
+    #[cfg(feature = "computer-use")]
+    fn installer_rollback_restores_the_prior_daemon_payload() {
+        for previously_installed in [false, true] {
+            let temporary = tempfile::tempdir().expect("installer directory");
+            let directory = temporary.path();
+            if previously_installed {
+                fs::create_dir(directory.join("cua")).unwrap();
+                fs::write(directory.join("cua/prior-daemon"), b"prior release").unwrap();
+            }
+            let next = directory.join("cua.next");
+            let daemon = if cfg!(target_os = "macos") {
+                "Pioneer Gateway.app/Contents/Helpers/cua-driver"
+            } else if cfg!(windows) {
+                "cua-driver.exe"
             } else {
-                "gz"
+                "cua-driver"
             };
-
-        assert_eq!(
-            asset_name,
-            format!(
-                "pioneer-gateway-{expected_os}-{expected_arch}{expected_variant}.{expected_ext}"
+            fs::create_dir_all(next.join(daemon).parent().unwrap()).unwrap();
+            fs::write(next.join(daemon), b"candidate daemon bytes").unwrap();
+            fs::write(next.join("LICENSE.cua-driver.md"), b"fixture notice").unwrap();
+            fs::write(next.join("THIRD_PARTY_NOTICES.md"), b"fixture notices").unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                let app = next.join("Pioneer Gateway.app/Contents");
+                fs::create_dir_all(app.join("MacOS")).unwrap();
+                fs::write(app.join("MacOS/pioneer"), b"candidate Gateway bytes").unwrap();
+                fs::write(app.join("Info.plist"), b"fixture identity").unwrap();
+                if previously_installed {
+                    fs::write(directory.join("pioneer"), b"prior executable").unwrap();
+                    fs::write(directory.join("libonnxruntime.dylib"), b"prior library").unwrap();
+                    fs::write(directory.join("libonnxruntime.prior.dylib"), b"prior only").unwrap();
+                }
+                fs::create_dir(next.join("bootstrap-libs")).unwrap();
+                fs::write(
+                    next.join("bootstrap-libs/libonnxruntime.dylib"),
+                    b"candidate library",
+                )
+                .unwrap();
+                fs::write(
+                    next.join("bootstrap-libs/libonnxruntime.candidate.dylib"),
+                    b"candidate only",
+                )
+                .unwrap();
+            }
+            fs::write(
+                next.join("manifest.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 1,
+                    "repository": "https://github.com/trycua/cua",
+                    "target": format!("{}-{}", std::env::consts::ARCH,
+                        if cfg!(target_os = "macos") {
+                            "apple-darwin"
+                        } else if cfg!(windows) {
+                            "pc-windows-msvc"
+                        } else {
+                            "unknown-linux-gnu"
+                        }),
+                    "revision": "upstream-revision",
+                    "version": "future-driver-version",
+                    "daemon": daemon,
+                    "permission_owner": "gateway",
+                    "sha256": super::sha256_file(&next.join(daemon)).unwrap(),
+                }))
+                .unwrap(),
             )
+            .unwrap();
+            #[cfg(windows)]
+            fs::write(next.join("cua-driver-uia.exe"), b"fixture UIA companion").unwrap();
+            // Exercise the archive boundary, including identity and completeness
+            // failures, before using its staged output for activation/recovery.
+            let manifest_bytes = fs::read(next.join("manifest.json")).unwrap();
+            #[cfg(not(windows))]
+            let archive_gateway = format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+                serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "os": std::env::consts::OS,
+                    "arch": std::env::consts::ARCH,
+                    "computer_use": true,
+                    "compiled_database_migrations": ["candidate-migration"]
+                })
+            )
+            .into_bytes();
+            #[cfg(windows)]
+            let archive_gateway = b"candidate Gateway bytes".to_vec();
+
+            for defect in ["manifest", "owner", "hash", "companion", "none"] {
+                let mut manifest: serde_json::Value =
+                    serde_json::from_slice(&manifest_bytes).unwrap();
+                if defect == "owner" {
+                    manifest["permission_owner"] = "client".into();
+                }
+                if defect == "hash" {
+                    manifest["sha256"] = "wrong-hash".into();
+                }
+                let asset = directory.join("candidate.zip");
+                let mut zip = zip::ZipWriter::new(fs::File::create(&asset).unwrap());
+                let options = zip::write::SimpleFileOptions::default();
+                zip.start_file(
+                    if cfg!(windows) {
+                        "pioneer.exe"
+                    } else {
+                        "pioneer"
+                    },
+                    options,
+                )
+                .unwrap();
+                zip.write_all(&archive_gateway).unwrap();
+                let mut pending = vec![next.clone()];
+                while let Some(folder) = pending.pop() {
+                    for entry in fs::read_dir(folder).unwrap() {
+                        let path = entry.unwrap().path();
+                        if path.is_dir() {
+                            pending.push(path);
+                            continue;
+                        }
+                        let relative = path.strip_prefix(&next).unwrap();
+                        let name = relative.to_string_lossy().replace('\\', "/");
+                        let required_companion = if cfg!(windows) {
+                            "cua-driver-uia.exe"
+                        } else if cfg!(target_os = "macos") {
+                            "Pioneer Gateway.app/Contents/Info.plist"
+                        } else {
+                            "THIRD_PARTY_NOTICES.md"
+                        };
+                        if (defect == "companion" && name == required_companion)
+                            || (defect == "manifest" && name == "manifest.json")
+                        {
+                            continue;
+                        }
+                        // Bootstrap libraries are root archive members in real packages.
+                        let member = name
+                            .strip_prefix("bootstrap-libs/")
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("cua/{name}"));
+                        zip.start_file(member, options).unwrap();
+                        let bytes = if name == "manifest.json" {
+                            serde_json::to_vec(&manifest).unwrap()
+                        } else {
+                            fs::read(&path).unwrap()
+                        };
+                        zip.write_all(&bytes).unwrap();
+                    }
+                }
+                zip.finish().unwrap();
+                let admission = tempfile::tempdir_in(directory).unwrap();
+                let candidate = admission.path().join("pioneer.next");
+                let result = super::unpack_asset_to_binary(&asset, &candidate);
+                let legacy = tempfile::tempdir_in(directory).unwrap();
+                let prior_binary = if cfg!(windows) {
+                    "pioneer.exe"
+                } else {
+                    "pioneer"
+                };
+                let prior = [
+                    (prior_binary, b"prior executable".as_slice()),
+                    ("settings.toml", b"prior settings".as_slice()),
+                    ("credentials", b"prior credential fixture".as_slice()),
+                    ("history.db", b"prior data fixture".as_slice()),
+                ];
+                for (name, bytes) in prior {
+                    fs::write(legacy.path().join(name), bytes).unwrap();
+                }
+                let package = fs::read(&asset).unwrap();
+                if defect != "none" {
+                    assert!(super::prepare_legacy_cu_package(legacy.path(), &package).is_err());
+                }
+                if defect == "none" {
+                    let prepared =
+                        super::prepare_legacy_cu_package(legacy.path(), &package).unwrap();
+                    let generation = prepared.parent().unwrap();
+                    assert!(generation.join("cua").is_dir());
+                    assert_eq!(
+                        super::prepare_legacy_cu_package(legacy.path(), &package).unwrap(),
+                        prepared
+                    );
+                    assert!(!legacy.path().join("cua").exists());
+                    assert!(!legacy.path().join("cua.rollback").exists());
+                    #[cfg(not(windows))]
+                    {
+                        super::probe_legacy_cu_package(&prepared).unwrap();
+                        for (field, value) in [
+                            ("version", serde_json::json!("wrong-version")),
+                            ("os", serde_json::json!("wrong-os")),
+                            ("arch", serde_json::json!("wrong-architecture")),
+                            ("computer_use", serde_json::json!(false)),
+                            ("compiled_database_migrations", serde_json::Value::Null),
+                        ] {
+                            let mut metadata = serde_json::json!({
+                                "version": env!("CARGO_PKG_VERSION"),
+                                "os": std::env::consts::OS,
+                                "arch": std::env::consts::ARCH,
+                                "computer_use": true,
+                                "compiled_database_migrations": ["candidate-migration"]
+                            });
+                            metadata[field] = value;
+                            fs::write(
+                                &prepared,
+                                format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", metadata),
+                            )
+                            .unwrap();
+                            assert!(
+                                super::probe_legacy_cu_package(&prepared).is_err(),
+                                "accepted {field}"
+                            );
+                        }
+                        fs::write(&prepared, &archive_gateway).unwrap();
+
+                        assert!(
+                            super::ensure_candidate_schema_compatible(
+                                &["unavailable-migration".into()],
+                                super::query_binary_version_output(&prepared)
+                                    .unwrap()
+                                    .compiled_database_migrations
+                                    .as_deref(),
+                            )
+                            .is_err()
+                        );
+                    }
+                    // Reuse must reject tampering before launching that executable.
+                    fs::write(&prepared, b"tampered Gateway").unwrap();
+                    assert!(super::prepare_legacy_cu_package(legacy.path(), &package).is_err());
+                    fs::write(&prepared, &archive_gateway).unwrap();
+                    super::make_binary_executable(&prepared).unwrap();
+                    fs::write(generation.join("unexpected.dll"), b"untrusted library").unwrap();
+                    assert!(super::prepare_legacy_cu_package(legacy.path(), &package).is_err());
+                }
+                for (name, bytes) in prior {
+                    assert_eq!(fs::read(legacy.path().join(name)).unwrap(), bytes);
+                }
+
+                if defect != "none" {
+                    assert!(result.is_err(), "accepted corrupt {defect} archive");
+                    assert!(!directory.join("cua.rollback").exists());
+                    assert_eq!(
+                        directory.join("cua/prior-daemon").exists(),
+                        previously_installed
+                    );
+                } else {
+                    result.unwrap();
+                    assert_eq!(fs::read(candidate).unwrap(), archive_gateway);
+                    fs::remove_dir_all(&next).unwrap();
+                    fs::rename(admission.path().join("cua.next"), &next).unwrap();
+                }
+            }
+            #[cfg(target_os = "macos")]
+            let (_layout, candidate, candidate_bytes) = {
+                // This fixture observes the actual version-command boundary and
+                // adjacent files; it does not simulate or qualify native dyld.
+                let bytes = br#"#!/bin/sh
+set -eu
+base=${0%/*}
+[ "$1" = version ] && [ "$2" = --json ]
+[ "$(cat "$base/libonnxruntime.dylib")" = 'candidate library' ]
+[ "$(cat "$base/libonnxruntime.candidate.dylib")" = 'candidate only' ]
+[ ! -e "$base/libonnxruntime.prior.dylib" ]
+printf '%s\n' '{"version":"candidate","compiled_database_migrations":["candidate-migration"]}'
+"#;
+                let staged = directory.join("pioneer.next");
+                fs::write(&staged, bytes).unwrap();
+                super::make_binary_executable(&staged).unwrap();
+                let (layout, candidate) = super::prepare_candidate_probe_layout(&staged).unwrap();
+                let version = super::query_binary_version_output(&candidate).unwrap();
+                assert_eq!(version.version, "candidate");
+                let compiled = version.compiled_database_migrations.as_deref();
+                assert!(
+                    super::ensure_candidate_schema_compatible(
+                        &["unavailable-migration".into()],
+                        compiled,
+                    )
+                    .is_err()
+                );
+                assert_eq!(directory.join("pioneer").exists(), previously_installed);
+                assert_eq!(
+                    directory.join("libonnxruntime.dylib").exists(),
+                    previously_installed
+                );
+                if previously_installed {
+                    assert_eq!(
+                        fs::read(directory.join("pioneer")).unwrap(),
+                        b"prior executable"
+                    );
+                    assert_eq!(
+                        fs::read(directory.join("libonnxruntime.dylib")).unwrap(),
+                        b"prior library"
+                    );
+                    assert_eq!(
+                        fs::read(directory.join("libonnxruntime.prior.dylib")).unwrap(),
+                        b"prior only"
+                    );
+                    assert_eq!(
+                        fs::read(directory.join("cua/prior-daemon")).unwrap(),
+                        b"prior release"
+                    );
+                }
+                assert!(!directory.join("libonnxruntime.candidate.dylib").exists());
+                assert!(!directory.join("cua.rollback").exists());
+                super::ensure_candidate_schema_compatible(
+                    &["candidate-migration".into()],
+                    compiled,
+                )
+                .unwrap();
+                (layout, candidate, bytes)
+            };
+            #[cfg(target_os = "macos")]
+            if previously_installed {
+                fs::rename(
+                    directory.join("pioneer"),
+                    directory.join("pioneer.rollback"),
+                )
+                .unwrap();
+            }
+            super::activate_install_companions(directory).expect("activate candidate");
+            #[cfg(target_os = "macos")]
+            {
+                fs::rename(&candidate, directory.join("pioneer")).unwrap();
+                assert_eq!(
+                    fs::read(directory.join("pioneer")).unwrap(),
+                    candidate_bytes
+                );
+                assert_eq!(
+                    fs::read(directory.join("libonnxruntime.candidate.dylib")).unwrap(),
+                    b"candidate only"
+                );
+            }
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                fs::read(directory.join("libonnxruntime.dylib")).unwrap(),
+                b"candidate library"
+            );
+            assert_eq!(
+                fs::read(directory.join("cua").join(daemon)).unwrap(),
+                b"candidate daemon bytes"
+            );
+            super::restore_cua_payload(directory).expect("restore prior payload");
+            assert!(!directory.join("cua").join(daemon).exists());
+            assert!(directory.join("cua.rollback").is_dir());
+            super::restore_cua_payload(directory).expect("retry retained payload restore");
+            #[cfg(target_os = "macos")]
+            {
+                assert!(!directory.join("libonnxruntime.candidate.dylib").exists());
+                assert_eq!(
+                    directory.join("libonnxruntime.dylib").exists(),
+                    previously_installed
+                );
+                if previously_installed {
+                    assert_eq!(
+                        fs::read(directory.join("libonnxruntime.dylib")).unwrap(),
+                        b"prior library"
+                    );
+                    assert_eq!(
+                        fs::read(directory.join("libonnxruntime.prior.dylib")).unwrap(),
+                        b"prior only"
+                    );
+                }
+            }
+            if previously_installed {
+                assert_eq!(
+                    fs::read(directory.join("cua/prior-daemon")).unwrap(),
+                    b"prior release"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn release_asset_name_preserves_server_updater_contract_and_cu_opt_in() {
+        for (os, arch, server, computer_use) in [
+            (
+                "linux",
+                "x86_64",
+                "pioneer-gateway-linux-x86_64.gz",
+                "pioneer-gateway-linux-x86_64-computer-use-package.zip",
+            ),
+            (
+                "linux",
+                "aarch64",
+                "pioneer-gateway-linux-aarch64.gz",
+                "pioneer-gateway-linux-aarch64-computer-use-package.zip",
+            ),
+            (
+                "macos",
+                "aarch64",
+                "pioneer-gateway-macos-aarch64.gz",
+                "pioneer-gateway-macos-aarch64-computer-use-package.zip",
+            ),
+            (
+                "macos",
+                "x86_64",
+                "pioneer-gateway-macos-x86_64.zip",
+                "pioneer-gateway-macos-x86_64-computer-use-package.zip",
+            ),
+            (
+                "windows",
+                "x86_64",
+                "pioneer-gateway-windows-x86_64.zip",
+                "pioneer-gateway-windows-x86_64-computer-use-package.zip",
+            ),
+            (
+                "windows",
+                "aarch64",
+                "pioneer-gateway-windows-aarch64.zip",
+                "pioneer-gateway-windows-aarch64-computer-use-package.zip",
+            ),
+        ] {
+            assert_eq!(
+                super::gateway_asset_file_name_for(os, arch, false).unwrap(),
+                server
+            );
+            assert_eq!(
+                super::gateway_asset_file_name_for(os, arch, true).unwrap(),
+                computer_use
+            );
+        }
+        assert_eq!(
+            super::gateway_asset_file_name().unwrap(),
+            super::gateway_asset_file_name_for(
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                cfg!(feature = "computer-use")
+            )
+            .unwrap()
         );
+    }
+
+    #[test]
+    fn server_zip_admission_needs_no_daemon_but_rejects_cu_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let gzip = temp.path().join("gateway.gz");
+        let mut encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&gzip).unwrap(),
+            flate2::Compression::default(),
+        );
+        encoder.write_all(b"server gzip executable").unwrap();
+        encoder.finish().unwrap();
+        let candidate = temp.path().join("gzip-candidate");
+        let result = super::unpack_asset_to_binary(&gzip, &candidate);
+        if !cfg!(feature = "computer-use")
+            && !cfg!(windows)
+            && !cfg!(all(target_os = "macos", target_arch = "x86_64"))
+        {
+            result.unwrap();
+            assert_eq!(fs::read(&candidate).unwrap(), b"server gzip executable");
+        } else {
+            assert!(result.unwrap_err().to_string().contains("format"));
+        }
+        let wrong_format = temp.path().join("gateway.tar");
+        fs::copy(&gzip, &wrong_format).unwrap();
+        assert!(
+            super::unpack_asset_to_binary(&wrong_format, &candidate)
+                .unwrap_err()
+                .to_string()
+                .contains("format")
+        );
+        if cfg!(feature = "computer-use") {
+            return;
+        }
+        for with_cua in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let asset = temp.path().join("gateway.zip");
+            let mut zip = zip::ZipWriter::new(fs::File::create(&asset).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file(
+                if cfg!(windows) {
+                    "pioneer.exe"
+                } else {
+                    "pioneer"
+                },
+                options,
+            )
+            .unwrap();
+            zip.write_all(b"server executable fixture").unwrap();
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            {
+                zip.start_file("libonnxruntime.dylib", options).unwrap();
+                zip.write_all(b"existing Intel companion").unwrap();
+            }
+            if with_cua {
+                zip.start_file("cua/manifest.json", options).unwrap();
+                zip.write_all(b"{}").unwrap();
+            }
+            zip.finish().unwrap();
+            let candidate = temp.path().join("candidate");
+            let result = super::unpack_asset_to_binary(&asset, &candidate);
+            if with_cua {
+                assert!(result.unwrap_err().to_string().contains("server archive"));
+            } else {
+                result.unwrap();
+                assert_eq!(fs::read(&candidate).unwrap(), b"server executable fixture");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "computer-use"))]
+    fn server_transition_retires_cu_app_and_preserves_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        super::activate_install_companions(directory).unwrap();
+        assert!(!directory.join("cua").exists());
+        assert!(!directory.join("cua.rollback").exists());
+        fs::create_dir_all(directory.join("cua/Pioneer Gateway.app")).unwrap();
+        fs::write(directory.join("cua/prior-daemon"), b"prior").unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            fs::write(
+                directory.join("libonnxruntime.dylib"),
+                b"prior Intel library",
+            )
+            .unwrap();
+            fs::create_dir_all(directory.join("cua.next/bootstrap-libs")).unwrap();
+            fs::write(
+                directory.join("cua.next/bootstrap-libs/libonnxruntime.dylib"),
+                b"server Intel library",
+            )
+            .unwrap();
+        }
+        super::activate_install_companions(directory).unwrap();
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            fs::read(directory.join("libonnxruntime.dylib")).unwrap(),
+            b"server Intel library"
+        );
+        assert!(!directory.join("cua/Pioneer Gateway.app").exists());
+        assert!(!directory.join("cua/prior-daemon").exists());
+        super::restore_cua_payload(directory).unwrap();
+        assert_eq!(
+            fs::read(directory.join("cua/prior-daemon")).unwrap(),
+            b"prior"
+        );
+        assert!(directory.join("cua/Pioneer Gateway.app").is_dir());
+        assert!(directory.join("cua.rollback/prior-daemon").is_file());
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                fs::read(directory.join("libonnxruntime.dylib")).unwrap(),
+                b"prior Intel library"
+            );
+            assert_eq!(
+                fs::read(directory.join("cua.rollback/bootstrap-libs/libonnxruntime.dylib"))
+                    .unwrap(),
+                b"prior Intel library"
+            );
+        }
     }
 
     #[test]
@@ -2125,14 +3547,14 @@ mod tests {
             release(
                 "0.53.11",
                 false,
-                &["pioneer-gateway-linux-x86_64.gz", "SHA256SUMS"],
+                &["pioneer-gateway-linux-x86_64.zip", "SHA256SUMS"],
             ),
         ];
 
         let selected = select_ready_release_tag(
             ReleaseChannel::Stable,
             releases.iter(),
-            "pioneer-gateway-linux-x86_64.gz",
+            "pioneer-gateway-linux-x86_64.zip",
         )
         .expect("previous complete stable release should be selected");
 
@@ -2144,13 +3566,13 @@ mod tests {
         let releases = vec![release(
             "0.53.12",
             false,
-            &["pioneer-gateway-linux-x86_64.gz"],
+            &["pioneer-gateway-linux-x86_64.zip"],
         )];
 
         let error = select_ready_release_tag(
             ReleaseChannel::Stable,
             releases.iter(),
-            "pioneer-gateway-linux-x86_64.gz",
+            "pioneer-gateway-linux-x86_64.zip",
         )
         .expect_err("release without checksums must remain unavailable");
 
@@ -2163,19 +3585,19 @@ mod tests {
             release(
                 "0.54.0-beta.1",
                 true,
-                &["pioneer-gateway-linux-x86_64.gz", "SHA256SUMS"],
+                &["pioneer-gateway-linux-x86_64.zip", "SHA256SUMS"],
             ),
             release(
                 "0.53.12",
                 false,
-                &["pioneer-gateway-linux-x86_64.gz", "SHA256SUMS"],
+                &["pioneer-gateway-linux-x86_64.zip", "SHA256SUMS"],
             ),
         ];
 
         let selected = select_ready_release_tag(
             ReleaseChannel::Stable,
             releases.iter(),
-            "pioneer-gateway-linux-x86_64.gz",
+            "pioneer-gateway-linux-x86_64.zip",
         )
         .expect("stable release should be selected");
 
@@ -2673,6 +4095,38 @@ fi
             );
             read += received;
         }
+    }
+
+    #[test]
+    fn candidate_must_know_every_applied_migration_without_version_ordering() {
+        let applied = vec!["migration_new".to_owned()];
+        let old_candidate = vec!["migration_old".to_owned()];
+        assert!(super::ensure_candidate_schema_compatible(&applied, Some(&old_candidate)).is_err());
+        let compatible = vec![
+            "migration_old".to_owned(),
+            "migration_new".to_owned(),
+            "migration_future".to_owned(),
+        ];
+        super::ensure_candidate_schema_compatible(&applied, Some(&compatible)).unwrap();
+        assert!(super::ensure_candidate_schema_compatible(&applied, None).is_err());
+        assert!(super::ensure_candidate_schema_compatible(&applied, Some(&[])).is_err());
+        assert!(
+            super::ensure_candidate_schema_compatible(
+                &applied,
+                Some(&["migration_new".into(), "migration_new".into()])
+            )
+            .is_err()
+        );
+        // Legacy version JSON parses, but cannot supply compatibility proof.
+        let legacy: super::VersionOutput =
+            serde_json::from_str(r#"{"version":"999.0.0"}"#).unwrap();
+        assert!(
+            super::ensure_candidate_schema_compatible(
+                &applied,
+                legacy.compiled_database_migrations.as_deref()
+            )
+            .is_err()
+        );
     }
 
     fn http_response(status: u16, reason: &str, body: &[u8]) -> Vec<u8> {

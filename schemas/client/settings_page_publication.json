@@ -47,6 +47,9 @@
     "input_reset_generation"
   ],
   "$defs": {
+    "GatewayBaseUrl": {
+      "type": "string"
+    },
     "GatewayGeneralSettings": {
       "type": "object",
       "properties": {
@@ -301,6 +304,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "public_base_url": {
+          "description": "Present only for the currently authenticated relay connection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayBaseUrl"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "state": {
@@ -572,6 +586,7 @@
       "enum": [
         "openai",
         "openrouter",
+        "vercel-ai-gateway",
         "local"
       ]
     },

@@ -409,7 +409,7 @@ impl GatewayHttpSession {
             .map_err(map_authority_error)?;
         self.validate_access(&access)?;
         if access.access_expires_at_unix <= now_unix()? {
-            access = self.refresh_access(access.generation).await?;
+            access = self.refresh_access(&access).await?;
         }
 
         let first = self
@@ -420,7 +420,7 @@ impl GatewayHttpSession {
         }
         drop(first);
 
-        let refreshed = self.refresh_access(access.generation).await?;
+        let refreshed = self.refresh_access(&access).await?;
         let retry = self
             .execute_once(&request, &refreshed, cancellation)
             .await?;
@@ -429,7 +429,7 @@ impl GatewayHttpSession {
 
     async fn refresh_access(
         &self,
-        rejected_generation: u64,
+        rejected: &GatewayHttpAccess,
     ) -> Result<GatewayHttpAccess, GatewayHttpError> {
         let current = self
             .authority
@@ -437,13 +437,15 @@ impl GatewayHttpSession {
             .await
             .map_err(map_authority_error)?;
         self.validate_access(&current)?;
-        if current.generation != rejected_generation && current.access_expires_at_unix > now_unix()?
+        if (current.generation != rejected.generation
+            || current.access_token != rejected.access_token)
+            && current.access_expires_at_unix > now_unix()?
         {
             return Ok(current);
         }
         let refreshed = self
             .authority
-            .coordinated_refresh(rejected_generation)
+            .coordinated_refresh(rejected.generation)
             .await
             .map_err(map_authority_error)?;
         self.validate_access(&refreshed)?;
@@ -913,6 +915,15 @@ mod tests {
             requests[1].access_token.expose_secret(),
             "fresh-access-secret"
         );
+        // A WebSocket renewal changes access without changing the physical ID.
+        let rejected = access();
+        authority.access.lock().await.generation = rejected.generation;
+        let renewed = session(authority.clone(), executor.clone())
+            .refresh_access(&rejected)
+            .await
+            .unwrap();
+        assert_eq!(renewed.generation, rejected.generation);
+        assert_eq!(authority.refreshes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

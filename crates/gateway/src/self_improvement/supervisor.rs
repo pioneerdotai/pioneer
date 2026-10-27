@@ -1073,7 +1073,8 @@ impl SelfImprovementSupervisor {
             run.workspace_id.as_str(),
             &default_model,
             Some(&reviewer_model),
-        );
+        )
+        .with_usage_store(self.maintenance_store.as_ref(), run.id.as_str());
 
         while !analysis.is_complete() {
             if !wake_budget.can_start_chunk() {
@@ -1963,6 +1964,7 @@ mod tests {
                 bail!("learning response script exhausted");
             };
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text,
                 usage: None,
                 reasoning_content: None,
@@ -2008,6 +2010,7 @@ mod tests {
                 bail!("workspace-scoped provider failure");
             }
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: serde_json::json!({
                     "digestRevision": 1,
                     "observations": []
@@ -2074,6 +2077,7 @@ mod tests {
             self.started.notify_one();
             self.release.notified().await;
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: serde_json::json!({
                     "digestRevision": 1,
                     "observations": []
@@ -2120,6 +2124,7 @@ mod tests {
                 .push(request);
             if is_preflight {
                 return Ok(ChatResponse {
+                    messages: Vec::new(),
                     text: r#"{"tools":{"visibleTools":[]}}"#.to_owned(),
                     usage: None,
                     reasoning_content: None,
@@ -2132,6 +2137,7 @@ mod tests {
                 self.started.notify_one();
                 self.release.notified().await;
                 return Ok(ChatResponse {
+                    messages: Vec::new(),
                     text: String::new(),
                     usage: None,
                     reasoning_content: None,
@@ -2145,6 +2151,7 @@ mod tests {
                 });
             }
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "The pinned learned procedure was read.".to_owned(),
                 usage: None,
                 reasoning_content: None,
@@ -2218,6 +2225,7 @@ mod tests {
                 .push(request);
             if is_preflight {
                 return Ok(ChatResponse {
+                    messages: Vec::new(),
                     text: r#"{"tools":{"visibleTools":[]}}"#.to_owned(),
                     usage: None,
                     reasoning_content: None,
@@ -2228,6 +2236,7 @@ mod tests {
             }
             if self.round.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Ok(ChatResponse {
+                    messages: Vec::new(),
                     text: String::new(),
                     usage: None,
                     reasoning_content: None,
@@ -2241,6 +2250,7 @@ mod tests {
                 });
             }
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "The learned procedure was read.".to_owned(),
                 usage: None,
                 reasoning_content: None,

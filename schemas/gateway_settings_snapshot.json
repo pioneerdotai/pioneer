@@ -24,6 +24,15 @@
             "id": "claude",
             "kind": "claude",
             "nickname": "claude"
+          },
+          {
+            "binary_path": "opencode",
+            "display_name": "OpenCode",
+            "enabled": true,
+            "home_path": "~/.config/opencode",
+            "id": "opencode",
+            "kind": "opencode",
+            "nickname": "opencode"
           }
         ]
       }
@@ -129,8 +138,12 @@
       "type": "string",
       "enum": [
         "codex",
-        "claude"
+        "claude",
+        "opencode"
       ]
+    },
+    "GatewayBaseUrl": {
+      "type": "string"
     },
     "GatewayCliRuntimeInstanceSettings": {
       "type": "object",
@@ -453,6 +466,17 @@
             "null"
           ]
         },
+        "public_base_url": {
+          "description": "Present only for the currently authenticated relay connection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayBaseUrl"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "state": {
           "$ref": "#/$defs/GatewayRemoteAccessState",
           "default": "disabled"
@@ -722,6 +746,7 @@
       "enum": [
         "openai",
         "openrouter",
+        "vercel-ai-gateway",
         "local"
       ]
     },
@@ -924,7 +949,8 @@
       "enum": [
         "api",
         "codex",
-        "claude"
+        "claude",
+        "opencode"
       ]
     },
     "SelfImprovementPhase": {

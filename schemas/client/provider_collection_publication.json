@@ -9,6 +9,12 @@
         "$ref": "#/$defs/ProviderDefinition"
       }
     },
+    "failure": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "key": {
       "$ref": "#/$defs/ProviderCollectionKey"
     },
@@ -126,16 +132,16 @@
         "name": {
           "type": "string"
         },
-        "supports_base_url_override": {
-          "type": "boolean",
-          "default": false
-        },
         "retirement_reason": {
           "description": "Terminal product lifecycle diagnostic; old clients can ignore it.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "supports_base_url_override": {
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [

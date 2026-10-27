@@ -683,6 +683,7 @@ mod tests {
         let turn_id = "turn_final_agent_message";
 
         thread::ActiveModel {
+            workspace_unread_started_at: sea_orm::NotSet,
             id: Set(thread_id.to_owned()),
             workspace_id: Set(DEFAULT_WORKSPACE_ID.to_owned()),
             name: Set(Some("final message repair".to_owned())),

@@ -52,6 +52,20 @@ pub enum ThreadComposerExecutionMode {
     ForegroundTurn,
 }
 
+impl ThreadComposerExecutionMode {
+    /// Only a user-authored Conversation is Composer admission. Agent child
+    /// Conversations and TaskRun occurrences retain their own execution.
+    pub fn is_detached_admission(self, turn: &Turn) -> bool {
+        self == Self::DetachedTask
+            && turn.turn_kind == crate::TurnKind::Conversation
+            && turn.origin == crate::TurnOrigin::User
+            && matches!(
+                turn.author.as_ref().map(|author| &author.actor),
+                Some(crate::PersistedActorRef::Principal(_))
+            )
+    }
+}
+
 impl ThreadOriginKind {
     pub const fn user() -> Self {
         Self::User
@@ -206,6 +220,9 @@ pub struct ThreadParticipantsChangedNotification {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ThreadTreeResponse {
+    /// Authorized visible threads with at least one Starting or Running TaskRun.
+    #[serde(default)]
+    pub running_task_thread_ids: Vec<String>,
     pub workspace_id: String,
     #[serde(default)]
     pub threads: Vec<Thread>,
@@ -217,6 +234,20 @@ pub struct ThreadTreeResponse {
     pub placements: Vec<ThreadPlacement>,
     #[serde(default)]
     pub agents_docs: Vec<ThreadAgentsDocSummary>,
+}
+
+impl ThreadTreeResponse {
+    /// Normalize only the directory boundary. Canonical Thread/get and stored
+    /// messages retain their full preview. Unnamed previews remain intact for
+    /// fallback titles (including name clearing) and first-message/draft flows.
+    pub fn into_directory_summary(mut self) -> Self {
+        self.threads = self
+            .threads
+            .into_iter()
+            .map(Thread::into_directory_summary)
+            .collect();
+        self
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -589,6 +620,33 @@ pub struct Thread {
     pub turns: Vec<Turn>,
 }
 
+impl Thread {
+    /// Directory metadata is also used for Composer defaults: preserve every
+    /// field and the latest turn marker. Named rows only need a short preview;
+    /// keep an exact Unicode prefix so normalization is idempotent.
+    pub fn into_directory_summary(mut self) -> Self {
+        if self
+            .name
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty())
+        {
+            if let Some((end, _)) = self.preview.char_indices().nth(160) {
+                let prefix = &self.preview[..end];
+                // First-message admission also uses trim().is_empty(). A long
+                // whitespace prefix must not turn an existing message into an
+                // empty draft. Keep that exceptional preview intact.
+                if !prefix.trim().is_empty() || self.preview.trim().is_empty() {
+                    // Release the original large buffer in retained summaries.
+                    // Canonical owners are untouched.
+                    self.preview = prefix.to_owned();
+                }
+            }
+        }
+        self.turns = self.turns.into_iter().next_back().into_iter().collect();
+        self
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadStatus {
     Active,
@@ -705,8 +763,10 @@ mod tests {
         }))
         .expect("thread tree response should decode without agents_docs");
         assert!(decoded.agents_docs.is_empty());
+        assert!(decoded.running_task_thread_ids.is_empty());
 
         let encoded = serde_json::to_value(ThreadTreeResponse {
+            running_task_thread_ids: Vec::new(),
             workspace_id: "ws_123".to_owned(),
             threads: Vec::new(),
             unread: Vec::new(),

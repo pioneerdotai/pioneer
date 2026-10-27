@@ -729,6 +729,7 @@ mod tests {
         Migrator::up(&database, None).await.unwrap();
         let now = chrono::Utc::now().fixed_offset();
         gateway_identity::ActiveModel {
+            unread_started_at: sea_orm::NotSet,
             id: Set(GATEWAY_ID.to_owned()),
             singleton_key: Set(1),
             identity_bootstrap_version: Set(1),
@@ -753,6 +754,7 @@ mod tests {
             updated_at: Set(now),
             removed_at: Set(None),
             authorization_guard: Set(1),
+            ..Default::default()
         }
         .insert(&database)
         .await
@@ -771,6 +773,7 @@ mod tests {
                 updated_at: Set(now),
                 removed_at: Set(None),
                 authorization_guard: Set(1),
+                ..Default::default()
             }
             .insert(&database)
             .await
@@ -788,6 +791,7 @@ mod tests {
         .await
         .unwrap();
         thread::ActiveModel {
+            workspace_unread_started_at: sea_orm::NotSet,
             id: Set(THREAD_ID.to_owned()),
             workspace_id: Set(WORKSPACE_ID.to_owned()),
             name: Set(Some("Private legacy thread".to_owned())),
@@ -808,6 +812,7 @@ mod tests {
             updated_at: Set(now),
             created_by_actor_id: Set(Some(SUPERUSER_ID.to_owned())),
             created_by_actor_kind: Set(Some("principal".to_owned())),
+            ..Default::default()
         }
         .insert(&database)
         .await
@@ -860,6 +865,7 @@ mod tests {
             added_by_actor_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         }
         .insert(&database)
         .await
@@ -892,6 +898,7 @@ mod tests {
             granted_by_actor_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         }
         .insert(&database)
         .await
@@ -903,6 +910,7 @@ mod tests {
             added_by_actor_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         }
         .insert(&database)
         .await

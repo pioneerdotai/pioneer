@@ -575,7 +575,7 @@ impl Drop for DesktopMemberAvatarState {
 pub(crate) struct ThreadAvatarClient {
     client: Arc<pioneer_client::core::ClientCore>,
     service: pioneer_client::avatars::AvatarCacheService,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: Arc<pioneer_observability::runtime::ObservedRuntime>,
 }
 impl ThreadAvatarClient {
     pub(crate) fn new(
@@ -583,8 +583,10 @@ impl ThreadAvatarClient {
         runtime_home: PathBuf,
     ) -> Result<Self, AvatarCacheError> {
         let service = client.avatar_cache_service(runtime_home)?;
-        let runtime =
-            Arc::new(tokio::runtime::Runtime::new().map_err(|_| AvatarCacheError::Offline)?);
+        let runtime = Arc::new(pioneer_observability::runtime::ObservedRuntime::new(
+            tokio::runtime::Runtime::new().map_err(|_| AvatarCacheError::Offline)?,
+            pioneer_observability::runtime::RuntimeRole::DesktopHelper,
+        ));
         Ok(Self {
             client,
             service,

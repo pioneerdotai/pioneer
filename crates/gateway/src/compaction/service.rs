@@ -22,14 +22,16 @@ use std::{sync::Arc, time::Duration};
 
 pub(super) async fn make_summarizer(
     providers: &ProviderRegistry,
+    store: &pioneer_crud::CrudStore,
     processor: Option<&crate::message::MessageProcessor>,
     workspace: &str,
     selection: ModelSelection,
 ) -> Result<Arc<dyn Summarizer>> {
     if selection.transport == Transport::Api {
         let provider = providers.get_or_create_for_workspace(workspace, &selection.instance)?;
-        let limits =
-            pioneer_provider::catalog::model_catalog()?.limits(provider.name(), &selection.model);
+        let provider =
+            crate::usage_journal::observe(provider, store, workspace, "summary", workspace);
+        let limits = provider.model_limits(&selection.model).await?;
         return Ok(Arc::new(NativeSummarizer::new(
             provider,
             selection,
@@ -50,10 +52,14 @@ pub(super) async fn make_summarizer(
     let proxy = processor
         .prepare_cli_runtime_proxy_url(workspace, &instance.id)
         .await?;
+    let opencode_data_home = (selection.transport == Transport::OpenCode)
+        .then(|| processor.opencode_managed_data_home(&instance));
     make_cli_summarizer(
         instance,
         selection,
         crate::cli_runtime::config::proxy_env(proxy.as_deref()),
+        Some((store.clone(), workspace.into())),
+        opencode_data_home,
     )
 }
 
@@ -61,6 +67,8 @@ fn make_cli_summarizer(
     instance: pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig,
     selection: ModelSelection,
     environment: pioneer_cli_agent_runtime::process::SensitiveEnvironment,
+    usage_scope: Option<(pioneer_crud::CrudStore, String)>,
+    opencode_data_home: Option<std::path::PathBuf>,
 ) -> Result<Arc<dyn Summarizer>> {
     ensure!(
         instance.id == selection.instance,
@@ -73,6 +81,7 @@ fn make_cli_summarizer(
     let kind = match instance.kind {
         GatewayCliAgentRuntimeKindConfig::Codex => Transport::Codex,
         GatewayCliAgentRuntimeKindConfig::Claude => Transport::Claude,
+        GatewayCliAgentRuntimeKindConfig::OpenCode => Transport::OpenCode,
     };
     ensure!(
         kind == selection.transport,
@@ -95,10 +104,31 @@ fn make_cli_summarizer(
             })),
             "anthropic",
         ),
+        Transport::OpenCode => (
+            CliService::OpenCode(
+                crate::cli_runtime::opencode_session::OpenCodeSummaryService::new(
+                    instance,
+                    environment,
+                    opencode_data_home.ok_or_else(|| {
+                        anyhow::anyhow!("OpenCode V2 summary data home is unavailable")
+                    })?,
+                ),
+            ),
+            "opencode",
+        ),
         Transport::Api => unreachable!(),
     };
-    let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog, &selection.model);
+    let (catalog, catalog_model) = if kind == Transport::OpenCode {
+        selection
+            .model
+            .split_once('/')
+            .unwrap_or((catalog, &selection.model))
+    } else {
+        (catalog, selection.model.as_str())
+    };
+    let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog, catalog_model);
     Ok(Arc::new(CliSummarizer {
+        usage_scope,
         selection,
         service,
         budget: ModelBudget::new(
@@ -112,8 +142,10 @@ fn make_cli_summarizer(
 enum CliService {
     Codex(CodexService),
     Claude(ClaudeService),
+    OpenCode(crate::cli_runtime::opencode_session::OpenCodeSummaryService),
 }
 struct CliSummarizer {
+    usage_scope: Option<(pioneer_crud::CrudStore, String)>,
     selection: ModelSelection,
     budget: ModelBudget,
     service: CliService,
@@ -297,7 +329,43 @@ impl Summarizer for CliSummarizer {
         // Runner owns the tighter remaining operation/attempt deadline and drops
         // this call on Stop. The service retains its owner for awaitable cleanup.
         let timeout = Duration::from_millis(pioneer_compaction::ATTEMPT_MILLIS);
-        let (text, input_tokens, output_tokens) = match &self.service {
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some(
+                match self.selection.transport {
+                    Transport::Codex => "codex-cli",
+                    Transport::OpenCode => "opencode-cli",
+                    _ => "claude-cli",
+                }
+                .into(),
+            ),
+            model: Some(request.selection.model.clone()),
+            api: Some(
+                match self.selection.transport {
+                    Transport::Codex => "codex_exec_json",
+                    Transport::OpenCode => "opencode_http",
+                    _ => "claude_print_json",
+                }
+                .into(),
+            ),
+            ..Default::default()
+        };
+        let call = if let Some((store, workspace)) = &self.usage_scope {
+            Some(
+                crate::usage_journal::Call::start(
+                    store, workspace, "summary", workspace, &observed,
+                )
+                .await
+                .map_err(failure)?,
+            )
+        } else {
+            None
+        };
+        let completion = async {
+        let (text, input_tokens, output_tokens, raw) = match &self.service {
+            CliService::OpenCode(service) => service.summarize(request.selection.model, request.selection.effort, INSTRUCTIONS, input, timeout).await.map_err(|error| {
+                if let Some(usage)=error.downcast_ref::<pioneer_cli_agent_runtime::service::ObservedServiceUsage>() { apply_cli_usage(&mut observed,&usage.0); }
+                failure(error)
+            })?,
             CliService::Codex(service) => {
                 let result = service
                     .summarize(
@@ -310,8 +378,11 @@ impl Summarizer for CliSummarizer {
                         timeout,
                     )
                     .await
-                    .map_err(failure)?;
-                (result.text, result.input_tokens, result.output_tokens)
+                    .map_err(|error| {
+                        if let Some(usage)=error.downcast_ref::<pioneer_cli_agent_runtime::service::ObservedServiceUsage>() { apply_cli_usage(&mut observed,&usage.0); }
+                        failure(error)
+                    })?;
+                (result.text, result.input_tokens, result.output_tokens, result.observed_usage)
             }
             CliService::Claude(service) => {
                 let result = service
@@ -326,28 +397,233 @@ impl Summarizer for CliSummarizer {
                         timeout,
                     )
                     .await
-                    .map_err(failure)?;
-                (result.text, result.input_tokens, result.output_tokens)
+                    .map_err(|error| {
+                        if let Some(usage)=error.downcast_ref::<pioneer_cli_agent_runtime::service::ObservedServiceUsage>() { apply_cli_usage(&mut observed,&usage.0); }
+                        failure(error)
+                    })?;
+                (result.text, result.input_tokens, result.output_tokens, result.observed_usage)
             }
         };
-        Ok(SummaryCompletion {
-            text,
-            kind: CompletionKind::Complete,
-            input_tokens,
-            output_tokens,
-        })
+        Ok(finish_cli_summary(&mut observed, text, input_tokens, output_tokens, &raw))
+        }.await;
+        if let Some(call) = call {
+            call.record(
+                if completion.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                &observed,
+            )
+            .await
+            .map_err(failure)?;
+        }
+        completion
     }
     async fn cleanup(&self) -> Result<(), SummaryFailure> {
         match &self.service {
             CliService::Codex(service) => service.cleanup().await,
             CliService::Claude(service) => service.cleanup().await,
+            CliService::OpenCode(service) => service.cleanup().await,
         }
         .map_err(failure)
     }
 }
 
+// OpenCode supplies normalized Pioneer totals and the exclusive native
+// breakdown together. Keep SummaryCompletion and the journal on that boundary.
+pub(crate) fn finish_cli_summary(
+    observed: &mut pioneer_provider::TokenUsage,
+    text: String,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    raw: &serde_json::Value,
+) -> SummaryCompletion {
+    apply_cli_usage(observed, raw);
+    if observed.provider.as_deref() != Some("opencode-cli") {
+        observed.input_tokens = input_tokens;
+        observed.output_tokens = output_tokens;
+    }
+    SummaryCompletion {
+        text,
+        kind: CompletionKind::Complete,
+        input_tokens: observed.input_tokens,
+        output_tokens: observed.output_tokens,
+    }
+}
+
+pub(crate) fn apply_cli_usage(
+    observed: &mut pioneer_provider::TokenUsage,
+    raw: &serde_json::Value,
+) {
+    let opencode = observed.provider.as_deref() == Some("opencode-cli");
+    observed.uncached_input_tokens = if opencode {
+        raw["uncached_input_tokens"].as_u64()
+    } else {
+        raw["input_tokens"].as_u64()
+    };
+    observed.cache_read_input_tokens = raw["cache_read_input_tokens"]
+        .as_u64()
+        .or_else(|| raw["cached_input_tokens"].as_u64());
+    observed.cache_write_input_tokens = raw["cache_creation_input_tokens"].as_u64();
+    let claude = observed.provider.as_deref() == Some("claude-cli");
+    observed.input_tokens = if claude {
+        observed.uncached_input_tokens.and_then(|input| {
+            input
+                .checked_add(observed.cache_read_input_tokens.unwrap_or(0))?
+                .checked_add(observed.cache_write_input_tokens.unwrap_or(0))
+        })
+    } else {
+        raw["input_tokens"].as_u64()
+    };
+    if !claude && !opencode {
+        observed.uncached_input_tokens = None;
+    }
+    observed.output_tokens = raw["output_tokens"].as_u64();
+    // Native Codex reasoning is already included in output. Prefer the valid
+    // documented name, including zero; retain a valid legacy alias separately.
+    // Claude/other profiles do not acquire Codex field semantics.
+    let codex_reasoning = (observed.provider.as_deref() == Some("codex-cli"))
+        .then(|| raw["reasoning_output_tokens"].as_u64())
+        .flatten();
+    observed.reasoning_tokens = codex_reasoning.or_else(|| raw["reasoning_tokens"].as_u64());
+    observed.semantics = Some(
+        if opencode {
+            "opencode_v2_exclusive_cache_separate_reasoning"
+        } else if claude {
+            "exclusive_cache"
+        } else {
+            "cli_native"
+        }
+        .into(),
+    );
+    observed.accounting = Some(
+        serde_json::json!({"reported_cost":null,"sdk_estimated_cost":raw["total_cost_usd"].as_f64().filter(|_|claude).map(|amount|serde_json::json!({"amount":amount,"currency":"USD","provenance":"cli_sdk_price_table_estimate","source":"https://code.claude.com/docs/en/agent-sdk/cost-tracking","scope":"isolated_cli_summary_result","sdk_version":null})),"estimated_cost":null,"price_status":"external_cli_route_not_attested"}),
+    );
+    if observed.provider.as_deref() == Some("codex-cli") {
+        let accounting = observed.accounting.as_mut().unwrap();
+        accounting["reasoning_source"] = if codex_reasoning.is_some() {
+            serde_json::json!("codex_exec.usage.reasoning_output_tokens")
+        } else if observed.reasoning_tokens.is_some() {
+            serde_json::json!("codex_exec.usage.reasoning_tokens")
+        } else {
+            serde_json::Value::Null
+        };
+        accounting["reasoning_alias_conflict"] =
+            match (codex_reasoning, raw["reasoning_tokens"].as_u64()) {
+                (Some(native), Some(legacy)) => serde_json::json!(native != legacy),
+                _ => serde_json::Value::Null,
+            };
+    }
+    observed.raw_usage = Some(raw.clone());
+}
+
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn nonzero_terminal_usage_preserves_gateway_failure_contract() {
+        use pioneer_cli_agent_runtime::{
+            claude::service::ensure_process_outcome, codex::service::decode_exec_outcome,
+        };
+        let transcript = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"SECRET_SESSION\"}\n",
+            "{\"type\":\"turn.started\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"SECRET_SUMMARY\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":13,\"reasoning_output_tokens\":7}}\n"
+        );
+        let error = decode_exec_outcome(transcript.as_bytes(), false)
+            .err()
+            .unwrap();
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("codex-cli".into()),
+            ..Default::default()
+        };
+        super::apply_cli_usage(
+            &mut observed,
+            &error
+                .downcast_ref::<pioneer_cli_agent_runtime::service::ObservedServiceUsage>()
+                .unwrap()
+                .0,
+        );
+        let after = super::failure(error);
+        let before = super::failure(anyhow::anyhow!("Codex service process failed"));
+        assert_eq!(after.kind, before.kind);
+        assert_eq!(after.code, before.code);
+        assert_eq!(after.retry_after_ms, before.retry_after_ms);
+        let diagnostic = after.diagnostic.unwrap();
+        assert_eq!(diagnostic.stage, before.diagnostic.as_ref().unwrap().stage);
+        assert_eq!(diagnostic.code, "cli_process_failed");
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .unwrap()
+                .contains("SECRET")
+        );
+        assert_eq!(observed.output_tokens, Some(13));
+        assert_eq!(observed.reasoning_tokens, Some(7));
+        let terminal = serde_json::json!({"type":"result","error":{"type":"rate_limit_error","message":"SECRET"},"retry_after_ms":3000,"usage":{"input_tokens":10,"output_tokens":0},"total_cost_usd":0.2});
+        let error = ensure_process_outcome(terminal.to_string().as_bytes(), false)
+            .err()
+            .unwrap();
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        super::apply_cli_usage(
+            &mut observed,
+            &error
+                .downcast_ref::<pioneer_cli_agent_runtime::service::ObservedServiceUsage>()
+                .unwrap()
+                .0,
+        );
+        let after = super::failure(error);
+        let before = super::failure(
+            pioneer_cli_agent_runtime::service::ServiceFailure {
+                class: pioneer_protocol::ProviderFailureClass::RateLimit,
+                retry_after_ms: Some(3000),
+            }
+            .into(),
+        );
+        assert_eq!(after.kind, before.kind);
+        assert_eq!(after.code, before.code);
+        assert_eq!(after.retry_after_ms, Some(3000));
+        assert_eq!(
+            after.diagnostic.as_ref().unwrap().stage,
+            before.diagnostic.as_ref().unwrap().stage
+        );
+        assert_eq!(
+            after.diagnostic.as_ref().unwrap().code,
+            before.diagnostic.as_ref().unwrap().code
+        );
+        assert!(
+            !serde_json::to_string(&after.diagnostic.unwrap())
+                .unwrap()
+                .contains("SECRET")
+        );
+        assert_eq!(observed.output_tokens, Some(0));
+        assert_eq!(
+            observed.accounting.unwrap()["sdk_estimated_cost"]["amount"],
+            0.2
+        );
+    }
+
+    #[test]
+    fn cli_sdk_estimate_and_partial_error_counts_are_not_provider_billing() {
+        let mut usage = pioneer_provider::TokenUsage {
+            provider: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        super::apply_cli_usage(
+            &mut usage,
+            &serde_json::json!({"input_tokens":10,"cache_read_input_tokens":20,"output_tokens":0,"total_cost_usd":0.02}),
+        );
+        assert_eq!(usage.input_tokens, Some(30));
+        assert_eq!(usage.cache_write_input_tokens, None);
+        assert!(usage.accounting.as_ref().unwrap()["reported_cost"].is_null());
+        assert_eq!(
+            usage.accounting.as_ref().unwrap()["sdk_estimated_cost"]["provenance"],
+            "cli_sdk_price_table_estimate"
+        );
+    }
     use super::*;
     use pioneer_cli_agent_runtime::process::SensitiveEnvironment;
     use pioneer_compaction::{
@@ -414,6 +690,7 @@ mod tests {
             effort: None,
         };
         let summarizer = CliSummarizer {
+            usage_scope: None,
             selection: selection.clone(),
             budget: ModelBudget::new(Some(128_000), None, None),
             service: CliService::Claude(ClaudeService::new(ClaudeServiceConfig {
@@ -506,6 +783,8 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
             instance.clone(),
             selection.clone(),
             SensitiveEnvironment::new(),
+            None,
+            None,
         )
         .unwrap();
         let request = SummaryRequest {
@@ -539,6 +818,8 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
         );
         let mut wrong = selection;
         wrong.transport = Transport::Codex;
-        assert!(make_cli_summarizer(instance, wrong, SensitiveEnvironment::new()).is_err());
+        assert!(
+            make_cli_summarizer(instance, wrong, SensitiveEnvironment::new(), None, None).is_err()
+        );
     }
 }

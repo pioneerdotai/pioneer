@@ -1,10 +1,8 @@
 //! Model-facing agent tools.
 //!
-//! The model is allowed to select only opaque, server-projected identities and
-//! execution profiles.  The values in this module deliberately do not contain
-//! actor references, provider configuration, credentials, host paths, or
-//! runtime session identifiers.  Adapters turn these typed inputs into the
-//! canonical [`AgentActionIntent`] after binding the current execution.
+//! The model selects admitted identities and either exact profiles or catalog
+//! provider/model IDs. The server resolves those choices to immutable execution
+//! facts. Credentials, host paths and runtime sessions never enter this surface.
 
 use crate::{
     AgentAuthoredInput, AgentExecutionProfileBackend, AgentExecutionProfileId,
@@ -25,6 +23,8 @@ use std::collections::BTreeSet;
 pub enum AgentModelToolName {
     #[serde(rename = "threads_start_options", alias = "agent_start_options")]
     AgentStartOptions,
+    #[serde(rename = "threads_identity_models_list")]
+    IdentityModelsList,
     SendMessage,
     CreateThread,
     #[serde(rename = "threads_turn_start", alias = "start_agent")]
@@ -41,6 +41,7 @@ impl AgentModelToolName {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AgentStartOptions => "threads_start_options",
+            Self::IdentityModelsList => "threads_identity_models_list",
             Self::SendMessage => "thread_message_send",
             Self::CreateThread => "thread_create",
             Self::StartAgent => "threads_turn_start",
@@ -127,11 +128,117 @@ pub struct AgentToolOptionsProjection {
     pub generation_fingerprint: String,
 }
 
-/// Read-only options lookup takes no model-controlled selector.  Target and
-/// execution context come exclusively from the execution-bound provider.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Read-only catalog pagination. Target and execution context are server-owned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AgentStartOptionsToolInput {}
+pub struct AgentStartOptionsToolInput {
+    #[serde(default = "default_catalog_page_limit")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: u32,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+fn default_catalog_page_limit() -> u32 {
+    100
+}
+impl Default for AgentStartOptionsToolInput {
+    fn default() -> Self {
+        Self {
+            limit: default_catalog_page_limit(),
+            cursor: None,
+        }
+    }
+}
+
+/// Model discovery is scoped to an identity already admitted to this execution.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentIdentityModelsToolInput {
+    pub identity_id: AgentIdentityId,
+    #[serde(default = "default_catalog_page_limit")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: u32,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentIdentityModelsToolResult {
+    pub identity_id: AgentIdentityId,
+    /// Present on its catalog segment; oversized headers use fragments.
+    pub identity: Option<AgentToolIdentityOption>,
+    pub executors: Vec<AgentToolExecutorModels>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    pub eof: bool,
+    #[serde(default)]
+    pub fragments: Vec<AgentCatalogFragment>,
+}
+
+/// Concatenate text in offset order and decode JSON to recover one catalog entry.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentCatalogFragment {
+    pub collection: String,
+    pub index: usize,
+    pub model_index: usize,
+    pub encoding: String,
+    pub version: String,
+    pub offset: usize,
+    pub next_offset: usize,
+    pub eof: bool,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentStartOptionsToolResult {
+    pub identities: Vec<AgentToolIdentityOption>,
+    pub profiles: Vec<AgentToolProfileOption>,
+    pub inherit_parent_identity_available: bool,
+    pub default_pioneer_identity_available: bool,
+    pub derived_ephemeral_identity_available: bool,
+    pub inherit_parent_profile_available: bool,
+    #[serde(default)]
+    pub allowed_skill_ids: Vec<crate::SkillId>,
+    #[serde(default)]
+    pub allowed_mcp_server_ids: Vec<String>,
+    pub max_permission_profile: crate::TurnPermissionProfileCap,
+    #[serde(default)]
+    pub thread_creation_options: Vec<AgentToolThreadCreationOption>,
+    #[serde(default)]
+    pub target_options: Vec<AgentToolTargetOption>,
+    pub generation_fingerprint: String,
+    pub next_cursor: Option<String>,
+    pub eof: bool,
+    #[serde(default)]
+    pub fragments: Vec<AgentCatalogFragment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentToolExecutorModels {
+    /// The providerId accepted by launch.profile.kind=model. For a CLI this
+    /// identifies its configured instance, never a runtime session or secret.
+    pub provider_id: String,
+    pub display_name: String,
+    pub backend: AgentToolBackendKind,
+    pub models: Vec<AgentToolModelOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentToolModelOption {
+    pub id: String,
+    pub display_name: String,
+    /// None means unknown. An empty effort list does not prove lack of support.
+    pub reasoning: Option<crate::ProviderModelReasoningCapabilities>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -187,30 +294,70 @@ pub enum AgentToolIdentityChoice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(
-    rename_all = "snake_case",
-    tag = "kind",
-    content = "id",
-    deny_unknown_fields
-)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum AgentToolProfileChoice {
     InheritParent,
-    Exact(AgentExecutionProfileId),
+    Exact {
+        id: AgentExecutionProfileId,
+    },
+    /// Direct, catalog-validated selection. Omitting providerId inherits the
+    /// current executor when compatible; otherwise selection must be unique.
+    Model {
+        #[serde(rename = "modelId")]
+        model_id: String,
+        #[serde(
+            default,
+            rename = "providerId",
+            skip_serializing_if = "Option::is_none"
+        )]
+        provider_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentToolLaunchSelection {
+    #[serde(default)]
     pub identity: AgentToolIdentityChoice,
+    #[serde(default)]
     pub profile: AgentToolProfileChoice,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<crate::TurnReasoningSelection>,
+    /// Use the selected model's native default, without inheriting an effort.
+    /// Mutually exclusive with reasoning. Omitted/false retains inheritance;
+    /// legacy reasoning:null also retains inheritance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_default_reasoning: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_profile: Option<crate::TurnPermissionProfileSelection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skill_ids: Vec<crate::SkillId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_server_ids: Vec<String>,
+}
+
+impl Default for AgentToolIdentityChoice {
+    fn default() -> Self {
+        Self::InheritParent
+    }
+}
+impl Default for AgentToolProfileChoice {
+    fn default() -> Self {
+        Self::InheritParent
+    }
+}
+impl Default for AgentToolLaunchSelection {
+    fn default() -> Self {
+        Self {
+            identity: Default::default(),
+            profile: Default::default(),
+            reasoning: None,
+            use_default_reasoning: false,
+            permission_profile: None,
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+        }
+    }
 }
 
 impl AgentToolLaunchSelection {
@@ -235,10 +382,20 @@ impl AgentToolLaunchSelection {
                     AgentToolProfileChoice::InheritParent => {
                         AgentExecutionProfileSelection::InheritParent
                     }
-                    AgentToolProfileChoice::Exact(id) => {
+                    AgentToolProfileChoice::Exact { id } => {
                         AgentExecutionProfileSelection::Exact { profile_id: id }
                     }
+                    AgentToolProfileChoice::Model {
+                        provider_id,
+                        model_id,
+                    } => AgentExecutionProfileSelection::Model {
+                        provider_id,
+                        model_id,
+                    },
                 },
+                // Tool defaults are resolved before admission. A native-default
+                // choice persists as None alongside the exact chosen profile;
+                // recovery must not interpret that None as inheritance again.
                 reasoning: self.reasoning,
                 permission_profile: self.permission_profile,
                 skill_ids: self.skill_ids,
@@ -267,8 +424,8 @@ pub struct AgentCreateThreadToolInput {
 pub struct AgentStartToolInput {
     pub target_option_id: String,
     pub input: AgentAuthoredInput,
-    /// Both fields are required; the server still validates them against the
-    /// immutable launch grant and the current runtime capability snapshot.
+    /// Omission inherits the current execution without an options lookup.
+    #[serde(default)]
     pub launch: AgentToolLaunchSelection,
 }
 
@@ -331,6 +488,9 @@ pub struct AgentToolSafeResult {
     pub outbox_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_message: Option<String>,
+    /// Refreshed opaque destinations after thread creation, including replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_options: Vec<AgentToolTargetOption>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -409,9 +569,36 @@ pub struct AgentModelToolCatalogEntry {
     pub capability: AgentToolCapability,
 }
 
-/// Build the capability-filtered tool catalog.  No entry is returned for a
-/// missing capability; callers must not replace a missing tool with a prose
-/// fallback that pretends the action succeeded.
+/// The shared options definition; callers still project its capability.
+pub fn agent_start_options_catalog_entry() -> AgentModelToolCatalogEntry {
+    AgentModelToolCatalogEntry {
+        name: AgentModelToolName::AgentStartOptions,
+        capability: AgentToolCapability::ChildStart,
+        description: "List permitted identity, execution profile, thread creation, and target options. Use these when explicitly selecting a task launch or a thread action; options do not grant permission to execute it. Follow nextCursor with the same limit until eof; arrays are page segments. Catalog changes require restarting. Oversized entries use fragments: concatenate text by offsets, then decode JSON.".to_owned(),
+        parameters: schema::<AgentStartOptionsToolInput>(),
+    }
+}
+
+pub fn agent_turn_start_catalog_entry() -> AgentModelToolCatalogEntry {
+    AgentModelToolCatalogEntry {
+        name: AgentModelToolName::StartAgent,
+        capability: AgentToolCapability::ChildStart,
+        description: "Start an Agent-turn in a permitted thread. Omit launch to inherit the current identity, executor, model and reasoning. For explicit models use threads_identity_models_list. Set launch.useDefaultReasoning=true to use the selected model's native default without inheriting effort; do not combine it with launch.reasoning. Use task_create for task delegation and attached subagents.".to_owned(),
+        parameters: schema::<AgentStartToolInput>(),
+    }
+}
+
+pub fn agent_identity_models_catalog_entry() -> AgentModelToolCatalogEntry {
+    AgentModelToolCatalogEntry {
+        name: AgentModelToolName::IdentityModelsList,
+        capability: AgentToolCapability::ChildStart,
+        description: "List the admitted executors and models for an available identity, with per-model reasoning metadata. Select a model with launch.profile={kind: model, providerId, modelId}; identity uses launch.identity={kind: exact, id}. Set launch.useDefaultReasoning=true to avoid inheriting an effort, including for models without reasoning controls. Catalogs do not grant launch authority. Follow nextCursor with the same identityId and limit until eof; an executor may continue its models across pages. identityId is stable; the identity header appears on its segment or through fragments. Catalog changes require restarting. Concatenate oversized entry fragments by offsets and decode JSON.".to_owned(),
+        parameters: schema::<AgentIdentityModelsToolInput>(),
+    }
+}
+
+/// Build the capability-filtered tool catalog. No entry is returned for a
+/// missing capability; callers must not pretend an unavailable action succeeded.
 pub fn project_agent_model_tool_catalog(
     capabilities: &BTreeSet<AgentToolCapability>,
     options: Option<&AgentToolOptionsProjection>,
@@ -443,19 +630,28 @@ pub fn project_agent_model_tool_catalog(
         schema::<AgentCreateThreadToolInput>(),
     );
     if options.is_some() {
+        let models = agent_identity_models_catalog_entry();
         push(
-            AgentModelToolName::AgentStartOptions,
-            AgentToolCapability::ChildStart,
-            "List permitted identity, execution profile, thread creation, and target options. Use these when explicitly selecting a task launch or a thread action; options do not grant permission to execute it.",
-            schema::<AgentStartOptionsToolInput>(),
+            models.name,
+            models.capability,
+            &models.description,
+            models.parameters,
+        );
+        let entry = agent_start_options_catalog_entry();
+        push(
+            entry.name,
+            entry.capability,
+            &entry.description,
+            entry.parameters,
         );
     }
     if options.is_some() {
+        let entry = agent_turn_start_catalog_entry();
         push(
-            AgentModelToolName::StartAgent,
-            AgentToolCapability::ChildStart,
-            "Start an Agent-turn in a permitted thread with authored input and a selected identity and execution profile. Use task_create for task delegation and attached subagents.",
-            schema::<AgentStartToolInput>(),
+            entry.name,
+            entry.capability,
+            &entry.description,
+            entry.parameters,
         );
     }
     // Task operations are projected by the established TaskToolProvider.
@@ -627,6 +823,26 @@ mod tests {
         );
         assert!(!names.contains(&"agent_start_options"));
         assert!(!names.contains(&"agent_start"));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == "threads_identity_models_list")
+                .count(),
+            1
+        );
+        assert_eq!(
+            serde_json::to_value(AgentModelToolName::IdentityModelsList).unwrap(),
+            json!("threads_identity_models_list")
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentModelToolName>(json!("threads_identity_models_list"))
+                .unwrap(),
+            AgentModelToolName::IdentityModelsList
+        );
+        assert!(
+            serde_json::from_value::<AgentModelToolName>(json!("threads_identity_odels_list"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -787,6 +1003,57 @@ mod tests {
     }
 
     #[test]
+    fn omitted_launch_and_partial_launch_preserve_inheritance_and_direct_model_selection() {
+        for launch in [
+            None,
+            Some(json!({})),
+            Some(json!({"reasoning": null})),
+            Some(json!({"reasoning": {"effort": "high"}})),
+        ] {
+            let mut input = json!({"targetOptionId": "current", "input": []});
+            if let Some(launch) = launch {
+                input["launch"] = launch;
+            }
+            let input: AgentStartToolInput = serde_json::from_value(input).unwrap();
+            assert_eq!(
+                input.launch.identity,
+                AgentToolIdentityChoice::InheritParent
+            );
+            assert_eq!(input.launch.profile, AgentToolProfileChoice::InheritParent);
+            assert!(!input.launch.use_default_reasoning);
+        }
+        let default: AgentToolLaunchSelection = serde_json::from_value(json!({
+            "useDefaultReasoning": true
+        }))
+        .unwrap();
+        assert!(default.use_default_reasoning);
+        assert!(
+            default
+                .into_server_selection()
+                .execution
+                .reasoning
+                .is_none()
+        );
+        let input: AgentStartToolInput = serde_json::from_value(json!({
+            "targetOptionId": "current", "input": [],
+            "launch": { "profile": {"kind": "model", "providerId": "openai", "modelId": "catalog-model"} }
+        })).unwrap();
+        assert_eq!(
+            input.launch.into_server_selection().execution.profile,
+            AgentExecutionProfileSelection::Model {
+                provider_id: Some("openai".into()),
+                model_id: "catalog-model".into()
+            }
+        );
+        let legacy: AgentToolProfileChoice =
+            serde_json::from_value(json!({"kind":"exact", "id":"P12345678901234567890"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap(),
+            json!({"kind":"exact", "id":"P12345678901234567890"})
+        );
+    }
+
+    #[test]
     fn launch_choice_converts_only_to_inherit_or_exact_server_selection() {
         let selection = AgentToolLaunchSelection {
             identity: AgentToolIdentityChoice::Exact {
@@ -794,6 +1061,7 @@ mod tests {
             },
             profile: AgentToolProfileChoice::InheritParent,
             reasoning: None,
+            use_default_reasoning: false,
             permission_profile: None,
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),

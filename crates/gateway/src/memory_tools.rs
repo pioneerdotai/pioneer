@@ -826,6 +826,15 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     ProviderFailureClassification::new(class),
                 )
             })?;
+        // Extraction is post-turn work: never inherit an interactive handle.
+        let usage_store = processor.crud_store.with_maintenance_access();
+        let provider = crate::usage_journal::observe(
+            provider,
+            &usage_store,
+            context.workspace_id.as_str(),
+            "memory_extraction",
+            context.workspace_id.as_str(),
+        );
         let raw_json =
             request_post_turn_extractor_json(provider.as_ref(), model, request.render_prompt())
                 .await?;
@@ -970,6 +979,16 @@ async fn request_post_turn_extractor_json_once(
             classified
         })
         .and_then(|response| {
+            pioneer_provider::ProviderMessageCollector::validate_response(&response).map_err(
+                |_| {
+                    extractor_completion_error(
+                        provider.name(),
+                        model,
+                        ExtractorCompletionFailure::AfterCompletion,
+                        Some(&response.termination),
+                    )
+                },
+            )?;
             validate_extractor_completion(
                 provider.name(),
                 model,
@@ -993,6 +1012,8 @@ async fn collect_post_turn_extractor_stream(
     request_attempt: &'static str,
 ) -> HookResult<String> {
     let mut text = String::new();
+    let mut collector = pioneer_provider::ProviderMessageCollector::default();
+    let mut completed = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             if pioneer_provider::failure::provider_stream_incomplete(&error).is_some() {
@@ -1027,6 +1048,32 @@ async fn collect_post_turn_extractor_stream(
             );
             classified
         })?;
+        if completed {
+            // Drain usage and transport completion so the auxiliary journal
+            // can finalize the physical attempt. Completion cannot admit more
+            // generated content or change the accepted termination.
+            if chunk.message.is_some()
+                || !chunk.delta.is_empty()
+                || chunk
+                    .reasoning_delta
+                    .as_ref()
+                    .is_some_and(|value| !value.is_empty())
+                || !chunk.tool_calls.is_empty()
+                || chunk.provider_replay_state.is_some()
+                || chunk
+                    .termination
+                    .as_ref()
+                    .is_some_and(|value| *value != ProviderTermination::Complete)
+            {
+                return Err(extractor_completion_error(
+                    provider.name(),
+                    model,
+                    ExtractorCompletionFailure::AfterCompletion,
+                    chunk.termination.as_ref(),
+                ));
+            }
+            continue;
+        }
         if !chunk.tool_calls.is_empty() {
             return Err(extractor_completion_error(
                 provider.name(),
@@ -1043,16 +1090,36 @@ async fn collect_post_turn_extractor_stream(
                 false,
             )?;
         }
+        collector.push(&chunk).map_err(|_| {
+            extractor_completion_error(
+                provider.name(),
+                model,
+                ExtractorCompletionFailure::AfterCompletion,
+                chunk.termination.as_ref(),
+            )
+        })?;
+        let projected_bytes = text.len().saturating_add(collector.result_delta().len());
         validate_extractor_response_size(
             provider.name(),
             model,
-            text.len().saturating_add(chunk.delta.len()),
+            projected_bytes,
             chunk.termination.as_ref(),
         )?;
-        text.push_str(&chunk.delta);
+        text.push_str(collector.result_delta());
         if chunk.is_final {
-            return Ok(text);
+            collector.finish().map_err(|_| {
+                extractor_completion_error(
+                    provider.name(),
+                    model,
+                    ExtractorCompletionFailure::AfterCompletion,
+                    chunk.termination.as_ref(),
+                )
+            })?;
+            completed = true;
         }
+    }
+    if completed {
+        return Ok(text);
     }
     Err(extractor_completion_error(
         provider.name(),
@@ -1134,6 +1201,7 @@ fn memory_response_format_error(
 
 #[derive(Clone, Copy)]
 enum ExtractorCompletionFailure {
+    AfterCompletion,
     StreamEof,
     Length,
     ContentFiltered,
@@ -1149,6 +1217,7 @@ enum ExtractorCompletionFailure {
 impl ExtractorCompletionFailure {
     fn as_str(self) -> &'static str {
         match self {
+            Self::AfterCompletion => "payload_after_completion",
             Self::StreamEof => "stream_truncated",
             Self::Length => "length",
             Self::ContentFiltered => "content_filtered",
@@ -1295,7 +1364,9 @@ fn memory_provider_request_error(
 ) -> HookError {
     let classification = provider.classify_failure(error).unwrap_or_else(|| {
         ProviderFailureClassification::new(pioneer_agent::classify_provider_failure_message(
-            error.to_string().as_str(),
+            pioneer_provider::usage::classification_source(error)
+                .to_string()
+                .as_str(),
             stage,
         ))
     });
@@ -1318,6 +1389,16 @@ fn classified_memory_provider_error(
         "provider_stage",
         provider_failure_stage_name(stage),
     );
+    if let Some(reason) = classification
+        .error_reason
+        .and_then(|reason| serde_json::to_value(reason).ok())
+        .and_then(|value| value.as_str().map(str::to_owned))
+    {
+        insert_hook_text_metadata(&mut metadata, "provider_error_reason", reason);
+    }
+    if let Some(id) = classification.request_id {
+        insert_hook_text_metadata(&mut metadata, "provider_request_id", String::from(id));
+    }
     if let Some(status) = classification.http_status {
         insert_hook_text_metadata(&mut metadata, "http_status", status.to_string());
     }
@@ -2812,6 +2893,39 @@ mod tests {
     }
 
     #[test]
+    fn memory_denial_preserves_allowlisted_reason_and_request_without_retry() {
+        let mut classification =
+            ProviderFailureClassification::new(ProviderFailureClass::AuthOrPermission);
+        classification.http_status = Some(403);
+        classification.error_reason = Some(pioneer_protocol::ProviderErrorReason::PermissionDenied);
+        classification.request_id = Some(
+            pioneer_protocol::ProviderRequestId::try_from("req-denial_fixture".to_owned()).unwrap(),
+        );
+        let error = classified_memory_provider_error(
+            "openrouter",
+            "fixture",
+            "provider_stream_start",
+            ProviderFailureStage::Connect,
+            classification,
+        );
+        assert!(!error.retryable);
+        for (key, expected) in [
+            ("http_status", "403"),
+            ("provider_error_reason", "permission_denied"),
+            ("provider_request_id", "req-denial_fixture"),
+        ] {
+            assert_eq!(
+                error
+                    .metadata
+                    .iter()
+                    .find(|(name, _)| name.as_str() == key)
+                    .map(|(_, value)| value.as_str()),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
     fn memory_remember_requires_content_and_category_for_all_write_addresses() {
         let spec = memory_tool_specs()
             .into_iter()
@@ -3002,6 +3116,60 @@ mod tests {
 
     struct CompatibilityFallbackProvider {
         requests: Arc<Mutex<Vec<ChatRequest>>>,
+    }
+
+    #[tokio::test]
+    async fn memory_extractor_drains_terminal_usage_and_rejects_late_failure() {
+        let provider = CompatibilityFallbackProvider::new();
+        let make_prefix = || -> Vec<anyhow::Result<StreamChunk>> {
+            vec![
+                Ok(StreamChunk::delta("{\"facts\":[]}")),
+                Ok(StreamChunk::final_chunk_with(ProviderTermination::Complete)),
+            ]
+        };
+        let mut chunks = make_prefix();
+        let mut usage = StreamChunk::delta(String::new());
+        usage.usage = Some(pioneer_provider::TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            ..Default::default()
+        });
+        chunks.push(Ok(usage));
+        assert_eq!(
+            collect_post_turn_extractor_stream(
+                Box::pin(stream::iter(chunks)),
+                &provider,
+                "memory-model",
+                "initial"
+            )
+            .await
+            .unwrap(),
+            "{\"facts\":[]}"
+        );
+        let mut chunks = make_prefix();
+        chunks.push(Err(anyhow!("provider stream failed after terminal")));
+        assert!(
+            collect_post_turn_extractor_stream(
+                Box::pin(stream::iter(chunks)),
+                &provider,
+                "memory-model",
+                "initial"
+            )
+            .await
+            .is_err()
+        );
+        let mut chunks = make_prefix();
+        chunks.push(Ok(StreamChunk::delta("late content")));
+        assert!(
+            collect_post_turn_extractor_stream(
+                Box::pin(stream::iter(chunks)),
+                &provider,
+                "memory-model",
+                "initial"
+            )
+            .await
+            .is_err()
+        );
     }
 
     impl CompatibilityFallbackProvider {

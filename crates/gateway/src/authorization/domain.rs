@@ -112,6 +112,8 @@ pub(crate) enum ResourceAction {
     ThreadCreatePrivate,
     ThreadCreateWorkspace,
     ThreadRead,
+    /// Observation of other ACL-authorized conversations; never grants writes.
+    ThreadObserveWorkspace,
     MessageCreate,
     MessageEditOwn,
     MessageDeleteOwn,
@@ -194,7 +196,14 @@ pub(crate) enum ResourceAction {
 }
 
 impl ResourceAction {
-    pub(crate) const ALL: [Self; 87] = [
+    pub(crate) const fn is_thread_creation(self) -> bool {
+        matches!(
+            self,
+            Self::ThreadCreatePrivate | Self::ThreadCreateWorkspace
+        )
+    }
+
+    pub(crate) const ALL: [Self; 88] = [
         Self::GatewayManage,
         Self::WorkspaceList,
         Self::WorkspaceRead,
@@ -203,6 +212,7 @@ impl ResourceAction {
         Self::ThreadCreatePrivate,
         Self::ThreadCreateWorkspace,
         Self::ThreadRead,
+        Self::ThreadObserveWorkspace,
         Self::MessageCreate,
         Self::MessageEditOwn,
         Self::MessageDeleteOwn,
@@ -294,6 +304,7 @@ impl ResourceAction {
             Self::ThreadCreatePrivate => "thread_create_private",
             Self::ThreadCreateWorkspace => "thread_create_workspace",
             Self::ThreadRead => "thread_read",
+            Self::ThreadObserveWorkspace => "thread_observe_workspace",
             Self::MessageCreate => "message_create",
             Self::MessageEditOwn => "message_edit_own",
             Self::MessageDeleteOwn => "message_delete_own",

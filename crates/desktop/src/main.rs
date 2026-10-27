@@ -1,3 +1,4 @@
+include!(concat!(env!("OUT_DIR"), "/pioneer-build-section.rs"));
 #[macro_use]
 extern crate rust_i18n;
 
@@ -108,12 +109,35 @@ impl HttpClient for DesktopHttpClient {
     }
 }
 
+struct ForegroundLiveness {
+    _registration: pioneer_observability::runtime::ForegroundRegistration,
+    _task: gpui_kit::Task<()>,
+}
+impl gpui_kit::Global for ForegroundLiveness {}
+
 fn main() {
+    struct LocalObservers;
+    impl Drop for LocalObservers {
+        fn drop(&mut self) {
+            pioneer_observability::stop_local_observers();
+        }
+    }
+    let _observers = LocalObservers;
+    // Pinned Kit's Windows child-WebView bootstrap, before UI/runtime threads.
+    #[cfg(target_os = "windows")]
+    unsafe {
+        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true");
+    }
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if let Some(version_probe) = version_probe_from_args(args.iter().cloned()) {
         print_version_probe(version_probe);
         return;
     }
+    std::hint::black_box(&PIONEER_BUILD_SECTION);
+    let _ = pioneer_observability::identity::configure_build(include_str!(concat!(
+        env!("OUT_DIR"),
+        "/pioneer-build.json"
+    )));
     let initial_urls = invitation_urls_from_args(args);
 
     pioneer_observability::set_telemetry_enabled(false);
@@ -197,10 +221,19 @@ fn main() {
             error = %format!("{error:#}"),
             message = %t!("logs.runtime.prepare_home_failed")
         );
+        pioneer_observability::stop_local_observers();
         drop(sentry_guard);
         std::process::exit(1);
     }
     runtime_home_stage.succeed();
+
+    if let Some(config) = startup_config.as_ref() {
+        if let Ok(home) = config.runtime_home_dir() {
+            if let Err(error) = pioneer_observability::diagnostics::start_local_diagnostics(&home) {
+                eprintln!("local diagnostics unavailable: {error}");
+            }
+        }
+    }
 
     let http_client_stage =
         startup.stage(pioneer_observability::DesktopStartupStage::HttpClientInitialize);
@@ -211,7 +244,11 @@ fn main() {
     let (url_sender, mut url_receiver) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
     let ui_runtime_stage =
         startup.stage(pioneer_observability::DesktopStartupStage::UiRuntimeInitialize);
-    let app = gpui_kit::application()
+    #[cfg(target_os = "linux")]
+    let app = gpui_kit::platform::linux(gpui_kit::WindowingModes::X11);
+    #[cfg(not(target_os = "linux"))]
+    let app = gpui_kit::application();
+    let app = app
         .with_assets(PioneerAssetsSource)
         .with_http_client(Arc::new(http_client));
     ui_runtime_stage.succeed();
@@ -227,7 +264,17 @@ fn main() {
         let ui_components_stage = startup_for_app
             .stage(pioneer_observability::DesktopStartupStage::UiComponentsInitialize);
         gpui_kit::init(cx);
-        client_runtime::DesktopRuntimeCoordinator::install(cx);
+        let (registration, mut probes) = pioneer_observability::runtime::register_foreground();
+        let task = cx.spawn(async move |_cx| while probes.acknowledge_next().await {});
+        cx.set_global(ForegroundLiveness {
+            _registration: registration,
+            _task: task,
+        });
+        pioneer_desktop_task_notifications::init(cx);
+        client_runtime::DesktopRuntimeCoordinator::install_with_startup(
+            Some(startup_for_app.clone()),
+            cx,
+        );
         theme::init(cx);
         menu::init_system_menus(cx);
 

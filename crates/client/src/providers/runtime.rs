@@ -126,6 +126,7 @@ pub(crate) struct RuntimeRequest {
 /// A retained consumer's demand. Dropping it wakes cancellation without calling
 /// back into a consumer while its store lock is held.
 pub(crate) struct ProviderRuntimeDemand {
+    queue: Option<pioneer_observability::queues::QueueObserver>,
     token: Option<Arc<()>>,
     wake: Option<mpsc::SyncSender<()>>,
 }
@@ -133,7 +134,31 @@ impl Drop for ProviderRuntimeDemand {
     fn drop(&mut self) {
         self.token.take();
         if let Some(wake) = &self.wake {
-            let _ = wake.try_send(());
+            send_runtime_wake(self.queue.as_ref(), wake);
+        }
+    }
+}
+// Both producers wake the same reconciliation lane; a full slot is merged input.
+fn send_runtime_wake(
+    queue: Option<&pioneer_observability::queues::QueueObserver>,
+    wake: &mpsc::SyncSender<()>,
+) {
+    use pioneer_observability::queues::{QueueBytes, QueueObserver};
+    let queue = queue.map(QueueObserver::in_current_epoch);
+    if let Some(queue) = &queue {
+        queue.enqueued(QueueBytes::Known(0));
+    }
+    match wake.try_send(()) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(_)) => {
+            if let Some(queue) = &queue {
+                queue.coalesced_send(QueueBytes::Known(0));
+            }
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            if let Some(queue) = &queue {
+                queue.rejected_send(QueueBytes::Known(0));
+            }
         }
     }
 }
@@ -143,6 +168,8 @@ struct RuntimeScope {
     source_revision: u64,
     minimum_revision: u64,
     loaded: bool,
+    // Accepted data belongs to authorization, while requests also belong to a connection.
+    accepted_auth: Option<(u64, u64)>,
     prefetch: bool,
     demand: usize,
     retained_demand: Vec<Weak<()>>,
@@ -161,6 +188,7 @@ impl RuntimeScope {
 }
 #[derive(Default)]
 pub(crate) struct ProviderRuntimeController {
+    queue: Option<pioneer_observability::queues::QueueObserver>,
     scopes: BTreeMap<String, RuntimeScope>,
     generation: u64,
     wake: Option<mpsc::SyncSender<()>>,
@@ -173,7 +201,7 @@ impl ProviderRuntimeController {
     }
     fn wake(&self) {
         if let Some(wake) = &self.wake {
-            let _ = wake.try_send(());
+            send_runtime_wake(self.queue.as_ref(), wake);
         }
     }
     fn schedule(&mut self, workspace: &str, auth: (u64, u64, Option<u64>)) {
@@ -272,11 +300,40 @@ impl ClientCore {
         refresh: bool,
         probe: Option<Option<String>>,
     ) -> anyhow::Result<CLIRuntimeListResponse> {
+        self.read_provider_runtime_request_with_wait(workspace, refresh, probe, |receiver| {
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
+                Err(_) => anyhow::bail!("provider_runtime_cancelled"),
+            }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_provider_runtimes_with_events_for_test(
+        &self,
+        workspace: &str,
+        mut event: impl FnMut(),
+    ) -> anyhow::Result<CLIRuntimeListResponse> {
+        self.read_provider_runtime_request_with_wait(workspace, true, None, |_| {
+            event();
+            Ok(())
+        })
+    }
+
+    fn read_provider_runtime_request_with_wait(
+        &self,
+        workspace: &str,
+        refresh: bool,
+        probe: Option<Option<String>>,
+        mut wait: impl FnMut(&mpsc::Receiver<()>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<CLIRuntimeListResponse> {
         anyhow::ensure!(
             !workspace.trim().is_empty() && !self.is_stopped(),
             "provider_runtime_unavailable"
         );
-        let epoch = self.provider_runtime_epoch();
+        let mut epoch = self.provider_runtime_epoch();
+        let mut connection_transitions = 0;
+        let allow_connection_transition = probe.is_none();
         let _demand = self.retain_provider_runtime(workspace);
         if let Some(runtime_id) = probe {
             self.schedule_provider_runtime_refresh(workspace, runtime_id)?;
@@ -305,10 +362,36 @@ impl ClientCore {
             scope.listeners.push(sender);
         }
         loop {
+            let current = self.provider_runtime_epoch();
             anyhow::ensure!(
-                !self.is_stopped() && self.provider_runtime_epoch() == epoch,
+                !self.is_stopped()
+                    && (current.0, current.1) == (epoch.0, epoch.1)
+                    && self.provider_runtime_allowed(workspace),
                 "provider_runtime_cancelled"
             );
+            if current != epoch {
+                // Only the safe list read can cross at most two connection replacements.
+                anyhow::ensure!(
+                    allow_connection_transition && connection_transitions < 2,
+                    "provider_runtime_cancelled"
+                );
+                connection_transitions += 1;
+                epoch = current;
+                let current_request = self
+                    .provider_runtimes
+                    .lock()
+                    .expect("provider runtimes poisoned")
+                    .scopes
+                    .get(workspace)
+                    .is_some_and(|scope| {
+                        scope.auth == epoch && (scope.loaded || scope.request.is_some())
+                    });
+                if !current_request {
+                    self.provider_runtime_intent(ProviderRuntimeIntent::Refresh {
+                        workspace_id: workspace.into(),
+                    });
+                }
+            }
             {
                 let owner = self
                     .provider_runtimes
@@ -318,6 +401,10 @@ impl ClientCore {
                     .scopes
                     .get(workspace)
                     .ok_or_else(|| anyhow::anyhow!("provider_runtime_cancelled"))?;
+                anyhow::ensure!(
+                    scope.auth == epoch && scope.demanded(),
+                    "provider_runtime_cancelled"
+                );
                 match scope.publication.request {
                     ProviderRuntimeRequestState::Ready => {
                         return Ok(CLIRuntimeListResponse {
@@ -334,10 +421,7 @@ impl ClientCore {
                     _ => anyhow::bail!("provider_runtime_unavailable"),
                 }
             }
-            match receiver.recv_timeout(Duration::from_millis(100)) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(_) => anyhow::bail!("provider_runtime_cancelled"),
-            }
+            wait(&receiver)?;
         }
     }
     pub(crate) fn resume_provider_runtime_demand(&self) {
@@ -364,6 +448,15 @@ impl ClientCore {
                 let capabilities = crate::authorization::principal_presentation_capabilities(&p);
                 capabilities.can_manage_capabilities || capabilities.can_use_cli_runtimes
             })
+    }
+    pub(crate) fn provider_runtime_data_valid(&self, workspace: &str) -> bool {
+        let auth = self.provider_runtime_epoch();
+        self.provider_runtimes
+            .lock()
+            .expect("provider runtimes poisoned")
+            .scopes
+            .get(workspace)
+            .is_some_and(|scope| scope.accepted_auth == Some((auth.0, auth.1)))
     }
     pub fn provider_runtime_snapshot(
         &self,
@@ -393,6 +486,33 @@ impl ClientCore {
             )
             .checked_add(1)
             .expect("provider runtime revision exhausted");
+        // Runtime -> collection is the lock order. Collection completion never
+        // acquires the runtime owner. Fence old catalog RPCs before publishing
+        // evidence that can wake model consumers on another thread.
+        let changed = scope
+            .publication
+            .runtimes
+            .iter()
+            .map(|row| row.runtime_id.clone())
+            .chain(next.runtimes.iter().map(|row| row.runtime_id.clone()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|id| {
+                super::list::cli_runtime_catalog_changed(
+                    scope
+                        .publication
+                        .runtimes
+                        .iter()
+                        .find(|row| &row.runtime_id == id)
+                        .map(|row| row.runtime()),
+                    next.runtimes
+                        .iter()
+                        .find(|row| &row.runtime_id == id)
+                        .map(|row| row.runtime()),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.invalidate_cli_runtime_model_collections(&next.workspace_id, &changed);
         let revision = next.revision;
         let workspace_id = next.workspace_id.clone();
         scope.publication = Arc::new(next);
@@ -410,6 +530,30 @@ impl ClientCore {
             vec![],
         )
     }
+    /// Guard buffered consumer responses too, including the interval between
+    /// runtime publication and reconciliation of that consumer's generation.
+    pub(crate) fn cli_catalog_matches_runtime_publication(
+        &self,
+        workspace: &str,
+        provider: Option<&str>,
+        known: &[RuntimeSummary],
+    ) -> bool {
+        let Some(id) = provider.and_then(super::list::runtime_id_from_cli_runtime_provider_key)
+        else {
+            return true;
+        };
+        let snapshot = self.provider_runtime_snapshot(workspace);
+        !super::list::cli_runtime_catalog_changed(
+            known.iter().find(|runtime| runtime.runtime_id == id),
+            snapshot.as_ref().and_then(|p| {
+                p.runtimes()
+                    .iter()
+                    .find(|row| row.runtime().runtime_id == id)
+                    .map(|row| row.runtime())
+            }),
+        )
+    }
+
     pub fn provider_runtime_intent(&self, intent: ProviderRuntimeIntent) -> ClientTransition {
         let workspace = match &intent {
             ProviderRuntimeIntent::Observe { workspace_id }
@@ -428,13 +572,14 @@ impl ClientCore {
             },
             Some(Arc::downgrade(&token)),
         );
-        let wake = self
+        let owner = self
             .provider_runtimes
             .lock()
-            .expect("provider runtimes poisoned")
-            .wake
-            .clone();
+            .expect("provider runtimes poisoned");
+        let wake = owner.wake.clone();
+        let queue = owner.queue.clone();
         ProviderRuntimeDemand {
+            queue,
             token: Some(token),
             wake,
         }
@@ -480,6 +625,7 @@ impl ClientCore {
                 source_revision: 0,
                 minimum_revision: 0,
                 loaded: false,
+                accepted_auth: None,
                 prefetch: false,
                 demand: 0,
                 retained_demand: Vec::new(),
@@ -521,9 +667,15 @@ impl ClientCore {
                 .checked_add(1)
                 .expect("provider runtime demand exhausted");
         }
-        if scope.auth != auth {
+        let epoch_changed = scope.auth != auth;
+        if epoch_changed {
             scope.auth = auth;
             scope.loaded = false;
+            if scope.accepted_auth != Some((auth.0, auth.1)) {
+                scope.accepted_auth = None;
+            }
+            // Revision fences belong to this connection's stream. Accepted rows
+            // remain useful while its replacement obtains a new full snapshot.
             scope.source_revision = 0;
             scope.minimum_revision = 0;
             scope.request = None;
@@ -534,6 +686,7 @@ impl ClientCore {
             scope.due = None;
             scope.prefetch = false;
             scope.loaded = false;
+            scope.accepted_auth = None;
             let mut next = (*scope.publication).clone();
             next.runtimes.clear();
             next.request = ProviderRuntimeRequestState::Cancelled;
@@ -542,7 +695,10 @@ impl ClientCore {
         if scope.request.is_some() {
             return self.navigation_outcome(ClientTransitionOutcome::Noop);
         }
-        if observe && scope.publication.request == ProviderRuntimeRequestState::Failed {
+        if observe
+            && !epoch_changed
+            && scope.publication.request == ProviderRuntimeRequestState::Failed
+        {
             return self.navigation_outcome(ClientTransitionOutcome::Noop);
         }
         if observe && scope.loaded {
@@ -562,7 +718,7 @@ impl ClientCore {
             .get_mut(workspace)
             .expect("registered runtime scope");
         let mut next = (*scope.publication).clone();
-        if !scope.loaded {
+        if scope.accepted_auth != Some((auth.0, auth.1)) {
             next.runtimes.clear();
         }
         next.request = ProviderRuntimeRequestState::Loading;
@@ -632,6 +788,7 @@ impl ClientCore {
                 scope.source_revision = response.revision;
                 scope.minimum_revision = scope.minimum_revision.max(response.revision);
                 scope.loaded = true;
+                scope.accepted_auth = Some((auth.0, auth.1));
                 scope.prefetch = false;
                 scope.request = None;
                 scope.due = None;
@@ -664,6 +821,7 @@ impl ClientCore {
             scope.due = None;
             scope.prefetch = false;
             scope.loaded = false;
+            scope.accepted_auth = None;
             scope.source_revision = 0;
             scope.minimum_revision = 0;
             let mut next = (*scope.publication).clone();
@@ -755,17 +913,27 @@ impl ClientCore {
     }
     pub(crate) fn start_provider_runtime_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel(1);
+        let queue = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(1),
+            "coalescing wake tokens only; zero payload bytes; domain state is reconciled separately",
+        );
+        let receiver_queue = queue.clone();
         let weak = Arc::downgrade(self);
         let mut owner = self
             .provider_runtimes
             .lock()
             .expect("provider runtimes poisoned");
+        owner.queue = Some(queue);
         owner.wake = Some(sender);
         owner.task = Some(
             std::thread::Builder::new()
                 .name("client-provider-runtimes".into())
                 .spawn(move || {
                     loop {
+                    let cycle=pioneer_observability::work::WorkCarrier::independent(pioneer_observability::work::Boundary::Timer,pioneer_observability::work::WorkKind::ClientCommand,pioneer_observability::work::Trigger::Reconcile,pioneer_observability::work::ExecutorRole::ClientController);
+                    let _cycle_scope=cycle.enter();
+                    let mut cycle_guard = pioneer_observability::live::WorkGuard::start(cycle.context(), false);
                         let Some(core) = weak.upgrade() else {
                             break;
                         };
@@ -817,26 +985,44 @@ impl ClientCore {
                                             && (scope.demanded() || scope.prefetch)
                                     });
                             if !matches {
-                                continue;
+                                cycle_guard.finish(pioneer_observability::work::Outcome::Completed);
+                        continue;
                             }
                             let sender = core.transport_runtime().ws_command_sender();
                             drop(core);
+                            let Some(connection) = request.auth.2 else {
+                                if let Some(core) = weak.upgrade() {
+                                    core.complete_provider_runtime(
+                                        &request,
+                                        Err(()),
+                                        Instant::now(),
+                                    );
+                                }
+                                cycle_guard.finish(pioneer_observability::work::Outcome::Completed);
+                        continue;
+                            };
+                            let transport = sender.requests_for_connection(connection);
                             let result = if let Some(runtime_id) = &request.refresh_runtime {
-                                sender
-                                    .cli_runtime_refresh(
-                                        pioneer_protocol::CLIRuntimeRefreshParams {
-                                            workspace_id: request.workspace_id.clone(),
-                                            runtime_id: runtime_id.clone(),
-                                        },
-                                    )
-                                    .map(|response| CLIRuntimeListResponse {
+                                crate::transport::ws::command_sender::cli_runtime_refresh(
+                                    &transport,
+                                    pioneer_protocol::CLIRuntimeRefreshParams {
+                                        workspace_id: request.workspace_id.clone(),
+                                        runtime_id: runtime_id.clone(),
+                                    },
+                                )
+                                .map(|response| {
+                                    CLIRuntimeListResponse {
                                         revision: response.revision,
                                         runtimes: response.runtimes,
-                                    })
-                            } else {
-                                sender.cli_runtime_list(CLIRuntimeListParams {
-                                    workspace_id: request.workspace_id.clone(),
+                                    }
                                 })
+                            } else {
+                                crate::transport::ws::command_sender::cli_runtime_list(
+                                    &transport,
+                                    CLIRuntimeListParams {
+                                        workspace_id: request.workspace_id.clone(),
+                                    },
+                                )
                             }
                             .map_err(|_| ());
                             let Some(core) = weak.upgrade() else {
@@ -845,17 +1031,18 @@ impl ClientCore {
                             core.complete_provider_runtime(&request, result, Instant::now());
                         } else {
                             drop(core);
-                            match delay {
+                            cycle_guard.finish(pioneer_observability::work::Outcome::Completed);
+                    match delay {
                                 Some(delay) => {
                                     if matches!(
-                                        receiver.recv_timeout(delay),
+                                        receiver.recv_timeout(delay).map(|()| { receiver_queue.dequeued(pioneer_observability::queues::QueueBytes::Known(0)); receiver_queue.outcome(pioneer_observability::queues::QueueOutcome::Processed, 1); }),
                                         Err(mpsc::RecvTimeoutError::Disconnected)
                                     ) {
                                         break;
                                     }
                                 }
                                 None => {
-                                    if receiver.recv().is_err() {
+                                    if receiver.recv().map(|()| { receiver_queue.dequeued(pioneer_observability::queues::QueueBytes::Known(0)); receiver_queue.outcome(pioneer_observability::queues::QueueOutcome::Processed, 1); }).is_err() {
                                         break;
                                     }
                                 }
@@ -871,6 +1058,82 @@ impl ClientCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_demand_drop_coalesces_a_pending_wake_and_pins_epoch() {
+        use pioneer_observability::{
+            live,
+            queues::{QueueBytes, QueueKind, QueueObserver},
+        };
+        let _lock = crate::OBSERVABILITY_TEST_LOCK.lock().unwrap();
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(false);
+        pioneer_observability::set_telemetry_enabled(true);
+        let queue = QueueObserver::new(QueueKind::ClientController, Some(1), "fixture demand wake");
+        let (tx, rx) = mpsc::sync_channel(1);
+        send_runtime_wake(Some(&queue), &tx);
+        let token = Arc::new(());
+        let retained = Arc::downgrade(&token);
+        drop(ProviderRuntimeDemand {
+            queue: Some(queue.clone()),
+            token: Some(token),
+            wake: Some(tx.clone()),
+        });
+        assert_eq!(retained.strong_count(), 0);
+        let q = live::snapshot()
+            .unwrap()
+            .queues
+            .into_iter()
+            .find(|q| q.byte_definition == "fixture demand wake")
+            .unwrap();
+        assert_eq!(
+            (
+                q.offered,
+                q.enqueued,
+                q.coalesced,
+                q.rejected,
+                q.depth,
+                q.processed
+            ),
+            (2, 1, 1, 0, 1, 0)
+        );
+        rx.try_recv().unwrap();
+        queue.dequeued(QueueBytes::Known(0));
+        queue.outcome(pioneer_observability::queues::QueueOutcome::Processed, 1);
+        drop(rx);
+        drop(ProviderRuntimeDemand {
+            queue: Some(queue.clone()),
+            token: Some(Arc::new(())),
+            wake: Some(tx.clone()),
+        });
+        let q = live::snapshot()
+            .unwrap()
+            .queues
+            .into_iter()
+            .find(|q| q.byte_definition == "fixture demand wake")
+            .unwrap();
+        assert_eq!(
+            (
+                q.offered,
+                q.enqueued,
+                q.coalesced,
+                q.rejected,
+                q.depth,
+                q.processed
+            ),
+            (3, 1, 1, 1, 0, 1)
+        );
+        let pinned = queue.in_current_epoch();
+        pioneer_observability::set_telemetry_enabled(false);
+        pioneer_observability::set_telemetry_enabled(true);
+        drop(ProviderRuntimeDemand {
+            queue: Some(pinned),
+            token: Some(Arc::new(())),
+            wake: Some(tx),
+        });
+        assert!(live::snapshot().unwrap().queues.is_empty());
+        pioneer_observability::set_telemetry_enabled(old);
+    }
+
     use std::num::NonZeroUsize;
     fn authorized_core() -> ClientCore {
         use pioneer_protocol::*;
@@ -926,6 +1189,87 @@ mod tests {
             runtimes: ids.iter().map(|id| runtime(id)).collect(),
         }
     }
+    fn replace_connection(core: &ClientCore, connection: u64) {
+        let scope = ClientScope::Administration { workspace_id: None };
+        let previous = core.snapshot(&scope).unwrap();
+        let mut identity = (*previous
+            .snapshot()
+            .payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>()
+            .unwrap())
+        .clone();
+        identity.connection_id = Some(connection);
+        core.publish(
+            &ClientMutationAuthority { _private: () },
+            scope,
+            crate::threads::registry::revisions(previous.revisions().scoped().get() + 1),
+            Arc::new(identity),
+            vec![],
+        );
+    }
+
+    #[test]
+    fn catalog_wait_follows_only_bounded_same_authorization_connections() {
+        for replacements in [1, 2, 3] {
+            let core = authorized_core();
+            let mut waits = 0;
+            let result =
+                core.read_provider_runtime_request_with_wait("workspace", true, None, |_| {
+                    waits += 1;
+                    if waits <= replacements {
+                        let old = request(&core, "workspace");
+                        replace_connection(&core, waits as u64);
+                        core.complete_provider_runtime(
+                            &old,
+                            Ok(response(100, &["stale"])),
+                            Instant::now(),
+                        );
+                    } else {
+                        let current = request(&core, "workspace");
+                        core.complete_provider_runtime(
+                            &current,
+                            Ok(response(1, &["current"])),
+                            Instant::now(),
+                        );
+                    }
+                    Ok(())
+                });
+            if replacements <= 2 {
+                assert_eq!(result.unwrap().runtimes[0].runtime_id, "current");
+                assert_eq!(waits, replacements + 1);
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "provider_runtime_cancelled"
+                );
+                assert_eq!(waits, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_wait_cannot_cross_authorization_loss_or_repeat_a_probe() {
+        for probe in [false, true] {
+            let core = authorized_core();
+            let mut waits = 0;
+            let result = core.read_provider_runtime_request_with_wait(
+                "workspace",
+                true,
+                probe.then_some(None),
+                |_| {
+                    waits += 1;
+                    if probe {
+                        replace_connection(&core, 9);
+                    } else {
+                        core.clear_authorization_projections();
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(waits, 1);
+        }
+    }
+
     #[test]
     fn explicit_probe_supersedes_snapshot_once_and_shares_the_existing_worker_generation() {
         let core = authorized_core();
@@ -1198,6 +1542,64 @@ mod tests {
         );
     }
     #[test]
+    fn cli_partial_deltas_preserve_siblings_and_revision_gap_recovers_full_snapshot() {
+        let core = authorized_core();
+        let first = observe(&core, "workspace");
+        core.complete_provider_runtime(&first, Ok(response(10, &["a", "b", "c"])), Instant::now());
+        let before = core.provider_runtime_snapshot("workspace").unwrap();
+        let notify = |revision, id: &str, removed, enabled| {
+            let mut changed = runtime(id);
+            changed.enabled = enabled;
+            if !enabled {
+                changed.status = pioneer_protocol::RuntimeStatus::Disabled;
+            }
+            core.reduce_provider_runtime_notification(
+                &GatewayNotification::CLIRuntimeStatusChanged(
+                    pioneer_protocol::CLIRuntimeStatusChangedNotification {
+                        workspace_id: "workspace".into(),
+                        revision,
+                        runtime: changed,
+                        removed,
+                    },
+                ),
+            );
+        };
+        notify(11, "a", false, false);
+        let disabled = core.provider_runtime_snapshot("workspace").unwrap();
+        assert!(!disabled.runtimes[0].enabled);
+        for index in [1, 2] {
+            assert!(Arc::ptr_eq(
+                &before.runtimes[index],
+                &disabled.runtimes[index]
+            ));
+        }
+        notify(12, "a", true, false);
+        let removed = core.provider_runtime_snapshot("workspace").unwrap();
+        assert_eq!(removed.runtimes.len(), 2);
+        assert!(Arc::ptr_eq(&before.runtimes[1], &removed.runtimes[0]));
+        // Revision 13 was lost. Applying 14 would create a mixed catalog;
+        // the reducer retains rows and requests an authoritative snapshot.
+        notify(14, "b", false, false);
+        assert!(Arc::ptr_eq(
+            &removed,
+            &core.provider_runtime_snapshot("workspace").unwrap()
+        ));
+        let recovery = request(&core, "workspace");
+        core.complete_provider_runtime(&recovery, Ok(response(14, &["b", "c"])), Instant::now());
+        let recovered = core.provider_runtime_snapshot("workspace").unwrap();
+        assert_eq!(recovered.runtimes.len(), 2);
+        notify(13, "a", false, true);
+        assert!(Arc::ptr_eq(
+            &recovered,
+            &core.provider_runtime_snapshot("workspace").unwrap()
+        ));
+        assert!(
+            core.provider_runtime_request_for_test("workspace")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn access_invalidation_drops_data_and_rejects_old_request() {
         let core = authorized_core();
         let work = observe(&core, "workspace");
@@ -1234,5 +1636,31 @@ impl ClientCore {
         result: Result<CLIRuntimeListResponse, ()>,
     ) {
         self.complete_provider_runtime(&request, result, Instant::now());
+    }
+}
+
+// Fixture completions enter the existing owner; no worker or extra demand is started.
+#[cfg(feature = "test-support")]
+impl ClientMutationAuthority {
+    pub fn complete_provider_runtime_for_test(
+        &self,
+        core: &ClientCore,
+        workspace: &str,
+        result: Result<CLIRuntimeListResponse, ()>,
+    ) {
+        let request = core
+            .provider_runtime_request_for_test(workspace)
+            .expect("pending runtime fixture request");
+        core.complete_provider_runtime_for_test(request, result);
+    }
+
+    pub fn provider_runtime_status_changed_for_test(
+        &self,
+        core: &ClientCore,
+        update: pioneer_protocol::CLIRuntimeStatusChangedNotification,
+    ) {
+        core.observe_provider_runtime_notification(&GatewayNotification::CLIRuntimeStatusChanged(
+            update,
+        ));
     }
 }

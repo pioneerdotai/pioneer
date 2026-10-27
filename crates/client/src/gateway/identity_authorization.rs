@@ -439,6 +439,45 @@ impl ClientCore {
         Ok(auth)
     }
 
+    /// Acknowledged transport renewal has already verified the exact durable
+    /// subject on Gateway. Update only its session receipt without a second RPC
+    /// behind an in-flight domain request, or a new operation/auth epoch.
+    pub(crate) fn finish_gateway_access_renewal(
+        &self,
+        generation: u64,
+        connection: Option<u64>,
+        metadata: &super::session_lifecycle::GatewaySessionMetadata,
+    ) -> anyhow::Result<()> {
+        let mut owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        anyhow::ensure!(
+            !self.is_stopped()
+                && owner.identity_request == generation
+                && self.gateway_http_generation() == connection,
+            "Gateway access renewal is stale"
+        );
+        let mut auth = owner
+            .current_auth
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Gateway identity is unavailable"))?;
+        anyhow::ensure!(
+            auth.gateway.id == metadata.gateway_id
+                && auth.device.id == metadata.device_id
+                && auth.session.id == metadata.session_id
+                && auth.session.status == pioneer_protocol::AuthSessionStatus::Active
+                && auth.session.refresh_generation <= metadata.refresh_generation,
+            "Gateway access renewal identity mismatch"
+        );
+        auth.session.refresh_generation = metadata.refresh_generation;
+        auth.session.refresh_expires_at_unix = metadata.refresh_expires_at_unix;
+        self.apply_current_auth(&mut owner, &auth);
+        drop(owner); // Never acquire domain owners under the identity lock.
+        self.renew_workspace_push();
+        Ok(())
+    }
+
     /// Serializes capability reads and owns their bounded recovery policy. Shells
     /// observe the accepted projection and request state through one publication.
     pub fn refresh_identity_authorization(

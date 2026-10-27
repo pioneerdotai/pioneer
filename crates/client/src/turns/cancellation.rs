@@ -38,6 +38,7 @@ pub struct TurnCancellationIntent {
 }
 #[derive(Clone)]
 struct CancellationRequest {
+    work_context: pioneer_observability::work::WorkCarrier,
     identity: TurnCancellationIdentity,
     token: ThreadOperationToken,
     params: pioneer_protocol::TurnCancelParams,
@@ -51,6 +52,7 @@ pub(crate) struct TurnCancellationController {
     suspended: BTreeSet<String>,
     subscriptions: BTreeMap<String, usize>,
     sender: Option<mpsc::SyncSender<CancellationRequest>>,
+    observer: Option<pioneer_observability::queues::QueueObserver>,
     task: Option<std::thread::JoinHandle<()>>,
 }
 impl TurnCancellationController {
@@ -166,6 +168,12 @@ impl ClientCore {
             generation: owner.generation,
         };
         let request = CancellationRequest {
+            work_context: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
             identity: identity.clone(),
             token,
             params,
@@ -180,10 +188,14 @@ impl ClientCore {
                 state: TurnCancellationState::Pending,
             },
         );
-        let queued = owner
-            .sender
-            .as_ref()
-            .is_some_and(|tx| tx.try_send(request.clone()).is_ok());
+        let queued = owner.sender.as_ref().is_some_and(|tx| {
+            pioneer_observability::queues::observe_try_send(
+                owner.observer.as_ref(),
+                pioneer_observability::queues::QueueBytes::Unsupported,
+                || tx.try_send(request.clone()),
+            )
+            .is_ok()
+        });
         drop(owner);
         if !queued {
             self.complete_turn_cancellation(request, Err("Turn cancellation unavailable".into()));
@@ -210,9 +222,7 @@ impl ClientCore {
         request: CancellationRequest,
         result: Result<pioneer_protocol::TurnCancelResponse, String>,
     ) {
-        if !self.turn_cancellation_matches(&request) {
-            return;
-        }
+        let applicable = self.turn_cancellation_matches(&request);
         let mut owner = self
             .turn_cancellations
             .lock()
@@ -222,6 +232,26 @@ impl ClientCore {
             .get(&request.identity.thread_id)
             .is_none_or(|r| r.identity != request.identity)
         {
+            return;
+        }
+        if !applicable {
+            // The old ticket cannot apply a response, but still owns this exact
+            // cancellation. Retire it before another Stop can be admitted.
+            self.finish_thread_turn_cancellation(
+                &request.token,
+                &request.identity.turn_id,
+                None,
+                true,
+            );
+            owner.requests.remove(&request.identity.thread_id);
+            self.publish_turn_cancellation(
+                &mut owner,
+                TurnCancellationPublication {
+                    identity: request.identity,
+                    revision: 0,
+                    state: TurnCancellationState::Cancelled,
+                },
+            );
             return;
         }
         let (event, state) = match result {
@@ -349,15 +379,37 @@ impl ClientCore {
     }
     pub(crate) fn start_turn_cancellation_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel::<CancellationRequest>(64);
+        let queue_observer = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(64),
+            "unsupported: controller request payload/shared references are not serialized",
+        );
+        let worker_queue = queue_observer.clone();
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-turn-cancellation".into())
             .spawn(move || {
                 while let Ok(request) = receiver.recv() {
+                    worker_queue.dequeued(pioneer_observability::queues::QueueBytes::Unsupported);
+                    let mut processing = worker_queue.processing();
+                    let carrier = request.work_context.clone().received(
+                        pioneer_observability::work::Boundary::StdThread,
+                        pioneer_observability::work::WorkKind::ClientCommand,
+                        pioneer_observability::work::ExecutorRole::ClientController,
+                    );
+                    let _scope = carrier.enter();
+                    let mut active_work = pioneer_observability::live::WorkGuard::start(
+                        pioneer_observability::work::current(),
+                        false,
+                    );
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
                     if !core.turn_cancellation_matches(&request) {
+                        core.complete_turn_cancellation(
+                            request,
+                            Err("Turn cancellation connection changed".into()),
+                        );
                         continue;
                     }
                     let sender = core.transport_runtime().ws_command_sender();
@@ -368,7 +420,14 @@ impl ClientCore {
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
+                    let outcome = if result.is_ok() {
+                        pioneer_observability::work::Outcome::Completed
+                    } else {
+                        pioneer_observability::work::Outcome::Failed
+                    };
                     core.complete_turn_cancellation(request, result);
+                    processing.processed();
+                    active_work.finish(outcome);
                 }
             })
             .expect("turn cancellation worker could not start");
@@ -376,6 +435,7 @@ impl ClientCore {
             .turn_cancellations
             .lock()
             .expect("turn cancellations poisoned");
+        owner.observer = Some(queue_observer);
         owner.sender = Some(sender);
         owner.task = Some(task);
     }
@@ -523,6 +583,32 @@ mod tests {
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
             },
         }
+    }
+    #[test]
+    fn retired_ticket_releases_exact_stop_and_late_reply_cannot_cancel_retry() {
+        let (core, queue) = fixture();
+        request(&core);
+        let mut old = queue.try_recv().unwrap();
+        old.auth.0 += 1;
+        core.complete_turn_cancellation(old.clone(), Ok(response("turn")));
+        assert_eq!(
+            core.turn_cancellation_snapshot("a").unwrap().state,
+            TurnCancellationState::Cancelled
+        );
+        assert!(
+            !core
+                .thread_coordinator_snapshot("a")
+                .unwrap()
+                .conversation
+                .is_cancelling_turn()
+        );
+        assert_eq!(request(&core), ClientTransitionOutcome::Changed);
+        let pending = core.turn_cancellation_snapshot("a").unwrap();
+        core.complete_turn_cancellation(old, Err("late".into()));
+        assert!(Arc::ptr_eq(
+            &pending,
+            &core.turn_cancellation_snapshot("a").unwrap()
+        ));
     }
     #[test]
     fn failure_retry_and_duplicate_completion_preserve_the_draft() {

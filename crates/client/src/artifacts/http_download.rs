@@ -822,7 +822,7 @@ async fn verified_file(
     let path = path.to_owned();
     let expected_size = request.expected_size_bytes;
     let expected_sha = request.expected_sha256.clone();
-    tokio::task::spawn_blocking(move || {
+    pioneer_observability::work::spawn_blocking(move || {
         verify_file_sync(path.as_path(), expected_size, &expected_sha)
     })
     .await
@@ -979,7 +979,7 @@ fn append_file_suffix(path: &Path, suffix: &str) -> Result<PathBuf, ArtifactHttp
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::{
         collections::VecDeque,
@@ -1047,6 +1047,35 @@ mod tests {
                 body: GatewayHttpBody::from_test_chunks(response.chunks, cancellation),
             })
         }
+    }
+
+    // Reuse this module's isolated HTTP fixture for the action/admission regression.
+    pub(in crate::artifacts) async fn verified_html_fixture(
+        operation: &crate::artifacts::operations::ArtifactDownloadOperation,
+        directory: &Path,
+    ) -> ArtifactHttpDownloadResult {
+        let bytes = b"<p>Verified HTML</p>";
+        let request = request(bytes);
+        let http = Arc::new(FakeHttp::new(vec![head(bytes), full(bytes, vec![bytes])]));
+        let service = ArtifactHttpDownloadService::with_http(http.clone(), directory);
+        let result = service
+            .download(
+                request.clone(),
+                operation.cancellation(),
+                Some(&|progress| operation.update_progress(progress)),
+            )
+            .await
+            .expect("verified HTML");
+        assert_eq!(result.artifact_id, request.artifact_id);
+        assert_eq!(result.version_id, request.version_id);
+        assert_eq!(result.sha256, request.expected_sha256);
+        assert_eq!(result.size_bytes, bytes.len() as u64);
+        assert_eq!(
+            tokio::fs::read(result.local_path.as_path()).await.unwrap(),
+            bytes
+        );
+        assert_eq!(http.requests().len(), 2);
+        result
     }
 
     #[tokio::test]

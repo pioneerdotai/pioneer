@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+pioneer-observability.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

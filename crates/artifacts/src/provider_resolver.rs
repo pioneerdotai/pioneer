@@ -40,10 +40,30 @@ impl ArtifactService {
             .get_artifact_version_blob(workspace_id, artifact_id, version_id)
             .await?;
         let safe_name = provider_safe_name(summary.artifact.display_name.as_str());
-        let path = self
-            .blob_store
-            .materialize_readable_copy(workspace_id, blob.storage_key.as_str(), safe_name.as_str())
-            .await?;
+        let temporary_preview = summary.created_by_kind
+            == pioneer_protocol::ArtifactCreatedByKind::Tool
+            && summary.created_by_actor_id.as_deref() == Some("html_preview")
+            && summary.metadata.get("htmlTool").is_some_and(|meta| {
+                matches!(meta["version"].as_u64(), Some(1 | 2)) && meta["publication"] == false
+            });
+        // CUA canonical history retains the admitted immutable original, never
+        // a readable copy whose independent TTL can expire during replay.
+        let cua_capture = summary.created_by_kind == pioneer_protocol::ArtifactCreatedByKind::Tool
+            && summary.created_by_actor_id.as_deref() == Some("cua_capture");
+        let original = if temporary_preview || cua_capture {
+            self.blob_store
+                .local_blob_path(workspace_id, &blob.storage_key)?
+        } else {
+            None
+        };
+        let path = match original {
+            Some(path) => path,
+            None => {
+                self.blob_store
+                    .materialize_readable_copy(workspace_id, &blob.storage_key, &safe_name)
+                    .await?
+            }
+        };
         let mime_type = summary
             .artifact
             .mime_type

@@ -76,6 +76,8 @@ pub struct GatewayConfig {
     pub artifacts: GatewayArtifactsConfig,
     #[serde(default)]
     pub resilience: GatewayResilienceConfig,
+    #[serde(default)]
+    pub context_compaction: GatewayContextCompactionConfig,
     pub auth: GatewayAuthConfig,
 }
 
@@ -325,6 +327,53 @@ impl Default for GatewayArtifactsConfig {
             view_grants_per_session: default_gateway_artifacts_view_grants_per_session(),
             view_grant_streams: default_gateway_artifacts_view_grant_streams(),
         }
+    }
+}
+
+/// Activity window for optional preparation of the main conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GatewayContextCompactionConfig {
+    pub hot_conversation_window_secs: u64,
+}
+
+impl Default for GatewayContextCompactionConfig {
+    fn default() -> Self {
+        Self {
+            hot_conversation_window_secs: 28_800,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GatewayContextCompactionConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct Wire {
+            hot_conversation_window_secs: u64,
+        }
+        impl Default for Wire {
+            fn default() -> Self {
+                Self {
+                    hot_conversation_window_secs: GatewayContextCompactionConfig::default()
+                        .hot_conversation_window_secs,
+                }
+            }
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        // Keep conversion to the durable signed millisecond clock bounded.
+        if wire.hot_conversation_window_secs == 0
+            || wire.hot_conversation_window_secs > i64::MAX as u64 / 1_000
+        {
+            return Err(serde::de::Error::custom(
+                "hot_conversation_window_secs must be positive and fit signed milliseconds",
+            ));
+        }
+        Ok(Self {
+            hot_conversation_window_secs: wire.hot_conversation_window_secs,
+        })
     }
 }
 
@@ -923,6 +972,8 @@ pub enum GatewayThreadEpisodicVectorProviderConfig {
     OpenAi,
     #[serde(rename = "openrouter")]
     OpenRouter,
+    #[serde(rename = "vercel-ai-gateway")]
+    VercelAiGateway,
     #[serde(rename = "local")]
     Local,
 }
@@ -1272,6 +1323,8 @@ pub enum GatewayCliAgentRuntimeKindConfig {
     #[default]
     Codex,
     Claude,
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1853,86 +1906,14 @@ impl Default for GatewayWebToolsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayComputerUseToolsConfig {
-    #[serde(default = "default_computer_use_artifacts_subdir")]
-    pub artifacts_subdir: String,
-    #[serde(default = "default_computer_use_retention_hours")]
-    pub retention_hours: u64,
     #[serde(default = "default_computer_use_max_total_bytes")]
     pub max_total_bytes: u64,
-    #[serde(default = "default_computer_use_run_max_steps_default")]
-    pub run_max_steps_default: u32,
-    #[serde(default = "default_computer_use_snapshot_transport_max_bytes")]
-    pub snapshot_transport_max_bytes: usize,
-    #[serde(default = "default_computer_use_snapshot_transport_max_side_px")]
-    pub snapshot_transport_max_side_px: u32,
-    #[serde(default = "default_computer_use_snapshot_transport_min_side_px")]
-    pub snapshot_transport_min_side_px: u32,
-    #[serde(default = "default_computer_use_snapshot_downscale_factor")]
-    pub snapshot_downscale_factor: f64,
-    #[serde(default = "default_computer_use_accessibility_tree_max_depth")]
-    pub accessibility_tree_max_depth: usize,
-    #[serde(default = "default_computer_use_accessibility_tree_max_nodes")]
-    pub accessibility_tree_max_nodes: usize,
-    #[serde(default = "default_computer_use_accessibility_tree_max_serialized_bytes")]
-    pub accessibility_tree_max_serialized_bytes: usize,
-    #[serde(default = "default_computer_use_accessibility_tree_text_max_chars")]
-    pub accessibility_tree_text_max_chars: usize,
-    #[serde(default = "default_computer_use_semantic_action_timeout_ms")]
-    pub semantic_action_timeout_ms: u64,
-    #[serde(default = "default_computer_use_app_activation_timeout_ms")]
-    pub app_activation_timeout_ms: u64,
-    #[serde(default = "default_computer_use_input_simulation_enabled")]
-    pub input_simulation_enabled: bool,
-    #[serde(default = "default_computer_use_launch_if_missing_default")]
-    pub launch_if_missing_default: bool,
-    #[serde(default)]
-    pub allowed_launch_commands: Vec<String>,
-    #[serde(default = "default_computer_use_preflight_screenshot_probe_enabled")]
-    pub preflight_screenshot_probe_enabled: bool,
-    #[serde(default = "default_computer_use_max_consecutive_same_snapshot_hash")]
-    pub max_consecutive_same_snapshot_hash: u32,
-    #[serde(default = "default_computer_use_max_consecutive_same_action_signature")]
-    pub max_consecutive_same_action_signature: u32,
-    #[serde(default = "default_computer_use_max_consecutive_no_progress_steps")]
-    pub max_consecutive_no_progress_steps: u32,
-    #[serde(default = "default_computer_use_max_recovery_attempts_per_step")]
-    pub max_recovery_attempts_per_step: u32,
-    #[serde(default = "default_computer_use_max_recovery_attempts_per_run")]
-    pub max_recovery_attempts_per_run: u32,
 }
 
 impl Default for GatewayComputerUseToolsConfig {
     fn default() -> Self {
         Self {
-            artifacts_subdir: default_computer_use_artifacts_subdir(),
-            retention_hours: default_computer_use_retention_hours(),
             max_total_bytes: default_computer_use_max_total_bytes(),
-            run_max_steps_default: default_computer_use_run_max_steps_default(),
-            snapshot_transport_max_bytes: default_computer_use_snapshot_transport_max_bytes(),
-            snapshot_transport_max_side_px: default_computer_use_snapshot_transport_max_side_px(),
-            snapshot_transport_min_side_px: default_computer_use_snapshot_transport_min_side_px(),
-            snapshot_downscale_factor: default_computer_use_snapshot_downscale_factor(),
-            accessibility_tree_max_depth: default_computer_use_accessibility_tree_max_depth(),
-            accessibility_tree_max_nodes: default_computer_use_accessibility_tree_max_nodes(),
-            accessibility_tree_max_serialized_bytes:
-                default_computer_use_accessibility_tree_max_serialized_bytes(),
-            accessibility_tree_text_max_chars:
-                default_computer_use_accessibility_tree_text_max_chars(),
-            semantic_action_timeout_ms: default_computer_use_semantic_action_timeout_ms(),
-            app_activation_timeout_ms: default_computer_use_app_activation_timeout_ms(),
-            input_simulation_enabled: default_computer_use_input_simulation_enabled(),
-            launch_if_missing_default: default_computer_use_launch_if_missing_default(),
-            allowed_launch_commands: Vec::new(),
-            preflight_screenshot_probe_enabled:
-                default_computer_use_preflight_screenshot_probe_enabled(),
-            max_consecutive_same_snapshot_hash:
-                default_computer_use_max_consecutive_same_snapshot_hash(),
-            max_consecutive_same_action_signature:
-                default_computer_use_max_consecutive_same_action_signature(),
-            max_consecutive_no_progress_steps:
-                default_computer_use_max_consecutive_no_progress_steps(),
-            max_recovery_attempts_per_step: default_computer_use_max_recovery_attempts_per_step(),
-            max_recovery_attempts_per_run: default_computer_use_max_recovery_attempts_per_run(),
         }
     }
 }
@@ -2037,20 +2018,8 @@ const fn default_tool_retry_max_retries_per_tool_name_per_episode() -> u32 {
     16
 }
 
-fn default_computer_use_artifacts_subdir() -> String {
-    "tools/computer_use".to_owned()
-}
-
-const fn default_computer_use_retention_hours() -> u64 {
-    24
-}
-
 const fn default_computer_use_max_total_bytes() -> u64 {
     1024 * 1024 * 1024
-}
-
-const fn default_computer_use_run_max_steps_default() -> u32 {
-    300
 }
 
 const fn default_gateway_keepawake() -> bool {
@@ -2198,78 +2167,6 @@ const fn default_gateway_hook_recovery_max_concurrent() -> usize {
 
 const fn default_gateway_hook_recovery_stale_running_after_ms() -> u64 {
     120_000
-}
-
-const fn default_computer_use_snapshot_transport_max_bytes() -> usize {
-    8 * 1024 * 1024
-}
-
-const fn default_computer_use_snapshot_transport_max_side_px() -> u32 {
-    1280
-}
-
-const fn default_computer_use_snapshot_transport_min_side_px() -> u32 {
-    320
-}
-
-const fn default_computer_use_snapshot_downscale_factor() -> f64 {
-    0.85
-}
-
-const fn default_computer_use_accessibility_tree_max_depth() -> usize {
-    6
-}
-
-const fn default_computer_use_accessibility_tree_max_nodes() -> usize {
-    200
-}
-
-const fn default_computer_use_accessibility_tree_max_serialized_bytes() -> usize {
-    192 * 1024
-}
-
-const fn default_computer_use_accessibility_tree_text_max_chars() -> usize {
-    160
-}
-
-const fn default_computer_use_semantic_action_timeout_ms() -> u64 {
-    30_000
-}
-
-const fn default_computer_use_app_activation_timeout_ms() -> u64 {
-    5_000
-}
-
-const fn default_computer_use_input_simulation_enabled() -> bool {
-    true
-}
-
-const fn default_computer_use_launch_if_missing_default() -> bool {
-    false
-}
-
-const fn default_computer_use_preflight_screenshot_probe_enabled() -> bool {
-    true
-}
-
-const fn default_computer_use_max_consecutive_same_snapshot_hash() -> u32 {
-    6
-}
-
-const fn default_computer_use_max_consecutive_same_action_signature() -> u32 {
-    8
-}
-
-const fn default_computer_use_max_consecutive_no_progress_steps() -> u32 {
-    4
-}
-
-const fn default_computer_use_max_recovery_attempts_per_step() -> u32 {
-    2
-}
-
-const fn default_computer_use_max_recovery_attempts_per_run() -> u32 {
-    12
 }
 
 const fn default_provider_non_stream_request_timeout_secs() -> u64 {
@@ -2420,12 +2317,35 @@ fn default_claude_cli_agent_runtime_instance(
     }
 }
 
+fn default_opencode_cli_agent_runtime_instance(
+    defaults: &GatewayCliAgentRuntimeConfig,
+) -> EffectiveGatewayCliAgentRuntimeInstanceConfig {
+    EffectiveGatewayCliAgentRuntimeInstanceConfig {
+        id: "opencode".to_owned(),
+        kind: GatewayCliAgentRuntimeKindConfig::OpenCode,
+        display_name: "OpenCode".to_owned(),
+        enabled: defaults.enabled,
+        binary_path: "opencode".to_owned(),
+        home_path: "~/.config/opencode".to_owned(),
+        shadow_home_path: None,
+        custom_models: Vec::new(),
+        app_server_args: Vec::new(),
+        startup_probe_timeout_ms: defaults.startup_timeout_ms,
+        request_timeout_ms: defaults.request_timeout_ms,
+        idle_session_ttl_secs: defaults.idle_session_ttl_secs,
+        event_channel_capacity: defaults.event_channel_capacity,
+        stderr_ring_lines: defaults.stderr_ring_lines,
+        debug_native_events: defaults.debug_native_events,
+    }
+}
+
 fn default_cli_agent_runtime_instances(
     defaults: &GatewayCliAgentRuntimeConfig,
 ) -> Vec<EffectiveGatewayCliAgentRuntimeInstanceConfig> {
     vec![
         default_codex_cli_agent_runtime_instance(defaults),
         default_claude_cli_agent_runtime_instance(defaults),
+        default_opencode_cli_agent_runtime_instance(defaults),
     ]
 }
 
@@ -2478,6 +2398,7 @@ fn default_cli_agent_runtime_binary_path(kind: GatewayCliAgentRuntimeKindConfig)
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => "codex".to_owned(),
         GatewayCliAgentRuntimeKindConfig::Claude => "claude".to_owned(),
+        GatewayCliAgentRuntimeKindConfig::OpenCode => "opencode".to_owned(),
     }
 }
 
@@ -2485,6 +2406,7 @@ fn default_cli_agent_runtime_home_path(kind: GatewayCliAgentRuntimeKindConfig) -
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => "~/.codex".to_owned(),
         GatewayCliAgentRuntimeKindConfig::Claude => "~/.claude".to_owned(),
+        GatewayCliAgentRuntimeKindConfig::OpenCode => "~/.config/opencode".to_owned(),
     }
 }
 
@@ -3792,10 +3714,19 @@ kind = "claude"
             4
         );
 
-        assert_eq!(
-            config.gateway.effective_cli_agent_runtime_instances().len(),
-            2
-        );
+        let instances = config.gateway.effective_cli_agent_runtime_instances();
+        assert_eq!(instances.len(), 3);
+        for (id, kind) in [
+            ("codex", GatewayCliAgentRuntimeKindConfig::Codex),
+            ("claude", GatewayCliAgentRuntimeKindConfig::Claude),
+            ("opencode", GatewayCliAgentRuntimeKindConfig::OpenCode),
+        ] {
+            let instance = instances
+                .iter()
+                .find(|instance| instance.id == id)
+                .expect(id);
+            assert_eq!(instance.kind, kind);
+        }
 
         let _ = fs::remove_file(workspace_override);
     }
@@ -3840,7 +3771,12 @@ request_timeout_ms = 60000
                 .expect("load config with default CLI runtimes enabled");
         let instances = config.gateway.effective_cli_agent_runtime_instances();
 
-        assert_eq!(instances.len(), 2);
+        assert_eq!(instances.len(), 3);
+        assert_eq!(
+            instances[2].kind,
+            GatewayCliAgentRuntimeKindConfig::OpenCode
+        );
+        assert_eq!(instances[2].id, "opencode");
         assert_eq!(instances[0].id, "codex");
         assert_eq!(instances[0].kind, GatewayCliAgentRuntimeKindConfig::Codex);
         assert_eq!(instances[0].display_name, "Codex");
@@ -3892,7 +3828,8 @@ request_timeout_ms = 45000
         assert_eq!(config.gateway.cli_agent_runtimes.instances.len(), 1);
 
         let instances = config.gateway.effective_cli_agent_runtime_instances();
-        assert_eq!(instances.len(), 3);
+        assert_eq!(instances.len(), 4);
+        assert_eq!(instances[3].id, "opencode");
         let instance = &instances[0];
         assert_eq!(instance.id, "codex_personal");
         assert_eq!(instance.kind, GatewayCliAgentRuntimeKindConfig::Codex);
@@ -3946,7 +3883,8 @@ request_timeout_ms = 0
                 .expect("load config with multiple codex runtime instances");
         let instances = config.gateway.effective_cli_agent_runtime_instances();
 
-        assert_eq!(instances.len(), 4);
+        assert_eq!(instances.len(), 5);
+        assert_eq!(instances[4].id, "opencode");
         assert_eq!(instances[0].id, "codex_personal");
         assert_eq!(instances[0].display_name, "Codex Personal");
         assert!(instances[0].enabled);
@@ -4027,6 +3965,72 @@ hard_secs = 0
         assert_eq!(config.provider_stream_items.lease_secs, 960);
         assert_eq!(config.provider_stream_items.idle_secs, 900);
         assert_eq!(config.provider_stream_items.hard_secs, 1_800);
+    }
+
+    // Contract: older config files retain eight hours; user layers may override
+    // it, but invalid durations cannot accidentally admit unbounded warming.
+    // Existing resilience tests exercise operation deadlines, not this layer.
+    #[test]
+    fn conversation_compaction_window_defaults_and_user_override() {
+        let config = load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new()).unwrap();
+        assert_eq!(
+            config
+                .gateway
+                .context_compaction
+                .hot_conversation_window_secs,
+            28_800
+        );
+        let mut legacy: toml::Value = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
+        legacy["gateway"]
+            .as_table_mut()
+            .unwrap()
+            .remove("context_compaction");
+        let legacy = toml::to_string(&legacy).unwrap();
+        let config = load_config_from_sources(&legacy, Vec::new()).unwrap();
+        assert_eq!(
+            config
+                .gateway
+                .context_compaction
+                .hot_conversation_window_secs,
+            28_800
+        );
+
+        let user_override = unique_temp_file_path("conversation-compaction-window");
+        write_file(
+            &user_override,
+            "[gateway.context_compaction]\nhot_conversation_window_secs = 3600\n",
+        );
+        let config = load_config_from_sources(&legacy, vec![user_override.clone()]).unwrap();
+        assert_eq!(
+            config
+                .gateway
+                .context_compaction
+                .hot_conversation_window_secs,
+            3_600
+        );
+        // The empty section is also backward compatible when the field is absent.
+        write_file(&user_override, "[gateway.context_compaction]\n");
+        let config = load_config_from_sources(&legacy, vec![user_override.clone()]).unwrap();
+        assert_eq!(
+            config
+                .gateway
+                .context_compaction
+                .hot_conversation_window_secs,
+            28_800
+        );
+        for invalid in ["0", "-1", "9223372036854776", "18446744073709551616"] {
+            write_file(
+                &user_override,
+                &format!(
+                    "[gateway.context_compaction]\nhot_conversation_window_secs = {invalid}\n"
+                ),
+            );
+            assert!(
+                load_config_from_sources(&legacy, vec![user_override.clone()]).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        let _ = fs::remove_file(user_override);
     }
 
     #[test]
@@ -4276,139 +4280,8 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
                 .runtime_recheck_on_tool_call
         );
         assert_eq!(
-            config.gateway.tools.computer_use.artifacts_subdir,
-            "tools/computer_use"
-        );
-        assert_eq!(config.gateway.tools.computer_use.retention_hours, 24);
-        assert_eq!(
             config.gateway.tools.computer_use.max_total_bytes,
             1024 * 1024 * 1024
-        );
-        assert_eq!(config.gateway.tools.computer_use.run_max_steps_default, 300);
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .snapshot_transport_max_bytes,
-            8 * 1024 * 1024
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .snapshot_transport_max_side_px,
-            1280
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .snapshot_transport_min_side_px,
-            320
-        );
-        assert_eq!(
-            config.gateway.tools.computer_use.snapshot_downscale_factor,
-            0.85
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .accessibility_tree_max_depth,
-            6
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .accessibility_tree_max_nodes,
-            200
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .accessibility_tree_max_serialized_bytes,
-            192 * 1024
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .accessibility_tree_text_max_chars,
-            160
-        );
-        assert_eq!(
-            config.gateway.tools.computer_use.semantic_action_timeout_ms,
-            30_000
-        );
-        assert_eq!(
-            config.gateway.tools.computer_use.app_activation_timeout_ms,
-            5_000
-        );
-        assert!(config.gateway.tools.computer_use.input_simulation_enabled);
-        assert!(!config.gateway.tools.computer_use.launch_if_missing_default);
-        assert!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .allowed_launch_commands
-                .is_empty()
-        );
-        assert!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .preflight_screenshot_probe_enabled
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_consecutive_same_snapshot_hash,
-            6
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_consecutive_same_action_signature,
-            8
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_consecutive_no_progress_steps,
-            4
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_recovery_attempts_per_step,
-            2
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_recovery_attempts_per_run,
-            12
         );
         assert_eq!(
             config.gateway.provider.attachments.max_bytes_per_attachment,

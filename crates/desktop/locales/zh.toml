@@ -1696,12 +1696,21 @@ add_confirm = "添加此参与者？"
 remove_confirm = "移除此参与者？"
 
 [tasks.notifications]
+mark_all_read = "全部标为已读"
 title = "任务结果"
 loading = "正在加载结果…"
-empty = "暂无任务结果"
+empty = "暂无未读任务结果"
 task = "任务"
 mark_read = "标记为已读"
 completed = "任务已完成"
+
+open = "打开会话"
+more = "加载更多"
+read = "已读"
+unread = "未读"
+retry = "重试"
+loading_failed = "无法更新任务结果"
+timed_out = "已超时"
 
 [settings.self_improvement.status]
 title = "活动"

@@ -516,7 +516,28 @@
       ]
     },
     {
-      "description": "Immutable terminal side-effect preparation. Gateway persists this\nbounded batch before acknowledging it; the subsequent canonical Turn\nterminal projection atomically makes the current batch runnable.",
+      "description": "Frozen cancellation description, registered before provider/tool work.\nRecovery may only confirm an existing description, never replace missing\nhistory with current configuration. This does not activate outbox work.",
+      "type": "object",
+      "properties": {
+        "initial_turn": {
+          "type": "boolean"
+        },
+        "kind": {
+          "type": "string",
+          "const": "native_cancellation_context_prepared"
+        },
+        "preparation": {
+          "$ref": "#/$defs/NativeTerminalEffectPreparation"
+        }
+      },
+      "required": [
+        "kind",
+        "preparation",
+        "initial_turn"
+      ]
+    },
+    {
+      "description": "Bounded obligations prepared before a canonical terminal result; the\nsubsequent terminal projection atomically makes the current batch runnable.",
       "type": "object",
       "properties": {
         "kind": {
@@ -633,6 +654,25 @@
     {
       "type": "object",
       "properties": {
+        "cancellation_owner": {
+          "description": "Initial native Stop retains its durable completion owner until ACK.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          ]
+        },
         "kind": {
           "type": "string",
           "const": "turn_interrupted"
@@ -799,6 +839,33 @@
           "additionalProperties": false,
           "required": [
             "exact"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "object",
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                },
+                "provider_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "model_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "model"
           ]
         }
       ]
@@ -1234,7 +1301,8 @@
       "type": "string",
       "enum": [
         "codex",
-        "claude"
+        "claude",
+        "opencode"
       ]
     },
     "DeltaOutputPolicy": {
@@ -2298,6 +2366,47 @@
           ]
         },
         {
+          "description": "Structured cells and the original GFM fragment with its used reference\ndefinitions, without Quote/List prefixes.",
+          "type": "object",
+          "properties": {
+            "alignments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownTableAlignment"
+              }
+            },
+            "headers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownInline"
+              }
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/MarkdownInline"
+                }
+              }
+            },
+            "source": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "table"
+            }
+          },
+          "required": [
+            "type",
+            "headers",
+            "rows",
+            "alignments",
+            "source"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "type": {
@@ -2472,6 +2581,15 @@
             "url"
           ]
         }
+      ]
+    },
+    "MarkdownTableAlignment": {
+      "type": "string",
+      "enum": [
+        "none",
+        "left",
+        "center",
+        "right"
       ]
     },
     "McpScopeKind": {
@@ -3048,7 +3166,7 @@
     "ProviderRequestId": {
       "type": "string",
       "maxLength": 128,
-      "pattern": "^(gen-|req-|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
+      "pattern": "^(gen-|req-|req_|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
     },
     "ProviderTransportKind": {
       "type": "string",
@@ -4906,6 +5024,40 @@
           ]
         },
         {
+          "description": "Dispatch claim committed; execution may still be preparing.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "run_starting"
+            },
+            "payload": {
+              "type": "object",
+              "properties": {
+                "claimed_at": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "task_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "task_id",
+                "run_id",
+                "claimed_at"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "kind": {
@@ -6438,6 +6590,31 @@
         }
       }
     },
+    "TaskFinishRequest": {
+      "description": "A user-directed final soft stop; this is not evidence that the goal succeeded.",
+      "type": "object",
+      "properties": {
+        "firstRunNumber": {
+          "description": "Earliest admitted run whose real outcome contributes to the final state.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestedAt": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "requestedAt",
+        "firstRunNumber"
+      ]
+    },
     "TaskLifecyclePolicy": {
       "type": "object",
       "properties": {
@@ -6487,6 +6664,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/TaskValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "finishRequest": {
+          "description": "Server-owned durable decision to stop future runs.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskFinishRequest"
             },
             {
               "type": "null"
@@ -7086,6 +7274,17 @@
             "null"
           ]
         },
+        "triggerInput": {
+          "description": "External data accepted for this occurrence, preserved across retries.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskRunTriggerInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "updatedAt": {
           "type": "integer",
           "format": "int64"
@@ -7101,6 +7300,13 @@
         "executorKind",
         "createdAt",
         "updatedAt"
+      ]
+    },
+    "TaskRunInputEncoding": {
+      "type": "string",
+      "enum": [
+        "utf8",
+        "base64"
       ]
     },
     "TaskRunStatus": {
@@ -7162,6 +7368,27 @@
         "primary_executor",
         "reviewer",
         "recovery"
+      ]
+    },
+    "TaskRunTriggerInput": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "contentType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "encoding": {
+          "$ref": "#/$defs/TaskRunInputEncoding"
+        }
+      },
+      "required": [
+        "encoding",
+        "body"
       ]
     },
     "TaskRunTurn": {
@@ -7422,6 +7649,13 @@
         "updatedAt": {
           "type": "integer",
           "format": "int64"
+        },
+        "webhookSecretRef": {
+          "description": "Opaque keystore reference; the bearer secret is never persisted here.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

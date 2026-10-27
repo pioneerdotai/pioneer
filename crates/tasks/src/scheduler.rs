@@ -5,7 +5,7 @@ use crate::executor::{
     TaskExecutionContext, TaskExecutionHandle, TaskExecutorRegistry, TaskExecutorStartOutcome,
 };
 use crate::service::{is_terminal_task, now_timestamp_secs, task_error};
-use crate::trigger::TaskTriggerCalculator;
+use crate::trigger::{TaskTriggerCalculator, TaskTriggerCatchUpPlan};
 use anyhow::Context;
 use pioneer_crud::CrudStore;
 use pioneer_protocol::{
@@ -16,6 +16,7 @@ use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
     is_anyhow_sqlite_transient_access, retry_with_backoff,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, sleep};
@@ -24,6 +25,7 @@ use tracing::{debug, error, warn};
 const ID_LEN: usize = 21;
 pub const TASK_EXECUTION_LEASE_SECONDS: i64 = 300;
 const TASK_SCHEDULER_MAX_SLEEP_SECONDS: u64 = 60;
+const TASK_FINISH_QUEUE_TASK_LIMIT: u64 = 64;
 
 /// Only schedule calculation failures can quarantine a Task. Storage and
 /// dispatch failures must retain their existing retry/recovery behavior.
@@ -58,11 +60,14 @@ pub struct TaskScheduler {
     process_lock: Mutex<()>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct TaskTriggerQueueItem {
     task_id: String,
     wake_id: String,
     next_fire_at: i64,
+    // Only a future observation arms an occurrence. Keep the schedule snapshot
+    // so a replacement spec at the same timestamp cannot inherit it.
+    armed_trigger: Option<TaskTrigger>,
 }
 
 impl TaskScheduler {
@@ -140,11 +145,36 @@ impl TaskScheduler {
 
     pub async fn process_due_once(&self, now: i64) -> TaskRuntimeResult<usize> {
         let _guard = self.process_lock.lock().await;
-        self.rebuild_due_queue().await?;
+        // Recover a stop committed before queue disposal, without waiting for
+        // a retry's old ready_at. One bounded disposal quantum per Task keeps
+        // transactions small; any remaining queue is rediscovered next pass.
+        for task_id in self
+            .store
+            .list_task_finish_queue_candidates(TASK_FINISH_QUEUE_TASK_LIMIT)
+            .await?
+        {
+            let events = self
+                .store
+                .discard_finished_task_queue(&task_id, now)
+                .await?;
+            self.event_bus.publish_many(events).await;
+        }
+        self.rebuild_due_queue(now).await?;
         let due = self.store.list_due_active_task_triggers(now).await?;
+        let armed = self
+            .due_queue
+            .lock()
+            .await
+            .iter()
+            .filter_map(|item| item.armed_trigger.as_ref())
+            .map(|trigger| (trigger.id.clone(), trigger.clone()))
+            .collect::<HashMap<_, _>>();
         let mut created = 0usize;
         for trigger in due {
-            match self.process_trigger(trigger.clone(), now).await {
+            let is_armed = armed
+                .get(&trigger.id)
+                .is_some_and(|previous| same_scheduled_occurrence(previous, &trigger));
+            match self.process_trigger(trigger.clone(), now, is_armed).await {
                 Ok(count) => created = created.saturating_add(count),
                 Err(error) if error.downcast_ref::<TriggerScheduleError>().is_some() => {
                     self.block_task_for_trigger_failure(
@@ -175,7 +205,7 @@ impl TaskScheduler {
                 created = created.saturating_add(1);
             }
         }
-        self.rebuild_due_queue().await?;
+        self.rebuild_due_queue(now).await?;
         Ok(created)
     }
 
@@ -320,7 +350,15 @@ impl TaskScheduler {
         Ok(())
     }
 
-    async fn rebuild_due_queue(&self) -> TaskRuntimeResult<()> {
+    async fn rebuild_due_queue(&self, now: i64) -> TaskRuntimeResult<()> {
+        let armed = self
+            .due_queue
+            .lock()
+            .await
+            .iter()
+            .filter_map(|item| item.armed_trigger.as_ref())
+            .map(|trigger| (trigger.id.clone(), trigger.clone()))
+            .collect::<HashMap<_, _>>();
         let mut items = self
             .store
             .list_active_task_triggers()
@@ -328,10 +366,15 @@ impl TaskScheduler {
             .into_iter()
             .filter_map(|trigger| {
                 let next_fire_at = trigger.next_fire_at?;
+                let is_armed = next_fire_at > now
+                    || armed
+                        .get(&trigger.id)
+                        .is_some_and(|previous| same_scheduled_occurrence(previous, &trigger));
                 Some(TaskTriggerQueueItem {
-                    task_id: trigger.task_id,
-                    wake_id: trigger.id,
+                    task_id: trigger.task_id.clone(),
+                    wake_id: trigger.id.clone(),
                     next_fire_at,
+                    armed_trigger: is_armed.then_some(trigger),
                 })
             })
             .collect::<Vec<_>>();
@@ -347,6 +390,7 @@ impl TaskScheduler {
                         task_id: run.task_id,
                         wake_id: run.id,
                         next_fire_at: ready_at,
+                        armed_trigger: None,
                     })
                 }),
         );
@@ -378,7 +422,12 @@ impl TaskScheduler {
             .unwrap_or_else(|| Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS))
     }
 
-    async fn process_trigger(&self, trigger: TaskTrigger, now: i64) -> TaskRuntimeResult<usize> {
+    async fn process_trigger(
+        &self,
+        trigger: TaskTrigger,
+        now: i64,
+        armed: bool,
+    ) -> TaskRuntimeResult<usize> {
         if trigger.status != TaskTriggerStatus::Active {
             return Ok(0);
         }
@@ -437,19 +486,25 @@ impl TaskScheduler {
             .as_ref()
             .map(|policy| usize::try_from(policy.max_parallel_runs.max(1)).unwrap_or(1))
             .unwrap_or(1);
-        if active_run_count >= max_parallel_runs {
+        let catch_up =
+            TaskTriggerCalculator::due_plan(&trigger, now, armed).map_err(TriggerScheduleError)?;
+        if active_run_count >= max_parallel_runs && !catch_up.fire_times.is_empty() {
             // Capacity is a scheduling condition, not a terminal result.  Keep
             // the occurrence durable and queued; the normal queued-run pass
             // will dispatch it once a permit is available.  This prevents a
             // recurring fire from disappearing merely because a sibling is
             // still running.
             return self
-                .enqueue_saturated_occurrence(task_response, trigger, &actor_contract, now)
+                .enqueue_saturated_occurrence(
+                    task_response,
+                    trigger,
+                    &actor_contract,
+                    catch_up,
+                    now,
+                )
                 .await;
         }
 
-        let catch_up =
-            TaskTriggerCalculator::catch_up_plan(&trigger, now).map_err(TriggerScheduleError)?;
         let available_run_slots = max_parallel_runs.saturating_sub(active_run_count).max(1);
         let planned_fire_count = catch_up.fire_times.len();
         let mut fire_times = catch_up.fire_times;
@@ -496,6 +551,7 @@ impl TaskScheduler {
         let mut parent_run_id = task_response.runs.last().map(|run| run.id.clone());
         for _fire_at in fire_times {
             let run = TaskRun {
+                trigger_input: None,
                 id: generate_id(ID_LEN),
                 task_id: task_response.task.id.clone(),
                 trigger_id: Some(trigger.id.clone()),
@@ -523,11 +579,19 @@ impl TaskScheduler {
             });
             events.push(TaskEventPayload::RunCreated {
                 run: run.clone(),
-                agent_spec: task_response.agent_specs.last().cloned().map(|mut spec| {
-                    spec.run_id = Some(run.id.clone());
-                    spec.updated_at = now;
-                    spec
-                }),
+                agent_spec: task_response
+                    .agent_specs
+                    .iter()
+                    .rev()
+                    .find(|spec| spec.run_id.is_none())
+                    .or_else(|| task_response.agent_specs.last())
+                    .cloned()
+                    .map(|mut spec| {
+                        spec.id = generate_id(ID_LEN);
+                        spec.run_id = Some(run.id.clone());
+                        spec.updated_at = now;
+                        spec
+                    }),
             });
             parent_run_id = Some(run.id.clone());
             next_run_number = next_run_number
@@ -567,8 +631,7 @@ impl TaskScheduler {
         let appended = self
             .store
             .append_due_trigger_task_events(
-                trigger.id.as_str(),
-                expected_next_fire_at,
+                &trigger,
                 now,
                 events,
                 occurrence_contracts,
@@ -582,7 +645,12 @@ impl TaskScheduler {
         let created_count = runs.len();
         for run in runs {
             let _ = self
-                .dispatch_run(&self.store, task_response.task.workspace_id.clone(), run)
+                .dispatch_run(
+                    &self.store,
+                    task_response.task.workspace_id.clone(),
+                    run,
+                    None,
+                )
                 .await?;
         }
         Ok(created_count)
@@ -593,9 +661,9 @@ impl TaskScheduler {
         task_response: pioneer_protocol::TaskGetResponse,
         trigger: TaskTrigger,
         actor_contract: &pioneer_protocol::TaskActorContract,
+        catch_up: TaskTriggerCatchUpPlan,
         now: i64,
     ) -> TaskRuntimeResult<usize> {
-        let expected_next_fire_at = trigger.next_fire_at.unwrap_or(now);
         if task_response.runs.iter().any(|run| {
             run.trigger_id.as_deref() == Some(trigger.id.as_str())
                 && run.status == TaskRunStatus::Queued
@@ -605,8 +673,6 @@ impl TaskScheduler {
             // be duplicated.  Still consume this due fire, otherwise every
             // scheduler pass observes the same timestamp forever and the
             // trigger can never move past an occupied serial slot.
-            let catch_up = TaskTriggerCalculator::catch_up_plan(&trigger, now)
-                .map_err(TriggerScheduleError)?;
             let mut updated_trigger = trigger.clone();
             updated_trigger.last_fire_at = catch_up.last_fire_at;
             updated_trigger.updated_at = now;
@@ -619,8 +685,7 @@ impl TaskScheduler {
             let appended = self
                 .store
                 .append_due_trigger_task_events(
-                    trigger.id.as_str(),
-                    expected_next_fire_at,
+                    &trigger,
                     now,
                     vec![TaskEventPayload::TaskRescheduled {
                         task_id: task_response.task.id.clone(),
@@ -648,6 +713,7 @@ impl TaskScheduler {
             .transpose()?
             .unwrap_or(1);
         let run = TaskRun {
+            trigger_input: None,
             id: generate_id(ID_LEN),
             task_id: task_response.task.id.clone(),
             trigger_id: Some(trigger.id.clone()),
@@ -670,12 +736,21 @@ impl TaskScheduler {
             updated_at: now,
         };
         let mut updated_trigger = trigger.clone();
-        updated_trigger.last_fire_at = Some(expected_next_fire_at);
+        let fire_at = catch_up.fire_times[0];
+        let truncated = catch_up.fire_times.len() > 1;
+        updated_trigger.last_fire_at = if truncated {
+            Some(fire_at)
+        } else {
+            catch_up.last_fire_at
+        };
         updated_trigger.updated_at = now;
-        if is_recurring(&trigger) {
+        if truncated {
             updated_trigger.next_fire_at =
-                TaskTriggerCalculator::next_after_fire(&trigger, expected_next_fire_at)
+                TaskTriggerCalculator::next_after_fire(&trigger, fire_at)
                     .map_err(TriggerScheduleError)?;
+            updated_trigger.status = TaskTriggerStatus::Active;
+        } else if !catch_up.exhausted {
+            updated_trigger.next_fire_at = catch_up.next_fire_at;
             updated_trigger.status = TaskTriggerStatus::Active;
         } else {
             updated_trigger.next_fire_at = None;
@@ -688,11 +763,19 @@ impl TaskScheduler {
             },
             TaskEventPayload::RunCreated {
                 run: run.clone(),
-                agent_spec: task_response.agent_specs.last().cloned().map(|mut spec| {
-                    spec.run_id = Some(run.id.clone());
-                    spec.updated_at = now;
-                    spec
-                }),
+                agent_spec: task_response
+                    .agent_specs
+                    .iter()
+                    .rev()
+                    .find(|spec| spec.run_id.is_none())
+                    .or_else(|| task_response.agent_specs.last())
+                    .cloned()
+                    .map(|mut spec| {
+                        spec.id = generate_id(ID_LEN);
+                        spec.run_id = Some(run.id.clone());
+                        spec.updated_at = now;
+                        spec
+                    }),
             },
             TaskEventPayload::TaskRescheduled {
                 task_id: task_response.task.id.clone(),
@@ -716,14 +799,7 @@ impl TaskScheduler {
         )?;
         let appended = self
             .store
-            .append_due_trigger_task_events(
-                trigger.id.as_str(),
-                expected_next_fire_at,
-                now,
-                events,
-                vec![occurrence],
-                Vec::new(),
-            )
+            .append_due_trigger_task_events(&trigger, now, events, vec![occurrence], Vec::new())
             .await?;
         if appended.is_empty() {
             return Ok(0);
@@ -736,6 +812,14 @@ impl TaskScheduler {
         let Some(task_response) = self.store.get_task(run.task_id.as_str()).await? else {
             return Ok(false);
         };
+        if task_response.task.finish_request().is_some() {
+            let events = self
+                .store
+                .discard_finished_task_queue(&run.task_id, now)
+                .await?;
+            self.event_bus.publish_many(events).await;
+            return Ok(false);
+        }
         if is_terminal_task(task_response.task.status)
             || crate::service::is_terminal_run(run.status)
             || run.retry_of_run_id.is_none()
@@ -760,11 +844,13 @@ impl TaskScheduler {
             anyhow::anyhow!("invalid task occurrence retry transition: {error:?}")
         })?;
         occurrence.run_id = run.id.clone();
-        self.store
-            .upsert_task_occurrence_contract(&occurrence, now)
-            .await?;
-        self.dispatch_run(&self.store, task_response.task.workspace_id, run)
-            .await
+        self.dispatch_run(
+            &self.store,
+            task_response.task.workspace_id,
+            run,
+            Some(occurrence),
+        )
+        .await
     }
 
     async fn process_queued_run(
@@ -775,6 +861,13 @@ impl TaskScheduler {
         let Some(task_response) = store.get_task(run.task_id.as_str()).await? else {
             return Ok(false);
         };
+        if task_response.task.finish_request().is_some() {
+            let events = store
+                .discard_finished_task_queue(&run.task_id, now_timestamp_secs())
+                .await?;
+            self.event_bus.publish_many(events).await;
+            return Ok(false);
+        }
         if is_terminal_task(task_response.task.status)
             || crate::service::is_terminal_run(run.status)
         {
@@ -795,7 +888,7 @@ impl TaskScheduler {
                     run.id
                 )
             })?;
-        self.dispatch_run(store, task_response.task.workspace_id, run)
+        self.dispatch_run(store, task_response.task.workspace_id, run, None)
             .await
     }
 
@@ -810,13 +903,30 @@ impl TaskScheduler {
             .as_ref()
             .map(|policy| usize::try_from(policy.max_parallel_runs.max(1)).unwrap_or(1))
             .unwrap_or(1);
-        let active_without_queued = task_response
+        let Some(candidate) = task_response
             .runs
             .iter()
-            .filter(|run| !crate::service::is_terminal_run(run.status))
-            .filter(|run| run.id != queued_run_id)
+            .find(|run| run.id == queued_run_id)
+        else {
+            return false;
+        };
+        let now = now_timestamp_secs();
+        let occupied = task_response
+            .runs
+            .iter()
+            .filter(|run| {
+                !crate::service::is_terminal_run(run.status) && run.status != TaskRunStatus::Queued
+            })
             .count();
-        active_without_queued < max_parallel_runs
+        let earlier_ready = task_response
+            .runs
+            .iter()
+            .filter(|run| {
+                run.status == TaskRunStatus::Queued && run.run_number < candidate.run_number
+            })
+            .filter(|run| run.ready_at.is_none_or(|ready| ready <= now))
+            .count();
+        occupied.saturating_add(earlier_ready) < max_parallel_runs
     }
 
     async fn dispatch_run(
@@ -824,15 +934,22 @@ impl TaskScheduler {
         store: &Arc<CrudStore>,
         workspace_id: String,
         run: TaskRun,
+        retry_occurrence: Option<pioneer_protocol::TaskOccurrenceContract>,
     ) -> TaskRuntimeResult<bool> {
         let Some(executor) = self.executors.get(run.executor_kind).await else {
             return Ok(false);
         };
         let claimed_at = now_timestamp_secs();
-        let Some(run) = store
-            .claim_task_run_for_dispatch(run.id.as_str(), claimed_at)
-            .await?
-        else {
+        let claim = if let Some(occurrence) = retry_occurrence {
+            store
+                .claim_task_retry_for_dispatch_with_event(&run.id, claimed_at, occurrence)
+                .await?
+        } else {
+            store
+                .claim_task_run_for_dispatch_with_event(&run.id, claimed_at)
+                .await?
+        };
+        let Some((run, claimed_event)) = claim else {
             debug!(
                 task_id = %run.task_id,
                 run_id = %run.id,
@@ -841,6 +958,7 @@ impl TaskScheduler {
             );
             return Ok(false);
         };
+        self.event_bus.publish(claimed_event).await;
         let worker_id = format!("task-worker-{}", generate_id(ID_LEN));
         let lease_until = claimed_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS);
         let Some(execution) = store
@@ -875,12 +993,8 @@ impl TaskScheduler {
 
         if run.executor_kind == TaskExecutorKind::Agent {
             tokio::spawn(async move {
-                if let Err(_error) = dispatch_run_to_executor(executor, context, run, handle).await
-                {
-                    error!(
-                        failure_class = "agent_task_dispatch_failed",
-                        "agent task dispatch failed"
-                    );
+                if let Err(error) = dispatch_run_to_executor(executor, context, run, handle).await {
+                    report_dispatch_terminal_failure(&error);
                 }
             });
             return Ok(true);
@@ -889,6 +1003,43 @@ impl TaskScheduler {
         dispatch_run_to_executor(executor, context, run, handle).await?;
         Ok(true)
     }
+}
+
+#[derive(Debug)]
+struct DispatchStartDiagnostic(Option<crate::TaskStartFailureDescriptor>);
+impl std::fmt::Display for DispatchStartDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("terminalization after executor start failure/rejection failed")
+    }
+}
+
+fn report_dispatch_terminal_failure(error: &anyhow::Error) {
+    let failure =
+        crate::TaskStartFailure::from_borrowed_error(crate::TaskStartStage::ExecutorStart, error);
+    let diagnostic = failure.descriptor();
+    let original = error
+        .downcast_ref::<DispatchStartDiagnostic>()
+        .and_then(|value| value.0.as_ref());
+    error!(
+        failure_class = "agent_task_dispatch_failed",
+        failure_phase = error
+            .downcast_ref::<crate::executor::TerminalCommitPhase>()
+            .map(|phase| phase.label()),
+        cause = if error
+            .downcast_ref::<pioneer_crud::TaskTerminalConflict>()
+            .is_some()
+        {
+            "domain_conflict"
+        } else {
+            diagnostic.cause.label()
+        },
+        sqlite_primary_code = diagnostic.sqlite_primary_code,
+        sqlite_extended_code = diagnostic.sqlite_extended_code,
+        original_start_stage = original.map(|value| value.stage.label()),
+        original_start_cause = original.map(|value| value.cause.label()),
+        correlation_id = original.and_then(|value| value.correlation_id.as_deref()),
+        "agent task dispatch failed"
+    );
 }
 
 async fn dispatch_run_to_executor(
@@ -911,13 +1062,19 @@ async fn dispatch_run_to_executor(
                 TaskErrorClass::Internal,
                 Some(run.id.clone()),
             );
-            handle.fail_run(Some(error), now).await?;
+            handle
+                .fail_run(Some(error), now)
+                .await
+                .context(DispatchStartDiagnostic(None))?;
         }
         Err(mut error) => {
             let descriptor = crate::TaskStartFailure::report_for_scheduler(&mut error);
             let now = now_timestamp_secs();
             let task_error = descriptor.task_error(Some(run.id.clone()));
-            handle.fail_run(Some(task_error), now).await?;
+            handle
+                .fail_run(Some(task_error), now)
+                .await
+                .context(DispatchStartDiagnostic(Some(descriptor)))?;
         }
     }
     Ok(())
@@ -928,6 +1085,18 @@ fn is_recurring(trigger: &TaskTrigger) -> bool {
         trigger.kind(),
         TaskTriggerKind::Interval | TaskTriggerKind::Cron
     )
+}
+
+fn same_scheduled_occurrence(left: &TaskTrigger, right: &TaskTrigger) -> bool {
+    // RunTerminalStatusRefresh changes updated_at without changing the schedule.
+    // It must not turn an armed deadline into recovery when a sibling finishes.
+    left.id == right.id
+        && left.task_id == right.task_id
+        && left.status == right.status
+        && left.spec == right.spec
+        && left.next_fire_at == right.next_fire_at
+        && left.last_fire_at == right.last_fire_at
+        && left.created_at == right.created_at
 }
 
 fn is_transient_scheduler_storage_error(error: &anyhow::Error) -> bool {

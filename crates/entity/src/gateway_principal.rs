@@ -22,6 +22,7 @@ pub struct Model {
     pub updated_at: DateTimeWithTimeZone,
     pub removed_at: Option<DateTimeWithTimeZone>,
     pub authorization_guard: i64,
+    pub inbox_after_sequence: Option<i64>,
     #[sea_orm(has_many)]
     pub audit_events: HasMany<super::audit_event::Entity>,
     #[sea_orm(has_many)]

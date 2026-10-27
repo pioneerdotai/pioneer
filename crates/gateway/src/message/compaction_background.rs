@@ -1,4 +1,4 @@
-//! Owned background preparation of completed CLI history. Queue rows contain
+//! Owned background preparation of active user conversations. Queue rows contain
 //! locators/settings only; the existing canonical history remains authoritative.
 use super::*;
 use crate::compaction::{CompactionClock, SystemCompactionClock};
@@ -37,7 +37,7 @@ pub(crate) struct CompletedHistoryPreparationBarrier {
 
 #[cfg(test)]
 impl CompletedHistoryPreparationBarrier {
-    fn arm(&self, turn: &str) {
+    pub(super) fn arm(&self, turn: &str) {
         *self.turn.lock().expect("preparation barrier lock") = Some(turn.to_owned());
     }
 
@@ -60,11 +60,11 @@ impl CompletedHistoryPreparationBarrier {
         }
     }
 
-    async fn wait_until_reached(&self) {
+    pub(super) async fn wait_until_reached(&self) {
         self.reached.notified().await;
     }
 
-    fn release(&self) {
+    pub(super) fn release(&self) {
         self.release.notify_one();
     }
 }
@@ -87,6 +87,13 @@ impl MessageProcessor {
     pub(crate) async fn wait_for_completed_history_preparation_barrier(&self) {
         self.completed_history_preparation_barrier
             .wait_until_reached()
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_at_completed_history_preparation_barrier(&self, phase: &str) {
+        self.completed_history_preparation_barrier
+            .wait_if_armed(phase, &CancellationToken::new())
             .await;
     }
 
@@ -140,6 +147,65 @@ impl MessageProcessor {
             result=enqueue=>result,
         }
     }
+    /// Root activity limits optional work only. Mandatory request preparation
+    /// never consults this policy. Strict subtraction avoids deadline overflow.
+    pub(crate) async fn root_history_check_admission(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<Option<HistoryCheckOutcome>> {
+        let activity = self
+            .crud_store
+            .compaction_root_history_activity(workspace, thread, turn)
+            .await?;
+        let Some(activity) = activity.and_then(|value| u64::try_from(value).ok()) else {
+            return Ok(Some(HistoryCheckOutcome::Cancelled));
+        };
+        let window = self
+            .context_compaction_config
+            .hot_conversation_window_secs
+            .checked_mul(1000)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid hot conversation window"))?;
+        if now_ms.saturating_sub(activity) >= window {
+            return Ok(Some(HistoryCheckOutcome::Cancelled));
+        }
+        if self
+            .crud_store
+            .compaction_root_history_busy(workspace, thread)
+            .await?
+        {
+            return Ok(Some(HistoryCheckOutcome::WaitingExecutor));
+        }
+        Ok(None)
+    }
+
+    pub(crate) async fn acquire_composer_history_priority(
+        &self,
+        store: &pioneer_crud::CrudStore,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<Option<crate::compaction::ContextCompactionLease>> {
+        let Some(root) = store
+            .compaction_root_for_execution(workspace, thread, turn)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.compaction_coordinator
+            .acquire(
+                workspace,
+                &root,
+                crate::compaction::ContextWorkPriority::Foreground,
+                cancellation,
+            )
+            .await
+    }
+
     /// Existing resilience owner polls only durable completion intents, not all
     /// histories. Service work runs separately and never stalls its poll loop.
     pub(crate) async fn poll_completed_history_checks(&self) -> anyhow::Result<()> {
@@ -168,7 +234,9 @@ impl MessageProcessor {
             }
         }
         for mut row in store
-            .compaction_due_history_checks(SystemCompactionClock::default().now_ms() as i64)
+            .compaction_due_history_checks(
+                self.compaction_clock.now_ms().min(i64::MAX as u64) as i64
+            )
             .await?
         {
             let key = (row.workspace_id.clone(), row.thread_id.clone());
@@ -188,10 +256,10 @@ impl MessageProcessor {
             let task_suspending = suspending.clone();
             let turn = row.turn_id.clone();
             let handle = tokio::spawn(async move {
-                let now = SystemCompactionClock::default().now_ms();
+                let now = processor.compaction_clock.now_ms();
                 let claimed = tokio::select! { biased;
                     _ = task_cancel.cancelled() => return,
-                    result = processor.crud_store.compaction_claim_history_check(&row.turn_id, row.revision, now as i64) => result,
+                    result = processor.crud_store.compaction_claim_history_check(&row.turn_id, row.revision, now.min(i64::MAX as u64) as i64) => result,
                 };
                 let claimed = match claimed {
                     Ok(Some(value)) => value,
@@ -214,7 +282,7 @@ impl MessageProcessor {
                 row.config_hash = claimed.config_hash;
                 row.failures = claimed.failures;
                 row.outcome = claimed.outcome;
-                let result = processor
+                let mut result = processor
                     .run_completed_history_check(
                         &row,
                         task_cancel.clone(),
@@ -223,14 +291,54 @@ impl MessageProcessor {
                     )
                     .await;
                 if !task_suspending.load(Ordering::Acquire) {
-                    let outcome =
-                        classify_check_result(result, &mut diagnostic, task_cancel.is_cancelled());
+                    // Technical foreground work can preempt the same user
+                    // conversation without replacing its publication request.
+                    let mut deferred = false;
+                    let mut cancellation_observed = task_cancel.is_cancelled();
+                    if matches!(&result, Ok(HistoryCheckOutcome::Cancelled)) {
+                        let readiness = async {
+                            Ok::<_, anyhow::Error>(
+                                processor
+                                    .crud_store
+                                    .compaction_history_check_is_current(&row.turn_id)
+                                    .await?
+                                    && matches!(
+                                        processor
+                                            .root_history_check_admission(
+                                                &row.workspace_id,
+                                                &row.thread_id,
+                                                &row.turn_id,
+                                                processor.compaction_clock.now_ms(),
+                                            )
+                                            .await?,
+                                        Some(HistoryCheckOutcome::WaitingExecutor)
+                                    ),
+                            )
+                        }
+                        .await;
+                        match readiness {
+                            Ok(true) => {
+                                deferred = true;
+                                result = Ok(HistoryCheckOutcome::WaitingExecutor);
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                cancellation_observed = false;
+                                result = Err(error);
+                            }
+                        }
+                    }
+                    let outcome = classify_check_result(
+                        result,
+                        &mut diagnostic,
+                        cancellation_observed && !deferred,
+                    );
                     if outcome == HistoryCheckOutcome::Retryable && row.failures >= 3 {
                         diagnostic
                             .explanation
                             .push_str("; automatic preparation retry limit reached");
                     }
-                    diagnostic.observed_ms = SystemCompactionClock::default().now_ms();
+                    diagnostic.observed_ms = processor.compaction_clock.now_ms();
                     if processor
                         .crud_store
                         .compaction_record_history_result(
@@ -239,7 +347,7 @@ impl MessageProcessor {
                             row.failures,
                             outcome,
                             &diagnostic,
-                            diagnostic.observed_ms as i64,
+                            diagnostic.observed_ms.min(i64::MAX as u64) as i64,
                         )
                         .await
                         .is_err()
@@ -283,7 +391,7 @@ impl MessageProcessor {
         let mut storage_error = None;
         let processor = Arc::new(self.scoped_with_database_class(SqliteWriteClass::Maintenance));
         let store = &processor.crud_store;
-        let clock = || i64::try_from(SystemCompactionClock::default().now_ms()).unwrap_or(i64::MAX);
+        let clock = || i64::try_from(self.compaction_clock.now_ms()).unwrap_or(i64::MAX);
         // One shared input budget: 4 seed + 4 scope + 8 pending. Neither an
         // outer lock-race retry nor per-row repair can rediscover this batch.
         for seed in [true, false] {
@@ -429,6 +537,13 @@ impl MessageProcessor {
         if !current {
             return Ok(HistoryCheckOutcome::Cancelled);
         }
+        let admission = tokio::select! { biased;
+            _ = cancel.cancelled() => return Ok(HistoryCheckOutcome::Cancelled),
+            result = self.root_history_check_admission(&row.workspace_id, &row.thread_id, &row.turn_id, self.compaction_clock.now_ms()) => result?,
+        };
+        if let Some(outcome) = admission {
+            return Ok(outcome);
+        }
         diagnostic.stage = "configuration".into();
         let legacy = self.compaction_settings()?;
         let (settings, cli_override) = {
@@ -439,7 +554,14 @@ impl MessageProcessor {
             match workspace.get(&row.workspace_id) {
                 Some(value) => (
                     value.compaction(&legacy),
-                    value.cli_overrides.get(&row.runtime_id).cloned(),
+                    value
+                        .cli_overrides
+                        .get(
+                            row.runtime_id
+                                .strip_prefix("cli_runtime:")
+                                .unwrap_or(&row.runtime_id),
+                        )
+                        .cloned(),
                 ),
                 None => (legacy, None),
             }
@@ -451,9 +573,33 @@ impl MessageProcessor {
             let transport = match row.runtime_kind.as_str() {
                 "codex" => Transport::Codex,
                 "claude" => Transport::Claude,
+                "opencode" => Transport::OpenCode,
                 _ => {
-                    diagnostic.code = "unknown_transport".into();
-                    return Ok(HistoryCheckOutcome::Failed);
+                    let runtime_id = row.runtime_id.strip_prefix("cli_runtime:");
+                    if let Some(runtime_id) = runtime_id {
+                        match self
+                            .load_cli_runtime_instances()?
+                            .into_iter()
+                            .find(|value| value.id == runtime_id)
+                            .map(|value| value.kind)
+                        {
+                            Some(pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex) => {
+                                Transport::Codex
+                            }
+                            Some(pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude) => {
+                                Transport::Claude
+                            }
+                            Some(pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode) => {
+                                Transport::OpenCode
+                            }
+                            None => {
+                                diagnostic.code = "unknown_transport".into();
+                                return Ok(HistoryCheckOutcome::WaitingSettings);
+                            }
+                        }
+                    } else {
+                        Transport::Api
+                    }
                 }
             };
             let Some(model) = row.model.clone().filter(|model| !model.trim().is_empty()) else {
@@ -463,7 +609,11 @@ impl MessageProcessor {
             CapturedCheck {
                 current: ModelSelection {
                     transport,
-                    instance: row.runtime_id.clone(),
+                    instance: row
+                        .runtime_id
+                        .strip_prefix("cli_runtime:")
+                        .unwrap_or(&row.runtime_id)
+                        .to_owned(),
                     model,
                     effort: row.reasoning_effort.clone(),
                 },
@@ -519,11 +669,11 @@ impl MessageProcessor {
         }
         // A resumed attempt retains its deadline and captured settings. Only a
         // scheduled pre-admission retry/readiness wakeup receives a fresh deadline.
-        let now = SystemCompactionClock::default().now_ms();
+        let now = self.compaction_clock.now_ms();
         let descriptor = serde_json::to_string(&captured)?;
         let deadline = tokio::select! { biased;
             _ = cancel.cancelled() => return Ok(HistoryCheckOutcome::Cancelled),
-            result = self.crud_store.compaction_begin_history_attempt(&row.turn_id, row.revision, &descriptor, &hash, now as i64) => result?,
+            result = self.crud_store.compaction_begin_history_attempt(&row.turn_id, row.revision, &descriptor, &hash, now.min(i64::MAX as u64) as i64) => result?,
         };
         let Some(deadline) = deadline else {
             return Ok(HistoryCheckOutcome::Cancelled);
@@ -564,8 +714,11 @@ impl MessageProcessor {
                 Some(captured.deadline_ms),
                 captured.target_output_cap,
                 captured.fixed_input_tokens,
+                None,
                 suspending,
                 None,
+                None,
+                Some(row.revision),
                 diagnostic,
             );
             tokio::pin!(work);
@@ -731,6 +884,42 @@ fn classify_check_result(
                             "Source revisions or accepted import evidence do not match the selected history; no provider call was made",
                         ))
                     }
+                    "compaction resume plan changed" => Some((
+                        "compaction_resume_plan_changed",
+                        "Saved compaction progress belongs to a different plan; restart from zero was refused",
+                    )),
+                    "compaction resume sources changed" => Some((
+                        "compaction_resume_sources_changed",
+                        "Saved compaction sources no longer match the admitted manifest",
+                    )),
+                    "compaction resume snapshot is unavailable" => Some((
+                        "compaction_resume_snapshot_unavailable",
+                        "Saved compaction input snapshot is unavailable or expired",
+                    )),
+                    "compaction resume checkpoint is unavailable" => Some((
+                        "compaction_resume_checkpoint_unavailable",
+                        "Saved compaction checkpoint is missing or belongs to another operation",
+                    )),
+                    "compaction resume phase is unsafe" => Some((
+                        "compaction_resume_unsafe_phase",
+                        "Saved compaction state cannot safely restore the attempt purpose",
+                    )),
+                    "compaction resume plan is unavailable" => Some((
+                        "compaction_resume_plan_unavailable",
+                        "Saved compaction plan is missing or incomplete",
+                    )),
+                    "compaction resume requires a new user execution" => Some((
+                        "compaction_resume_new_execution_required",
+                        "Compaction progress may resume only on a new user execution",
+                    )),
+                    "compaction resume state or execution fence changed" => Some((
+                        "compaction_resume_fence_changed",
+                        "Compaction state, head, checkpoint or execution no longer admits resume",
+                    )),
+                    "compaction resume request deadline expired" => Some((
+                        "compaction_resume_request_deadline",
+                        "The new request deadline expired before compaction resume",
+                    )),
                     "selected CLI service instance is unavailable" => Some((
                         "summary_instance_missing",
                         "Selected CLI summary instance is not configured",
@@ -804,6 +993,31 @@ mod result_tests {
             HistoryCheckOutcome::WaitingSettings
         );
     }
+    #[test]
+    fn compaction_resume_refusals_keep_fixed_public_diagnostics() {
+        for (message, code) in [
+            ("plan changed", "plan_changed"),
+            ("sources changed", "sources_changed"),
+            ("snapshot is unavailable", "snapshot_unavailable"),
+            ("checkpoint is unavailable", "checkpoint_unavailable"),
+            ("phase is unsafe", "unsafe_phase"),
+            ("plan is unavailable", "plan_unavailable"),
+            ("requires a new user execution", "new_execution_required"),
+            ("state or execution fence changed", "fence_changed"),
+            ("request deadline expired", "request_deadline"),
+        ] {
+            let mut diagnostic = HistoryCheckDiagnostic::new("admission", "", "");
+            let error = anyhow::anyhow!("private provider payload")
+                .context(format!("compaction resume {message}"));
+            assert_eq!(
+                classify_check_result(Err(error), &mut diagnostic, false),
+                HistoryCheckOutcome::Failed
+            );
+            assert_eq!(diagnostic.code, format!("compaction_resume_{code}"));
+            assert!(!diagnostic.explanation.contains("private"));
+        }
+    }
+
     #[test]
     fn history_check_wait_cancel_and_fit_remain_distinct() {
         let mut d = HistoryCheckDiagnostic::new("history_capture", "", "");

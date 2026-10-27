@@ -523,11 +523,18 @@ async fn cli_active_terminal_snapshot_resume_wins_without_new_execution_effects_
         .mcp_service
         .hold_test_turn_mcp_invocation(GUARDED_TURN, cancel.clone());
     let lease = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    let session_handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .get_or_start(CLIAgentRuntimeSessionKey::new(&workspace, "codex", GUARDED_THREAD).unwrap())
+        .await
+        .unwrap();
     processor
         .cli_runtime_session_turn_leases
         .lock()
         .await
-        .insert(GUARDED_TURN.into(), lease);
+        .insert(GUARDED_TURN.into(), (lease, session_handle));
     let events = pioneer_entity::turn_event::Entity::find()
         .filter(pioneer_entity::turn_event::Column::TurnId.eq(GUARDED_TURN))
         .count(&store.database_connection())
@@ -1063,11 +1070,18 @@ async fn cli_blocked_observation_rejects_old_segment_at_writer_and_fresh_snapsho
     let now = chrono::Utc::now().fixed_offset();
     let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
     let lease = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    let session_handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
     processor
         .cli_runtime_session_turn_leases
         .lock()
         .await
-        .insert(BLOCKED_TURN.into(), lease);
+        .insert(BLOCKED_TURN.into(), (lease, session_handle));
     let cancellation = tokio_util::sync::CancellationToken::new();
     let _invocation = processor
         .mcp_service
@@ -1637,13 +1651,25 @@ async fn cli_timeout_terminal_cleanup_rejects_resume_and_late_effects_after_comp
         let _invocation = processor
             .mcp_service
             .hold_test_turn_mcp_invocation(GUARDED_TURN, cancel.clone());
+        let session_handle = processor
+            .cli_runtime_manager
+            .as_ref()
+            .unwrap()
+            .get_or_start(
+                CLIAgentRuntimeSessionKey::new(&workspace, "codex", GUARDED_THREAD).unwrap(),
+            )
+            .await
+            .unwrap();
         processor
             .cli_runtime_session_turn_leases
             .lock()
             .await
             .insert(
                 GUARDED_TURN.into(),
-                Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                (
+                    Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                    session_handle,
+                ),
             );
         let binding = store
             .get_cli_runtime_turn_binding(GUARDED_TURN)
@@ -2226,11 +2252,18 @@ async fn cli_old_native_failed_producer_cannot_open_recovery_or_cleanup_resumed_
         .mcp_service
         .hold_test_turn_mcp_invocation(GUARDED_TURN, cancel.clone());
     let lease = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    let session_handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .get_or_start(CLIAgentRuntimeSessionKey::new(&workspace, "codex", GUARDED_THREAD).unwrap())
+        .await
+        .unwrap();
     processor
         .cli_runtime_session_turn_leases
         .lock()
         .await
-        .insert(GUARDED_TURN.into(), lease);
+        .insert(GUARDED_TURN.into(), (lease, session_handle));
     let before = store
         .cli_runtime_turn_terminal_guard(
             &store
@@ -2640,9 +2673,8 @@ async fn cli_native_terminal_consumer_acks_delivery_and_retains_ownership_after_
         gate.try_lock().is_err(),
         "consumer retains ownership independently of its publisher"
     );
-    // Count before polling admission: its binding lookup can retain the
-    // fixture's only connection until the future is polled again. Another DB
-    // query while admission is suspended would deadlock the fixture itself.
+    // Read before suspending admission: its first poll can retain the fixture's
+    // only SQLite connection while the binding lookup is still in progress.
     let before = pioneer_entity::turn_event::Entity::find()
         .filter(pioneer_entity::turn_event::Column::TurnId.eq(BLOCKED_TURN))
         .count(&store.database_connection())
@@ -4306,5 +4338,163 @@ async fn cli_timeout_poll_and_command_heartbeat_prioritize_saved_native_failure(
                 .await
                 .unwrap()
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independently_heartbeating_owner_keeps_terminal_authority_and_cancellation_fences() {
+    use pioneer_entity::turn_execution as execution;
+    for race in ["generation", "expired", "cancel"] {
+        let temp = tempfile::tempdir().unwrap();
+        let (processor, store, _, workspace) = blocked_observation_fixture_with_receipt(
+            &temp.path().join("heartbeat-authority.sqlite"),
+            "codex",
+            true,
+            true,
+        )
+        .await;
+        let active = store
+            .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        processor
+            .ensure_runtime_turn_loaded_for_lifecycle(&workspace, BLOCKED_THREAD, &active)
+            .await
+            .unwrap();
+        let processor = Arc::new(processor);
+        let heartbeat = tokio::spawn(MessageProcessor::run_turn_execution_owner_heartbeat_worker(
+            Arc::downgrade(&processor),
+        ));
+        processor
+            .turn_execution_heartbeat_barrier
+            .arm("__execution_owner_heartbeat_written__");
+        timeout(
+            Duration::from_secs(5),
+            processor
+                .turn_execution_heartbeat_barrier
+                .wait_until_reached(),
+        )
+        .await
+        .unwrap();
+        let renewed = store
+            .get_turn_execution(BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(renewed.lease_until > chrono::Utc::now().fixed_offset());
+        assert_eq!(
+            renewed.lease_until.timestamp() - renewed.heartbeat_at.timestamp(),
+            TURN_EXECUTION_OWNER_LEASE_SECONDS
+        );
+        // Keep this production worker at its post-write probe while the old
+        // producer captures authority. No DB resource is held by either probe.
+        let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+        let handle = processor
+            .cli_runtime_manager
+            .as_ref()
+            .unwrap()
+            .existing_session(&key)
+            .await
+            .unwrap();
+        processor.arm_completed_history_preparation_barrier("__cli_native_terminal_before_gate__");
+        let mut producer = Box::pin(processor.handle_cli_runtime_timeline_event(
+            handle.instance(),
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(BLOCKED_NATIVE_THREAD.into()),
+                native_turn_id: BLOCKED_TURN.into(),
+                status: "completed".into(),
+                native: None,
+            }),
+        ));
+        tokio::select! {
+            _ = processor.wait_for_completed_history_preparation_barrier() => {},
+            _ = &mut producer => panic!("terminal producer must capture its source before the race"),
+        }
+        match race {
+            "generation" => {
+                execution::Entity::update_many()
+                    .col_expr(
+                        execution::Column::OwnerGeneration,
+                        Expr::value(renewed.owner_generation as i64 + 1),
+                    )
+                    .filter(execution::Column::TurnId.eq(BLOCKED_TURN))
+                    .exec(&store.database_connection())
+                    .await
+                    .unwrap();
+            }
+            "expired" => {
+                let expired = chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(1);
+                execution::Entity::update_many()
+                    .col_expr(execution::Column::HeartbeatAt, Expr::value(expired))
+                    .col_expr(execution::Column::LeaseUntil, Expr::value(expired))
+                    .filter(execution::Column::TurnId.eq(BLOCKED_TURN))
+                    .exec(&store.database_connection())
+                    .await
+                    .unwrap();
+            }
+            "cancel" => {
+                let (tx, mut rx) = mpsc::channel(128);
+                let connection =
+                    register_authenticated_test_connection(processor.session_manager.as_ref(), tx)
+                        .await;
+                processor
+                    .session_manager
+                    .set_connection_workspace(connection, Some(workspace.clone()))
+                    .await;
+                // The cancel RPC reads the terminal Turn back from live state.
+                // A subscribed client keeps it loaded through terminal cleanup.
+                subscribe_test_connection_to_materialized_thread(
+                    processor.as_ref(),
+                    connection,
+                    &workspace,
+                    BLOCKED_THREAD,
+                )
+                .await;
+                let request_id = generate_test_request_id("heartbeat", "cancel");
+                processor.process_request_for_connection(connection, &json!({
+                    "jsonrpc":"2.0", "id":request_id, "method":"turn/cancel",
+                    "params":{"thread_id":BLOCKED_THREAD,"turn_id":BLOCKED_TURN,"reason":"accepted stop"}
+                }).to_string()).await;
+                let response = recv_response_by_id(&mut rx, &request_id).await;
+                let response: TurnCancelResponse = serde_json::from_value(response.result).unwrap();
+                assert_eq!(response.turn.status, TurnStatus::Interrupted);
+                assert!(
+                    store
+                        .native_turn_has_accepted_terminal(BLOCKED_TURN)
+                        .await
+                        .unwrap()
+                );
+            }
+            _ => unreachable!(),
+        }
+        processor.release_completed_history_preparation_barrier();
+        producer.await;
+        let expected = if race == "cancel" {
+            TurnStatus::Interrupted
+        } else {
+            TurnStatus::InProgress
+        };
+        assert_eq!(
+            store
+                .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            expected
+        );
+        assert!(
+            !store
+                .has_pending_cli_runtime_terminal_event(BLOCKED_TURN)
+                .await
+                .unwrap()
+        );
+        assert!(!has_recovery(&store, BLOCKED_TURN).await);
+        heartbeat.abort();
+        assert!(heartbeat.await.unwrap_err().is_cancelled());
+        // The heartbeat probe was cancelled; do not leave a release permit.
     }
 }

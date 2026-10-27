@@ -18,7 +18,7 @@ use super::{
     TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
     WorkspaceSkillPolicy,
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use pioneer_hooks::{
     AuditContribution, HookActorKind, HookAuditEventKind, HookAwaitPolicy, HookCapabilities,
     HookCapability, HookContextMode, HookContribution, HookDiagnosticCode, HookDiagnosticMessage,
@@ -76,7 +76,36 @@ use tokio::task::yield_now;
 use tokio::time::{Duration, Instant, advance, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
+#[derive(Debug)]
+struct VisibilityCuaBackend;
+
+#[async_trait::async_trait]
+impl pioneer_tools::ComputerUseBackend for VisibilityCuaBackend {
+    async fn execute(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _arguments: serde_json::Value,
+        _cancellation: CancellationToken,
+    ) -> Result<serde_json::Value, ToolError> {
+        panic!("visibility fixtures must not execute computer use")
+    }
+
+    fn observation_delivered(&self, _owner: &str, _context: &serde_json::Value) -> bool {
+        false
+    }
+
+    fn release_owner(&self, _owner: &str) {}
+}
+
+fn test_tool_loop_config_with_computer_use() -> ToolLoopConfig {
+    let mut config = test_tool_loop_config();
+    config.computer_use.backend = Some(Arc::new(VisibilityCuaBackend));
+    config
+}
+
 pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
+    crate::chat::preflight::load_test_catalog();
     ToolLoopConfig {
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
         preflight: super::PreflightLoopConfig::default(),
@@ -100,7 +129,7 @@ pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
         },
         computer_use: ComputerUseToolsConfig {
             runtime_home_dir: std::env::temp_dir().join("pioneer-agent-tests"),
-            artifacts_subdir: "tools/computer_use".to_owned(),
+
             ..ComputerUseToolsConfig::default()
         },
         skills: super::SkillsLoopConfig {
@@ -1708,7 +1737,7 @@ fn optional_domain_preflight_response() -> String {
         "task_create",
         "artifact_prepare",
         "artifact_register",
-        "computer_use",
+        "cua_get_window_state",
     ])
 }
 
@@ -1727,6 +1756,7 @@ fn is_turn_preflight_request(request: &ChatRequest) -> bool {
 
 fn test_preflight_response() -> ChatResponse {
     ChatResponse {
+        messages: Vec::new(),
         text: TEST_PREFLIGHT_RESPONSE.to_owned(),
         usage: None,
         reasoning_content: None,
@@ -3061,6 +3091,7 @@ impl Provider for CaptureStandardProvider {
             return Ok(test_preflight_response());
         }
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: "done".to_owned(),
             usage: None,
             reasoning_content: None,
@@ -3108,6 +3139,7 @@ impl Provider for SequencedToolProvider {
             .push(request);
         if preflight {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: self.preflight_response_text.clone(),
                 usage: None,
                 reasoning_content: None,
@@ -3123,6 +3155,7 @@ impl Provider for SequencedToolProvider {
                 sleep(self.first_response_delay).await;
             }
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3137,6 +3170,7 @@ impl Provider for SequencedToolProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: self.second_text.clone(),
             usage: None,
             reasoning_content: None,
@@ -3185,6 +3219,7 @@ impl Provider for LoopBudgetProvider {
             .push(request);
         if preflight {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: self.preflight_response_text.clone(),
                 usage: None,
                 reasoning_content: None,
@@ -3230,6 +3265,7 @@ impl Provider for LoopBudgetProvider {
         };
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: if tool_calls.is_empty() {
                 if matches!(
                     self.mode,
@@ -3297,6 +3333,7 @@ impl Provider for AlwaysTaskCreateProvider {
 
         let round_index = self.next_index.fetch_add(1, Ordering::SeqCst);
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: String::new(),
             usage: None,
             reasoning_content: None,
@@ -3358,6 +3395,7 @@ impl Provider for ProviderRecoveryBoundaryProvider {
         match self.next_index.fetch_add(1, Ordering::SeqCst) {
             0 => Err(anyhow::anyhow!("initial provider failure 500")),
             1 => Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3423,6 +3461,7 @@ impl Provider for CaptureAgentProvider {
             .push(request);
         if preflight {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: self.preflight_response_text.clone(),
                 usage: None,
                 reasoning_content: None,
@@ -3432,6 +3471,7 @@ impl Provider for CaptureAgentProvider {
             });
         }
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: self.response_text.clone(),
             usage: None,
             reasoning_content: None,
@@ -3524,6 +3564,7 @@ impl Provider for ReviewGuardProvider {
             .unwrap_or_else(|| ReviewGuardProviderStep::text("done"));
         let response = match step {
             ReviewGuardProviderStep::Text(text) => ChatResponse {
+                messages: Vec::new(),
                 text,
                 usage: None,
                 reasoning_content: None,
@@ -3532,6 +3573,7 @@ impl Provider for ReviewGuardProvider {
                 termination: pioneer_provider::ProviderTermination::Complete,
             },
             ReviewGuardProviderStep::Tool { name, arguments } => ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3596,6 +3638,7 @@ impl Provider for EmptyNoToolRoundProvider {
             && let Some(first_tool_call) = self.first_tool_call.clone()
         {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3608,6 +3651,7 @@ impl Provider for EmptyNoToolRoundProvider {
         let empty_index = index.saturating_sub(usize::from(self.first_tool_call.is_some()));
         if empty_index < self.empty_rounds_before_final {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3618,6 +3662,7 @@ impl Provider for EmptyNoToolRoundProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: "done after empty response recovery".to_owned(),
             usage: None,
             reasoning_content: None,
@@ -3675,6 +3720,7 @@ impl Provider for SequencedTextProvider {
             .cloned()
             .unwrap_or_else(|| "done".to_owned());
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage: None,
             reasoning_content: None,
@@ -3990,6 +4036,7 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
             turn_id,
             reason,
             recovery,
+            ..
         } => Some(AgentEvent::TurnFailed {
             thread_id,
             turn_id,
@@ -4326,6 +4373,161 @@ async fn start_simple_turn_with_terminal_effects(
         .expect("turn should start");
 
     recv_and_execute_terminal_effects(manager, &mut durable_events, turn_id).await
+}
+
+// Preparation must precede the real agent inventory, not just dispatch.
+#[tokio::test]
+async fn connection_owned_model_preparation_precedes_agent_tool_inventory() {
+    use crate::compaction::controller::NativeContextController;
+    #[derive(Default)]
+    struct AdmissionBoundary {
+        inner: RecordingContextBoundary,
+        admitted: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl crate::compaction::controller::NativeContextController for AdmissionBoundary {
+        async fn stop(
+            &self,
+            context: &crate::compaction::controller::NativeContext,
+        ) -> anyhow::Result<()> {
+            self.inner.stop(context).await
+        }
+        async fn prepare(
+            &self,
+            context: &crate::compaction::controller::NativeContext,
+            request: ChatRequest,
+            measurement: Option<crate::compaction::controller::NativeUsageMeasurement>,
+            recovery: bool,
+        ) -> anyhow::Result<crate::compaction::controller::NativePreparedRequest> {
+            let prepared = context.provider.prepare_input_budget(request).await?;
+            self.admitted.store(true, Ordering::SeqCst);
+            self.inner
+                .prepare(context, prepared.request, measurement, recovery)
+                .await
+        }
+    }
+    struct PreparedModel {
+        inner: CaptureAgentProvider,
+        prepared: std::sync::atomic::AtomicBool,
+        preflight_observed_prepared: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl Provider for PreparedModel {
+        fn name(&self) -> &str {
+            "connection-facts-provider"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+        async fn prepare_model(&self, _: &str) -> anyhow::Result<()> {
+            self.prepared.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn model_catalog_entry(
+            &self,
+            model: &str,
+        ) -> Option<pioneer_provider::catalog::CatalogModel> {
+            Some(pioneer_provider::catalog::CatalogModel {
+                id: model.into(),
+                name: "connection model".into(),
+                provider: self.name().into(),
+                api: "fixture-api".into(),
+                base_url: String::new(),
+                context_window: 32000,
+                max_tokens: 4321,
+                reasoning: false,
+                input: vec!["text".into()],
+                cost: serde_json::json!({}),
+                metadata: Default::default(),
+            })
+        }
+        fn model_tool_calling(&self, _: &str) -> bool {
+            self.prepared.load(Ordering::SeqCst)
+        }
+        fn native_file_tool_capability(
+            &self,
+            model: &str,
+        ) -> pioneer_provider::NativeFileToolCapability {
+            self.inner.native_file_tool_capability(model)
+        }
+        async fn prepare_input_budget(
+            &self,
+            request: ChatRequest,
+        ) -> anyhow::Result<pioneer_provider::attachments::PreparedInputBudget> {
+            assert!(
+                self.prepared.load(Ordering::SeqCst),
+                "model facts must be ready before input admission"
+            );
+            self.inner.prepare_input_budget(request).await
+        }
+        async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+            if is_turn_preflight_request(&request) {
+                assert!(
+                    self.prepared.load(Ordering::SeqCst),
+                    "preflight follows model preparation and inventory selection"
+                );
+                self.preflight_observed_prepared
+                    .store(true, Ordering::SeqCst);
+            } else {
+                assert!(
+                    self.prepared.load(Ordering::SeqCst),
+                    "main dispatch requires prepared model facts"
+                );
+            }
+            self.inner.chat(request).await
+        }
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            self.inner.stream_chat(request).await
+        }
+    }
+    let provider = Arc::new(PreparedModel {
+        inner: CaptureAgentProvider::default(),
+        prepared: std::sync::atomic::AtomicBool::new(false),
+        preflight_observed_prepared: std::sync::atomic::AtomicBool::new(false),
+    });
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "connection-facts-provider",
+        provider.clone(),
+    ));
+    let wrapped = registry.get_or_create("connection-facts-provider").unwrap();
+    assert!(wrapped.capabilities().tool_calling);
+    assert!(!wrapped.model_tool_calling("test-model"));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let admission = Arc::new(AdmissionBoundary::default());
+    manager
+        .set_context_controller(Some(admission.clone()))
+        .await;
+    assert!(!provider.prepared.load(Ordering::SeqCst));
+    let observed = start_simple_turn(
+        &manager,
+        "prepared_model_inventory_thread",
+        "workspace",
+        "prepared_model_inventory_turn",
+        ThreadMode::Agent,
+        "connection-facts-provider",
+        "hello",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    assert!(admission.admitted.load(Ordering::SeqCst));
+    assert!(provider.preflight_observed_prepared.load(Ordering::SeqCst));
+    let requests = provider.inner.snapshot_all_requests();
+    assert!(is_turn_preflight_request(
+        requests.first().expect("preflight request")
+    ));
+    let main_request = requests
+        .iter()
+        .find(|request| request.compiled_prompt.is_some())
+        .expect("main provider request");
+    let tools = main_request
+        .tools
+        .as_ref()
+        .expect("prepared model must receive the real tool inventory");
+    assert!(tools.iter().any(|tool| tool.name == "read_file"));
 }
 
 #[tokio::test]
@@ -8552,7 +8754,7 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
     assert!(
         prompt
             .full_system_text
-            .contains("Some tool domains and their tools are hidden until requested.")
+            .contains("For hidden tools, call request_tools to open their domain.")
     );
     assert!(
         !prompt.full_system_text.contains("Available memory tools:"),
@@ -8626,7 +8828,7 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
         optional_domain_preflight_response(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
     manager
         .set_task_tool_provider(Some(Arc::new(StaticTaskToolProvider {
             bundle: fake_memory_tool_bundle_for_names(&registered_optional_tools, handler),
@@ -8655,17 +8857,6 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    let probe_tool_loop_config = test_tool_loop_config();
-    let computer_use_available = pioneer_tools::build_builtin_tools_with_security_snapshot(
-        ".",
-        "turn_phase10_computer_use_probe",
-        test_tools_permission_context("turn_phase10_computer_use_probe"),
-        probe_tool_loop_config.web,
-        probe_tool_loop_config.computer_use,
-        Some(test_full_access_security_snapshot()),
-    )
-    .router
-    .has_handler("computer_use");
 
     for selected in [
         "memory_search",
@@ -8678,17 +8869,11 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
             "selected optional tool `{selected}` should be serialized"
         );
     }
-    if computer_use_available {
-        assert!(
-            request_tool_names.contains(&"computer_use"),
-            "selected optional tool `computer_use` should be serialized when registered"
-        );
-    } else {
-        assert!(
-            !request_tool_names.contains(&"computer_use"),
-            "unregistered optional tool `computer_use` must stay hidden"
-        );
-    }
+    assert_eq!(
+        request_tool_names.contains(&"cua_get_window_state"),
+        !pioneer_tools::computer_use_tool_specs().is_empty(),
+        "selected optional tool `computer_use` should be serialized when registered"
+    );
     for hidden in ["memory_get", "task_wait"] {
         assert!(
             !request_tool_names.contains(&hidden),
@@ -8958,13 +9143,13 @@ async fn phase_11_repeated_review_observation_does_not_spam_or_complete() {
 #[tokio::test]
 async fn computer_use_text_only_model_does_not_gate_computer_use() {
     let provider = Arc::new(TextOnlyAgentProvider::with_preflight_response(
-        preflight_response_with_visible_tools(&["computer_use"]),
+        preflight_response_with_visible_tools(&["cua_get_window_state"]),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "text-only",
         provider.clone(),
     ));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
 
     let observed = start_simple_turn(
         &manager,
@@ -8987,37 +9172,20 @@ async fn computer_use_text_only_model_does_not_gate_computer_use() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    let probe_tool_loop_config = test_tool_loop_config();
-    let computer_use_available = pioneer_tools::build_builtin_tools_with_security_snapshot(
-        ".",
-        "turn_computer_use_text_only_no_gate_probe",
-        test_tools_permission_context("turn_computer_use_text_only_no_gate_probe"),
-        probe_tool_loop_config.web,
-        probe_tool_loop_config.computer_use,
-        Some(test_full_access_security_snapshot()),
-    )
-    .router
-    .has_handler("computer_use");
-    if computer_use_available {
-        assert!(
-            request_tool_names.contains(&"computer_use"),
-            "computer_use must not be provider-gated by image capability"
-        );
-    } else {
-        assert!(
-            !request_tool_names.contains(&"computer_use"),
-            "unregistered computer_use must stay hidden"
-        );
-    }
+    assert_eq!(
+        request_tool_names.contains(&"cua_get_window_state"),
+        !pioneer_tools::computer_use_tool_specs().is_empty(),
+        "computer_use must not be provider-gated by image capability"
+    );
 }
 
 #[tokio::test]
 async fn computer_use_registered_tool_exposes_when_preflight_selects_it() {
     let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        preflight_response_with_visible_tools(&["computer_use"]),
+        preflight_response_with_visible_tools(&["cua_get_window_state"]),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
 
     let observed = start_simple_turn(
         &manager,
@@ -9040,28 +9208,11 @@ async fn computer_use_registered_tool_exposes_when_preflight_selects_it() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    let probe_tool_loop_config = test_tool_loop_config();
-    let computer_use_available = pioneer_tools::build_builtin_tools_with_security_snapshot(
-        ".",
-        "turn_computer_use_registered_tool_probe",
-        test_tools_permission_context("turn_computer_use_registered_tool_probe"),
-        probe_tool_loop_config.web,
-        probe_tool_loop_config.computer_use,
-        Some(test_full_access_security_snapshot()),
-    )
-    .router
-    .has_handler("computer_use");
-    if computer_use_available {
-        assert!(
-            request_tool_names.contains(&"computer_use"),
-            "image-capable providers may expose computer_use when preflight selects it"
-        );
-    } else {
-        assert!(
-            !request_tool_names.contains(&"computer_use"),
-            "unregistered computer_use must stay hidden even for image-capable providers"
-        );
-    }
+    assert_eq!(
+        request_tool_names.contains(&"cua_get_window_state"),
+        !pioneer_tools::computer_use_tool_specs().is_empty(),
+        "image-capable providers may expose computer_use when preflight selects it"
+    );
 }
 
 #[tokio::test]
@@ -12082,6 +12233,399 @@ async fn completed_parallel_tool_result_is_journaled_before_the_batch_finishes()
         AgentEvent::TurnLlmContextAppended { tool_name, .. }
             if tool_name == "batch_slow"
     )));
+
+    // Same parallel-result owner, now with a real CUA handler/receipt. The
+    // lifecycle ItemCompleted ACK is deliberately distinct from exact history.
+    // The generic fast/slow proof above runs in every build. Keep the complete
+    // receipt matrix when the real tools feature is enabled (including via
+    // workspace unification), without introducing an agent-only CU feature.
+    if !pioneer_tools::computer_use_tool_specs().is_empty() {
+        for delivery in [
+            "success",
+            "rejected",
+            "receiver_dropped",
+            "cancelled",
+            "caller_dropped",
+            "bounded_rejected",
+        ] {
+            cua_parallel_result_history_delivery(delivery).await;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct JournalCuaBackend {
+    inputs: AtomicUsize,
+    delivered: AtomicUsize,
+    released: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl pioneer_tools::ComputerUseBackend for JournalCuaBackend {
+    async fn execute(
+        &self,
+        _owner: &str,
+        name: &str,
+        _arguments: serde_json::Value,
+        _cancellation: CancellationToken,
+    ) -> Result<serde_json::Value, ToolError> {
+        if name == "get_window_state" {
+            return Ok(json!({
+                "content": [{"type":"image", "mimeType":"image/png", "data":"AAECAw==", "width":320, "height":240}],
+                "structuredContent": {"generation":7, "elementToken":"opaque", "origin":{"x":-8,"y":3}, "scale":2},
+                "pioneer_cua_context":{"generation":7,"delivery_nonce":"private"},
+                "isError":false
+            }));
+        }
+        assert_eq!(name, "type_text");
+        self.inputs.fetch_add(1, Ordering::SeqCst);
+        // Transport fixture only: no successful GUI action or OS grant claim.
+        Ok(json!({"content":[{"type":"text","text":"input delivery unverified"}], "isError":false}))
+    }
+
+    fn observation_delivered(&self, _owner: &str, context: &serde_json::Value) -> bool {
+        assert_eq!(context, &json!({"generation":7,"delivery_nonce":"private"}));
+        self.delivered.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    fn release_owner(&self, _owner: &str) {
+        self.released.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
+struct JournalCuaAdmission {
+    capture_entered: tokio::sync::Semaphore,
+    input_requested: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl pioneer_tools::PermissionApprovalBroker for JournalCuaAdmission {
+    async fn revalidate_permission_context(
+        &self,
+        context: &pioneer_tools::PermissionEvaluationContext,
+        invocation: &ToolInvocation,
+    ) -> Result<pioneer_tools::PermissionEvaluationContext, String> {
+        if invocation.tool_name == "cua_type_text" {
+            // Revalidation always precedes dispatch, including profiles that
+            // need no approval. The real image sink signals with capture's
+            // actual CUA gate held, so input can never win that gate first.
+            let permit = tokio::select! {
+                biased;
+                _ = invocation.cancellation.cancelled() => return Err("fixture input cancelled".into()),
+                permit = self.capture_entered.acquire() => permit.map_err(|error| error.to_string())?,
+            };
+            drop(permit); // A latch: repeated revalidation must not consume it.
+            self.input_requested.add_permits(1);
+        }
+        Ok(context.clone())
+    }
+
+    async fn request_approval(
+        &self,
+        _context: &pioneer_tools::PermissionEvaluationContext,
+        _invocation: &ToolInvocation,
+        _intent: &pioneer_tools::PermissionIntent,
+        _key: &pioneer_tools::PermissionRequestKey,
+        _reason: pioneer_tools::PermissionDecisionReason,
+    ) -> pioneer_tools::PermissionApprovalResolution {
+        pioneer_tools::PermissionApprovalResolution::AllowOnce
+    }
+}
+
+#[derive(Debug)]
+struct JournalCuaImageSink {
+    oversized: bool,
+    admission: Arc<JournalCuaAdmission>,
+}
+
+#[async_trait::async_trait]
+impl pioneer_tools::handlers::computer_use::ComputerUseImageSink for JournalCuaImageSink {
+    async fn admit(
+        &self,
+        _owner: &str,
+        _call_id: &str,
+        _index: usize,
+        bytes: Vec<u8>,
+        mime: &str,
+        cancellation: CancellationToken,
+    ) -> Result<pioneer_provider::MessageAttachment, ToolError> {
+        assert_eq!(bytes, [0, 1, 2, 3]);
+        assert_eq!(mime, "image/png");
+        self.admission.capture_entered.add_permits(1);
+        // Hold real capture admission until the parallel input has requested
+        // permission; this is scheduling only, never observation authority.
+        let permit = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(ToolError::cancelled("fixture capture cancelled")),
+            permit = self.admission.input_requested.acquire() => permit.map_err(|error| ToolError::execution_failed(error.to_string()))?,
+        };
+        drop(permit);
+        let path = if self.oversized {
+            format!(
+                "/artifacts/{}",
+                "x".repeat(pioneer_compaction::RESULT_BYTES + 1)
+            )
+        } else {
+            "/artifacts/journal-capture.png".into()
+        };
+        let mut image = pioneer_provider::MessageAttachment::from_path(path, mime);
+        image.artifact = Some(pioneer_provider::AttachmentArtifactContext {
+            workspace_id: "ws_parallel_cua_journal".into(),
+            artifact_id: "journal-capture".into(),
+            artifact_version_id: Some("v1".into()),
+        });
+        Ok(image)
+    }
+}
+
+async fn cua_parallel_result_history_delivery(delivery: &str) {
+    let backend = Arc::new(JournalCuaBackend::default());
+    let admission = Arc::new(JournalCuaAdmission {
+        capture_entered: tokio::sync::Semaphore::new(0),
+        input_requested: tokio::sync::Semaphore::new(0),
+    });
+    let mut config = test_tool_loop_config();
+    config.computer_use.backend = Some(backend.clone());
+    config
+        .computer_use
+        .image_admission
+        .set(Arc::new(JournalCuaImageSink {
+            oversized: delivery == "bounded_rejected",
+            admission: admission.clone(),
+        }));
+    let provider = Arc::new(SequencedToolProvider::with_preflight_response(
+        vec![
+            ProviderToolCall {
+                id: "capture".into(),
+                name: "cua_get_window_state".into(),
+                arguments: json!({"pid":7,"window_id":9,"include_screenshot":true}).to_string(),
+            },
+            ProviderToolCall {
+                id: "input".into(),
+                name: "cua_type_text".into(),
+                arguments:
+                    json!({"text":"private input","target":{"kind":"window","pid":7,"window_id":9}})
+                        .to_string(),
+            },
+        ],
+        "final after CUA batch",
+        preflight_response_with_visible_tools(&["cua_get_window_state", "cua_type_text"]),
+    ));
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "sequenced-tools",
+            provider.clone(),
+        )),
+        config,
+    );
+    manager
+        .set_permission_approval_broker(admission.clone())
+        .await;
+    let thread = "thr_parallel_cua_journal";
+    let turn = "turn_parallel_cua_journal";
+    manager
+        .ensure_thread(thread, "ws_parallel_cua_journal")
+        .await
+        .unwrap();
+    let mut events = manager.take_durable_receiver(thread).await.unwrap();
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread,
+            turn,
+            ThreadMode::Agent,
+            "test-model",
+            "sequenced-tools",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "observe the window, then enter text".into(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let mut early_completion = false;
+    let history = loop {
+        let event = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("exact CUA history must arrive before the parallel batch finishes")
+            .unwrap();
+        if let AgentDurableEvent::TurnLlmContextAppended {
+            tool_name, payload, ..
+        } = &event
+            && tool_name == "cua_get_window_state"
+        {
+            let pioneer_protocol::ToolResultView::Json { value, .. } = payload else {
+                panic!("exact ChatMessage retained");
+            };
+            break serde_json::from_value::<ChatMessage>(value.clone()).unwrap();
+        }
+        if let AgentDurableEvent::ItemCompleted { notification } = &event {
+            if let TurnItem::DynamicToolCall { tool_name, .. } = &notification.item
+                && tool_name == "cua_get_window_state"
+            {
+                early_completion = true;
+            }
+        }
+        events.acknowledge_last(Ok(()));
+    };
+    assert!(
+        early_completion,
+        "early lifecycle accepted before exact typed history"
+    );
+    assert!(
+        admission.input_requested.available_permits() > 0,
+        "parallel input requested permission before capture reached the held exact history ACK"
+    );
+    let image = history
+        .content_parts
+        .iter()
+        .find_map(|part| match part {
+            MessageContentPart::Image { image } => Some(image),
+            _ => None,
+        })
+        .expect("typed image survives into exact history");
+    assert_eq!(
+        image.artifact.as_ref().unwrap().artifact_id,
+        "journal-capture"
+    );
+    let metadata = history
+        .content_parts
+        .iter()
+        .find_map(|part| match part {
+            MessageContentPart::Text { text } => {
+                serde_json::from_str::<serde_json::Value>(text).ok()
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        metadata["structuredContent"],
+        json!({"generation":7,"elementToken":"opaque","origin":{"x":-8,"y":3},"scale":2})
+    );
+    assert_eq!(metadata["content"][0]["width"], 320);
+    assert!(
+        metadata["pioneer_cua_context"]
+            .get("delivery_nonce")
+            .is_none()
+    );
+    assert_eq!(
+        backend.delivered.load(Ordering::SeqCst),
+        0,
+        "ItemCompleted ACK cannot commit observation"
+    );
+    assert_eq!(
+        backend.inputs.load(Ordering::SeqCst),
+        0,
+        "parallel input cannot reach backend while exact history ACK is held"
+    );
+    match delivery {
+        "success" | "bounded_rejected" => events.acknowledge_last(Ok(())),
+        "rejected" => events.acknowledge_last(Err(
+            pioneer_runtime_events::DurableCommitRejection::permanent(
+                "fixture_history_rejected",
+                "exact history append rejected",
+            ),
+        )),
+        "receiver_dropped" => {
+            drop(events);
+            timeout(Duration::from_secs(5), async {
+                while backend.released.load(Ordering::SeqCst) == 0 {
+                    yield_now().await;
+                }
+            })
+            .await
+            .expect("lost history ACK revokes receipt");
+            assert_eq!(backend.delivered.load(Ordering::SeqCst), 0);
+            assert_eq!(backend.inputs.load(Ordering::SeqCst), 0);
+            manager.remove_thread(thread).await;
+            return;
+        }
+        "caller_dropped" => {
+            // Abrupt loss of the actor drops its owned native turn future;
+            // do not simulate this by rejecting the early lifecycle event.
+            manager
+                .state
+                .read()
+                .await
+                .threads
+                .get(thread)
+                .unwrap()
+                .loop_handle
+                .abort();
+            timeout(Duration::from_secs(5), async {
+                while backend.released.load(Ordering::SeqCst) == 0 {
+                    yield_now().await;
+                }
+            })
+            .await
+            .expect("lost native caller revokes pending receipt");
+            drop(events);
+            assert_eq!(backend.delivered.load(Ordering::SeqCst), 0);
+            assert_eq!(backend.inputs.load(Ordering::SeqCst), 0);
+            manager.remove_thread(thread).await;
+            return;
+        }
+        "cancelled" => {
+            timeout(
+                Duration::from_secs(5),
+                manager.cancel_turn(thread, turn, "cancel during exact result append"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            // A late successful storage ACK cannot revive cancelled authority.
+            events.acknowledge_last(Ok(()));
+        }
+        _ => unreachable!(),
+    }
+    let mut observed = Vec::new();
+    loop {
+        let event = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("parallel batch must finish after delivery resolution")
+            .unwrap();
+        let terminal = matches!(
+            &event,
+            AgentDurableEvent::TurnCompleted { .. }
+                | AgentDurableEvent::TurnFailed { .. }
+                | AgentDurableEvent::TurnBlocked { .. }
+                | AgentDurableEvent::TurnInterrupted { .. }
+        );
+        events.acknowledge_last(Ok(()));
+        if let Some(event) = test_agent_event_from_durable(event) {
+            observed.push(event);
+        }
+        if terminal {
+            break;
+        }
+    }
+    if delivery == "success" {
+        assert_turn_completed(&observed);
+        assert_eq!(backend.delivered.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backend.inputs.load(Ordering::SeqCst),
+            1,
+            "input blocked by capture receipt must resume before batch gather"
+        );
+        let requests = provider.snapshot_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].messages.iter().any(|message| message.role == Role::Tool && message.content_parts.iter().any(|part| matches!(part, MessageContentPart::Image { image: delivered } if delivered == image))), "next provider request retains the original typed image");
+    } else {
+        assert_eq!(backend.delivered.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.inputs.load(Ordering::SeqCst), 0);
+        assert!(backend.released.load(Ordering::SeqCst) > 0);
+        if delivery == "bounded_rejected" {
+            assert!(observed.iter().any(|event| matches!(event,
+                AgentEvent::TurnBlocked { reason, .. }
+                    if reason.contains("tool result attachment references exceed available context")
+            )), "negative control must reach the bounded provider-message guard");
+        }
+    }
+    manager.remove_thread(thread).await;
 }
 
 #[tokio::test]
@@ -15934,6 +16478,7 @@ impl Provider for UsageToolProvider {
         response.usage = Some(pioneer_provider::TokenUsage {
             input_tokens: Some(12345),
             output_tokens: Some(12),
+            ..Default::default()
         });
         Ok(response)
     }
@@ -16484,4 +17029,346 @@ async fn cancellation_context_freezes_interrupted_policy_request_handlers_and_cl
         receiver.acknowledge_last(Ok(()));
         manager.remove_thread(thread).await;
     }
+}
+
+// Actual manager command -> actor -> fresh native task contract. The fake
+// provider blocks at the first preflight call; it never starts native tools.
+#[derive(Clone, Copy, Debug)]
+enum ObservedTurnFinish {
+    Completed,
+    RootlessCompleted,
+    Failed,
+    Panicked,
+    Cancelled,
+    Aborted,
+    Revoked,
+}
+
+struct ObservedTurnProvider {
+    first: std::sync::Mutex<
+        Option<
+            tokio::sync::oneshot::Sender<(Option<pioneer_observability::work::WorkContext>, bool)>,
+        >,
+    >,
+    release: tokio::sync::Semaphore,
+    finish: ObservedTurnFinish,
+    inner: CaptureAgentProvider,
+}
+#[async_trait::async_trait]
+impl Provider for ObservedTurnProvider {
+    fn name(&self) -> &str {
+        "observed-turn"
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let first = self.first.lock().unwrap().take();
+        if let Some(first) = first {
+            let _ = first.send((
+                pioneer_observability::work::current(),
+                is_turn_preflight_request(&request),
+            ));
+            self.release.acquire().await.unwrap().forget();
+        }
+        if matches!(self.finish, ObservedTurnFinish::Panicked) {
+            panic!("observed turn fixture panic");
+        }
+        if matches!(self.finish, ObservedTurnFinish::Failed) && !is_turn_preflight_request(&request)
+        {
+            anyhow::bail!("HTTP 400 Bad Request: fixture rejection");
+        }
+        self.inner.chat(request).await
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk_with(response.termination)),
+        ])
+        .boxed())
+    }
+}
+
+#[tokio::test]
+async fn native_turn_command_handoff_is_live_during_preflight_and_retires_real_outcome() {
+    use pioneer_observability::{
+        live::{self, JournalPayload, WorkState},
+        work::{self, Boundary, ExecutorRole, Outcome, Trigger, WorkCarrier, WorkKind},
+    };
+    let _lock = crate::TURN_OBSERVATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            pioneer_observability::set_telemetry_enabled(self.0);
+        }
+    }
+    let _restore = Restore(pioneer_observability::telemetry_enabled());
+    for finish in [
+        ObservedTurnFinish::Completed,
+        ObservedTurnFinish::RootlessCompleted,
+        ObservedTurnFinish::Failed,
+        ObservedTurnFinish::Panicked,
+        ObservedTurnFinish::Cancelled,
+        ObservedTurnFinish::Aborted,
+        ObservedTurnFinish::Revoked,
+    ] {
+        pioneer_observability::set_telemetry_enabled(false);
+        pioneer_observability::set_telemetry_enabled(true);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let provider = Arc::new(ObservedTurnProvider {
+            first: std::sync::Mutex::new(Some(started_tx)),
+            release: tokio::sync::Semaphore::new(0),
+            finish,
+            inner: CaptureAgentProvider::default(),
+        });
+        let manager = AgentManager::new(
+            Arc::new(ProviderRegistry::with_provider(
+                "observed-turn",
+                provider.clone(),
+            )),
+            test_tool_loop_config(),
+        );
+        let thread = "observed-native-turn";
+        manager
+            .ensure_thread(thread, "observed-workspace")
+            .await
+            .unwrap();
+        let mut receiver = manager.take_durable_receiver(thread).await.unwrap();
+        let terminal_context = Arc::new(std::sync::Mutex::new(None));
+        let terminal_started = Arc::new(tokio::sync::Notify::new());
+        let terminal_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let drain = {
+            let observed = terminal_context.clone();
+            let started = terminal_started.clone();
+            let release = terminal_release.clone();
+            tokio::spawn(async move {
+                while let Some(event) = receiver.recv().await {
+                    if matches!(finish, ObservedTurnFinish::Completed)
+                        && matches!(event, AgentDurableEvent::TurnCompleted { .. })
+                    {
+                        *observed.lock().unwrap() = receiver.pending_work().context();
+                        started.notify_one();
+                        release.acquire().await.unwrap().forget();
+                    }
+                    receiver.acknowledge_last(Ok(()));
+                }
+            })
+        };
+        // Always run owner cleanup before propagating a fixture assertion panic.
+        let checked = std::panic::AssertUnwindSafe(async {
+            let parent = WorkCarrier::independent(Boundary::Rpc, WorkKind::RpcTurn, Trigger::Rpc, ExecutorRole::Gateway);
+            let parent_context = parent.context().unwrap();
+            let start = manager.start_test_turn_with_default_profile(thread, "observed-turn", ThreadMode::Agent, "test-model", "observed-turn", HashMap::new(), vec![UserInput::Text { text: "fixture".into(), text_elements: Vec::new() }], Vec::new());
+            if matches!(finish, ObservedTurnFinish::RootlessCompleted) { start.await.unwrap(); }
+            else { parent.scope(start).await.unwrap(); }
+            assert!(work::current().is_none(), "ACK scope restores the poll-local parent");
+            let (context, preflight) = timeout(Duration::from_secs(5), started_rx).await.expect("preflight reached").unwrap();
+            assert!(preflight, "the real preflight is independently blocked");
+            let context = context.expect("fresh task receives the command carrier");
+            assert_eq!(context.parent, if matches!(finish, ObservedTurnFinish::RootlessCompleted) { None } else { Some(parent_context.token) });
+            if matches!(finish, ObservedTurnFinish::RootlessCompleted) { assert_eq!(context.origin, work::ContextOrigin::MissingLocalParent); }
+            assert_eq!(context.consent_generation, parent_context.consent_generation);
+            let snapshot = live::snapshot().unwrap();
+            let own = snapshot.active.iter().find(|a| a.context.token == context.token).expect("turn remains active after RPC ACK");
+            assert!(!own.worker_lifetime);
+            assert_ne!(own.state, WorkState::Queued, "queued lease handed to the fresh execution");
+            assert_eq!(snapshot.active.iter().filter(|a| a.context.token == context.token).count(),1,"one native execution owner");
+            match finish {
+                ObservedTurnFinish::Cancelled => manager.cancel_turn(thread, "observed-turn", "fixture cancellation").await.unwrap(),
+                ObservedTurnFinish::Aborted => manager.state.read().await.threads.get(thread).unwrap().loop_handle.abort(),
+                ObservedTurnFinish::Revoked => {
+                    pioneer_observability::set_telemetry_enabled(false);
+                    pioneer_observability::set_telemetry_enabled(true);
+                    provider.release.add_permits(1);
+                }
+                _ => provider.release.add_permits(1),
+            }
+            if matches!(finish, ObservedTurnFinish::Completed) {
+                timeout(Duration::from_secs(5),terminal_started.notified()).await.expect("real durable terminal is waiting for its ACK");
+                let terminal_context = terminal_context.lock().unwrap().expect("actual durable terminal carries context");
+                assert_eq!(terminal_context.parent, Some(context.token), "actor terminal publication retains turn lineage");
+                assert_eq!(terminal_context.consent_generation, context.consent_generation);
+                let pending_terminal=live::snapshot().unwrap();
+                assert!(pending_terminal.active.iter().any(|entry|entry.context.token==context.token),"provider completion is not the durable turn terminal");
+                assert!(!pending_terminal.journal.iter().any(|r|matches!(&r.payload,JournalPayload::Work(entry) if entry.context.token==context.token && matches!(entry.state,WorkState::Terminal(_)))));
+                terminal_release.add_permits(1);
+            }
+            if matches!(finish, ObservedTurnFinish::Revoked) {
+                // Drive cleanup after the old in-flight future resumes in E2.
+                manager.remove_thread(thread).await;
+                let next = live::snapshot().unwrap();
+                assert_ne!(next.consent_generation, context.consent_generation);
+                assert!(next.active.iter().all(|a| a.context.token != context.token));
+                assert!(next.journal.iter().all(|r| !matches!(&r.payload, JournalPayload::Work(a) if a.context.token == context.token)));
+            } else {
+                let expected = match finish {
+                    ObservedTurnFinish::Completed | ObservedTurnFinish::RootlessCompleted => Outcome::Completed,
+                    ObservedTurnFinish::Failed => Outcome::Failed,
+                    ObservedTurnFinish::Panicked => Outcome::Panicked,
+                    ObservedTurnFinish::Cancelled | ObservedTurnFinish::Aborted => Outcome::Cancelled,
+                    ObservedTurnFinish::Revoked => unreachable!(),
+                };
+                timeout(Duration::from_secs(5), async {
+                    loop {
+                        let snapshot = live::snapshot().unwrap();
+                        if !snapshot.active.iter().any(|a| a.context.token == context.token) {
+                            let terminals: Vec<_> = snapshot.journal.iter().filter_map(|r| match &r.payload { JournalPayload::Work(a) if a.context.token == context.token => match a.state { WorkState::Terminal(o) => Some(o), _ => None }, _ => None }).collect();
+                            assert_eq!(terminals, vec![expected], "exactly one actual terminal for {finish:?}");
+                            break;
+                        }
+                        yield_now().await;
+                    }
+                }).await.expect("native execution retires after real completion/cancellation");
+            }
+            assert!(work::current().is_none());
+        }).catch_unwind().await;
+        terminal_release.add_permits(1);
+        manager.remove_thread(thread).await;
+        drain.abort();
+        let _ = drain.await;
+        if let Err(panic) = checked {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
+async fn phased_rejected_final_keeps_native_candidate_and_commentary_before_retry() {
+    struct PhasedSequence {
+        inner: SequencedTextProvider,
+    }
+    #[async_trait::async_trait]
+    impl Provider for PhasedSequence {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+        async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+            let preflight = is_turn_preflight_request(&request);
+            let model = request.model.clone();
+            let mut response = self.inner.chat(request).await?;
+            if !preflight {
+                response.messages = vec![
+                    pioneer_provider::ProviderMessage {
+                        id: pioneer_provider::ProviderMessageId(0),
+                        phase: Some(pioneer_protocol::AgentMessagePhase::Commentary),
+                        text: format!("progress for {}", response.text),
+                    },
+                    pioneer_provider::ProviderMessage {
+                        id: pioneer_provider::ProviderMessageId(1),
+                        phase: Some(pioneer_protocol::AgentMessagePhase::FinalAnswer),
+                        text: response.text.clone(),
+                    },
+                ];
+                response.provider_replay_state = Some(
+                    pioneer_provider::ProviderReplayState::for_model(
+                        self.name(),
+                        model,
+                        json!({"schema_version":1,"assistant_message":{"content":response.text,"reasoning_content":null,"tool_calls":[]}}),
+                    ),
+                );
+            }
+            Ok(response)
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            anyhow::bail!("non-stream fixture")
+        }
+    }
+    let provider = Arc::new(PhasedSequence {
+        inner: SequencedTextProvider::new(vec!["premature final answer", "accepted final answer"]),
+    });
+    let finalization = Arc::new(RetryOnceFinalizationProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-text",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_turn_finalization_provider(Some(finalization.clone()))
+        .await;
+    let observed = start_simple_turn(
+        &manager,
+        "phased_retry_thread",
+        "workspace",
+        "phased_retry_turn",
+        ThreadMode::Agent,
+        "sequenced-text",
+        "finish with artifact",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    let items = observed
+        .iter()
+        .filter_map(|event| {
+            if let AgentEvent::ItemCompleted(notification) = event {
+                Some(&notification.item)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let finals = items
+        .iter()
+        .filter_map(|item| {
+            if let TurnItem::AgentMessage {
+                text,
+                phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                ..
+            } = item
+            {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(finals, vec!["accepted final answer"]);
+    let commentary = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                TurnItem::AgentMessage {
+                    phase: pioneer_protocol::AgentMessagePhase::Commentary,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(commentary, 2);
+    assert_eq!(
+        finalization.snapshot_contexts()[0].final_text,
+        "premature final answer"
+    );
+    let requests = provider.inner.snapshot_requests();
+    assert_eq!(requests.len(), 2);
+    let native = requests[1]
+        .messages
+        .iter()
+        .filter(|m| m.provider_replay_state.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        native.len(),
+        1,
+        "rejected candidate must survive before next dispatch"
+    );
+    assert!(
+        native[0]
+            .content
+            .contains("progress for premature final answer")
+    );
+    assert!(native[0].provenance.is_some());
+    assert!(requests[1].temperature.is_none());
 }

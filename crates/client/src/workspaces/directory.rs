@@ -13,9 +13,8 @@ use std::{
 
 /// Keep the latest turn marker supplied by thread metadata, without retaining history.
 /// Composer defaults need this marker to distinguish a conversation from an empty draft.
-pub(crate) fn thread_directory_summary(mut thread: Thread) -> Thread {
-    thread.turns = thread.turns.into_iter().next_back().into_iter().collect();
-    thread
+pub(crate) fn thread_directory_summary(thread: Thread) -> Thread {
+    thread.into_directory_summary()
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -68,10 +67,29 @@ impl DirectoryActionPublication {
         self.error.as_deref()
     }
 }
+/// Evidence from the existing directory request owner. Local unread/metadata
+/// projections may change `loading`, but cannot complete a full-tree request.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadTreeLoadReceipt {
+    pub generation: u64,
+    pub state: ThreadTreeLoadState,
+}
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadTreeLoadState {
+    Pending,
+    Ready,
+    Failed,
+}
+
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadTreePublication {
     revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    load: Option<ThreadTreeLoadReceipt>,
     snapshot: ThreadTreeSnapshot,
     changes: SidebarChangeSet,
     #[serde(default)]
@@ -80,6 +98,9 @@ pub struct ThreadTreePublication {
     error: Option<String>,
 }
 impl ThreadTreePublication {
+    pub fn load(&self) -> Option<&ThreadTreeLoadReceipt> {
+        self.load.as_ref()
+    }
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -115,6 +136,7 @@ impl SidebarProjectionStore {
         next: ThreadTreeSnapshot,
         loading: bool,
         error: Option<String>,
+        load: Option<ThreadTreeLoadReceipt>,
     ) -> Option<Arc<ThreadTreePublication>> {
         let previous = self.publications.get(&next.workspace_id);
         let empty = ThreadTreeSnapshot::default();
@@ -149,10 +171,22 @@ impl SidebarProjectionStore {
         let next_unread = unread(&next);
         for id in next.threads_by_id.keys() {
             if (before.placements_by_thread_id.get(id) != next.placements_by_thread_id.get(id)
-                || before_unread.get(id) != next_unread.get(id))
+                || before_unread.get(id) != next_unread.get(id)
+                || before.running_task_thread_ids.contains(id)
+                    != next.running_task_thread_ids.contains(id))
                 && !changes.changed.contains(&SidebarNodeId::Thread(id.clone()))
             {
                 changes.changed.push(SidebarNodeId::Thread(id.clone()));
+            }
+        }
+        for id in next.folders_by_id.keys() {
+            let node = SidebarNodeId::Folder(id.clone());
+            if (before.unread_by_folder_id.get(id) != next.unread_by_folder_id.get(id)
+                || before.running_task_folder_ids.contains(id)
+                    != next.running_task_folder_ids.contains(id))
+                && !changes.changed.contains(&node)
+            {
+                changes.changed.push(node);
             }
         }
         let folders = before
@@ -172,8 +206,9 @@ impl SidebarProjectionStore {
                 changes.reordered_folders.push(folder);
             }
         }
-        if previous.is_some_and(|p| changes.is_empty() && p.loading == loading && p.error == error)
-        {
+        if previous.is_some_and(|p| {
+            changes.is_empty() && p.loading == loading && p.error == error && p.load == load
+        }) {
             return None;
         }
         let mut actions = previous
@@ -195,6 +230,7 @@ impl SidebarProjectionStore {
             true
         });
         let publication = Arc::new(ThreadTreePublication {
+            load,
             revision: self.revisions.get(&next.workspace_id).copied().unwrap_or(0) + 1,
             snapshot: next,
             actions,
@@ -233,8 +269,59 @@ fn changed_nodes<T: PartialEq>(
     }
 }
 
+// A request-local baseline, never another cache. It lets a full response merge
+// unchanged rows while preserving metadata, removals and moves made in flight.
+#[derive(Default)]
+struct DirectoryRequestBaseline {
+    threads: HashMap<String, Thread>,
+    folders: HashMap<String, ThreadFolder>,
+    placements: HashMap<String, ThreadPlacement>,
+    agents_docs: HashMap<(String, Option<String>), ThreadAgentsDocSummary>,
+    read_revisions: HashMap<String, u64>,
+    push_revision: Option<(String, u64)>,
+    // Accepted writes can return to their baseline value (or disappear from
+    // both maps). Track that fact only for the lifetime of this request.
+    touched_threads: std::collections::HashSet<String>,
+    touched_placements: std::collections::HashSet<String>,
+}
+
+// One already-started selection load may continue after a partial read merge.
+// Kept with directory/navigation lifecycle, never with an ordinary tree hint.
+pub(super) struct InitialDirectoryRestore {
+    pub workspace: String,
+    pub connection: Option<u64>,
+    pub navigation_revision: u64,
+}
+
+fn merge_directory_rows<K, V>(
+    current: &mut HashMap<K, V>,
+    before: HashMap<K, V>,
+    mut protected: std::collections::HashSet<K>,
+    incoming: impl IntoIterator<Item = (K, V)>,
+    in_workspace: impl Fn(&V) -> bool,
+) where
+    K: Clone + Eq + std::hash::Hash,
+    V: PartialEq,
+{
+    protected.extend(
+        before
+            .keys()
+            .chain(current.keys())
+            .filter(|id| current.get(*id) != before.get(*id))
+            .cloned(),
+    );
+    current.retain(|id, value| !in_workspace(value) || protected.contains(id));
+    for (id, value) in incoming {
+        if !protected.contains(&id) {
+            current.insert(id, value);
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ThreadDirectoryStore {
+    pub(crate) push_revisions: HashMap<String, (String, u64)>,
+    pub(super) initial_restore: Option<InitialDirectoryRestore>,
     pub(crate) dirty_workspaces: std::collections::BTreeSet<String>,
     pub(crate) threads: HashMap<String, Thread>,
     pub(crate) placements: HashMap<String, ThreadPlacement>,
@@ -242,20 +329,151 @@ pub struct ThreadDirectoryStore {
     folders: HashMap<String, ThreadFolder>,
     agents_docs: HashMap<(String, Option<String>), ThreadAgentsDocSummary>,
     unread: HashMap<String, u64>,
+    running_task_thread_ids: std::collections::HashSet<String>,
     cursors: HashMap<String, pioneer_protocol::ThreadReadCursor>,
+    read_revisions: HashMap<String, u64>,
     requests: HashMap<String, u64>,
+    loads: HashMap<String, ThreadTreeLoadReceipt>,
     subscriptions: HashMap<String, usize>,
     suspended_workspaces: BTreeSet<String>,
     // An access fence clears protected data, but must not erase the need to
     // reload it. Local projections can be recreated before that reload finishes.
     authorization_reloads: BTreeSet<String>,
     lifecycle_generations: HashMap<String, u64>,
-    request_versions: HashMap<String, u64>,
-    semantic_versions: HashMap<String, u64>,
+    request_baselines: HashMap<String, DirectoryRequestBaseline>,
     next_request: u64,
     projections: SidebarProjectionStore,
 }
 impl ThreadDirectoryStore {
+    pub(crate) fn cancel_initial_restore(&mut self) {
+        self.initial_restore = None;
+    }
+
+    pub(crate) fn upsert_thread_summary(&mut self, thread: Thread) {
+        if self.threads.get(&thread.id) == Some(&thread) {
+            return;
+        }
+        let id = thread.id.clone();
+        let workspace = thread.workspace_id.clone();
+        if let Some(previous) = self.threads.insert(id.clone(), thread)
+            && previous.workspace_id != workspace
+            && let Some(request) = self.request_baselines.get_mut(&previous.workspace_id)
+        {
+            request.touched_threads.insert(id.clone());
+        }
+        if let Some(request) = self.request_baselines.get_mut(&workspace) {
+            request.touched_threads.insert(id);
+        }
+    }
+
+    pub(crate) fn upsert_placement(&mut self, placement: ThreadPlacement) {
+        if self.placements.get(&placement.thread_id) == Some(&placement) {
+            return;
+        }
+        let id = placement.thread_id.clone();
+        let workspace = placement.workspace_id.clone();
+        if let Some(previous) = self.placements.insert(id.clone(), placement)
+            && previous.workspace_id != workspace
+            && let Some(request) = self.request_baselines.get_mut(&previous.workspace_id)
+        {
+            request.touched_placements.insert(id.clone());
+        }
+        if let Some(request) = self.request_baselines.get_mut(&workspace) {
+            request.touched_placements.insert(id);
+        }
+    }
+
+    // Semantic removal only. Coordinator LRU eviction retains directory rows
+    // and must not mark a request-local deletion.
+    pub(crate) fn remove_thread(&mut self, id: &str) {
+        let thread = self.threads.remove(id);
+        let placement = self.placements.remove(id);
+        for workspace in thread
+            .iter()
+            .map(|t| &t.workspace_id)
+            .chain(placement.iter().map(|p| &p.workspace_id))
+        {
+            if let Some(request) = self.request_baselines.get_mut(workspace) {
+                request.touched_threads.insert(id.to_owned());
+                request.touched_placements.insert(id.to_owned());
+            }
+            self.dirty_workspaces.insert(workspace.clone());
+        }
+        self.unread.remove(id);
+        self.running_task_thread_ids.remove(id);
+    }
+
+    pub(crate) fn push_demand(&self, workspace: &str) -> Option<Vec<String>> {
+        if self.suspended_workspaces.contains(workspace)
+            || !self.subscriptions.contains_key(workspace)
+            || !self
+                .loads
+                .get(workspace)
+                .is_some_and(|load| load.state == ThreadTreeLoadState::Ready)
+        {
+            return None;
+        }
+        Some(
+            self.threads
+                .values()
+                .filter(|t| t.workspace_id == workspace)
+                .map(|t| t.id.clone())
+                .collect(),
+        )
+    }
+    pub(crate) fn push_epoch_is_current(&self, workspace: &str, epoch: &str) -> bool {
+        !self.suspended_workspaces.contains(workspace)
+            && self.subscriptions.contains_key(workspace)
+            && self
+                .push_revisions
+                .get(workspace)
+                .is_some_and(|(current, _)| current == epoch)
+    }
+    pub(crate) fn apply_push_indicators(
+        &mut self,
+        packet: &pioneer_protocol::WorkspacePushNotification,
+    ) -> bool {
+        if self
+            .push_revisions
+            .get(&packet.workspace_id)
+            .is_none_or(|(epoch, _)| epoch != &packet.epoch)
+            || packet.indicators.iter().any(|patch| {
+                !self
+                    .threads
+                    .get(&patch.thread_id)
+                    .is_some_and(|thread| thread.workspace_id == packet.workspace_id)
+            })
+        {
+            return false;
+        }
+        for patch in &packet.indicators {
+            if let Some(count) = patch.unread_count {
+                self.unread.insert(patch.thread_id.clone(), count);
+                *self
+                    .read_revisions
+                    .entry(patch.thread_id.clone())
+                    .or_default() += 1;
+            }
+            if let Some(running) = patch.has_running_tasks {
+                if running {
+                    self.running_task_thread_ids.insert(patch.thread_id.clone());
+                } else {
+                    self.running_task_thread_ids.remove(&patch.thread_id);
+                }
+            }
+        }
+        self.push_revisions.insert(
+            packet.workspace_id.clone(),
+            (packet.epoch.clone(), packet.revision),
+        );
+        true
+    }
+    pub(crate) fn read_position_is_confirmed(&self, thread: &str, sort_key: &str) -> bool {
+        self.cursors
+            .get(thread)
+            .is_some_and(|cursor| cursor.sort_key.as_str() >= sort_key)
+    }
+
     pub(crate) fn has_unread(&self, thread: &str) -> bool {
         self.unread.get(thread).copied().unwrap_or(0) > 0
     }
@@ -279,6 +497,7 @@ impl ThreadDirectoryStore {
                 })
                 .cloned()
                 .collect(),
+            self.running_task_thread_ids.iter().cloned().collect(),
             self.unread
                 .iter()
                 .map(|(id, count)| ThreadUnreadSummary {
@@ -302,17 +521,8 @@ impl ThreadDirectoryStore {
                 .cloned()
                 .collect(),
         );
-        let publication = self.projections.update(snapshot, loading, error);
-        if publication
-            .as_ref()
-            .is_some_and(|publication| !publication.changes.is_empty())
-        {
-            *self
-                .semantic_versions
-                .entry(workspace.to_owned())
-                .or_default() += 1;
-        }
-        publication
+        self.projections
+            .update(snapshot, loading, error, self.loads.get(workspace).cloned())
     }
     pub(crate) fn invalidate(&mut self) {
         let generation = self.next_request.saturating_add(1);
@@ -347,36 +557,82 @@ impl ThreadDirectoryStore {
             .expect("directory request generation exhausted");
         self.requests
             .insert(workspace.to_owned(), self.next_request);
-        self.request_versions.insert(
+        self.request_baselines.insert(
             workspace.to_owned(),
-            self.semantic_versions.get(workspace).copied().unwrap_or(0),
+            DirectoryRequestBaseline {
+                push_revision: self.push_revisions.get(workspace).cloned(),
+                threads: self
+                    .threads
+                    .iter()
+                    .filter(|(_, t)| t.workspace_id == workspace)
+                    .map(|(id, t)| (id.clone(), t.clone()))
+                    .collect(),
+                folders: self
+                    .folders
+                    .iter()
+                    .filter(|(_, f)| f.workspace_id == workspace)
+                    .map(|(id, f)| (id.clone(), f.clone()))
+                    .collect(),
+                placements: self
+                    .placements
+                    .iter()
+                    .filter(|(_, p)| p.workspace_id == workspace)
+                    .map(|(id, p)| (id.clone(), p.clone()))
+                    .collect(),
+                agents_docs: self
+                    .agents_docs
+                    .iter()
+                    .filter(|((w, _), _)| w == workspace)
+                    .map(|(id, a)| (id.clone(), a.clone()))
+                    .collect(),
+                read_revisions: self
+                    .read_revisions
+                    .iter()
+                    .filter(|(id, _)| {
+                        self.threads
+                            .get(*id)
+                            .is_some_and(|t| t.workspace_id == workspace)
+                    })
+                    .map(|(id, revision)| (id.clone(), *revision))
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        self.loads.insert(
+            workspace.to_owned(),
+            ThreadTreeLoadReceipt {
+                generation: self.next_request,
+                state: ThreadTreeLoadState::Pending,
+            },
         );
         self.next_request
+    }
+    fn finish_load(&mut self, workspace: &str, generation: u64, failed: bool) {
+        if let Some(load) = self.loads.get_mut(workspace).filter(|load| {
+            load.generation == generation && load.state == ThreadTreeLoadState::Pending
+        }) {
+            load.state = if failed {
+                ThreadTreeLoadState::Failed
+            } else {
+                ThreadTreeLoadState::Ready
+            };
+        }
     }
     fn complete(&mut self, workspace: &str, generation: u64, response: ThreadTreeResponse) -> bool {
         if response.workspace_id != workspace
             || self.requests.get(workspace) != Some(&generation)
-            || response.threads.iter().any(|thread| {
-                thread.workspace_id != workspace
-                    || self
-                        .threads
-                        .get(&thread.id)
-                        .is_some_and(|known| known.workspace_id != workspace)
-            })
-            || response.folders.iter().any(|folder| {
-                folder.workspace_id != workspace
-                    || self
-                        .folders
-                        .get(&folder.id)
-                        .is_some_and(|known| known.workspace_id != workspace)
-            })
-            || response.placements.iter().any(|placement| {
-                placement.workspace_id != workspace
-                    || self
-                        .threads
-                        .get(&placement.thread_id)
-                        .is_some_and(|known| known.workspace_id != workspace)
-            })
+            || response
+                .threads
+                .iter()
+                .any(|thread| thread.workspace_id != workspace)
+            || response
+                .folders
+                .iter()
+                .any(|folder| folder.workspace_id != workspace)
+            || response
+                .placements
+                .iter()
+                .any(|placement| placement.workspace_id != workspace)
             || response
                 .agents_docs
                 .iter()
@@ -385,65 +641,120 @@ impl ThreadDirectoryStore {
             return false;
         }
         self.requests.remove(workspace);
-        if self.request_versions.remove(workspace)
-            != Some(self.semantic_versions.get(workspace).copied().unwrap_or(0))
-        {
-            return false;
-        }
-        let removed = self
-            .threads
-            .values()
-            .filter(|t| t.workspace_id == workspace)
-            .map(|t| t.id.clone())
-            .collect::<Vec<_>>();
-        for id in removed {
-            self.threads.remove(&id);
-            self.unread.remove(&id);
-        }
-        self.folders.retain(|_, f| f.workspace_id != workspace);
-        self.placements.retain(|_, p| p.workspace_id != workspace);
-        self.agents_docs.retain(|(w, _), _| w != workspace);
-        for thread in response
-            .threads
-            .into_iter()
-            .filter(|t| t.workspace_id == workspace)
-        {
+        let before = self
+            .request_baselines
+            .remove(workspace)
+            .expect("request has baseline");
+        // Request/connection/access fences remain authoritative. Compare rows
+        // against the request baseline so unrelated local metadata does not
+        // suppress fresh indicators, including changes to unprojected drafts.
+        let mut response = response.into_directory_summary();
+        // A valid old snapshot can still contain IDs moved to another workspace
+        // locally. Keep those row fences without discarding independent fresh
+        // indicators. A payload whose own workspace fields disagree was rejected
+        // above; moved rows never enter either workspace through this response.
+        response.threads.retain(|thread| {
             self.threads
-                .insert(thread.id.clone(), thread_directory_summary(thread));
-        }
-        for folder in response
-            .folders
+                .get(&thread.id)
+                .is_none_or(|known| known.workspace_id == workspace)
+        });
+        response.folders.retain(|folder| {
+            self.folders
+                .get(&folder.id)
+                .is_none_or(|known| known.workspace_id == workspace)
+        });
+        response.placements.retain(|placement| {
+            self.threads
+                .get(&placement.thread_id)
+                .is_none_or(|known| known.workspace_id == workspace)
+        });
+        let response_ids = response
+            .threads
+            .iter()
+            .map(|t| t.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        merge_directory_rows(
+            &mut self.threads,
+            before.threads,
+            before.touched_threads,
+            response.threads.into_iter().map(|t| (t.id.clone(), t)),
+            |t| t.workspace_id == workspace,
+        );
+        merge_directory_rows(
+            &mut self.folders,
+            before.folders,
+            Default::default(),
+            response.folders.into_iter().map(|f| (f.id.clone(), f)),
+            |f| f.workspace_id == workspace,
+        );
+        merge_directory_rows(
+            &mut self.placements,
+            before.placements,
+            before.touched_placements,
+            response
+                .placements
+                .into_iter()
+                .map(|p| (p.thread_id.clone(), p)),
+            |p| p.workspace_id == workspace,
+        );
+        merge_directory_rows(
+            &mut self.agents_docs,
+            before.agents_docs,
+            Default::default(),
+            response
+                .agents_docs
+                .into_iter()
+                .map(|a| ((workspace.to_owned(), a.folder_id.clone()), a)),
+            |a| a.workspace_id == workspace,
+        );
+        self.placements.retain(|id, placement| {
+            placement.workspace_id != workspace || self.threads.contains_key(id)
+        });
+        self.unread.retain(|id, _| self.threads.contains_key(id));
+        self.running_task_thread_ids
+            .retain(|id| self.threads.contains_key(id));
+        let incoming_unread = response
+            .unread
             .into_iter()
-            .filter(|f| f.workspace_id == workspace)
-        {
-            self.folders.insert(folder.id.clone(), folder);
-        }
-        for placement in response
-            .placements
+            .map(|u| (u.thread_id, u.unread_count))
+            .collect::<HashMap<_, _>>();
+        let incoming_running = response
+            .running_task_thread_ids
             .into_iter()
-            .filter(|p| p.workspace_id == workspace)
-        {
-            self.placements
-                .insert(placement.thread_id.clone(), placement);
-        }
-        for summary in response
-            .agents_docs
-            .into_iter()
-            .filter(|a| a.workspace_id == workspace)
-        {
-            self.agents_docs
-                .insert((workspace.to_owned(), summary.folder_id.clone()), summary);
-        }
-        for summary in response.unread {
-            if self
+            .collect::<std::collections::HashSet<_>>();
+        let mut reconciled = true;
+        for id in response_ids {
+            if !self
                 .threads
-                .get(&summary.thread_id)
+                .get(&id)
                 .is_some_and(|t| t.workspace_id == workspace)
             {
-                self.unread.insert(summary.thread_id, summary.unread_count);
+                continue; // Never resurrect a locally deleted/moved thread.
+            }
+            let push_unchanged =
+                self.push_revisions.get(workspace) == before.push_revision.as_ref();
+            if push_unchanged && incoming_running.contains(&id) {
+                self.running_task_thread_ids.insert(id.clone());
+            } else if push_unchanged {
+                self.running_task_thread_ids.remove(&id);
+            }
+            if !push_unchanged {
+                continue;
+            }
+            if self.read_revisions.get(&id) == before.read_revisions.get(&id) {
+                if let Some(count) = incoming_unread.get(&id) {
+                    self.unread.insert(id.clone(), *count);
+                } else {
+                    self.unread.remove(&id);
+                }
+            } else {
+                // Counts have no cursor in the wire contract. Keep the newer
+                // confirmed read and reconcile through the coalescing queue.
+                // Pending local read requests never enter this cursor map.
+                reconciled = false;
             }
         }
-        true
+        reconciled
     }
 }
 impl ClientCore {
@@ -454,14 +765,12 @@ impl ClientCore {
         else {
             return;
         };
-        let suspended = {
+        let (suspended, resumed) = {
             let mut registry = self
                 .thread_registry
                 .lock()
                 .expect("thread registry poisoned");
-            if added {
-                registry.directory.suspended_workspaces.remove(workspace);
-            }
+            let resumed = added && registry.directory.suspended_workspaces.remove(workspace);
             let count = registry
                 .directory
                 .subscriptions
@@ -476,13 +785,17 @@ impl ClientCore {
             if suspended {
                 registry.directory.subscriptions.remove(workspace);
             }
-            suspended
+            (suspended, resumed)
         };
         if suspended {
             self.workspace_demand_changed(scope, crate::core::ClientDemand::Suspended);
         } else if added {
             self.resume_workspace_directory_demand();
+            if resumed && self.authorization_snapshot(None, None).is_some() {
+                self.queue_directory_refresh(workspace);
+            }
         }
+        self.queue_workspace_push(workspace);
     }
     pub(crate) fn resume_workspace_directory_demand(&self) {
         if self.is_stopped() || self.authorization_snapshot(None, None).is_none() {
@@ -535,13 +848,20 @@ impl ClientCore {
             return;
         };
         if demand != crate::core::ClientDemand::Suspended {
-            self.thread_registry
+            let resumed = self
+                .thread_registry
                 .lock()
                 .expect("thread registry poisoned")
                 .directory
                 .suspended_workspaces
                 .remove(workspace);
             self.resume_workspace_directory_demand();
+            // Lifecycle hints are intentionally not fetched while suspended.
+            // Re-enter through the existing queue to recover any missed state.
+            if resumed && self.authorization_snapshot(None, None).is_some() {
+                self.queue_directory_refresh(workspace);
+            }
+            self.queue_workspace_push(workspace);
             return;
         }
         self.cancel_workspace_requests(workspace);
@@ -559,8 +879,19 @@ impl ClientCore {
             .entry(workspace.clone())
             .or_default() += 1;
         registry.directory.requests.remove(workspace);
-        registry.directory.request_versions.remove(workspace);
+        registry.directory.request_baselines.remove(workspace);
+        if registry
+            .directory
+            .initial_restore
+            .as_ref()
+            .is_some_and(|initial| initial.workspace == *workspace)
+        {
+            registry.directory.cancel_initial_restore();
+        }
+        registry.directory.push_revisions.remove(workspace);
         let Some(previous) = registry.directory.snapshot(workspace) else {
+            drop(registry);
+            self.queue_workspace_push(workspace);
             return;
         };
         let mut next = previous.as_ref().clone();
@@ -572,6 +903,8 @@ impl ClientCore {
             }
         });
         if next == *previous {
+            drop(registry);
+            self.queue_workspace_push(workspace);
             return;
         }
         next.revision += 1;
@@ -587,6 +920,8 @@ impl ClientCore {
             .publications
             .insert(workspace.clone(), publication.clone());
         self.publish_workspace_tree(publication);
+        drop(registry);
+        self.queue_workspace_push(workspace);
     }
     pub fn workspace_tree(&self, workspace: &str) -> Option<Arc<ThreadTreePublication>> {
         self.thread_registry
@@ -625,16 +960,6 @@ impl ClientCore {
             {
                 self.publish_workspace_tree(publication);
             }
-            let version = registry
-                .directory
-                .semantic_versions
-                .get(workspace)
-                .copied()
-                .unwrap_or(0);
-            registry
-                .directory
-                .request_versions
-                .insert(workspace.to_owned(), version);
             generation
         };
         let result = crate::transport::ws::command_sender::thread_tree(
@@ -645,41 +970,43 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        anyhow::ensure!(
-            !self.is_stopped()
-                && connection == self.gateway_http_generation()
-                && registry.directory.requests.get(workspace) == Some(&generation),
-            "Directory request is stale"
-        );
+        if self.is_stopped()
+            || connection != self.gateway_http_generation()
+            || registry.directory.requests.get(workspace) != Some(&generation)
+        {
+            // Retire only this request, never a replacement generation. Its
+            // touched keys must not outlive a fenced/error completion.
+            if registry.directory.requests.get(workspace) == Some(&generation) {
+                registry.directory.requests.remove(workspace);
+                registry.directory.request_baselines.remove(workspace);
+            }
+            anyhow::bail!("Directory request is stale");
+        }
+        let mut reconcile_counts = false;
         let error = match result {
             Ok(response) => {
-                let changed_during_request =
-                    registry.directory.request_versions.get(workspace).copied()
-                        != Some(
-                            registry
-                                .directory
-                                .semantic_versions
-                                .get(workspace)
-                                .copied()
-                                .unwrap_or(0),
-                        );
                 if registry.directory.complete(workspace, generation, response) {
                     None
-                } else if changed_during_request {
-                    drop(registry);
-                    self.queue_directory_refresh(workspace);
-                    anyhow::bail!("Directory semantic generation changed during loading");
+                } else if !registry.directory.requests.contains_key(workspace) {
+                    reconcile_counts = true;
+                    None
                 } else {
                     registry.directory.requests.remove(workspace);
-                    registry.directory.request_versions.remove(workspace);
+                    registry.directory.request_baselines.remove(workspace);
                     Some("Directory response scope mismatch".into())
                 }
             }
             Err(error) => {
                 registry.directory.requests.remove(workspace);
+                registry.directory.request_baselines.remove(workspace);
                 Some(format!("{error:#}"))
             }
         };
+        if !reconcile_counts {
+            registry
+                .directory
+                .finish_load(workspace, generation, error.is_some());
+        }
         let draft = registry.navigation.drafts.get(workspace).cloned();
         if let Some(publication) =
             registry
@@ -696,14 +1023,23 @@ impl ClientCore {
             .directory
             .threads
             .values()
-            .filter(|thread| thread.workspace_id == workspace)
+            .filter(|thread| {
+                thread.workspace_id == workspace && registry.has_thread_store(&thread.id)
+            })
             .cloned()
             .collect::<Vec<_>>();
         drop(registry);
         // Active thread coordinators consume metadata from this directory owner.
         for thread in threads {
-            self.upsert_thread(thread);
+            self.upsert_existing_directory_thread(thread);
         }
+        if reconcile_counts {
+            // One coalesced follow-up for actual confirmed-read changes only.
+            // Metadata churn cannot create a self-sustaining refresh loop.
+            self.queue_directory_refresh(workspace);
+            anyhow::bail!("Directory read changed during loading; reconciling counts");
+        }
+        self.queue_workspace_push(workspace);
         Ok(publication)
     }
     pub(crate) fn publish_workspace_tree(&self, publication: Arc<ThreadTreePublication>) {
@@ -759,11 +1095,19 @@ impl ClientCore {
         {
             return;
         }
-        if registry.directory.cursors.get(thread) != Some(cursor) {
+        // Negotiated publisher owns counts; legacy reads still confirm the cursor.
+        let unread = if registry.directory.push_revisions.contains_key(workspace) {
+            registry.directory.unread.get(thread).copied().unwrap_or(0)
+        } else {
+            unread
+        };
+        let read_changed = registry.directory.cursors.get(thread) != Some(cursor)
+            || registry.directory.unread.get(thread).copied().unwrap_or(0) != unread;
+        if read_changed {
             *registry
                 .directory
-                .semantic_versions
-                .entry(workspace.to_owned())
+                .read_revisions
+                .entry(thread.to_owned())
                 .or_default() += 1;
         }
         registry
@@ -824,7 +1168,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({"id":id,"workspace_id":workspace,"preview":"","mode":"Chat","model":"model","model_provider":"provider","created_at":time,"updated_at":time,"status":"Idle","turns":[]})).unwrap()
     }
     fn snapshot(threads: Vec<Thread>, unread: Vec<ThreadUnreadSummary>) -> ThreadTreeSnapshot {
-        thread_tree_snapshot_from_parts("a".into(), threads, unread, vec![], vec![], vec![])
+        thread_tree_snapshot_from_parts("a".into(), threads, vec![], unread, vec![], vec![], vec![])
     }
 
     fn conversation_thread(id: &str, workspace: &str, time: i64, effort: Option<&str>) -> Thread {
@@ -858,6 +1202,7 @@ mod tests {
             workspace,
             generation,
             ThreadTreeResponse {
+                running_task_thread_ids: Vec::new(),
                 workspace_id: workspace.into(),
                 threads,
                 unread: vec![],
@@ -890,6 +1235,559 @@ mod tests {
             assert_eq!(core.resolved_composer_model_selection(thread_id), expected);
         }
         selection
+    }
+
+    struct TreeReply<'a, F> {
+        core: &'a ClientCore,
+        response: ThreadTreeResponse,
+        during: F,
+    }
+    impl<F: Fn(&ClientCore)> crate::rpc::JsonRpcRequestTransport for TreeReply<'_, F> {
+        fn send_json_rpc_request(
+            &self,
+            _: String,
+            _: String,
+            tx: crate::rpc::JsonRpcResponseSender,
+        ) -> Result<(), String> {
+            (self.during)(self.core);
+            tx.send(Ok(serde_json::to_value(&self.response).unwrap()))
+                .unwrap();
+            Ok(())
+        }
+    }
+    fn response(
+        threads: Vec<Thread>,
+        running: &[&str],
+        unread: &[(&str, u64)],
+    ) -> ThreadTreeResponse {
+        ThreadTreeResponse {
+            workspace_id: "a".into(),
+            threads,
+            running_task_thread_ids: running.iter().map(|id| (*id).into()).collect(),
+            unread: unread
+                .iter()
+                .map(|(id, count)| ThreadUnreadSummary {
+                    thread_id: (*id).into(),
+                    unread_count: *count,
+                })
+                .collect(),
+            folders: vec![],
+            placements: vec![],
+            agents_docs: vec![],
+        }
+    }
+
+    #[test]
+    fn rpc_and_live_directory_summaries_preserve_titles_drafts_and_metadata() {
+        let core = ClientCore::new();
+        let mut full = conversation_thread("t", "a", 1, Some("high"));
+        full.preview = "First message 😀\n".repeat(200);
+        for name in [None, Some(""), Some("   "), Some("Named")] {
+            full.name = name.map(str::to_owned);
+            let summary = thread_directory_summary(full.clone());
+            let rpc = response(vec![full.clone()], &[], &[]).into_directory_summary();
+            assert_eq!(rpc.threads, vec![summary.clone()]);
+            assert_eq!(thread_directory_summary(summary.clone()), summary);
+            assert_eq!(
+                crate::threads::title::thread_display_title(&summary),
+                crate::threads::title::thread_display_title(&full)
+            );
+            let mut expected = full.clone();
+            expected.preview = summary.preview.clone();
+            expected.turns = vec![full.turns.last().unwrap().clone()];
+            assert_eq!(summary, expected);
+            if name == Some("Named") {
+                assert_eq!(summary.preview.chars().count(), 160);
+                assert!(
+                    summary.preview.capacity() <= 4 * 160,
+                    "retained summary must release the full preview buffer"
+                );
+            } else {
+                assert_eq!(summary.preview, full.preview);
+            }
+            core.upsert_thread(full.clone());
+            let published = core.workspace_tree("a").unwrap();
+            assert_eq!(published.snapshot().threads_by_id["t"], summary);
+            assert_eq!(
+                core.thread_snapshot("t")
+                    .unwrap()
+                    .coordinator()
+                    .thread()
+                    .unwrap()
+                    .preview,
+                full.preview
+            );
+        }
+        let draft = thread_directory_summary(thread("draft", "a", 1));
+        assert!(draft.preview.is_empty() && draft.turns.is_empty());
+    }
+
+    #[test]
+    fn directory_summary_preserves_first_message_sentinel_after_long_whitespace() {
+        let mut full = thread("t", "a", 1);
+        full.name = Some("Named".into());
+        for preview in [
+            format!("{}first message", "\u{2003}".repeat(170)),
+            " ".repeat(400),
+        ] {
+            full.preview = preview;
+            let summary = thread_directory_summary(full.clone());
+            assert_eq!(
+                summary.preview.trim().is_empty(),
+                full.preview.trim().is_empty()
+            );
+            assert_eq!(thread_directory_summary(summary.clone()), summary);
+            let rpc = response(vec![full.clone()], &[], &[]).into_directory_summary();
+            assert_eq!(rpc.threads, vec![summary.clone()]);
+            if !full.preview.trim().is_empty() {
+                assert_eq!(summary.preview, full.preview);
+            } else {
+                assert_eq!(summary.preview.chars().count(), 160);
+            }
+        }
+    }
+
+    #[test]
+    fn in_flight_notification_moves_back_to_baseline_keep_current_ancestor_indicators() {
+        use pioneer_protocol::{GatewayNotification, ThreadUpdatedNotification};
+
+        let core = ClientCore::new();
+        let fixture = folder_directory();
+        let mut initial = response(vec![thread("t", "a", 1), thread("other", "a", 1)], &[], &[]);
+        initial.folders = fixture.folders.values().cloned().collect();
+        initial.placements = fixture.placements.values().cloned().collect();
+        initial.placements.push(ThreadPlacement {
+            thread_id: "other".into(),
+            workspace_id: "a".into(),
+            folder_id: Some("right".into()),
+        });
+        core.refresh_workspace_tree_with_transport(
+            "a",
+            &TreeReply {
+                core: &core,
+                response: initial.clone(),
+                during: |_: &ClientCore| {},
+            },
+        )
+        .unwrap();
+        let mut incoming = initial;
+        incoming
+            .placements
+            .iter_mut()
+            .find(|p| p.thread_id == "t")
+            .unwrap()
+            .folder_id = Some("right".into());
+        incoming.running_task_thread_ids = vec!["t".into(), "other".into()];
+        incoming.unread = [("t", 7), ("other", 5)]
+            .into_iter()
+            .map(|(id, count)| ThreadUnreadSummary {
+                thread_id: id.into(),
+                unread_count: count,
+            })
+            .collect();
+        let published = core
+            .refresh_workspace_tree_with_transport(
+                "a",
+                &TreeReply {
+                    core: &core,
+                    response: incoming,
+                    during: |core: &ClientCore| {
+                        for (index, folder) in ["child", "right", "child"].into_iter().enumerate() {
+                            assert!(core.apply_thread_notification(
+                                GatewayNotification::ThreadUpdated(ThreadUpdatedNotification {
+                                    thread: thread("t", "a", 1),
+                                    placement: Some(ThreadPlacement {
+                                        thread_id: "t".into(),
+                                        workspace_id: "a".into(),
+                                        folder_id: Some(folder.into())
+                                    }),
+                                })
+                            ));
+                            if index == 0 {
+                                let registry = core.thread_registry.lock().unwrap();
+                                let request = &registry.directory.request_baselines["a"];
+                                assert!(request.touched_threads.is_empty());
+                                assert!(request.touched_placements.is_empty());
+                            }
+                        }
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            published.snapshot().placements_by_thread_id["t"]
+                .folder_id
+                .as_deref(),
+            Some("child")
+        );
+        for (folder, count) in [("child", 7), ("left", 7), ("root", 12), ("right", 5)] {
+            assert_eq!(published.snapshot().unread_by_folder_id[folder], count);
+            assert!(
+                published
+                    .snapshot()
+                    .running_task_folder_ids
+                    .contains(folder)
+            );
+        }
+        assert!(
+            published
+                .snapshot()
+                .running_task_thread_ids
+                .contains("other")
+        );
+        assert_eq!(published.load().unwrap().state, ThreadTreeLoadState::Ready);
+        assert!(
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .directory
+                .request_baselines
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn in_flight_notification_creation_then_removal_does_not_resurrect_unknown_id() {
+        use pioneer_protocol::{
+            GatewayNotification, ThreadClosedNotification, ThreadUpdatedNotification,
+        };
+
+        let core = ClientCore::new();
+        let mut incoming = response(
+            vec![thread("transient", "a", 1)],
+            &["transient"],
+            &[("transient", 9)],
+        );
+        incoming.placements.push(ThreadPlacement {
+            thread_id: "transient".into(),
+            workspace_id: "a".into(),
+            folder_id: None,
+        });
+        let published = core
+            .refresh_workspace_tree_with_transport(
+                "a",
+                &TreeReply {
+                    core: &core,
+                    response: incoming.clone(),
+                    during: |core: &ClientCore| {
+                        assert!(core.apply_thread_notification(
+                            GatewayNotification::ThreadUpdated(ThreadUpdatedNotification {
+                                thread: thread("transient", "a", 1),
+                                placement: incoming.placements.first().cloned(),
+                            })
+                        ));
+                        assert!(
+                            core.apply_thread_notification(GatewayNotification::ThreadClosed(
+                                ThreadClosedNotification {
+                                    workspace_id: "a".into(),
+                                    thread_id: "transient".into(),
+                                }
+                            ))
+                        );
+                    },
+                },
+            )
+            .unwrap();
+        assert!(!published.snapshot().threads_by_id.contains_key("transient"));
+        let registry = core.thread_registry.lock().unwrap();
+        assert!(!registry.directory.placements.contains_key("transient"));
+        assert!(!registry.directory.unread.contains_key("transient"));
+        assert!(
+            !registry
+                .directory
+                .running_task_thread_ids
+                .contains("transient")
+        );
+        assert!(registry.directory.request_baselines.is_empty());
+        drop(registry);
+        // Request-local protection is gone; a later authoritative response can
+        // accept this ID normally, without retained deletion history.
+        let fresh = core
+            .refresh_workspace_tree_with_transport(
+                "a",
+                &TreeReply {
+                    core: &core,
+                    response: incoming,
+                    during: |_: &ClientCore| {},
+                },
+            )
+            .unwrap();
+        assert!(fresh.snapshot().threads_by_id.contains_key("transient"));
+        assert!(
+            fresh
+                .snapshot()
+                .running_task_thread_ids
+                .contains("transient")
+        );
+        assert_eq!(fresh.snapshot().unread[0].unread_count, 9);
+        assert!(
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .directory
+                .request_baselines
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_local_rows_but_delivers_independent_activity_and_unread() {
+        let core = ClientCore::new();
+        core.upsert_thread(thread("local", "a", 1));
+        core.upsert_thread(thread("other", "a", 1));
+        core.upsert_thread(thread("deleted", "a", 1));
+        let reply = TreeReply {
+            core: &core,
+            response: response(
+                vec![
+                    thread("local", "a", 1),
+                    thread("other", "a", 1),
+                    thread("deleted", "a", 1),
+                ],
+                &["other"],
+                &[("other", 7)],
+            ),
+            during: |core: &ClientCore| {
+                let mut local = thread("local", "a", 2);
+                local.name = Some("fresh".into());
+                core.upsert_thread(local);
+                let mut registry = core.thread_registry.lock().unwrap();
+                registry.directory.threads.remove("deleted");
+                registry.directory.project("a", None, true, None);
+            },
+        };
+        let published = core
+            .refresh_workspace_tree_with_transport("a", &reply)
+            .unwrap();
+        assert_eq!(
+            published.snapshot().threads_by_id["local"].name.as_deref(),
+            Some("fresh")
+        );
+        assert!(!published.snapshot().threads_by_id.contains_key("deleted"));
+        assert!(
+            published
+                .snapshot()
+                .running_task_thread_ids
+                .contains("other")
+        );
+        assert_eq!(
+            published
+                .snapshot()
+                .unread
+                .iter()
+                .find(|u| u.thread_id == "other")
+                .unwrap()
+                .unread_count,
+            7
+        );
+        assert_eq!(published.load().unwrap().state, ThreadTreeLoadState::Ready);
+    }
+
+    #[test]
+    fn in_flight_placement_merge_keeps_moves_and_does_not_restore_deleted_membership() {
+        let mut directory = folder_directory();
+        directory
+            .threads
+            .insert("deleted".into(), thread("deleted", "a", 1));
+        let mut incoming = response(
+            vec![thread("t", "a", 1), thread("deleted", "a", 1)],
+            &["t"],
+            &[("t", 7)],
+        );
+        incoming.folders = directory.folders.values().cloned().collect();
+        incoming.placements = directory.placements.values().cloned().collect();
+        incoming.placements.push(ThreadPlacement {
+            thread_id: "deleted".into(),
+            workspace_id: "a".into(),
+            folder_id: Some("left".into()),
+        });
+        let generation = directory.begin("a");
+        directory.placements.get_mut("t").unwrap().folder_id = Some("right".into());
+        directory.threads.remove("deleted");
+        assert!(directory.complete("a", generation, incoming));
+        assert_eq!(
+            directory.placements["t"].folder_id.as_deref(),
+            Some("right")
+        );
+        assert!(!directory.placements.contains_key("deleted"));
+        let publication = directory.project("a", None, false, None).unwrap();
+        assert_eq!(publication.snapshot().unread_by_folder_id["right"], 7);
+        assert_eq!(publication.snapshot().unread_by_folder_id["left"], 0);
+        assert!(
+            publication
+                .snapshot()
+                .running_task_folder_ids
+                .contains("right")
+        );
+    }
+
+    #[test]
+    fn local_workspace_transfer_fences_its_rows_without_dropping_other_indicators() {
+        let mut directory = folder_directory();
+        directory
+            .threads
+            .insert("other".into(), thread("other", "a", 1));
+        let mut incoming = response(
+            vec![thread("t", "a", 1), thread("other", "a", 1)],
+            &["other"],
+            &[("t", 99), ("other", 7)],
+        );
+        incoming.folders = directory.folders.values().cloned().collect();
+        incoming.placements = directory.placements.values().cloned().collect();
+        incoming.placements.push(ThreadPlacement {
+            thread_id: "other".into(),
+            workspace_id: "a".into(),
+            folder_id: Some("right".into()),
+        });
+        let generation = directory.begin("a");
+        directory.threads.get_mut("t").unwrap().workspace_id = "b".into();
+        directory.placements.insert(
+            "t".into(),
+            ThreadPlacement {
+                thread_id: "t".into(),
+                workspace_id: "b".into(),
+                folder_id: None,
+            },
+        );
+        directory.unread.insert("t".into(), 4);
+        directory.running_task_thread_ids.insert("t".into());
+        assert!(directory.complete("a", generation, incoming));
+        assert_eq!(directory.threads["t"].workspace_id, "b");
+        assert_eq!(directory.placements["t"].workspace_id, "b");
+        assert_eq!(directory.unread["t"], 4);
+        let a = directory.project("a", None, false, None).unwrap();
+        assert!(!a.snapshot().threads_by_id.contains_key("t"));
+        assert!(a.snapshot().running_task_thread_ids.contains("other"));
+        assert_eq!(a.snapshot().unread_by_folder_id["right"], 7);
+        let b = directory.project("b", None, false, None).unwrap();
+        assert!(b.snapshot().running_task_thread_ids.contains("t"));
+        assert_eq!(b.snapshot().unread[0].unread_count, 4);
+    }
+
+    #[test]
+    fn confirmed_read_conflict_is_partial_then_late_answer_reconciles() {
+        let core = ClientCore::new();
+        core.upsert_thread(thread("read", "a", 1));
+        core.upsert_thread(thread("other", "a", 1));
+        let cursor = pioneer_protocol::ThreadReadCursor {
+            sort_key: "002".into(),
+            through_turn_id: "turn".into(),
+        };
+        let reply = TreeReply {
+            core: &core,
+            response: response(
+                vec![thread("read", "a", 1), thread("other", "a", 1)],
+                &["other"],
+                &[("read", 4), ("other", 3)],
+            ),
+            during: |core: &ClientCore| core.apply_directory_read("a", "read", &cursor, 0),
+        };
+        assert!(
+            core.refresh_workspace_tree_with_transport("a", &reply)
+                .is_err()
+        );
+        let partial = core.workspace_tree("a").unwrap();
+        assert_eq!(partial.load().unwrap().state, ThreadTreeLoadState::Pending);
+        assert!(partial.snapshot().running_task_thread_ids.contains("other"));
+        // Unread summaries are sparse: a missing row also represents zero.
+        assert_eq!(
+            partial
+                .snapshot()
+                .unread
+                .iter()
+                .find(|u| u.thread_id == "read")
+                .map(|u| u.unread_count)
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            partial
+                .snapshot()
+                .unread
+                .iter()
+                .find(|u| u.thread_id == "other")
+                .unwrap()
+                .unread_count,
+            3
+        );
+        let followup = TreeReply {
+            core: &core,
+            response: response(
+                vec![thread("read", "a", 1), thread("other", "a", 1)],
+                &[],
+                &[("read", 1)],
+            ),
+            during: |_: &ClientCore| {},
+        };
+        let ready = core
+            .refresh_workspace_tree_with_transport("a", &followup)
+            .unwrap();
+        assert_eq!(ready.load().unwrap().state, ThreadTreeLoadState::Ready);
+        assert_eq!(
+            ready
+                .snapshot()
+                .unread
+                .iter()
+                .find(|u| u.thread_id == "read")
+                .unwrap()
+                .unread_count,
+            1
+        );
+        core.apply_directory_read(
+            "a",
+            "read",
+            &pioneer_protocol::ThreadReadCursor {
+                sort_key: "001".into(),
+                through_turn_id: "old".into(),
+            },
+            9,
+        );
+        assert_eq!(
+            core.thread_registry.lock().unwrap().directory.cursors["read"],
+            cursor
+        );
+        // A newer count at the same confirmed cursor also fences the response.
+        let same_cursor = TreeReply {
+            core: &core,
+            response: followup.response.clone(),
+            during: |core: &ClientCore| core.apply_directory_read("a", "read", &cursor, 0),
+        };
+        assert!(
+            core.refresh_workspace_tree_with_transport("a", &same_cursor)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn access_and_demand_fences_reject_in_flight_indicators() {
+        let core = ClientCore::new();
+        core.upsert_thread(thread("t", "a", 1));
+        for suspend in [false, true] {
+            let reply = TreeReply {
+                core: &core,
+                response: response(vec![thread("t", "a", 1)], &["t"], &[("t", 9)]),
+                during: |core: &ClientCore| {
+                    if suspend {
+                        core.workspace_demand_changed(
+                            &ClientScope::WorkspaceTree {
+                                workspace_id: Some("a".into()),
+                            },
+                            crate::core::ClientDemand::Suspended,
+                        );
+                    } else {
+                        core.invalidate_authorization_revision(88);
+                    }
+                },
+            };
+            assert!(
+                core.refresh_workspace_tree_with_transport("a", &reply)
+                    .is_err()
+            );
+            assert!(
+                core.workspace_tree("a")
+                    .is_none_or(|p| !p.snapshot().running_task_thread_ids.contains("t"))
+            );
+        }
     }
 
     #[test]
@@ -1034,8 +1932,8 @@ mod tests {
         let a = thread("a1", "a", 1);
         let b = thread("a2", "a", 2);
         let initial = snapshot(vec![a.clone(), b.clone()], vec![]);
-        let first = store.update(initial.clone(), false, None).unwrap();
-        assert!(store.update(initial, false, None).is_none());
+        let first = store.update(initial.clone(), false, None, None).unwrap();
+        assert!(store.update(initial, false, None, None).is_none());
         assert!(Arc::ptr_eq(&first, &store.snapshot("a").unwrap()));
         let unread = snapshot(
             vec![b, a],
@@ -1044,7 +1942,7 @@ mod tests {
                 unread_count: 2,
             }],
         );
-        let next = store.update(unread, false, None).unwrap();
+        let next = store.update(unread, false, None, None).unwrap();
         assert_eq!(next.revision, first.revision + 1);
         assert_eq!(
             next.changes.changed,
@@ -1052,6 +1950,392 @@ mod tests {
         );
         assert!(next.changes.reordered_folders.is_empty());
     }
+    fn folder_directory() -> ThreadDirectoryStore {
+        let mut directory = ThreadDirectoryStore::default();
+        directory.threads.insert("t".into(), thread("t", "a", 1));
+        directory.unread.insert("t".into(), 3);
+        for (id, parent) in [
+            ("root", None),
+            ("left", Some("root")),
+            ("child", Some("left")),
+            ("right", Some("root")),
+        ] {
+            directory.folders.insert(
+                id.into(),
+                ThreadFolder {
+                    id: id.into(),
+                    workspace_id: "a".into(),
+                    parent_folder_id: parent.map(str::to_owned),
+                    name: id.into(),
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            );
+        }
+        directory.placements.insert(
+            "t".into(),
+            ThreadPlacement {
+                thread_id: "t".into(),
+                workspace_id: "a".into(),
+                folder_id: Some("child".into()),
+            },
+        );
+        directory
+    }
+
+    #[test]
+    fn task_activity_publishes_thread_and_ancestors_without_unread_or_navigation_changes() {
+        let mut directory = folder_directory();
+        directory.unread.clear();
+        directory.project("a", None, false, None).unwrap();
+        directory.running_task_thread_ids.insert("t".into());
+        let active = directory.project("a", None, false, None).unwrap();
+        for node in [
+            SidebarNodeId::Thread("t".into()),
+            SidebarNodeId::Folder("root".into()),
+            SidebarNodeId::Folder("left".into()),
+            SidebarNodeId::Folder("child".into()),
+        ] {
+            assert!(active.changes.changed.contains(&node));
+        }
+        assert!(active.changes.reordered_folders.is_empty());
+        assert_eq!(active.snapshot.running_task_folder_ids.len(), 3);
+        let decoded: ThreadTreePublication =
+            serde_json::from_value(serde_json::to_value(active.as_ref()).unwrap()).unwrap();
+        assert_eq!(&decoded, active.as_ref());
+        // Partial thread/get/local publications preserve the authoritative activity.
+        directory.threads.get_mut("t").unwrap().name = Some("renamed".into());
+        let renamed = directory.project("a", None, false, None).unwrap();
+        assert_eq!(
+            renamed.snapshot.running_task_thread_ids,
+            active.snapshot.running_task_thread_ids
+        );
+        directory.placements.get_mut("t").unwrap().folder_id = Some("right".into());
+        let moved = directory.project("a", None, false, None).unwrap();
+        assert_eq!(
+            moved.snapshot.running_task_folder_ids,
+            std::collections::HashSet::from(["root".into(), "right".into()])
+        );
+        for id in ["left", "child", "right"] {
+            assert!(
+                moved
+                    .changes
+                    .changed
+                    .contains(&SidebarNodeId::Folder(id.into()))
+            );
+        }
+        directory.placements.get_mut("t").unwrap().folder_id = Some("child".into());
+        directory.project("a", None, false, None).unwrap();
+        directory.folders.get_mut("child").unwrap().parent_folder_id = Some("right".into());
+        let moved = directory.project("a", None, false, None).unwrap();
+        assert!(!moved.snapshot.running_task_folder_ids.contains("left"));
+        assert!(moved.snapshot.running_task_folder_ids.contains("right"));
+        directory.running_task_thread_ids.clear();
+        let done = directory.project("a", None, false, None).unwrap();
+        assert!(done.snapshot.running_task_folder_ids.is_empty());
+        assert!(
+            done.changes
+                .changed
+                .contains(&SidebarNodeId::Thread("t".into()))
+        );
+        assert!(
+            done.changes
+                .changed
+                .contains(&SidebarNodeId::Folder("root".into()))
+        );
+    }
+
+    #[test]
+    fn task_activity_survives_partial_thread_get_publications() {
+        let core = ClientCore::new();
+        {
+            let mut registry = core.thread_registry.lock().unwrap();
+            registry.directory = folder_directory();
+            registry
+                .directory
+                .running_task_thread_ids
+                .insert("t".into());
+            core.publish_workspace_tree(
+                registry.directory.project("a", None, false, None).unwrap(),
+            );
+        }
+        let navigation = core.navigation_snapshot();
+        core.upsert_thread(thread("t", "a", 2));
+        let updated = core.workspace_tree("a").unwrap();
+        assert!(updated.snapshot().running_task_thread_ids.contains("t"));
+        assert!(updated.snapshot().running_task_folder_ids.contains("root"));
+        assert_eq!(navigation.as_ref(), core.navigation_snapshot().as_ref());
+    }
+
+    #[test]
+    fn task_activity_reloads_without_timeline_and_is_scoped_to_authoritative_visible_tree() {
+        let mut directory = folder_directory();
+        directory
+            .threads
+            .insert("foreign".into(), thread("foreign", "b", 1));
+        let mut hidden = thread("hidden", "a", 1);
+        hidden.sidebar_visibility = pioneer_protocol::ThreadSidebarVisibility::Hidden;
+        let response = |ids: Vec<&str>| ThreadTreeResponse {
+            workspace_id: "a".into(),
+            threads: vec![thread("t", "a", 1), hidden.clone()],
+            running_task_thread_ids: ids.into_iter().map(str::to_owned).collect(),
+            unread: vec![],
+            folders: directory.folders.values().cloned().collect(),
+            placements: directory.placements.values().cloned().collect(),
+            agents_docs: vec![],
+        };
+        let active_response = response(vec!["t", "foreign", "hidden"]);
+        let inactive_response = response(vec![]);
+        let generation = directory.begin("a");
+        assert!(directory.complete("a", generation, active_response.clone()));
+        let active = directory.project("a", None, false, None).unwrap();
+        assert_eq!(
+            active.snapshot.running_task_thread_ids,
+            std::collections::HashSet::from(["t".into()])
+        );
+        assert!(
+            directory
+                .project("b", None, false, None)
+                .unwrap()
+                .snapshot
+                .running_task_folder_ids
+                .is_empty()
+        );
+        directory.threads.get_mut("t").unwrap().sidebar_visibility =
+            pioneer_protocol::ThreadSidebarVisibility::Hidden;
+        assert!(
+            directory
+                .project("a", None, false, None)
+                .unwrap()
+                .snapshot
+                .running_task_folder_ids
+                .is_empty()
+        );
+        directory.threads.get_mut("t").unwrap().sidebar_visibility =
+            pioneer_protocol::ThreadSidebarVisibility::Visible;
+        let visible = directory.project("a", None, false, None).unwrap();
+        assert!(visible.snapshot.running_task_thread_ids.contains("t"));
+        assert!(visible.snapshot.running_task_folder_ids.contains("root"));
+        assert!(
+            directory
+                .project("a", Some("t"), false, None)
+                .unwrap()
+                .snapshot
+                .running_task_folder_ids
+                .is_empty()
+        );
+        directory.invalidate(); // authorization fence / reconnect clears protected state
+        let generation = directory.begin("a");
+        assert!(directory.complete("a", generation, active_response));
+        assert!(
+            directory
+                .project("a", None, false, None)
+                .unwrap()
+                .snapshot
+                .running_task_folder_ids
+                .contains("root")
+        );
+        let generation = directory.begin("a");
+        assert!(directory.complete("a", generation, inactive_response));
+        assert!(
+            directory
+                .project("a", None, false, None)
+                .unwrap()
+                .snapshot
+                .running_task_folder_ids
+                .is_empty()
+        );
+        directory.threads.remove("t");
+        assert!(
+            directory
+                .project("a", None, false, None)
+                .unwrap()
+                .snapshot
+                .running_task_thread_ids
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn folder_unread_read_updates_publish_ancestors_without_reordering() {
+        let core = ClientCore::new();
+        {
+            let mut registry = core.thread_registry.lock().unwrap();
+            registry.directory = folder_directory();
+            let publication = registry.directory.project("a", None, false, None).unwrap();
+            core.publish_workspace_tree(publication);
+        }
+        let navigation = core.navigation_snapshot();
+        let mut revision = core.workspace_tree("a").unwrap().revision();
+        for (sort_key, count) in [("1", 8), ("2", 0)] {
+            core.apply_directory_read(
+                "a",
+                "t",
+                &pioneer_protocol::ThreadReadCursor {
+                    sort_key: sort_key.into(),
+                    through_turn_id: "turn".into(),
+                },
+                count,
+            );
+            let publication = core.workspace_tree("a").unwrap();
+            assert_eq!(publication.revision(), revision + 1);
+            revision = publication.revision();
+            for id in ["root", "left", "child"] {
+                assert_eq!(publication.snapshot().unread_by_folder_id[id], count);
+                assert!(
+                    publication
+                        .changes()
+                        .changed()
+                        .contains(&SidebarNodeId::Folder(id.into()))
+                );
+            }
+            assert_eq!(publication.snapshot().unread_by_folder_id["right"], 0);
+            assert!(publication.changes().reordered_folders().is_empty());
+            let decoded: ThreadTreePublication =
+                serde_json::from_value(serde_json::to_value(publication.as_ref()).unwrap())
+                    .unwrap();
+            assert_eq!(&decoded, publication.as_ref());
+        }
+        assert_eq!(core.navigation_snapshot().as_ref(), navigation.as_ref());
+    }
+
+    #[test]
+    fn folder_unread_moves_remove_old_ancestors_and_add_new_ones() {
+        let mut directory = folder_directory();
+        directory.project("a", None, false, None).unwrap();
+        directory.placements.get_mut("t").unwrap().folder_id = Some("right".into());
+        let moved = directory.project("a", None, false, None).unwrap();
+        assert_eq!(moved.snapshot.unread_by_folder_id["left"], 0);
+        assert_eq!(moved.snapshot.unread_by_folder_id["child"], 0);
+        assert_eq!(moved.snapshot.unread_by_folder_id["right"], 3);
+        assert_eq!(moved.snapshot.unread_by_folder_id["root"], 3);
+        for id in ["left", "child", "right"] {
+            assert!(
+                moved
+                    .changes
+                    .changed
+                    .contains(&SidebarNodeId::Folder(id.into()))
+            );
+        }
+        directory.placements.get_mut("t").unwrap().folder_id = Some("child".into());
+        directory.project("a", None, false, None);
+        directory.folders.get_mut("child").unwrap().parent_folder_id = Some("right".into());
+        let moved = directory.project("a", None, false, None).unwrap();
+        assert_eq!(moved.snapshot.unread_by_folder_id["left"], 0);
+        assert_eq!(moved.snapshot.unread_by_folder_id["right"], 3);
+        assert_eq!(moved.snapshot.unread_by_folder_id["root"], 3);
+        assert!(
+            moved
+                .changes
+                .changed
+                .contains(&SidebarNodeId::Folder("left".into()))
+        );
+        assert!(
+            moved
+                .changes
+                .changed
+                .contains(&SidebarNodeId::Folder("right".into()))
+        );
+        directory.folders.get_mut("child").unwrap().parent_folder_id = None;
+        let root = directory.project("a", None, false, None).unwrap();
+        assert_eq!(root.snapshot.unread_by_folder_id["root"], 0);
+        assert_eq!(root.snapshot.unread_by_folder_id["right"], 0);
+        assert_eq!(root.snapshot.unread_by_folder_id["child"], 3);
+        directory.placements.get_mut("t").unwrap().folder_id = None;
+        let root = directory.project("a", None, false, None).unwrap();
+        assert!(
+            root.snapshot
+                .unread_by_folder_id
+                .values()
+                .all(|count| *count == 0)
+        );
+        directory.placements.get_mut("t").unwrap().folder_id = Some("child".into());
+        directory.project("a", None, false, None);
+        directory.folders.get_mut("child").unwrap().name = "Renamed".into();
+        let renamed = directory.project("a", None, false, None).unwrap();
+        assert_eq!(renamed.snapshot.unread_by_folder_id["child"], 3);
+        directory.folders.remove("child");
+        let deleted = directory.project("a", None, false, None).unwrap();
+        assert!(!deleted.snapshot.unread_by_folder_id.contains_key("child"));
+        assert!(
+            deleted
+                .snapshot
+                .unread_by_folder_id
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(
+            deleted
+                .changes
+                .removed
+                .contains(&SidebarNodeId::Folder("child".into()))
+        );
+    }
+
+    #[test]
+    fn folder_unread_filters_visibility_drafts_foreign_and_removed_threads_and_reconnects() {
+        let mut directory = folder_directory();
+        directory
+            .threads
+            .insert("foreign".into(), thread("foreign", "b", 1));
+        directory.unread.insert("foreign".into(), 90);
+        directory.unread.insert("inaccessible".into(), 80);
+        for id in ["foreign", "inaccessible"] {
+            directory.placements.insert(
+                id.into(),
+                ThreadPlacement {
+                    thread_id: id.into(),
+                    workspace_id: "a".into(),
+                    folder_id: Some("child".into()),
+                },
+            );
+        }
+        let initial = directory.project("a", None, false, None).unwrap();
+        assert_eq!(initial.snapshot.unread_by_folder_id["root"], 3);
+        let foreign = directory.project("b", None, false, None).unwrap();
+        assert!(foreign.snapshot.unread_by_folder_id.is_empty());
+        assert!(Arc::ptr_eq(&initial, &directory.snapshot("a").unwrap()));
+        directory.threads.get_mut("t").unwrap().sidebar_visibility =
+            pioneer_protocol::ThreadSidebarVisibility::Hidden;
+        let hidden = directory.project("a", None, false, None).unwrap();
+        assert_eq!(hidden.snapshot.unread_by_folder_id["root"], 0);
+        assert!(
+            hidden
+                .changes
+                .changed
+                .contains(&SidebarNodeId::Folder("root".into()))
+        );
+        directory.threads.get_mut("t").unwrap().sidebar_visibility =
+            pioneer_protocol::ThreadSidebarVisibility::Visible;
+        directory.project("a", None, false, None).unwrap();
+        let draft = directory.project("a", Some("t"), false, None).unwrap();
+        assert_eq!(draft.snapshot.unread_by_folder_id["root"], 0);
+        directory.project("a", None, false, None).unwrap();
+        directory.threads.remove("t");
+        let deleted = directory.project("a", None, false, None).unwrap();
+        assert_eq!(deleted.snapshot.unread_by_folder_id["root"], 0);
+        directory.invalidate();
+        assert!(directory.snapshot("a").is_none());
+        assert!(directory.snapshot("b").is_none());
+        let generation = directory.begin("a");
+        assert!(directory.complete(
+            "a",
+            generation,
+            ThreadTreeResponse {
+                running_task_thread_ids: Vec::new(),
+                workspace_id: "a".into(),
+                threads: vec![],
+                unread: vec![],
+                folders: vec![],
+                placements: vec![],
+                agents_docs: vec![],
+            }
+        ));
+        let reconnected = directory.project("a", None, false, None).unwrap();
+        assert!(reconnected.snapshot.unread_by_folder_id.is_empty());
+        assert!(reconnected.revision > deleted.revision);
+    }
+
     #[test]
     fn node_actions_complete_once_and_last_subscription_cancels_old_operation() {
         let core = Arc::new(ClientCore::new());
@@ -1108,6 +2392,7 @@ mod tests {
         directory.threads.get_mut("a1").unwrap().name = Some("new title".into());
         directory.project("a", None, true, None);
         let response = |threads| ThreadTreeResponse {
+            running_task_thread_ids: Vec::new(),
             workspace_id: "a".into(),
             threads,
             unread: vec![],
@@ -1115,18 +2400,48 @@ mod tests {
             placements: vec![],
             agents_docs: vec![],
         };
-        assert!(!directory.complete("a", generation, response(vec![thread("a1", "a", 1)])));
+        assert!(directory.complete("a", generation, response(vec![thread("a1", "a", 1)])));
         assert_eq!(directory.threads["a1"].name.as_deref(), Some("new title"));
         let generation = directory.begin("a");
         assert!(!directory.complete("a", generation, response(vec![thread("foreign", "b", 2)])));
         assert!(!directory.threads.contains_key("foreign"));
     }
     #[test]
+    fn load_receipt_follows_replacement_and_survives_local_projections() {
+        let mut directory = ThreadDirectoryStore::default();
+        let first = directory.begin("a");
+        directory.project("a", None, true, None).unwrap();
+        let replacement = directory.begin("a");
+        let pending = directory.project("a", None, true, None).unwrap();
+        assert_eq!(pending.load().unwrap().generation, replacement);
+        directory.finish_load("a", first, true);
+        // An unrelated metadata/unread projection must not claim that the
+        // still-pending replacement completed, even when its UI loading is false.
+        let local = directory.project("a", None, false, None).unwrap();
+        assert_eq!(local.load().unwrap().state, ThreadTreeLoadState::Pending);
+        directory.finish_load("a", replacement, false);
+        let ready = directory.project("a", None, false, None).unwrap();
+        assert!(ready.snapshot().threads_by_id.is_empty());
+        assert_eq!(ready.load().unwrap().state, ThreadTreeLoadState::Ready);
+        let next = directory.begin("a");
+        directory.finish_load("a", next, true);
+        let failed = directory
+            .project("a", None, false, Some("request failed".into()))
+            .unwrap();
+        assert_eq!(failed.load().unwrap().state, ThreadTreeLoadState::Failed);
+        let local = directory.project("a", None, false, None).unwrap();
+        assert_eq!(local.load(), failed.load());
+        directory.invalidate();
+        assert!(directory.loads.is_empty());
+    }
+
+    #[test]
     fn request_scope_and_generation_reject_late_inputs() {
         let mut directory = ThreadDirectoryStore::default();
         let first = directory.begin("a");
         let second = directory.begin("a");
         let response = |workspace: &str| ThreadTreeResponse {
+            running_task_thread_ids: Vec::new(),
             workspace_id: workspace.into(),
             threads: vec![],
             unread: vec![],
@@ -1148,11 +2463,13 @@ mod tests {
             snapshot(vec![thread("a1", "a", 1), thread("a2", "a", 2)], vec![]),
             false,
             None,
+            None,
         );
         let next = store
             .update(
                 snapshot(vec![thread("a2", "a", 3), thread("a3", "a", 4)], vec![]),
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -1301,4 +2618,26 @@ fn directory_action_node(key: &str) -> Option<SidebarNodeId> {
             key.strip_prefix("folder:")
                 .map(|id| SidebarNodeId::Folder(id.to_owned()))
         })
+}
+
+#[cfg(feature = "test-support")]
+impl ClientMutationAuthority {
+    /// Publish a controlled read state through the existing directory projection.
+    pub fn publish_workspace_tree_for_test(
+        &self,
+        core: &ClientCore,
+        workspace: &str,
+        loading: bool,
+        error: Option<String>,
+    ) {
+        let mut registry = core.thread_registry.lock().unwrap();
+        let draft = registry.navigation.draft(workspace).map(str::to_owned);
+        if let Some(publication) =
+            registry
+                .directory
+                .project(workspace, draft.as_deref(), loading, error)
+        {
+            core.publish_workspace_tree(publication);
+        }
+    }
 }

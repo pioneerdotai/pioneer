@@ -26,7 +26,53 @@ impl MessageProcessor {
         item: &TurnItem,
         db_status: Option<&str>,
     ) {
+        self.notify_semantic_timeline_item_changed_with_indicators(
+            workspace_id,
+            thread_id,
+            turn_id,
+            item,
+            db_status,
+            true,
+        )
+        .await;
+    }
+
+    pub(super) async fn notify_semantic_timeline_item_changed_after_indicator_commit(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item: &TurnItem,
+        db_status: Option<&str>,
+    ) {
+        self.notify_semantic_timeline_item_changed_with_indicators(
+            workspace_id,
+            thread_id,
+            turn_id,
+            item,
+            db_status,
+            false,
+        )
+        .await;
+    }
+
+    async fn notify_semantic_timeline_item_changed_with_indicators(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item: &TurnItem,
+        db_status: Option<&str>,
+        publish_indicators: bool,
+    ) {
         let classification = classify_turn_item_with_db_status(item, db_status);
+        if publish_indicators
+            && classification.placement == ProjectionPlacement::TopLevelAssistantMessage
+            && db_status == Some("completed")
+        {
+            self.notify_thread_unread_changed(workspace_id, thread_id)
+                .await;
+        }
         let item_id = item.item_id();
         let detached_task_run = self.is_detached_task_run_turn(thread_id, turn_id).await;
         let mut changed_block_ids = Vec::new();
@@ -322,7 +368,7 @@ impl MessageProcessor {
         ancestor_thread_ids
     }
 
-    async fn notify_semantic_timeline_blocks_changed(
+    pub(super) async fn notify_semantic_timeline_blocks_changed(
         &self,
         workspace_id: &str,
         thread_id: &str,

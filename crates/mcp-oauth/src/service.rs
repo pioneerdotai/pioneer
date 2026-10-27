@@ -97,12 +97,20 @@ struct Entry {
     oauth_http: Arc<crate::network::ExchangeBudgetHttpClient>,
     credentials: PersistentCredentials,
     cancellation: CancellationToken,
+    credential_cancellation: CancellationToken,
     active_flow: std::sync::Mutex<Option<ActiveFlow>>,
     projection: std::sync::Mutex<ObservableProjection>,
     data: Mutex<EntryData>,
     #[cfg(feature = "test-support")]
     completed_exchange: std::sync::Mutex<Option<String>>,
     presentation_owner: std::sync::Mutex<Option<(String, u64, String)>>,
+}
+impl Entry {
+    // Retirement/revocation fences both lifetimes. Quiesce cancels only flows.
+    fn retire(&self) {
+        self.cancellation.cancel();
+        self.credential_cancellation.cancel();
+    }
 }
 #[derive(Clone)]
 struct ObservableProjection {
@@ -239,6 +247,7 @@ struct Inner {
     callers: Arc<LifecycleAdmission>,
     shutdown_gate: Mutex<()>,
     shutdown: CancellationToken,
+    credentials_shutdown: CancellationToken,
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     retired_events: std::sync::Mutex<std::collections::VecDeque<OAuthEvent>>,
     http: reqwest::Client,
@@ -316,6 +325,7 @@ impl McpOAuthService {
                 callers: Arc::new(LifecycleAdmission::default()),
                 shutdown_gate: Mutex::new(()),
                 shutdown: CancellationToken::new(),
+                credentials_shutdown: CancellationToken::new(),
                 tasks: std::sync::Mutex::new(Vec::new()),
                 retired_events: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 http,
@@ -386,21 +396,23 @@ impl McpOAuthService {
         hash: String,
     ) -> Arc<Entry> {
         let cancellation = self.inner.shutdown.child_token();
+        let credential_cancellation = self.inner.credentials_shutdown.child_token();
         Arc::new(Entry {
             installation: installation.clone(),
             identity: hash.clone(),
             generation: uuid::Uuid::new_v4().to_string(),
             oauth_http: Arc::new(crate::network::ExchangeBudgetHttpClient::new(
                 self.inner.oauth_http.clone(),
-                cancellation.clone(),
+                credential_cancellation.clone(),
             )),
             credentials: self.inner.persistence.credential_store(
                 id.into(),
                 hash,
                 Arc::new(Mutex::new(())),
-                cancellation.clone(),
+                credential_cancellation.clone(),
             ),
             cancellation,
+            credential_cancellation,
             active_flow: std::sync::Mutex::new(None),
             cleanup_available: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-support")]
@@ -501,7 +513,7 @@ impl McpOAuthService {
                 }
                 return Ok(entry.clone());
             }
-            entry.cancellation.cancel();
+            entry.retire();
             // The old actor is fenced before the replacement can use credentials.
         }
         let entry = self.new_entry(id, installation, hash);
@@ -773,7 +785,7 @@ impl McpOAuthService {
         if active.as_ref().is_some_and(|flow| {
             flow.id == operation && flow.terminal_decision == Some(OAuthState::Authorized)
         }) {
-            entry.cancellation.cancel();
+            entry.retire();
             #[cfg(feature = "test-support")]
             if let Some(hooks) = &self.inner.options.test_hooks {
                 hooks.retirement_observed.notify_one();
@@ -1519,7 +1531,7 @@ impl McpOAuthService {
         Ok(())
     }
     async fn expire_operation(&self, id: &str, entry: &Entry, data: &mut EntryData) {
-        entry.cancellation.cancel();
+        entry.retire();
         data.status = OAuthState::TimedOut;
         data.terminal = true;
         self.event(id, entry, data, None, None).await;
@@ -1634,7 +1646,7 @@ impl McpOAuthService {
         let result = tokio::select! {
             _=entry.cancellation.cancelled()=>Err(AuthError::AuthorizationRequired),
             _=tokio::time::sleep_until(deadline)=>{
-                entry.cancellation.cancel();
+                entry.retire();
                 Err(AuthError::AuthorizationRequired)
             },
             result=async {
@@ -1659,7 +1671,7 @@ impl McpOAuthService {
         // admission before releasing the refresh lease or performing any await.
         // A cancellation that won remains recorded until the exchange drains.
         // Read the injectable wall clock outside admission as well: observing
-        // time never owns the decision lock. Recheck both clocks inside it.
+        // time never owns the decision lock. Check monotonic time inside it.
         let observed_wall_time = self.inner.options.clock.now();
         let mut decision = {
             let mut active = entry
@@ -1671,7 +1683,7 @@ impl McpOAuthService {
                 .and_then(|flow| flow.terminal_decision)
                 .unwrap_or_else(|| {
                     if tokio::time::Instant::now() >= deadline
-                        || observed_wall_time.max(self.inner.options.clock.now()) >= wall_deadline
+                        || observed_wall_time >= wall_deadline
                     {
                         OAuthState::TimedOut
                     } else if entry.cancellation.is_cancelled() {
@@ -1712,8 +1724,12 @@ impl McpOAuthService {
             data.status = OAuthState::Resolving;
             self.event(&id, &entry, &data, None, None).await;
         }
-        let commit_failed =
-            decision == OAuthState::Authorized && entry.credentials.commit_consent().await.is_err();
+        let commit_failed = decision == OAuthState::Authorized
+            && entry
+                .credentials
+                .commit_consent(&entry.cancellation)
+                .await
+                .is_err();
         if commit_failed {
             // Retirement while an acknowledged promotion's fence cleanup is
             // uncertain must not publish Failed for a possibly committed grant.
@@ -2064,6 +2080,8 @@ impl McpOAuthService {
             event.state,
             OAuthState::Preparing | OAuthState::AwaitingCallback | OAuthState::Exchanging
         ) {
+            // The injectable clock may block; it must not own Cancel admission.
+            let observed_wall_time = self.inner.options.clock.now();
             let active = entry
                 .active_flow
                 .lock()
@@ -2074,7 +2092,7 @@ impl McpOAuthService {
                         && event.client_id == Some(flow.client)
                         && flow.terminal_decision.is_none()
                         && flow.deadline > tokio::time::Instant::now()
-                        && flow.wall_deadline > self.inner.options.clock.now()
+                        && flow.wall_deadline > observed_wall_time
                         && (event.state != OAuthState::AwaitingCallback
                             || (flow.callback_ready && !flow.callback_accepted))
                 });
@@ -2148,7 +2166,7 @@ impl McpOAuthService {
         }
         let retired = { self.inner.entries.lock().await.remove(id) };
         if let Some(entry) = retired {
-            entry.cancellation.cancel();
+            entry.retire();
             let mut data = entry.data.lock().await;
             if let Some(flow) = &data.flow {
                 data.states
@@ -2190,6 +2208,7 @@ impl McpOAuthService {
             .get(id)
             .cloned()
             .ok_or_else(|| McpRuntimeError::failed("OAuth flow unavailable"))?;
+        let observed_wall_time = self.inner.options.clock.now();
         let (workspace, terminal_state) = {
             let mut active = entry
                 .active_flow
@@ -2207,14 +2226,14 @@ impl McpOAuthService {
                 return Err(McpRuntimeError::failed("OAuth operation already completed"));
             }
             let terminal_state = if tokio::time::Instant::now() >= active.deadline
-                || self.inner.options.clock.now() >= active.wall_deadline
+                || observed_wall_time >= active.wall_deadline
             {
                 OAuthState::TimedOut
             } else {
                 terminal_state
             };
             active.terminal_decision = Some(terminal_state);
-            entry.cancellation.cancel();
+            entry.retire();
             (active.workspace.clone(), terminal_state)
         };
         let service = self.clone();
@@ -2314,7 +2333,7 @@ impl McpOAuthService {
                     .await
                     .unwrap_or_else(|_| identity(installation, None));
                 let fresh = self.new_entry(id, installation, hash);
-                fresh.cancellation.cancel();
+                fresh.retire();
                 let mut entries = self.inner.entries.lock().await;
                 if self.inner.shutdown.is_cancelled() {
                     return Err(McpRuntimeError::failed("OAuth service is shutting down"));
@@ -2332,7 +2351,7 @@ impl McpOAuthService {
                 .await
                 .map_err(|e| oauth_runtime_error(&e));
         };
-        entry.cancellation.cancel();
+        entry.retire();
         let mut data = entry.data.lock().await;
         // Retirement ends the old consent/presentation, not management cleanup.
         self.retire_presentation(id, &entry, &data).await;
@@ -2468,8 +2487,22 @@ impl McpOAuthService {
         }
         Ok(())
     }
+    /// Stop admission and drain accepted flows/connects while established
+    /// sessions retain their generation-fenced credential access for DELETE.
+    pub async fn quiesce(&self) {
+        let _shutdown_owner = self.inner.shutdown_gate.lock().await;
+        self.quiesce_owned().await;
+    }
+
     pub async fn shutdown(&self) {
         let _shutdown_owner = self.inner.shutdown_gate.lock().await;
+        self.quiesce_owned().await;
+        self.inner.credentials_shutdown.cancel();
+        self.inner.persistence.drain().await;
+        self.inner.entries.lock().await.clear();
+    }
+
+    async fn quiesce_owned(&self) {
         self.inner.callers.close();
         self.inner.shutdown.cancel();
         // External runtime connects/cleanup may still hold accepted permits.
@@ -2493,7 +2526,6 @@ impl McpOAuthService {
             }
         }
         self.inner.persistence.drain().await;
-        self.inner.entries.lock().await.clear();
     }
     async fn challenge_entry(
         &self,

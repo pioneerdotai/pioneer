@@ -52,6 +52,26 @@ impl TaskStartCause {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStartReason {
+    RuntimeNotReady,
+    ReadinessSnapshotMissing,
+    CapabilityProjectionInvalid,
+    LaunchSourceUnavailable,
+    ProviderAuthorityUnavailable,
+}
+impl TaskStartReason {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RuntimeNotReady => "runtime_not_ready",
+            Self::ReadinessSnapshotMissing => "readiness_snapshot_missing",
+            Self::CapabilityProjectionInvalid => "capability_projection_invalid",
+            Self::LaunchSourceUnavailable => "launch_source_unavailable",
+            Self::ProviderAuthorityUnavailable => "provider_authority_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStartReporting {
     Unreported,
     Reported,
@@ -63,6 +83,7 @@ pub enum TaskStartReporting {
 pub struct TaskStartFailureDescriptor {
     pub stage: TaskStartStage,
     pub cause: TaskStartCause,
+    pub reason: Option<TaskStartReason>,
     pub sqlite_primary_code: Option<i32>,
     pub sqlite_extended_code: Option<i32>,
     pub correlation_id: Option<String>,
@@ -75,6 +96,9 @@ impl TaskStartFailureDescriptor {
             ("stage".to_owned(), TaskValue::from(self.stage.label())),
             ("cause".to_owned(), TaskValue::from(self.cause.label())),
         ]);
+        if let Some(reason) = self.reason {
+            fields.insert("reason".to_owned(), TaskValue::from(reason.label()));
+        }
         if let Some(code) = self.sqlite_primary_code {
             fields.insert(
                 "sqlite_primary_code".to_owned(),
@@ -120,6 +144,7 @@ impl TaskStartFailure {
             descriptor: TaskStartFailureDescriptor {
                 stage,
                 cause,
+                reason: None,
                 sqlite_primary_code: None,
                 sqlite_extended_code: None,
                 correlation_id: None,
@@ -133,13 +158,25 @@ impl TaskStartFailure {
     /// Classify before losing a typed cause. Never use Display, Debug, public
     /// codes, or numeric codes from a non-SQLite database implementation.
     pub fn from_error(stage: TaskStartStage, error: anyhow::Error) -> Self {
-        let sqlite_code = sqlite_code(&error);
+        let mut failure = Self::from_borrowed_error(stage, &error);
+        failure.source = Some(error);
+        failure
+    }
+
+    /// Classify an existing source without consuming or formatting it.
+    pub fn from_borrowed_error(stage: TaskStartStage, error: &anyhow::Error) -> Self {
+        let sqlite_code = sqlite_code(error);
         let storage = sqlite_code.is_some()
-            || error.downcast_ref::<DbErr>().is_some_and(|error| {
-                matches!(
-                    error,
-                    DbErr::Conn(_) | DbErr::Exec(_) | DbErr::Query(_) | DbErr::ConnectionAcquire(_)
-                )
+            || error.chain().any(|cause| {
+                cause.downcast_ref::<DbErr>().is_some_and(|error| {
+                    matches!(
+                        error,
+                        DbErr::Conn(_)
+                            | DbErr::Exec(_)
+                            | DbErr::Query(_)
+                            | DbErr::ConnectionAcquire(_)
+                    )
+                })
             });
         let mut failure = Self::new(
             stage,
@@ -151,8 +188,12 @@ impl TaskStartFailure {
         );
         failure.descriptor.sqlite_extended_code = sqlite_code;
         failure.descriptor.sqlite_primary_code = sqlite_code.map(|code| code & 0xff);
-        failure.source = Some(error);
         failure
+    }
+
+    pub fn with_reason(mut self, reason: TaskStartReason) -> Self {
+        self.descriptor.reason = Some(reason);
+        self
     }
 
     pub fn descriptor(&self) -> &TaskStartFailureDescriptor {
@@ -195,6 +236,7 @@ impl TaskStartFailure {
                     tracing::warn!(
                         stage = descriptor.stage.label(),
                         cause = descriptor.cause.label(),
+                        reason = descriptor.reason.map(TaskStartReason::label),
                         correlation_id = descriptor.correlation_id.as_deref(),
                         "Task preparation or launch refused"
                     );
@@ -203,6 +245,7 @@ impl TaskStartFailure {
                     tracing::error!(
                         stage = descriptor.stage.label(),
                         cause = descriptor.cause.label(),
+                        reason = descriptor.reason.map(TaskStartReason::label),
                         sqlite_primary_code = descriptor.sqlite_primary_code,
                         sqlite_extended_code = descriptor.sqlite_extended_code,
                         correlation_id = descriptor.correlation_id.as_deref(),
@@ -221,7 +264,7 @@ impl TaskStartFailure {
             failure.report_in_place();
             return failure.descriptor.clone();
         }
-        Self::new(TaskStartStage::ExecutorStart, TaskStartCause::Unclassified)
+        Self::from_borrowed_error(TaskStartStage::ExecutorStart, error)
             .report()
             .descriptor
     }
@@ -315,6 +358,27 @@ mod tests {
         ] {
             assert!(!encoded.contains(canary));
         }
+    }
+
+    #[tokio::test]
+    async fn scheduler_fallback_preserves_borrowed_storage_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut error = sea_orm::Database::connect(format!(
+            "sqlite:{}?mode=rw",
+            temp.path().join("missing/db.sqlite").display(),
+        ))
+        .await
+        .unwrap_err()
+        .into();
+        let descriptor = TaskStartFailure::report_for_scheduler(&mut error);
+        assert_eq!(descriptor.cause, TaskStartCause::Storage);
+        assert_eq!(descriptor.sqlite_primary_code, Some(14));
+        assert!(
+            error.downcast_ref::<DbErr>().is_some(),
+            "borrowed source must survive reporting"
+        );
+        let encoded = serde_json::to_string(&descriptor.task_error(None)).unwrap();
+        assert!(!encoded.contains(temp.path().to_str().unwrap()));
     }
 
     #[test]

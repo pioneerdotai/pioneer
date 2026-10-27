@@ -16,6 +16,7 @@ pub(crate) mod auth_session;
 pub(crate) mod authorization_persistence;
 pub(crate) mod authorization_scope;
 pub(crate) mod canonical_turn_event;
+pub(crate) mod checkpoint_proofs;
 pub mod cli_runtime_binding;
 pub mod compaction;
 pub(crate) mod compaction_background;
@@ -47,6 +48,7 @@ pub mod policy;
 pub(crate) mod policy_generation;
 pub(crate) mod principal_avatar;
 pub(crate) mod projection_receipt_cleanup;
+pub mod provider_usage;
 pub(crate) mod read_model_repair;
 pub mod recovery_job;
 pub mod recovery_terminalization_outbox;
@@ -64,6 +66,7 @@ pub mod skill_workspace_policy;
 pub mod task;
 pub mod task_actor_contract;
 pub mod task_agent_spec;
+pub mod task_completion_inbox;
 pub mod task_delivery;
 pub(crate) mod task_delivery_recovery;
 pub mod task_dependency;
@@ -126,3 +129,15 @@ pub(crate) mod task_run_occurrence_reconcile;
 pub(crate) mod plugins;
 
 pub(crate) mod task_occurrence_reconcile;
+
+pub(crate) mod frozen_storage_lifetime;
+mod frozen_sweep_work;
+
+pub(crate) mod html_preview_retention;
+
+pub(crate) mod task_cancellation_actor;
+pub(crate) mod task_child_cleanup;
+
+pub(crate) mod unread_start;
+
+pub(crate) mod thread_history_read;

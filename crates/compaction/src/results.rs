@@ -15,7 +15,7 @@ pub struct ResultPage {
 }
 
 fn fits(text: &str, tokens: u64, bytes: usize) -> bool {
-    text.len() <= bytes && text_tokens(text) <= tokens
+    text.len() <= bytes && (tokens == u64::MAX || text_tokens(text) <= tokens)
 }
 fn boundary_before(text: &str, mut offset: usize) -> usize {
     offset = offset.min(text.len());
@@ -72,8 +72,27 @@ pub fn result_page(
     available_tokens: u64,
     available_bytes: usize,
 ) -> anyhow::Result<ResultPage> {
-    let tokens = available_tokens.min(PAGE_TOKENS);
-    let bytes = available_bytes.min(PAGE_BYTES);
+    result_page_in_budget(
+        text,
+        version,
+        cursor,
+        available_tokens.min(PAGE_TOKENS),
+        available_bytes.min(PAGE_BYTES),
+    )
+}
+
+/// Exact caller budget without compaction's excerpt/page defaults. Thread tools
+/// own their complete projection envelope and must not inherit smaller ceilings.
+/// Other consumers retain result_page's existing behavior.
+pub fn result_page_in_budget(
+    text: &str,
+    version: &str,
+    cursor: Option<&ResultCursor>,
+    available_tokens: u64,
+    available_bytes: usize,
+) -> anyhow::Result<ResultPage> {
+    let tokens = available_tokens;
+    let bytes = available_bytes;
     let start = if let Some(cursor) = cursor {
         anyhow::ensure!(cursor.version == version, "stale result cursor");
         cursor.offset

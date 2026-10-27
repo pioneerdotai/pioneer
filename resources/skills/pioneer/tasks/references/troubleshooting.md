@@ -11,6 +11,7 @@ Use this reference after confusing durable task behavior, missing delivered resu
 - Duplicate Or Noisy Scheduled Messages
 - Delivery Update Did Not Affect Previous Run
 - Stuck Or Failed Task
+- Finish Accepted But Work Or Delivery Is Pending
 
 ## Result Exists But Is Not In The Main Thread
 
@@ -108,5 +109,21 @@ Then choose:
 
 - retry/reschedule if the failure is transient and supported;
 - update instructions if the future run prompt is wrong;
-- cancel or pause if the task is no longer useful;
+- pause for a temporary stop, finish for a user-requested permanent stop that lets current work finish, or cancel for interruption under existing rules;
 - explain clearly if the runtime lacks the required capability.
+
+## Finish Accepted But Work Or Delivery Is Pending
+
+`task_finish` returning `alreadyFinished:false` confirms that the permanent stop request is accepted. It does not say that every active run has ended or that a result was delivered. A repeated request while work is finishing can return the same value. `alreadyFinished:true` means the task is already terminal; inspect its actual status rather than reporting success automatically.
+
+Inspect these separately, using `task_get` for task/run state and the existing delivery records or destination when available:
+
+1. `task.finishRequest`: the saved stop time, optional reason, and run boundary. It survives Gateway restart; future runs and queued work that has not started must not launch.
+2. Task and run state: all already admitted parallel runs, review and required revisions may still be active. A normal finish becomes `completed`; an error, cancellation or review rejection remains an honest unsuccessful outcome. No new task attempt is started after finish.
+3. Result and delivery state: preserved results follow configured delivery. Pending delivery does not mean computation is still running; a delivery error does not revive the task.
+
+If there was no active work, a completed task without a new run or result is expected. Finish stops further work; it does not prove the original goal was achieved or invent a successful result.
+
+Do not repeatedly finish, create a replacement task, or independently post to the delivery thread merely because work or delivery is pending. A repeated finish is safe, but it does not force completion or re-delivery. Resume, update and reschedule after finish are rejected. Use explicit cancel under its existing permissions if the user now wants remaining work interrupted.
+
+A permitted execution can finish its own task. `task_cancel` still rejects self-cancellation and ancestor cancellation; finish does not remove ancestor or scope protections. For `task_access_denied`, inspect the current permissions and scope. For `task_state_conflict`, reload state and preserve the permanent stop decision.

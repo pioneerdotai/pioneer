@@ -34,6 +34,7 @@ use pioneer_protocol::{
 };
 use sea_orm::{
     ActiveValue::Set, ConnectionTrait, Database, DatabaseBackend, EntityTrait, Statement,
+    TransactionTrait,
 };
 use std::collections::BTreeMap;
 use std::sync::{
@@ -355,9 +356,18 @@ async fn runtime() -> TaskRuntime {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("sqlite memory database should connect");
-    Migrator::up(&connection, None)
+    let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection.clone());
+    let migration = database
+        .begin()
+        .await
+        .expect("fixture migration transaction");
+    Migrator::up(&*migration, None)
         .await
         .expect("migration should apply");
+    migration
+        .commit()
+        .await
+        .expect("fixture schema must commit");
     seed_task_test_workspace(&connection).await;
     let store = Arc::new(CrudStore::new(connection));
     TaskRuntime::new(store)
@@ -367,9 +377,18 @@ async fn runtime_with_review_config() -> TaskRuntime {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("sqlite memory database should connect");
-    Migrator::up(&connection, None)
+    let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection.clone());
+    let migration = database
+        .begin()
+        .await
+        .expect("fixture migration transaction");
+    Migrator::up(&*migration, None)
         .await
         .expect("migration should apply");
+    migration
+        .commit()
+        .await
+        .expect("fixture schema must commit");
     seed_task_test_workspace(&connection).await;
     let store = Arc::new(CrudStore::new(connection));
     TaskRuntime::new_with_config(
@@ -457,6 +476,7 @@ async fn task_event_idempotency_rejects_conflicting_duplicate_key_for_task() {
 
 fn idempotency_test_run(status: TaskRunStatus, run_number: i64) -> TaskRun {
     TaskRun {
+        trigger_input: None,
         id: "run_00000000000001".to_owned(),
         task_id: "task_0000000000001".to_owned(),
         trigger_id: None,
@@ -552,11 +572,9 @@ fn test_agent_launch_facts() -> (
             selected_capabilities: Vec::new(),
         },
     };
-    let child_launch_grant = pioneer_protocol::ChildAgentLaunchGrantSet::new(
-        vec![identity.clone()],
-        vec![profile.clone()],
-    )
-    .expect("valid test child launch grant");
+    let child_launch_grant =
+        pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![identity.clone()])
+            .expect("valid test child launch grant");
     let authorization = crate::TaskAgentAuthorizationGrantSeed {
         role_key: "tasks_test_role".to_owned(),
         policy_generation: 1,
@@ -908,6 +926,8 @@ fn task_create_context_for(params: &TaskCreateParams) -> TaskCreateContext {
     let (launch, identity, profile, authorization) = test_agent_launch_facts();
     assert_eq!(params.launch.as_ref(), Some(&launch));
     TaskCreateContext {
+        webhook_secret_ref: None,
+        conversation_frozen_hold: None,
         actor_id: Some(TEST_PRINCIPAL_ID.to_owned()),
         creator_presentation_snapshot: None,
         execution_destination_thread_id: None,
@@ -1286,6 +1306,7 @@ fn composer_work_create_params(
     params.metadata = Some(pioneer_protocol::TaskMetadata {
         labels: vec!["composer-work".to_owned()],
         data: None,
+        finish_request: None,
         composer_work: Some(pioneer_protocol::TaskComposerWork {
             version: payload_version,
             launch: pioneer_protocol::TurnStartParams {
@@ -3374,6 +3395,14 @@ async fn mark_started_is_idempotent_and_emits_one_started_event() {
         .filter(|event| matches!(event.payload, TaskEventPayload::RunStarted { .. }))
         .count();
     assert_eq!(started_count, 1);
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .filter(|event| matches!(event.payload, TaskEventPayload::RunStarting { .. }))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -4026,6 +4055,7 @@ async fn due_trigger_materialization_rolls_back_run_when_occurrence_contract_is_
     let task_id = response.task.id.clone();
     let trigger = response.trigger;
     let run = TaskRun {
+        trigger_input: None,
         id: pioneer_protocol::generate_id(21),
         task_id: task_id.clone(),
         trigger_id: Some(trigger.id.clone()),
@@ -4071,8 +4101,7 @@ async fn due_trigger_materialization_rolls_back_run_when_occurrence_contract_is_
         .service()
         .store()
         .append_due_trigger_task_events(
-            trigger.id.as_str(),
-            10,
+            &trigger,
             10,
             vec![
                 TaskEventPayload::TaskQueued {
@@ -4932,6 +4961,32 @@ async fn failed_run_schedules_retry_and_defers_terminal_delivery_until_exhausted
         .await
         .expect("deliveries should read after first failure");
     assert!(deliveries.deliveries.is_empty());
+
+    assert_eq!(
+        runtime
+            .process_due_once(retry_ready_at - 1)
+            .await
+            .expect("ordinary retry must still wait for its scheduled time"),
+        0
+    );
+    let before_ready = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id.clone(),
+        })
+        .await
+        .expect("task should read before retry becomes due");
+    assert_eq!(before_ready.runs.len(), 2);
+    assert_eq!(
+        before_ready
+            .runs
+            .iter()
+            .find(|run| run.id == retry_run.id)
+            .unwrap()
+            .status,
+        TaskRunStatus::Queued
+    );
+    assert!(before_ready.task.finish_request().is_none());
 
     assert_eq!(
         runtime
@@ -8621,5 +8676,156 @@ async fn reported_start_failure_does_not_swallow_failed_state_persistence_error(
 
 #[path = "tests_delivery_lifecycle.rs"]
 mod delivery_lifecycle;
+#[path = "tests_finish.rs"]
+mod finish;
+#[path = "tests/scheduler_catch_up.rs"]
+mod scheduler_catch_up;
 #[path = "tests/terminal_delivery.rs"]
 mod terminal_delivery;
+
+// Models the durable accepted Stop fact, retained independently of Gateway's
+// live intent map. Gateway regressions exercise creation through turn/cancel.
+#[tokio::test]
+async fn cancelled_terminal_commit_uses_saved_stop_actor_and_rolls_back_receipt_failure() {
+    let runtime = runtime().await;
+    let created = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .unwrap();
+    let run = created.run.unwrap();
+    let store = runtime.service().store();
+    let db = store.database_connection();
+    pioneer_entity::task_run_cancellation_actor::Entity::insert(
+        pioneer_entity::task_run_cancellation_actor::ActiveModel {
+            run_id: Set(run.id.clone()),
+            task_id: Set(run.task_id.clone()),
+            workspace_id: Set(TEST_WORKSPACE_ID.into()),
+            principal_id: Set(TEST_PRINCIPAL_ID.into()),
+            origin_turn_id: Set(TEST_PARENT_TURN_ID.into()),
+        },
+    )
+    .exec(&db)
+    .await
+    .unwrap();
+    let handle = TaskExecutionHandle::new(
+        store.clone(),
+        runtime.event_bus(),
+        run.task_id.clone(),
+        run.id.clone(),
+    );
+    db.execute_unprepared("CREATE TRIGGER reject_stop_receipt BEFORE INSERT ON task_run_read BEGIN SELECT RAISE(ABORT, 'receipt fixture failure'); END").await.unwrap();
+    assert!(
+        handle
+            .cancel_run(Some("saved Stop".into()), run.created_at + 1)
+            .await
+            .is_err()
+    );
+    let unchanged = pioneer_entity::task_run::Entity::find_by_id(run.id.clone())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unchanged.status, "queued",
+        "receipt failure rolls back terminal transition"
+    );
+    assert!(
+        pioneer_entity::task_run_read::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        pioneer_entity::task_run_cancellation_actor::Entity::find_by_id(run.id.clone())
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some(),
+        "durable intent survives the failed commit"
+    );
+    let events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: run.task_id.clone(),
+            after_sequence: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        events
+            .events
+            .iter()
+            .all(|event| !matches!(event.payload, TaskEventPayload::RunCancelled { .. })),
+        "receipt failure also rolls back the cancellation event and fanout journal"
+    );
+    db.execute_unprepared("DROP TRIGGER reject_stop_receipt")
+        .await
+        .unwrap();
+    handle
+        .cancel_run(Some("saved Stop".into()), run.created_at + 1)
+        .await
+        .unwrap();
+    handle
+        .cancel_run(Some("saved Stop".into()), run.created_at + 1)
+        .await
+        .unwrap();
+    let committed_events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: run.task_id.clone(),
+            after_sequence: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        committed_events
+            .events
+            .iter()
+            .filter(|event| matches!(event.payload, TaskEventPayload::RunCancelled { .. }))
+            .count(),
+        1,
+        "an exact replay must not append another cancellation"
+    );
+    // A different reason is a conflicting outcome, not an idempotent replay.
+    // Keep the production terminal fence, and require this rejected attempt
+    // to leave the original actor's receipt and canonical journal intact.
+    let conflict = handle
+        .cancel_run(Some("replay".into()), run.created_at + 2)
+        .await
+        .unwrap_err();
+    assert!(
+        conflict
+            .downcast_ref::<pioneer_crud::TaskTerminalConflict>()
+            .is_some()
+    );
+    let after_conflict = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: run.task_id.clone(),
+            after_sequence: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(after_conflict.events, committed_events.events);
+    let receipts = pioneer_entity::task_run_read::Entity::find()
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].principal_id, TEST_PRINCIPAL_ID);
+    assert_eq!(receipts[0].run_id, run.id);
+}
+
+#[path = "tests_webhook.rs"]
+mod webhook;
+
+#[path = "tests/agent_spec_snapshots.rs"]
+mod agent_spec_snapshots;

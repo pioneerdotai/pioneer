@@ -11,13 +11,242 @@ use pioneer_provider::failure::{
     extract_retry_after_ms,
 };
 use pioneer_provider::{
-    ChatRequest, Provider, ProviderFailureClassification, ProviderResponseLimits,
-    ProviderResponseTooLarge, ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall,
-    StreamChunk, TokenUsage,
+    ChatRequest, Provider, ProviderFailureClassification, ProviderMessageBoundary,
+    ProviderMessageCollector, ProviderResponseLimits, ProviderResponseTooLarge,
+    ProviderRoundUiCopy, ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall, StreamChunk,
+    TokenUsage,
 };
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::time::timeout;
+
+/// Request-local UI ownership. Only resolved commentary End creates a
+/// completed-copy relation. Text previews use the existing lossy progress lane:
+/// they are never canonical items, ACKs, history, or semantic phase evidence.
+#[derive(Default)]
+struct CommentaryUi {
+    ids: Vec<(pioneer_provider::ProviderMessageId, String, bool)>,
+    copies: Vec<ProviderRoundUiCopy>,
+    previews: bool,
+}
+impl CommentaryUi {
+    async fn push(
+        &mut self,
+        chunk: &StreamChunk,
+        collector: &ProviderMessageCollector,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        events: &AgentEventHub,
+    ) -> Result<(), ChatTurnError> {
+        let Some(meta) = &chunk.message else {
+            return Ok(());
+        };
+        if meta.boundary == ProviderMessageBoundary::StartProvisional {
+            self.previews = true;
+        }
+        let commentary = meta.phase == Some(pioneer_protocol::AgentMessagePhase::Commentary);
+        if matches!(
+            meta.boundary,
+            ProviderMessageBoundary::Start | ProviderMessageBoundary::StartProvisional
+        ) {
+            self.ids
+                .push((meta.id, super::generate_id(super::TURN_ITEM_ID_LEN), false));
+        }
+        if !commentary && !self.previews {
+            return Ok(());
+        }
+        let index = self
+            .ids
+            .iter()
+            .position(|(id, _, _)| *id == meta.id)
+            .expect("validated message start");
+        let id = self.ids[index].1.clone();
+        let text = &collector
+            .messages()
+            .iter()
+            .find(|message| message.id == meta.id)
+            .expect("validated message")
+            .text;
+        if !commentary {
+            if meta.boundary == ProviderMessageBoundary::Delta && !chunk.delta.is_empty() {
+                // Use real append deltas on a separate progress key from the
+                // eventual canonical commentary. Generic progress already has
+                // bounded UTF-8 coalescing/fanout; no prefix is hidden in payload.
+                super::emit_progress_event(
+                    events,
+                    AgentProgressEvent::ItemDelta {
+                        notification: ItemDeltaNotification {
+                            workspace_id: workspace.into(),
+                            thread_id: thread.into(),
+                            turn_id: turn.into(),
+                            item_id: id,
+                            delta: chunk.delta.clone(),
+                            stream: Some(pioneer_protocol::ItemDeltaStream::Generic),
+                            payload: Some(
+                                serde_json::json!({"runtimeDeltaKind":"provider_message_preview"}),
+                            ),
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+        let was_started = self.ids[index].2;
+        if !was_started {
+            // An unresolved empty item is never made into empty commentary.
+            if text.is_empty() && (self.previews || meta.boundary != ProviderMessageBoundary::Start)
+            {
+                return Ok(());
+            }
+            self.ids[index].2 = true;
+            super::emit_durable_event(
+                events,
+                AgentDurableEvent::ItemStarted {
+                    notification: ItemStartedNotification {
+                        workspace_id: workspace.into(),
+                        thread_id: thread.into(),
+                        turn_id: turn.into(),
+                        item: TurnItem::AgentMessage {
+                            id: id.clone(),
+                            text: text.clone(),
+                            phase: pioneer_protocol::AgentMessagePhase::Commentary,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                },
+            )
+            .await?;
+        }
+        if meta.boundary == ProviderMessageBoundary::Delta && was_started {
+            super::emit_progress_event(
+                events,
+                AgentProgressEvent::ItemDelta {
+                    notification: ItemDeltaNotification {
+                        workspace_id: workspace.into(),
+                        thread_id: thread.into(),
+                        turn_id: turn.into(),
+                        item_id: id.clone(),
+                        delta: chunk.delta.clone(),
+                        stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
+                        payload: None,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+            )
+            .await?;
+        }
+        if meta.boundary == ProviderMessageBoundary::End {
+            let item = TurnItem::AgentMessage {
+                id,
+                text: text.clone(),
+                phase: pioneer_protocol::AgentMessagePhase::Commentary,
+                markdown: None,
+                markdown_version: None,
+            };
+            let copy = ProviderRoundUiCopy::from_item(&item).expect("commentary item");
+            super::emit_durable_event(
+                events,
+                AgentDurableEvent::ItemCompleted {
+                    notification: ItemCompletedNotification {
+                        workspace_id: workspace.into(),
+                        thread_id: thread.into(),
+                        turn_id: turn.into(),
+                        item,
+                    },
+                },
+            )
+            .await?;
+            self.copies.push(copy);
+        }
+        Ok(())
+    }
+    async fn response(
+        &mut self,
+        response: &pioneer_provider::ChatResponse,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        events: &AgentEventHub,
+    ) -> Result<(), ChatTurnError> {
+        let mut collector = ProviderMessageCollector::default();
+        for message in &response.messages {
+            for boundary in [
+                ProviderMessageBoundary::Start,
+                ProviderMessageBoundary::Delta,
+                ProviderMessageBoundary::End,
+            ] {
+                let mut chunk = StreamChunk::delta(if boundary == ProviderMessageBoundary::Delta {
+                    message.text.as_str()
+                } else {
+                    ""
+                });
+                chunk.message = Some(pioneer_provider::ProviderMessageMetadata {
+                    id: message.id,
+                    phase: message.phase.clone(),
+                    boundary,
+                });
+                collector.push(&chunk).map_err(|_| {
+                    ChatTurnError::Terminal("invalid provider message lifecycle".into())
+                })?;
+                self.push(&chunk, &collector, workspace, thread, turn, events)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_messages(response: &pioneer_provider::ChatResponse) -> Result<(), ChatTurnError> {
+    ProviderMessageCollector::validate_response(response)
+        .map_err(|_| ChatTurnError::Terminal("invalid provider message projection".into()))
+}
+fn push_message(
+    collector: &mut ProviderMessageCollector,
+    chunk: &StreamChunk,
+) -> Result<(), ChatTurnError> {
+    collector.push(chunk).map_err(|_| {
+        ChatTurnError::Terminal("invalid or oversized provider message lifecycle".into())
+    })
+}
+fn validate_collected_retained(
+    collector: &ProviderMessageCollector,
+    text: &str,
+    reasoning: &str,
+    calls: &[ProviderToolCall],
+    replay: Option<&pioneer_provider::ProviderReplayState>,
+    copies: &[ProviderRoundUiCopy],
+) -> Result<(), ChatTurnError> {
+    let retained = collector
+        .retained_bytes()
+        .saturating_add(text.len())
+        .saturating_add(reasoning.len())
+        .saturating_add(
+            calls
+                .iter()
+                .map(|c| c.id.len() + c.name.len() + c.arguments.len())
+                .sum::<usize>(),
+        )
+        .saturating_add(replay.map_or(0, |s| s.payload.to_string().len()))
+        .saturating_add(
+            copies
+                .iter()
+                .map(|c| c.turn_item_id.len() + c.content_sha256.len() + 64)
+                .sum::<usize>(),
+        );
+    ProviderResponseLimits::default()
+        .validate_retained_bytes(retained)
+        .map_err(|_| ChatTurnError::Terminal("provider retained response limit exceeded".into()))
+}
+fn finish_messages(collector: &ProviderMessageCollector) -> Result<(), ChatTurnError> {
+    collector
+        .finish()
+        .map_err(|_| ChatTurnError::Terminal("unfinished provider message".into()))
+}
 
 struct NativeProviderRoundMetric {
     started: Instant,
@@ -67,16 +296,7 @@ impl<'a> FailureTarget<'a> {
 
 fn total_token_usage(usage: Option<&TokenUsage>) -> Option<u64> {
     let usage = usage?;
-    if usage.input_tokens.is_none() && usage.output_tokens.is_none() {
-        return None;
-    }
-
-    Some(
-        usage
-            .input_tokens
-            .unwrap_or_default()
-            .saturating_add(usage.output_tokens.unwrap_or_default()),
-    )
+    usage.input_tokens?.checked_add(usage.output_tokens?)
 }
 
 fn bind_replay_to_response_target(
@@ -91,39 +311,69 @@ fn bind_replay_to_response_target(
     }
 }
 
-/// A final no-tool response can contain native state absent from UI text.
-/// Keep it in the existing acknowledged history route before finalization.
-#[allow(clippy::too_many_arguments)]
+pub(super) fn history_text(text: &str, messages: &[pioneer_provider::ProviderMessage]) -> String {
+    if messages.is_empty() {
+        return text.to_owned();
+    }
+    messages
+        .iter()
+        .map(|message| {
+            if message.phase == Some(pioneer_protocol::AgentMessagePhase::Commentary) {
+                format!("[Assistant commentary]\n{}", message.text)
+            } else {
+                message.text.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+pub(super) fn reasoning_copy(id: &str, reasoning: &str) -> Option<ProviderRoundUiCopy> {
+    if reasoning.is_empty() {
+        return None;
+    }
+    ProviderRoundUiCopy::from_item(&TurnItem::Reasoning {
+        id: id.into(),
+        summary: Vec::new(),
+        content: vec![reasoning.into()],
+    })
+}
+pub(super) fn final_copy(id: &str, text: &str) -> ProviderRoundUiCopy {
+    ProviderRoundUiCopy::from_item(&TurnItem::AgentMessage {
+        id: id.into(),
+        text: text.into(),
+        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        markdown: None,
+        markdown_version: None,
+    })
+    .expect("final copy")
+}
 pub(super) async fn persist_completed_response(
     events: &AgentEventHub,
     thread: &str,
     turn: &str,
-    item: &str,
-    reasoning_item: &str,
-    text: &str,
+    envelope: &pioneer_provider::CanonicalProviderRoundEnvelope,
+) -> Result<(), ChatTurnError> {
+    super::persist_provider_history_message(events, thread, turn, &envelope.round_id, envelope)
+        .await
+}
+fn completed_envelope(
+    round_id: String,
+    text: String,
     reasoning: &str,
     replay: Option<&pioneer_provider::ProviderReplayState>,
-) -> Result<(), ChatTurnError> {
-    if replay.is_none() && reasoning.is_empty() {
-        return Ok(());
-    }
+    copies: Vec<ProviderRoundUiCopy>,
+) -> pioneer_provider::CanonicalProviderRoundEnvelope {
     let mut message = pioneer_provider::ChatMessage::assistant(text);
-    message.reasoning_content = (!reasoning.is_empty()).then(|| reasoning.to_owned());
+    message.reasoning_content = (!reasoning.is_empty()).then(|| reasoning.into());
     message.provider_replay_state = replay.cloned();
-    super::persist_provider_history_message(
-        events,
-        thread,
-        turn,
-        reasoning_item,
-        &pioneer_provider::CanonicalProviderRoundEnvelope {
-            version: 1,
-            round_id: item.into(),
-            termination: pioneer_provider::ProviderTermination::Complete,
-            message,
-            calls: Vec::new(),
-        },
-    )
-    .await
+    pioneer_provider::CanonicalProviderRoundEnvelope {
+        ui_copies: Some(copies),
+        version: 1,
+        round_id,
+        termination: ProviderTermination::Complete,
+        message,
+        calls: vec![],
+    }
 }
 
 /// Persist the provider accumulator, including opaque state absent from UI text.
@@ -139,11 +389,9 @@ async fn persist_failed_provider_observation(
     reasoning: &str,
     calls: &[ProviderToolCall],
     replay: Option<&pioneer_provider::ProviderReplayState>,
-    error: &ChatTurnError,
+    copies: &[ProviderRoundUiCopy],
 ) -> Result<(), ChatTurnError> {
-    if !matches!(error, ChatTurnError::ProviderFailure { .. })
-        || (text.is_empty() && reasoning.is_empty() && calls.is_empty() && replay.is_none())
-    {
+    if text.is_empty() && reasoning.is_empty() && calls.is_empty() && replay.is_none() {
         return Ok(());
     }
     let mut message = pioneer_provider::ChatMessage::assistant(text);
@@ -156,6 +404,7 @@ async fn persist_failed_provider_observation(
         turn,
         item,
         &pioneer_provider::CanonicalProviderRoundEnvelope {
+            ui_copies: Some(copies.to_vec()),
             version: 1,
             round_id: item.into(),
             termination: ProviderTermination::ProviderError,
@@ -166,7 +415,7 @@ async fn persist_failed_provider_observation(
     .await
 }
 
-pub(super) async fn request_agent_round(
+async fn request_agent_round_observed(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
     workspace_id: &str,
@@ -176,6 +425,7 @@ pub(super) async fn request_agent_round(
     force_non_stream: bool,
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
+    observation: &ProviderAttemptObservation,
 ) -> Result<AgentRoundResponse, ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
@@ -187,6 +437,7 @@ pub(super) async fn request_agent_round(
         let pioneer_provider::ProviderStream {
             mut stream,
             diagnostics,
+            message_delivery,
         } = {
             let _startup_part = pioneer_observability::turn_startup::stage(
                 turn_id,
@@ -196,6 +447,7 @@ pub(super) async fn request_agent_round(
                 .stream_chat_with_diagnostics(request)
                 .await
                 .map_err(|error| {
+                    observation.observe_error(&error);
                     adapter_error_for_target(
                         target,
                         provider.as_ref(),
@@ -209,27 +461,46 @@ pub(super) async fn request_agent_round(
         };
 
         let mut full_text = String::new();
+        let mut message_collector = ProviderMessageCollector::default();
+        let mut commentary_ui = CommentaryUi {
+            previews: message_delivery == pioneer_provider::ProviderMessageDelivery::Provisional,
+            ..Default::default()
+        };
         let mut full_reasoning = String::new();
         let mut tool_calls = Vec::new();
         let mut provider_replay_state = None;
         let mut termination = None;
         let mut usage: Option<pioneer_provider::TokenUsage> = None;
         let mut seen_any_chunk = false;
+        let mut content_deadline = None;
         let response_limits = ProviderResponseLimits::default();
 
         let received = async {
             while let Some(mut chunk) = read_next_stream_chunk(
                 &mut stream,
                 &mut seen_any_chunk,
+                &mut content_deadline,
                 &diagnostics,
                 target,
                 provider,
                 model_name.as_str(),
                 provider_timeout_policy,
+                observation,
             )
             .await?
             {
                 observe_startup_chunk(turn_id, &chunk);
+                push_message(&mut message_collector, &chunk)?;
+                commentary_ui
+                    .push(
+                        &chunk,
+                        &message_collector,
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        event_tx,
+                    )
+                    .await?;
                 if let Err(error) = response_limits.validate_stream_chunk(&chunk) {
                     return Err(provider_response_limit_error(
                         target,
@@ -241,6 +512,7 @@ pub(super) async fn request_agent_round(
                 }
                 if let Some(snapshot) = &chunk.usage {
                     usage.get_or_insert_with(Default::default).update(snapshot);
+                    observation.observe(snapshot);
                 }
                 if chunk.provider_replay_state.is_some() {
                     provider_replay_state = chunk.provider_replay_state.take();
@@ -288,9 +560,7 @@ pub(super) async fn request_agent_round(
                     .await?;
                 }
 
-                if !chunk.delta.is_empty() {
-                    full_text.push_str(chunk.delta.as_str());
-                }
+                full_text.push_str(message_collector.result_delta());
 
                 validate_provider_tool_calls(
                     chunk.tool_calls.as_slice(),
@@ -316,12 +586,21 @@ pub(super) async fn request_agent_round(
                         error,
                     ));
                 }
+                validate_collected_retained(
+                    &message_collector,
+                    &full_text,
+                    &full_reasoning,
+                    &tool_calls,
+                    provider_replay_state.as_ref(),
+                    &commentary_ui.copies,
+                )?;
                 if chunk.is_final {
                     termination = chunk.termination;
                     break;
                 }
             }
 
+            finish_messages(&message_collector)?;
             require_round_termination(
                 termination,
                 tool_calls.as_slice(),
@@ -340,11 +619,11 @@ pub(super) async fn request_agent_round(
                     thread_id,
                     turn_id,
                     thinking_item_id,
-                    &full_text,
+                    &history_text(&full_text, message_collector.messages()),
                     &full_reasoning,
                     &tool_calls,
                     provider_replay_state.as_ref(),
-                    &error,
+                    &commentary_ui.copies,
                 )
                 .await?;
                 return Err(error);
@@ -352,6 +631,9 @@ pub(super) async fn request_agent_round(
         };
         lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
         return Ok(AgentRoundResponse {
+            round_id: super::generate_id(super::TURN_ITEM_ID_LEN),
+            messages: message_collector.into_messages(),
+            ui_copies: commentary_ui.copies,
             text: full_text,
             reasoning: full_reasoning,
             tool_calls,
@@ -365,6 +647,7 @@ pub(super) async fn request_agent_round(
     let model_name = request.model.clone();
 
     let mut response = provider.chat(request).await.map_err(|error| {
+        observation.observe_error(&error);
         adapter_error_for_target(
             FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
             provider.as_ref(),
@@ -375,12 +658,20 @@ pub(super) async fn request_agent_round(
             &error,
         )
     })?;
+    if let Some(usage) = &response.usage {
+        observation.observe(usage);
+    }
     bind_replay_to_response_target(
         &mut response.provider_replay_state,
         provider.name(),
         model_name.as_str(),
     );
 
+    validate_messages(&response)?;
+    let mut commentary_ui = CommentaryUi::default();
+    commentary_ui
+        .response(&response, workspace_id, thread_id, turn_id, event_tx)
+        .await?;
     let startup_output = if !response.text.is_empty() {
         Some(pioneer_observability::turn_startup::Output::BufferedText)
     } else if response
@@ -432,16 +723,36 @@ pub(super) async fn request_agent_round(
         .await?;
     }
 
-    let termination = require_round_termination(
-        Some(response.termination),
+    let termination = match require_round_termination(
+        Some(response.termination.clone()),
         response.tool_calls.as_slice(),
         FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
         provider.name(),
-        model_name.as_str(),
+        &model_name,
         ProviderTransportKind::NonStream,
-    )?;
+    ) {
+        Ok(termination) => termination,
+        Err(error) => {
+            persist_failed_provider_observation(
+                event_tx,
+                thread_id,
+                turn_id,
+                thinking_item_id,
+                &history_text(&response.text, &response.messages),
+                &reasoning,
+                &response.tool_calls,
+                response.provider_replay_state.as_ref(),
+                &commentary_ui.copies,
+            )
+            .await?;
+            return Err(error);
+        }
+    };
     lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
     Ok(AgentRoundResponse {
+        round_id: super::generate_id(super::TURN_ITEM_ID_LEN),
+        messages: response.messages,
+        ui_copies: commentary_ui.copies,
         text: response.text,
         reasoning,
         tool_calls: response.tool_calls,
@@ -452,7 +763,7 @@ pub(super) async fn request_agent_round(
     })
 }
 
-pub(super) async fn stream_provider_response(
+async fn stream_provider_response_observed(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
     workspace_id: &str,
@@ -462,6 +773,7 @@ pub(super) async fn stream_provider_response(
     message_item_id: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
+    observation: &ProviderAttemptObservation,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
@@ -472,6 +784,7 @@ pub(super) async fn stream_provider_response(
     let pioneer_provider::ProviderStream {
         mut stream,
         diagnostics,
+        message_delivery,
     } = {
         let _startup_part = pioneer_observability::turn_startup::stage(
             turn_id,
@@ -481,6 +794,7 @@ pub(super) async fn stream_provider_response(
             .stream_chat_with_diagnostics(request)
             .await
             .map_err(|error| {
+                observation.observe_error(&error);
                 adapter_error_for_target(
                     connect_target,
                     provider.as_ref(),
@@ -494,12 +808,19 @@ pub(super) async fn stream_provider_response(
     };
 
     let mut full_text = String::new();
+    let mut message_collector = ProviderMessageCollector::default();
+    let mut commentary_ui = CommentaryUi {
+        previews: message_delivery == pioneer_provider::ProviderMessageDelivery::Provisional,
+        ..Default::default()
+    };
     let mut reasoning_parts = String::new();
     let mut message_started = false;
+    let mut completed_reasoning_len = None;
     let mut stream_tool_calls = Vec::new();
     let mut termination = None;
     let mut usage: Option<pioneer_provider::TokenUsage> = None;
     let mut seen_any_chunk = false;
+    let mut content_deadline = None;
     let response_limits = ProviderResponseLimits::default();
 
     let mut provider_replay_state = None;
@@ -507,11 +828,13 @@ pub(super) async fn stream_provider_response(
         while let Some(chunk) = read_next_stream_chunk(
             &mut stream,
             &mut seen_any_chunk,
+            &mut content_deadline,
             &diagnostics,
             response_stream_target(message_started, thinking_item_id, message_item_id),
             provider,
             model_name.as_str(),
             provider_timeout_policy,
+            observation,
         )
         .await?
         {
@@ -525,9 +848,22 @@ pub(super) async fn stream_provider_response(
                     error,
                 ));
             }
+            push_message(&mut message_collector, &chunk)?;
+            commentary_ui
+                .push(
+                    &chunk,
+                    &message_collector,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    event_tx,
+                )
+                .await?;
+            let result_delta = message_collector.result_delta().to_owned();
             let StreamChunk {
+                message: _,
                 usage: chunk_usage,
-                delta,
+                delta: _,
                 reasoning_delta,
                 tool_calls,
                 is_final,
@@ -537,6 +873,7 @@ pub(super) async fn stream_provider_response(
 
             if let Some(snapshot) = &chunk_usage {
                 usage.get_or_insert_with(Default::default).update(snapshot);
+                observation.observe(snapshot);
             }
             if chunk_replay.is_some() {
                 provider_replay_state = chunk_replay;
@@ -547,6 +884,7 @@ pub(super) async fn stream_provider_response(
                 );
             }
 
+            let delta = result_delta;
             let target = response_stream_target(message_started, thinking_item_id, message_item_id);
             validate_stream_append_limits(
                 &response_limits,
@@ -596,6 +934,9 @@ pub(super) async fn stream_provider_response(
             }
 
             if !delta.is_empty() {
+                full_text.push_str(delta.as_str());
+            }
+            if !commentary_ui.previews && !delta.is_empty() {
                 if !message_started {
                     message_started = true;
                     let reasoning_text = reasoning_parts.clone();
@@ -620,6 +961,7 @@ pub(super) async fn stream_provider_response(
                         },
                     )
                     .await?;
+                    completed_reasoning_len = Some(reasoning_parts.len());
 
                     super::emit_durable_event(
                         event_tx,
@@ -641,7 +983,6 @@ pub(super) async fn stream_provider_response(
                     .await?;
                 }
 
-                full_text.push_str(delta.as_str());
                 super::emit_progress_event(
                     event_tx,
                     AgentProgressEvent::ItemDelta {
@@ -675,12 +1016,21 @@ pub(super) async fn stream_provider_response(
                     error,
                 ));
             }
+            validate_collected_retained(
+                &message_collector,
+                &full_text,
+                &reasoning_parts,
+                &stream_tool_calls,
+                provider_replay_state.as_ref(),
+                &commentary_ui.copies,
+            )?;
             if is_final {
                 termination = chunk_termination;
                 break;
             }
         }
 
+        finish_messages(&message_collector)?;
         require_round_termination(
             termination,
             stream_tool_calls.as_slice(),
@@ -698,27 +1048,67 @@ pub(super) async fn stream_provider_response(
             thread_id,
             turn_id,
             thinking_item_id,
-            &full_text,
+            &history_text(&full_text, message_collector.messages()),
             &reasoning_parts,
             &stream_tool_calls,
             provider_replay_state.as_ref(),
-            &error,
+            &commentary_ui.copies,
         )
         .await?;
         return Err(error);
     }
-    if stream_tool_calls.is_empty() {
-        persist_completed_response(
-            event_tx,
+    if completed_reasoning_len != Some(reasoning_parts.len()) {
+        super::send_reasoning_completed(
+            workspace_id,
             thread_id,
             turn_id,
-            message_item_id,
             thinking_item_id,
-            &full_text,
             &reasoning_parts,
-            provider_replay_state.as_ref(),
+            event_tx,
         )
         .await?;
+    }
+    if !message_started && !full_text.trim().is_empty() {
+        // Replace runtime previews only after successful request termination.
+        // The canonical final still follows history ACK and finalization gates.
+        super::emit_durable_event(
+            event_tx,
+            AgentDurableEvent::ItemStarted {
+                notification: ItemStartedNotification {
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: turn_id.into(),
+                    item: TurnItem::AgentMessage {
+                        id: message_item_id.into(),
+                        text: String::new(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+            },
+        )
+        .await?;
+    }
+    let mut copies = commentary_ui.copies;
+    copies.extend(reasoning_copy(thinking_item_id, &reasoning_parts));
+    if !full_text.trim().is_empty() {
+        copies.push(final_copy(message_item_id, &full_text));
+    }
+    let envelope = completed_envelope(
+        super::generate_id(super::TURN_ITEM_ID_LEN),
+        history_text(&full_text, message_collector.messages()),
+        &reasoning_parts,
+        provider_replay_state.as_ref(),
+        copies,
+    );
+    if stream_tool_calls.is_empty() {
+        persist_completed_response(event_tx, thread_id, turn_id, &envelope).await?;
+    }
+    if full_text.trim().is_empty() {
+        return Err(ChatTurnError::Terminal(
+            "provider completed without a final message".into(),
+        ));
     }
     for tool_call in stream_tool_calls {
         super::emit_durable_event(
@@ -764,50 +1154,6 @@ pub(super) async fn stream_provider_response(
         .await?;
     }
 
-    if !message_started {
-        let reasoning_text = reasoning_parts;
-
-        super::emit_durable_event(
-            event_tx,
-            AgentDurableEvent::ItemCompleted {
-                notification: ItemCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: TurnItem::Reasoning {
-                        id: thinking_item_id.to_owned(),
-                        summary: Vec::new(),
-                        content: if reasoning_text.is_empty() {
-                            Vec::new()
-                        } else {
-                            vec![reasoning_text]
-                        },
-                    },
-                },
-            },
-        )
-        .await?;
-
-        super::emit_durable_event(
-            event_tx,
-            AgentDurableEvent::ItemStarted {
-                notification: ItemStartedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: TurnItem::AgentMessage {
-                        id: message_item_id.to_owned(),
-                        text: String::new(),
-                        phase: Default::default(),
-                        markdown: None,
-                        markdown_version: None,
-                    },
-                },
-            },
-        )
-        .await?;
-    }
-
     let assistant_text = full_text;
 
     super::emit_durable_event(
@@ -835,7 +1181,7 @@ pub(super) async fn stream_provider_response(
     Ok((assistant_text, usage))
 }
 
-pub(super) async fn non_stream_provider_response(
+async fn non_stream_provider_response_observed(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
     workspace_id: &str,
@@ -844,12 +1190,14 @@ pub(super) async fn non_stream_provider_response(
     thinking_item_id: &str,
     message_item_id: &str,
     event_tx: &AgentEventHub,
+    observation: &ProviderAttemptObservation,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
     let model_name = request.model.clone();
 
     let mut response = provider.chat(request).await.map_err(|error| {
+        observation.observe_error(&error);
         adapter_error_for_target(
             FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
             provider.as_ref(),
@@ -861,6 +1209,9 @@ pub(super) async fn non_stream_provider_response(
         )
     })?;
 
+    if let Some(usage) = &response.usage {
+        observation.observe(usage);
+    }
     bind_replay_to_response_target(
         &mut response.provider_replay_state,
         provider.name(),
@@ -892,49 +1243,63 @@ pub(super) async fn non_stream_provider_response(
         ));
     }
 
-    require_round_termination(
+    validate_messages(&response)?;
+    let mut commentary_ui = CommentaryUi::default();
+    commentary_ui
+        .response(&response, workspace_id, thread_id, turn_id, event_tx)
+        .await?;
+    if let Err(error) = require_round_termination(
         Some(response.termination.clone()),
         response.tool_calls.as_slice(),
         FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
         provider.name(),
-        model_name.as_str(),
+        &model_name,
         ProviderTransportKind::NonStream,
-    )?;
-    if response.tool_calls.is_empty() {
-        persist_completed_response(
+    ) {
+        persist_failed_provider_observation(
             event_tx,
             thread_id,
             turn_id,
-            message_item_id,
             thinking_item_id,
-            &response.text,
+            &history_text(&response.text, &response.messages),
             response.reasoning_content.as_deref().unwrap_or_default(),
+            &response.tool_calls,
             response.provider_replay_state.as_ref(),
+            &commentary_ui.copies,
         )
         .await?;
+        return Err(error);
     }
-    let reasoning_content = match &response.reasoning_content {
-        Some(rc) if !rc.is_empty() => vec![rc.clone()],
-        _ => Vec::new(),
-    };
-
-    super::emit_durable_event(
+    let reasoning = response.reasoning_content.as_deref().unwrap_or_default();
+    super::send_reasoning_completed(
+        workspace_id,
+        thread_id,
+        turn_id,
+        thinking_item_id,
+        reasoning,
         event_tx,
-        AgentDurableEvent::ItemCompleted {
-            notification: ItemCompletedNotification {
-                workspace_id: workspace_id.to_owned(),
-                thread_id: thread_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                item: TurnItem::Reasoning {
-                    id: thinking_item_id.to_owned(),
-                    summary: Vec::new(),
-                    content: reasoning_content,
-                },
-            },
-        },
     )
     .await?;
-
+    let mut copies = commentary_ui.copies;
+    copies.extend(reasoning_copy(thinking_item_id, reasoning));
+    if !response.text.trim().is_empty() {
+        copies.push(final_copy(message_item_id, &response.text));
+    }
+    let envelope = completed_envelope(
+        super::generate_id(super::TURN_ITEM_ID_LEN),
+        history_text(&response.text, &response.messages),
+        reasoning,
+        response.provider_replay_state.as_ref(),
+        copies,
+    );
+    if response.tool_calls.is_empty() {
+        persist_completed_response(event_tx, thread_id, turn_id, &envelope).await?;
+    }
+    if response.text.trim().is_empty() {
+        return Err(ChatTurnError::Terminal(
+            "provider completed without a final message".into(),
+        ));
+    }
     super::emit_durable_event(
         event_tx,
         AgentDurableEvent::ItemStarted {
@@ -1013,6 +1378,23 @@ fn response_stream_target<'a>(
     }
 }
 
+pub(super) fn model_preparation_error(
+    item_id: &str,
+    provider: &dyn Provider,
+    model: &str,
+    error: &anyhow::Error,
+) -> ChatTurnError {
+    adapter_error_for_target(
+        FailureTarget::new(item_id, TurnItemType::Reasoning),
+        provider,
+        model,
+        ProviderTransportKind::NonStream,
+        ProviderFailureStage::Connect,
+        "model capability discovery failed",
+        error,
+    )
+}
+
 fn adapter_error_for_target(
     target: FailureTarget<'_>,
     provider: &dyn Provider,
@@ -1022,7 +1404,7 @@ fn adapter_error_for_target(
     prefix: &str,
     error: &anyhow::Error,
 ) -> ChatTurnError {
-    let classification = if let Some(http_error) =
+    let mut classification = if let Some(http_error) =
         error.downcast_ref::<pioneer_provider::ProviderHttpErrorBodyTooLarge>()
     {
         Some(classify_http_error_body_too_large(http_error.status))
@@ -1033,6 +1415,25 @@ fn adapter_error_for_target(
     } else {
         provider.classify_failure(error)
     };
+    if let Some(id) = pioneer_provider::usage::error_usage(error)
+        .and_then(|usage| usage.request_id.clone())
+        .and_then(|id| pioneer_protocol::ProviderRequestId::try_from(id).ok())
+    {
+        classification
+            .get_or_insert_with(|| {
+                ProviderFailureClassification::new(ProviderFailureClass::Unknown)
+            })
+            .request_id = Some(id);
+    }
+    // Usage context has a safe fixed Display. Classify the original cause
+    // privately, then persist only the safe outer diagnostic and typed hints.
+    let inferred = infer_failure_classification(
+        &format!(
+            "{prefix}: {}",
+            pioneer_provider::usage::classification_source(error)
+        ),
+        stage,
+    );
     provider_failure_error_with_classification(
         target.item_id,
         target.item_type,
@@ -1041,7 +1442,7 @@ fn adapter_error_for_target(
         transport,
         stage,
         format!("{prefix}: {error}"),
-        classification,
+        Some(merge_failure_classification(classification, inferred)),
     )
 }
 
@@ -1258,11 +1659,13 @@ fn should_replace_tool_arguments(current: &str, next: &str) -> bool {
 async fn read_next_stream_chunk<S>(
     stream: &mut S,
     seen_any_chunk: &mut bool,
+    content_deadline: &mut Option<tokio::time::Instant>,
     diagnostics: &pioneer_provider::ProviderStreamDiagnostics,
     target: FailureTarget<'_>,
     provider: &Arc<dyn Provider>,
     model_name: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
+    observation: &ProviderAttemptObservation,
 ) -> Result<Option<StreamChunk>, ChatTurnError>
 where
     S: Stream<Item = anyhow::Result<StreamChunk>> + Unpin,
@@ -1279,7 +1682,39 @@ where
         provider_timeout_policy.first_chunk_timeout
     };
 
-    let next_chunk = timeout(wait, stream.next()).await.map_err(|_| {
+    let deadline = *content_deadline.get_or_insert_with(|| tokio::time::Instant::now() + wait);
+    let next_chunk = tokio::time::timeout_at(deadline, async {
+        loop {
+            let next = stream.next().await;
+            if let Some(Ok(chunk)) = &next {
+                let identity_only = !chunk.is_final
+                    && chunk.message.is_none()
+                    && chunk.delta.is_empty()
+                    && chunk.reasoning_delta.is_none()
+                    && chunk.tool_calls.is_empty()
+                    && chunk.provider_replay_state.is_none()
+                    && chunk.termination.is_none()
+                    && chunk.usage.as_ref().is_some_and(|usage| {
+                        usage.input_tokens.is_none()
+                            && usage.output_tokens.is_none()
+                            && usage.uncached_input_tokens.is_none()
+                            && usage.cache_read_input_tokens.is_none()
+                            && usage.cache_write_input_tokens.is_none()
+                            && usage.reasoning_tokens.is_none()
+                            && usage.reported_total_tokens.is_none()
+                    });
+                if identity_only {
+                    // Correlation evidence must survive without resetting the
+                    // request's first/inter-chunk deadline or counting as progress.
+                    observation.observe(chunk.usage.as_ref().expect("identity usage"));
+                    continue;
+                }
+            }
+            break next;
+        }
+    })
+    .await
+    .map_err(|_| {
         let mut classification =
             ProviderFailureClassification::new(ProviderFailureClass::StreamStall);
         classification.request_id = diagnostics.request_id();
@@ -1299,9 +1734,8 @@ where
         return Ok(None);
     };
 
-    *seen_any_chunk = true;
-
     let chunk = chunk_result.map_err(|error| {
+        observation.observe_error(&error);
         adapter_error_for_target(
             target,
             provider.as_ref(),
@@ -1313,6 +1747,17 @@ where
         )
     })?;
 
+    if !chunk.delta.is_empty()
+        || chunk
+            .reasoning_delta
+            .as_ref()
+            .is_some_and(|s| !s.is_empty())
+        || !chunk.tool_calls.is_empty()
+    {
+        *seen_any_chunk = true;
+        *content_deadline =
+            Some(tokio::time::Instant::now() + provider_timeout_policy.inter_chunk_idle_timeout);
+    }
     Ok(Some(chunk))
 }
 
@@ -1348,29 +1793,19 @@ fn provider_failure_error_with_classification(
     error_message: String,
     classification: Option<ProviderFailureClassification>,
 ) -> ChatTurnError {
-    let error_reason = classification.as_ref().and_then(|value| value.error_reason);
-    let request_id = classification
-        .as_ref()
-        .and_then(|value| value.request_id.clone());
-    let lower = error_message.to_ascii_lowercase();
-    let inferred_http_status = extract_http_status(error_message.as_str());
-    let inferred_retry_after_ms = extract_retry_after_ms(lower.as_str());
-    let inferred_provider_code = extract_provider_code(error_message.as_str());
-    let inferred_class = classify_provider_failure_message(error_message.as_str(), stage);
-    let (class, http_status, provider_code, retry_after_ms) = match classification {
-        Some(classification) => (
-            classification.class,
-            classification.http_status.or(inferred_http_status),
-            classification.provider_code.or(inferred_provider_code),
-            classification.retry_after_ms.or(inferred_retry_after_ms),
-        ),
-        None => (
-            inferred_class,
-            inferred_http_status,
-            inferred_provider_code,
-            inferred_retry_after_ms,
-        ),
-    };
+    let classification = merge_failure_classification(
+        classification,
+        infer_failure_classification(&error_message, stage),
+    );
+    let ProviderFailureClassification {
+        is_network_error: _,
+        error_reason,
+        request_id,
+        class,
+        http_status,
+        provider_code,
+        retry_after_ms,
+    } = classification;
     let is_recoverable_hint = provider_failure_class_is_recoverable(class);
 
     ChatTurnError::ProviderFailure {
@@ -1390,6 +1825,39 @@ fn provider_failure_error_with_classification(
             is_recoverable_hint,
             message: Some(error_message),
         },
+    }
+}
+
+fn infer_failure_classification(
+    message: &str,
+    stage: ProviderFailureStage,
+) -> ProviderFailureClassification {
+    ProviderFailureClassification {
+        is_network_error: false,
+        error_reason: None,
+        request_id: None,
+        class: classify_provider_failure_message(message, stage),
+        http_status: extract_http_status(message),
+        provider_code: extract_provider_code(message),
+        retry_after_ms: extract_retry_after_ms(&message.to_ascii_lowercase()),
+    }
+}
+
+fn merge_failure_classification(
+    classification: Option<ProviderFailureClassification>,
+    inferred: ProviderFailureClassification,
+) -> ProviderFailureClassification {
+    match classification {
+        Some(classification) => ProviderFailureClassification {
+            is_network_error: classification.is_network_error,
+            error_reason: classification.error_reason,
+            request_id: classification.request_id,
+            class: classification.class,
+            http_status: classification.http_status.or(inferred.http_status),
+            provider_code: classification.provider_code.or(inferred.provider_code),
+            retry_after_ms: classification.retry_after_ms.or(inferred.retry_after_ms),
+        },
+        None => inferred,
     }
 }
 
@@ -1442,6 +1910,288 @@ fn extract_http_status(message: &str) -> Option<u16> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn registry_usage_metadata_is_transparent_to_production_failure_translation() {
+        struct Failing {
+            message: &'static str,
+            classification: Option<ProviderFailureClassification>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Failing {
+            fn name(&self) -> &str {
+                "openrouter"
+            }
+            fn classify_failure(&self, _: &anyhow::Error) -> Option<ProviderFailureClassification> {
+                self.classification.clone()
+            }
+            async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+                Err(anyhow::anyhow!(self.message))
+            }
+            async fn stream_chat(
+                &self,
+                _: ChatRequest,
+            ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+            {
+                let snapshot = TokenUsage {
+                    generation_id: Some("gen-header".into()),
+                    input_tokens: None,
+                    output_tokens: Some(0),
+                    cache_read_input_tokens: Some(8),
+                    ..Default::default()
+                };
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamChunk::usage(snapshot.clone())),
+                    Ok(StreamChunk::usage(snapshot)),
+                    Err(anyhow::anyhow!(self.message)),
+                ])))
+            }
+        }
+        let request = || ChatRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        for (message, stage, class, typed) in [
+            (
+                "OpenRouter API error 429: {\"code\":\"rate_limit_exceeded\"} retry-after: 2",
+                ProviderFailureStage::Connect,
+                ProviderFailureClass::RateLimit,
+                false,
+            ),
+            (
+                "OpenRouter API error 503: unavailable",
+                ProviderFailureStage::Connect,
+                ProviderFailureClass::Provider5xx,
+                false,
+            ),
+            (
+                "connection reset by peer",
+                ProviderFailureStage::MidStream,
+                ProviderFailureClass::NetworkTransient,
+                false,
+            ),
+            (
+                "provider API error 400: invalid request",
+                ProviderFailureStage::MidStream,
+                ProviderFailureClass::ProviderRejected,
+                false,
+            ),
+            (
+                "provider returned empty response",
+                ProviderFailureStage::Finalize,
+                ProviderFailureClass::EmptyResponse,
+                true,
+            ),
+            (
+                "opaque adapter failure",
+                ProviderFailureStage::FirstChunk,
+                ProviderFailureClass::RateLimit,
+                true,
+            ),
+        ] {
+            let inner = Arc::new(Failing {
+                message,
+                classification: typed.then(|| ProviderFailureClassification {
+                    is_network_error: false,
+                    error_reason: None,
+                    request_id: None,
+                    class,
+                    http_status: (class == ProviderFailureClass::RateLimit).then_some(429),
+                    provider_code: (class == ProviderFailureClass::RateLimit)
+                        .then(|| "native_rate_limit".into()),
+                    retry_after_ms: (class == ProviderFailureClass::RateLimit).then_some(7000),
+                }),
+            });
+            let plain = inner.chat(request()).await.err().unwrap();
+            let registry = pioneer_provider::ProviderRegistry::new(|_| String::new());
+            registry.insert("openrouter", inner.clone()).unwrap();
+            let wrapped = registry.get_or_create("openrouter").unwrap();
+            let mut stream = wrapped.stream_chat(request()).await.unwrap();
+            let observation = ProviderAttemptObservation::new(wrapped.as_ref(), "fixture");
+            for _ in 0..2 {
+                observation.observe(&stream.next().await.unwrap().unwrap().usage.unwrap());
+            }
+            let enriched = stream.next().await.unwrap().err().unwrap();
+            observation.observe_error(&enriched);
+            observation.observe_error(&enriched);
+            let translate = |provider: &dyn Provider, error: &anyhow::Error| {
+                let ChatTurnError::ProviderFailure { failure, .. } = adapter_error_for_target(
+                    FailureTarget::new("item", TurnItemType::Reasoning),
+                    provider,
+                    "fixture",
+                    ProviderTransportKind::Stream,
+                    stage,
+                    "provider error",
+                    error,
+                ) else {
+                    panic!("expected failure")
+                };
+                failure
+            };
+            let before = translate(inner.as_ref(), &plain);
+            let after = translate(wrapped.as_ref(), &enriched);
+            assert_eq!(after.class, class);
+            assert_eq!(after.class, before.class);
+            assert_eq!(after.http_status, before.http_status);
+            assert_eq!(after.provider_code, before.provider_code);
+            assert_eq!(after.retry_after_ms, before.retry_after_ms);
+            if message.starts_with("OpenRouter API error 429") {
+                assert_eq!(after.http_status, Some(429));
+                assert_eq!(after.provider_code.as_deref(), Some("rate_limit_exceeded"));
+                assert_eq!(after.retry_after_ms, Some(2000));
+            }
+            if message.starts_with("OpenRouter API error 503") {
+                assert_eq!(after.http_status, Some(503));
+            }
+            assert_eq!(after.is_recoverable_hint, before.is_recoverable_hint);
+            assert_eq!(after.stage, before.stage);
+            assert_eq!(after.transport, before.transport);
+            assert!(!after.message.unwrap().contains(message));
+            let observed = observation.usage.lock().unwrap();
+            assert_eq!(observed.generation_id.as_deref(), Some("gen-header"));
+            assert_eq!(observed.input_tokens, None);
+            assert_eq!(observed.output_tokens, Some(0));
+            assert_eq!(observed.cache_read_input_tokens, Some(8));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_openrouter_header_errors_keep_http_and_retry_hints_without_redaction_override()
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        for (status, class) in [
+            (429, ProviderFailureClass::RateLimit),
+            (503, ProviderFailureClass::Provider5xx),
+        ] {
+            for streaming in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    // Read the complete request before closing the connection. Closing
+                    // with unread request bytes can reset the socket on Linux, obscuring
+                    // the response failure this fixture is intended to exercise.
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buffer = [0u8; 2048];
+                        let count = socket.read(&mut buffer).await.unwrap();
+                        assert!(count > 0, "fixture request ended before its body");
+                        assert!(request.len() + count <= 8192, "fixture request too large");
+                        request.extend_from_slice(&buffer[..count]);
+                        if let Some(start) =
+                            request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        {
+                            let header = std::str::from_utf8(&request[..start]).unwrap();
+                            let length = header
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .expect("fixture request Content-Length");
+                            if request.len() >= start + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+
+                    let body = r#"{"error":{"code":"native_rejection","message":"SECRET_BODY retry-after: 2"}}"#;
+                    socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nX-Generation-Id: gen-native-header\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                });
+                // Native adapter + normal registry wrapper; no endpoint override
+                // resolver, so the default non-redacting error path is exercised.
+                let registry = pioneer_provider::ProviderRegistry::new(|_| String::new());
+                registry
+                    .insert(
+                        "openrouter",
+                        Arc::new(
+                            pioneer_provider::providers::OpenRouterProvider::with_base_url(
+                                "key", url,
+                            ),
+                        ),
+                    )
+                    .unwrap();
+                let provider = registry.get_or_create("openrouter").unwrap();
+                let request = ChatRequest {
+                    model: "fixture".into(),
+                    messages: vec![],
+                    temperature: None,
+                    max_tokens: None,
+                    tools: None,
+                    tool_choice: None,
+                    parallel_tool_calls: None,
+                    reasoning: None,
+                    compiled_prompt: None,
+                };
+                let error = if streaming {
+                    provider.stream_chat(request).await.err().unwrap()
+                } else {
+                    provider.chat(request).await.err().unwrap()
+                };
+                server.await.unwrap();
+                let classification = provider.classify_failure(&error).unwrap();
+                assert_eq!(classification.http_status, Some(status));
+                let transport = if streaming {
+                    ProviderTransportKind::Stream
+                } else {
+                    ProviderTransportKind::NonStream
+                };
+                let translate = |error: &anyhow::Error| {
+                    let ChatTurnError::ProviderFailure { failure, .. } = adapter_error_for_target(
+                        FailureTarget::new("item", TurnItemType::Reasoning),
+                        provider.as_ref(),
+                        "fixture",
+                        transport,
+                        ProviderFailureStage::Connect,
+                        "provider error",
+                        error,
+                    ) else {
+                        panic!("expected provider failure")
+                    };
+                    failure
+                };
+                let ChatTurnError::ProviderFailure {
+                    failure: before, ..
+                } = provider_failure_error_with_classification(
+                    "item",
+                    TurnItemType::Reasoning,
+                    provider.name(),
+                    "fixture",
+                    transport,
+                    ProviderFailureStage::Connect,
+                    pioneer_provider::usage::classification_source(&error).to_string(),
+                    Some(classification),
+                )
+                else {
+                    panic!("expected failure")
+                };
+                let after = translate(&error);
+                assert_eq!(after.class, class);
+                assert_eq!(after.http_status, Some(status));
+                assert_eq!(after.provider_code, None);
+                assert_eq!(after.retry_after_ms, Some(2000));
+                assert_eq!(after.class, before.class);
+                assert_eq!(after.http_status, before.http_status);
+                assert_eq!(after.provider_code, before.provider_code);
+                assert_eq!(after.retry_after_ms, before.retry_after_ms);
+                assert_eq!(after.is_recoverable_hint, before.is_recoverable_hint);
+                assert!(!after.message.unwrap().contains("SECRET_BODY"));
+                let usage = pioneer_provider::usage::error_usage(&error).unwrap();
+                assert_eq!(usage.generation_id.as_deref(), Some("gen-native-header"));
+                assert_eq!(usage.input_tokens, None);
+                assert_eq!(usage.output_tokens, None);
+            }
+        }
+    }
+
     async fn failure_from_overridden_endpoint(
         provider_name: &'static str,
         status: u16,
@@ -1459,6 +2209,11 @@ mod tests {
         stream_request: bool,
         response_body: Option<String>,
     ) -> ProviderFailureDetails {
+        let headers = if provider_name == "openrouter" && response_body.is_none() {
+            "X-Generation-Id: gen-private-header\r\n"
+        } else {
+            ""
+        };
         failure_from_local_endpoint(
             provider_name,
             status,
@@ -1466,7 +2221,7 @@ mod tests {
             stream_request,
             response_body,
             true,
-            "",
+            headers,
             false,
         )
         .await
@@ -1639,12 +2394,18 @@ mod tests {
             provider.chat(request).await.err().unwrap()
         };
         server.await.unwrap();
-        assert!(
-            error
-                .chain()
-                .skip(1)
-                .all(|cause| { cause.is::<pioneer_provider::failure::ProviderStreamIncomplete>() })
-        );
+        if provider_name == "openrouter" && headers.contains("gen-private-header") {
+            let usage = pioneer_provider::usage::error_usage(&error).unwrap();
+            assert_eq!(usage.generation_id.as_deref(), Some("gen-private-header"));
+            assert_eq!(usage.input_tokens, None);
+        }
+        // Anyhow wraps usage in a context whose standard Error type differs
+        // from the metadata type. Check the original adapter cause chain.
+        let mut source = pioneer_provider::usage::classification_source(&error).source();
+        while let Some(cause) = source {
+            assert!(cause.is::<pioneer_provider::failure::ProviderStreamIncomplete>());
+            source = cause.source();
+        }
         assert!(!error.chain().any(
             |cause| cause.is::<std::string::FromUtf8Error>() || cause.is::<serde_json::Error>()
         ));
@@ -1679,18 +2440,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_final_without_native_state_or_reasoning_does_not_expect_ui_aliases() {
-        let hub = AgentEventHub::new();
-        let mut receiver = hub.take_durable_receiver().await.unwrap();
-        persist_completed_response(
-            &hub, "thread", "turn", "final", "thinking", "answer", "", None,
-        )
-        .await
-        .unwrap();
-        assert!(futures_util::FutureExt::now_or_never(receiver.recv()).is_none());
-    }
-
-    #[tokio::test]
     async fn completed_native_response_waits_for_durable_history_acknowledgement() {
         let hub = AgentEventHub::new();
         let mut receiver = hub.take_durable_receiver().await.unwrap();
@@ -1699,16 +2448,14 @@ mod tests {
             "fixture",
             serde_json::json!({"schema_version":2,"parts":[{"text":"answer","thoughtSignature":"signed"}]}),
         );
-        let publish = persist_completed_response(
-            &hub,
-            "thread",
-            "turn",
-            "final",
-            "thinking",
-            "answer",
+        let envelope = completed_envelope(
+            "request-round".into(),
+            "answer".into(),
             "",
             Some(&state),
+            vec![final_copy("final", "answer")],
         );
+        let publish = persist_completed_response(&hub, "thread", "turn", &envelope);
         let receive = async {
             let AgentDurableEvent::TurnProviderHistoryAppended {
                 payload, item_id, ..
@@ -1716,7 +2463,7 @@ mod tests {
             else {
                 panic!("expected canonical history");
             };
-            assert_eq!(item_id, "thinking");
+            assert_eq!(item_id, "request-round");
             let envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
                 serde_json::from_value(payload).unwrap();
             assert_eq!(
@@ -2287,6 +3034,22 @@ mod tests {
                 false,
             ),
             (
+                "openrouter",
+                503,
+                "temporary upstream failure",
+                false,
+                ProviderFailureClass::Provider5xx,
+                true,
+            ),
+            (
+                "openrouter",
+                429,
+                "rate limit; retry-after: 3",
+                true,
+                ProviderFailureClass::RateLimit,
+                true,
+            ),
+            (
                 "openai",
                 429,
                 "rate limit; retry-after: 3",
@@ -2759,6 +3522,14 @@ mod partial_observation_tests {
         ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
         {
             Ok(futures_util::stream::iter(vec![
+                Ok(StreamChunk::usage(TokenUsage {
+                    generation_id: Some("gen-header".into()),
+                    request_id: Some("req-distinct".into()),
+                    reported_model: Some("actual-returned".into()),
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                })),
                 Ok(StreamChunk::reasoning("reasoning actually received")),
                 Ok(StreamChunk::delta("partial answer actually received")),
                 Ok(StreamChunk::provider_replay_state(
@@ -2795,21 +3566,40 @@ mod partial_observation_tests {
                 compiled_prompt: None,
             };
             let receive = async {
+                let mut history = None;
                 loop {
                     let event = events.recv().await.unwrap();
                     assert!(!matches!(
                         event,
                         AgentDurableEvent::TurnFinalizationPrepared { .. }
                     ));
-                    let observation = match event {
+                    let usage = match event {
                         AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
-                            Some(payload)
+                            history = Some(payload);
+                            None
+                        }
+                        AgentDurableEvent::ItemCompleted { notification } => {
+                            match notification.item {
+                                TurnItem::SystemEvent { code, details, .. }
+                                    if code.as_deref() == Some("provider_usage") =>
+                                {
+                                    details
+                                }
+                                _ => None,
+                            }
                         }
                         _ => None,
                     };
                     events.acknowledge_last(Ok(()));
-                    if let Some(payload) = observation {
-                        break payload;
+                    if let Some(details) = usage {
+                        assert_eq!(details["status"], "failed");
+                        assert_eq!(details["usage"]["generation_id"], "gen-header");
+                        assert_eq!(details["usage"]["request_id"], "req-distinct");
+                        assert_eq!(details["usage"]["reported_model"], "actual-returned");
+                        assert_eq!(details["usage"]["input_tokens"], 10);
+                        assert_eq!(details["usage"]["output_tokens"], 2);
+                        assert!(!details.to_string().contains("request\""));
+                        break history.expect("partial history precedes failure");
                     }
                 }
             };
@@ -2889,6 +3679,217 @@ fn observe_startup_chunk(turn_id: &str, chunk: &pioneer_provider::StreamChunk) {
     }
 }
 
+/// One item per physical chat dispatch; snapshots are never additional charges.
+/// Start records survive cancellation. Only provider-reported partial counters
+/// survive error; no usage is invented for a failed connect or missing terminal.
+pub(super) struct ProviderAttemptObservation {
+    id: String,
+    provider: String,
+    model: String,
+    api: String,
+    route: Option<String>,
+    usage: std::sync::Mutex<TokenUsage>,
+}
+impl ProviderAttemptObservation {
+    pub(super) fn new(provider: &dyn Provider, model: &str) -> Self {
+        Self {
+            id: super::generate_id(super::TURN_ITEM_ID_LEN),
+            provider: provider.name().to_owned(),
+            model: model.to_owned(),
+            api: provider.usage_api().to_owned(),
+            route: provider.usage_route(),
+            usage: std::sync::Mutex::new(TokenUsage::default()),
+        }
+    }
+    pub(super) fn for_request(
+        provider: &dyn Provider,
+        request: &ChatRequest,
+    ) -> Result<Self, ChatTurnError> {
+        let profile = provider
+            .request_usage_profile(request)
+            .map_err(|_| ChatTurnError::Terminal("provider usage profile unavailable".into()))?;
+        let mut observation = Self::new(provider, &request.model);
+        observation.api = profile.api;
+        observation.route = profile.route;
+        Ok(observation)
+    }
+    pub(super) fn observe(&self, snapshot: &TokenUsage) {
+        self.usage
+            .lock()
+            .expect("usage observation")
+            .update(snapshot);
+    }
+    pub(super) fn observe_error(&self, error: &anyhow::Error) {
+        if let Some(snapshot) = pioneer_provider::usage::error_usage(error) {
+            self.observe(snapshot);
+        }
+    }
+    pub(super) async fn publish(
+        &self,
+        events: &AgentEventHub,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        completed: Option<bool>,
+    ) -> Result<(), ChatTurnError> {
+        let mut usage = self.usage.lock().expect("usage observation").clone();
+        if let Some(raw) = &usage.raw_usage {
+            usage.raw_usage = Some(pioneer_provider::usage::bounded_usage(raw));
+        }
+        let item = TurnItem::SystemEvent {
+            id: self.id.clone(),
+            level: pioneer_protocol::SystemEventLevel::Info,
+            message: "Provider usage observation".into(),
+            code: Some("provider_usage".into()),
+            details: Some(serde_json::json!({"schema_version":1,
+                "nativeMethod":"provider/usage/observed", "observation_id":self.id,
+                "physical_attempt_id":usage.physical_attempt_id,
+                "request_sent":serde_json::Value::Null,
+                "provider":self.provider,"model":self.model,"api":self.api,"route":self.route,
+                "status":match completed {None=>"started",Some(true)=>"completed",Some(false)=>"failed"},
+                "complete":completed == Some(true),"usage":usage})),
+        };
+        let event = if completed.is_none() {
+            AgentDurableEvent::ItemStarted {
+                notification: ItemStartedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item,
+                },
+            }
+        } else {
+            AgentDurableEvent::ItemCompleted {
+                notification: ItemCompletedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item,
+                },
+            }
+        };
+        super::emit_durable_event(events, event).await
+    }
+}
+
+pub(super) async fn request_agent_round(
+    provider: &Arc<dyn Provider>,
+    request: ChatRequest,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    thinking_item_id: &str,
+    force_non_stream: bool,
+    provider_timeout_policy: ProviderTimeoutPolicy,
+    event_tx: &AgentEventHub,
+) -> Result<AgentRoundResponse, ChatTurnError> {
+    let observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
+    observation
+        .publish(event_tx, workspace_id, thread_id, turn_id, None)
+        .await?;
+    let result = request_agent_round_observed(
+        provider,
+        request,
+        workspace_id,
+        thread_id,
+        turn_id,
+        thinking_item_id,
+        force_non_stream,
+        provider_timeout_policy,
+        event_tx,
+        &observation,
+    )
+    .await;
+    observation
+        .publish(
+            event_tx,
+            workspace_id,
+            thread_id,
+            turn_id,
+            Some(result.is_ok()),
+        )
+        .await?;
+    result
+}
+
+pub(super) async fn stream_provider_response(
+    provider: &Arc<dyn Provider>,
+    request: ChatRequest,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    thinking_item_id: &str,
+    message_item_id: &str,
+    provider_timeout_policy: ProviderTimeoutPolicy,
+    event_tx: &AgentEventHub,
+) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
+    let observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
+    observation
+        .publish(event_tx, workspace_id, thread_id, turn_id, None)
+        .await?;
+    let result = stream_provider_response_observed(
+        provider,
+        request,
+        workspace_id,
+        thread_id,
+        turn_id,
+        thinking_item_id,
+        message_item_id,
+        provider_timeout_policy,
+        event_tx,
+        &observation,
+    )
+    .await;
+    observation
+        .publish(
+            event_tx,
+            workspace_id,
+            thread_id,
+            turn_id,
+            Some(result.is_ok()),
+        )
+        .await?;
+    result
+}
+
+pub(super) async fn non_stream_provider_response(
+    provider: &Arc<dyn Provider>,
+    request: ChatRequest,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    thinking_item_id: &str,
+    message_item_id: &str,
+    event_tx: &AgentEventHub,
+) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
+    let observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
+    observation
+        .publish(event_tx, workspace_id, thread_id, turn_id, None)
+        .await?;
+    let result = non_stream_provider_response_observed(
+        provider,
+        request,
+        workspace_id,
+        thread_id,
+        turn_id,
+        thinking_item_id,
+        message_item_id,
+        event_tx,
+        &observation,
+    )
+    .await;
+    observation
+        .publish(
+            event_tx,
+            workspace_id,
+            thread_id,
+            turn_id,
+            Some(result.is_ok()),
+        )
+        .await?;
+    result
+}
+
 #[cfg(test)]
 mod terminal_boundary_tests {
     use super::*;
@@ -2943,6 +3944,25 @@ mod terminal_boundary_tests {
             compiled_prompt: None,
         }
     }
+
+    async fn acknowledge_round_events(hub: &AgentEventHub) -> Vec<AgentDurableEvent> {
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let mut events = Vec::new();
+        loop {
+            let event = receiver.recv().await.unwrap();
+            let usage_completed = matches!(&event,
+                AgentDurableEvent::ItemCompleted { notification }
+                    if matches!(&notification.item,
+                        TurnItem::SystemEvent { code, .. }
+                            if code.as_deref() == Some("provider_usage")));
+            receiver.acknowledge_last(Ok(()));
+            events.push(event);
+            if usage_completed {
+                return events;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn failed_partial_call_never_becomes_executable_round_or_automatic_retry() {
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -2956,36 +3976,43 @@ mod terminal_boundary_tests {
             attempts: attempts.clone(),
         });
         let hub = AgentEventHub::new();
-        let mut receiver = hub.take_durable_receiver().await.unwrap();
-        let acknowledgement = tokio::spawn(async move {
-            let event = receiver.recv().await.unwrap();
-            let AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } = event else {
-                panic!("expected failed observation")
-            };
+        let (result, events) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                request_agent_round(
+                    &provider,
+                    request(),
+                    "ws",
+                    "thread",
+                    "turn",
+                    "item",
+                    false,
+                    ProviderTimeoutPolicy::default(),
+                    &hub,
+                ),
+                acknowledge_round_events(&hub),
+            )
+        })
+        .await
+        .expect("provider round and all durable acknowledgements must finish");
+        let history = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => Some(payload),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(history.len(), 1, "expected one failed observation");
+        for payload in history {
             let envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
-                serde_json::from_value(payload).unwrap();
+                serde_json::from_value(payload.clone()).unwrap();
             assert_eq!(envelope.termination, ProviderTermination::ProviderError);
             assert!(
                 envelope.calls.is_empty(),
                 "failed observations must not retain executable identities"
             );
-            receiver.acknowledge_last(Ok(()));
-        });
-        let result = request_agent_round(
-            &provider,
-            request(),
-            "ws",
-            "thread",
-            "turn",
-            "item",
-            false,
-            ProviderTimeoutPolicy::default(),
-            &hub,
-        )
-        .await;
+        }
         assert!(matches!(result, Err(ChatTurnError::ProviderFailure { .. })));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        acknowledgement.await.unwrap();
     }
     #[tokio::test]
     async fn final_chunk_payload_is_accumulated_before_terminal_validation() {
@@ -2996,19 +4023,26 @@ mod terminal_boundary_tests {
             fail: false,
             attempts: Arc::new(AtomicUsize::new(0)),
         });
-        let result = request_agent_round(
-            &provider,
-            request(),
-            "ws",
-            "thread",
-            "turn",
-            "item",
-            false,
-            ProviderTimeoutPolicy::default(),
-            &AgentEventHub::new(),
-        )
+        let hub = AgentEventHub::new();
+        let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                request_agent_round(
+                    &provider,
+                    request(),
+                    "ws",
+                    "thread",
+                    "turn",
+                    "item",
+                    false,
+                    ProviderTimeoutPolicy::default(),
+                    &hub,
+                ),
+                acknowledge_round_events(&hub),
+            )
+        })
         .await
-        .unwrap();
+        .expect("provider round and all durable acknowledgements must finish");
+        let result = result.unwrap();
         assert_eq!(result.text, "terminal text");
     }
 }
@@ -3204,5 +4238,738 @@ mod native_decoder_gate_tests {
             )
             + &event(serde_json::json!({"type":"message_stop"}));
         check_gate(body, false, true).await;
+    }
+}
+
+#[cfg(test)]
+mod phased_message_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use pioneer_protocol::AgentMessagePhase;
+    use pioneer_provider::{
+        ProviderMessageBoundary as Boundary, ProviderMessageId, ProviderMessageMetadata,
+    };
+    fn message(id: u32, phase: Option<AgentMessagePhase>, text: &str) -> Vec<StreamChunk> {
+        [Boundary::Start, Boundary::Delta, Boundary::End]
+            .into_iter()
+            .map(|boundary| {
+                let mut chunk = StreamChunk::delta(if boundary == Boundary::Delta {
+                    text
+                } else {
+                    ""
+                });
+                chunk.message = Some(ProviderMessageMetadata {
+                    id: ProviderMessageId(id),
+                    phase,
+                    boundary,
+                });
+                chunk
+            })
+            .collect()
+    }
+    struct PhasedProvider {
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        no_final: bool,
+        fail: bool,
+        multiple_commentary: bool,
+    }
+    #[async_trait]
+    impl Provider for PhasedProvider {
+        fn name(&self) -> &str {
+            "phased-fixture"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: true,
+                ..Default::default()
+            }
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("no implicit fallback")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            let release = self.release.lock().unwrap().take();
+            let no_final = self.no_final;
+            let fail = self.fail;
+            let mut early_messages = message(0, Some(AgentMessagePhase::Commentary), "working");
+            if self.multiple_commentary {
+                early_messages.extend(message(
+                    1,
+                    Some(AgentMessagePhase::Commentary),
+                    "still working",
+                ));
+            }
+            let early = futures_util::stream::iter(early_messages.into_iter().map(Ok));
+            let rest = futures_util::stream::once(async move {
+                if let Some(release) = release {
+                    release.await.unwrap();
+                }
+                let mut chunks = Vec::new();
+                if fail {
+                    chunks.extend(message(2,Some(AgentMessagePhase::FinalAnswer),"partial").into_iter().take(2));
+                } else if !no_final {
+                    chunks.extend(message(2, Some(AgentMessagePhase::FinalAnswer), "one"));
+                    chunks.extend(message(3, None, "two"));
+                }
+                let mut chunks=chunks.into_iter().map(Ok).collect::<Vec<_>>();
+                if fail {chunks.push(Err(pioneer_provider::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into()));}
+                else {chunks.push(Ok(StreamChunk::final_chunk_with(ProviderTermination::Complete)));}
+                futures_util::stream::iter(chunks)
+            })
+            .flatten();
+            Ok(early.chain(rest).boxed())
+        }
+    }
+    fn request() -> ChatRequest {
+        ChatRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        }
+    }
+    struct ProvisionalProvider {
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        phase: Option<AgentMessagePhase>,
+        eof: bool,
+        delivery: pioneer_provider::ProviderMessageDelivery,
+        provisional_start: bool,
+    }
+    #[async_trait]
+    impl Provider for ProvisionalProvider {
+        fn name(&self) -> &str {
+            "provisional-fixture"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: true,
+                ..Default::default()
+            }
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("no fallback")
+        }
+        async fn stream_chat_with_diagnostics(
+            &self,
+            request: ChatRequest,
+        ) -> anyhow::Result<pioneer_provider::ProviderStream> {
+            let mut stream =
+                pioneer_provider::ProviderStream::new(self.stream_chat(request).await?);
+            stream.message_delivery = self.delivery;
+            Ok(stream)
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            let mut early = message(
+                0,
+                if self.provisional_start {
+                    None
+                } else {
+                    self.phase
+                },
+                "working",
+            );
+            if self.provisional_start {
+                early[0].message.as_mut().unwrap().boundary = Boundary::StartProvisional;
+            }
+            let provisional_start = self.provisional_start;
+            early.truncate(2);
+            let release = self.release.lock().unwrap().take().unwrap();
+            let phase = self.phase;
+            let eof = self.eof;
+            let rest = futures_util::stream::once(async move {
+                release.await.unwrap();
+                if eof {
+                    return futures_util::stream::iter(vec![Err(pioneer_provider::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into())]);
+                }
+                let mut resolve = StreamChunk::delta("");
+                resolve.message = Some(ProviderMessageMetadata { id: ProviderMessageId(0), phase, boundary: Boundary::Resolve });
+                let mut end = resolve.clone();
+                end.message.as_mut().unwrap().boundary = Boundary::End;
+                let mut chunks = if provisional_start { vec![resolve, end] } else { vec![end] };
+                if phase == Some(AgentMessagePhase::Commentary) {
+                    chunks.extend(message(1, Some(AgentMessagePhase::FinalAnswer), "answer"));
+                }
+                chunks.push(StreamChunk::final_chunk_with(ProviderTermination::Complete));
+                futures_util::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
+            }).flatten();
+            Ok(futures_util::stream::iter(early.into_iter().map(Ok))
+                .chain(rest)
+                .boxed())
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn provisional_text_reaches_agent_and_chat_before_terminal_without_final_or_history_pollution()
+     {
+        for agent in [false, true] {
+            use pioneer_provider::ProviderMessageDelivery::{Incremental, Provisional};
+            for (phase, eof, delivery, provisional_start) in [
+                (None, false, Incremental, true),
+                (
+                    Some(AgentMessagePhase::FinalAnswer),
+                    false,
+                    Incremental,
+                    true,
+                ),
+                (
+                    Some(AgentMessagePhase::Commentary),
+                    false,
+                    Incremental,
+                    true,
+                ),
+                (None, true, Incremental, true),
+                (None, false, Provisional, true),
+                (
+                    Some(AgentMessagePhase::FinalAnswer),
+                    false,
+                    Provisional,
+                    false,
+                ),
+                (None, true, Provisional, false),
+            ] {
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let provider: Arc<dyn Provider> = Arc::new(ProvisionalProvider {
+                    release: std::sync::Mutex::new(Some(release_rx)),
+                    phase,
+                    eof,
+                    delivery,
+                    provisional_start,
+                });
+                let hub = AgentEventHub::new();
+                let mut durable = hub.take_durable_receiver().await.unwrap();
+                let mut live = hub.subscribe_live();
+                let expected = if phase == Some(AgentMessagePhase::Commentary) {
+                    "answer"
+                } else {
+                    "working"
+                };
+                let mut policy = ProviderTimeoutPolicy::default();
+                policy.first_chunk_timeout = std::time::Duration::from_secs(5);
+                policy.inter_chunk_idle_timeout = std::time::Duration::from_secs(60);
+                let producer = async {
+                    if agent {
+                        let round = request_agent_round(
+                            &provider,
+                            request(),
+                            "ws",
+                            "thread",
+                            "turn",
+                            "thinking",
+                            false,
+                            policy,
+                            &hub,
+                        )
+                        .await?;
+                        assert_eq!(round.messages[0].phase, phase);
+                        assert_eq!(round.messages[0].text, "working");
+                        assert_eq!(
+                            round.ui_copies.len(),
+                            usize::from(phase == Some(AgentMessagePhase::Commentary))
+                        );
+                        Ok(round.text)
+                    } else {
+                        stream_provider_response(
+                            &provider,
+                            request(),
+                            "ws",
+                            "thread",
+                            "turn",
+                            "thinking",
+                            "final",
+                            policy,
+                            &hub,
+                        )
+                        .await
+                        .map(|r| r.0)
+                    }
+                };
+                let consume = async {
+                    let mut release = Some(release_tx);
+                    let mut saved = false;
+                    let mut finals = 0;
+                    let mut commentary = 0;
+                    let mut preview_id = None;
+                    loop {
+                        tokio::select! {
+                            progress = live.recv(), if release.is_some() => {
+                                let AgentProgressEvent::ItemDelta { notification } = progress.unwrap() else { continue; };
+                                if notification.payload.as_ref().and_then(|p|p["runtimeDeltaKind"].as_str()) == Some("provider_message_preview") {
+                                    assert_eq!(notification.delta, "working");
+                                    assert_eq!(notification.stream, Some(pioneer_protocol::ItemDeltaStream::Generic));
+                                    assert!(notification.payload.as_ref().unwrap().get("text").is_none());
+                                    assert_eq!(finals, 0);
+                                    preview_id = Some(notification.item_id);
+                                    // Real text, rather than heartbeat bytes, changes the existing
+                                    // first-content gate to the accepted inter-content deadline.
+                                    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+                                    release.take().unwrap().send(()).unwrap();
+                                }
+                            }
+                            event = durable.recv() => {
+                                let event = event.unwrap();
+                                let done = matches!(&event,AgentDurableEvent::ItemCompleted{notification} if matches!(&notification.item,TurnItem::SystemEvent{code,..} if code.as_deref()==Some("provider_usage"))) && release.is_none();
+                                match &event {
+                                    AgentDurableEvent::ItemStarted { notification } if matches!(&notification.item,TurnItem::AgentMessage{phase:AgentMessagePhase::FinalAnswer,..}) => {
+                                        assert!(release.is_none(), "preview must not start a canonical result");
+                                    }
+                                    AgentDurableEvent::ItemCompleted { notification } if matches!(&notification.item,TurnItem::AgentMessage{phase:AgentMessagePhase::Commentary,..}) => {
+                                        let TurnItem::AgentMessage { id, text, .. } = &notification.item else { unreachable!() };
+                                        assert_eq!(Some(id), preview_id.as_ref());
+                                        assert_eq!(text, "working");
+                                        commentary += 1;
+                                    }
+                                    AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
+                                        assert!(release.is_none(), "preview is not accepted history");
+                                        let envelope: pioneer_provider::CanonicalProviderRoundEnvelope = serde_json::from_value(payload.clone()).unwrap();
+                                        assert_eq!(envelope.termination, if eof { ProviderTermination::ProviderError } else { ProviderTermination::Complete });
+                                        assert!(envelope.calls.is_empty());
+                                        assert!(envelope.message.provider_replay_state.is_none());
+                                        if phase == Some(AgentMessagePhase::Commentary) { assert!(envelope.message.content.contains("[Assistant commentary]\nworking")); }
+                                        saved = true;
+                                    }
+                                    AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
+                                        assert!(!eof);
+                                        assert!(saved, "history ACK precedes finalization");
+                                        let TurnItem::AgentMessage { text, .. } = &notification.item else { panic!("final") };
+                                        assert_eq!(text, expected);
+                                        finals += 1;
+                                    }
+                                    _ => {}
+                                }
+                                durable.acknowledge_last(Ok(()));
+                                if done { break; }
+                            }
+                        }
+                    }
+                    assert!(
+                        preview_id.is_some(),
+                        "text was consumed before terminal release"
+                    );
+                    assert_eq!(
+                        commentary,
+                        usize::from(phase == Some(AgentMessagePhase::Commentary))
+                    );
+                    assert_eq!(finals, usize::from(!agent && !eof));
+                };
+                let (result, ()) =
+                    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+                        tokio::join!(producer, consume)
+                    })
+                    .await
+                    .expect("live text must release the terminal gate");
+                if eof {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result.unwrap(), expected);
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn default_delivery_keeps_incremental_chat_result_before_terminal() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let provider: Arc<dyn Provider> = Arc::new(ProvisionalProvider {
+            release: std::sync::Mutex::new(Some(release_rx)),
+            phase: Some(AgentMessagePhase::FinalAnswer),
+            eof: false,
+            delivery: Default::default(),
+            provisional_start: false,
+        });
+        let hub = AgentEventHub::new();
+        let mut durable = hub.take_durable_receiver().await.unwrap();
+        let mut live = hub.subscribe_live();
+        let consume = async {
+            let mut release = Some(release_tx);
+            let mut started = 0;
+            let mut saved = false;
+            loop {
+                tokio::select! {
+                    progress = live.recv(), if release.is_some() => {
+                        let AgentProgressEvent::ItemDelta { notification } = progress.unwrap() else { continue; };
+                        assert_ne!(notification.payload.as_ref().and_then(|p| p["runtimeDeltaKind"].as_str()), Some("provider_message_preview"));
+                        if notification.stream == Some(pioneer_protocol::ItemDeltaStream::AgentMessage) {
+                            assert_eq!(notification.item_id, "final");
+                            assert_eq!(notification.delta, "working");
+                            // The producer has received the durable start ACK before this delta.
+                            assert_eq!(started, 1);
+                            release.take().unwrap().send(()).unwrap();
+                        }
+                    }
+                    event = durable.recv() => {
+                        let event = event.unwrap();
+                        let done = matches!(&event, AgentDurableEvent::ItemCompleted { notification } if matches!(&notification.item, TurnItem::SystemEvent { code, .. } if code.as_deref() == Some("provider_usage")));
+                        match &event {
+                            AgentDurableEvent::ItemStarted { notification } if matches!(&notification.item, TurnItem::AgentMessage { phase: AgentMessagePhase::FinalAnswer, .. }) => {
+                                assert!(release.is_some());
+                                started += 1;
+                            }
+                            AgentDurableEvent::TurnProviderHistoryAppended { .. } => {
+                                assert!(release.is_none());
+                                saved = true;
+                            }
+                            AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
+                                assert!(saved);
+                                let TurnItem::AgentMessage { text, .. } = &notification.item else { panic!("final") };
+                                assert_eq!(text, "working");
+                            }
+                            _ => {}
+                        }
+                        durable.acknowledge_last(Ok(()));
+                        if done { break; }
+                    }
+                }
+            }
+            assert_eq!(started, 1);
+            assert!(release.is_none());
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                stream_provider_response(
+                    &provider,
+                    request(),
+                    "ws",
+                    "thread",
+                    "turn",
+                    "thinking",
+                    "final",
+                    ProviderTimeoutPolicy::default(),
+                    &hub
+                ),
+                consume
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap().0, "working");
+    }
+    #[tokio::test]
+    async fn commentary_precedes_terminal_and_multiple_results_share_one_gated_final() {
+        for agent in [false, true] {
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let provider: Arc<dyn Provider> = Arc::new(PhasedProvider {
+                release: std::sync::Mutex::new(Some(release_rx)),
+                no_final: false,
+                fail: false,
+                multiple_commentary: true,
+            });
+            let hub = AgentEventHub::new();
+            let mut receiver = hub.take_durable_receiver().await.unwrap();
+            let producer = async {
+                if agent {
+                    request_agent_round(
+                        &provider,
+                        request(),
+                        "ws",
+                        "thread",
+                        "turn",
+                        "thinking",
+                        false,
+                        ProviderTimeoutPolicy::default(),
+                        &hub,
+                    )
+                    .await
+                    .map(|round| round.text)
+                } else {
+                    stream_provider_response(
+                        &provider,
+                        request(),
+                        "ws",
+                        "thread",
+                        "turn",
+                        "thinking",
+                        "final",
+                        ProviderTimeoutPolicy::default(),
+                        &hub,
+                    )
+                    .await
+                    .map(|r| r.0)
+                }
+            };
+            let consume = async {
+                let mut release = Some(release_tx);
+                let mut copies = Vec::new();
+                let mut finals = 0;
+                let mut canonical = None;
+                loop {
+                    let event = receiver.recv().await.unwrap();
+                    match &event {
+                        AgentDurableEvent::ItemCompleted { notification } => {
+                            match &notification.item {
+                                TurnItem::AgentMessage {
+                                    phase: AgentMessagePhase::Commentary,
+                                    text,
+                                    ..
+                                } => {
+                                    assert_eq!(
+                                        text,
+                                        if copies.is_empty() {
+                                            "working"
+                                        } else {
+                                            "still working"
+                                        }
+                                    );
+                                    assert_eq!(finals, 0);
+                                    copies.push(
+                                        ProviderRoundUiCopy::from_item(&notification.item).unwrap(),
+                                    );
+                                    if let Some(release) = release.take() {
+                                        release.send(()).unwrap();
+                                    }
+                                }
+                                TurnItem::SystemEvent { code, .. }
+                                    if code.as_deref() == Some("provider_usage") =>
+                                {
+                                    receiver.acknowledge_last(Ok(()));
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
+                            assert!(release.is_none());
+                            canonical = Some(
+                                serde_json::from_value::<
+                                    pioneer_provider::CanonicalProviderRoundEnvelope,
+                                >(payload.clone())
+                                .unwrap(),
+                            );
+                        }
+                        AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
+                            finals += 1;
+                            let TurnItem::AgentMessage { text, phase, .. } = &notification.item
+                            else {
+                                panic!("final item")
+                            };
+                            assert_eq!(text, "one\n\ntwo");
+                            assert_eq!(*phase, AgentMessagePhase::FinalAnswer);
+                            assert!(
+                                canonical.is_some(),
+                                "durable canonical ACK must precede finalization"
+                            );
+                        }
+                        _ => {}
+                    }
+                    receiver.acknowledge_last(Ok(()));
+                }
+                assert_eq!(copies.len(), 2);
+                assert_ne!(copies[0].turn_item_id, copies[1].turn_item_id);
+                if agent {
+                    assert_eq!(finals, 0);
+                } else {
+                    assert_eq!(finals, 1);
+                    let envelope = canonical.unwrap();
+                    let declared = envelope.ui_copies.unwrap();
+                    assert!(copies.iter().all(|copy| declared.contains(copy)));
+                }
+            };
+            let (result, ()) = tokio::join!(producer, consume);
+            assert_eq!(result.unwrap(), "one\n\ntwo");
+        }
+    }
+    #[tokio::test]
+    async fn commentary_only_chat_persists_completed_candidate_without_empty_final_or_retry() {
+        let provider: Arc<dyn Provider> = Arc::new(PhasedProvider {
+            release: std::sync::Mutex::new(None),
+            no_final: true,
+            fail: false,
+            multiple_commentary: false,
+        });
+        let hub = AgentEventHub::new();
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let consume = async {
+            let mut saved = false;
+            loop {
+                let event = receiver.recv().await.unwrap();
+                assert!(!matches!(
+                    event,
+                    AgentDurableEvent::TurnFinalizationPrepared { .. }
+                ));
+                match &event {
+                    AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
+                        saved = true;
+                        let envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
+                            serde_json::from_value(payload.clone()).unwrap();
+                        assert_eq!(envelope.termination, ProviderTermination::Complete);
+                        assert_eq!(envelope.ui_copies.unwrap().len(), 1);
+                    }
+                    AgentDurableEvent::ItemCompleted { notification } if matches!(&notification.item,TurnItem::SystemEvent{code,..}if code.as_deref()==Some("provider_usage")) =>
+                    {
+                        receiver.acknowledge_last(Ok(()));
+                        break;
+                    }
+                    _ => {}
+                }
+                receiver.acknowledge_last(Ok(()));
+            }
+            assert!(saved);
+        };
+        let (result, ()) = tokio::join!(
+            stream_provider_response(
+                &provider,
+                request(),
+                "ws",
+                "thread",
+                "turn",
+                "thinking",
+                "final",
+                ProviderTimeoutPolicy::default(),
+                &hub
+            ),
+            consume
+        );
+        assert!(matches!(result, Err(ChatTurnError::Terminal(_))));
+    }
+    #[tokio::test]
+    async fn partial_typed_failure_keeps_only_completed_commentary_as_observation_copy() {
+        let provider: Arc<dyn Provider> = Arc::new(PhasedProvider {
+            release: std::sync::Mutex::new(None),
+            no_final: false,
+            fail: true,
+            multiple_commentary: false,
+        });
+        let hub = AgentEventHub::new();
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let consume = async {
+            let mut observation = None;
+            loop {
+                let event = receiver.recv().await.unwrap();
+                assert!(!matches!(
+                    event,
+                    AgentDurableEvent::TurnFinalizationPrepared { .. }
+                ));
+                let done = matches!(&event,AgentDurableEvent::ItemCompleted{notification}if matches!(&notification.item,TurnItem::SystemEvent{code,..}if code.as_deref()==Some("provider_usage")));
+                if let AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } = event {
+                    observation = Some(
+                        serde_json::from_value::<pioneer_provider::CanonicalProviderRoundEnvelope>(
+                            payload,
+                        )
+                        .unwrap(),
+                    );
+                }
+                receiver.acknowledge_last(Ok(()));
+                if done {
+                    break;
+                }
+            }
+            let observation = observation.unwrap();
+            assert_eq!(observation.termination, ProviderTermination::ProviderError);
+            assert!(observation.calls.is_empty());
+            assert!(observation.message.content.contains("partial"));
+            let copies = observation.ui_copies.unwrap();
+            assert_eq!(copies.len(), 1);
+            assert!(matches!(
+                copies[0].kind,
+                pioneer_provider::ProviderRoundUiCopyKind::AgentMessage {
+                    phase: AgentMessagePhase::Commentary
+                }
+            ));
+        };
+        let (result, ()) = tokio::join!(
+            request_agent_round(
+                &provider,
+                request(),
+                "ws",
+                "thread",
+                "turn",
+                "thinking",
+                false,
+                ProviderTimeoutPolicy::default(),
+                &hub
+            ),
+            consume
+        );
+        assert!(matches!(result, Err(ChatTurnError::ProviderFailure { .. })));
+    }
+}
+
+#[cfg(test)]
+mod control_deadline_tests {
+    use super::*;
+    use async_trait::async_trait;
+    struct Controls;
+    #[async_trait]
+    impl Provider for Controls {
+        fn name(&self) -> &str {
+            "control-fixture"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: true,
+                ..Default::default()
+            }
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("no fallback")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            Ok(futures_util::stream::unfold(0u32, |id| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                let mut chunk = StreamChunk::delta("");
+                chunk.message = Some(pioneer_provider::ProviderMessageMetadata {
+                    id: pioneer_provider::ProviderMessageId(id),
+                    phase: None,
+                    boundary: pioneer_provider::ProviderMessageBoundary::Start,
+                });
+                Some((Ok(chunk), id + 1))
+            })
+            .boxed())
+        }
+    }
+    #[tokio::test]
+    async fn message_boundaries_without_content_do_not_extend_first_chunk_deadline() {
+        let provider: Arc<dyn Provider> = Arc::new(Controls);
+        let hub = AgentEventHub::new();
+        let mut events = hub.take_durable_receiver().await.unwrap();
+        let mut policy = ProviderTimeoutPolicy::default();
+        policy.first_chunk_timeout = std::time::Duration::from_millis(20);
+        policy.inter_chunk_idle_timeout = std::time::Duration::from_millis(20);
+        let request = ChatRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        let consume = async {
+            loop {
+                let event = events.recv().await.unwrap();
+                let done = matches!(&event,AgentDurableEvent::ItemCompleted{notification}if matches!(&notification.item,TurnItem::SystemEvent{code,..}if code.as_deref()==Some("provider_usage")));
+                events.acknowledge_last(Ok(()));
+                if done {
+                    break;
+                }
+            }
+        };
+        let (result, ()) = tokio::join!(
+            request_agent_round(
+                &provider, request, "ws", "thread", "turn", "thinking", false, policy, &hub
+            ),
+            consume
+        );
+        let Err(ChatTurnError::ProviderFailure { failure, .. }) = result else {
+            panic!("content deadline must terminate control-only stream")
+        };
+        assert_eq!(failure.class, ProviderFailureClass::StreamStall);
+        assert_eq!(failure.stage, ProviderFailureStage::FirstChunk);
     }
 }

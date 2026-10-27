@@ -13,6 +13,9 @@ qualification-diagnostics = []
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+opentelemetry-http = { version = "0.32", default-features = false }
+reqwest.workspace = true
 dotenvy.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
@@ -24,5 +27,21 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 
+object = { version = "0.37.3", default-features = false, features = ["read", "std"] }
+tokio.workspace = true
+nanoid.workspace = true
+libc.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_SystemInformation"] }
+
+[build-dependencies]
+sha2.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+
 [dev-dependencies]
+tempfile.workspace = true
 sentry = { workspace = true, features = ["test"] }

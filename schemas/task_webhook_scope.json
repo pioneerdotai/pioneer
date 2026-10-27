@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskWebhookScope",
+  "type": "string",
+  "enum": [
+    "public",
+    "lan",
+    "loopback"
+  ]
+}

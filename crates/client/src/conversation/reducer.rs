@@ -14,8 +14,9 @@ use pioneer_protocol::{
 use serde_json::Value as JsonValue;
 use std::{
     cmp::Ordering,
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
+    sync::Arc,
 };
 
 macro_rules! client_system_label {
@@ -139,6 +140,8 @@ pub struct PermissionAuditDisplayItem {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ItemView {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub html_publications: Vec<pioneer_protocol::HtmlPublication>,
     pub id: String,
     pub turn_id: String,
     pub item_type: String,
@@ -311,6 +314,12 @@ pub struct ConversationProjector {
     item_index: HashMap<String, usize>,
     item_timeline_index: HashMap<String, usize>,
     turn_index: HashMap<String, usize>,
+    // Identity changes only on an accepted phase change, including snapshot sync.
+    // A request can retain it to distinguish a repeat from departure and return.
+    turn_phase_markers: HashMap<String, Arc<TurnPhase>>,
+    // Runtime progress only. These views have no canonical item, completed
+    // copy, or history identity. Never serialize them as semantic phase facts.
+    provider_previews: HashSet<String>,
     timeline_counter: u64,
     synthetic_item_counter: u64,
 }
@@ -321,12 +330,18 @@ impl ConversationProjector {
         self.item_index.clear();
         self.item_timeline_index.clear();
         self.turn_index.clear();
+        self.turn_phase_markers.clear();
+        self.provider_previews.clear();
         self.timeline_counter = 0;
         self.synthetic_item_counter = 0;
     }
 
     pub fn view_state(&self) -> &ConversationViewState {
         &self.view_state
+    }
+
+    pub(super) fn turn_phase_marker(&self, turn_id: &str) -> Option<&Arc<TurnPhase>> {
+        self.turn_phase_markers.get(turn_id)
     }
 
     pub fn bump_revision(&mut self) {
@@ -360,10 +375,32 @@ impl ConversationProjector {
         self.view_state.in_flight_turn_id = state_machine.in_flight_turn_id().map(str::to_owned);
         self.view_state.pending_request_id = state_machine.pending_request_id().map(str::to_owned);
         self.view_state.phase_label = state_machine.status_label().to_owned();
+        // A user item can arrive while Composer is still waiting for admission.
+        // Its item lifecycle must not project that submission as executing work.
+        if let Some(turn_id) = state_machine.in_flight_turn_id()
+            && state_machine.pending_request_id().is_some()
+            && state_machine.is_local_admission(turn_id)
+        {
+            self.upsert_turn(turn_id, TurnPhase::Starting, None, None, None);
+        }
     }
 
     pub fn upsert_turn_snapshot_metadata(&mut self, turn: &Turn) {
+        // Use the same phase mutation and index as live events. The DTO metadata
+        // helper alone would bypass lifecycle evidence and leave new views unindexed.
+        self.upsert_turn(
+            &turn.id,
+            turn_phase_for_status(turn.status),
+            None,
+            None,
+            turn.error.clone(),
+        );
         self.view_state.upsert_turn_snapshot_metadata(turn);
+        if turn.status != TurnStatus::InProgress {
+            // Reconciliation can observe completion after the live terminal event
+            // was missed. Runtime previews must not survive that snapshot.
+            self.discard_provider_previews(&turn.id, None);
+        }
     }
 
     pub fn apply_local_turn_start_requested(
@@ -410,6 +447,53 @@ impl ConversationProjector {
 
     pub fn apply_local_turn_start_accepted(&mut self, turn_id: &str, ts_unix_ms: i64) {
         self.upsert_turn(turn_id, TurnPhase::Running, Some(ts_unix_ms), None, None);
+    }
+
+    // Detached admission errors belong to the semantic outcome row. Keep its
+    // legacy Turn metadata in sync without creating an additional RPC error item.
+    pub(super) fn apply_admission_outcome(
+        &mut self,
+        turn_id: &str,
+        status: TurnStatus,
+        error: Option<&str>,
+        now_unix_ms: i64,
+        update_flow_error: bool,
+        resume: Option<&TurnBlockedResumeMetadata>,
+    ) {
+        let phase = match status {
+            TurnStatus::InProgress | TurnStatus::Completed => TurnPhase::Completed,
+            TurnStatus::Failed => TurnPhase::Failed,
+            TurnStatus::Blocked => TurnPhase::Blocked,
+            TurnStatus::Interrupted => TurnPhase::Cancelled,
+        };
+        // Snapshot metadata can insert a TurnView before the projector has indexed it.
+        // Reuse that view so a fresh/reconnected client keeps one admission Turn.
+        if !self.turn_index.contains_key(turn_id)
+            && let Some(index) = self
+                .view_state
+                .turns
+                .iter()
+                .position(|turn| turn.id == turn_id)
+        {
+            self.turn_index.insert(turn_id.to_owned(), index);
+        }
+        self.upsert_turn(turn_id, phase, None, None, None);
+        let turn = self
+            .view_state
+            .turns
+            .get_mut(self.turn_index[turn_id])
+            .expect("upserted admission");
+        // None is authoritative here: successful confirmation clears a local timeout.
+        turn.error = error.map(str::to_owned);
+        turn.completed_at_unix_ms.get_or_insert(now_unix_ms);
+        if status != TurnStatus::Blocked {
+            turn.resume = None;
+        } else if let Some(resume) = resume {
+            turn.resume = Some(resume.clone());
+        }
+        if update_flow_error {
+            self.view_state.last_error = error.map(str::to_owned);
+        }
     }
 
     pub fn apply_local_turn_start_rejected(&mut self, turn_id: &str, error: &str, ts_unix_ms: i64) {
@@ -1132,6 +1216,7 @@ impl ConversationProjector {
             index
         } else {
             self.view_state.items.push(ItemView {
+                html_publications: Vec::new(),
                 id: item_id.to_owned(),
                 turn_id: turn_id.to_owned(),
                 item_type: item_type.to_owned(),
@@ -1169,6 +1254,112 @@ impl ConversationProjector {
         self.insert_timeline_entry(timeline_entry);
     }
 
+    pub(super) fn preview_provider_message(
+        &mut self,
+        turn_id: &str,
+        item_id: &str,
+        text: &str,
+        ts: i64,
+    ) {
+        if text.is_empty()
+            || self
+                .turn_index
+                .get(turn_id)
+                .and_then(|index| self.view_state.turns.get(*index))
+                .is_some_and(|turn| !matches!(turn.phase, TurnPhase::Starting | TurnPhase::Running))
+        {
+            return;
+        }
+        if self.provider_previews.contains(item_id) {
+            self.append_item_delta(item_id, text, None, ts);
+            return;
+        }
+        if self.view_state.items.iter().any(|item| {
+            item.turn_id == turn_id
+                && !self.provider_previews.contains(&item.id)
+                && matches!(
+                    &item.item,
+                    TurnItem::AgentMessage {
+                        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                        ..
+                    }
+                )
+        }) || self.item_index.contains_key(item_id)
+        {
+            return;
+        }
+        self.provider_previews.insert(item_id.to_owned());
+        // AgentMessage is the existing text presentation container. Its default
+        // phase is not semantic evidence: this runtime view is explicitly marked
+        // provisional and is discarded/replaced before canonical publication.
+        self.start_item_view(
+            item_id,
+            turn_id,
+            super::handlers::ITEM_TYPE_AGENT_MESSAGE,
+            TimelineEntryStatus::Running,
+            text.to_owned(),
+            None,
+            TurnItem::AgentMessage {
+                id: item_id.to_owned(),
+                text: String::new(),
+                phase: Default::default(),
+                markdown: None,
+                markdown_version: None,
+            },
+            Some(serde_json::json!({"runtimeDeltaKind":"provider_message_preview"})),
+            ts,
+        );
+    }
+
+    pub(super) fn resolve_provider_previews(
+        &mut self,
+        turn_id: &str,
+        item_id: &str,
+        final_answer: bool,
+    ) {
+        self.discard_provider_previews(turn_id, (!final_answer).then_some(item_id));
+    }
+
+    fn discard_provider_previews(&mut self, turn_id: &str, only: Option<&str>) {
+        if self.provider_previews.is_empty() {
+            return;
+        }
+        let removed = self
+            .view_state
+            .items
+            .iter()
+            .filter(|item| {
+                item.turn_id == turn_id
+                    && self.provider_previews.contains(&item.id)
+                    && only.is_none_or(|id| item.id == id)
+            })
+            .map(|item| item.id.clone())
+            .collect::<HashSet<_>>();
+        if removed.is_empty() {
+            return;
+        }
+        self.provider_previews.retain(|id| !removed.contains(id));
+        self.view_state
+            .items
+            .retain(|item| !removed.contains(&item.id));
+        self.view_state
+            .timeline
+            .retain(|entry| !removed.contains(&entry.item_id));
+        self.item_index = self
+            .view_state
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item.id.clone(), index))
+            .collect();
+        for entry in &mut self.view_state.timeline {
+            if let Some(index) = self.item_index.get(&entry.item_id) {
+                entry.item_index = *index;
+            }
+        }
+        self.rebuild_item_timeline_index();
+    }
+
     pub fn append_item_delta(
         &mut self,
         item_id: &str,
@@ -1189,7 +1380,26 @@ impl ConversationProjector {
                 item.status = TimelineEntryStatus::Running;
                 item.updated_at_unix_ms = Some(ts_unix_ms);
             }
-            if let Some(markdown) = markdown.clone() {
+            let prose = matches!(
+                &item.item,
+                TurnItem::AgentMessage { .. } | TurnItem::Reasoning { .. }
+            );
+            if prose && !preserve_terminal {
+                // A missing AST means raw fallback for the updated source.
+                // Clear every presentation fallback, including a restored payload.
+                item.final_markdown = None;
+                item.partial_markdown = markdown;
+                if item.partial_markdown.is_none()
+                    && let TurnItem::AgentMessage {
+                        markdown,
+                        markdown_version,
+                        ..
+                    } = &mut item.item
+                {
+                    *markdown = None;
+                    *markdown_version = None;
+                }
+            } else if !prose && let Some(markdown) = markdown {
                 item.partial_markdown = Some(markdown);
             }
         }
@@ -1234,6 +1444,13 @@ impl ConversationProjector {
         completed_at_unix_ms: Option<i64>,
         error: Option<String>,
     ) {
+        let marker = self
+            .turn_phase_markers
+            .entry(turn_id.to_owned())
+            .or_insert_with(|| Arc::new(phase));
+        if **marker != phase {
+            *marker = Arc::new(phase);
+        }
         if let Some(index) = self.turn_index.get(turn_id).copied()
             && let Some(turn) = self.view_state.turns.get_mut(index)
         {
@@ -1282,6 +1499,7 @@ impl ConversationProjector {
         terminal_status: TimelineEntryStatus,
         ts_unix_ms: i64,
     ) {
+        self.discard_provider_previews(turn_id, None);
         for item in &mut self.view_state.items {
             if item.turn_id != turn_id {
                 continue;

@@ -88,6 +88,8 @@ fn download_artifact(
     runtime_home: PathBuf,
     target: ArtifactDownloadTarget,
     operation: &ArtifactDownloadOperation,
+    runtime: &tokio::runtime::Runtime,
+    runtime_observer: &pioneer_observability::runtime::RuntimeRegistration,
 ) -> Result<(String, ArtifactHttpDownloadResult), ArtifactAccessError> {
     let artifact = resolve_artifact(sender, target)?;
     let access = sender
@@ -103,15 +105,12 @@ fn download_artifact(
     });
     let session = GatewayHttpSession::from_access(&access, authority).map_err(map_http_error)?;
     let service = ArtifactHttpDownloadService::new(session, runtime_home);
-    let runtime = tokio::runtime::Runtime::new().map_err(|_| {
-        ArtifactAccessError::new(
-            "artifact download runtime is unavailable",
-            "artifact_download_unavailable",
-        )
-    })?;
     let progress = |progress| operation.update_progress(progress);
-    let result = runtime
-        .block_on(service.download(request, operation.cancellation(), Some(&progress)))
+    let result = runtime_observer
+        .block_on(
+            runtime,
+            service.download(request, operation.cancellation(), Some(&progress)),
+        )
         .map_err(map_download_error)?;
     if operation.cancellation().is_cancelled() {
         return Err(map_download_error(ArtifactHttpDownloadError::Cancelled));
@@ -263,7 +262,12 @@ impl crate::core::ClientCore {
         &self,
         mut operation: impl FnMut() -> Result<T, ArtifactAccessError>,
     ) -> Result<T, ArtifactAccessError> {
-        let generation = self.gateway_http_generation();
+        let access = self
+            .transport_runtime()
+            .ws_command_sender()
+            .current_gateway_http_access()
+            .ok();
+        let generation = access.as_ref().map(|access| access.generation);
         let endpoint = self
             .gateway_registry()
             .and_then(|registry| registry.active_gateway_id.clone());
@@ -274,9 +278,19 @@ impl crate::core::ClientCore {
             };
             !self.is_stopped()
                 && self.authorization_connection_generation() == authorization
-                && self
-                    .refresh_configured_gateway_session_after_unauthorized(endpoint, generation)
-                    .is_ok()
+                && (self
+                    .transport_runtime()
+                    .ws_command_sender()
+                    .current_gateway_http_access()
+                    .ok()
+                    .zip(access.as_ref())
+                    .is_some_and(|(current, previous)| {
+                        current.generation != previous.generation
+                            || current.access_token != previous.access_token
+                    })
+                    || self
+                        .refresh_configured_gateway_session_after_unauthorized(endpoint, generation)
+                        .is_ok())
                 && self.authorization_connection_generation() == authorization
         })
     }
@@ -322,6 +336,59 @@ impl crate::core::ClientCore {
         }
     }
 
+    // Both desktop and Nitro call this workflow from their existing IO worker.
+    // Register before checking capacity, so release/cancel cannot be missed.
+    pub(super) async fn admit_artifact_action_download(
+        self: &Arc<Self>,
+        identity: &super::workflow::ArtifactActionIdentity,
+        operation_id: String,
+    ) -> Result<ArtifactDownloadOperation, ArtifactAccessError> {
+        use super::operations::ArtifactDownloadOperationError;
+        let admission = self.wait_artifact_download_admission().ok_or_else(|| {
+            ArtifactAccessError::new(
+                "artifact download admission queue is full",
+                "artifact_download_queue_capacity",
+            )
+        })?;
+        let mut publications = self.watch_publications();
+        loop {
+            let available = admission.slots_changed.notified();
+            tokio::pin!(available);
+            available.as_mut().enable();
+            publications.borrow_and_update();
+            if !self.artifact_preparation_is_current(identity) {
+                return Err(map_download_error(ArtifactHttpDownloadError::Cancelled));
+            }
+            let action = self
+                .artifact_action_snapshot(identity)
+                .ok_or_else(invalid_artifact)?;
+            match self.begin_artifact_download(operation_id.clone(), action.target) {
+                Ok(operation) => {
+                    if self.attach_artifact_download(identity, operation.identity()) {
+                        return Ok(operation);
+                    }
+                    return Err(map_download_error(ArtifactHttpDownloadError::Cancelled));
+                }
+                Err(ArtifactDownloadOperationError::Capacity) => {
+                    tokio::select! {
+                        _ = &mut available => {},
+                        change = publications.changed() => {
+                            if change.is_err() {
+                                return Err(map_download_error(ArtifactHttpDownloadError::Cancelled));
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    return Err(ArtifactAccessError::new(
+                        "artifact download operation unavailable",
+                        INVALID_ARTIFACT_ACTION_CODE,
+                    ));
+                }
+            }
+        }
+    }
+
     fn download_artifact_action_once(
         self: &Arc<Self>,
         identity: &super::workflow::ArtifactActionIdentity,
@@ -335,26 +402,35 @@ impl crate::core::ClientCore {
         let action = self
             .artifact_action_snapshot(identity)
             .ok_or_else(invalid_artifact)?;
-        let operation = self
-            .begin_artifact_download(operation_id, action.target.clone())
-            .map_err(|error| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| {
                 ArtifactAccessError::new(
-                    "artifact download operation unavailable",
-                    if error == super::operations::ArtifactDownloadOperationError::Capacity {
-                        "artifact_download_capacity"
-                    } else {
-                        INVALID_ARTIFACT_ACTION_CODE
-                    },
+                    "artifact download runtime is unavailable",
+                    "artifact_download_unavailable",
                 )
             })?;
-        if !self.attach_artifact_download(identity, operation.identity()) {
-            return Err(map_download_error(ArtifactHttpDownloadError::Cancelled));
-        }
+        let _runtime_observer = pioneer_observability::runtime::register(
+            runtime.handle(),
+            pioneer_observability::runtime::RuntimeRole::ClientHttp,
+        );
+        let operation = _runtime_observer
+            .block_on(
+                &runtime,
+                self.admit_artifact_action_download(identity, operation_id),
+            )
+            .map_err(|error| {
+                self.fail_artifact_preparation(identity, error.code.clone());
+                error
+            })?;
         let result = download_artifact(
             &self.transport_runtime().ws_command_sender(),
             runtime_home,
             action.target,
             &operation,
+            &runtime,
+            &_runtime_observer,
         );
         match result {
             Ok(result) => {

@@ -2,6 +2,23 @@ use super::*;
 use crate::authorization::AuthorizationExternalError;
 
 impl MessageProcessor {
+    /// Shared model discovery for RPC and execution-bound launch catalogs.
+    pub(super) async fn provider_models_catalog(
+        &self,
+        workspace_id: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<Vec<ProviderModelInfo>> {
+        let provider = self
+            .provider_registry
+            .get_or_create_for_workspace(workspace_id, provider_id)?;
+        Ok(provider
+            .list_models()
+            .await?
+            .into_iter()
+            .map(provider_model_info_to_protocol)
+            .collect())
+    }
+
     pub(super) async fn provider_list(
         &self,
         request_context: &RequestContext,
@@ -282,31 +299,13 @@ impl MessageProcessor {
             return;
         }
 
-        let provider = match self
-            .provider_registry
-            .get_or_create_for_workspace(workspace_id.as_str(), &params.provider)
+        match self
+            .provider_models_catalog(workspace_id.as_str(), &params.provider)
+            .await
         {
-            Ok(p) => p,
-            Err(error) => {
-                let message = if member {
-                    "provider model catalog is unavailable".to_owned()
-                } else {
-                    format!("failed to create provider `{}`: {error:#}", params.provider)
-                };
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
-                )
-                .await;
-                return;
-            }
-        };
-
-        match provider.list_models().await {
             Ok(models) => {
                 let protocol_models = models
                     .into_iter()
-                    .map(provider_model_info_to_protocol)
                     .filter(|model| {
                         crate::authorization::AuthorizationService::new().provider_model_allowed(
                             request_context.principal().kind,
@@ -1309,15 +1308,28 @@ impl MessageProcessor {
 
     /// Restore canonical history without generating summaries or truncating sources.
     /// The native request controller owns admission and full-request budgeting.
+    #[cfg(test)]
     pub(super) async fn load_conversation_history_for_workspace(
         &self,
         workspace_id: &str,
         thread_id: &str,
         turn_id: &str,
     ) -> anyhow::Result<Vec<ChatMessage>> {
+        Ok(self
+            .load_prepared_conversation_history_for_workspace(workspace_id, thread_id, turn_id)
+            .await?
+            .messages)
+    }
+
+    pub(super) async fn load_prepared_conversation_history_for_workspace(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> anyhow::Result<crate::compaction::frozen::PreparedHistory> {
         let store = self.crud_store.as_ref();
         let prepared = self
-            .capture_current_context_basis_prepared(
+            .capture_running_context_basis_prepared(
                 store,
                 workspace_id,
                 thread_id,
@@ -1325,7 +1337,7 @@ impl MessageProcessor {
                 Some(turn_id),
             )
             .await?;
-        Ok(prepared.messages)
+        Ok(prepared)
     }
 
     #[cfg(test)]

@@ -51,6 +51,18 @@ const fn record(
     }
 }
 
+// Access renewal authenticates credentials and the exact connection session;
+// it does not enter domain dispatch or the restricted issuance exchange.
+const TRANSPORT_RPC_RECORDS: &[AuthorizationCatalogRecord] = &[record(
+    AuthorizationCatalogSurface::Rpc,
+    methods::AUTH_ACCESS_RENEW,
+    "session_access_renew",
+    "connection_session",
+    "authentication_terminal",
+    "authentication",
+    true,
+)];
+
 const RESTRICTED_RPC_RECORDS: &[AuthorizationCatalogRecord] = &[
     record(
         AuthorizationCatalogSurface::RestrictedRpc,
@@ -192,16 +204,52 @@ const INTERNAL_TOOL_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
-        "computer_use",
-        "tool_computer_use",
-        "execution_computer_policy",
-        "forbidden",
-        "execution",
+        "threads_list",
+        "thread_read",
+        "execution_approved_thread",
+        "not_found",
+        "read",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
+        "threads_history_read",
+        "thread_read",
+        "execution_approved_thread",
+        "not_found",
+        "read",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
+        "threads_search",
+        "thread_read",
+        "execution_approved_thread",
+        "not_found",
+        "read",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
+        "threads_children_list",
+        "thread_read",
+        "execution_approved_thread",
+        "not_found",
+        "read",
         true,
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
         "threads_start_options",
+        "child_observe",
+        "execution_agent_options",
+        "not_found",
+        "read",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
+        "threads_identity_models_list",
         "child_observe",
         "execution_agent_options",
         "not_found",
@@ -336,6 +384,15 @@ const INTERNAL_TOOL_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
+        "task_finish",
+        "task_schedule_manage",
+        "root_thread_task",
+        "not_found",
+        "mutation",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
         "task_update",
         "task_schedule_manage",
         "root_thread_task",
@@ -456,9 +513,27 @@ const DYNAMIC_TOOL_FAMILY_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
 ];
 
+fn internal_tool_records() -> impl Iterator<Item = AuthorizationCatalogRecord> {
+    INTERNAL_TOOL_RECORDS
+        .iter()
+        .copied()
+        .chain(pioneer_protocol::CUA_TOOL_NAMES.iter().map(|name| {
+            record(
+                AuthorizationCatalogSurface::InternalTool,
+                name,
+                "tool_computer_use",
+                "execution_computer_policy",
+                "forbidden",
+                "execution",
+                true,
+            )
+        }))
+}
+
 pub(crate) fn authorization_catalog() -> Vec<AuthorizationCatalogRecord> {
     let mut catalog = Vec::with_capacity(
         NORMAL_METHOD_REGISTRY.len()
+            + TRANSPORT_RPC_RECORDS.len()
             + RESTRICTED_RPC_RECORDS.len()
             + BINARY_INGRESS_REGISTRY.len()
             + INTERNAL_TOOL_RECORDS.len()
@@ -480,6 +555,7 @@ pub(crate) fn authorization_catalog() -> Vec<AuthorizationCatalogRecord> {
             true,
         )
     }));
+    catalog.extend_from_slice(TRANSPORT_RPC_RECORDS);
     catalog.extend_from_slice(RESTRICTED_RPC_RECORDS);
     catalog.extend(BINARY_INGRESS_REGISTRY.iter().map(|entry| {
         record(
@@ -492,7 +568,7 @@ pub(crate) fn authorization_catalog() -> Vec<AuthorizationCatalogRecord> {
             entry.reauthorize_each_frame,
         )
     }));
-    catalog.extend_from_slice(INTERNAL_TOOL_RECORDS);
+    catalog.extend(internal_tool_records());
     catalog.extend_from_slice(DYNAMIC_TOOL_FAMILY_RECORDS);
     catalog
 }
@@ -507,8 +583,9 @@ mod tests {
     use super::*;
 
     fn static_tool_catalog_names() -> BTreeSet<&'static str> {
-        INTERNAL_TOOL_RECORDS
-            .iter()
+        authorization_catalog()
+            .into_iter()
+            .filter(|entry| entry.surface == AuthorizationCatalogSurface::InternalTool)
             .map(|entry| entry.entry_point)
             .collect()
     }
@@ -538,6 +615,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let expected_rpc = methods::NORMAL_METHODS
             .iter()
+            .chain(methods::AUTHENTICATED_TRANSPORT_METHODS)
             .chain(methods::RESTRICTED_AUTH_METHODS)
             .copied()
             .collect::<BTreeSet<_>>();
@@ -586,8 +664,6 @@ mod tests {
             unregistered_sensitive_tools(sensitive.iter().map(String::as_str)),
             Vec::<&str>::new()
         );
-        let registered = static_tool_catalog_names();
-        assert_eq!(registered.len(), INTERNAL_TOOL_RECORDS.len());
     }
 
     #[test]

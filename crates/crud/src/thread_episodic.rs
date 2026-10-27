@@ -12,6 +12,46 @@ pub const THREAD_EPISODIC_USER_EXCLUDED_ERROR: &str = "thread episodic source ex
 pub const THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR: &str =
     "thread episodic source text hash changed before indexing";
 
+// A request was resolved for a projection the workspace cannot accept. Keep
+// that transition obligation on its existing job even at the old attempt limit.
+pub const THREAD_EPISODIC_PROJECTION_CHANGED_ERROR: &str =
+    "thread episodic request requires projection replacement";
+
+#[derive(Debug, Default)]
+pub struct ThreadEpisodicIndexClaimBatch {
+    pub claimed: Vec<ThreadEpisodicIndexJobRecord>,
+    // Input snapshots, not dispatch receipts. Only writer-side observation may
+    // settle a possibly committed attempt; the static class excludes panic data.
+    pub failures: Vec<(ThreadEpisodicIndexJobRecord, &'static str)>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ThreadEpisodicIndexClaimBatch {
+    pub fn assert_no_failures_for_test(self) -> Vec<ThreadEpisodicIndexJobRecord> {
+        assert!(
+            self.failures.is_empty(),
+            "unexpected episodic claim failure"
+        );
+        self.claimed
+    }
+}
+
+/// Progress for the existing workspace projection-reset checkpoint. The files
+/// are removed before rebudgeting jobs; the source cursor commits with each
+/// replacement batch, so a restart never grants that source another budget.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThreadEpisodicProjectionResetProgress {
+    pub files_cleaned: bool,
+    pub after_source: Option<[String; 4]>,
+}
+
+pub fn thread_episodic_projection_reset_key(workspace_id: &str) -> Result<String> {
+    Ok(format!(
+        "thread_episodic_projection_reset:{}",
+        thread_episodic_key_hash("workspace", workspace_id)?
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadEpisodicCapsuleWriteState {
     ActiveWrite,
@@ -261,6 +301,7 @@ pub struct NewThreadEpisodicItemRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadEpisodicCanonicalItem {
+    pub committed: bool,
     pub item: pioneer_protocol::TurnItem,
     pub source_payload: String,
 }

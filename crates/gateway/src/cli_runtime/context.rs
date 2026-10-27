@@ -21,6 +21,98 @@ use std::path::Path;
 
 pub(crate) const MAX_CLI_TURN_INPUT_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
+// Codex rust-v0.159.2 (also 0.144.1): protocol/src/user_input.rs defines the cap;
+// app-server/src/request_processors/turn_processor.rs::turn_start_inner
+// sums app-server-protocol/src/protocol/v2/turn.rs::UserInput::text_char_count.
+// Only Text.text participates, across ALL items, in Unicode scalar values.
+// 0.159.2 also counts toolOutput text; Pioneer does not send that field.
+pub(crate) const MAX_CODEX_INPUT_TEXT_CHARS: usize = 1 << 20;
+
+pub(crate) fn codex_input_text_chars(input: &[CLIRuntimeTurnInputItem]) -> usize {
+    input.iter().fold(0_usize, |total, item| {
+        total.saturating_add(match item {
+            CLIRuntimeTurnInputItem::Text { text } => text.chars().count(),
+            CLIRuntimeTurnInputItem::Image { .. }
+            | CLIRuntimeTurnInputItem::LocalImage { .. }
+            | CLIRuntimeTurnInputItem::Skill { .. } => 0,
+        })
+    })
+}
+
+pub(crate) struct CodexTransferHistoryBudget {
+    history_chars: usize,
+    available_chars: usize,
+    token_ceiling: u64,
+    fraction: u64,
+}
+
+impl CodexTransferHistoryBudget {
+    pub(crate) fn from_prepared_input(
+        full: &CLIRuntimeTurnInputMapping,
+        current: &CLIRuntimeTurnInputMapping,
+    ) -> Option<Self> {
+        let full_chars = codex_input_text_chars(&full.input);
+        if full_chars <= MAX_CODEX_INPUT_TEXT_CHARS {
+            return None;
+        }
+        let current_chars = codex_input_text_chars(&current.input);
+        Some(Self {
+            history_chars: full_chars.saturating_sub(current_chars).max(1),
+            available_chars: MAX_CODEX_INPUT_TEXT_CHARS.saturating_sub(current_chars),
+            token_ceiling: u64::MAX,
+            fraction: 1,
+        })
+    }
+
+    pub(crate) fn with_token_target(mut self, ceiling: u64, fraction: u64) -> Self {
+        self.token_ceiling = ceiling;
+        self.fraction = fraction.max(1);
+        self
+    }
+
+    fn history_token_target(&self, history_tokens: u64) -> u64 {
+        // A planning hint based on the measured request, not a characters/token
+        // conversion or admission proof. Summaries can have another density;
+        // the caller MUST rebuild and validate the actual input after the runner.
+        (history_tokens as u128 * self.available_chars as u128
+            / self.history_chars as u128
+            / u128::from(self.fraction))
+        .min(u128::from(self.token_ceiling))
+        .max(1) as u64
+    }
+
+    pub(crate) fn fixed_input_tokens(
+        &self,
+        budget: &pioneer_compaction::ModelBudget,
+        history_tokens: u64,
+        output_reserve: u64,
+    ) -> u64 {
+        // Use the shared runner's existing measurement. No extra tokenization
+        // or history reconstruction is needed to choose the transfer target.
+        let desired = self.history_token_target(history_tokens);
+        Self::input_capacity(budget, output_reserve).saturating_sub(desired)
+    }
+
+    pub(crate) fn available_input_tokens(
+        &self,
+        budget: &pioneer_compaction::ModelBudget,
+        output_reserve: u64,
+        fixed_input_tokens: u64,
+    ) -> u64 {
+        Self::input_capacity(budget, output_reserve).saturating_sub(fixed_input_tokens)
+    }
+
+    fn input_capacity(budget: &pioneer_compaction::ModelBudget, output_reserve: u64) -> u64 {
+        // Account for the shared runner's 5% padding and actual output reserve.
+        // context - desired would make a small size-driven target impossible.
+        let padded_capacity = budget
+            .context
+            .saturating_sub(output_reserve)
+            .min(budget.input_limit.unwrap_or(u64::MAX));
+        (u128::from(padded_capacity) * 100 / 105) as u64
+    }
+}
+
 pub(crate) struct CLIRuntimeContextBuildInput<'a> {
     pub workspace_id: &'a str,
     pub thread_id: &'a str,
@@ -218,6 +310,80 @@ fn historical_attachment_inputs(
     .map_err(Into::into)
 }
 
+/// Budget the same portable history and attachment items used by CLI delivery.
+/// These are frame estimates, not API model media estimates or hidden context.
+pub(crate) fn completed_cli_history_budget(
+    history: &[ChatMessage],
+    workspace: &str,
+    cwd: Option<&str>,
+    runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
+) -> Result<(
+    u64,
+    Vec<u64>,
+    Vec<pioneer_provider::attachments::MediaInputEstimate>,
+)> {
+    let label = match runtime_kind {
+        pioneer_protocol::CLIAgentRuntimeKind::Codex => "Codex CLI",
+        pioneer_protocol::CLIAgentRuntimeKind::Claude => "Claude CLI",
+        pioneer_protocol::CLIAgentRuntimeKind::OpenCode => "OpenCode CLI",
+    };
+    let mapping = historical_attachment_inputs(history, workspace, cwd, label)?;
+    let mut input = vec![CLIRuntimeTurnInputItem::Text {
+        text: thread_context_from_history(history)?.text,
+    }];
+    input.extend(mapping.input);
+    let mut visual = 0_u64;
+    let mut media = Vec::new();
+    let mut per_message = Vec::with_capacity(history.len());
+    for (message_index, message) in history.iter().enumerate() {
+        let mut tokens = 0_u64;
+        for (part_index, part) in message.content_parts.iter().enumerate() {
+            let attachment = match part {
+                MessageContentPart::Image { image } => image,
+                MessageContentPart::File { file } => file,
+                MessageContentPart::Text { .. } => continue,
+                _ => anyhow::bail!("unsupported CLI historical media"),
+            };
+            // Claude materializes local images; other CLI media stay references
+            // in this frame and must not inherit API model image assumptions.
+            let image_tokens = if runtime_kind == pioneer_protocol::CLIAgentRuntimeKind::Claude
+                && matches!(part, MessageContentPart::Image { .. })
+                && let AttachmentDataSource::Path { path } = &attachment.source
+            {
+                let (width, height) = image::image_dimensions(path)?;
+                pioneer_provider::attachments::image_tokens("anthropic", "claude", width, height)?
+            } else {
+                0
+            };
+            visual = visual.saturating_add(image_tokens);
+            // NativeRequestProjection uses this only to validate retained part
+            // identities; final token totals below come from the CLI frame.
+            let estimate = pioneer_compaction::text_tokens(&serde_json::to_string(attachment)?)
+                .saturating_add(image_tokens)
+                .max(1);
+            media.push(pioneer_provider::attachments::MediaInputEstimate {
+                message: message_index,
+                part: part_index,
+                input_tokens: estimate,
+            });
+            tokens = tokens.saturating_add(image_tokens);
+        }
+        let singleton = [message.clone()];
+        let mut items = vec![CLIRuntimeTurnInputItem::Text {
+            text: thread_context_from_history(&singleton)?.text,
+        }];
+        items.extend(historical_attachment_inputs(&singleton, workspace, cwd, label)?.input);
+        per_message.push(
+            pioneer_compaction::text_tokens(&serde_json::to_string(&items)?).saturating_add(tokens),
+        );
+    }
+    Ok((
+        pioneer_compaction::text_tokens(&serde_json::to_string(&input)?).saturating_add(visual),
+        per_message,
+        media,
+    ))
+}
+
 pub(crate) fn cli_runtime_mcp_capabilities_input(
     projection: Option<&crate::turn_mcp::ResolvedMcpTurnProjection>,
 ) -> Option<CliRuntimeSelectedCapabilitiesInput> {
@@ -243,6 +409,28 @@ pub(crate) fn cli_runtime_mcp_capabilities_input(
     explicit_tools.sort();
     explicit_tools.dedup();
     Some(CliRuntimeSelectedCapabilitiesInput {
+        native_threads_tools: projection
+            .tools
+            .iter()
+            .filter(|tool| {
+                crate::turn_mcp::native_tools::is_threads_operation(tool)
+                    || (tool.raw_tool_name == "threads_start_options"
+                        && crate::turn_mcp::native_tools::exact_definition(tool).is_some())
+            })
+            .map(|tool| tool.canonical_callable_name.clone())
+            .collect(),
+        native_html_tools: projection
+            .tools
+            .iter()
+            .filter(|tool| tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID)
+            .map(|tool| tool.canonical_callable_name.clone())
+            .collect(),
+        native_task_tools: projection
+            .tools
+            .iter()
+            .filter(|tool| crate::turn_mcp::native_tools::is_task_operation(tool))
+            .map(|tool| tool.canonical_callable_name.clone())
+            .collect(),
         total_tool_count: projection.tools.len(),
         explicit_servers: explicit_servers
             .into_iter()
@@ -298,6 +486,13 @@ pub(crate) fn validate_cli_runtime_turn_input_frame(
     max_input_tokens: Option<u64>,
     runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
 ) -> Result<()> {
+    if runtime_kind == pioneer_protocol::CLIAgentRuntimeKind::Codex {
+        let actual_chars = codex_input_text_chars(&mapping.input);
+        anyhow::ensure!(
+            actual_chars <= MAX_CODEX_INPUT_TEXT_CHARS,
+            "Codex input contains {actual_chars} Unicode scalar values across Text items, exceeding the maximum length of {MAX_CODEX_INPUT_TEXT_CHARS} characters"
+        );
+    }
     // Include the turn envelope fields that accompany input at the adapter
     // boundary. Claude additionally performs an exact post-materialization
     // check after LocalImage paths have become base64 blocks.
@@ -447,8 +642,9 @@ mod tests {
     use super::{
         CLIRuntimeContextBuildInput, cli_runtime_mcp_capabilities_input,
         cli_runtime_prompt_manifest_from_plan, compile_cli_runtime_delivery_plan,
+        completed_cli_history_budget, historical_attachment_inputs,
         prepend_cli_turn_context_and_history_input, prepend_cli_turn_context_input,
-        validate_cli_runtime_turn_input_frame,
+        thread_context_from_history, validate_cli_runtime_turn_input_frame,
     };
     use pioneer_cli_agent_runtime::input::{CLIRuntimeTurnInputItem, CLIRuntimeTurnInputMapping};
     use pioneer_protocol::{CLIAgentRuntimeKind, PromptManifestProfile};
@@ -847,6 +1043,138 @@ mod tests {
     }
 
     #[test]
+    fn codex_input_limit_counts_unicode_text_across_items_at_the_exact_boundary() {
+        let root = temp_workspace("codex-input-chars");
+        let mut plan = compile_cli_runtime_delivery_plan(
+            root.as_path(),
+            CLIRuntimeContextBuildInput {
+                workspace_id: "workspace_1",
+                thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
+                turn_id: "turn_1",
+                runtime_id: "codex",
+                runtime_label: "Codex CLI",
+                runtime_kind: CLIAgentRuntimeKind::Codex,
+                model: Some("test-model"),
+                cwd: Some(root.to_str().unwrap()),
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+                history: None,
+                selected_skill_names: &[],
+                selected_capabilities: None,
+            },
+        )
+        .unwrap();
+        // Provider instructions are a separate field, outside Codex's input cap.
+        plan.provider_instructions.text = "i".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS + 1);
+        for chars in [
+            super::MAX_CODEX_INPUT_TEXT_CHARS - 1,
+            super::MAX_CODEX_INPUT_TEXT_CHARS,
+            super::MAX_CODEX_INPUT_TEXT_CHARS + 1,
+        ] {
+            let first = "😀".repeat(chars / 2);
+            // Two scalar values, one grapheme: a letter and combining accent.
+            let second_chars = chars - chars / 2;
+            let second = format!(
+                "{}{}",
+                "e\u{301}".repeat(second_chars / 2),
+                if second_chars % 2 == 1 { "Ж" } else { "" },
+            );
+            let mapping = CLIRuntimeTurnInputMapping {
+                input: vec![
+                    CLIRuntimeTurnInputItem::Text { text: first },
+                    CLIRuntimeTurnInputItem::Text { text: second },
+                    CLIRuntimeTurnInputItem::Image {
+                        url: "url".repeat(64),
+                    },
+                    CLIRuntimeTurnInputItem::LocalImage {
+                        path: "missing.png".into(),
+                    },
+                    CLIRuntimeTurnInputItem::Skill {
+                        name: "skill".into(),
+                        path: "path".repeat(64),
+                    },
+                ],
+                diagnostics: Vec::new(),
+            };
+            assert_eq!(super::codex_input_text_chars(&mapping.input), chars);
+            assert!(
+                serde_json::to_vec(&mapping.input).unwrap().len()
+                    < super::MAX_CLI_TURN_INPUT_FRAME_BYTES
+            );
+            let result = validate_cli_runtime_turn_input_frame(
+                &mapping,
+                &plan,
+                None,
+                CLIAgentRuntimeKind::Codex,
+            );
+            if chars <= super::MAX_CODEX_INPUT_TEXT_CHARS {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("1048577 Unicode scalar values"));
+                assert!(error.contains("maximum length of 1048576 characters"));
+            }
+            // Claude still admits the same textual request under the frame cap.
+            let mut claude = mapping.clone();
+            claude
+                .input
+                .retain(|item| !matches!(item, CLIRuntimeTurnInputItem::LocalImage { .. }));
+            validate_cli_runtime_turn_input_frame(
+                &claude,
+                &plan,
+                None,
+                CLIAgentRuntimeKind::Claude,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn codex_history_budget_uses_prepared_text_and_current_input_headroom() {
+        let mapping = |text: String| CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::Text { text }],
+            diagnostics: Vec::new(),
+        };
+        let current = mapping("current".into());
+        assert!(
+            super::CodexTransferHistoryBudget::from_prepared_input(&current, &current,).is_none()
+        );
+        let full = mapping(format!(
+            "{}current",
+            "x".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS)
+        ));
+        let small =
+            super::CodexTransferHistoryBudget::from_prepared_input(&full, &current).unwrap();
+        let near_limit = mapping("y".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS - 1_024));
+        let tight_full = mapping(format!(
+            "{}{}",
+            "x".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS),
+            "y".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS - 1_024)
+        ));
+        let tight =
+            super::CodexTransferHistoryBudget::from_prepared_input(&tight_full, &near_limit)
+                .unwrap();
+        assert!(tight.history_token_target(10_000) < small.history_token_target(10_000));
+        let retry = super::CodexTransferHistoryBudget::from_prepared_input(&full, &current)
+            .unwrap()
+            .with_token_target(u64::MAX, 4);
+        assert!(retry.history_token_target(10_000) < small.history_token_target(10_000));
+        let desired = tight.history_token_target(10_000);
+        for input_limit in [None, Some(900_000)] {
+            let model = pioneer_compaction::ModelBudget::new(Some(1_000_000), input_limit, None);
+            let reserve = model.output_reserve(None).unwrap();
+            let fixed = tight.fixed_input_tokens(&model, 10_000, reserve);
+            assert!(model.fits(fixed + desired, reserve, false));
+            assert!(!model.fits(fixed + 10_000, reserve, false));
+            assert_eq!(
+                tight.available_input_tokens(&model, reserve, fixed),
+                desired
+            );
+        }
+        assert_eq!(small.available_chars, super::MAX_CODEX_INPUT_TEXT_CHARS - 7);
+    }
+
+    #[test]
     fn claude_frame_preflight_counts_materialized_local_image_bytes() {
         let root = temp_workspace("claude-image-frame");
         let image = root.join("historical.png");
@@ -944,6 +1272,42 @@ mod tests {
             CLIAgentRuntimeKind::Claude,
         )
         .expect("visual token estimate should admit an ordinary image below the byte cap");
+    }
+
+    #[test]
+    fn completed_cli_history_counts_the_actual_media_frame_once() {
+        let mut message = ChatMessage::user("accepted history");
+        message.content_parts.push(MessageContentPart::image(
+            pioneer_provider::MessageAttachment::from_url(
+                "https://fixture.invalid/image.png",
+                "image/png",
+            ),
+        ));
+        let history = vec![message];
+        let mapping =
+            historical_attachment_inputs(&history, "workspace", None, "Codex CLI").unwrap();
+        let mut input = vec![CLIRuntimeTurnInputItem::Text {
+            text: thread_context_from_history(&history).unwrap().text,
+        }];
+        input.extend(mapping.input);
+        let (tokens, per_message, media) = completed_cli_history_budget(
+            &history,
+            "workspace",
+            None,
+            pioneer_protocol::CLIAgentRuntimeKind::Codex,
+        )
+        .unwrap();
+        assert_eq!(
+            tokens,
+            pioneer_compaction::text_tokens(&serde_json::to_string(&input).unwrap())
+        );
+        assert_eq!(per_message, vec![tokens]);
+        assert_eq!((media[0].message, media[0].part), (0, 0));
+        assert!(media[0].input_tokens > 0);
+        assert!(matches!(
+            history[0].content_parts[0],
+            MessageContentPart::Image { .. }
+        ));
     }
 
     #[test]

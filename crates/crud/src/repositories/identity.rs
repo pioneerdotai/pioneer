@@ -172,6 +172,7 @@ pub async fn create_gateway_singleton<C: ConnectionTrait>(
     now: DateTimeWithTimeZone,
 ) -> Result<GatewayIdentityRecord> {
     let model = gateway_identity::ActiveModel {
+        unread_started_at: Set(now.timestamp()),
         id: Set(id.to_string()),
         singleton_key: Set(GATEWAY_SINGLETON_KEY),
         identity_bootstrap_version: Set(identity_bootstrap_version),
@@ -389,6 +390,7 @@ pub async fn create_member_principal<C: ConnectionTrait>(
         updated_at: Set(row.now),
         removed_at: Set(None),
         authorization_guard: Set(1),
+        inbox_after_sequence: Set(None),
     }
     .insert(db)
     .await
@@ -406,6 +408,8 @@ pub async fn create_superuser<C: ConnectionTrait>(
     nickname_key: &str,
     now: DateTimeWithTimeZone,
 ) -> Result<GatewayPrincipalRecord> {
+    let inbox_after_sequence =
+        super::task_completion_inbox::current_completion_sequence(db).await?;
     let model = gateway_principal::ActiveModel {
         id: Set(id.to_string()),
         gateway_id: Set(gateway_id.to_string()),
@@ -419,6 +423,7 @@ pub async fn create_superuser<C: ConnectionTrait>(
         updated_at: Set(now),
         removed_at: Set(None),
         authorization_guard: Set(1),
+        inbox_after_sequence: Set(Some(inbox_after_sequence)),
     }
     .insert(db)
     .await

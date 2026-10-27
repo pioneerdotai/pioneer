@@ -7,6 +7,7 @@ use std::fmt;
 pub enum CLIRuntimeProvider {
     Codex,
     Claude,
+    OpenCode,
 }
 
 impl CLIRuntimeProvider {
@@ -14,6 +15,7 @@ impl CLIRuntimeProvider {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::OpenCode => "opencode",
         }
     }
 }
@@ -179,6 +181,32 @@ pub fn validate_claude_custom_args(args: &[String]) -> Result<(), ReservedLaunch
         }
 
         index += 1;
+    }
+    Ok(())
+}
+
+pub fn validate_opencode_custom_args(args: &[String]) -> Result<(), ReservedLaunchArgumentError> {
+    for (index, argument) in args.iter().enumerate() {
+        let normalized = flag_name(argument).to_ascii_lowercase();
+        let reserved = match normalized.as_str() {
+            "serve" => Some("serve"),
+            "--port" => Some("--port"),
+            "--hostname" => Some("--hostname"),
+            "--cors" => Some("--cors"),
+            "--stdio" | "--no-stdio" => Some("--stdio"),
+            "--no-service" | "--service" | "service" => Some("--service"),
+            "--standalone" => Some("--standalone"),
+            "--server" => Some("--server"),
+            _ => None,
+        };
+        if let Some(reserved) = reserved {
+            return Err(ReservedLaunchArgumentError::new(
+                CLIRuntimeProvider::OpenCode,
+                index,
+                reserved,
+                "Pioneer owns the OpenCode server transport, authentication, and network boundary",
+            ));
+        }
     }
     Ok(())
 }
@@ -353,5 +381,29 @@ mod tests {
             .expect_err("settings must be reserved");
         assert!(!format!("{error:?}").contains(canary));
         assert!(!error.to_string().contains(canary));
+    }
+
+    #[test]
+    fn reserved_opencode_arguments_cover_server_transport_forms() {
+        for values in [
+            args(&["serve"]),
+            args(&["--port", "4096"]),
+            args(&["--port=4096"]),
+            args(&["--hostname", "0.0.0.0"]),
+            args(&["--cors=https://example.com"]),
+            args(&["--stdio=false"]),
+            args(&["--service"]),
+            args(&["--server", "http://localhost:4096"]),
+        ] {
+            assert!(
+                validate_opencode_custom_args(&values).is_err(),
+                "{values:?}"
+            );
+        }
+
+        for values in [args(&["--print-logs"]), args(&["--print-logs=true"])] {
+            validate_opencode_custom_args(&values)
+                .unwrap_or_else(|error| panic!("{values:?}: {error}"));
+        }
     }
 }

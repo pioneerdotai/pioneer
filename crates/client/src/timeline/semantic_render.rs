@@ -164,6 +164,7 @@ fn push_user_block(
         projection,
         rows,
         ItemRowInput {
+            html_publications: Vec::new(),
             entry_id: block.block_id.clone(),
             item_id: item_id.to_owned(),
             turn_id: turn_id.to_owned(),
@@ -224,6 +225,7 @@ fn push_assistant_block(
     author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) {
     let TimelineBlockKind::AssistantMessage {
+        html_publications,
         item_id,
         text,
         status,
@@ -246,6 +248,7 @@ fn push_assistant_block(
         projection,
         rows,
         ItemRowInput {
+            html_publications: html_publications.clone(),
             entry_id: block.block_id.clone(),
             item_id: item_id.clone(),
             turn_id: turn_id.to_owned(),
@@ -307,6 +310,7 @@ fn push_work_item(
         projection,
         rows,
         ItemRowInput {
+            html_publications: Vec::new(),
             entry_id: item.work_item_id.clone(),
             item_id: item.item_id.clone(),
             turn_id: item.turn_id.clone(),
@@ -335,7 +339,12 @@ fn push_detached_task_run(
     block: &TimelineBlock,
     author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) {
-    let TimelineBlockKind::DetachedTaskRun { task, .. } = &block.kind else {
+    let TimelineBlockKind::DetachedTaskRun {
+        task,
+        codex_retry_notices,
+        ..
+    } = &block.kind
+    else {
         return;
     };
     let turn_id = block.turn_id.as_deref().unwrap_or(block.block_id.as_str());
@@ -345,6 +354,7 @@ fn push_detached_task_run(
         projection,
         rows,
         ItemRowInput {
+            html_publications: Vec::new(),
             entry_id: block.block_id.clone(),
             item_id: task.id.clone(),
             turn_id: turn_id.to_owned(),
@@ -373,6 +383,51 @@ fn push_detached_task_run(
             })),
         },
     );
+    for notice in codex_retry_notices {
+        let item = TurnItem::SystemEvent {
+            id: notice.item_id.clone(),
+            level: SystemEventLevel::Warning,
+            message: notice.message.clone(),
+            code: Some("codex_request_retried".into()),
+            details: None,
+        };
+        let item_index = projection.items.len();
+        push_item_row(
+            projection,
+            rows,
+            ItemRowInput {
+                html_publications: Vec::new(),
+                entry_id: format!("{}:retry:{}", block.block_id, notice.item_id),
+                item_id: notice.item_id.clone(),
+                turn_id: notice.source_turn_id.clone(),
+                item_type: "system_event".into(),
+                status: TimelineEntryStatus::Completed,
+                started_at_unix_ms: Some(notice.occurred_at_unix_ms),
+                updated_at_unix_ms: Some(notice.occurred_at_unix_ms),
+                completed_at_unix_ms: Some(notice.occurred_at_unix_ms),
+                partial_text: notice.message.clone(),
+                final_text: Some(notice.message.clone()),
+                partial_markdown: None,
+                final_markdown: None,
+                item,
+                author: None,
+                route: None,
+                opaque_meta: None,
+            },
+        );
+        projection.items[item_index].timeline_origin = Some(pioneer_protocol::TimelineOrigin {
+            kind: pioneer_protocol::TimelineOriginKind::ChildTurn,
+            task_id: Some(task.task_id.clone()),
+            run_id: task.run_id.clone(),
+            child_thread_id: Some(notice.source_thread_id.clone()),
+            child_turn_id: Some(notice.source_turn_id.clone()),
+            origin_event_id: None,
+            origin_turn_item_id: Some(notice.item_id.clone()),
+            origin_sequence: 0,
+            occurred_at: notice.occurred_at_unix_ms / 1_000,
+            lane: pioneer_protocol::TimelineLane::ChildTool,
+        });
+    }
 }
 
 fn push_turn_state(
@@ -434,6 +489,7 @@ fn push_turn_state(
         projection,
         rows,
         ItemRowInput {
+            html_publications: Vec::new(),
             entry_id: block.block_id.clone(),
             item_id,
             turn_id: turn_id.to_owned(),
@@ -491,6 +547,7 @@ fn running_turn_display_for_projection(
 }
 
 struct ItemRowInput {
+    html_publications: Vec<pioneer_protocol::HtmlPublication>,
     entry_id: String,
     item_id: String,
     turn_id: String,
@@ -517,6 +574,7 @@ fn push_item_row(
     let item_index = projection.items.len();
     let timeline_index = projection.timeline.len();
     projection.items.push(ItemView {
+        html_publications: input.html_publications,
         id: input.item_id.clone(),
         turn_id: input.turn_id.clone(),
         item_type: input.item_type,
@@ -686,6 +744,61 @@ mod tests {
         TurnAuthorSnapshot, TurnKind, TurnMention, TurnOrigin, TurnPermissionMode,
         TurnPermissionProfileSource, TurnStatus,
     };
+
+    #[test]
+    fn publications_remain_ordered_and_unique_before_final_reply_on_replay() {
+        let publication = |id: &str| pioneer_protocol::HtmlPublication {
+            workspace_id: "workspace_a".into(),
+            thread_id: "thread_a".into(),
+            turn_id: "turn_a".into(),
+            call_id: id.into(),
+            title: id.into(),
+            artifact: pioneer_protocol::ArtifactRef {
+                artifact_id: id.into(),
+                version_id: Some(format!("version-{id}")),
+                display_name: id.into(),
+                kind: pioneer_protocol::ArtifactKind::File,
+                mime_type: Some("text/html".into()),
+                size_bytes: Some(20),
+                sha256: Some("a".repeat(64)),
+                status: pioneer_protocol::ArtifactStatus::Ready,
+                preview: None,
+            },
+        };
+        let mut answer = assistant_block(None);
+        if let TimelineBlockKind::AssistantMessage {
+            html_publications, ..
+        } = &mut answer.kind
+        {
+            *html_publications = vec![publication("first"), publication("second")];
+        }
+        let semantic = semantic_row(SemanticTimelineRowKind::AssistantMessage { block: answer });
+        let model =
+            render_semantic_timeline_rows(&[semantic.clone()], ConversationViewState::default());
+        let replay = render_semantic_timeline_rows(&[semantic], ConversationViewState::default());
+        assert_eq!(model.rows.len(), 1);
+        assert_eq!(model.projection.items.len(), 1);
+        let item = &model.projection.items[0];
+        assert!(matches!(
+            item.item,
+            TurnItem::AgentMessage {
+                phase: AgentMessagePhase::FinalAnswer,
+                ..
+            }
+        ));
+        assert_eq!(
+            item.html_publications,
+            vec![publication("first"), publication("second")]
+        );
+        assert!(model.projection.same_content(&replay.projection));
+        assert_eq!(model.projection.revision, replay.projection.revision);
+        assert!(
+            model
+                .rows
+                .iter()
+                .all(|row| !row.key.starts_with("html-publication::"))
+        );
+    }
 
     #[test]
     fn assistant_block_preserves_final_markdown_in_shared_projection() {
@@ -1069,6 +1182,7 @@ mod tests {
                 attachments: Vec::new(),
                 mode: ThreadMode::Message,
                 author: Some(TurnAuthorSnapshot {
+                    cli_runtime_kind: None,
                     actor: PersistedActorRef::Principal(alice.clone()),
                     display_name: "Alice".to_owned(),
                     nickname: "alice".to_owned(),
@@ -1103,6 +1217,7 @@ mod tests {
             started_at_unix_ms: Some(3),
             updated_at_unix_ms: Some(3),
             kind: TimelineBlockKind::AssistantMessage {
+                html_publications: Vec::new(),
                 item_id: "assistant_final".to_owned(),
                 text: "final **markdown**".to_owned(),
                 status: TurnWorkItemStatus::Completed,
@@ -1123,6 +1238,7 @@ mod tests {
             started_at_unix_ms: Some(2),
             updated_at_unix_ms: Some(3),
             kind: TimelineBlockKind::DetachedTaskRun {
+                codex_retry_notices: Vec::new(),
                 task: TaskTurnItem {
                     id: "task_anchor_a".to_owned(),
                     task_id: "task_a".to_owned(),
@@ -1174,6 +1290,7 @@ mod tests {
 
     fn work_payload(presentation: TurnWorkPresentation, work_count: u64) -> TurnWorkBlock {
         TurnWorkBlock {
+            html_publications: Vec::new(),
             turn_id: "turn_a".to_owned(),
             presentation,
             state: TurnWorkState::Completed,

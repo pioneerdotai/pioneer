@@ -33,6 +33,8 @@ proxy_hint = "Optional workspace-scoped proxy for this provider."
 replace_hint = "%{provider} के लिए पहले से एक कुंजी कॉन्फ़िगर है। सहेजने पर यह बदल जाएगी।"
 
 [providers.error]
+configure_failed = "%{provider} की सेटिंग सहेजी नहीं जा सकीं"
+disconnect_failed = "%{provider} की API कुंजी हटाई नहीं जा सकी"
 gateway_not_connected = "गेटवे कनेक्ट नहीं है।"
 workspace_not_selected = "कार्यक्षेत्र चयनित नहीं है."
 load_failed = "प्रोवाइडर कॉन्फ़िगरेशन लोड करने में विफल"
@@ -127,6 +129,12 @@ unsupported = "Unsupported"
 error = "Error"
 
 [providers.cli.error]
+settings_load_failed = "CLI प्रोवाइडर सेटिंग लोड नहीं की जा सकीं"
+settings_forbidden = "इस खाते को Gateway सेटिंग प्रबंधित करने की अनुमति नहीं है"
+login_failed = "%{runtime} के लिए लॉगिन शुरू नहीं हो सका"
+proxy_failed = "%{runtime} का प्रॉक्सी अपडेट नहीं हो सका"
+save_failed = "%{runtime} की सेटिंग सहेजी नहीं जा सकीं"
+enabled_failed = "%{runtime} को सक्षम या अक्षम नहीं किया जा सका"
 open_path_failed = "Open path failed"
 
 [providers.catalog.anthropic]
@@ -157,6 +165,18 @@ description = "Google AI के Gemini मॉडल"
 title = "GLM"
 description = "GLM और Zhipu-संगत मॉडल"
 
+[providers.catalog.zai]
+title = "Z.AI"
+description = "वैश्विक Z.AI API के ज़रिए GLM मॉडल"
+
+[providers.catalog.glm-coding]
+title = "GLM Coding Plan"
+description = "चीन के API के ज़रिए प्रोग्रामिंग के लिए GLM सदस्यता"
+
+[providers.catalog.zai-coding]
+title = "Z.AI Coding Plan"
+description = "वैश्विक Z.AI API के ज़रिए प्रोग्रामिंग के लिए GLM सदस्यता"
+
 [providers.catalog.groq]
 title = "Groq"
 description = "Groq हार्डवेयर पर तेज अनुमान"
@@ -180,6 +200,10 @@ description = "GPT और अन्य OpenAI मॉडल"
 [providers.catalog.openrouter]
 title = "OpenRouter"
 description = "कई मॉडल प्रदाताओं के लिए राउटर"
+
+[providers.catalog.vercel-ai-gateway]
+title = "Vercel AI Gateway"
+description = "Vercel AI Gateway के ज़रिए मॉडल का उपयोग करें"
 
 [providers.catalog.telnyx]
 title = "Telnyx"

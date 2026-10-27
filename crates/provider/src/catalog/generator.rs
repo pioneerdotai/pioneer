@@ -37,6 +37,39 @@ pub struct SourceResponse {
     pub error: Option<String>,
 }
 impl SourceSnapshot {
+    /// Only structurally usable, successful public sources participate in a
+    /// refresh. A failed source must not masquerade as an empty native listing.
+    pub(super) fn source_body(&self, url: &str) -> Option<&Value> {
+        let source = self.sources.get(url)?;
+        if source.status != 200 || source.error.is_some() || !source.body.is_object() {
+            return None;
+        }
+        let valid = if url == SOURCE_URLS[0] {
+            source.body.as_object().is_some_and(|providers| {
+                providers
+                    .values()
+                    .any(|provider| provider["models"].is_object())
+            })
+        } else {
+            source.body["data"]
+                .as_array()
+                .is_some_and(|models| !models.is_empty())
+        };
+        valid.then_some(&source.body)
+    }
+
+    fn validate_available(&self) -> Result<()> {
+        chrono::DateTime::parse_from_rfc3339(&self.captured_at)
+            .context("invalid source capture timestamp")?;
+        ensure!(
+            SOURCE_URLS
+                .iter()
+                .any(|url| self.source_body(url).is_some()),
+            "no usable model catalog sources"
+        );
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         chrono::DateTime::parse_from_rfc3339(&self.captured_at)
             .context("invalid source capture timestamp")?;
@@ -75,6 +108,17 @@ pub struct GeneratedCatalog {
     pub provenance: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_capabilities: Option<super::ToolCapabilities>,
+    /// Bounded public-source diagnostics; never contain credentials or raw bodies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<CatalogDiagnostic>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogDiagnostic {
+    pub source: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub code: String,
 }
 impl GeneratedCatalog {
     pub fn validate(&self) -> Result<()> {
@@ -112,7 +156,10 @@ impl GeneratedCatalog {
                 );
                 for field in ["input", "output", "cacheRead", "cacheWrite"] {
                     ensure!(
-                        model["cost"][field].as_f64().is_some_and(|v| v.is_finite()),
+                        model["cost"][field].is_null()
+                            || model["cost"][field]
+                                .as_f64()
+                                .is_some_and(|v| v.is_finite() && v >= 0.),
                         "invalid model pricing"
                     );
                 }
@@ -191,15 +238,20 @@ fn missing_or_falsy(value: &Value) -> bool {
     value.is_null() || value == false || value.as_f64() == Some(0.) || value == ""
 }
 fn source_price(value: &Value) -> Value {
-    if missing_or_falsy(value) {
-        json!(0)
-    } else {
-        value.clone()
-    }
+    value.clone()
 }
 fn cost(source: &Value) -> Value {
-    json!({"input":source_price(&source["input"]), "output":source_price(&source["output"]),
-        "cacheRead":source_price(&source["cache_read"]), "cacheWrite":source_price(&source["cache_write"])})
+    // Preserve tier conditions, TTL prices and non-token fees from the source.
+    let mut result = source.as_object().cloned().unwrap_or_default();
+    for (key, field) in [
+        ("input", "input"),
+        ("output", "output"),
+        ("cacheRead", "cache_read"),
+        ("cacheWrite", "cache_write"),
+    ] {
+        result.insert(key.into(), source_price(&source[field]));
+    }
+    Value::Object(result)
 }
 fn limit(value: &Value, fallback: u64, source: &str) -> (Value, LimitOrigin) {
     if missing_or_falsy(value) {
@@ -246,7 +298,8 @@ fn base(
         "sourceMetadata":source,
         "inputConstraints":source["inputConstraints"],
         "output":source["modalities"]["output"],
-        "cost":cost(&source["cost"]),"contextWindow":context,"maxTokens":output}),
+        "cost":cost(&source["cost"]),"pricingSource":{"url":SOURCE_URLS[0],"units":"USD_per_million_tokens","raw":source["cost"]},"contextWindow":context,"maxTokens":output,
+        "sourceGeneration":{"temperature":source["temperature"],"reasoningOptions":source["reasoning_options"]}}),
         context_origin,
         output_origin,
         reasoning_options: source["reasoning_options"].clone(),
@@ -255,43 +308,79 @@ fn base(
     }
 }
 
+/// Authority discovery and public refresh share these exact source facts.
+/// This function does not establish authentication, availability or eligibility.
+pub(crate) fn vercel_model(raw: &Value) -> Option<super::CatalogModel> {
+    let mut candidate = sources::vercel_model(raw)?;
+    compatibility::apply(&mut candidate);
+    serde_json::from_value(candidate.model).ok()
+}
+pub(crate) fn vercel_chat_eligible(raw: &Value) -> bool {
+    sources::vercel_chat_eligible(raw)
+}
+pub(crate) fn vercel_embedding_eligible(raw: &Value) -> bool {
+    raw["type"] == "embedding"
+        && raw["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty() && !id.ends_with("-batch"))
+}
+
 /// Full pinned-reference transformation, including dynamic entries not present
 /// in the saved fixture. First source wins identity collisions, as in Pi.
 pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCatalog> {
-    snapshot.validate()?;
-    let (mut candidates, specialized) = sources::models_dev(
-        &snapshot.sources[SOURCE_URLS[0]].body,
-        &snapshot.sources[SOURCE_URLS[3]].body,
-        strict,
-    )?;
-    candidates.extend(sources::openrouter(&snapshot.sources[SOURCE_URLS[1]].body));
-    candidates.extend(sources::vercel(&snapshot.sources[SOURCE_URLS[2]].body));
+    if strict {
+        snapshot.validate()?;
+    } else {
+        snapshot.validate_available()?;
+    }
+    let body = |url| snapshot.source_body(url).unwrap_or(&Value::Null);
+    let (mut candidates, specialized) =
+        sources::models_dev(body(SOURCE_URLS[0]), body(SOURCE_URLS[3]), strict)?;
+    candidates.extend(sources::openrouter(body(SOURCE_URLS[1])));
+    candidates.extend(sources::vercel(body(SOURCE_URLS[2])));
     candidates.retain(|m| {
         !(m.provider() == "xai" && rules::XAI_BUILTIN_EXCLUDED_MODEL_IDS.contains(&m.id())
             || matches!(m.provider(), "opencode" | "opencode-go")
                 && m.id() == "gpt-5.3-codex-spark")
     });
     overrides::apply(&mut candidates)?;
-    let supplements = sources::registered_supplements(
-        &snapshot.sources[SOURCE_URLS[0]].body,
-        &specialized,
-        &candidates,
-    );
+    let supplements =
+        sources::registered_supplements(body(SOURCE_URLS[0]), &specialized, &candidates);
     candidates.extend(supplements);
     for model in &mut candidates {
         compatibility::apply(model);
+        model.model["pricingEvidenceVersion"] = json!(1);
+        model.model["pricingCapturedAt"] = json!(snapshot.captured_at);
+        model.model["pricingUnits"] = json!(if model.provider() == "github-copilot" {
+            "unknown_subscription_units"
+        } else {
+            "USD_per_million_tokens"
+        });
     }
     compatibility::fallbacks(&mut candidates);
     let mut output = GeneratedCatalog {
         models: BTreeMap::new(),
         provenance: BTreeMap::new(),
         tool_capabilities: Some(sources::tool_capabilities(snapshot)),
+        diagnostics: SOURCE_URLS
+            .iter()
+            .filter(|url| snapshot.source_body(url).is_none())
+            .map(|url| CatalogDiagnostic {
+                source: (*url).into(),
+                provider: None,
+                model: None,
+                code: "source_unavailable".into(),
+            })
+            .collect(),
     };
     for candidate in candidates {
         let provider = candidate.provider().to_owned();
         let id = candidate.id().to_owned();
-        let entries = output.models.entry(provider.clone()).or_default();
-        if entries.contains_key(&id) {
+        if output
+            .models
+            .get(&provider)
+            .is_some_and(|entries| entries.contains_key(&id))
+        {
             continue;
         }
         let mut origins =
@@ -310,12 +399,73 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
                 },
             })?;
         }
+        // Validate each record through the same parser and pricing checks used
+        // for persisted catalogs. One malformed remote record cannot poison
+        // unrelated models, while strict fixture validation still fails closed.
+        let record = GeneratedCatalog {
+            models: BTreeMap::from([(
+                provider.clone(),
+                BTreeMap::from([(id.clone(), candidate.model.clone())]),
+            )]),
+            provenance: BTreeMap::from([(
+                provider.clone(),
+                BTreeMap::from([(id.clone(), origins.clone())]),
+            )]),
+            tool_capabilities: None,
+            diagnostics: vec![],
+        };
+        if let Err(error) = record.validate() {
+            if strict {
+                return Err(error.context("invalid catalog model record"));
+            }
+            // Cap diagnostic volume independently of the source byte budget.
+            if output.diagnostics.len() < 256 {
+                output.diagnostics.push(CatalogDiagnostic {
+                    source: candidate.model["pricingSource"]["url"]
+                        .as_str()
+                        .filter(|url| SOURCE_URLS.contains(url))
+                        .unwrap_or("unknown")
+                        .into(),
+                    provider: Some(provider.chars().take(256).collect()),
+                    model: Some(id.chars().take(256).collect()),
+                    code: "invalid_model_record".into(),
+                });
+            }
+            continue;
+        }
         output
             .provenance
-            .entry(provider)
+            .entry(provider.clone())
             .or_default()
             .insert(id.clone(), origins);
-        entries.insert(id, candidate.model);
+        output
+            .models
+            .entry(provider)
+            .or_default()
+            .insert(id, candidate.model);
+    }
+    // Fallback annotations were derived before quarantine. Do not retain a
+    // route (and its tariff) pointing at a rejected record.
+    let identities: std::collections::BTreeSet<_> = output
+        .models
+        .iter()
+        .flat_map(|(provider, models)| models.keys().map(move |id| (provider.clone(), id.clone())))
+        .collect();
+    for models in output.models.values_mut() {
+        for model in models.values_mut() {
+            if let Some(fallbacks) = model
+                .get_mut("compat")
+                .and_then(|compat| compat.get_mut("allowedFallbackModels"))
+                .and_then(Value::as_array_mut)
+            {
+                fallbacks.retain(|fallback| {
+                    identities.contains(&(
+                        text(&fallback["provider"]).into(),
+                        text(&fallback["model"]).into(),
+                    ))
+                });
+            }
+        }
     }
     output.validate()?;
     Ok(output)
@@ -348,6 +498,35 @@ mod tests {
             (a, b) => out.push(format!("{path}: actual {a}; expected {b}")),
         }
     }
+
+    fn project_pinned_cost_fields(actual: &mut Value, expected: &Value, raw: &Value) {
+        let prices = actual.as_object_mut().unwrap();
+        // Only source-backed additions absent from Pi's normalized contract
+        // may be projected out. Changed known rates still reach differences.
+        for (field, value) in prices.iter() {
+            if expected.get(field).is_none() {
+                assert_eq!(
+                    raw.get(field),
+                    Some(value),
+                    "additional cost field {field} must retain its exact source value"
+                );
+            }
+        }
+        prices.retain(|field, _| expected.get(field).is_some());
+    }
+    #[test]
+    fn missing_source_price_is_unknown_and_explicit_zero_is_free() {
+        let c = cost(
+            &json!({"input":2,"output":0,"tiers":[{"tier":{"type":"context","size":200000},"input":4}]}),
+        );
+        assert_eq!(c["input"], 2);
+        assert_eq!(c["output"], 0);
+        assert!(c["cacheRead"].is_null());
+        assert!(c["cacheWrite"].is_null());
+        assert_eq!(c["tiers"][0]["tier"]["size"], 200000);
+        assert_eq!(source_price(&json!(false)), false);
+    }
+
     #[test]
     fn separate_input_limit_reaches_runtime_without_changing_pi_model_fields() {
         let mut source = snapshot();
@@ -375,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_non_media_catalog_contract_matches_pi_reference() {
+    fn pinned_non_media_catalog_preserves_pi_contract_and_distinguishes_unknown_pricing() {
         let mut generated = generate(&snapshot(), true).unwrap();
         // Pioneer exposes standard CN/global profiles as well as Pi's coding
         // plans. The supplements are verified against their own source below.
@@ -383,11 +562,25 @@ mod tests {
             assert!(generated.models.remove(supplement).is_some());
             assert!(generated.provenance.remove(supplement).is_some());
         }
-        let reference: Value =
+        // Pi's explicit DeepSeek definitions predate the pinned source snapshot.
+        // Pioneer keeps source limits/modalities/prices authoritative. This
+        // explicit golden overlay covers the full changed provider subtree,
+        // including the source-only alias, without dropping it from comparison.
+        let deepseek: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/catalog/pioneer-deepseek.json"
+        ))
+        .unwrap();
+        let mut reference: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/provenance.json"))
                 .unwrap();
+        reference["deepseek"] = deepseek["provenance"].clone();
         let mut origins = Vec::new();
         for (p, models) in &generated.provenance {
+            // The independent Vercel contract tests below replace this old
+            // Anthropic-profile golden, including its obsolete limit override.
+            if p == "vercel-ai-gateway" || reference.get(p).is_none() {
+                continue;
+            }
             for (id, fields) in models {
                 for field in ["contextWindow", "maxTokens"] {
                     if reference[p][id].is_null() {
@@ -407,33 +600,162 @@ mod tests {
             "origin differences:\n{}",
             origins.join("\n")
         );
-        let mut actual = serde_json::to_value(generated.models).unwrap();
-        let expected: Value =
+        let unprojected = serde_json::to_value(generated.models).unwrap();
+        let mut actual = unprojected.clone();
+        let mut expected: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
+        expected["deepseek"] = deepseek["models"].clone();
+        // Preserve the old reader fixture while the generator fixes 3.1 Pro.
+        for models in expected.as_object_mut().unwrap().values_mut() {
+            for model in models.as_object_mut().unwrap().values_mut() {
+                if model["api"] == "google-generative-ai"
+                    && model["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("gemini-3.1-pro"))
+                {
+                    model["thinkingLevelMap"]["medium"] = json!("MEDIUM");
+                }
+            }
+        }
         // Compare the pinned Pi surface, which deliberately had text/image
         // only. Pioneer media supplements and new registered source routes
         // have their own propagation fixtures below.
+        // The Pi fixture collapsed missing prices into zero. Keep every
+        // known price under exact comparison; allow unknown only when the
+        // source omitted that exact category.
+        let captured_at = snapshot().captured_at;
+        actual.as_object_mut().unwrap().remove("vercel-ai-gateway");
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("vercel-ai-gateway");
         let providers = actual.as_object_mut().unwrap();
-        providers.retain(|p, _| !expected[p].is_null());
-        for (p, models) in providers {
+        providers.retain(|provider, _| !expected[provider].is_null());
+        for (provider, models) in providers {
             models
                 .as_object_mut()
                 .unwrap()
-                .retain(|id, _| !expected[p][id].is_null());
-            for model in models.as_object_mut().unwrap().values_mut() {
+                .retain(|id, _| !expected[provider][id].is_null());
+            for (id, model) in models.as_object_mut().unwrap() {
+                // The Pi fixture predates the media contract and supplements.
                 let image = has(&model["input"], "image");
                 model["input"] = if image {
                     json!(["text", "image"])
                 } else {
                     json!(["text"])
                 };
+
+                let source = model.get("pricingSource").cloned().unwrap_or(Value::Null);
+                if model.get("pricingEvidenceVersion").is_some() {
+                    assert_eq!(model["pricingEvidenceVersion"], 1);
+                    assert_eq!(model["pricingCapturedAt"], captured_at);
+                    assert_eq!(
+                        model["pricingUnits"],
+                        if provider == "github-copilot" {
+                            json!("unknown_subscription_units")
+                        } else {
+                            json!("USD_per_million_tokens")
+                        }
+                    );
+                }
                 for field in [
+                    "pricingSource",
+                    "pricingEvidenceVersion",
+                    "pricingCapturedAt",
+                    "pricingUnits",
+                    "sourceGeneration",
                     "inputOrigin",
                     "sourceMetadata",
                     "inputConstraints",
                     "output",
                 ] {
                     model.as_object_mut().unwrap().remove(field);
+                }
+                let reference = &expected[provider][id]["cost"];
+                if let (Some(fallbacks), Some(old)) = (
+                    model
+                        .get_mut("compat")
+                        .and_then(|compat| compat.get_mut("allowedFallbackModels"))
+                        .and_then(Value::as_array_mut),
+                    expected[provider][id]["compat"]["allowedFallbackModels"].as_array(),
+                ) {
+                    assert_eq!(fallbacks.len(), old.len());
+                    for (fallback, old) in fallbacks.iter_mut().zip(old) {
+                        let canonical = &unprojected[fallback["provider"].as_str().unwrap()]
+                            [fallback["model"].as_str().unwrap()];
+                        assert_eq!(fallback["cost"], canonical["cost"]);
+                        project_pinned_cost_fields(
+                            &mut fallback["cost"],
+                            &old["cost"],
+                            &canonical["pricingSource"]["raw"],
+                        );
+                    }
+                }
+                let prices = model["cost"].as_object_mut().unwrap();
+                // Native source fields remain in production; the old fixture
+                // compares normalized fields only. Separate tests assert their
+                // retention and conservative handling of opaque tier conditions.
+                prices.retain(|key, _| reference.get(key).is_some());
+                for (field, native) in [
+                    ("input", "input"),
+                    ("output", "output"),
+                    ("cacheRead", "cache_read"),
+                    ("cacheWrite", "cache_write"),
+                ] {
+                    if provider == "openrouter"
+                        && matches!(id.as_str(), "openrouter/auto" | "openrouter/auto-beta")
+                        && matches!(field, "input" | "output")
+                    {
+                        let native = if field == "input" {
+                            "prompt"
+                        } else {
+                            "completion"
+                        };
+                        assert_eq!(source["raw"][native], "-1");
+                        assert_eq!(
+                            source["unknownRateContract"]["reason"],
+                            "dynamic_selected_model_tariff"
+                        );
+                        assert_eq!(prices[field], Value::Null);
+                        assert_eq!(reference[field], -1_000_000);
+                        // Comparison-only projection of the exact old sentinel.
+                        prices.insert(field.into(), reference[field].clone());
+                    }
+                    if prices.get(field) == Some(&Value::Null)
+                        && reference[field].as_f64() == Some(0.)
+                    {
+                        let router = match field {
+                            "input" => "prompt",
+                            "output" => "completion",
+                            "cacheRead" => "input_cache_read",
+                            _ => "input_cache_write",
+                        };
+                        assert!(
+                            source["raw"][native].is_null() && source["raw"][router].is_null(),
+                            "{provider}/{id}/{field}: explicit zero must not become unknown"
+                        );
+                        prices.insert(field.into(), reference[field].clone());
+                    }
+                }
+                if let (Some(tiers), Some(old)) = (
+                    prices.get_mut("tiers").and_then(Value::as_array_mut),
+                    reference["tiers"].as_array(),
+                ) {
+                    assert_eq!(tiers.len(), old.len());
+                    for (index, (tier, old)) in tiers.iter_mut().zip(old).enumerate() {
+                        project_pinned_cost_fields(tier, old, &source["raw"]["tiers"][index]);
+                        for (field, native) in [
+                            ("input", "input"),
+                            ("output", "output"),
+                            ("cacheRead", "cache_read"),
+                            ("cacheWrite", "cache_write"),
+                        ] {
+                            if tier[field].is_null() && old[field].as_f64() == Some(0.) {
+                                assert!(source["raw"][native].is_null());
+                                tier[field] = old[field].clone();
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -573,11 +895,24 @@ mod behavior_tests {
         for url in SOURCE_URLS {
             let mut source = snapshot();
             source.sources.get_mut(url).unwrap().status = 503;
-            assert!(generate(&source, false).is_err());
+            assert!(generate(&source, true).is_err());
+            let output = generate(&source, false).unwrap();
+            assert!(
+                output
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.source == url && d.code == "source_unavailable")
+            );
             let mut source = snapshot();
             source.sources.get_mut(url).unwrap().body = json!({});
-            assert!(generate(&source, false).is_err());
+            assert!(generate(&source, true).is_err());
+            assert!(generate(&source, false).is_ok());
+            source.sources.remove(url);
+            assert!(generate(&source, false).is_ok());
         }
+        let mut source = snapshot();
+        source.sources.clear();
+        assert!(generate(&source, false).is_err());
     }
     #[test]
     fn source_filters_aliases_and_endpoint_routing_are_dynamic() {
@@ -634,6 +969,35 @@ mod behavior_tests {
 mod validation_tests {
     use super::*;
     #[test]
+    fn quarantine_removes_fallback_routes_to_invalid_models() {
+        let mut snapshot: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        let models = snapshot.sources.get_mut(SOURCE_URLS[0]).unwrap().body["anthropic"]["models"]
+            .as_object_mut()
+            .unwrap();
+        let mut template = models
+            .values()
+            .find(|model| model["tool_call"] == true)
+            .unwrap()
+            .clone();
+        template["cost"]["input"] = json!(1.);
+        models.insert("claude-fable-5".into(), template.clone());
+        template["cost"]["input"] = json!(true);
+        models.insert("claude-opus-4-8".into(), template);
+        let output = generate(&snapshot, false).unwrap();
+        assert!(!output.models["anthropic"].contains_key("claude-opus-4-8"));
+        let fallbacks =
+            &output.models["anthropic"]["claude-fable-5"]["compat"]["allowedFallbackModels"];
+        assert!(
+            !fallbacks
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|entry| entry["model"] == "claude-opus-4-8")
+        );
+    }
+    #[test]
     fn malformed_source_cost_is_rejected_instead_of_coerced_to_zero() {
         for invalid in [json!(true), json!("bad-price"), json!([1])] {
             let mut snapshot: SourceSnapshot =
@@ -643,6 +1007,184 @@ mod validation_tests {
                 json!({"tool_call":true,"cost":{"input":invalid}});
             assert!(generate(&snapshot, true).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod dynamic_pricing_regressions {
+    use super::*;
+    fn pinned() -> SourceSnapshot {
+        serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json")).unwrap()
+    }
+    #[test]
+    fn jev_router_unknown_tariff_does_not_poison_other_providers() {
+        let mut source = pinned();
+        let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+            .as_array_mut()
+            .unwrap();
+        let mut router = entries
+            .iter()
+            .find(|model| model["id"] == "openrouter/auto")
+            .unwrap()
+            .clone();
+        router["id"] = json!("typesafe/jev-router");
+        router["name"] = json!("Jev Router");
+        // Actual outage shape: a new router with -1 input/output tariffs.
+        entries.push(router);
+        let output = generate(&source, false).unwrap();
+        output.validate().unwrap();
+        assert!(output.models["openai"].contains_key("gpt-5-nano"));
+        assert!(!output.models["deepseek"].is_empty());
+        assert!(output.models["openrouter"].contains_key("openrouter/auto"));
+        assert!(!output.models["openrouter"].contains_key("typesafe/jev-router"));
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.model.as_deref() == Some("typesafe/jev-router")
+                    && d.code == "invalid_model_record")
+        );
+        assert!(generate(&source, true).is_err());
+    }
+    #[test]
+    fn full_pinned_generation_accepts_documented_auto_unknown_at_both_strictness_levels() {
+        let strict_output = generate(&pinned(), true).unwrap();
+        for strict in [true, false] {
+            let output = generate(&pinned(), strict).unwrap();
+            assert_eq!(output.models, strict_output.models);
+            assert_eq!(output.provenance, strict_output.provenance);
+            output.validate().unwrap();
+            for id in ["openrouter/auto", "openrouter/auto-beta"] {
+                let m = &output.models["openrouter"][id];
+                assert!(m["cost"]["input"].is_null());
+                assert!(m["cost"]["output"].is_null());
+                assert_eq!(m["pricingSource"]["raw"]["prompt"], "-1");
+                assert_eq!(m["pricingSource"]["raw"]["completion"], "-1");
+                assert_eq!(
+                    m["pricingSource"]["unknownRateContract"]["reason"],
+                    "dynamic_selected_model_tariff"
+                );
+                assert_eq!(m["api"], "openai-completions");
+            }
+        }
+    }
+    #[test]
+    fn sentinel_exception_never_allows_other_negative_or_malformed_rates() {
+        for strict in [true, false] {
+            for value in [
+                json!("-2"),
+                json!(-2),
+                json!("NaN"),
+                json!("inf"),
+                json!("1e308"),
+                json!(1e308),
+                json!("bad"),
+                json!(false),
+            ] {
+                let mut source = pinned();
+                let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+                    .as_array_mut()
+                    .unwrap();
+                let auto = entries
+                    .iter_mut()
+                    .find(|m| m["id"] == "openrouter/auto")
+                    .unwrap();
+                auto["pricing"]["prompt"] = value;
+                if strict {
+                    assert!(generate(&source, true).is_err());
+                } else {
+                    let output = generate(&source, false).unwrap();
+                    assert!(!output.diagnostics.is_empty());
+                    assert!(!output.models["openrouter"].contains_key("openrouter/auto"));
+                    assert!(!output.models["openai"].is_empty());
+                }
+            }
+            let mut source = pinned();
+            let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+                .as_array_mut()
+                .unwrap();
+            let auto = entries
+                .iter()
+                .find(|m| m["id"] == "openrouter/auto")
+                .unwrap()
+                .clone();
+            let mut unsupported = auto;
+            unsupported["id"] = json!("fixture/unknown-sentinel");
+            entries.push(unsupported);
+            if strict {
+                assert!(generate(&source, true).is_err());
+            } else {
+                let output = generate(&source, false).unwrap();
+                assert!(!output.models["openrouter"].contains_key("fixture/unknown-sentinel"));
+                assert!(
+                    output
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.model.as_deref() == Some("fixture/unknown-sentinel"))
+                );
+            }
+        }
+    }
+    #[test]
+    fn unsupported_source_and_cache_sentinels_are_still_invalid() {
+        let mut source = pinned();
+        let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+            .as_array_mut()
+            .unwrap();
+        let auto = entries
+            .iter_mut()
+            .find(|m| m["id"] == "openrouter/auto")
+            .unwrap();
+        auto["pricing"]["input_cache_read"] = json!("-1");
+        assert!(generate(&source, true).is_err());
+        let output = generate(&source, false).unwrap();
+        assert!(!output.models["openrouter"].contains_key("openrouter/auto"));
+        let mut source = pinned();
+        let entries = source.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"]
+            .as_array_mut()
+            .unwrap();
+        let mut model = entries
+            .iter()
+            .find(|m| {
+                m["tags"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|tag| tag == "tool-use"))
+            })
+            .unwrap()
+            .clone();
+        model["id"] = json!("fixture/negative-vercel");
+        model["pricing"]["input"] = json!("-1");
+        entries.push(model);
+        assert!(generate(&source, true).is_err());
+        let output = generate(&source, false).unwrap();
+        assert!(!output.models["vercel-ai-gateway"].contains_key("fixture/negative-vercel"));
+    }
+    #[test]
+    fn explicit_free_zero_preserves_entire_nonpricing_contract() {
+        let source = pinned();
+        let baseline = generate(&source, true).unwrap();
+        let mut free = source;
+        let auto = free.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|m| m["id"] == "openrouter/auto")
+            .unwrap();
+        auto["pricing"]["prompt"] = json!("0");
+        auto["pricing"]["completion"] = json!("0");
+        let output = generate(&free, true).unwrap();
+        assert_eq!(
+            output.models["openrouter"]["openrouter/auto"]["cost"]["input"],
+            0.
+        );
+        let mut before = baseline.models["openrouter"]["openrouter/auto"].clone();
+        let mut after = output.models["openrouter"]["openrouter/auto"].clone();
+        for field in ["cost", "pricingSource"] {
+            before.as_object_mut().unwrap().remove(field);
+            after.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(before, after);
+        assert_eq!(baseline.provenance, output.provenance);
     }
 }
 
@@ -674,7 +1216,7 @@ mod media_propagation_tests {
         snapshot.sources.get_mut(SOURCE_URLS[0]).unwrap().body["groq"]["models"]["fixture-unknown"] =
             json!({"tool_call":true});
         snapshot.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/media","name":"media fixture","supported_parameters":["tools"],"architecture":{"input_modalities":input,"output_modalities":["text","audio"]}}));
-        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/media","tags":["tool-use"],"input_modalities":input,"output_modalities":["text","audio"]}));
+        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/media","type":"language","tags":["tool-use"],"input_modalities":input,"output_modalities":["text","audio"]}));
         let generated = generate(&snapshot, true).unwrap();
         generated.validate().unwrap();
         for (provider, id) in [
@@ -724,8 +1266,8 @@ mod partial_source_tests {
         snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"]
             .as_array_mut()
             .unwrap()
-            .push(json!({"id":"fixture/vision-tag","tags":["tool-use","vision"]}));
-        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/vision-array","tags":["tool-use","vision"],"input_modalities":["text","image"]}));
+            .push(json!({"id":"fixture/vision-tag","type":"language","output_modalities":["text"],"tags":["tool-use","vision"]}));
+        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/vision-array","type":"language","output_modalities":["text"],"tags":["tool-use","vision"],"input_modalities":["text","image"]}));
         let generated = generate(&snapshot, true).unwrap();
         let catalog = ModelCatalog::parse(
             &serde_json::to_string(&generated.models).unwrap(),
@@ -806,36 +1348,41 @@ mod specialized_zero_regressions {
         let mut s: SourceSnapshot =
             serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
                 .unwrap();
-        let reference: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
         let changed = json!({"tool_call":true,"name":"dynamic","modalities":{"input":["text"]},"cost":{"input":99,"output":99},"limit":{"context":64000,"output":4000}});
         s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["deepseek-v4-flash"] =
+            changed.clone();
+        s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["anthropic"]["models"]["claude-opus-4-6"] =
             changed.clone();
         s.sources.get_mut(SOURCE_URLS[0]).unwrap().body["deepseek"]["models"]["fixture-dynamic"] =
             changed;
         let generated = generate(&s, true).unwrap();
         let known = &generated.models["deepseek"]["deepseek-v4-flash"];
-        for field in ["contextWindow", "maxTokens"] {
-            assert_eq!(
-                known[field],
-                reference["deepseek"]["deepseek-v4-flash"][field]
-            );
-        }
-        // Numeric JSON representations such as 0 and 0.0 carry the same rate.
-        // Compare all pinned cost fields without dropping any pricing evidence.
-        let expected_cost = reference["deepseek"]["deepseek-v4-flash"]["cost"]
-            .as_object()
-            .unwrap();
-        let actual_cost = known["cost"].as_object().unwrap();
+        // DeepSeek's existing IDs, like new IDs, are source-owned. Do not
+        // reintroduce stale pinned limits/prices to exercise override priority.
+        assert_eq!(known["contextWindow"], 64000);
+        assert_eq!(known["maxTokens"], 4000);
+        // The source supplies input/output rates only; missing cache rates
+        // remain unknown rather than being interpreted as free caching.
         assert_eq!(
-            actual_cost.keys().collect::<Vec<_>>(),
-            expected_cost.keys().collect::<Vec<_>>()
+            known["cost"],
+            json!({"input":99,"output":99,"cacheRead":null,"cacheWrite":null})
         );
-        for (field, expected) in expected_cost {
-            assert_eq!(actual_cost[field].as_f64(), expected.as_f64(), "{field}");
-        }
         assert_eq!(
             generated.provenance["deepseek"]["deepseek-v4-flash"]["contextWindow"]["kind"],
+            "source"
+        );
+        // A genuine explicit context override retains priority, while the
+        // independently source-owned output limit continues to refresh.
+        assert_eq!(
+            generated.models["anthropic"]["claude-opus-4-6"]["contextWindow"],
+            1_000_000
+        );
+        assert_eq!(
+            generated.models["anthropic"]["claude-opus-4-6"]["maxTokens"],
+            4000
+        );
+        assert_eq!(
+            generated.provenance["anthropic"]["claude-opus-4-6"]["contextWindow"]["kind"],
             "override"
         );
         let dynamic = &generated.models["deepseek"]["fixture-dynamic"];
@@ -916,5 +1463,176 @@ mod specialized_zero_regressions {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod vercel_contract_tests {
+    use super::*;
+
+    // Hand-authored API-contract cases, not recorded inference responses.
+    #[test]
+    fn vercel_route_modalities_controls_and_price_preserve_source_facts() {
+        for (options, off, high) in [
+            (
+                json!([{"type":"effort","values":["low","high"]}]),
+                None,
+                Some("high"),
+            ),
+            (
+                json!([{"type":"toggle"},{"type":"effort","values":["none","medium"]}]),
+                Some("none"),
+                None,
+            ),
+            (json!([{"type":"effort","values":["low"]}]), None, None),
+            (json!([{"type":"toggle"}]), Some("none"), None),
+            (Value::Null, None, None),
+        ] {
+            let raw = json!({"id":"private/gpt-6-astra-claude-opus-5","type":"language","tags":["tool-use"],
+                "modalities":{"input":["text","image","pdf"],"output":["text"]},
+                "input_modalities":["text"],"context_window":123456,"max_tokens":5432,
+                "temperature":false,"reasoning_options":options,"pricing":{"input":"0.000002","output":"0.000006"}});
+            let model = vercel_model(&raw).unwrap();
+            assert!(vercel_chat_eligible(&raw));
+            assert_eq!(model.id, "private/gpt-6-astra-claude-opus-5");
+            assert_eq!(model.api, "openai-responses");
+            assert_eq!(model.base_url, "https://ai-gateway.vercel.sh/v1");
+            assert_eq!(model.input, ["text", "image", "pdf"]);
+            assert_eq!(model.context_window, 123456);
+            assert_eq!(model.max_tokens, 5432);
+            assert_eq!(
+                model.metadata["vercelLimitOrigins"]["contextWindow"]["kind"],
+                "source"
+            );
+            assert_eq!(model.cost["input"], 2.0);
+            assert_eq!(model.cost["output"], 6.0);
+            assert!(model.cost["cacheRead"].is_null());
+            assert_eq!(
+                model.metadata["sourceGeneration"]["reasoningOptions"],
+                options
+            );
+            assert_eq!(model.metadata["compat"]["supportsTemperature"], false);
+            let map = model
+                .metadata
+                .get("thinkingLevelMap")
+                .unwrap_or(&Value::Null);
+            assert_eq!(map["off"].as_str(), off);
+            assert_eq!(map["high"].as_str(), high);
+            assert!(map["max"].is_null());
+        }
+    }
+
+    #[test]
+    fn vercel_legacy_unknown_and_sync_eligibility_are_distinct() {
+        let mut raw = json!({"id":"creator/model","type":"language","tags":["tool-use"],
+            "input_modalities":["text","image"],"output_modalities":["text"]});
+        assert!(vercel_chat_eligible(&raw));
+        let legacy = vercel_model(&raw).unwrap();
+        assert!(legacy.input_is_known());
+        assert_eq!(
+            legacy.metadata["vercelLimitOrigins"]["contextWindow"]["kind"],
+            "fallback"
+        );
+        assert_eq!(
+            legacy.metadata["vercelLimitOrigins"]["maxTokens"]["kind"],
+            "fallback"
+        );
+        assert!(
+            legacy.metadata["inputOrigin"]["expression"]
+                .as_str()
+                .unwrap()
+                .contains("legacy")
+        );
+        raw["modalities"] = json!({"input":[],"output":["text"]});
+        assert!(vercel_model(&raw).unwrap().input.is_empty());
+        for (id, kind, tags, expected) in [
+            (
+                "creator/model-batch",
+                "language",
+                json!(["tool-use"]),
+                false,
+            ),
+            (
+                "creator/realtime-model",
+                "realtime",
+                json!(["tool-use"]),
+                false,
+            ),
+            (
+                "private/realtime-analysis",
+                "language",
+                json!(["tool-use"]),
+                true,
+            ),
+            ("creator/model", "realtime", json!(["tool-use"]), false),
+            ("creator/model", "language", json!([]), false),
+            ("creator/embed", "embedding", json!([]), false),
+        ] {
+            raw["id"] = json!(id);
+            raw["type"] = json!(kind);
+            raw["tags"] = tags;
+            assert_eq!(vercel_chat_eligible(&raw), expected);
+            assert_eq!(vercel_embedding_eligible(&raw), kind == "embedding");
+        }
+        // Registering the provider must not let generic models.dev supplements
+        // refill native entries excluded from the synchronous Vercel route.
+        let mut source: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        source.sources.get_mut(SOURCE_URLS[0]).unwrap().body["vercel-ai-gateway"]["models"]["creator/model-batch"] = json!({
+            "tool_call":true,"modalities":{"input":["text"]},"limit":{"context":32000,"output":4000}
+        });
+        source.sources.get_mut(SOURCE_URLS[2]).unwrap().body = json!({"data":[{
+            "id":"creator/model-batch","type":"language","tags":["tool-use"],
+            "modalities":{"input":["text"],"output":["text"]}
+        }]});
+        let generated = generate(&source, true).unwrap();
+        assert!(
+            generated
+                .models
+                .get("vercel-ai-gateway")
+                .is_none_or(|models| !models.contains_key("creator/model-batch"))
+        );
+    }
+
+    #[test]
+    fn private_discovery_reasoning_survives_public_enrichment_without_model_entry() {
+        let catalog = super::super::tool_tests::generated_catalog();
+        let mut model = super::super::tool_tests::discovered("private/opaque", Some(true));
+        model.provider = "vercel-ai-gateway".into();
+        let reasoning = pioneer_protocol::ProviderModelReasoningCapabilities {
+            supported: Some(true),
+            effort_options: vec!["low".into()],
+            source: Some(pioneer_protocol::ReasoningCapabilitySource::ProviderMetadata),
+            ..Default::default()
+        };
+        model.capabilities.reasoning = Some(reasoning.clone());
+        catalog.enrich("vercel-ai-gateway", std::slice::from_mut(&mut model));
+        assert_eq!(model.capabilities.reasoning, Some(reasoning));
+    }
+
+    #[test]
+    fn stale_vercel_snapshot_does_not_discard_other_providers() {
+        let generated = generate(
+            &serde_json::from_str::<SourceSnapshot>(include_str!(
+                "../../tests/fixtures/catalog/sources.json"
+            ))
+            .unwrap(),
+            true,
+        )
+        .unwrap();
+        let mut models = generated.models;
+        let vercel = models.get_mut("vercel-ai-gateway").unwrap();
+        let (id, model) = vercel.iter_mut().next().unwrap();
+        let id = id.clone();
+        model["api"] = json!("anthropic-messages");
+        model["baseUrl"] = json!("https://ai-gateway.vercel.sh");
+        let catalog = ModelCatalog::parse(
+            &serde_json::to_string(&models).unwrap(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        assert!(catalog.model("vercel-ai-gateway", &id).is_none());
+        assert!(catalog.model("openai", "gpt-5-nano").is_some());
     }
 }

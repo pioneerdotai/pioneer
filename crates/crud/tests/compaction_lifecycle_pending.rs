@@ -19,7 +19,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-const TRACKING: &str = "m20261004_000004_compaction_lifecycle_pending";
+const TRACKING: &str = "m20261008_000004_compaction_lifecycle_pending";
 const NOW: i64 = 2_000_000_000_000;
 
 // Exercise this migration's schema without applying later irreversible changes.
@@ -1771,7 +1771,7 @@ async fn lifecycle_migration_partial_ddl_rollback_retry_and_down_up_trust_termin
             .is_err()
     );
     assert_eq!(scalar(&store, "SELECT count(*) n FROM sqlite_master WHERE (name LIKE 'compaction_lifecycle_%' OR name LIKE 'idx_compaction_lifecycle_%') AND name <> 'compaction_lifecycle_compaction_operation_delete'").await, 0);
-    assert_eq!(scalar(&store, "SELECT count(*) n FROM seaql_migrations WHERE version='m20261004_000004_compaction_lifecycle_pending'").await, 0);
+    assert_eq!(scalar(&store, "SELECT count(*) n FROM seaql_migrations WHERE version='m20261008_000004_compaction_lifecycle_pending'").await, 0);
     db.execute_unprepared(&format!("DROP TRIGGER {collision}"))
         .await
         .unwrap();
@@ -1779,7 +1779,7 @@ async fn lifecycle_migration_partial_ddl_rollback_retry_and_down_up_trust_termin
         .run_migrations::<LifecycleFixtureMigrator>(SqliteWriteClass::Maintenance, None)
         .await
         .unwrap();
-    assert_eq!(scalar(&store, "SELECT count(*) n FROM seaql_migrations WHERE version='m20261004_000004_compaction_lifecycle_pending'").await, 1);
+    assert_eq!(scalar(&store, "SELECT count(*) n FROM seaql_migrations WHERE version='m20261008_000004_compaction_lifecycle_pending'").await, 1);
     expand_all(&store, NOW).await;
     assert!(row(&store, "old-terminal").await.is_none());
     assert!(row(&store, "old-running").await.is_some());
@@ -1787,7 +1787,7 @@ async fn lifecycle_migration_partial_ddl_rollback_retry_and_down_up_trust_termin
     LifecycleFixtureMigrator::down(&*tx, Some(1)).await.unwrap();
     tx.commit().await.unwrap();
     assert_eq!(scalar(&store, "SELECT count(*) n FROM sqlite_master WHERE name LIKE 'compaction_lifecycle_%' OR name LIKE 'idx_compaction_lifecycle_%'").await, 0);
-    assert_eq!(scalar(&store, "SELECT count(*) n FROM seaql_migrations WHERE version='m20261004_000004_compaction_lifecycle_pending'").await, 0);
+    assert_eq!(scalar(&store, "SELECT count(*) n FROM seaql_migrations WHERE version='m20261008_000004_compaction_lifecycle_pending'").await, 0);
     writer
         .run_migrations::<LifecycleFixtureMigrator>(SqliteWriteClass::Maintenance, None)
         .await

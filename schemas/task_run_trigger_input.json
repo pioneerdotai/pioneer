@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskRunTriggerInput",
+  "type": "object",
+  "properties": {
+    "body": {
+      "type": "string"
+    },
+    "contentType": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "encoding": {
+      "$ref": "#/$defs/TaskRunInputEncoding"
+    }
+  },
+  "required": [
+    "encoding",
+    "body"
+  ],
+  "$defs": {
+    "TaskRunInputEncoding": {
+      "type": "string",
+      "enum": [
+        "utf8",
+        "base64"
+      ]
+    }
+  }
+}

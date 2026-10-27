@@ -35,6 +35,13 @@ pub struct Conversation {
 }
 
 impl Conversation {
+    pub(crate) fn turn_phase_marker(
+        &self,
+        turn_id: &str,
+    ) -> Option<std::sync::Arc<self::reducer::TurnPhase>> {
+        self.projector.turn_phase_marker(turn_id).cloned()
+    }
+
     pub(crate) fn snapshot_copy(&self) -> Self {
         Self {
             thread_id: self.thread_id.clone(),

@@ -8,17 +8,21 @@ use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 const NOW: i64 = 4_000_000_000;
 
-// Gateway setup reads the current Turn, including nullable plugin selections.
-// Keep that schema prefix, excluding later irreversible migrations before rollback.
-struct FanoutCutoverFixtureMigrator;
-impl MigratorTrait for FanoutCutoverFixtureMigrator {
+const FANOUT_MIGRATION: &str = "m20261008_000007_task_event_fanout_pending";
+
+// Bootstrap uses the complete production schema. This rollback-only registry
+// places fanout last so down(1) removes just the feature under test, preserving
+// the schema required by today's identity, authorization and Task CRUD paths.
+struct FanoutRollbackFixtureMigrator;
+impl MigratorTrait for FanoutRollbackFixtureMigrator {
     fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
         let mut migrations = Migrator::migrations();
         let target = migrations
             .iter()
-            .position(|migration| migration.name() == "m20261005_000001_plugin_ownership")
-            .expect("plugin selection migration remains registered");
-        migrations.truncate(target + 1);
+            .position(|migration| migration.name() == FANOUT_MIGRATION)
+            .expect("fanout migration remains registered");
+        let fanout = migrations.remove(target);
+        migrations.push(fanout);
         migrations
     }
 }
@@ -591,10 +595,7 @@ async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_even
     let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
     options.max_connections(1).sqlx_logging(false);
     let writer = Database::connect(options).await.unwrap();
-    let (_, _, workspace) = setup_workspace_manager_with_connection_migrator::<
-        FanoutCutoverFixtureMigrator,
-    >(writer.clone())
-    .await;
+    let (_, _, workspace) = setup_workspace_manager_with_connection(writer.clone()).await;
     writer
         .execute_unprepared("PRAGMA journal_mode=WAL")
         .await
@@ -635,20 +636,32 @@ async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_even
         ))
     };
     let processor = make_processor();
-    let migrations = FanoutCutoverFixtureMigrator::migrations();
-    let boundary = migrations
-        .iter()
-        .position(|m| m.name() == "m20261004_000008_task_event_fanout_pending")
-        .unwrap();
+    assert_eq!(
+        FanoutRollbackFixtureMigrator::migrations()
+            .last()
+            .unwrap()
+            .name(),
+        FANOUT_MIGRATION
+    );
     let tx = store
         .with_maintenance_access()
         .database_connection()
         .begin()
         .await
         .unwrap();
-    FanoutCutoverFixtureMigrator::down(&*tx, Some((migrations.len() - boundary) as u32))
+    FanoutRollbackFixtureMigrator::down(&*tx, Some(1))
         .await
         .unwrap();
+    assert_eq!(
+        Migrator::get_pending_migrations_read_only(&*tx)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|migration| migration.name().to_owned())
+            .collect::<Vec<_>>(),
+        vec![FANOUT_MIGRATION.to_owned()],
+        "cutover must retain every unrelated migration required by current Gateway code"
+    );
     tx.commit().await.unwrap();
     create(&processor, &workspace, "cutover-old").await;
     for _ in 2..=100 {
@@ -688,7 +701,13 @@ async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_even
         .begin()
         .await
         .unwrap();
-    FanoutCutoverFixtureMigrator::up(&*tx, None).await.unwrap();
+    Migrator::up(&*tx, None).await.unwrap();
+    assert!(
+        Migrator::get_pending_migrations_read_only(&*tx)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     tx.commit().await.unwrap();
     observed.reads.lock().unwrap().clear();
     observed.writes.lock().unwrap().clear();

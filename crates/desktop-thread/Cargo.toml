@@ -10,6 +10,8 @@ qualification-diagnostics = ["pioneer-client/qualification-diagnostics"]
 
 [dependencies]
 gpui-kit = { workspace = true, features = ["component"] }
+gpui-webview.workspace = true
+wry.workspace = true
 pioneer-client.workspace = true
 pioneer-observability.workspace = true
 pioneer-desktop-foundation.workspace = true

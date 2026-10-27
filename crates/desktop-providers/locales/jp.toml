@@ -33,6 +33,8 @@ proxy_hint = "Optional workspace-scoped proxy for this provider."
 replace_hint = "%{provider} にはすでにキーが設定されています。保存すると置き換えられます。"
 
 [providers.error]
+configure_failed = "%{provider} の設定を保存できませんでした"
+disconnect_failed = "%{provider} の API キーを削除できませんでした"
 gateway_not_connected = "ゲートウェイに接続されていません。"
 workspace_not_selected = "ワークスペースが選択されていません。"
 load_failed = "プロバイダー設定の読み込みに失敗しました"
@@ -127,6 +129,12 @@ unsupported = "Unsupported"
 error = "Error"
 
 [providers.cli.error]
+settings_load_failed = "CLI プロバイダー設定を読み込めませんでした"
+settings_forbidden = "このアカウントには Gateway 設定を管理する権限がありません"
+login_failed = "%{runtime} のログインを開始できませんでした"
+proxy_failed = "%{runtime} のプロキシを更新できませんでした"
+save_failed = "%{runtime} の設定を保存できませんでした"
+enabled_failed = "%{runtime} を有効または無効にできませんでした"
 open_path_failed = "Open path failed"
 
 [providers.catalog.anthropic]
@@ -157,6 +165,18 @@ description = "Google AI の Gemini モデル"
 title = "GLM"
 description = "GLM と Zhipu 互換モデル"
 
+[providers.catalog.zai]
+title = "Z.AI"
+description = "Z.AI のグローバル API 経由の GLM モデル"
+
+[providers.catalog.glm-coding]
+title = "GLM Coding Plan"
+description = "中国向け API 経由の GLM コーディングサブスクリプション"
+
+[providers.catalog.zai-coding]
+title = "Z.AI Coding Plan"
+description = "Z.AI のグローバル API 経由の GLM コーディングサブスクリプション"
+
 [providers.catalog.groq]
 title = "Groq"
 description = "Groq ハードウェアによる高速推論"
@@ -180,6 +200,10 @@ description = "GPT とその他の OpenAI モデル"
 [providers.catalog.openrouter]
 title = "OpenRouter"
 description = "多数のモデルプロバイダー向けルーター"
+
+[providers.catalog.vercel-ai-gateway]
+title = "Vercel AI Gateway"
+description = "Vercel AI Gateway 経由でモデルにアクセス"
 
 [providers.catalog.telnyx]
 title = "Telnyx"

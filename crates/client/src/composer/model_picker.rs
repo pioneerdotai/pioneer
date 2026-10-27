@@ -116,6 +116,7 @@ struct ModelPickerWork {
     workspace: String,
     auth: (u64, Option<u64>),
     kind: RequestKind,
+    refresh: bool,
 }
 enum ModelPickerResult {
     Providers(Result<ProviderListResponse, String>),
@@ -175,9 +176,10 @@ impl ClientCore {
             return;
         };
         if let Some(provider) = current.selector.selected_provider() {
-            self.request_composer_model_picker(
+            self.request_composer_model_picker_with_refresh(
                 current.identity.clone(),
                 RequestKind::Models(provider.to_owned()),
+                false,
                 false,
             );
         }
@@ -200,6 +202,10 @@ impl ClientCore {
             return;
         }
         let mut next = (*current).clone();
+        if next.selector.selected_cli_catalog_changed(&runtimes) {
+            // Reset both state and identity before accepting another response.
+            next.models_request = Default::default();
+        }
         next.selector.sync_cli_runtime_snapshot(runtimes);
         self.publish_composer_model_picker(store, next);
     }
@@ -450,6 +456,9 @@ impl ClientCore {
             self.request_composer_model_picker(identity.clone(), request, false);
         }
         if apply {
+            // Reconcile the applied provider from the retained runtime snapshot,
+            // outside the composer lock and without requesting a runtime refresh.
+            self.observe_composer_runtime(&identity.thread_id, None, false);
             self.observe_composer_model_display(&identity.thread_id, None);
         }
         transition
@@ -459,6 +468,15 @@ impl ClientCore {
         identity: ComposerOperationIdentity,
         kind: RequestKind,
         retry: bool,
+    ) -> ClientTransition {
+        self.request_composer_model_picker_with_refresh(identity, kind, retry, true)
+    }
+    fn request_composer_model_picker_with_refresh(
+        &self,
+        identity: ComposerOperationIdentity,
+        kind: RequestKind,
+        retry: bool,
+        refresh: bool,
     ) -> ClientTransition {
         let Some(workspace) = self
             .thread_coordinator_snapshot(&identity.thread_id)
@@ -516,6 +534,7 @@ impl ClientCore {
             workspace,
             auth,
             kind,
+            refresh,
         };
         if !self
             .composer_model_picker_requests
@@ -539,14 +558,31 @@ impl ClientCore {
             return false;
         }
         let store = self.composer_store.lock().expect("composer store poisoned");
-        model_picker_work_matches(&store, work)
+        model_picker_work_matches(&store, work) && self.model_picker_catalog_current(&store, work)
+    }
+    fn model_picker_catalog_current(&self, store: &ComposerStore, work: &ModelPickerWork) -> bool {
+        if !matches!(&work.kind, RequestKind::Models(_)) {
+            return true;
+        }
+        store
+            .model_pickers
+            .get(&work.identity.thread_id)
+            .is_some_and(|picker| {
+                self.cli_catalog_matches_runtime_publication(
+                    &work.workspace,
+                    picker.selector.selected_provider(),
+                    picker.selector.cli_runtimes(),
+                )
+            })
     }
     fn complete_composer_model_picker(&self, work: ModelPickerWork, result: ModelPickerResult) {
         if !self.model_picker_work_current(&work) {
             return;
         }
         let mut store = self.composer_store.lock().expect("composer store poisoned");
-        if !model_picker_work_matches(&store, &work) {
+        if !model_picker_work_matches(&store, &work)
+            || !self.model_picker_catalog_current(&store, &work)
+        {
             return;
         }
         let mut next = (**store
@@ -621,6 +657,7 @@ impl ClientCore {
         self.publish_composer_model_picker(&mut store, next);
         drop(store);
         if apply_effort {
+            self.observe_composer_runtime(&work.identity.thread_id, None, false);
             self.observe_composer_model_display(&work.identity.thread_id, None);
         }
         if let Some(kind) = model_request {
@@ -706,7 +743,7 @@ impl ClientCore {
                             ProviderModelKind::Chat,
                         ),
                     };
-                    let read = core.read_provider_collection(key, true);
+                    let read = core.read_provider_collection(key, work.refresh);
                     drop(core);
                     let publication = read.and_then(|read| {
                         read.wait_while(|| {
@@ -718,12 +755,20 @@ impl ClientCore {
                         RequestKind::Providers => ModelPickerResult::Providers(
                             publication
                                 .and_then(|p| p.catalog_response())
-                                .map_err(|_| "provider_catalog_unavailable".into()),
+                                .map_err(|error| {
+                                    pioneer_protocol::sanitize_runtime_diagnostic_line(
+                                        &error.to_string(),
+                                    )
+                                }),
                         ),
                         RequestKind::Models(_) => ModelPickerResult::Models(
                             publication
                                 .and_then(|p| p.models_response())
-                                .map_err(|_| "provider_models_unavailable".into()),
+                                .map_err(|error| {
+                                    pioneer_protocol::sanitize_runtime_diagnostic_line(
+                                        &error.to_string(),
+                                    )
+                                }),
                         ),
                     };
                     let Some(core) = weak.upgrade() else {
@@ -777,6 +822,11 @@ fn model_picker_work_matches(store: &ComposerStore, work: &ModelPickerWork) -> b
 mod tests {
     use super::super::store::ComposerIntent;
     use super::*;
+    use crate::composer::{
+        model_display::{ComposerModelDisplayRequestState, test_support::FakeModelDisplay},
+        state_machine::ComposerDomainAction,
+        store::ComposerPublication,
+    };
     use crate::core::ClientTransitionOutcome;
     use pioneer_protocol::*;
     fn fixture() -> (Arc<ClientCore>, mpsc::Receiver<ModelPickerWork>) {
@@ -921,15 +971,507 @@ mod tests {
         ModelPickerResult::Models(Ok(serde_json::from_value(serde_json::json!({"provider":provider,"models":[{"id":"one", "provider":provider,"name":"One", "limits":{}, "capabilities":{}}]})).unwrap()))
     }
     fn ready(core: &ClientCore, rx: &mpsc::Receiver<ModelPickerWork>) {
-        core.complete_composer_model_picker(rx.try_recv().unwrap(), providers());
-        if let Ok(work) = rx.try_recv() {
-            let RequestKind::Models(provider) = &work.kind else {
-                panic!("models expected");
+        while let Ok(work) = rx.try_recv() {
+            let result = match &work.kind {
+                RequestKind::Providers => providers(),
+                RequestKind::Models(provider) => models(provider),
             };
-            let result = models(provider);
             core.complete_composer_model_picker(work, result);
         }
     }
+
+    fn selection_fixture(
+        provider: Option<&str>,
+    ) -> (
+        Arc<ClientCore>,
+        mpsc::Receiver<ModelPickerWork>,
+        FakeModelDisplay,
+    ) {
+        let (core, rx) = fixture();
+        let draft = core.composer_snapshot("a").unwrap();
+        core.composer_intent(ComposerIntent::Domain {
+            thread_id: "a".into(),
+            draft_id: draft.draft_id(),
+            action: ComposerDomainAction::SetModelSelectionFromUser {
+                provider: provider.map(str::to_owned),
+                model: provider.map(|_| "one".into()),
+                capability_target: None,
+            },
+        });
+        // Synthetic access only enables the normal display enqueue path. No
+        // controller is started; both catalogs are completed through channels.
+        core.transport_runtime()
+            .ws_command_sender()
+            .set_http_session_access_for_test(Some(crate::transport::http::GatewayHttpAccess {
+                gateway_base_url: GatewayBaseUrl::parse_presentation("https://example.test")
+                    .unwrap(),
+                gateway_id: GatewayId::new("GAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                session_id: AuthSessionId::new("SAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                generation: 7,
+                access_expires_at_unix: 1000,
+                access_token: AuthSecretString::new("synthetic-token"),
+            }));
+        let display = FakeModelDisplay::install(&core);
+        (core, rx, display)
+    }
+
+    fn runtime(id: &str, enabled: bool) -> RuntimeSummary {
+        serde_json::from_value(serde_json::json!({
+            "runtime_id":id, "kind":id, "display_name":id,
+            "enabled":enabled, "status":{"state":"ready"},
+            "capabilities":RuntimeCapabilities {
+                supports_threads:true, supports_model_list:true, ..Default::default()
+            }
+        }))
+        .unwrap()
+    }
+
+    fn ready_runtime_picker(
+        core: &ClientCore,
+        rx: &mpsc::Receiver<ModelPickerWork>,
+        deferred: bool,
+        runtimes: Vec<RuntimeSummary>,
+    ) -> ComposerOperationIdentity {
+        ClientMutationAuthority { _private: () }.accept_composer_runtime_for_test(
+            core,
+            "a",
+            CLIRuntimeListResponse {
+                revision: 1,
+                runtimes: runtimes.clone(),
+            },
+        );
+        let identity = open(core, deferred);
+        ready(core, rx);
+        // Opening already requests a refresh. Finish it before selecting so an
+        // accidental refresh on apply cannot hide behind an in-flight request.
+        let request = core.provider_runtime_request_for_test("ws").unwrap();
+        core.complete_provider_runtime_for_test(
+            request,
+            Ok(CLIRuntimeListResponse {
+                revision: 2,
+                runtimes,
+            }),
+        );
+        assert!(core.provider_runtime_request_for_test("ws").is_none());
+        assert!(rx.try_recv().is_err());
+        identity
+    }
+
+    fn choose(
+        core: &ClientCore,
+        rx: &mpsc::Receiver<ModelPickerWork>,
+        identity: &ComposerOperationIdentity,
+        provider: &str,
+    ) {
+        core.composer_model_picker_intent(ComposerModelPickerIntent::SelectProvider {
+            identity: identity.clone(),
+            provider: provider.into(),
+        });
+        core.complete_composer_model_picker(rx.try_recv().unwrap(), models(provider));
+        core.composer_model_picker_intent(ComposerModelPickerIntent::SelectModel {
+            identity: identity.clone(),
+            model: "one".into(),
+        });
+    }
+
+    fn published_selection(
+        core: &ClientCore,
+        provider: &str,
+        ready: bool,
+    ) -> Arc<ComposerPublication> {
+        let published = core
+            .snapshot(&ClientScope::Composer {
+                thread_id: "a".into(),
+            })
+            .unwrap()
+            .typed::<ComposerPublication>()
+            .unwrap()
+            .payload();
+        assert!(Arc::ptr_eq(
+            &published,
+            &core.composer_snapshot("a").unwrap()
+        ));
+        assert_eq!(
+            published.domain().selected_provider.as_deref(),
+            Some(provider)
+        );
+        assert_eq!(published.domain().selected_model.as_deref(), Some("one"));
+        assert_eq!(published.selected_provider_ready(), ready);
+        assert_eq!(published.has_complete_model_selection(), ready);
+        if list::runtime_id_from_cli_runtime_provider_key(provider).is_some() {
+            let runtime = published.runtime_selection().unwrap();
+            assert_eq!(runtime.identity.thread_id, published.thread_id());
+            assert_eq!(runtime.identity.draft_id, published.draft_id());
+            assert_eq!(
+                runtime.selected_provider,
+                published.domain().selected_provider
+            );
+            assert_eq!(runtime.selected_provider_ready, ready);
+        }
+        published
+    }
+
+    fn model_response(provider: &str) -> ProviderListModelsResponse {
+        let ModelPickerResult::Models(Ok(response)) = models(provider) else {
+            unreachable!()
+        };
+        response
+    }
+
+    #[test]
+    fn first_cli_commit_publishes_ready_selection_and_resolves_name_without_reopening() {
+        for id in ["codex", "claude", "opencode"] {
+            let (core, rx, display) = selection_fixture(None);
+            let identity = ready_runtime_picker(&core, &rx, true, vec![runtime(id, true)]);
+            core.composer_intent(ComposerIntent::Open {
+                thread_id: "b".into(),
+                defaults: Default::default(),
+            });
+            let other_draft = core.composer_snapshot("b").unwrap();
+            let before = core.composer_snapshot("a").unwrap();
+            assert!(before.domain().selected_provider.is_none());
+            assert!(before.domain().selected_model.is_none());
+            assert!(
+                before
+                    .runtime_selection()
+                    .unwrap()
+                    .selected_provider
+                    .is_none()
+            );
+            let runtime_snapshot = core.provider_runtime_snapshot("ws").unwrap();
+            let provider = list::cli_runtime_provider_key(id);
+            choose(&core, &rx, &identity, &provider);
+            assert!(Arc::ptr_eq(&before, &core.composer_snapshot("a").unwrap()));
+            assert!(display.is_empty());
+            core.composer_model_picker_intent(ComposerModelPickerIntent::Commit {
+                identity: identity.clone(),
+            });
+            let applied = published_selection(&core, &provider, true);
+            assert_eq!(
+                applied.model_display().unwrap().request,
+                ComposerModelDisplayRequestState::Loading
+            );
+            display.take().complete(&core, model_response(&provider));
+            let resolved = published_selection(&core, &provider, true);
+            assert_eq!(
+                resolved.model_display().unwrap().request,
+                ComposerModelDisplayRequestState::Ready
+            );
+            assert_eq!(
+                resolved.model_display().unwrap().label.as_deref(),
+                Some("One")
+            );
+            assert!(Arc::ptr_eq(
+                &runtime_snapshot,
+                &core.provider_runtime_snapshot("ws").unwrap()
+            ));
+            assert!(core.provider_runtime_request_for_test("ws").is_none());
+            assert!(rx.try_recv().is_err());
+            assert!(display.is_empty());
+            assert!(Arc::ptr_eq(
+                &other_draft,
+                &core.composer_snapshot("b").unwrap()
+            ));
+            assert_eq!(
+                core.composer_model_picker_intent(ComposerModelPickerIntent::Commit {
+                    identity: identity.clone()
+                })
+                .outcome(),
+                ClientTransitionOutcome::Noop
+            );
+            core.composer_model_picker_intent(ComposerModelPickerIntent::Close { identity });
+            assert!(Arc::ptr_eq(
+                &resolved,
+                &core.composer_snapshot("a").unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn applied_picker_switches_cli_and_api_without_runtime_refresh_or_stale_name() {
+        for deferred in [true, false] {
+            for (source, target) in [
+                ("cli_runtime:codex", "cli_runtime:claude"),
+                ("provider", "cli_runtime:opencode"),
+                ("cli_runtime:codex", "other"),
+                ("provider", "other"),
+            ] {
+                let (core, rx, display) = selection_fixture(Some(source));
+                let identity = ready_runtime_picker(
+                    &core,
+                    &rx,
+                    deferred,
+                    vec![
+                        runtime("codex", true),
+                        runtime("claude", true),
+                        runtime("opencode", true),
+                    ],
+                );
+                core.observe_composer_model_display("a", None);
+                let old_name = display.take();
+                let before = core.composer_snapshot("a").unwrap();
+                let runtime_snapshot = core.provider_runtime_snapshot("ws").unwrap();
+                choose(&core, &rx, &identity, target);
+                if deferred {
+                    assert!(Arc::ptr_eq(&before, &core.composer_snapshot("a").unwrap()));
+                    core.composer_model_picker_intent(ComposerModelPickerIntent::Commit {
+                        identity: identity.clone(),
+                    });
+                }
+                let applied = published_selection(&core, target, true);
+                old_name.complete(&core, model_response(source));
+                assert!(Arc::ptr_eq(&applied, &core.composer_snapshot("a").unwrap()));
+                display.take().complete(&core, model_response(target));
+                let resolved = published_selection(&core, target, true);
+                assert_eq!(resolved.model_display().unwrap().key.provider, target);
+                assert_eq!(
+                    resolved.model_display().unwrap().label.as_deref(),
+                    Some("One")
+                );
+                assert!(display.is_empty());
+                assert!(core.provider_runtime_request_for_test("ws").is_none());
+                assert!(Arc::ptr_eq(
+                    &runtime_snapshot,
+                    &core.provider_runtime_snapshot("ws").unwrap()
+                ));
+                // Also closes the non-deferred session; apply has already happened.
+                core.composer_model_picker_intent(ComposerModelPickerIntent::Close { identity });
+                assert!(Arc::ptr_eq(
+                    &resolved,
+                    &core.composer_snapshot("a").unwrap()
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_close_and_replaced_draft_do_not_apply_pending_cli_selection() {
+        for replace in [false, true] {
+            let (core, rx, display) = selection_fixture(None);
+            let identity = ready_runtime_picker(&core, &rx, true, vec![runtime("codex", true)]);
+            choose(&core, &rx, &identity, "cli_runtime:codex");
+            if replace {
+                core.composer_intent(ComposerIntent::Clear {
+                    thread_id: "a".into(),
+                    draft_id: identity.draft_id,
+                });
+                assert_ne!(
+                    core.composer_snapshot("a").unwrap().draft_id(),
+                    identity.draft_id
+                );
+            } else {
+                core.composer_model_picker_intent(ComposerModelPickerIntent::Close {
+                    identity: identity.clone(),
+                });
+            }
+            let before = core.composer_snapshot("a").unwrap();
+            assert_eq!(
+                core.composer_model_picker_intent(ComposerModelPickerIntent::Commit { identity })
+                    .outcome(),
+                ClientTransitionOutcome::Noop
+            );
+            assert!(Arc::ptr_eq(&before, &core.composer_snapshot("a").unwrap()));
+            assert!(display.is_empty());
+        }
+    }
+
+    #[test]
+    fn committing_cli_that_became_unavailable_does_not_publish_false_readiness() {
+        for unavailable in ["disabled", "missing"] {
+            let (core, rx, display) = selection_fixture(None);
+            let identity = ready_runtime_picker(&core, &rx, true, vec![runtime("codex", true)]);
+            choose(&core, &rx, &identity, "cli_runtime:codex");
+            let row = runtime("codex", unavailable != "disabled");
+            core.provider_runtime_intent(
+                crate::providers::runtime::ProviderRuntimeIntent::Refresh {
+                    workspace_id: "ws".into(),
+                },
+            );
+            let request = core.provider_runtime_request_for_test("ws").unwrap();
+            core.complete_provider_runtime_for_test(
+                request,
+                Ok(CLIRuntimeListResponse {
+                    revision: 3,
+                    runtimes: if unavailable == "missing" {
+                        vec![]
+                    } else {
+                        vec![row]
+                    },
+                }),
+            );
+            core.composer_model_picker_intent(ComposerModelPickerIntent::Commit { identity });
+            published_selection(&core, "cli_runtime:codex", false);
+            display
+                .take()
+                .complete(&core, model_response("cli_runtime:codex"));
+            let resolved = published_selection(&core, "cli_runtime:codex", false);
+            assert_eq!(
+                resolved.model_display().unwrap().label.as_deref(),
+                Some("One")
+            );
+            assert!(core.provider_runtime_request_for_test("ws").is_none());
+        }
+    }
+
+    #[test]
+    fn cli_commit_without_a_ready_snapshot_keeps_submission_blocked_after_name_resolution() {
+        let (core, rx, display) = selection_fixture(Some("cli_runtime:codex"));
+        let identity = open(&core, true);
+        ready(&core, &rx);
+        let runtime_snapshot = core.provider_runtime_snapshot("ws").unwrap();
+        assert!(runtime_snapshot.runtimes().is_empty());
+        core.composer_model_picker_intent(ComposerModelPickerIntent::Commit { identity });
+        published_selection(&core, "cli_runtime:codex", false);
+        display
+            .take()
+            .complete(&core, model_response("cli_runtime:codex"));
+        published_selection(&core, "cli_runtime:codex", false);
+        assert!(Arc::ptr_eq(
+            &runtime_snapshot,
+            &core.provider_runtime_snapshot("ws").unwrap()
+        ));
+    }
+
+    #[test]
+    fn access_loss_rejects_pending_cli_commit() {
+        let (core, rx, display) = selection_fixture(None);
+        let identity = ready_runtime_picker(&core, &rx, true, vec![runtime("codex", true)]);
+        choose(&core, &rx, &identity, "cli_runtime:codex");
+        let mut denied = core
+            .thread_capability_snapshot("a")
+            .unwrap()
+            .snapshot
+            .clone()
+            .unwrap();
+        let capabilities = &mut denied.workspace.as_mut().unwrap().capabilities;
+        capabilities.can_use_cli_runtimes = false;
+        capabilities.can_use_providers = false;
+        ClientMutationAuthority { _private: () }.accept_thread_capabilities_for_test(&core, denied);
+        let before = core.composer_snapshot("a").unwrap();
+        assert_eq!(
+            core.composer_model_picker_intent(ComposerModelPickerIntent::Commit { identity })
+                .outcome(),
+            ClientTransitionOutcome::Rejected
+        );
+        assert!(Arc::ptr_eq(&before, &core.composer_snapshot("a").unwrap()));
+        assert!(before.domain().selected_provider.is_none());
+        assert!(!before.has_complete_model_selection());
+        assert!(display.is_empty());
+        assert!(core.provider_runtime_request_for_test("ws").is_none());
+    }
+
+    #[test]
+    fn execution_policy_denied_cli_is_not_applied_even_with_a_ready_snapshot() {
+        let (core, rx, display) = selection_fixture(None);
+        let identity = ready_runtime_picker(&core, &rx, true, vec![runtime("codex", true)]);
+        choose(&core, &rx, &identity, "cli_runtime:codex");
+        let mut denied = core
+            .thread_capability_snapshot("a")
+            .unwrap()
+            .snapshot
+            .clone()
+            .unwrap();
+        let policy = &mut denied.workspace.as_mut().unwrap().execution_draft_policy;
+        policy.fingerprint = "denied-cli".into();
+        policy.resources.cli_runtimes = AuthorizationResourceSelector {
+            all: false,
+            ids: vec![],
+        };
+        ClientMutationAuthority { _private: () }.accept_thread_capabilities_for_test(&core, denied);
+        core.reconcile_composer_authorization("a", identity.draft_id);
+        let runtime_snapshot = core.provider_runtime_snapshot("ws").unwrap();
+        core.composer_model_picker_intent(ComposerModelPickerIntent::Commit { identity });
+        let published = core
+            .snapshot(&ClientScope::Composer {
+                thread_id: "a".into(),
+            })
+            .unwrap()
+            .typed::<ComposerPublication>()
+            .unwrap()
+            .payload();
+        assert!(published.domain().selected_provider.is_none());
+        assert!(published.domain().selected_model.is_none());
+        assert!(!published.has_complete_model_selection());
+        assert!(display.is_empty());
+        assert!(core.provider_runtime_request_for_test("ws").is_none());
+        assert!(Arc::ptr_eq(
+            &runtime_snapshot,
+            &core.provider_runtime_snapshot("ws").unwrap()
+        ));
+    }
+
+    #[test]
+    fn non_deferred_catalog_validation_applies_reasoning_without_runtime_refresh() {
+        let (core, rx, display) = selection_fixture(Some("cli_runtime:codex"));
+        let draft = core.composer_snapshot("a").unwrap();
+        core.composer_intent(ComposerIntent::Domain {
+            thread_id: "a".into(),
+            draft_id: draft.draft_id(),
+            action: ComposerDomainAction::SetReasoningEffortFromUser {
+                effort: Some("high".into()),
+            },
+        });
+        let old_name = display.take();
+        let runtimes = vec![runtime("codex", true)];
+        ClientMutationAuthority { _private: () }.accept_composer_runtime_for_test(
+            &core,
+            "a",
+            CLIRuntimeListResponse {
+                revision: 1,
+                runtimes: runtimes.clone(),
+            },
+        );
+        open(&core, false);
+        // Runtime reconciliation can enqueue models before the provider catalog.
+        // Finish providers first and retain the newest model request generation.
+        let mut model_work = None;
+        while let Ok(work) = rx.try_recv() {
+            match &work.kind {
+                RequestKind::Providers => {
+                    core.complete_composer_model_picker(work, providers());
+                }
+                RequestKind::Models(_) => model_work = Some(work),
+            }
+        }
+        let model_work = model_work.expect("model catalog request");
+        let request = core.provider_runtime_request_for_test("ws").unwrap();
+        core.complete_provider_runtime_for_test(
+            request,
+            Ok(CLIRuntimeListResponse {
+                revision: 2,
+                runtimes,
+            }),
+        );
+        let runtime_snapshot = core.provider_runtime_snapshot("ws").unwrap();
+        // Catalog arrival refreshes the label for the old reasoning effort.
+        // Hold that response too, so validation must fence both stale requests.
+        let previous_effort_name = display.take();
+        // The returned model has no reasoning options, so the non-deferred
+        // response path must clear the previously selected effort.
+        core.complete_composer_model_picker(model_work, models("cli_runtime:codex"));
+        let applied = published_selection(&core, "cli_runtime:codex", true);
+        assert!(applied.domain().selected_reasoning_effort.is_none());
+        for stale_name in [old_name, previous_effort_name] {
+            stale_name.complete(&core, model_response("cli_runtime:codex"));
+            assert!(Arc::ptr_eq(&applied, &core.composer_snapshot("a").unwrap()));
+        }
+        display
+            .take()
+            .complete(&core, model_response("cli_runtime:codex"));
+        let resolved = published_selection(&core, "cli_runtime:codex", true);
+        assert_eq!(
+            resolved.model_display().unwrap().label.as_deref(),
+            Some("One")
+        );
+        assert!(core.provider_runtime_request_for_test("ws").is_none());
+        assert!(Arc::ptr_eq(
+            &runtime_snapshot,
+            &core.provider_runtime_snapshot("ws").unwrap()
+        ));
+        assert!(display.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
     #[test]
     fn runtime_readiness_arriving_after_providers_resumes_the_selected_model_request() {
         let (core, rx) = fixture();
@@ -965,6 +1507,146 @@ mod tests {
         assert_eq!(picker.selector.models().len(), 1);
         assert!(rx.try_recv().is_err());
     }
+    #[test]
+    fn open_cli_picker_tracks_catalog_arrival_updates_and_fences_old_responses() {
+        let (core, rx) = fixture();
+        let draft = core.composer_snapshot("a").unwrap();
+        core.composer_intent(ComposerIntent::Domain {
+            thread_id: "a".into(),
+            draft_id: draft.draft_id(),
+            action: super::super::state_machine::ComposerDomainAction::SetModelSelectionFromUser {
+                provider: Some("cli_runtime:codex".into()),
+                model: Some("model".into()),
+                capability_target: None,
+            },
+        });
+        open(&core, true);
+        core.complete_composer_model_picker(rx.try_recv().unwrap(), providers());
+        let mut runtime: RuntimeSummary = serde_json::from_value(serde_json::json!({
+            "runtime_id":"codex", "kind":"codex", "display_name":"Codex", "enabled":true,
+            "status":{"state":"initializing"}, "capabilities": pioneer_protocol::RuntimeCapabilities {
+                supports_threads: true,
+                supports_model_list: true,
+                ..Default::default()
+            }
+        })).unwrap();
+        let request = core.provider_runtime_request_for_test("ws").unwrap();
+        core.complete_provider_runtime_for_test(
+            request,
+            Ok(CLIRuntimeListResponse {
+                revision: 1,
+                runtimes: vec![runtime.clone()],
+            }),
+        );
+        let initial = rx.try_recv().unwrap();
+        core.complete_composer_model_picker(
+            initial,
+            ModelPickerResult::Models(Ok(ProviderListModelsResponse {
+                provider: "cli_runtime:codex".into(),
+                models: vec![],
+            })),
+        );
+        assert_eq!(
+            core.composer_model_picker_snapshot("a")
+                .unwrap()
+                .models_request
+                .state,
+            ComposerCatalogRequestState::Ready
+        );
+        let selection = core
+            .composer_model_picker_snapshot("a")
+            .unwrap()
+            .selection();
+        for (revision, timestamp, name) in [(2, Some(10), "First"), (3, Some(20), "Updated")] {
+            runtime.models_refreshed_at_unix_ms = timestamp;
+            core.observe_provider_runtime_notification(
+                &pioneer_protocol::GatewayNotification::CLIRuntimeStatusChanged(
+                    pioneer_protocol::CLIRuntimeStatusChangedNotification {
+                        workspace_id: "ws".into(),
+                        revision,
+                        runtime: runtime.clone(),
+                        removed: false,
+                    },
+                ),
+            );
+            let work = rx
+                .try_recv()
+                .expect("open picker must refresh automatically");
+            assert!(
+                !work.refresh,
+                "automatic reads use the invalidated shared collection"
+            );
+            let result = ModelPickerResult::Models(Ok(serde_json::from_value(serde_json::json!({
+                "provider":"cli_runtime:codex", "models":[{"id":"model","provider":"cli_runtime:codex","name":name,"limits":{},"capabilities":{}}]
+            })).unwrap()));
+            core.complete_composer_model_picker(work, result);
+            let current = core.composer_model_picker_snapshot("a").unwrap();
+            assert_eq!(current.selector.models()[0].name.as_deref(), Some(name));
+            assert_eq!(current.selection(), selection);
+        }
+        runtime.status = pioneer_protocol::RuntimeStatus::Error {
+            message: "diagnostic only".into(),
+        };
+        core.observe_provider_runtime_notification(
+            &pioneer_protocol::GatewayNotification::CLIRuntimeStatusChanged(
+                pioneer_protocol::CLIRuntimeStatusChangedNotification {
+                    workspace_id: "ws".into(),
+                    revision: 4,
+                    runtime: runtime.clone(),
+                    removed: false,
+                },
+            ),
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            core.composer_model_picker_snapshot("a")
+                .unwrap()
+                .selector
+                .models()[0]
+                .name
+                .as_deref(),
+            Some("Updated")
+        );
+        let identity = core
+            .composer_model_picker_snapshot("a")
+            .unwrap()
+            .identity
+            .clone();
+        core.composer_model_picker_intent(ComposerModelPickerIntent::RetryModels { identity });
+        let stale = rx.try_recv().unwrap();
+        runtime.home_path = Some("/different-source".into());
+        runtime.models_refreshed_at_unix_ms = None;
+        core.observe_provider_runtime_notification(
+            &pioneer_protocol::GatewayNotification::CLIRuntimeStatusChanged(
+                pioneer_protocol::CLIRuntimeStatusChangedNotification {
+                    workspace_id: "ws".into(),
+                    revision: 5,
+                    runtime,
+                    removed: false,
+                },
+            ),
+        );
+        let current = rx.try_recv().unwrap();
+        assert_ne!(current.generation, stale.generation);
+        core.complete_composer_model_picker(stale, models("cli_runtime:codex"));
+        assert!(
+            core.composer_model_picker_snapshot("a")
+                .unwrap()
+                .selector
+                .models()
+                .is_empty()
+        );
+        core.complete_composer_model_picker(current, models("cli_runtime:codex"));
+        assert_eq!(
+            core.composer_model_picker_snapshot("a")
+                .unwrap()
+                .selector
+                .models()
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn deferred_model_session_commits_once_without_editor_echo() {
         let (core, rx) = fixture();

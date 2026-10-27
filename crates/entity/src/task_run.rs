@@ -12,6 +12,8 @@ pub struct Model {
     #[sea_orm(unique_key = "uidx_task_run_group_attempt")]
     pub task_id: String,
     pub trigger_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub trigger_input_json: Option<String>,
     pub parent_run_id: Option<String>,
     #[sea_orm(unique_key = "uidx_task_run_group_attempt")]
     pub run_group_id: String,
@@ -34,8 +36,11 @@ pub struct Model {
     pub error_json: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub inbox_sequence: Option<i64>,
     #[sea_orm(has_many)]
     pub compaction_task_outputs: HasMany<super::compaction_task_output::Entity>,
+    #[sea_orm(has_many)]
+    pub task_run_reads: HasMany<super::task_run_read::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -728,6 +728,7 @@ pub(crate) struct LearnerReviewerClient<'a> {
     workspace_id: &'a str,
     default_model: &'a GatewaySelfImprovementModelSelectionConfig,
     reviewer_model: Option<&'a GatewaySelfImprovementModelSelectionConfig>,
+    usage_store: Option<(&'a pioneer_crud::CrudStore, &'a str)>,
 }
 
 impl<'a> LearnerReviewerClient<'a> {
@@ -743,7 +744,17 @@ impl<'a> LearnerReviewerClient<'a> {
             workspace_id,
             default_model,
             reviewer_model,
+            usage_store: None,
         }
+    }
+
+    pub(crate) fn with_usage_store(
+        mut self,
+        store: &'a pioneer_crud::CrudStore,
+        run_id: &'a str,
+    ) -> Self {
+        self.usage_store = Some((store, run_id));
+        self
     }
 
     pub(crate) fn with_temporal_context(mut self, context: &'a TemporalLearningContext) -> Self {
@@ -1098,6 +1109,17 @@ impl<'a> LearnerReviewerClient<'a> {
                     "provider_unavailable",
                 )
             })?;
+        let provider = if let Some((store, run_id)) = self.usage_store {
+            crate::usage_journal::observe(
+                provider,
+                store,
+                self.workspace_id,
+                "self_improvement",
+                run_id,
+            )
+        } else {
+            provider
+        };
         let response = provider
             .chat(ChatRequest {
                 model: selection.model.clone(),
@@ -1105,7 +1127,9 @@ impl<'a> LearnerReviewerClient<'a> {
                     ChatMessage::system(system_prompt),
                     ChatMessage::user(untrusted_data),
                 ],
-                temperature: Some(0.0),
+                // The selected model may prohibit temperature, including 0.
+                // This helper has no user-selected sampling override.
+                temperature: None,
                 max_tokens: None,
                 tools: None,
                 tool_choice: None,
@@ -1129,6 +1153,13 @@ impl<'a> LearnerReviewerClient<'a> {
             })
             .await
             .map_err(|error| ModelContractError::provider_transport(stage, &error))?;
+        pioneer_provider::ProviderMessageCollector::validate_response(&response).map_err(|_| {
+            ModelContractError::new(
+                stage,
+                ModelContractErrorKind::IncompleteResponse,
+                "invalid_model_messages",
+            )
+        })?;
         let usage = ModelCallUsage::from(response.usage);
         let reason = match response.termination {
             ProviderTermination::Complete if response.tool_calls.is_empty() => None,
@@ -1542,10 +1573,12 @@ mod tests {
                 bail!("scripted response exhausted");
             };
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text,
                 usage: Some(TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
+                    ..Default::default()
                 }),
                 reasoning_content: None,
                 provider_replay_state: None,
@@ -2176,6 +2209,7 @@ mod tests {
         assert_eq!(provider.requests().len(), 4);
         assert!(provider.requests().iter().all(|request| {
             request.model == "learner-model"
+                && request.temperature.is_none()
                 && request.messages[0].content == SYNTHESIS_SYSTEM_PROMPT
                 && serde_json::from_str::<serde_json::Value>(request.messages[1].content.as_str())
                     .ok()
@@ -2814,6 +2848,7 @@ mod tests {
                 .requests()
                 .iter()
                 .all(|request| request.model == "one-model"
+                    && request.temperature.is_none()
                     && request.max_tokens.is_none()
                     && request.reasoning
                         == Some(ReasoningConfig::effort(

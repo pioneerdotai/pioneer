@@ -1,0 +1,945 @@
+name: Release
+run-name: Release (${{ github.ref_name }})
+
+on:
+  push:
+    tags: ["*"]
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    name: prepare-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: keep-release-hidden-until-all-assets-are-ready
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          prerelease_flag=""
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft ${prerelease_flag}
+          else
+            if ! gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" --draft ${prerelease_flag}; then
+              gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                --draft ${prerelease_flag}
+            fi
+          fi
+
+  generate-model-catalog:
+    name: generate-model-catalog
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-model-catalog-v1
+
+      - name: generate-and-validate-model-catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-model-catalog
+          cargo run --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
+            release-model-catalog/catalog.json
+
+      - name: upload-model-catalog
+        uses: actions/upload-artifact@v6
+        with:
+          name: pioneer-release-model-catalog
+          path: release-model-catalog/catalog.json
+          if-no-files-found: error
+
+  build-gateway:
+    name: gateway-${{ matrix.platform.target }}-${{ matrix.variant }}
+    needs: generate-model-catalog
+    defaults:
+      run:
+        shell: ${{ startsWith(matrix.platform.os, 'windows') && 'pwsh' || 'bash' }}
+    runs-on: ${{ matrix.variant == 'computer-use' && matrix.platform.cu_os || matrix.platform.os }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
+      PIONEER_SENTRY_ENVIRONMENT: production
+      CARGO_BUILD_JOBS: "2"
+      # Exact release inputs only; ordinary CI/local release profiles stay unchanged.
+      # Stack profiles need function/source locations, not type/variable debug data.
+      CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
+      CARGO_PROFILE_RELEASE_STRIP: "none"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(matrix.platform.target, 'apple-darwin') && 'unpacked' || 'off' }}
+      PIONEER_BUNDLED_MODEL_CATALOG: ${{ github.workspace }}/release-model-catalog/catalog.json
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, computer-use]
+        platform:
+          - {os: ubuntu-latest, target: x86_64-unknown-linux-gnu, asset: pioneer-gateway-linux-x86_64.gz, cu_asset: pioneer-gateway-linux-x86_64-computer-use-package.zip}
+          - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, asset: pioneer-gateway-linux-aarch64.gz, cu_asset: pioneer-gateway-linux-aarch64-computer-use-package.zip}
+          - {os: macos-latest, cu_os: macos-15, target: aarch64-apple-darwin, asset: pioneer-gateway-macos-aarch64.gz, cu_asset: pioneer-gateway-macos-aarch64-computer-use-package.zip}
+          - {os: macos-latest, cu_os: macos-15-intel, target: x86_64-apple-darwin, asset: pioneer-gateway-macos-x86_64.zip, cu_asset: pioneer-gateway-macos-x86_64-computer-use-package.zip}
+          - {os: windows-latest, target: x86_64-pc-windows-msvc, asset: pioneer-gateway-windows-x86_64.zip, cu_asset: pioneer-gateway-windows-x86_64-computer-use-package.zip}
+          - {os: windows-11-arm, target: aarch64-pc-windows-msvc, asset: pioneer-gateway-windows-aarch64.zip, cu_asset: pioneer-gateway-windows-aarch64-computer-use-package.zip}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - name: select-cua-xcode
+        if: runner.os == 'macOS' && matrix.variant == 'computer-use'
+        shell: bash
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
+          echo 'DEVELOPER_DIR=/Applications/Xcode_26.2.app/Contents/Developer' >> "$GITHUB_ENV"
+      - name: download-model-catalog
+        uses: actions/download-artifact@v7
+        with:
+          name: pioneer-release-model-catalog
+          path: release-model-catalog
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+      - name: configure-native-release-environment
+        run: python scripts/packaging/build-gateway.py --target "${{ matrix.platform.target }}" --configure
+      - name: install-linux-build-dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(pkg-config libssl-dev libegl1-mesa-dev libgbm-dev
+                    libpipewire-0.3-dev libwayland-dev libxkbcommon-dev)
+          if [[ "${{ matrix.variant }}" == "computer-use" ]]; then
+            packages+=(libx11-dev libxi-dev libxtst-dev libxext-dev)
+          fi
+          sudo apt-get update
+          sudo apt-get install -y "${packages[@]}"
+          multiarch="$(gcc -print-multiarch)"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
+      - name: install-onnx-runtime-macos-x86_64
+        if: matrix.platform.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ORT_VERSION="1.24.2"
+          ORT_ARCHIVE="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          ORT_DIR="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}"
+          curl -fL --retry 3 --retry-delay 1 \
+            -o "$ORT_ARCHIVE" \
+            "https://blob.handy.computer/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          tar -xzf "$ORT_ARCHIVE" -C "$RUNNER_TEMP"
+          test -d "$ORT_DIR/lib"
+          echo "ORT_LIB_LOCATION=$ORT_DIR/lib" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+          echo "PIONEER_ONNXRUNTIME_DYLIB_DIR=$ORT_DIR/lib" >> "$GITHUB_ENV"
+          existing_rustflags="${RUSTFLAGS:-}"
+          echo "RUSTFLAGS=${existing_rustflags:+$existing_rustflags }-C link-arg=-Wl,-rpath,@executable_path" >> "$GITHUB_ENV"
+
+      - name: restore-release-dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-gateway-${{ matrix.platform.target }}-${{ matrix.variant }}-v1
+          cache-workspace-crates: false
+
+      - name: setup-macos-signing-keychain
+        if: runner.os == 'macOS' && matrix.variant == 'computer-use'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
+          MACOS_DMG_SIGN_IDENTITY: ${{ secrets.MACOS_DMG_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          [[ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ]] || { echo "missing MACOS_CERTIFICATE_P12_BASE64 secret" >&2; exit 1; }
+          [[ -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]] || { echo "missing MACOS_CERTIFICATE_PASSWORD secret" >&2; exit 1; }
+          [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]] || { echo "missing MACOS_DESKTOP_SIGN_IDENTITY secret" >&2; exit 1; }
+
+          keychain_path="${RUNNER_TEMP}/pioneer-signing.keychain-db"
+          cert_path="${RUNNER_TEMP}/pioneer-signing-cert.p12"
+          trap 'rm -f "$cert_path"' EXIT
+
+          python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          raw = os.environ["MACOS_CERTIFICATE_P12_BASE64"]
+          normalized = "".join(raw.split()).rstrip("%")
+          if not normalized:
+              raise SystemExit("MACOS_CERTIFICATE_P12_BASE64 is empty after normalization")
+          try:
+              decoded = base64.b64decode(normalized, validate=True)
+          except Exception as exc:
+              raise SystemExit(f"invalid MACOS_CERTIFICATE_P12_BASE64: {exc}")
+
+          Path(os.environ["RUNNER_TEMP"], "pioneer-signing-cert.p12").write_bytes(decoded)
+          PY
+
+          security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" login.keychain-db
+          security default-keychain -d user -s "$keychain_path"
+
+          security import "$cert_path" \
+            -k "$keychain_path" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CERTIFICATE_PASSWORD" "$keychain_path"
+
+          identities="$(security find-identity -v -p codesigning "$keychain_path")"
+          printf '%s\n' "$identities"
+          for identity_name in MACOS_DESKTOP_SIGN_IDENTITY MACOS_DMG_SIGN_IDENTITY; do
+            identity="${!identity_name:-}"
+            [[ -z "$identity" ]] && continue
+            grep -Fqi -- "$identity" <<<"$identities" || {
+              echo "configured ${identity_name} was not found in the imported keychain" >&2
+              exit 1
+            }
+          done
+
+      - name: build-gateway
+        env:
+          MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+          APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
+          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+          APPLE_NOTARIZATION_KEY_BASE64: ${{ secrets.APPLE_NOTARIZATION_KEY_BASE64 }}
+        run: >-
+          python scripts/packaging/build-gateway.py --target "${{ matrix.platform.target }}"
+          --variant "${{ matrix.variant }}"
+          --asset "${{ matrix.variant == 'computer-use' && matrix.platform.cu_asset || matrix.platform.asset }}"
+          --out "release-gateway"
+
+      - name: retain-symbol-inputs
+        uses: actions/upload-artifact@v6
+        with:
+          name: symbol-inputs-gateway-${{ matrix.platform.target }}-${{ matrix.variant }}
+          path: release-gateway/symbol-inputs/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+      - name: retain-release-asset
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.variant == 'computer-use' && matrix.platform.cu_asset || matrix.platform.asset }}
+          path: release-gateway/assets/
+          if-no-files-found: error
+      - name: remove-uploaded-transfer-copy
+        run: python -c 'import shutil; shutil.rmtree("release-gateway")'
+
+      - name: cleanup-macos-signing-keychain
+        if: always() && runner.os == 'macOS' && matrix.variant == 'computer-use'
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain_path="${RUNNER_TEMP}/pioneer-signing.keychain-db"
+          security default-keychain -d user -s login.keychain-db || true
+          security delete-keychain "$keychain_path" || true
+
+  build-desktop:
+    name: desktop-${{ matrix.target }}-compile
+    needs: generate-model-catalog
+    defaults:
+      run:
+        shell: ${{ startsWith(matrix.os, 'windows') && 'pwsh' || 'bash' }}
+    runs-on: ${{ matrix.os }}
+    env: &desktop-release-env
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
+      PIONEER_DESKTOP_SENTRY_DSN: ${{ secrets.PIONEER_DESKTOP_SENTRY_DSN }}
+      PIONEER_SENTRY_ENVIRONMENT: production
+      # Exact release inputs only; ordinary CI/local release profiles stay unchanged.
+      # Stack profiles need function/source locations, not type/variable debug data.
+      CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
+      CARGO_PROFILE_RELEASE_STRIP: "none"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'apple-darwin') && 'unpacked' || 'off' }}
+      PIONEER_APP_URL_SCHEME: pioneer
+      PIONEER_SYMBOL_INPUTS_DIR: ${{ github.workspace }}/desktop-symbol-inputs
+      PIONEER_BUNDLED_MODEL_CATALOG: ${{ github.workspace }}/release-model-catalog/catalog.json
+    strategy:
+      fail-fast: false
+      matrix: &desktop-platforms
+        # Desktop release assets have two roles:
+        # - asset_name is the manual install artifact that remains published for users.
+        # - update_asset_name is the v1 auto-update artifact included in desktop-update-manifest.json.
+        # Linux uses the AppImage for both roles. macOS keeps DMG for manual install and uses
+        # a signed .app.zip for auto-update. Windows keeps MSI for manual install and uses the
+        # WiX bundle .exe for auto-update.
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            package_kind: linux_appimage
+            asset_name: pioneer-linux-x86_64.AppImage
+            update_asset_name: pioneer-linux-x86_64.AppImage
+            appimagetool_arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            package_kind: linux_appimage
+            asset_name: pioneer-linux-aarch64.AppImage
+            update_asset_name: pioneer-linux-aarch64.AppImage
+            appimagetool_arch: aarch64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            package_kind: macos_dmg
+            asset_name: Pioneer-x86_64.dmg
+            update_asset_name: Pioneer-x86_64.app.zip
+          - os: macos-15
+            target: aarch64-apple-darwin
+            package_kind: macos_dmg
+            asset_name: Pioneer-aarch64.dmg
+            update_asset_name: Pioneer-aarch64.app.zip
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            package_kind: windows_msi
+            asset_name: Pioneer-x86_64.msi
+            update_asset_name: Pioneer-x86_64.exe
+            windows_exe_name: Pioneer-x86_64.exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            package_kind: windows_msi
+            asset_name: Pioneer-aarch64.msi
+            update_asset_name: Pioneer-aarch64.exe
+            windows_exe_name: Pioneer-aarch64.exe
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+
+      - name: select-cua-xcode
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
+          echo 'DEVELOPER_DIR=/Applications/Xcode_26.2.app/Contents/Developer' >> "$GITHUB_ENV"
+      - name: download-model-catalog
+        uses: actions/download-artifact@v7
+        with:
+          name: pioneer-release-model-catalog
+          path: release-model-catalog
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: install-linux-build-dependencies
+        if: matrix.package_kind == 'linux_appimage'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libasound2-dev \
+            libgbm-dev \
+            libssl-dev \
+            libpipewire-0.3-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libegl1-mesa-dev \
+            libfontconfig-dev \
+            libfreetype6-dev \
+            libwebkit2gtk-4.1-dev \
+            libx11-dev \
+            libxi-dev \
+            libxtst-dev \
+            libxext-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libgl1-mesa-dev
+          multiarch="$(gcc -print-multiarch)"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
+
+      - name: install-onnx-runtime-macos-x86_64
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ORT_VERSION="1.24.2"
+          ORT_ARCHIVE="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          ORT_DIR="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}"
+          curl -fL --retry 3 --retry-delay 1 \
+            -o "$ORT_ARCHIVE" \
+            "https://blob.handy.computer/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          tar -xzf "$ORT_ARCHIVE" -C "$RUNNER_TEMP"
+          test -d "$ORT_DIR/lib"
+          echo "ORT_LIB_LOCATION=$ORT_DIR/lib" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+          echo "PIONEER_ONNXRUNTIME_DYLIB_DIR=$ORT_DIR/lib" >> "$GITHUB_ENV"
+          existing_rustflags="${RUSTFLAGS:-}"
+          echo "RUSTFLAGS=${existing_rustflags:+$existing_rustflags }-C link-arg=-Wl,-rpath,@executable_path" >> "$GITHUB_ENV"
+
+      - name: configure-native-release-environment
+        run: python scripts/packaging/build-gateway.py --target "${{ matrix.target }}" --configure
+
+      - name: restore-desktop-release-dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-desktop-${{ matrix.target }}-v1
+          cache-workspace-crates: false
+
+      - name: compile-desktop-and-updater
+        run: python scripts/packaging/build-desktop.py --target "${{ matrix.target }}"
+
+      - name: retain-compiled-desktop
+        uses: actions/upload-artifact@v6
+        with:
+          name: compiled-desktop-${{ matrix.target }}
+          path: desktop-symbol-inputs/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
+  package-desktop:
+    name: desktop-${{ matrix.target }}-package
+    needs: [build-gateway, build-desktop]
+    defaults:
+      run:
+        shell: ${{ startsWith(matrix.os, 'windows') && 'pwsh' || 'bash' }}
+    runs-on: ${{ matrix.os }}
+    env: *desktop-release-env
+    strategy:
+      fail-fast: false
+      matrix: *desktop-platforms
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - name: select-cua-xcode
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
+          echo 'DEVELOPER_DIR=/Applications/Xcode_26.2.app/Contents/Developer' >> "$GITHUB_ENV"
+      - name: download-model-catalog
+        uses: actions/download-artifact@v7
+        with:
+          name: pioneer-release-model-catalog
+          path: release-model-catalog
+      - name: download-compiled-desktop
+        uses: actions/download-artifact@v7
+        with:
+          name: compiled-desktop-${{ matrix.target }}
+          path: desktop-symbol-inputs
+      - name: download-gateway
+        uses: actions/download-artifact@v7
+        with:
+          name: symbol-inputs-gateway-${{ matrix.target }}-computer-use
+          path: desktop-symbol-inputs/gateway
+      - name: restore-exact-release-binaries
+        run: python scripts/packaging/release-inputs.py --target "${{ matrix.target }}" --inputs desktop-symbol-inputs
+
+      - name: install-linux-build-dependencies
+        if: matrix.package_kind == 'linux_appimage'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libasound2-dev \
+            libgbm-dev \
+            libssl-dev \
+            libpipewire-0.3-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libegl1-mesa-dev \
+            libfontconfig-dev \
+            libfreetype6-dev \
+            libwebkit2gtk-4.1-dev \
+            libx11-dev \
+            libxi-dev \
+            libxtst-dev \
+            libxext-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libgl1-mesa-dev
+          multiarch="$(gcc -print-multiarch)"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
+
+      - name: setup-macos-signing-keychain
+        if: matrix.package_kind == 'macos_dmg'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
+          MACOS_DMG_SIGN_IDENTITY: ${{ secrets.MACOS_DMG_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          [[ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ]] || { echo "missing MACOS_CERTIFICATE_P12_BASE64 secret" >&2; exit 1; }
+          [[ -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]] || { echo "missing MACOS_CERTIFICATE_PASSWORD secret" >&2; exit 1; }
+          [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]] || { echo "missing MACOS_DESKTOP_SIGN_IDENTITY secret" >&2; exit 1; }
+
+          keychain_path="${RUNNER_TEMP}/pioneer-signing.keychain-db"
+          cert_path="${RUNNER_TEMP}/pioneer-signing-cert.p12"
+          trap 'rm -f "$cert_path"' EXIT
+
+          python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          raw = os.environ["MACOS_CERTIFICATE_P12_BASE64"]
+          normalized = "".join(raw.split()).rstrip("%")
+          if not normalized:
+              raise SystemExit("MACOS_CERTIFICATE_P12_BASE64 is empty after normalization")
+          try:
+              decoded = base64.b64decode(normalized, validate=True)
+          except Exception as exc:
+              raise SystemExit(f"invalid MACOS_CERTIFICATE_P12_BASE64: {exc}")
+
+          Path(os.environ["RUNNER_TEMP"], "pioneer-signing-cert.p12").write_bytes(decoded)
+          PY
+
+          security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" login.keychain-db
+          security default-keychain -d user -s "$keychain_path"
+
+          security import "$cert_path" \
+            -k "$keychain_path" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CERTIFICATE_PASSWORD" "$keychain_path"
+
+          identities="$(security find-identity -v -p codesigning "$keychain_path")"
+          printf '%s\n' "$identities"
+          for identity_name in MACOS_DESKTOP_SIGN_IDENTITY MACOS_DMG_SIGN_IDENTITY; do
+            identity="${!identity_name:-}"
+            [[ -z "$identity" ]] && continue
+            grep -Fqi -- "$identity" <<<"$identities" || {
+              echo "configured ${identity_name} was not found in the imported keychain" >&2
+              exit 1
+            }
+          done
+
+      - name: setup-appimagetool
+        if: matrix.package_kind == 'linux_appimage'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_url="https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${{ matrix.appimagetool_arch }}.AppImage"
+          curl -fsSL "$tool_url" -o appimagetool.AppImage
+          chmod +x appimagetool.AppImage
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'set -euo pipefail' \
+            '"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/appimagetool.AppImage" --appimage-extract-and-run "$@"' \
+            > appimagetool
+          chmod +x appimagetool
+
+      - name: install-onnx-runtime-macos-x86_64
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ORT_VERSION="1.24.2"
+          ORT_ARCHIVE="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          ORT_DIR="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}"
+          curl -fL --retry 3 --retry-delay 1 \
+            -o "$ORT_ARCHIVE" \
+            "https://blob.handy.computer/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          tar -xzf "$ORT_ARCHIVE" -C "$RUNNER_TEMP"
+          test -d "$ORT_DIR/lib"
+          echo "ORT_LIB_LOCATION=$ORT_DIR/lib" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+          echo "PIONEER_ONNXRUNTIME_DYLIB_DIR=$ORT_DIR/lib" >> "$GITHUB_ENV"
+          existing_rustflags="${RUSTFLAGS:-}"
+          echo "RUSTFLAGS=${existing_rustflags:+$existing_rustflags }-C link-arg=-Wl,-rpath,@executable_path" >> "$GITHUB_ENV"
+
+      - name: package-linux-appimage
+        if: matrix.package_kind == 'linux_appimage'
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/packaging/desktop/package-linux-appimage.sh \
+            --target "${{ matrix.target }}" \
+            --skip-build --out-dir dist \
+            --appimagetool "$PWD/appimagetool"
+
+      - name: package-macos-dmg
+        if: matrix.package_kind == 'macos_dmg'
+        shell: bash
+        env:
+          MACOS_SIGNING_REQUIRED: ${{ github.event_name == 'push' && github.ref_type == 'tag' && 'true' || 'false' }}
+          MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
+          MACOS_DMG_SIGN_IDENTITY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.MACOS_DMG_SIGN_IDENTITY || '' }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARIZATION_KEY_ID || '' }}
+          APPLE_NOTARIZATION_ISSUER_ID: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARIZATION_ISSUER_ID || '' }}
+          APPLE_NOTARIZATION_KEY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARIZATION_KEY || '' }}
+          APPLE_NOTARIZATION_KEY_BASE64: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARIZATION_KEY_BASE64 || '' }}
+        run: |
+          set -euo pipefail
+          scripts/packaging/desktop/package-macos.sh \
+            --target "${{ matrix.target }}" \
+            --skip-build --out-dir dist
+
+      - name: setup-wix
+        if: matrix.package_kind == 'windows_msi'
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 4.0.5
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          wix extension add WixToolset.Bal.wixext/4.0.5
+
+      - name: package-windows-msi
+        if: matrix.package_kind == 'windows_msi'
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_REQUIRED: "false"
+          WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
+          WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+          WINDOWS_SIGNING_SUBJECT_NAME: ${{ secrets.WINDOWS_SIGNING_SUBJECT_NAME }}
+          WINDOWS_SIGNING_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_URL }}
+          WINDOWS_SIGNING_FILE_DIGEST: ${{ secrets.WINDOWS_SIGNING_FILE_DIGEST }}
+          WINDOWS_SIGNING_TIMESTAMP_DIGEST: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_DIGEST }}
+        run: |
+          ./scripts/packaging/desktop/package-windows-msi.ps1 -Target "${{ matrix.target }}" -OutDir "dist" -SkipBuild
+
+      - name: upload-symbol-inputs
+        uses: actions/upload-artifact@v6
+        with:
+          name: symbol-inputs-desktop-${{ matrix.target }}
+          path: desktop-symbol-inputs/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: upload-desktop-artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: desktop-${{ matrix.target }}
+          path: |
+            dist/${{ matrix.asset_name }}
+            dist/${{ matrix.update_asset_name }}
+          if-no-files-found: error
+
+      - name: cleanup-macos-signing-keychain
+        if: always() && matrix.package_kind == 'macos_dmg'
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain_path="${RUNNER_TEMP}/pioneer-signing.keychain-db"
+          security default-keychain -d user -s login.keychain-db || true
+          security delete-keychain "$keychain_path" || true
+
+  publish-release:
+    name: publish-release
+    runs-on: ubuntu-latest
+    needs: [prepare-release, package-desktop]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+
+      - name: download-gateway-artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          pattern: pioneer-gateway-*
+          merge-multiple: true
+
+      - name: download-desktop-artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          pattern: desktop-*
+          merge-multiple: true
+
+      - name: assemble-release-assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist
+          cd dist
+          rm -f SHA256SUMS
+          shopt -s nullglob
+          files=(pioneer-gateway-*.gz pioneer-gateway-*.zip)
+          if [[ ${#files[@]} -ne 18 ]]; then
+            echo "expected all 18 Gateway assets before publication, found ${#files[@]}"
+            exit 1
+          fi
+          for platform in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64 windows-x86_64 windows-aarch64; do
+            extension=zip
+            case "$platform" in linux-*|macos-aarch64) extension=gz ;; esac
+            test -f "pioneer-gateway-${platform}.${extension}"
+            test -f "pioneer-gateway-${platform}-computer-use-package.zip"
+            test -f "pioneer-gateway-${platform}-computer-use.${extension}"
+          done
+          for file in "${files[@]}"; do
+            sha="$(sha256sum "$file" | awk '{print $1}')"
+            printf 'sha256:%s %s\n' "$sha" "$file" >> SHA256SUMS
+          done
+          sort -o SHA256SUMS SHA256SUMS
+          cat SHA256SUMS
+
+      - name: assemble-desktop-update-metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          dist = Path("dist")
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = tag[1:] if tag.startswith(("v", "V")) else tag
+          channel = "stable"
+          if "-canary" in tag:
+              channel = "canary"
+          elif "-beta" in tag:
+              channel = "beta"
+          elif "-" in tag:
+              channel = "prerelease"
+
+          expected_assets = [
+              ("macos", "aarch64", "macos_app_zip", "Pioneer-aarch64.app.zip"),
+              ("macos", "x86_64", "macos_app_zip", "Pioneer-x86_64.app.zip"),
+              ("linux", "x86_64", "appimage", "pioneer-linux-x86_64.AppImage"),
+              ("linux", "aarch64", "appimage", "pioneer-linux-aarch64.AppImage"),
+              ("windows", "x86_64", "wix_bundle_exe", "Pioneer-x86_64.exe"),
+              ("windows", "aarch64", "wix_bundle_exe", "Pioneer-aarch64.exe"),
+          ]
+
+          assets = []
+          checksum_lines = []
+          for os_name, arch, kind, file_name in expected_assets:
+              path = dist / file_name
+              if not path.is_file():
+                  raise SystemExit(f"missing expected desktop update asset: {path}")
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              size_bytes = path.stat().st_size
+              assets.append(
+                  {
+                      "os": os_name,
+                      "arch": arch,
+                      "kind": kind,
+                      "name": file_name,
+                      "sha256": digest,
+                      "size_bytes": size_bytes,
+                  }
+              )
+              checksum_lines.append(f"sha256:{digest} {file_name}")
+
+          manifest = {
+              "schema_version": 1,
+              "product": "pioneer-desktop",
+              "version": version,
+              "tag": tag,
+              "channel": channel,
+              "published_at": datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+              "assets": assets,
+          }
+
+          manifest_path = dist / "desktop-update-manifest.json"
+          manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+          manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+          checksum_lines.append(f"sha256:{manifest_digest} desktop-update-manifest.json")
+          (dist / "DESKTOP_SHA256SUMS").write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: validate-desktop-update-metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          jq -e '
+            .schema_version == 1
+            and .product == "pioneer-desktop"
+            and (.version | type == "string" and length > 0)
+            and (.tag | type == "string" and length > 0)
+            and (.channel | type == "string" and length > 0)
+            and (.published_at | type == "string" and length > 0)
+            and (.assets | type == "array")
+          ' dist/desktop-update-manifest.json >/dev/null
+
+          python3 <<'PY'
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          dist = Path("dist")
+          manifest_path = dist / "desktop-update-manifest.json"
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          expected = {
+              ("macos", "aarch64"): ("macos_app_zip", "Pioneer-aarch64.app.zip"),
+              ("macos", "x86_64"): ("macos_app_zip", "Pioneer-x86_64.app.zip"),
+              ("linux", "x86_64"): ("appimage", "pioneer-linux-x86_64.AppImage"),
+              ("linux", "aarch64"): ("appimage", "pioneer-linux-aarch64.AppImage"),
+              ("windows", "x86_64"): ("wix_bundle_exe", "Pioneer-x86_64.exe"),
+              ("windows", "aarch64"): ("wix_bundle_exe", "Pioneer-aarch64.exe"),
+          }
+
+          seen = {}
+          rows = []
+          for index, asset in enumerate(manifest["assets"]):
+              for field in ("os", "arch", "kind", "name", "sha256", "size_bytes"):
+                  if field not in asset:
+                      raise SystemExit(f"manifest asset #{index} missing field: {field}")
+
+              key = (asset["os"], asset["arch"])
+              if key not in expected:
+                  raise SystemExit(f"unexpected desktop update asset platform: {key[0]}/{key[1]}")
+              if key in seen:
+                  raise SystemExit(f"duplicate desktop update asset platform: {key[0]}/{key[1]}")
+
+              expected_kind, expected_name = expected[key]
+              if asset["kind"] != expected_kind:
+                  raise SystemExit(f"{key[0]}/{key[1]} has kind {asset['kind']}, expected {expected_kind}")
+              if asset["name"] != expected_name:
+                  raise SystemExit(f"{key[0]}/{key[1]} has name {asset['name']}, expected {expected_name}")
+              if not re.fullmatch(r"[0-9a-f]{64}", asset["sha256"]):
+                  raise SystemExit(f"{asset['name']} has invalid sha256 format")
+
+              asset_path = dist / asset["name"]
+              if not asset_path.is_file():
+                  raise SystemExit(f"manifest asset file is missing: {asset_path}")
+              actual_sha256 = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+              if actual_sha256 != asset["sha256"]:
+                  raise SystemExit(f"{asset['name']} sha256 mismatch: {actual_sha256} != {asset['sha256']}")
+              actual_size = asset_path.stat().st_size
+              if actual_size != asset["size_bytes"]:
+                  raise SystemExit(f"{asset['name']} size mismatch: {actual_size} != {asset['size_bytes']}")
+
+              seen[key] = asset
+              rows.append((asset["os"], asset["arch"], asset["kind"], asset["name"], actual_size, actual_sha256[:12]))
+
+          missing = sorted(set(expected) - set(seen))
+          if missing:
+              missing_text = ", ".join(f"{os_name}/{arch}" for os_name, arch in missing)
+              raise SystemExit(f"missing expected desktop update asset platforms: {missing_text}")
+
+          expected_checksums = {
+              asset["name"]: asset["sha256"]
+              for asset in manifest["assets"]
+          }
+          expected_checksums["desktop-update-manifest.json"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+          checksum_path = dist / "DESKTOP_SHA256SUMS"
+          actual_checksums = {}
+          for line_number, raw_line in enumerate(checksum_path.read_text(encoding="utf-8").splitlines(), start=1):
+              if not raw_line:
+                  continue
+              try:
+                  digest_part, file_name = raw_line.split(" ", 1)
+              except ValueError:
+                  raise SystemExit(f"DESKTOP_SHA256SUMS line {line_number} is malformed")
+              if not digest_part.startswith("sha256:"):
+                  raise SystemExit(f"DESKTOP_SHA256SUMS line {line_number} does not start with sha256:")
+              digest = digest_part.removeprefix("sha256:")
+              if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                  raise SystemExit(f"DESKTOP_SHA256SUMS line {line_number} has invalid sha256")
+              if file_name in actual_checksums:
+                  raise SystemExit(f"DESKTOP_SHA256SUMS has duplicate entry: {file_name}")
+              actual_checksums[file_name] = digest
+
+          if actual_checksums != expected_checksums:
+              raise SystemExit("DESKTOP_SHA256SUMS does not match desktop update manifest assets")
+
+          print("Desktop update release assets:")
+          print(f"{'os':<8} {'arch':<8} {'kind':<16} {'name':<32} {'bytes':>12} {'sha256':<12}")
+          for row in rows:
+              print(f"{row[0]:<8} {row[1]:<8} {row[2]:<16} {row[3]:<32} {row[4]:>12} {row[5]:<12}")
+          PY
+
+      - name: publish-github-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for arch in x86_64 aarch64; do
+            test -f "dist/Pioneer-${arch}.dmg"
+            test -f "dist/Pioneer-${arch}.msi"
+          done
+          files=(
+            dist/pioneer-gateway-*.gz
+            dist/pioneer-gateway-*.zip
+            dist/SHA256SUMS
+            dist/Pioneer-*.app.zip
+            dist/Pioneer-*.dmg
+            dist/Pioneer-*.exe
+            dist/Pioneer-*.msi
+            dist/pioneer-linux-*.AppImage
+            dist/desktop-update-manifest.json
+            dist/DESKTOP_SHA256SUMS
+          )
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "no release assets found in dist/"
+            exit 1
+          fi
+
+          prerelease_flag=""
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber
+
+          # This is the only publication point: both products are already uploaded.
+          if [[ -n "${prerelease_flag}" ]]; then
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --prerelease
+          else
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --prerelease=false --latest
+          fi
+
+  # Dispatch once the exact inputs exist; publication does not wait for symbols.
+  queue-debug-symbols:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    name: queue-independent-debug-symbols
+    needs: [build-gateway, package-desktop]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'build-debug-symbols.yml',
+              ref: context.ref.replace(/^refs\/(heads|tags)\//, ''),
+              inputs: {source_run_id: String(context.runId)},
+            });

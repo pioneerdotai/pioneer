@@ -16,6 +16,7 @@ use pioneer_protocol::{
     ToolStoragePayload, TurnItem,
 };
 pub(crate) use pioneer_runtime_events::ExecutionSnapshotEvent as AgentSnapshotEvent;
+use pioneer_tools::bounded_summary_for_chars;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +25,8 @@ pub(crate) struct CLIRuntimeProjectorContext {
     pub thread_id: String,
     pub turn_id: String,
     pub recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+    /// Set only for Codex after current durable attempt ownership is validated.
+    pub codex_retry_attempt_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -98,9 +101,31 @@ pub(crate) fn project_cli_runtime_event(
                 turn_id: context.turn_id.clone(),
                 reason: interrupted.reason.clone(),
                 recovery: context.recovery.clone(),
+                cancellation_owner: None,
             })
         }
-        RuntimeEvent::TurnRetrying(_) => CLIRuntimeProjectedEvents::ignored("turn_retrying"),
+        RuntimeEvent::TurnRetrying(_) => {
+            let Some(attempt_id) = context.codex_retry_attempt_id.as_deref() else {
+                return CLIRuntimeProjectedEvents::ignored("turn_retrying");
+            };
+            // One immutable historical fact per native attempt. Neither retry
+            // diagnostics nor recovery confirmation may change this payload.
+            CLIRuntimeProjectedEvents::durable(AgentDurableEvent::ItemCompleted {
+                notification: ItemCompletedNotification {
+                    workspace_id: context.workspace_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    turn_id: context.turn_id.clone(),
+                    item: TurnItem::SystemEvent {
+                        id: pioneer_crud::codex_retry_notice_item_id(&context.turn_id, attempt_id),
+                        level: SystemEventLevel::Warning,
+                        message: "Codex reported a request retry after a temporary failure."
+                            .to_owned(),
+                        code: Some("codex_request_retried".to_owned()),
+                        details: None,
+                    },
+                },
+            })
+        }
         RuntimeEvent::Error(error) => project_runtime_error(context, error),
         RuntimeEvent::ReviewModeChanged(review) => project_review_mode_changed(context, review),
         RuntimeEvent::ItemStarted(started) => project_item_started(context, started),
@@ -112,6 +137,7 @@ pub(crate) fn project_cli_runtime_event(
         RuntimeEvent::ThreadStateChanged(thread) => project_thread_state_changed(context, thread),
         RuntimeEvent::Raw(raw) => project_raw_event(context, raw),
         RuntimeEvent::SessionStateChanged(_)
+        | RuntimeEvent::ThreadNameUpdated(_)
         | RuntimeEvent::ThreadGoalUpdated(_)
         | RuntimeEvent::ThreadGoalCleared(_)
         | RuntimeEvent::TurnStarted(_)
@@ -781,7 +807,9 @@ fn command_execution_item(
         ),
         status,
         recovery_policy: None,
-        output_policy: ToolOutputPolicySnapshot::for_tool_name(tool_name.as_str()),
+        // The canonical item kind determines the shell payload policy. Native
+        // names such as OpenCode's `shell` and Claude's `Bash` are not core tools.
+        output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
         display,
         storage,
         recovery: metadata
@@ -942,9 +970,12 @@ fn dynamic_tool_item(
 }
 
 fn mcp_tool_item(item_id: &str, metadata: Option<&JsonValue>, status: ToolCallStatus) -> TurnItem {
-    let metadata_json = metadata.cloned().unwrap_or_else(|| json!({}));
+    let mut metadata_json = metadata.cloned().unwrap_or_else(|| json!({}));
     let tool_name = metadata_string(metadata, "canonicalCallableName")
         .unwrap_or_else(|| "mcp_tool_call".to_owned());
+    if matches!(tool_name.as_str(), "html_render" | "html_preview") {
+        pioneer_protocol::compact_html_timeline_value(&mut metadata_json);
+    }
     let server_name = metadata_string(metadata, "serverName").unwrap_or_else(|| "MCP".to_owned());
     let raw_tool_name =
         metadata_string(metadata, "rawToolName").unwrap_or_else(|| tool_name.clone());
@@ -962,6 +993,19 @@ fn mcp_tool_item(item_id: &str, metadata: Option<&JsonValue>, status: ToolCallSt
         .and_then(JsonValue::as_str)
     {
         lines.push(error.to_owned());
+    }
+    // Preserve the semantic public task result before ToolMetadata redacts raw
+    // MCP content/text. Lifecycle/identity are validated separately by the gate.
+    // Claude already normalizes before its earlier typed metadata conversion.
+    if matches!(
+        tool_name.as_str(),
+        "task_wait" | "task_get" | "task_cancel" | "task_finish" | "task_accept"
+    ) && metadata_json["serverInstallationId"] == "pioneer-task-tools-v1"
+        && metadata_json["rawToolName"].as_str() == Some(tool_name.as_str())
+        && metadata_json.get("taskResult").is_none()
+        && let Some(payload) = crate::task_tools::delivered_task_payload(&metadata_json["result"])
+    {
+        metadata_json["taskResult"] = payload;
     }
     let summary = tool_summary(
         format!("MCP: {server_name} / {raw_tool_name}"),
@@ -983,7 +1027,17 @@ fn mcp_tool_item(item_id: &str, metadata: Option<&JsonValue>, status: ToolCallSt
         arguments: tool_arguments(item_id, arguments),
         status,
         recovery_policy: None,
-        execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
+        execution_class: metadata_string(metadata, "serverInstallationId")
+            .as_deref()
+            .and_then(crate::turn_mcp::native_tools::NativeToolFamily::from_server_id)
+            .and_then(|family| {
+                family
+                    .definitions()
+                    .into_iter()
+                    .find(|definition| definition.spec.name == raw_tool_name)
+            })
+            .map(|definition| definition.spec.turn_item_execution_class)
+            .unwrap_or_default(),
         output_policy,
         display,
         storage,
@@ -1068,16 +1122,18 @@ fn summary_payloads_for_policy(
     summary: &ToolOutputSummary,
 ) -> (ToolDisplayPayload, ToolStoragePayload) {
     let display = match &output_policy.timeline {
-        TimelineOutputPolicy::Full { .. } | TimelineOutputPolicy::Summary { .. } => {
-            ToolDisplayPayload::Summary(summary.clone())
+        TimelineOutputPolicy::Full { .. } => ToolDisplayPayload::Summary(summary.clone()),
+        TimelineOutputPolicy::Summary { max_chars } => {
+            ToolDisplayPayload::Summary(bounded_summary_for_chars(summary.clone(), *max_chars))
         }
         TimelineOutputPolicy::MetadataOnly | TimelineOutputPolicy::Hidden => {
             ToolDisplayPayload::Hidden
         }
     };
     let storage = match &output_policy.storage {
-        StorageOutputPolicy::Full { .. } | StorageOutputPolicy::Summary { .. } => {
-            ToolStoragePayload::Summary(summary.clone())
+        StorageOutputPolicy::Full { .. } => ToolStoragePayload::Summary(summary.clone()),
+        StorageOutputPolicy::Summary { max_chars } => {
+            ToolStoragePayload::Summary(bounded_summary_for_chars(summary.clone(), *max_chars))
         }
         StorageOutputPolicy::MetadataOnly => ToolStoragePayload::Metadata {
             metadata: summary.metadata.clone(),
@@ -1255,7 +1311,7 @@ fn review_system_event_item(
     }
 }
 
-fn is_agent_message_kind(kind: &str) -> bool {
+pub(crate) fn is_agent_message_kind(kind: &str) -> bool {
     matches!(
         normalize_kind(kind).as_str(),
         "agentmessage" | "assistantmessage" | "message"
@@ -1443,6 +1499,7 @@ fn event_kind_name(event: &RuntimeEvent) -> &'static str {
     match event {
         RuntimeEvent::SessionStateChanged(_) => "session_state_changed",
         RuntimeEvent::ThreadStateChanged(_) => "thread_state_changed",
+        RuntimeEvent::ThreadNameUpdated(_) => "thread_name_updated",
         RuntimeEvent::ThreadGoalUpdated(_) => "thread_goal_updated",
         RuntimeEvent::ThreadGoalCleared(_) => "thread_goal_cleared",
         RuntimeEvent::TurnStarted(_) => "turn_started",
@@ -1468,7 +1525,10 @@ fn event_kind_name(event: &RuntimeEvent) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{CLIRuntimeProjectorContext, project_cli_runtime_event};
+    use super::{
+        CLIRuntimeProjectorContext, project_cli_runtime_event, summary_payloads_for_policy,
+        tool_summary,
+    };
     use pioneer_cli_agent_runtime::codex::CodexJsonlRpcNotificationEvent;
     use pioneer_cli_agent_runtime::event::{
         RuntimeAgentMessagePhase, RuntimeEvent, RuntimeEventMappingOptions, RuntimeItemCompleted,
@@ -1478,7 +1538,7 @@ mod tests {
     use pioneer_protocol::{
         AgentDurableEvent, AgentMessagePhase, AgentProgressEvent, ItemDeltaStream,
         StorageOutputPolicy, SystemEventLevel, TimelineOutputPolicy, ToolDisplayPayload,
-        ToolStoragePayload, TurnItem,
+        ToolMetadata, ToolOutputPolicySnapshot, ToolStoragePayload, TurnItem,
     };
     use serde_json::{Value as JsonValue, json};
 
@@ -1488,6 +1548,7 @@ mod tests {
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             recovery: None,
+            codex_retry_attempt_id: Some("attempt_1".to_owned()),
         }
     }
 
@@ -2551,6 +2612,365 @@ mod tests {
         assert_eq!(*success, Some(true));
     }
 
+    #[tokio::test]
+    async fn cli_projector_large_mcp_result_passes_durable_payload_validation() {
+        use migration::{Migrator, MigratorTrait};
+        use pioneer_crud::CrudStore;
+        use pioneer_protocol::{
+            PersistedActorRef, SandboxMode, Thread, ThreadMode, ThreadOriginKind,
+            ThreadSidebarVisibility, ThreadStatus, Turn, TurnItemEventPayload, TurnStatus,
+            UserInput,
+        };
+
+        let connection = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite");
+        Migrator::up(&connection, None)
+            .await
+            .expect("projector fixture migrations");
+        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection);
+        let store = CrudStore::new(database);
+        let context = context();
+        let timestamp = 1_700_030_000;
+        let thread = Thread {
+            workspace_id: context.workspace_id.clone(),
+            id: context.thread_id.clone(),
+            name: None,
+            preview: String::new(),
+            preview_author: None,
+            mode: ThreadMode::Agent,
+            model: "test-model".to_owned(),
+            model_provider: "echo".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: context.turn_id.clone(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: ThreadMode::Agent,
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        store
+            .upsert_thread_model(&thread, PersistedActorRef::System)
+            .await
+            .expect("thread fixture");
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[UserInput::Text {
+                    text: "Read MCP result".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                PersistedActorRef::System,
+            )
+            .await
+            .expect("started turn fixture");
+
+        for (raw_tool_name, chars) in [
+            ("asc_list_app_store_versions", 6_989),
+            ("asc_list_territory_availabilities", 17_278),
+        ] {
+            let message = "界".repeat(chars);
+            let metadata = json!({
+                "canonicalCallableName": format!("mcp__asc__{raw_tool_name}"),
+                "serverName": "App Store Connect",
+                "rawToolName": raw_tool_name,
+                "arguments": {"appId": "app-1"},
+                "status": "completed",
+                "success": true,
+                "message": message,
+                "result": [{"type": "text", "text": message}],
+                "providerCallId": raw_tool_name,
+                "sessionGeneration": 7
+            });
+            let event = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                native_thread_id: Some("native_thread_1".to_owned()),
+                native_turn_id: "native_turn_1".to_owned(),
+                native_item_id: raw_tool_name.to_owned(),
+                item_kind: "mcpToolCall".to_owned(),
+                text: None,
+                summary: Vec::new(),
+                content: Vec::new(),
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: Some(metadata.clone()),
+                native_item_redacted: None,
+                native: None,
+            });
+            let original_event = event.clone();
+            let projected = project_cli_runtime_event(&context, &event);
+            assert_eq!(event, original_event, "native result must remain intact");
+            assert_eq!(projected.durable.len(), 1);
+            let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
+                panic!("expected MCP completion");
+            };
+            let TurnItem::DynamicToolCall {
+                arguments,
+                status,
+                output_policy,
+                display: ToolDisplayPayload::Summary(summary),
+                storage: ToolStoragePayload::Metadata { metadata: stored },
+                success,
+                recovery,
+                outcome,
+                ..
+            } = &notification.item
+            else {
+                panic!("expected MCP summary with metadata-only storage");
+            };
+            let expected_metadata = ToolMetadata::from_json(metadata);
+            assert_eq!(summary.metadata, expected_metadata);
+            assert_eq!(stored, &expected_metadata);
+            assert_eq!(arguments["appId"], "app-1");
+            assert_eq!(arguments["nativeItemId"], raw_tool_name);
+            assert_eq!(*status, pioneer_protocol::ToolCallStatus::Completed);
+            assert_eq!(*success, Some(true));
+            assert!(recovery.is_none());
+            assert!(outcome.is_none());
+            assert_eq!(
+                output_policy.timeline,
+                TimelineOutputPolicy::Summary { max_chars: 2_000 }
+            );
+            assert_eq!(
+                summary.title.chars().count()
+                    + summary
+                        .lines
+                        .iter()
+                        .map(|line| line.chars().count())
+                        .sum::<usize>(),
+                2_000
+            );
+            assert!(summary.truncated);
+            assert!(message.starts_with(&summary.lines[0]));
+
+            // The original unbounded card must still fail the CrudStore guard.
+            let mut unbounded = notification.clone();
+            let TurnItem::DynamicToolCall { display, .. } = &mut unbounded.item else {
+                unreachable!();
+            };
+            let mut unbounded_summary = summary.clone();
+            unbounded_summary.lines = vec![message];
+            unbounded_summary.truncated = false;
+            *display = ToolDisplayPayload::Summary(unbounded_summary);
+            let error = store
+                .materialize_item_completed(unbounded, timestamp + 1)
+                .await
+                .expect_err("oversized display must remain forbidden");
+            assert!(format!("{error:#}").contains("display summary exceeds policy limit"));
+            store
+                .materialize_item_completed(notification.clone(), timestamp + 1)
+                .await
+                .expect("bounded MCP completion must persist");
+            let persisted = store
+                .get_turn_item_events(&context.thread_id, &context.turn_id)
+                .await
+                .expect("read durable events")
+                .expect("fixture thread exists");
+            assert!(persisted.events.iter().any(|event| {
+                matches!(&event.payload, TurnItemEventPayload::ItemCompleted { item, .. }
+                    if item == &notification.item)
+            }));
+        }
+    }
+
+    #[test]
+    fn cli_summary_channels_have_independent_total_character_budgets() {
+        let summary = tool_summary(
+            "Title",
+            vec!["first".to_owned(), "second".to_owned(), "third".to_owned()],
+            json!({"providerCallId": "call-1", "result": "retained by metadata contract"}),
+        );
+        for (display_max, storage_max, display_lines, storage_lines) in [
+            (8, 17, vec!["fir"], vec!["first", "second", "t"]),
+            (17, 8, vec!["first", "second", "t"], vec!["fir"]),
+            (8, 21, vec!["fir"], vec!["first", "second", "third"]),
+            (21, 8, vec!["first", "second", "third"], vec!["fir"]),
+        ] {
+            let mut policy = ToolOutputPolicySnapshot::for_external_runtime_tool_name("tool");
+            policy.timeline = TimelineOutputPolicy::Summary {
+                max_chars: display_max,
+            };
+            policy.storage = StorageOutputPolicy::Summary {
+                max_chars: storage_max,
+            };
+            let (display, storage) = summary_payloads_for_policy(&policy, &summary);
+            let ToolDisplayPayload::Summary(display) = display else {
+                panic!("expected display summary");
+            };
+            let ToolStoragePayload::Summary(storage) = storage else {
+                panic!("expected storage summary");
+            };
+            for (bounded, limit, lines) in [
+                (display, display_max, display_lines),
+                (storage, storage_max, storage_lines),
+            ] {
+                assert_eq!(bounded.title, summary.title);
+                assert_eq!(bounded.lines, lines);
+                assert_eq!(bounded.metadata, summary.metadata);
+                assert_eq!(bounded.truncated, limit < 21);
+                assert_eq!(
+                    bounded.title.chars().count()
+                        + bounded
+                            .lines
+                            .iter()
+                            .map(|line| line.chars().count())
+                            .sum::<usize>(),
+                    limit
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_summary_bounds_preserve_unicode_and_truncation_at_boundaries() {
+        for already_truncated in [false, true] {
+            let mut summary = tool_summary(
+                "Заг🦀",
+                vec!["ёж".to_owned(), "🙂界".to_owned()],
+                json!({"providerCallId": "unicode-call"}),
+            );
+            summary.truncated = already_truncated;
+            for (max_chars, title, lines, shortened) in [
+                (0, "", vec![], true),
+                (3, "Заг", vec![], true),
+                (4, "Заг🦀", vec![], true),
+                (6, "Заг🦀", vec!["ёж"], true),
+                (7, "Заг🦀", vec!["ёж", "🙂"], true),
+                (8, "Заг🦀", vec!["ёж", "🙂界"], false),
+                (9, "Заг🦀", vec!["ёж", "🙂界"], false),
+            ] {
+                let mut policy = ToolOutputPolicySnapshot::for_external_runtime_tool_name("tool");
+                policy.timeline = TimelineOutputPolicy::Summary { max_chars };
+                policy.storage = StorageOutputPolicy::Summary { max_chars };
+                let (display, storage) = summary_payloads_for_policy(&policy, &summary);
+                let ToolDisplayPayload::Summary(display) = display else {
+                    panic!("expected display summary");
+                };
+                let ToolStoragePayload::Summary(storage) = storage else {
+                    panic!("expected storage summary");
+                };
+                assert_eq!(display, storage);
+                assert_eq!(display.title, title);
+                assert_eq!(display.lines, lines);
+                assert_eq!(display.metadata, summary.metadata);
+                assert_eq!(display.truncated, already_truncated || shortened);
+                assert!(
+                    display.title.chars().count()
+                        + display
+                            .lines
+                            .iter()
+                            .map(|line| line.chars().count())
+                            .sum::<usize>()
+                        <= max_chars
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_summary_projection_preserves_other_policy_variants() {
+        let mut summary = tool_summary(
+            "Full title",
+            vec!["Full line".to_owned()],
+            json!({"providerCallId": "call-1", "result": {"value": 7}}),
+        );
+        summary.truncated = true;
+        for timeline in [
+            TimelineOutputPolicy::Full { max_bytes: 1 },
+            TimelineOutputPolicy::MetadataOnly,
+            TimelineOutputPolicy::Hidden,
+        ] {
+            for storage in [
+                StorageOutputPolicy::Full { max_bytes: 1 },
+                StorageOutputPolicy::MetadataOnly,
+                StorageOutputPolicy::None,
+            ] {
+                let mut policy = ToolOutputPolicySnapshot::for_external_runtime_tool_name("tool");
+                policy.timeline = timeline.clone();
+                policy.storage = storage;
+                let (display, storage) = summary_payloads_for_policy(&policy, &summary);
+                assert_eq!(
+                    display,
+                    match &policy.timeline {
+                        TimelineOutputPolicy::Full { .. } =>
+                            ToolDisplayPayload::Summary(summary.clone()),
+                        _ => ToolDisplayPayload::Hidden,
+                    }
+                );
+                assert_eq!(
+                    storage,
+                    match &policy.storage {
+                        StorageOutputPolicy::Full { .. } =>
+                            ToolStoragePayload::Summary(summary.clone()),
+                        StorageOutputPolicy::MetadataOnly => ToolStoragePayload::Metadata {
+                            metadata: summary.metadata.clone(),
+                        },
+                        _ => ToolStoragePayload::None,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn task_result_normalization_precedes_raw_metadata_redaction() {
+        let payload = json!({"taskId":"accepted_task","runId":"run","candidateId":"candidate","status":"completed","taskTerminal":true,"finalAnswerAllowed":true});
+        let blocks = json!([{"type":"text","text":payload.to_string()}]);
+        // Codex's content-only MCP envelope and OpenCode V2's content array.
+        for result in [json!({"content":blocks}), blocks.clone()] {
+            let item = super::mcp_tool_item(
+                "native-task",
+                Some(&json!({
+                    "canonicalCallableName":"task_accept", "rawToolName":"task_accept",
+                    "serverInstallationId":"pioneer-task-tools-v1", "serverName":"pioneer_tasks",
+                    "status":"completed", "success":true, "result":result,
+                    "message":"preview contains no IDs",
+                })),
+                pioneer_protocol::ToolCallStatus::Completed,
+            );
+            let TurnItem::DynamicToolCall {
+                storage: ToolStoragePayload::Metadata { metadata },
+                ..
+            } = item
+            else {
+                panic!("metadata");
+            };
+            let metadata = metadata.to_json();
+            assert_eq!(
+                pioneer_agent::observed_terminal_task_outcomes_from_payload(
+                    "task_accept",
+                    &metadata["taskResult"]
+                ),
+                std::collections::BTreeSet::from([
+                    pioneer_agent::ObservedTaskOutcome::AcceptedCandidate {
+                        task_id: "accepted_task".into(),
+                        run_id: "run".into(),
+                        candidate_id: "candidate".into()
+                    }
+                ])
+            );
+            assert_ne!(metadata["result"], result, "raw content remains redacted");
+        }
+    }
+
     #[test]
     fn codex_mcp_timeline_uses_one_enriched_native_item_for_start_terminal_and_replay() {
         let metadata = json!({
@@ -2886,23 +3306,74 @@ mod tests {
     }
 
     #[test]
-    fn codex_retrying_turn_does_not_project_terminal_or_timeline_events() {
-        let retrying = project_codex_notification(
-            "error",
-            json!({
-                "threadId": "native_thread_1",
-                "turnId": "native_turn_1",
-                "error": {
-                    "message": "Reconnecting... 2/5",
-                    "code": "stream_disconnected"
-                },
-                "willRetry": true
-            }),
+    fn codex_retrying_turn_projects_one_immutable_historical_warning() {
+        let retry = |message: &str| {
+            project_codex_notification(
+                "error",
+                json!({
+                    "threadId": "native_thread_1",
+                    "turnId": "native_turn_1",
+                    "error": {"message": message, "code": message},
+                    "willRetry": true
+                }),
+            )
+        };
+        let first = retry("Reconnecting... 2/5");
+        assert!(first.progress.is_empty());
+        assert!(first.snapshot.is_empty());
+        assert!(first.ignored.is_empty());
+        let [AgentDurableEvent::ItemCompleted { notification }] = first.durable.as_slice() else {
+            panic!("retry must emit only a completed historical item");
+        };
+        assert!(matches!(&notification.item, TurnItem::SystemEvent {
+            level: SystemEventLevel::Warning, code: Some(code), details: None, ..
+        } if code == "codex_request_retried"));
+        let payload = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification.clone());
+        for message in [
+            "Reconnecting... 3/5",
+            "different temporary failure",
+            "Reconnecting... 2/5",
+        ] {
+            let projected = retry(message);
+            assert_eq!(projected.durable, first.durable);
+            let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
+                unreachable!();
+            };
+            let replay =
+                pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification.clone());
+            assert_eq!(
+                replay.idempotency_key().unwrap(),
+                payload.idempotency_key().unwrap()
+            );
+        }
+        assert!(
+            pioneer_observability::turn_startup::notification_output(
+                "item/completed",
+                &serde_json::to_value(notification).unwrap()
+            )
+            .is_none()
         );
 
-        assert!(retrying.progress.is_empty());
-        assert!(retrying.durable.is_empty());
-        assert_eq!(retrying.ignored, vec!["turn_retrying"]);
+        let event =
+            RuntimeEvent::TurnRetrying(pioneer_cli_agent_runtime::event::RuntimeTurnRetrying {
+                native_thread_id: Some("native_thread_1".into()),
+                native_turn_id: Some("native_turn_1".into()),
+                message: "temporary failure".into(),
+                code: None,
+                native: None,
+            });
+        let mut next_attempt = context();
+        next_attempt.codex_retry_attempt_id = Some("attempt_2".into());
+        let next = project_cli_runtime_event(&next_attempt, &event);
+        let [AgentDurableEvent::ItemCompleted { notification: next }] = next.durable.as_slice()
+        else {
+            panic!("next attempt must own its own notice");
+        };
+        assert_ne!(next.item.item_id(), notification.item.item_id());
+        next_attempt.codex_retry_attempt_id = None;
+        let unowned = project_cli_runtime_event(&next_attempt, &event);
+        assert!(unowned.durable.is_empty());
+        assert!(unowned.progress.is_empty());
     }
 
     #[test]
@@ -2924,6 +3395,7 @@ mod tests {
                 thread_id: "thread_1".to_owned(),
                 turn_id: "turn_1".to_owned(),
                 reason: "interrupted".to_owned(),
+                cancellation_owner: None,
                 recovery: None
             }]
         );

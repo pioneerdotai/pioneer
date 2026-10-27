@@ -65,6 +65,7 @@ impl fmt::Debug for CLIRuntimeElevatedInstructions {
 pub enum CLIRuntimeElevatedInstructionTransport {
     CodexTurnCollaborationMode,
     ClaudeAppendSystemPromptFile,
+    OpenCodeInstructionEntry,
 }
 
 impl CLIRuntimeElevatedInstructionTransport {
@@ -72,6 +73,7 @@ impl CLIRuntimeElevatedInstructionTransport {
         match kind {
             CLIAgentRuntimeKind::Codex => Self::CodexTurnCollaborationMode,
             CLIAgentRuntimeKind::Claude => Self::ClaudeAppendSystemPromptFile,
+            CLIAgentRuntimeKind::OpenCode => Self::OpenCodeInstructionEntry,
         }
     }
 
@@ -79,6 +81,7 @@ impl CLIRuntimeElevatedInstructionTransport {
         match self {
             Self::CodexTurnCollaborationMode => "codex_turn_collaboration_mode",
             Self::ClaudeAppendSystemPromptFile => "claude_append_system_prompt_file",
+            Self::OpenCodeInstructionEntry => "opencode_instruction_entry",
         }
     }
 }

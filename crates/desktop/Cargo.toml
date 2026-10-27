@@ -67,6 +67,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+pioneer-client = { workspace = true, features = ["test-support"] }
 # Syntax-aware ownership and Render checks use the already locked parser.
 syn = { version = "=2.0.119", features = ["full", "visit"] }
 gpui-kit = { workspace = true, features = ["test-support"] }
@@ -78,3 +79,8 @@ tokio-tungstenite.workspace = true
 available-locales = ["en", "ru", "zh", "hi", "es", "de", "fr", "jp"]
 default-locale = "en"
 load-path = "locales"
+
+[build-dependencies]
+sha2.workspace = true
+hex.workspace = true
+serde_json.workspace = true

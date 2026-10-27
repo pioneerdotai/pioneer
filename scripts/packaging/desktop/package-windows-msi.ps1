@@ -6,7 +6,9 @@ param(
 
     [string]$OutDir,
 
-    [string]$WixPath
+    [string]$WixPath,
+
+    [switch]$SkipBuild
 )
 
 Set-StrictMode -Version Latest
@@ -302,9 +304,17 @@ if ($Target -eq "aarch64-pc-windows-msvc") {
     $env:GGML_CCACHE = "OFF"
 }
 
-cargo build --release -p pioneer-desktop --target $Target
-cargo build --release -p pioneer-app-updater --target $Target
-cargo build --release -p pioneer-cli --features computer-use --target $Target
+if (-not $SkipBuild) {
+    cargo update -p cua-driver-sdk
+    if ($LASTEXITCODE -ne 0) { throw "CUA SDK refresh failed" }
+    cargo build --locked --release -p pioneer-desktop --target $Target
+    cargo build --locked --release -p pioneer-app-updater --target $Target
+    cargo build --locked --release -p pioneer-cli --features computer-use --target $Target
+    if ($env:PIONEER_SYMBOL_INPUTS_DIR) {
+        python scripts/packaging/symbol-inputs.py export --target $Target "$env:PIONEER_SYMBOL_INPUTS_DIR" "target/$Target/release/pioneer-app.exe" "target/$Target/release/pioneer.exe" "target/$Target/release/pioneer-app-updater.exe"
+        if ($LASTEXITCODE -ne 0) { throw "Symbol input preservation failed" }
+    }
+}
 
 $workDir = Join-Path $env:TEMP ("pioneer-msi-" + [Guid]::NewGuid().ToString("N"))
 $stageDir = Join-Path $workDir "stage"
@@ -326,14 +336,22 @@ try {
     $gatewayStageDir = Join-Path $stageDir "gateway"
     New-Item -ItemType Directory -Path $gatewayStageDir -Force | Out-Null
 
-    $gatewayAssetName = "pioneer-gateway-windows-$archLabel.zip"
+    $gatewayAssetName = "pioneer-gateway-windows-$archLabel-computer-use-package.zip"
     $gatewayAssetPath = Join-Path $gatewayStageDir $gatewayAssetName
-    Compress-Archive -Path "target/$Target/release/pioneer.exe" -DestinationPath $gatewayAssetPath -Force
+    python scripts/packaging/cua-driver.py --target $Target --binary "target/$Target/release/pioneer.exe" --archive $gatewayAssetPath
+    if ($LASTEXITCODE -ne 0) { throw "Gateway CUA packaging failed" }
 
     $gatewaySha256 = (Get-FileHash -Path $gatewayAssetPath -Algorithm SHA256).Hash.ToLowerInvariant()
     "sha256:$gatewaySha256 $gatewayAssetName" | Set-Content -Path (Join-Path $gatewayStageDir "SHA256SUMS") -NoNewline
 
     Copy-Item -Path "target/$Target/release/pioneer.exe" -Destination (Join-Path $gatewayStageDir "pioneer-bootstrap.exe") -Force
+    if ($env:PIONEER_SYMBOL_INPUTS_DIR) {
+        $ledger = Join-Path $env:PIONEER_SYMBOL_INPUTS_DIR "packaged.json"
+        foreach ($binary in @((Join-Path $stageDir "pioneer-app.exe"), (Join-Path $gatewayStageDir "pioneer-bootstrap.exe"), $helperStagePath)) {
+            python scripts/packaging/symbol-inputs.py record $binary $ledger
+            if ($LASTEXITCODE -ne 0) { throw "Packaged module inventory failed" }
+        }
+    }
 
     $wxsPath = Join-Path $workDir "Pioneer.wxs"
     @"

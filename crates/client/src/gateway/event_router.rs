@@ -33,7 +33,7 @@ impl GatewayEventRoute {
             InvitationChanged(_) | MemberChanged(_) | WorkspaceMembersChanged(_) => {
                 Self::Administration
             }
-            WorkspaceChanged(_) | ThreadTreeChanged(_) => Self::Workspace,
+            WorkspaceChanged(_) | ThreadTreeChanged(_) | WorkspacePush(_) => Self::Workspace,
             GatewayRemoteAccessStatusChanged(_)
             | GatewayThreadEpisodicVectorRefillStatusChanged(_)
             | GatewayVoiceInputStatusChanged(_) => Self::Settings,
@@ -74,6 +74,7 @@ impl GatewayEventRoute {
             | TaskDeliveryDelivered(_)
             | TaskDeliveryFailed(_)
             | TaskDeliveryCancelled(_)
+            | TaskCompletionInboxChanged(_)
             | TaskUserNotificationDelivered(_)
             | TaskTreeChanged(_)
             | TaskRecovered(_) => Self::TaskNotification,

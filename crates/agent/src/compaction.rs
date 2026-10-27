@@ -135,7 +135,7 @@ impl Summarizer for NativeSummarizer {
             let classification = self.provider.classify_failure(&error);
             let class = classification.as_ref().map(|c| c.class).unwrap_or_else(|| {
                 crate::classify_provider_failure_message(
-                    &error.to_string(),
+                    &pioneer_provider::usage::classification_source(&error).to_string(),
                     ProviderFailureStage::Connect,
                 )
             });
@@ -162,6 +162,14 @@ impl Summarizer for NativeSummarizer {
                 } else {
                     "summary_transport_rejected"
                 },
+            }
+        })?;
+        pioneer_provider::ProviderMessageCollector::validate_response(&response).map_err(|_| {
+            SummaryFailure {
+                diagnostic: None,
+                kind: FailureKind::Permanent,
+                retry_after_ms: None,
+                code: "invalid_summary_messages",
             }
         })?;
         let kind = if !response.tool_calls.is_empty() {
@@ -212,6 +220,7 @@ mod tests {
                 anyhow::bail!("synthetic failure")
             }
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: HEADINGS
                     .iter()
                     .map(|h| format!("{h}\nНет сведений.\n"))

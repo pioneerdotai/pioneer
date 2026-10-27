@@ -100,6 +100,7 @@ struct StdioChildState {
     child: Box<dyn ChildWrapper>,
     stderr_reader: Option<tokio::task::JoinHandle<()>>,
     process_stopped: bool,
+    observation: pioneer_observability::resources::ChildRegistration,
     reader_error: Option<String>,
 }
 impl StdioChildOwner {
@@ -109,6 +110,9 @@ impl StdioChildOwner {
             // Same ProcessGroup/JobObject policy; kill includes child.wait.
             Box::into_pin(state.child.kill()).await?;
             state.process_stopped = true;
+            if let Some(status) = state.child.try_wait()? {
+                state.observation.exited(status.success());
+            }
         }
         if let Some(reader) = state.stderr_reader.as_mut() {
             reader.abort();
@@ -163,6 +167,11 @@ pub(crate) fn build_stdio_transport(
     command.wrap(JobObject);
 
     let mut child = command.spawn()?;
+    let observation = pioneer_observability::resources::ChildRegistration::register(
+        child.id(),
+        pioneer_observability::resources::ChildRole::Mcp,
+        None,
+    );
     let stdin = child
         .inner_mut()
         .stdin()
@@ -180,6 +189,7 @@ pub(crate) fn build_stdio_transport(
             child,
             stderr_reader,
             process_stopped: false,
+            observation,
             reader_error: None,
         }),
     });

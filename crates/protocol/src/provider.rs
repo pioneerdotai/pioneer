@@ -101,6 +101,11 @@ pub enum ReasoningCapabilitySource {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ProviderModelReasoningCapabilities {
+    /// Raw Models API reasoning facts. Missing key means absent; null means
+    /// unknown. Effort, thinking support and thinking types remain separate.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub native: std::collections::BTreeMap<String, Option<bool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -248,6 +253,7 @@ mod tests {
         assert_eq!(
             capabilities.reasoning,
             Some(ProviderModelReasoningCapabilities {
+                native: Default::default(),
                 supported: Some(true),
                 effort_options: vec!["low".to_owned(), "high".to_owned()],
                 default_effort: Some("medium".to_owned()),
@@ -406,5 +412,134 @@ mod tests {
         .expect("legacy configure params should decode");
         assert!(legacy_configure.base_url.is_none());
         assert!(!legacy_configure.clear_base_url);
+    }
+}
+
+/// Totals from persisted provider usage items. This is observed consumption,
+/// not a bill, a context-window measurement, or an estimate of missing usage.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedProviderUsageTotals {
+    pub attempts: usize,
+    pub confirmed_physical_attempts: usize,
+    pub unconfirmed_dispatches: usize,
+    pub known_input_tokens: u64,
+    pub known_output_tokens: u64,
+    pub missing_input_attempts: usize,
+    pub missing_output_attempts: usize,
+    pub incomplete_attempts: usize,
+}
+
+/// Supply canonical current items (or ordered item snapshots). Last snapshot
+/// wins for each observation. Retries have distinct observations and are counted
+/// once, including reported partial usage on failed attempts.
+pub fn observed_provider_usage_totals<'a>(
+    items: impl IntoIterator<Item = &'a crate::TurnItem>,
+) -> ObservedProviderUsageTotals {
+    let mut observations = std::collections::BTreeMap::new();
+    for item in items {
+        if let crate::TurnItem::SystemEvent {
+            id,
+            code,
+            details: Some(details),
+            ..
+        } = item
+            && code.as_deref() == Some("provider_usage")
+            && details["schema_version"].as_u64() == Some(1)
+        {
+            observations.insert(id, details);
+        }
+    }
+    // Delivery replay can materialize the same physical attempt under another
+    // item ID. Cumulative counts take the maximum; missing never erases known.
+    let mut distinct =
+        std::collections::BTreeMap::<String, (Option<u64>, Option<u64>, bool, bool)>::new();
+    for (id, details) in observations {
+        let physical = details["physical_attempt_id"].as_str();
+        let key = physical
+            .map(|p| format!("physical:{p}"))
+            .unwrap_or_else(|| format!("observation:{id}"));
+        let value = distinct
+            .entry(key)
+            .or_insert((None, None, false, physical.is_some()));
+        let max = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        value.0 = max(value.0, details["usage"]["input_tokens"].as_u64());
+        value.1 = max(value.1, details["usage"]["output_tokens"].as_u64());
+        value.2 |= details["complete"].as_bool() == Some(true);
+    }
+    let mut totals = ObservedProviderUsageTotals::default();
+    for (input, output, complete, physical) in distinct.values() {
+        totals.attempts += 1;
+        if *physical {
+            totals.confirmed_physical_attempts += 1;
+        } else {
+            totals.unconfirmed_dispatches += 1;
+        }
+        if !complete {
+            totals.incomplete_attempts += 1;
+        }
+        match input {
+            Some(count) => {
+                totals.known_input_tokens = totals.known_input_tokens.saturating_add(*count)
+            }
+            None => totals.missing_input_attempts += 1,
+        };
+        match output {
+            Some(count) => {
+                totals.known_output_tokens = totals.known_output_tokens.saturating_add(*count)
+            }
+            None => totals.missing_output_attempts += 1,
+        };
+    }
+    totals
+}
+
+#[cfg(test)]
+mod usage_observation_tests {
+    use super::*;
+    fn item(id: &str, input: Option<u64>, output: Option<u64>, complete: bool) -> crate::TurnItem {
+        crate::TurnItem::SystemEvent {
+            id: id.into(),
+            level: crate::SystemEventLevel::Info,
+            message: "Provider usage observation".into(),
+            code: Some("provider_usage".into()),
+            details: Some(serde_json::json!({"schema_version":1,"complete":complete,
+                "usage":{"input_tokens":input,"output_tokens":output}})),
+        }
+    }
+    #[test]
+    fn physical_attempt_identity_deduplicates_distinct_delivery_items() {
+        let mut a = item("delivery-a", Some(10), Some(2), true);
+        let mut b = item("delivery-b", Some(10), Some(2), true);
+        for item in [&mut a, &mut b] {
+            if let crate::TurnItem::SystemEvent {
+                details: Some(details),
+                ..
+            } = item
+            {
+                details["physical_attempt_id"] = serde_json::json!("physical-1");
+            }
+        }
+        let totals = observed_provider_usage_totals([&a, &b]);
+        assert_eq!(totals.attempts, 1);
+        assert_eq!(totals.confirmed_physical_attempts, 1);
+        assert_eq!(totals.known_input_tokens, 10);
+    }
+    #[test]
+    fn retries_partial_missing_zero_and_duplicate_snapshots_are_distinct() {
+        let first = item("attempt-1", Some(10), Some(2), false);
+        let second = item("attempt-2", Some(20), Some(0), true);
+        let missing = item("attempt-3", None, None, false);
+        let totals = observed_provider_usage_totals([&first, &second, &second, &missing]);
+        assert_eq!(totals.attempts, 3);
+        assert_eq!(totals.known_input_tokens, 30);
+        assert_eq!(totals.known_output_tokens, 2);
+        assert_eq!(totals.missing_output_attempts, 1);
+        assert_eq!(totals.incomplete_attempts, 2);
+        let encoded = serde_json::to_value(&second).unwrap();
+        let decoded: crate::TurnItem = serde_json::from_value(encoded).unwrap();
+        assert_eq!(observed_provider_usage_totals([&decoded]).attempts, 1);
     }
 }

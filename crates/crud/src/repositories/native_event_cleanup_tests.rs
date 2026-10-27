@@ -331,7 +331,45 @@ impl Fixture {
                         "status",
                         "projected_through_sequence",
                     ])
-                    .values_panic([id.into(), thread.id.into(), "healthy".into(), 1_i64.into()])
+                    .values_panic([
+                        id.into(),
+                        thread.id.clone().into(),
+                        "healthy".into(),
+                        1_i64.into(),
+                    ])
+                    .to_owned(),
+                // The current binding writer also persists a frozen locator,
+                // which does not exist at this historical migration boundary.
+                Query::insert()
+                    .into_table("turn_cli_runtime_binding")
+                    .columns([
+                        "turn_id",
+                        "thread_id",
+                        "continuation_thread_id",
+                        "workspace_id",
+                        "runtime_id",
+                        "runtime_kind",
+                        "native_thread_id",
+                        "native_turn_id",
+                        "status",
+                        "input_mapping_json",
+                        "created_at",
+                        "updated_at",
+                    ])
+                    .values_panic([
+                        id.into(),
+                        thread.id.clone().into(),
+                        thread.id.into(),
+                        "ws-cleanup".into(),
+                        "codex".into(),
+                        "codex".into(),
+                        "native-codex".into(),
+                        format!("native-{id}").into(),
+                        "completed".into(),
+                        "{}".into(),
+                        at.into(),
+                        at.into(),
+                    ])
                     .to_owned(),
             ];
             let statements = statements.map(|statement| DatabaseBackend::Sqlite.build(&statement));
@@ -340,7 +378,7 @@ impl Fixture {
                 transaction.execute_raw(statement).await?;
             }
             transaction.commit().await?;
-            return self.bind(id, "codex", "completed").await;
+            return Ok(());
         }
         self.store
             .materialize_turn_start(

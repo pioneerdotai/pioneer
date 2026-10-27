@@ -53,6 +53,10 @@ fn capsule_step_with_rounds(
             test_summary_config(),
             test_tool_loop_config(),
         ));
+        processor
+            .gateway_secrets
+            .set_workspace_provider_api_key(&workspace, "openai", "fixture-key")
+            .expect("capsule fixture provider should be configured");
         processor.bind_task_bridge().await;
         let response = create_task_for_test(
             &processor,
@@ -434,6 +438,7 @@ fn task_wait_repeats_timed_out_observations_for_task_and_run_ids() {
                 .append_task_event(
                     TaskEventPayload::RunCreated {
                         run: TaskRun {
+                            trigger_input: None,
                             id: run_id.clone(),
                             task_id: task_id.clone(),
                             trigger_id: None,

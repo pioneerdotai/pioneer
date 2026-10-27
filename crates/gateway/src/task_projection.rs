@@ -33,6 +33,8 @@ pub(crate) fn project_task_get_with_configuration(
     configuration_allowed: bool,
 ) -> PublicTaskGetResponse {
     PublicTaskGetResponse {
+        webhook_url: None,
+        webhook_scope: None,
         task: project_task(&response.task),
         triggers: response.triggers.iter().map(project_trigger).collect(),
         runs: response.runs.iter().map(project_run).collect(),
@@ -421,6 +423,7 @@ pub(crate) fn project_task(task: &Task) -> PublicTask {
         created_at: task.created_at,
         updated_at: task.updated_at,
         completed_at: task.completed_at,
+        finish_request: task.finish_request().cloned(),
     }
 }
 
@@ -793,6 +796,7 @@ mod tests {
             },
             triggers: vec![
                 TaskTrigger {
+                    webhook_secret_ref: None,
                     id: "trigger-cron".to_owned(),
                     task_id: "task-1".to_owned(),
                     status: TaskTriggerStatus::Active,
@@ -807,6 +811,7 @@ mod tests {
                     updated_at: 1,
                 },
                 TaskTrigger {
+                    webhook_secret_ref: None,
                     id: "trigger-external".to_owned(),
                     task_id: "task-1".to_owned(),
                     status: TaskTriggerStatus::Active,
@@ -897,6 +902,7 @@ mod tests {
                 };
                 response.task.error = Some(error.clone());
                 let run = TaskRun {
+                    trigger_input: None,
                     id: "run-1".to_owned(),
                     task_id: response.task.id.clone(),
                     trigger_id: None,
@@ -1074,6 +1080,41 @@ mod tests {
             canary_input,
             canary_external_filter,
         );
+        let raw_webhook_body = "private per-run webhook payload";
+        response.triggers[1].webhook_secret_ref =
+            Some("private-webhook-secret-reference".to_owned());
+        response.runs.push(pioneer_protocol::TaskRun {
+            id: "private-webhook-run".to_owned(),
+            task_id: response.task.id.clone(),
+            trigger_id: Some(response.triggers[1].id.clone()),
+            trigger_input: Some(pioneer_protocol::TaskRunTriggerInput {
+                content_type: Some("application/octet-stream".to_owned()),
+                encoding: pioneer_protocol::TaskRunInputEncoding::Utf8,
+                body: raw_webhook_body.to_owned(),
+            }),
+            parent_run_id: None,
+            run_group_id: "webhook-run-group".to_owned(),
+            attempt_number: 1,
+            retry_of_run_id: None,
+            ready_at: Some(1),
+            run_number: 1,
+            status: pioneer_protocol::TaskRunStatus::Queued,
+            executor_kind: pioneer_protocol::TaskExecutorKind::Agent,
+            started_at: None,
+            completed_at: None,
+            heartbeat_at: None,
+            locked_by: None,
+            lock_expires_at: None,
+            result: None,
+            error: None,
+            created_at: 1,
+            updated_at: 1,
+        });
+        // The same projection feeds general run lifecycle notifications.
+        let notification_run =
+            serde_json::to_string(&super::project_run(&response.runs[0])).unwrap();
+        assert!(!notification_run.contains(raw_webhook_body));
+        assert!(!notification_run.contains("triggerInput"));
         let mut run_spec = response.agent_specs[0].clone();
         run_spec.id = "agent-spec-run-1".to_owned();
         run_spec.run_id = Some("run-1".to_owned());
@@ -1085,6 +1126,8 @@ mod tests {
         assert!(!encoded.contains(canary_path));
         assert!(!encoded.contains(canary_webhook));
         assert!(!encoded.contains(canary_error));
+        assert!(!encoded.contains(raw_webhook_body));
+        assert!(!encoded.contains("private-webhook-secret-reference"));
         assert!(!encoded.contains("deliveryPolicy"));
         assert!(!encoded.contains("operator"));
         assert!(encoded.contains("\"error\":"));
@@ -1103,6 +1146,8 @@ mod tests {
         assert!(!managed.contains(canary_path));
         assert!(!managed.contains(canary_error));
         assert!(!managed.contains(canary_input));
+        assert!(!managed.contains(raw_webhook_body));
+        assert!(!managed.contains("private-webhook-secret-reference"));
         assert!(!managed.contains(canary_external_filter));
         assert!(!managed.contains(latest_projected_instruction));
         assert!(!managed.contains("\"operator\":"));

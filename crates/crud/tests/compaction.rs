@@ -1,7 +1,7 @@
 use migration::{Migrator, MigratorTrait};
 use pioneer_compaction::*;
 use pioneer_crud::{CrudStore, compaction::*};
-use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
 
 async fn store() -> CrudStore {
     store_recording_statements(None).await
@@ -543,8 +543,20 @@ async fn source(store: &CrudStore, id: &str, sequence: i64, payload: &str) -> So
     store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',?,'fixture',?,CURRENT_TIMESTAMP)",
         [id.into(), sequence.into(), payload.into()])).await.unwrap();
+    let revision = store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT revision FROM compaction_event_revision WHERE source_id=?1",
+            [id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "revision")
+        .unwrap();
     SourceAssertion {
-        revision: None,
+        revision: Some(revision),
         kind: CanonicalSource::Event,
         turn_id: "turn".into(),
         id: id.into(),
@@ -594,6 +606,30 @@ async fn candidate_with_manifest(
 }
 
 async fn candidate_fixture(
+    store: &CrudStore,
+    op: &str,
+    expected: Option<&str>,
+    assertion: &SourceAssertion,
+    source_epochs: std::collections::BTreeMap<String, u64>,
+    prepare_manifest: bool,
+) -> Checkpoint {
+    let checkpoint = candidate_admission_fixture(
+        store,
+        op,
+        expected,
+        assertion,
+        source_epochs,
+        prepare_manifest,
+    )
+    .await;
+    store
+        .compaction_save_candidate(&checkpoint, 0)
+        .await
+        .unwrap();
+    checkpoint
+}
+
+async fn candidate_admission_fixture(
     store: &CrudStore,
     op: &str,
     expected: Option<&str>,
@@ -659,10 +695,6 @@ async fn candidate_fixture(
         selection,
         projection_version: 1,
     };
-    store
-        .compaction_save_candidate(&checkpoint, 0)
-        .await
-        .unwrap();
     checkpoint
 }
 #[tokio::test]
@@ -675,8 +707,9 @@ async fn append_survives_atomic_apply_and_restart_does_not_regenerate_or_reapply
             .compaction_manifest_page("op-a", false, 0, 0)
             .await
             .unwrap()
-            .is_empty(),
-        "legacy assertion publication has no manifest"
+            .len()
+            == 1,
+        "raw assertion publication saves exact historical ownership"
     );
     source(&store, "source-b", 2, "appended after snapshot").await;
     assert_eq!(
@@ -1183,9 +1216,9 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
         plan: CompactionPlan {
             mode: CompactionMode::Normal,
             coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
-            compact: vec![],
+            compact: vec![0],
             retain: vec![],
-            coverage: vec![],
+            coverage: vec![reference.clone()],
             fingerprint: "runner-plan".into(),
         },
     };
@@ -1473,12 +1506,20 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
             .is_some(),
         "published checkpoint must survive an edit to its historical leaf"
     );
-    // Normal thread deletion must keep its existing cascade contract.
-    store
-        .database_connection()
-        .execute_unprepared("DELETE FROM thread WHERE id='thread'")
-        .await
-        .unwrap();
+    // FK-on cascade must not bypass permanent checkpoint identity/ownership
+    // guards. The rejected delete rolls back the entire thread cascade.
+    assert!(
+        store
+            .database_connection()
+            .execute_unprepared("DELETE FROM thread WHERE id='thread'")
+            .await
+            .is_err()
+    );
+    assert!(store.get_thread_model("thread").await.unwrap().is_some());
+    assert_eq!(
+        store.compaction_head(&checkpoint.owner).await.unwrap(),
+        Some(checkpoint.id.clone())
+    );
 }
 
 #[tokio::test]
@@ -1968,6 +2009,21 @@ async fn frozen_history_is_paged_immutable_scoped_and_restart_safe() {
         )
         .await
         .unwrap();
+    // R1: the committed prefix is visible in the logical view before ready;
+    // physical allocation beyond next is not part of the logical stream.
+    let visible = store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS n FROM compaction_frozen_message WHERE manifest_id=?",
+            [descriptor.manifest_id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(visible, 128);
     assert!(
         store
             .compaction_frozen_history_owner("ws", &descriptor)
@@ -2685,7 +2741,7 @@ async fn task_basis_scope_requires_exact_execution_snapshot_and_lineage() {
             .unwrap(),
         None
     );
-    db.execute_unprepared("INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('run','task','ws','thread','not read by metadata lookup',CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('run','task','ws','thread','not read by metadata lookup',CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture").await.unwrap();
     assert_eq!(
         store
             .compaction_task_basis_thread("ws", "child", "child-turn")
@@ -2737,7 +2793,7 @@ async fn task_basis_scope_requires_exact_execution_snapshot_and_lineage() {
     );
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "UPDATE task_run_conversation_snapshot SET history_json=? WHERE run_id='run'",
+        "WITH root_replacement(history_json) AS (VALUES (?)) UPDATE task_run_conversation_snapshot SET history_json=(SELECT history_json FROM root_replacement),frozen_manifest_id=(SELECT CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM root_replacement) WHERE run_id='run'",
         [large.clone().into()],
     ))
     .await
@@ -2894,46 +2950,1179 @@ async fn task_output_snapshot_is_bound_to_completed_turn_and_never_recaptured() 
     );
 }
 
+// Exact canonical delivery/output fixture; no mutable Task result payload is
+// needed for metadata discovery. Every output has a completed TaskRunTurn and
+// a ready frozen manifest, as in the production queue binding.
+async fn delivered_output_fixture(store: &CrudStore, delivery: &str, delivery_turn: &str) {
+    let db = store.database_connection();
+    let task = format!("task-{delivery}");
+    let run = format!("run-{delivery}");
+    let run_turn = format!("rt-{delivery}");
+    let source_turn = format!("output-turn-{delivery}");
+    for (sql, values) in [
+        (
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,'thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            vec![source_turn.clone().into()],
+        ),
+        (
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES (?,'ws','thread','thread','thread','turn','agent','completed','Task','fixture')",
+            vec![task.clone().into()],
+        ),
+        (
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES (?,?,?,1,1,'succeeded','agent')",
+            vec![run.clone().into(), task.clone().into(), run.clone().into()],
+        ),
+        (
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES (?,?,?,'thread',?,'initial',0,1,'completed',CURRENT_TIMESTAMP)",
+            vec![
+                run_turn.clone().into(),
+                task.clone().into(),
+                run.clone().into(),
+                source_turn.clone().into(),
+            ],
+        ),
+        (
+            "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES (?,?,?,?,'thread',?,0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            vec![
+                delivery.into(),
+                task.clone().into(),
+                run.clone().into(),
+                run_turn.clone().into(),
+                source_turn.clone().into(),
+            ],
+        ),
+        (
+            "INSERT OR IGNORE INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,'thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            vec![delivery_turn.into()],
+        ),
+        (
+            "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES (?,'ws',?,?,?,'thread','origin_thread','thread','delivered',1,1,?)",
+            vec![
+                delivery.into(),
+                task.into(),
+                run.into(),
+                delivery.into(),
+                delivery_turn.into(),
+            ],
+        ),
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .await
+        .unwrap();
+    }
+    let history = pioneer_compaction::frozen::FrozenHistoryRef {
+        format: 1,
+        manifest_id: format!("output-{delivery}"),
+        messages: 0,
+        identity_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+    };
+    store
+        .compaction_begin_frozen_history("ws", "thread", &history)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_finish_frozen_history("ws", "thread", &history)
+            .await
+            .unwrap()
+    );
+    store
+        .compaction_record_task_output("ws", &run_turn, &history)
+        .await
+        .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES (?,?,?)",
+        [delivery.into(),delivery.into(),run_turn.into()],
+    )).await.unwrap();
+}
+
+async fn delivered_ack(store: &CrudStore, delivery: &str, turn: &str) {
+    store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: turn.into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: pioneer_protocol::task_delivery_result_item_id(delivery),
+                    text: format!("result-{delivery}"),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn repeat_delivered_ack(
+    store: &CrudStore,
+    delivery: &str,
+    turn: &str,
+    id: &str,
+    sequence: i64,
+) {
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT ?,e.thread_id,e.turn_id,?,e.event_type,e.payload,CURRENT_TIMESTAMP FROM turn_event e JOIN compaction_event_revision r ON r.source_id=e.id WHERE e.turn_id=? AND r.item_id=? ORDER BY r.capture_order LIMIT 1",
+        [id.into(),sequence.into(),turn.into(),pioneer_protocol::task_delivery_result_item_id(delivery).into()],
+    )).await.unwrap();
+    let source = SourceRef {
+        scope: format!("event:{turn}"),
+        id: id.into(),
+        version: "event-revision:1".into(),
+    };
+    let payload = store
+        .compaction_reference_payload("ws", "thread", &source)
+        .await
+        .unwrap()
+        .unwrap();
+    let event = serde_json::from_str(&payload).unwrap();
+    assert!(
+        store
+            .compaction_record_event_projection("ws", "thread", &source, &event)
+            .await
+            .unwrap()
+    );
+}
+
+async fn output_metadata_padding(store: &CrudStore, turn: &str, tag: &str, start: i64, count: i64) {
+    for sequence in start..start + count {
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread',?,?,'fixture','{}',CURRENT_TIMESTAMP)",
+            [format!("{tag}-{sequence}").into(),turn.into(),sequence.into()],
+        )).await.unwrap();
+    }
+}
+
+async fn compress_output_events(store: &CrudStore) {
+    store.database_connection().query_one_write_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "SELECT zstd_enable_transparent(?)",
+        [serde_json::json!({"table":"turn_event","column":"payload","compression_level":3,"dict_chooser":"'[nodict]'"}).to_string().into()],
+    )).await.unwrap();
+}
+
+async fn refresh_output_page(store: &CrudStore, page: &DeliveredTaskOutputPage) {
+    for source in &page.unprojected_events {
+        let payload = store
+            .compaction_reference_payload("ws", "thread", source)
+            .await
+            .unwrap()
+            .unwrap();
+        let event = serde_json::from_str(&payload).unwrap();
+        assert!(
+            store
+                .compaction_record_event_projection("ws", "thread", source, &event)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+async fn foreign_output_history(store: &CrudStore) {
+    let db = store.database_connection();
+    for sql in [
+        "INSERT OR IGNORE INTO workspace(id,name,is_active,is_current) VALUES ('foreign-ws','foreign',1,0)",
+        "INSERT OR IGNORE INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('foreign-thread','foreign-ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT OR IGNORE INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('foreign-turn','foreign-thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<4096) INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT 'foreign-'||x,'foreign-thread','foreign-turn',x,'item/completed','{}',CURRENT_TIMESTAMP FROM n",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+}
+
+async fn discover_output_metadata(
+    store: &CrudStore,
+    fence: &HistoryReadFence,
+) -> (Vec<DeliveredTaskOutputRef>, usize, usize) {
+    let mut cursor = DeliveredTaskOutputCursor::default();
+    let mut entries = Vec::new();
+    let mut pages = 0;
+    let mut event_rows = 0;
+    loop {
+        let page = store
+            .compaction_delivered_output_page("ws", "thread", &cursor, fence)
+            .await
+            .unwrap();
+        assert!(page.selected_turn_rows + page.selected_event_rows <= 128);
+        assert!(page.unprojected_events.is_empty());
+        pages += 1;
+        assert!(pages <= 20, "local keyset cursor must terminate");
+        event_rows += page.selected_event_rows;
+        entries.extend(page.entries);
+        if page.done {
+            break;
+        }
+        assert_ne!(page.next_cursor, cursor);
+        cursor = page.next_cursor;
+    }
+    entries.sort_by_key(|entry| entry.capture_order);
+    (entries, pages, event_rows)
+}
+
+// Inspect the actual bound repository statements. Returned row counts alone
+// cannot detect a hidden global revision/delivery scan inside a SQL plan.
+async fn assert_output_discovery_plans(store: &CrudStore, statements: &RecordedStatements) {
+    let statements = statements.lock().unwrap().clone();
+    let discovery = statements
+        .into_iter()
+        .filter(|statement| {
+            statement.sql.starts_with("SELECT d.delivered_turn_id")
+                || statement.sql.contains("WITH quantum AS MATERIALIZED")
+        })
+        .collect::<Vec<_>>();
+    assert!(!discovery.is_empty());
+    for mut statement in discovery {
+        let event_page = statement.sql.contains("WITH quantum AS MATERIALIZED");
+        let resumed_events = statement.sql.contains("AND e.sequence>?");
+        let exact_recheck = statement.sql.contains("FROM json_each(?) w");
+        assert!(!statement.sql.contains("SELECT *"));
+        assert!(!statement.sql.contains("compaction_event_revision WHERE"));
+        assert!(!statement.sql.contains("rowid"));
+        assert!(!statement.sql.contains("payload"));
+        statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
+        let plan = store
+            .database_connection()
+            .query_all_raw(statement)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "detail").unwrap())
+            .collect::<Vec<_>>();
+        if event_page {
+            if exact_recheck {
+                assert!(
+                    plan.iter().any(|detail| detail.starts_with("SEARCH ")
+                        && (detail.starts_with("SEARCH e ") || detail.contains("turn_event"))
+                        && detail.contains("(id=?)")),
+                    "{plan:#?}"
+                );
+            } else {
+                assert!(
+                    plan.iter().any(|detail| detail.starts_with("SEARCH ")
+                        && detail.contains("idx_turn_events_turn_id_sequence")
+                        && detail.contains("(turn_id=?")
+                        && detail.contains("sequence<?")
+                        && (!resumed_events || detail.contains("sequence>?"))),
+                    "{plan:#?}"
+                );
+            }
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.starts_with("SEARCH r ")
+                        && detail.contains("(source_id=?)")),
+                "{plan:#?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.starts_with("SEARCH d ") && detail.contains("(id=?)")),
+                "{plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|detail| detail.starts_with("SCAN ")
+                    && (detail.contains("turn_event")
+                        || detail.starts_with("SCAN e ")
+                        || detail.starts_with("SCAN r ")
+                        || detail.starts_with("SCAN d "))),
+                "{plan:#?}"
+            );
+        } else {
+            assert!(
+                plan.iter().any(|detail| detail
+                    .contains("SEARCH d USING INDEX compaction_delivery_turn")
+                    && detail
+                        .contains("workspace_id=? AND target_thread_id=? AND delivered_turn_id>?")
+                    && detail.contains("delivered_turn_id<?")),
+                "{plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|detail| detail.contains("SCAN d ")),
+                "{plan:#?}"
+            );
+            assert!(
+                plan.iter().any(
+                    |detail| detail.starts_with("SEARCH ct ") && detail.contains("(turn_id=?)")
+                ),
+                "Turn fence uses the existing unique locator: {plan:#?}"
+            );
+            assert!(
+                plan.iter().any(|detail| detail.starts_with("SEARCH ")
+                    && detail.contains("idx_turn_events_turn_id_sequence")
+                    && detail.contains("(turn_id=?)")),
+                "sequence endpoint uses the local index: {plan:#?}"
+            );
+        }
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("compaction_event_revision_capture_order")),
+            "{plan:#?}"
+        );
+    }
+}
+
 #[tokio::test]
-async fn delivered_output_discovery_advances_empty_bounded_quanta() {
-    let store = store().await;
+async fn delivered_output_discovery_without_deliveries_ignores_foreign_history() {
+    let statements = RecordedStatements::default();
+    let store = store_recording_statements(Some(statements.clone())).await;
+    // Include same-workspace ordinary events as well: absent deliveries require
+    // no event/revision query, irrespective of any history high-water mark.
     for n in 1..=260 {
         source(&store, &format!("irrelevant-{n}"), n, "{}").await;
     }
+    foreign_output_history(&store).await;
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    statements.lock().unwrap().clear();
+    let page = store
+        .compaction_delivered_output_page(
+            "ws",
+            "thread",
+            &DeliveredTaskOutputCursor::default(),
+            &fence,
+        )
+        .await
+        .unwrap();
+    assert!(page.done);
+    assert!(page.entries.is_empty() && page.unprojected_events.is_empty());
+    assert_eq!(page.selected_turn_rows, 0);
+    assert_eq!(page.selected_event_rows, 0);
+    assert_eq!(statements.lock().unwrap().len(), 1);
+    assert_output_discovery_plans(&store, &statements).await;
+    source(&store, "late", 261, "{}").await;
+    assert_eq!(
+        store
+            .compaction_delivered_output_page(
+                "ws",
+                "thread",
+                &DeliveredTaskOutputCursor::default(),
+                &fence
+            )
+            .await
+            .unwrap(),
+        page
+    );
+}
+
+#[tokio::test]
+async fn delivered_output_local_keysets_preserve_sparse_outputs_and_repeated_acks() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    for compressed in [false, true] {
+        let statements = RecordedStatements::default();
+        let store = store_recording_statements(Some(statements.clone())).await;
+        if compressed {
+            store.database_connection().query_one_write_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "SELECT zstd_enable_transparent(?)", [serde_json::json!({"table":"turn_event","column":"payload","compression_level":3,"dict_chooser":"'[nodict]'"}).to_string().into()],
+            )).await.unwrap();
+        }
+        for (delivery, turn) in [
+            ("first", "z-turn"),
+            ("second", "a-turn"),
+            ("shared", "a-turn"),
+            ("third", "m-turn"),
+        ] {
+            delivered_output_fixture(&store, delivery, turn).await;
+        }
+        let mut canonical_outputs = std::collections::BTreeSet::new();
+        for delivery in ["first", "second", "shared", "third"] {
+            let snapshot = store
+                .compaction_delivery_output("ws", delivery)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                snapshot.output.source_turn,
+                format!("output-turn-{delivery}")
+            );
+            assert_eq!(snapshot.output.task_run_turn_id, format!("rt-{delivery}"));
+            assert_eq!(snapshot.candidate_id, delivery);
+            assert_eq!(
+                snapshot.output.history.manifest_id,
+                format!("output-{delivery}")
+            );
+            assert!(canonical_outputs.insert(snapshot.output.source_turn));
+        }
+        assert_eq!(canonical_outputs.len(), 4);
+        let before = store.compaction_history_read_fence().await.unwrap();
+        delivered_ack(&store, "first", "z-turn").await;
+        foreign_output_history(&store).await;
+        delivered_ack(&store, "second", "a-turn").await;
+        delivered_ack(&store, "shared", "a-turn").await;
+        delivered_ack(&store, "third", "m-turn").await;
+        // Put a replay on a different local page; sequence order deliberately
+        // disagrees with capture order so first-encountered is invalid.
+        for n in 2..=130 {
+            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','z-turn',?,'fixture','{}',CURRENT_TIMESTAMP)",
+                [format!("padding-{n}").into(),n.into()],
+            )).await.unwrap();
+        }
+        repeat_delivered_ack(&store, "first", "z-turn", "repeated-first", -1).await;
+        repeat_delivered_ack(&store, "first", "z-turn", "repeated-first-late", 131).await;
+        let fence = store.compaction_history_read_fence().await.unwrap();
+        statements.lock().unwrap().clear();
+        let (entries, pages, rows) = discover_output_metadata(&store, &fence).await;
+        assert_eq!(pages, 5); // a, m, two z pages, local exhaustion
+        assert_eq!(rows, 135);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.delivery_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "shared", "third", "first", "first"]
+        );
+        assert!(
+            entries
+                .windows(2)
+                .all(|pair| pair[0].capture_order < pair[1].capture_order)
+        );
+        assert_eq!(entries[0].acknowledgement.version, "event-revision:1");
+        assert_eq!(entries[4].acknowledgement.id, "repeated-first");
+        assert_ne!(entries[0].acknowledgement.id, "repeated-first");
+        assert_output_discovery_plans(&store, &statements).await;
+        store.database_connection().execute_unprepared(
+            "WITH RECURSIVE n(x) AS (VALUES(4097) UNION ALL SELECT x+1 FROM n WHERE x<8192) INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT 'foreign-'||x,'foreign-thread','foreign-turn',x,'item/completed','{}',CURRENT_TIMESTAMP FROM n",
+        ).await.unwrap();
+        let larger_fence = store.compaction_history_read_fence().await.unwrap();
+        statements.lock().unwrap().clear();
+        let (same, same_pages, same_rows) = discover_output_metadata(&store, &larger_fence).await;
+        assert_eq!(same, entries);
+        assert_eq!((same_pages, same_rows), (pages, rows));
+        // Three local Turn seeks plus exhaustion, and four event pages.
+        assert_eq!(statements.lock().unwrap().len(), 8);
+
+        // Append during an existing fenced request. Old discovery neither
+        // includes the new acknowledgement nor traverses foreign revisions.
+        let first_page = store
+            .compaction_delivered_output_page(
+                "ws",
+                "thread",
+                &DeliveredTaskOutputCursor::default(),
+                &fence,
+            )
+            .await
+            .unwrap();
+        assert!(!first_page.done);
+        repeat_delivered_ack(&store, "third", "m-turn", "late-third", 2).await;
+        let mut during_append = first_page.entries;
+        let mut cursor = first_page.next_cursor;
+        for n in 0..20 {
+            let page = store
+                .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+                .await
+                .unwrap();
+            assert!(page.unprojected_events.is_empty());
+            during_append.extend(page.entries);
+            if page.done {
+                break;
+            }
+            assert!(n < 19, "append must not prevent local exhaustion");
+            assert_ne!(page.next_cursor, cursor);
+            cursor = page.next_cursor;
+        }
+        during_append.sort_by_key(|entry| entry.capture_order);
+        assert_eq!(during_append, entries);
+        assert_eq!(discover_output_metadata(&store, &fence).await.0, entries);
+        assert!(discover_output_metadata(&store, &before).await.0.is_empty());
+        let after = store.compaction_history_read_fence().await.unwrap();
+        assert_eq!(discover_output_metadata(&store, &after).await.0.len(), 7);
+        for (workspace, thread) in [("foreign-ws", "thread"), ("ws", "foreign-thread")] {
+            let page = store
+                .compaction_delivered_output_page(
+                    workspace,
+                    thread,
+                    &DeliveredTaskOutputCursor::default(),
+                    &after,
+                )
+                .await
+                .unwrap();
+            assert!(page.done && page.entries.is_empty());
+            assert_eq!(page.selected_event_rows, 0);
+        }
+        assert_eq!(
+            store.database_connection().read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        assert_eq!(
+            store.database_connection().write_class(),
+            pioneer_sqlite::SqliteWriteClass::Maintenance
+        );
+    }
+}
+
+#[tokio::test]
+async fn delivered_output_exact_full_page_exhausts_without_a_revision_range_seek() {
+    let store = store().await;
+    delivered_output_fixture(&store, "delivery", "delivery-turn").await;
+    delivered_ack(&store, "delivery", "delivery-turn").await;
+    for sequence in 2..=127 {
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','delivery-turn',?,'fixture','{}',CURRENT_TIMESTAMP)",
+            [format!("exact-padding-{sequence}").into(),sequence.into()],
+        )).await.unwrap();
+    }
     let fence = store.compaction_history_read_fence().await.unwrap();
     let first = store
-        .compaction_delivered_output_page("ws", "thread", 0, &fence)
+        .compaction_delivered_output_page(
+            "ws",
+            "thread",
+            &DeliveredTaskOutputCursor::default(),
+            &fence,
+        )
         .await
         .unwrap();
-    assert!(first.entries.is_empty());
-    assert_eq!(first.scanned_through, 128);
+    assert_eq!(first.selected_event_rows, 127);
+    assert_eq!(first.entries.len(), 1);
     assert!(!first.done);
-    let second = store
-        .compaction_delivered_output_page("ws", "thread", first.scanned_through, &fence)
+    assert_eq!(first.next_cursor.after_sequence, Some(127));
+    let empty_tail = store
+        .compaction_delivered_output_page("ws", "thread", &first.next_cursor, &fence)
         .await
         .unwrap();
-    assert!(second.entries.is_empty());
-    assert_eq!(second.scanned_through, 256);
-    assert!(!second.done);
-    source(&store, "late", 261, "{}").await;
+    assert_eq!(
+        empty_tail.selected_turn_rows + empty_tail.selected_event_rows,
+        0
+    );
+    assert!(!empty_tail.done);
+    assert_ne!(empty_tail.next_cursor, first.next_cursor);
+    assert_eq!(empty_tail.next_cursor.after_turn, "delivery-turn");
     let last = store
-        .compaction_delivered_output_page("ws", "thread", second.scanned_through, &fence)
+        .compaction_delivered_output_page("ws", "thread", &empty_tail.next_cursor, &fence)
         .await
         .unwrap();
-    assert!(last.entries.is_empty());
-    assert_eq!(last.scanned_through, fence.event_order);
-    assert!(last.done);
+    assert!(last.done && last.entries.is_empty());
+    assert_eq!(last.selected_turn_rows + last.selected_event_rows, 0);
+}
+
+#[tokio::test]
+async fn delivered_output_cold_metadata_uses_scoped_revision_cas_and_source_freshness() {
+    let store = store().await;
+    delivered_output_fixture(&store, "delivery", "delivery-turn").await;
+    delivered_ack(&store, "delivery", "delivery-turn").await;
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    let cursor = DeliveredTaskOutputCursor::default();
+    let warm = store
+        .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+        .await
+        .unwrap();
+    assert_eq!(warm.entries.len(), 1);
+    let acknowledgement = &warm.entries[0].acknowledgement;
+    let payload = store
+        .compaction_reference_payload("ws", "thread", acknowledgement)
+        .await
+        .unwrap()
+        .unwrap();
+    let event: pioneer_crud::CanonicalTurnEventPayload = serde_json::from_str(&payload).unwrap();
+    for projection in ["NULL", "revision-1"] {
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            format!("UPDATE compaction_event_revision SET projection_revision={projection},item_id=NULL,projection_kind=NULL WHERE source_id=?"),
+            [acknowledgement.id.clone().into()],
+        )).await.unwrap();
+        let cold = store
+            .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+            .await
+            .unwrap();
+        assert!(cold.entries.is_empty());
+        assert_eq!(cold.unprojected_events, vec![acknowledgement.clone()]);
+        assert!(
+            store
+                .compaction_reference_payload("foreign-ws", "thread", acknowledgement)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .compaction_record_event_projection("ws", "thread", acknowledgement, &event)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+                .await
+                .unwrap(),
+            warm
+        );
+    }
+    foreign_output_history(&store).await;
+    store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE task_delivery SET delivered_turn_id='foreign-turn' WHERE id='delivery'",
+        )
+        .await
+        .unwrap();
+    let foreign_locator = store
+        .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+        .await
+        .unwrap();
+    assert!(foreign_locator.done && foreign_locator.entries.is_empty());
+    assert_eq!(foreign_locator.selected_event_rows, 0);
+    store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE task_delivery SET delivered_turn_id='delivery-turn' WHERE id='delivery'",
+        )
+        .await
+        .unwrap();
+    let epoch = store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_event SET payload=payload||' ' WHERE id=?",
+            [acknowledgement.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert_ne!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        epoch
+    );
+    assert!(
+        !store
+            .compaction_record_event_projection("ws", "thread", acknowledgement, &event)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .compaction_reference_payload("ws", "thread", acknowledgement)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let stale = store
+        .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+        .await
+        .unwrap();
+    assert!(stale.entries.is_empty());
+    assert_eq!(stale.unprojected_events.len(), 1);
+    assert_eq!(stale.unprojected_events[0].version, "event-revision:2");
+    store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM turn_event WHERE id=?",
+            [acknowledgement.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .compaction_record_event_projection("ws", "thread", acknowledgement, &event)
+            .await
+            .unwrap()
+    );
+    let deleted = store
+        .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+        .await
+        .unwrap();
+    assert!(deleted.entries.is_empty() && deleted.unprojected_events.is_empty());
+    assert_eq!(deleted.selected_event_rows, 0);
+}
+
+#[tokio::test]
+async fn delivered_output_fence_terminates_despite_continuous_append_and_new_turns() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    for compressed in [false, true] {
+        let statements = RecordedStatements::default();
+        let store = store_recording_statements(Some(statements.clone())).await;
+        if compressed {
+            compress_output_events(&store).await;
+        }
+        delivered_output_fixture(&store, "first", "a-old").await;
+        delivered_output_fixture(&store, "second", "z-old").await;
+        delivered_ack(&store, "first", "a-old").await;
+        delivered_ack(&store, "second", "z-old").await;
+        // A valid old acknowledgement can have a sequence far above the
+        // global capture order. An event_order-as-sequence cutoff would lose it.
+        let mut second_source = store
+            .compaction_source_metadata_page("ws", "thread", "z-old", PagedSource::Event, 0)
+            .await
+            .unwrap()
+            .entries[0]
+            .reference
+            .clone();
+        store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE turn_event SET sequence=10000 WHERE id=?",
+                [second_source.id.clone().into()],
+            ))
+            .await
+            .unwrap();
+        second_source.version = "event-revision:2".into();
+        let payload = store
+            .compaction_reference_payload("ws", "thread", &second_source)
+            .await
+            .unwrap()
+            .unwrap();
+        let event = serde_json::from_str(&payload).unwrap();
+        assert!(
+            store
+                .compaction_record_event_projection("ws", "thread", &second_source, &event)
+                .await
+                .unwrap()
+        );
+        output_metadata_padding(&store, "a-old", "before", 2, 259).await;
+        let fence = store.compaction_history_read_fence().await.unwrap();
+        assert!(fence.event_order < 10000);
+        let (expected, expected_pages, expected_rows) =
+            discover_output_metadata(&store, &fence).await;
+        assert_eq!((expected_pages, expected_rows), (5, 261));
+        let mut cursor = DeliveredTaskOutputCursor::default();
+        let mut entries = Vec::new();
+        let mut sources = std::collections::BTreeSet::new();
+        let mut rows = 0;
+        let mut pages = 0_usize;
+        loop {
+            // A producer appends a full quantum before EVERY continuation,
+            // including the would-be terminating request. New Turn IDs are
+            // inside the fence's lexical range, so creation_order is essential.
+            if pages > 0 {
+                if pages == 1 {
+                    // Late rows BEFORE an unvisited old acknowledgement must
+                    // not fill its quantum or move the admitted continuation.
+                    output_metadata_padding(&store, "z-old", "late-interleaved", 1, 127).await;
+                }
+                output_metadata_padding(
+                    &store,
+                    "a-old",
+                    &format!("late-{pages}"),
+                    261 + (pages as i64 - 1) * 127,
+                    127,
+                )
+                .await;
+                repeat_delivered_ack(
+                    &store,
+                    "first",
+                    "a-old",
+                    &format!("late-low-{pages}"),
+                    -(pages as i64),
+                )
+                .await;
+                let delivery = format!("late-delivery-{pages}");
+                let turn = format!("b-new-{pages:02}");
+                delivered_output_fixture(&store, &delivery, &turn).await;
+                delivered_ack(&store, &delivery, &turn).await;
+            }
+            statements.lock().unwrap().clear();
+            let page = store
+                .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+                .await
+                .unwrap();
+            assert!(page.selected_turn_rows + page.selected_event_rows <= 128);
+            for selected in &page.selected_events {
+                assert!(selected.capture_order <= fence.event_order);
+                assert!(
+                    sources.insert(selected.source.clone()),
+                    "no source is selected twice"
+                );
+            }
+            rows += page.selected_event_rows;
+            entries.extend(page.entries);
+            pages += 1;
+            assert!(
+                pages <= expected_pages,
+                "post-fence appends must not extend discovery"
+            );
+            assert_output_discovery_plans(&store, &statements).await;
+            if page.done {
+                break;
+            }
+            if let Some(upper) = cursor.event_high_water {
+                if page.next_cursor.active_turn == cursor.active_turn {
+                    assert_eq!(page.next_cursor.event_high_water, Some(upper));
+                }
+            }
+            assert_ne!(page.next_cursor, cursor);
+            cursor = page.next_cursor;
+        }
+        entries.sort_by_key(|entry| entry.capture_order);
+        assert_eq!(entries, expected);
+        assert_eq!((pages, rows), (expected_pages, expected_rows));
+        assert_eq!(sources.len(), expected_rows);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.delivery_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn delivered_output_cold_page_refresh_keeps_exact_sources_across_append_boundaries() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    for compressed in [false, true] {
+        for count in [126, 127, 128] {
+            let statements = RecordedStatements::default();
+            let store = store_recording_statements(Some(statements.clone())).await;
+            if compressed {
+                compress_output_events(&store).await;
+            }
+            delivered_output_fixture(&store, "delivery", "delivery-turn").await;
+            delivered_ack(&store, "delivery", "delivery-turn").await;
+            output_metadata_padding(&store, "delivery-turn", "before", 2, count - 1).await;
+            let fence = store.compaction_history_read_fence().await.unwrap();
+            let warm = store
+                .compaction_delivered_output_page(
+                    "ws",
+                    "thread",
+                    &DeliveredTaskOutputCursor::default(),
+                    &fence,
+                )
+                .await
+                .unwrap();
+            let ack = warm.entries[0].acknowledgement.clone();
+            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id=?", [ack.id.clone().into()],
+            )).await.unwrap();
+            let cold = store
+                .compaction_delivered_output_page(
+                    "ws",
+                    "thread",
+                    &DeliveredTaskOutputCursor::default(),
+                    &fence,
+                )
+                .await
+                .unwrap();
+            assert_eq!(cold.selected_event_rows, std::cmp::min(count, 127) as usize);
+            assert_eq!(cold.selected_events, warm.selected_events);
+            assert_eq!(cold.unprojected_events, [ack.clone()]);
+            // Append between selection and CAS, then again between CAS and
+            // exact recheck. Both high and negative sequences are after fence.
+            output_metadata_padding(&store, "delivery-turn", "after-selection", count + 1, 127)
+                .await;
+            // Use the known canonical source key: its item cache is deliberately
+            // NULL until CAS, so the replay fixture cannot locate it via cache.
+            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT 'negative-late',thread_id,turn_id,-1,event_type,payload,CURRENT_TIMESTAMP FROM turn_event WHERE id=?",
+                [ack.id.clone().into()],
+            )).await.unwrap();
+            refresh_output_page(&store, &cold).await;
+            output_metadata_padding(&store, "delivery-turn", "after-cas", count + 128, 127).await;
+            delivered_output_fixture(&store, "late", "late-turn").await;
+            delivered_ack(&store, "late", "late-turn").await;
+            statements.lock().unwrap().clear();
+            let refreshed = store
+                .compaction_recheck_delivered_output_page("ws", "thread", &cold, &fence)
+                .await
+                .unwrap();
+            assert_eq!(refreshed, warm);
+            assert_eq!(
+                statements.lock().unwrap().len(),
+                1,
+                "refresh uses one exact-key query"
+            );
+            assert_output_discovery_plans(&store, &statements).await;
+            assert!(
+                store
+                    .compaction_recheck_delivered_output_page("foreign-ws", "thread", &cold, &fence)
+                    .await
+                    .is_err()
+            );
+            let mut selected = refreshed
+                .selected_events
+                .into_iter()
+                .map(|event| event.source)
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut entries = refreshed.entries;
+            let mut cursor = refreshed.next_cursor;
+            loop {
+                let tail = store
+                    .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+                    .await
+                    .unwrap();
+                assert!(tail.selected_turn_rows + tail.selected_event_rows <= 128);
+                for event in tail.selected_events {
+                    assert!(selected.insert(event.source));
+                }
+                entries.extend(tail.entries);
+                if tail.done {
+                    break;
+                }
+                assert_ne!(tail.next_cursor, cursor);
+                cursor = tail.next_cursor;
+            }
+            assert_eq!(selected.len(), count as usize);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].acknowledgement, ack);
+        }
+    }
+}
+
+#[tokio::test]
+async fn delivered_output_exact_refresh_rejects_source_and_known_binding_changes() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    for compressed in [false, true] {
+        for mutation in ["edit", "delete", "scope", "binding"] {
+            let store = store().await;
+            if compressed {
+                compress_output_events(&store).await;
+            }
+            delivered_output_fixture(&store, "first", "shared-turn").await;
+            delivered_output_fixture(&store, "second", "shared-turn").await;
+            delivered_ack(&store, "first", "shared-turn").await;
+            delivered_ack(&store, "second", "shared-turn").await;
+            let fence = store.compaction_history_read_fence().await.unwrap();
+            let warm = store
+                .compaction_delivered_output_page(
+                    "ws",
+                    "thread",
+                    &DeliveredTaskOutputCursor::default(),
+                    &fence,
+                )
+                .await
+                .unwrap();
+            let first = warm.entries[0].acknowledgement.clone();
+            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id=?", [first.id.clone().into()],
+            )).await.unwrap();
+            let cold = store
+                .compaction_delivered_output_page(
+                    "ws",
+                    "thread",
+                    &DeliveredTaskOutputCursor::default(),
+                    &fence,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                cold.entries.len(),
+                1,
+                "a warm binding is retained alongside the cold source"
+            );
+            refresh_output_page(&store, &cold).await;
+            assert_eq!(
+                store
+                    .compaction_recheck_delivered_output_page("ws", "thread", &cold, &fence)
+                    .await
+                    .unwrap(),
+                warm
+            );
+            let db = store.database_connection();
+            if mutation == "binding" {
+                db.execute_unprepared("UPDATE compaction_delivery_output SET candidate_id='first' WHERE delivery_id='second'").await.unwrap();
+            } else {
+                let sql = match mutation {
+                    "edit" => "UPDATE turn_event SET payload=payload||' ' WHERE id=?",
+                    "delete" => "DELETE FROM turn_event WHERE id=?",
+                    "scope" => "UPDATE turn_event SET thread_id='other-thread' WHERE id=?",
+                    _ => unreachable!(),
+                };
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    sql,
+                    [first.id.clone().into()],
+                ))
+                .await
+                .unwrap();
+            }
+            assert!(
+                store
+                    .compaction_recheck_delivered_output_page("ws", "thread", &cold, &fence)
+                    .await
+                    .is_err(),
+                "{mutation} must invalidate the selected page"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn delivered_output_discovery_preserves_routes_and_cancels_queued_reads() {
+    use pioneer_sqlite::{
+        SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteReadOutcome, SqliteWriteEvent,
+        SqliteWriteObserver,
+    };
+    use sea_orm::{ConnectOptions, StreamTrait};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    #[derive(Default)]
+    struct Observer {
+        reads: Mutex<Vec<SqliteReadEvent>>,
+        writes: Mutex<Vec<SqliteWriteEvent>>,
+        queued: tokio::sync::Notify,
+    }
+    impl SqliteReadObserver for Observer {
+        fn observe(&self, event: SqliteReadEvent) {
+            self.reads.lock().unwrap().push(event);
+            if matches!(
+                event,
+                SqliteReadEvent::AdmissionEnqueued {
+                    queue_depth: 1,
+                    active: 1,
+                    ..
+                }
+            ) {
+                self.queued.notify_one();
+            }
+        }
+    }
+    impl SqliteWriteObserver for Observer {
+        fn observe(&self, event: SqliteWriteEvent) {
+            self.writes.lock().unwrap().push(event);
+        }
+    }
+    let directory = std::env::current_dir()
+        .unwrap()
+        .join("target/compaction-tests");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("{}.sqlite", uuid::Uuid::new_v4()));
+    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
+    options.max_connections(1).min_connections(1);
+    let writer = Database::connect(options).await.unwrap();
+    Migrator::up(&writer, None).await.unwrap();
+    writer
+        .execute_unprepared("PRAGMA journal_mode=WAL")
+        .await
+        .unwrap();
+    for sql in [
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    ] {
+        writer.execute_unprepared(sql).await.unwrap();
+    }
+    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
+    options.max_connections(2).min_connections(2);
+    let reader = Database::connect(options).await.unwrap();
+    reader
+        .execute_unprepared("PRAGMA query_only=ON")
+        .await
+        .unwrap();
+    let reader_proof = reader.clone();
+    let observer = Arc::new(Observer::default());
+    let database = pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+        reader,
+        pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        observer.clone(),
+    );
+    let interactive = CrudStore::new(database.clone());
+    delivered_output_fixture(&interactive, "delivery", "delivery-turn").await;
+    delivered_ack(&interactive, "delivery", "delivery-turn").await;
+    let fence = interactive.compaction_history_read_fence().await.unwrap();
+    let maintenance = interactive.with_maintenance_access();
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    let held = maintenance
+        .database_connection()
+        .stream_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT 1".to_owned(),
+        ))
+        .await
+        .unwrap();
+    let waiting = tokio::spawn({
+        let maintenance = maintenance.clone();
+        let fence = fence.clone();
+        async move {
+            maintenance
+                .compaction_delivered_output_page(
+                    "ws",
+                    "thread",
+                    &DeliveredTaskOutputCursor::default(),
+                    &fence,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), observer.queued.notified())
+        .await
+        .unwrap();
+    // Interactive discovery remains on its reader route while maintenance is
+    // queued. Both locator and bounded event query inherit the scoped class.
+    let page = tokio::time::timeout(
+        Duration::from_secs(2),
+        interactive.compaction_delivered_output_page(
+            "ws",
+            "thread",
+            &DeliveredTaskOutputCursor::default(),
+            &fence,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    assert!(observer.reads.lock().unwrap().iter().any(|event| matches!(
+        event,
+        SqliteReadEvent::AdmissionCancelled {
+            queue_depth: 0,
+            active: 1,
+            ..
+        }
+    )));
+    drop(held);
+    let resumed = tokio::time::timeout(
+        Duration::from_secs(2),
+        maintenance.compaction_delivered_output_page(
+            "ws",
+            "thread",
+            &DeliveredTaskOutputCursor::default(),
+            &fence,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resumed, page);
+    let reads = observer.reads.lock().unwrap().clone();
+    for class in [SqliteReadClass::Interactive, SqliteReadClass::Maintenance] {
+        assert_eq!(reads.iter().filter(|event| matches!(event,
+            SqliteReadEvent::OperationFinished { class: actual, outcome: SqliteReadOutcome::Ok, .. } if *actual == class
+        )).count(), 2);
+    }
+    assert!(reads.iter().any(|event| matches!(
+        event,
+        SqliteReadEvent::AdmissionReleased {
+            queue_depth: 0,
+            active: 0,
+            ..
+        }
+    )));
+    assert!(
+        observer.writes.lock().unwrap().is_empty(),
+        "metadata discovery must stay on the physical reader"
+    );
+    assert!(
+        reader_proof
+            .execute_unprepared("UPDATE task_delivery SET status='queued'")
+            .await
+            .is_err(),
+        "the independently opened discovery reader must reject physical writes"
+    );
 }
 
 #[tokio::test]
 async fn frozen_own_imports_require_exact_output_membership_and_atomic_publication() {
+    let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
     use sha2::{Digest, Sha256};
     fn descriptor(id: &str, messages: &[FrozenMessageRef]) -> FrozenHistoryRef {
         let mut digest = Sha256::new();
         for message in messages {
             let bytes = serde_json::to_vec(message).unwrap();
-            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update((bytes.len() as u64).to_be_bytes());
             digest.update(bytes);
         }
         FrozenHistoryRef {
@@ -3244,7 +4433,11 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             .is_empty()
     );
     for _ in 0..100 {
-        if !store.compact_frozen_storage_quantum().await.unwrap() {
+        if !store
+            .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+            .await
+            .unwrap()
+        {
             break;
         }
     }
@@ -3358,7 +4551,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         "an arbitrary parent manifest is not an accepted Task basis"
     );
     db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('run-c','task','ws','thread',?,CURRENT_TIMESTAMP)",
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('run-c','task','ws','thread',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         [serde_json::to_string(&context).unwrap().into()])).await.unwrap();
     assert!(
         store
@@ -3443,7 +4636,21 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     );
     // An accessible checkpoint must not launder H into accepted OWN work.
     // Model an older mixed checkpoint: only one of its two leaves was delivered.
-    let mixed_op = admit_import_operation(&store, "mixed-summary", "child", "child-turn").await;
+    let mut mixed_op = admit_import_operation(&store, "mixed-summary", "child", "child-turn").await;
+    // This legacy raw checkpoint originally admitted both leaves. It still
+    // must not grant a leaf that was never accepted in the delivered output.
+    mixed_op.plan.compact = vec![0, 1];
+    mixed_op.plan.coverage = vec![own_source.clone(), inherited.clone()];
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_operation SET snapshot=? WHERE id=?",
+        [
+            serde_json::to_string(&mixed_op).unwrap().into(),
+            mixed_op.id.clone().into(),
+        ],
+    ))
+    .await
+    .unwrap();
     let mixed = Checkpoint {
         id: "mixed-checkpoint".into(),
         operation_id: mixed_op.id.clone(),
@@ -3553,7 +4760,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     }
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('run-d','task-d','ws','thread',?,CURRENT_TIMESTAMP)",
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('run-d','task-d','ws','thread',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         [serde_json::to_string(&context).unwrap().into()],
     ))
     .await
@@ -3691,7 +4898,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .await
         .unwrap();
     db.execute_unprepared(
-        "UPDATE task_run_conversation_snapshot SET history_json='[]' WHERE run_id='run-c'",
+        "UPDATE task_run_conversation_snapshot SET history_json='[]',frozen_manifest_id=NULL WHERE run_id='run-c'",
     )
     .await
     .unwrap();
@@ -3715,7 +4922,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     );
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "UPDATE task_run_conversation_snapshot SET history_json=? WHERE run_id='run-c'",
+        "WITH root_replacement(history_json) AS (VALUES (?)) UPDATE task_run_conversation_snapshot SET history_json=(SELECT history_json FROM root_replacement),frozen_manifest_id=(SELECT CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM root_replacement) WHERE run_id='run-c'",
         [serde_json::to_string(&context).unwrap().into()],
     ))
     .await
@@ -3876,26 +5083,33 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .compaction_bind_source_projection(&operation.id, &context)
         .await
         .unwrap();
-    // Header identity is pinned with the operation, so mutation cannot widen
-    // the manifest's read-time authority before summarization.
-    db.execute_unprepared(
-        "UPDATE compaction_frozen_history SET imports_sha256='changed' WHERE id='assembled'",
-    )
-    .await
-    .unwrap();
+    // Complete identity is immutable now: an attempted rewrite is rejected
+    // before it can widen the operation's read-time authority. Corrupt legacy
+    // headers remain covered by the predicate/oracle fixtures.
     assert!(
-        !store
+        db.execute_unprepared(
+            "UPDATE compaction_frozen_history SET imports_sha256='changed' WHERE id='assembled'",
+        )
+        .await
+        .is_err()
+    );
+    let pinned: String = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT imports_sha256 FROM compaction_frozen_history WHERE id='assembled'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "imports_sha256")
+        .unwrap();
+    assert_eq!(pinned, import_digest);
+    assert!(
+        store
             .compaction_manifest_sources_current(&operation.id)
             .await
             .unwrap()
     );
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id='assembled'",
-        [import_digest.clone().into()],
-    ))
-    .await
-    .unwrap();
     db.execute_unprepared("CREATE TEMP TRIGGER abort_import_commit AFTER UPDATE OF head ON compaction_context BEGIN SELECT RAISE(ABORT,'fixture imported commit rollback'); END").await.unwrap();
     assert!(
         store
@@ -4224,7 +5438,7 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         let mut digest = Sha256::new();
         for message in messages {
             let bytes = serde_json::to_vec(message).unwrap();
-            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update((bytes.len() as u64).to_be_bytes());
             digest.update(bytes);
         }
         FrozenHistoryRef {
@@ -4261,6 +5475,19 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         let h = h_assertion.reference();
         let operation =
             admit_import_operation(&store, "portion-output", "portion-child", "portion-turn").await;
+        let mut raw = operation.clone();
+        raw.plan.compact = vec![0];
+        raw.plan.coverage = vec![h.clone()];
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_operation SET snapshot=?2 WHERE id=?1",
+            [
+                operation.id.clone().into(),
+                serde_json::to_string(&raw).unwrap().into(),
+            ],
+        ))
+        .await
+        .unwrap();
         let budget = ModelBudget::new(None, None, None);
         store
             .compaction_prepare_runner(&operation.id, &budget, 1, 0)
@@ -4627,11 +5854,6 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         // that atomic grant onto a distinct T whose historical input is K.
         for statement in [
             "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('portion-target-thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-            "INSERT INTO compaction_context(workspace_id,thread_id,owner,format_version) VALUES ('ws','portion-target-thread','portion-target-owner',1)",
-            "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES ('portion-target-operation','portion-target-owner','portion-target','completed','{}',1)",
-            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES ('portion-t','portion-target-operation','portion-target-owner',0,'target T','portion-t-version','{}',0,1,'applied')",
-            "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) SELECT 'portion-t',source_scope,source_id,source_version FROM compaction_live_sources WHERE source_id='portion-k'",
-            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) SELECT 'portion-target-operation',0,0,0,'portion-child',source_scope,source_id,source_version FROM compaction_live_sources WHERE source_id='portion-k'",
             "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('portion-consumer','ws','','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('portion-consumer','thread','thread',1,CURRENT_TIMESTAMP)",
             "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('portion-consumer-turn','portion-consumer','in_progress','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
@@ -4641,9 +5863,52 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         ] {
             db.execute_unprepared(statement).await.unwrap();
         }
+        db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('portion-target-turn','portion-target-thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+        let mut target_op = admit_import_operation(
+            &store,
+            "portion-target-operation",
+            "portion-target-thread",
+            "portion-target-turn",
+        )
+        .await;
+        target_op.plan.compact = vec![0];
+        target_op.plan.coverage = vec![k_source.clone()];
         db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('portion-consumer-run','portion-consumer-task','ws','thread',?,CURRENT_TIMESTAMP)",
+            "UPDATE compaction_operation SET snapshot=? WHERE id=?",
+            [
+                serde_json::to_string(&target_op).unwrap().into(),
+                target_op.id.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        let target_checkpoint = Checkpoint {
+            id: "portion-t".into(),
+            operation_id: target_op.id.clone(),
+            owner: target_op.owner.clone(),
+            previous: None,
+            coverage: vec![k_source.clone()],
+            summary: "target T".into(),
+            selection: target_op.admission.selection.clone(),
+            projection_version: target_op.projection_version,
+            format_version: 1,
+        };
+        store
+            .compaction_save_candidate(&target_checkpoint, 0)
+            .await
+            .unwrap();
+        // Model a pre-proof published legacy node with a real original raw
+        // contract, exact identity and ownership, rather than malformed '{}'.
+        db.execute_unprepared(
+            "UPDATE compaction_checkpoint SET status='applied' WHERE id='portion-t'",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared("UPDATE compaction_operation SET status='completed' WHERE id='portion-target-operation'").await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('portion-consumer-run','portion-consumer-task','ws','thread',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
             [serde_json::to_string(&imported).unwrap().into()],
         ))
         .await
@@ -4742,13 +6007,27 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
             .unwrap();
         let (raced_target, raced_imports) =
             begin_target(&store, "portion-target-raced", &target_message, raced).await;
-        db.execute_unprepared(if delete_leaf {
-            "DELETE FROM compaction_checkpoint WHERE id='portion-k'"
+        if delete_leaf {
+            assert!(
+                db.execute_unprepared("DELETE FROM compaction_checkpoint WHERE id='portion-k'")
+                    .await
+                    .is_err(),
+                "sealed original grant evidence cannot be deleted"
+            );
+            // The accepted binding itself can disappear after preparation;
+            // retain the immutable checkpoint and test that real writer race.
+            db.execute_unprepared(
+                "DELETE FROM task_run_conversation_snapshot WHERE run_id='portion-consumer-run'",
+            )
+            .await
+            .unwrap();
         } else {
-            "UPDATE compaction_checkpoint SET status='candidate' WHERE id='portion-k'"
-        })
-        .await
-        .unwrap();
+            db.execute_unprepared(
+                "UPDATE compaction_checkpoint SET status='candidate' WHERE id='portion-k'",
+            )
+            .await
+            .unwrap();
+        }
         assert!(
             store
                 .compaction_append_frozen_imports(
@@ -4853,6 +6132,32 @@ async fn ready_operation_with_references(
 ) -> pioneer_compaction::runner::RunnerState {
     use pioneer_compaction::runner::{RunnerState, SourceCursor};
     let op = &snapshot.id;
+    // Seed the exact original legacy raw plan before runner execution. An
+    // empty frozen-style plan is not a valid missing-binding contract.
+    if !sources.is_empty()
+        && snapshot.plan.compact.is_empty()
+        && store
+            .compaction_bound_source_projection(op)
+            .await
+            .unwrap()
+            .is_none()
+    {
+        let mut raw = snapshot.clone();
+        raw.plan.compact = (0..sources.len()).collect();
+        raw.plan.coverage = sources.iter().map(|(_, source)| source.clone()).collect();
+        store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_operation SET snapshot=?2 WHERE id=?1",
+                [
+                    op.clone().into(),
+                    serde_json::to_string(&raw).unwrap().into(),
+                ],
+            ))
+            .await
+            .unwrap();
+    }
     let budget = ModelBudget::new(None, None, None);
     store
         .compaction_prepare_runner(op, &budget, sources.len() as u64, references.len() as u64)
@@ -5627,7 +6932,7 @@ async fn legacy_task_snapshot_reference_is_bounded_scoped_and_revision_guarded()
     }
     let body = serde_json::to_string(&vec!["память🦀".repeat(9000)]).unwrap();
     db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('run','task','ws','thread','turn',?,CURRENT_TIMESTAMP)", [body.clone().into()])).await.unwrap();
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('run','task','ws','thread','turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture", [body.clone().into()])).await.unwrap();
     let source = store
         .compaction_legacy_task_basis_source("ws", "thread", "run")
         .await
@@ -5700,11 +7005,79 @@ async fn legacy_task_snapshot_reference_is_bounded_scoped_and_revision_guarded()
     );
 }
 
+// These fixtures enter optional preparation through canonical root publication,
+// while retry/deadline tests below continue to own the durable worker contract.
+async fn start_history_check_root(store: &CrudStore) {
+    let mut thread = store.get_thread_model("thread").await.unwrap().unwrap();
+    thread.updated_at = 1;
+    let (_, mut turn) = store.get_turn("thread", "turn").await.unwrap().unwrap();
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn WHERE id='turn'")
+        .await
+        .unwrap();
+    // The serialized writer may have foreign_keys=OFF, as production does.
+    // Retire only this raw fixture's creation key before reusing its Turn id.
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM compaction_turn_creation WHERE turn_id='turn'")
+        .await
+        .unwrap();
+    turn.status = pioneer_protocol::TurnStatus::InProgress;
+    store
+        .materialize_turn_start(
+            &thread,
+            pioneer_protocol::SandboxMode::FullAccess,
+            &turn,
+            &[],
+            pioneer_protocol::PersistedActorRef::Principal(
+                pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+}
+
+async fn publish_history_check_root(store: &CrudStore) {
+    store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "root-answer".into(),
+                    text: "ready root answer".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let (_, mut turn) = store.get_turn("thread", "turn").await.unwrap().unwrap();
+    turn.status = pioneer_protocol::TurnStatus::Completed;
+    store
+        .materialize_turn_completed(
+            pioneer_protocol::TurnCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn completed_cli_check_is_atomic_bounded_and_captures_settings_once() {
     let store = store().await;
+    start_history_check_root(&store).await;
     let db = store.database_connection();
-    db.execute_unprepared("INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,model) VALUES('turn','thread','thread','ws','claude','claude','native','running','sonnet')").await.unwrap();
+    db.execute_unprepared("INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,model,frozen_manifest_id) VALUES('turn','thread','thread','ws','claude','claude','native','running','sonnet',NULL)").await.unwrap();
     assert!(
         store
             .compaction_pending_history_checks()
@@ -5732,9 +7105,7 @@ async fn completed_cli_check_is_atomic_bounded_and_captures_settings_once() {
             .unwrap()
             .is_empty()
     );
-    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
-        .await
-        .unwrap();
+    publish_history_check_root(&store).await;
     let pending = store.compaction_pending_history_checks().await.unwrap();
     assert_eq!(pending.len(), 1);
     assert!(
@@ -5854,7 +7225,9 @@ async fn compaction_timeline_persists_explicit_terminal_status_with_one_item() {
 
 #[tokio::test]
 async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_reapply() {
+    use pioneer_entity::thread as legacy_thread;
     use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
+    use sea_orm::sea_query::{Expr, ExprTrait, Query};
     let connection = Database::connect("sqlite::memory:").await.unwrap();
     let writer = SqliteWriteExecutor::new(connection.clone());
     let migrations = Migrator::migrations();
@@ -5877,18 +7250,39 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
-    store
-        .update_thread_summary("thread", "retained old summary", 42)
-        .await
-        .unwrap();
+    // Seed only columns present at this historical migration boundary. The
+    // current Thread CRUD also selects later inbox fields, which do not exist yet.
+    let summary = Query::update()
+        .table(legacy_thread::Entity)
+        .value(
+            legacy_thread::Column::Summary,
+            Expr::val("retained old summary"),
+        )
+        .value(legacy_thread::Column::SummaryTurnCount, Expr::val(42_i64))
+        .and_where(Expr::col(legacy_thread::Column::Id).eq("thread"))
+        .to_owned();
+    assert_eq!(db.execute(&summary).await.unwrap().rows_affected(), 1);
+    let summary_query = Query::select()
+        .columns([
+            legacy_thread::Column::Summary,
+            legacy_thread::Column::SummaryTurnCount,
+        ])
+        .from(legacy_thread::Entity)
+        .and_where(Expr::col(legacy_thread::Column::Id).eq("thread"))
+        .to_owned();
     for _ in 0..2 {
         writer
             .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, Some(1))
             .await
             .unwrap();
+        let summary = db.query_one(&summary_query).await.unwrap().unwrap();
         assert_eq!(
-            store.get_thread_summary("thread").await.unwrap(),
-            Some(("retained old summary".into(), 42))
+            summary.try_get::<String>("", "summary").unwrap(),
+            "retained old summary"
+        );
+        assert_eq!(
+            summary.try_get::<i64>("", "summary_turn_count").unwrap(),
+            42
         );
         let row = db
             .query_one_raw(Statement::from_string(
@@ -5916,6 +7310,11 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
         .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
         .await
         .unwrap();
+    // The current CRUD is valid once the full schema has been installed.
+    assert_eq!(
+        store.get_thread_summary("thread").await.unwrap(),
+        Some(("retained old summary".into(), 42))
+    );
     source(&store, "after-migration", 1, "retained original").await;
     let page = store
         .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
@@ -5973,6 +7372,44 @@ async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrit
         db.execute_unprepared("INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES ('upgrade-summary','event:upgrade-turn','upgrade-leaf','event-revision:1')")
             .await
             .unwrap();
+        let raw = OperationSnapshot {
+            id: "upgrade-operation".into(),
+            owner: "upgrade-owner".into(),
+            expected_checkpoint: None,
+            projection_version: 0,
+            source_epochs: Default::default(),
+            admission: CompactionSettings::default()
+                .admit(
+                    &ModelSelection {
+                        transport: Transport::Api,
+                        instance: "upgrade-instance".into(),
+                        model: "upgrade-model".into(),
+                        effort: None,
+                    },
+                    None,
+                    0,
+                )
+                .unwrap(),
+            plan: CompactionPlan {
+                mode: CompactionMode::Normal,
+                coverage_domain: CoverageDomain::OwnContribution,
+                compact: vec![0],
+                retain: vec![],
+                coverage: vec![SourceRef {
+                    scope: "event:upgrade-turn".into(),
+                    id: "upgrade-leaf".into(),
+                    version: "event-revision:1".into(),
+                }],
+                fingerprint: "upgrade".into(),
+            },
+        };
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_operation SET snapshot=?1 WHERE id='upgrade-operation'",
+            [serde_json::to_string(&raw).unwrap().into()],
+        ))
+        .await
+        .unwrap();
         if compressed {
             let config = serde_json::json!({
                 "table":"turn_event",
@@ -6256,7 +7693,7 @@ fn shared_descriptor(
     let mut digest = Sha256::new();
     for r in refs {
         let b = serde_json::to_vec(r).unwrap();
-        digest.update((b.len() as u64).to_le_bytes());
+        digest.update((b.len() as u64).to_be_bytes());
         digest.update(b);
     }
     pioneer_compaction::frozen::FrozenHistoryRef {
@@ -6401,6 +7838,7 @@ async fn shared_frozen_growth_is_linear_and_old_revisions_are_unchanged() {
 }
 #[tokio::test]
 async fn legacy_frozen_duplicates_convert_incrementally_without_changing_ids_or_reads() {
+    let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     let store = store().await;
     let refs = shared_refs(300);
     for id in ["a", "b", "c"] {
@@ -6420,9 +7858,13 @@ async fn legacy_frozen_duplicates_convert_incrementally_without_changing_ids_or_
     );
 
     let mut quanta = 0;
-    while store.compact_frozen_storage_quantum().await.unwrap() {
+    while store
+        .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+        .await
+        .unwrap()
+    {
         quanta += 1;
-        assert!(quanta < 100);
+        assert!(quanta < 512);
         for id in ["a", "b", "c"] {
             assert_eq!(shared_read(&store, id).await, refs);
         }
@@ -6441,7 +7883,199 @@ async fn legacy_frozen_duplicates_convert_incrementally_without_changing_ids_or_
             .unwrap(),
         Some("thread".into())
     );
-    assert!(!store.compact_frozen_storage_quantum().await.unwrap());
+    assert!(
+        !store
+            .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn old_layout_sizes_and_new_shared_payload_keep_exact_logical_stream() {
+    let store = store().await;
+    let refs = shared_refs(260);
+    shared_capture(&store, "base", &refs, true).await;
+    let descriptor = shared_capture(&store, "legacy", &refs, false).await;
+    let sizes = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Sqlite,"SELECT ordinal,bytes FROM compaction_frozen_message WHERE manifest_id='legacy' ORDER BY ordinal")).await.unwrap();
+    assert_eq!(sizes.len(), refs.len());
+    let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
+    for _ in 0..512 {
+        store
+            .compact_frozen_storage_quantum(&mut progress)
+            .await
+            .unwrap();
+    }
+    assert_eq!(shared_read(&store, "legacy").await, refs);
+    let after = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Sqlite,"SELECT ordinal,bytes FROM compaction_frozen_message WHERE manifest_id='legacy' ORDER BY ordinal")).await.unwrap();
+    assert_eq!(
+        sizes
+            .iter()
+            .map(|r| (
+                r.try_get::<i64>("", "ordinal").unwrap(),
+                r.try_get::<i64>("", "bytes").unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        after
+            .iter()
+            .map(|r| (
+                r.try_get::<i64>("", "ordinal").unwrap(),
+                r.try_get::<i64>("", "bytes").unwrap()
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        260
+    );
+    assert_eq!(
+        store
+            .compaction_frozen_history_owner("ws", &descriptor)
+            .await
+            .unwrap(),
+        Some("thread".into())
+    );
+}
+
+#[tokio::test]
+async fn duplicate_cleanup_keeps_understated_physical_bytes_and_advances_after_layout_switch() {
+    let store = store().await;
+    let refs = shared_refs(2);
+    shared_capture(&store, "base", &refs, true).await;
+    shared_capture(&store, "legacy", &refs, false).await;
+    let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
+    let mut activated = false;
+    for _ in 0..128 {
+        store
+            .compact_frozen_storage_quantum(&mut progress)
+            .await
+            .unwrap();
+        let row=store.database_connection().query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT active,cleanup_next,cleanup_to FROM compaction_frozen_layout WHERE manifest_id='legacy' AND kind=0")).await.unwrap();
+        if let Some(row) = row {
+            if row.try_get::<i64>("", "active").unwrap() == 1
+                && row.try_get::<i64>("", "cleanup_next").unwrap() == 0
+                && row.try_get::<i64>("", "cleanup_to").unwrap() == 2
+            {
+                activated = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        activated,
+        "fixture must pause after real activation and before cleanup"
+    );
+    // Seed legacy corruption only; tested cleanup runs with CHECKs restored.
+    let oversized = serde_json::json!({"padding":"x".repeat(300_000)}).to_string();
+    let corrupted_payload = oversized.clone();
+    let tx = store.database_connection().begin().await.unwrap();
+    tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
+        .await
+        .unwrap();
+    tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_frozen_message_data SET reference_json=?1,bytes=2 WHERE manifest_id='legacy' AND ordinal=0",[corrupted_payload.into()])).await.unwrap();
+    tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        store
+            .compact_frozen_storage_quantum(&mut progress)
+            .await
+            .unwrap()
+    );
+    let state = store.database_connection().query_one_raw(Statement::from_string(DbBackend::Sqlite,
+        "SELECT active,failed,pending,cleanup_next,cleanup_to FROM compaction_frozen_layout WHERE manifest_id='legacy' AND kind=0")).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            state.try_get::<i64>("", "active").unwrap(),
+            state.try_get::<i64>("", "failed").unwrap(),
+            state.try_get::<i64>("", "pending").unwrap(),
+            state.try_get::<i64>("", "cleanup_next").unwrap(),
+            state.try_get::<i64>("", "cleanup_to").unwrap(),
+        ),
+        (1, 0, 0, 2, 2),
+        "a bad redundant row must not quarantine the published layout"
+    );
+    let mut finished = false;
+    for _ in 0..128 {
+        if !store
+            .compact_frozen_storage_quantum(&mut progress)
+            .await
+            .unwrap()
+        {
+            finished = true;
+            break;
+        }
+    }
+    assert!(finished, "the poison row must not cause endless retries");
+    let remaining = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Sqlite,
+        "SELECT ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id='legacy' ORDER BY ordinal")).await.unwrap();
+    assert_eq!(remaining.len(), 1, "the healthy duplicate must be deleted");
+    assert_eq!(remaining[0].try_get::<i64>("", "ordinal").unwrap(), 0);
+    assert_eq!(remaining[0].try_get::<i64>("", "bytes").unwrap(), 2);
+    assert_eq!(
+        remaining[0]
+            .try_get::<String>("", "reference_json")
+            .unwrap(),
+        oversized,
+        "cleanup must preserve the unsuitable physical row exactly"
+    );
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        3
+    );
+    assert_eq!(shared_read(&store, "base").await, refs);
+    assert_eq!(shared_read(&store, "legacy").await, refs);
+}
+
+#[tokio::test]
+async fn restart_staged_copy_next_does_not_publish_wrong_backing() {
+    let store = store().await;
+    let refs = shared_refs(2);
+    shared_capture(&store, "base", &refs, true).await;
+    shared_capture(&store, "staged", &refs, false).await;
+    store.database_connection().execute_unprepared("INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending,candidate,compared,copy_to,copy_next) VALUES('staged',0,0,1,'base',2,2,2)").await.unwrap();
+    // Plausible old progress with corrupt physical source. Direct rows still
+    // exist, so rejecting activation must keep the old logical layout usable.
+    store.database_connection().execute_unprepared("INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('staged',0,0,2,'staged')").await.unwrap();
+    let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
+    let mut rejected = false;
+    for _ in 0..128 {
+        if store
+            .compact_frozen_storage_quantum(&mut progress)
+            .await
+            .is_err()
+        {
+            rejected = true;
+            break;
+        }
+    }
+    assert!(rejected);
+    let state=store.database_connection().query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT active,failed FROM compaction_frozen_layout WHERE manifest_id='staged' AND kind=0")).await.unwrap().unwrap();
+    assert_eq!(state.try_get::<i64>("", "active").unwrap(), 0);
+    assert_eq!(state.try_get::<i64>("", "failed").unwrap(), 1);
+    assert!(
+        store
+            .compaction_frozen_history_page("ws", "thread", "staged", 0)
+            .await
+            .is_err(),
+        "corrupt layout is explicit, not empty history"
+    );
+    store.database_connection().execute_unprepared(
+        "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending,failed) VALUES('staged',1,0,1,1)"
+    ).await.unwrap();
+    assert!(
+        store
+            .compaction_frozen_import_page("ws", "thread", "staged", 0)
+            .await
+            .is_err(),
+        "a failed import layout is explicit even when its stream is empty"
+    );
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        4
+    );
+    assert_eq!(shared_read(&store, "base").await, refs);
 }
 
 #[tokio::test]
@@ -6494,6 +8128,7 @@ async fn shared_frozen_append_rollback_and_concurrent_retry_preserve_one_sequenc
 
 #[tokio::test]
 async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history() {
+    let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     let store = store().await;
     let refs = shared_refs(20);
     shared_capture(&store, "a", &refs, true).await;
@@ -6501,8 +8136,12 @@ async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history
     let db = store.database_connection();
     db.execute_unprepared("CREATE TEMP TRIGGER reject_shared_cleanup BEFORE DELETE ON compaction_frozen_message_data BEGIN SELECT RAISE(ABORT,'fixture cleanup rollback'); END").await.unwrap();
     let mut failed = false;
-    for _ in 0..20 {
-        if store.compact_frozen_storage_quantum().await.is_err() {
+    for _ in 0..128 {
+        if store
+            .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+            .await
+            .is_err()
+        {
             failed = true;
             break;
         }
@@ -6516,8 +8155,12 @@ async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history
     db.execute_unprepared("DROP TRIGGER reject_shared_cleanup")
         .await
         .unwrap();
-    for _ in 0..20 {
-        if !store.compact_frozen_storage_quantum().await.unwrap() {
+    for _ in 0..128 {
+        if !store
+            .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+            .await
+            .unwrap()
+        {
             break;
         }
     }
@@ -6533,8 +8176,11 @@ async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history
     .await
     .unwrap();
     let mut rejected = 0;
-    for _ in 0..40 {
-        match store.compact_frozen_storage_quantum().await {
+    for _ in 0..128 {
+        match store
+            .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+            .await
+        {
             Ok(false) => break,
             Ok(true) => {}
             Err(_) => rejected += 1,
@@ -6554,20 +8200,12 @@ async fn history_check_retries_are_durable_bounded_and_cas_protected() {
     use pioneer_entity::compaction_history_check as check;
     use sea_orm::EntityTrait;
     let store = store().await.with_maintenance_access();
-    store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
-        .await
-        .unwrap();
+    start_history_check_root(&store).await;
     store
         .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
         .await
         .unwrap();
-    store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
-        .await
-        .unwrap();
+    publish_history_check_root(&store).await;
     let mut now = 1000;
     for (failure, delay) in [60_000, 300_000, 900_000, 0].into_iter().enumerate() {
         let page = store.compaction_due_history_checks(now).await.unwrap();
@@ -6694,20 +8332,12 @@ async fn history_check_waits_do_not_spend_retries_and_stop_wins_over_stale_resul
     use pioneer_entity::compaction_history_check as check;
     use sea_orm::EntityTrait;
     let store = store().await.with_maintenance_access();
-    store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
-        .await
-        .unwrap();
+    start_history_check_root(&store).await;
     store
         .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
         .await
         .unwrap();
-    store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
-        .await
-        .unwrap();
+    publish_history_check_root(&store).await;
     let mut now = 0;
     for outcome in [
         O::Preparing,
@@ -6793,108 +8423,1181 @@ async fn history_check_waits_do_not_spend_retries_and_stop_wins_over_stale_resul
 }
 
 #[tokio::test]
-async fn history_check_legacy_failures_are_reconciled_once_without_reviving_cancelled_jobs() {
-    use pioneer_crud::compaction::{HistoryCheckDiagnostic as D, HistoryCheckOutcome as O};
+async fn history_check_legacy_failures_remain_retained_without_optional_admission() {
+    use pioneer_entity::compaction_history_check as check;
+    use sea_orm::EntityTrait;
     let store = store().await.with_maintenance_access();
     let db = store.database_connection();
     db.execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
         .await
         .unwrap();
     store
-        .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
+        .compaction_enqueue_native_history_check("ws", "thread", "turn", "retained descriptor")
         .await
         .unwrap();
     db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
         .await
         .unwrap();
-    db.execute_unprepared("UPDATE compaction_history_check SET state='finished',outcome='failed' WHERE turn_id='turn'").await.unwrap();
-    let row = store
-        .compaction_due_history_checks(0)
-        .await
-        .unwrap()
-        .remove(0);
-    let claim = store
-        .compaction_claim_history_check("turn", row.revision, 0)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        serde_json::from_str::<D>(claim.diagnostic.as_ref().unwrap())
-            .unwrap()
-            .legacy_reason_unknown,
-        "legacy marker must survive a crash before the result is recorded"
-    );
-    let d = D {
-        legacy_reason_unknown: true,
-        ..D::new("budget", "history_fits", "No summary needed")
-    };
-    store
-        .compaction_record_history_result("turn", claim.revision, 0, O::Fits, &d, 0)
-        .await
-        .unwrap();
-    assert!(
-        store
-            .compaction_due_history_checks(i64::MAX)
+    for outcome in ["failed", "cancelled"] {
+        db.execute_unprepared(&format!("UPDATE compaction_history_check SET managed=0,state='finished',outcome='{outcome}' WHERE turn_id='turn'")).await.unwrap();
+        let before = check::Entity::find_by_id("turn")
+            .one(&db)
             .await
             .unwrap()
-            .is_empty()
-    );
-    db.execute_unprepared("UPDATE compaction_history_check SET managed=0,state='finished',outcome='cancelled' WHERE turn_id='turn'").await.unwrap();
-    assert!(
-        store
-            .compaction_due_history_checks(i64::MAX)
+            .unwrap();
+        assert!(
+            store
+                .compaction_due_history_checks(i64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .compaction_claim_history_check("turn", before.revision, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let after = check::Entity::find_by_id("turn")
+            .one(&db)
             .await
             .unwrap()
-            .is_empty()
-    );
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "policy upgrade must not spend or rewrite the legacy lifecycle budget"
+        );
+    }
 }
 
 #[tokio::test]
-async fn history_check_legacy_pages_discard_superseded_turns_and_make_progress() {
+async fn history_check_legacy_pages_do_not_reenter_optional_discovery() {
+    use pioneer_entity::compaction_history_check as check;
+    use sea_orm::EntityTrait;
     let store = store().await.with_maintenance_access();
     let db = store.database_connection();
     for n in 0..33 {
         db.execute_unprepared(&format!("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('legacy-{n:02}','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")).await.unwrap();
         db.execute_unprepared(&format!("INSERT INTO compaction_history_check(turn_id,state,outcome) VALUES ('legacy-{n:02}','finished','failed')")).await.unwrap();
     }
-    for expected in [16, 16, 1] {
-        let page = store.compaction_due_history_checks(0).await.unwrap();
-        assert_eq!(page.len(), expected);
-        for row in page {
-            let claim = store
-                .compaction_claim_history_check(&row.turn_id, row.revision, 0)
+    let before = check::Entity::find().all(&db).await.unwrap();
+    for _ in 0..2 {
+        assert!(
+            store
+                .compaction_due_history_checks(i64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        check::Entity::find().all(&db).await.unwrap(),
+        before,
+        "discovery must leave legacy checks available to lifecycle inspection"
+    );
+}
+
+// Frozen history lifetime regressions.
+async fn checkpoint_proof_version(store: &CrudStore, id: &str) -> i64 {
+    store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT proof_version FROM compaction_checkpoint WHERE id=?1",
+            [id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "proof_version")
+        .unwrap()
+}
+#[tokio::test]
+async fn raw_assertion_publication_seals_exact_empty_proofs_and_immutable_ownership() {
+    let store = store().await;
+    let assertion = source(&store, "raw-proof-source", 1, "original").await;
+    let cp = candidate(&store, "raw-proof-op", None, &assertion).await;
+    assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 0);
+    let ownership = store
+        .compaction_manifest_page(&cp.operation_id, false, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(ownership.len(), 1);
+    assert_eq!(ownership[0].source, assertion.reference());
+    assert_eq!(ownership[0].thread_id, "thread");
+    // Genuine no-runner/no-manifest bootstrap still supports exact candidate
+    // retry once historical ownership was established in the first save.
+    store.compaction_save_candidate(&cp, 0).await.unwrap();
+    let retried = store
+        .compaction_manifest_page(&cp.operation_id, false, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].ordinal, ownership[0].ordinal);
+    assert_eq!(retried[0].unit, ownership[0].unit);
+    assert_eq!(retried[0].source, ownership[0].source);
+    assert_eq!(retried[0].thread_id, ownership[0].thread_id);
+    assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 0);
+    assert_eq!(
+        store
+            .compaction_apply(&cp, None, &[assertion.clone()])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 1);
+    let db = store.database_connection();
+    for table in [
+        "compaction_checkpoint_replay_alias",
+        "compaction_checkpoint_event_input",
+        "compaction_checkpoint_import",
+    ] {
+        let n: i64 = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!("SELECT count(*) AS n FROM {table} WHERE checkpoint_id=?1"),
+                [cp.id.clone().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap();
+        assert_eq!(n, 0, "empty set is proven by marker, not row presence");
+    }
+    for sql in [
+        "UPDATE compaction_checkpoint SET proof_version=0 WHERE id=?1",
+        "UPDATE compaction_checkpoint SET previous='forged' WHERE id=?1",
+        "DELETE FROM compaction_coverage WHERE checkpoint_id=?1",
+        "INSERT INTO compaction_checkpoint_event_input(checkpoint_id,source_thread,source_scope,source_id,source_version,role) VALUES(?1,'thread','event:turn','forged','event-revision:1','deleted')",
+    ] {
+        assert!(
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                [cp.id.clone().into()]
+            ))
+            .await
+            .is_err(),
+            "sealed evidence/links must be immutable"
+        );
+    }
+    assert!(
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM compaction_manifest WHERE operation_id=?1",
+            [cp.operation_id.clone().into()]
+        ))
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        store
+            .compaction_apply(&cp, None, &[assertion])
+            .await
+            .unwrap(),
+        CommitOutcome::AlreadyApplied
+    );
+}
+#[tokio::test]
+async fn raw_assertion_next_candidate_adds_unclaimed_original_source_and_publishes() {
+    let store = store().await;
+    let db = store.database_connection();
+    db.execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    let foreign_keys: i64 = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA foreign_keys",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "foreign_keys")
+        .unwrap();
+    assert_eq!(foreign_keys, 0);
+    let a = source(&store, "A", 1, "original A").await;
+    let b = source(&store, "B", 2, "original B").await;
+    let selection = ModelSelection {
+        transport: Transport::Api,
+        instance: "p".into(),
+        model: "m".into(),
+        effort: None,
+    };
+    let snapshot = OperationSnapshot {
+        id: "incremental-raw-op".into(),
+        owner: "owner".into(),
+        expected_checkpoint: None,
+        projection_version: 1,
+        source_epochs: Default::default(),
+        admission: CompactionSettings::default()
+            .admit(&selection, None, 10)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: CoverageDomain::OwnContribution,
+            compact: vec![0, 1],
+            retain: vec![],
+            coverage: vec![a.reference(), b.reference()],
+            fingerprint: "incremental-raw-op".into(),
+        },
+    };
+    let admitted = store
+        .compaction_admit("ws", "thread", &snapshot)
+        .await
+        .unwrap();
+    // One genuine raw admission: no runner preparation, seeded ownership,
+    // frozen binding, or later snapshot replacement supplies B.
+    assert!(
+        store
+            .compaction_runner_plan(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_runner_state(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_bound_source_projection(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_manifest_page(&snapshot.id, false, 0, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(admitted.snapshot, serde_json::to_string(&snapshot).unwrap());
+    let k0 = Checkpoint {
+        id: "raw-K0".into(),
+        operation_id: snapshot.id.clone(),
+        owner: snapshot.owner.clone(),
+        previous: None,
+        summary: "First portion, only A".into(),
+        selection,
+        coverage: vec![a.reference()],
+        projection_version: 1,
+        format_version: 1,
+    };
+    store.compaction_save_candidate(&k0, 0).await.unwrap();
+    let first = store
+        .compaction_manifest_page(&snapshot.id, false, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].source, a.reference());
+    assert_eq!(first[0].ordinal, 0);
+    assert_eq!(first[0].unit, 0);
+    assert_eq!(first[0].thread_id, "thread");
+    assert!(!first[0].reference_only);
+    store.compaction_save_candidate(&k0, 0).await.unwrap();
+    let k1 = Checkpoint {
+        id: "raw-K1".into(),
+        previous: None, // independent of unpublished-previous publication
+        summary: "Next portion, original A and B".into(),
+        coverage: snapshot.plan.coverage.clone(),
+        ..k0.clone()
+    };
+    // B's fresh insert and the candidate belong to one atomic write set.
+    // A conflicting closed portion rolls that insert back too.
+    assert!(store.compaction_save_candidate(&k1, 0).await.is_err());
+    assert!(store.compaction_checkpoint(&k1.id).await.unwrap().is_none());
+    let rolled_back = store
+        .compaction_manifest_page(&snapshot.id, false, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(rolled_back.len(), first.len());
+    assert_eq!(rolled_back[0].source, first[0].source);
+    assert_eq!(rolled_back[0].ordinal, first[0].ordinal);
+    assert_eq!(rolled_back[0].unit, first[0].unit);
+    assert_eq!(rolled_back[0].thread_id, first[0].thread_id);
+    assert_eq!(
+        store
+            .compaction_operation(&snapshot.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .next_portion,
+        1
+    );
+    // Corrupt unclaimed staging is not absence, even without a runner. The
+    // bootstrap above was genuine; these negative rows never seed a valid
+    // manifest for K1 and must survive each rejected save unchanged.
+    for (role, version) in [
+        ("1", b.reference().version),
+        ("2", b.reference().version),
+        ("0.5", b.reference().version),
+        ("0", "event-revision:999".into()),
+    ] {
+        let r = b.reference();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES(?1,7,7,?2,'thread',?3,?4,?5)",
+            [snapshot.id.clone().into(), role.into(), r.scope.into(), r.id.into(), version.clone().into()],
+        )).await.unwrap();
+        if role == "0.5" {
+            // Valid extrema 0/1 must not conceal an invalid interior value.
+            // This unrelated corrupt unclaimed row never enters coverage.
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES(?1,8,8,1,'thread','event:turn','unclaimed-role-boundary','event-revision:1')",
+                [snapshot.id.clone().into()])).await.unwrap();
+        }
+        let error = store.compaction_save_candidate(&k1, 1).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("raw candidate missing expected manifest ownership"),
+            "{role}/{version}: {error:#}"
+        );
+        assert!(store.compaction_checkpoint(&k1.id).await.unwrap().is_none());
+        assert_eq!(store.compaction_head(&k1.owner).await.unwrap(), None);
+        assert_eq!(checkpoint_proof_version(&store, &k0.id).await, 0);
+        let operation = store
+            .compaction_operation(&snapshot.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.snapshot, admitted.snapshot);
+        assert_eq!(operation.next_portion, 1);
+        assert_eq!(operation.status, "running");
+        let row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT CAST(reference_only AS TEXT) AS role,source_version FROM compaction_manifest WHERE operation_id=?1 AND ordinal=7",
+            [snapshot.id.clone().into()])).await.unwrap().unwrap();
+        assert_eq!(row.try_get::<String>("", "role").unwrap(), role);
+        assert_eq!(
+            row.try_get::<String>("", "source_version").unwrap(),
+            version
+        );
+        let boundary_row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT 1 FROM compaction_manifest WHERE operation_id=?1 AND ordinal=8 AND unit_ordinal=8 AND reference_only=1 AND source_thread='thread' AND source_scope='event:turn' AND source_id='unclaimed-role-boundary' AND source_version='event-revision:1'",
+            [snapshot.id.clone().into()])).await.unwrap();
+        assert_eq!(boundary_row.is_some(), role == "0.5");
+        // B is not covered by K0; removal of this corrupt unsealed staging
+        // row uses the existing permitted path, with all guards still active.
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM compaction_manifest WHERE operation_id=?1 AND ordinal IN (7,8)",
+            [snapshot.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    }
+    for _ in 0..2 {
+        for assertion in [&a, &b] {
+            assert_eq!(
+                store
+                    .compaction_reference_thread("ws", &assertion.reference())
+                    .await
+                    .unwrap(),
+                Some("thread".into())
+            );
+        }
+        store.compaction_save_candidate(&k1, 1).await.unwrap();
+        let saved = store
+            .compaction_manifest_page(&snapshot.id, false, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 2);
+        for (entry, expected) in saved.iter().zip([a.reference(), b.reference()]) {
+            assert_eq!(entry.source, expected);
+            assert_eq!(entry.thread_id, "thread");
+            assert!(!entry.reference_only);
+        }
+        assert_eq!(
+            (saved[0].ordinal, saved[0].unit),
+            (first[0].ordinal, first[0].unit)
+        );
+        assert_eq!((saved[1].ordinal, saved[1].unit), (1, 1));
+        let operation = store
+            .compaction_operation(&snapshot.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.snapshot, admitted.snapshot);
+        assert_eq!(operation.status, "running");
+        assert_eq!(operation.next_portion, 2);
+        assert_eq!(store.compaction_head(&k1.owner).await.unwrap(), None);
+        assert_eq!(checkpoint_proof_version(&store, &k0.id).await, 0);
+        assert_eq!(checkpoint_proof_version(&store, &k1.id).await, 0);
+    }
+    assert_eq!(
+        store
+            .compaction_apply(&k1, None, &[a.clone(), b.clone()])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(checkpoint_proof_version(&store, &k1.id).await, 1);
+    assert_eq!(
+        store.compaction_head(&k1.owner).await.unwrap(),
+        Some(k1.id.clone())
+    );
+    for (cp, expected) in [
+        (&k0, vec![a.reference()]),
+        (&k1, vec![a.reference(), b.reference()]),
+    ] {
+        let edges = store
+            .compaction_checkpoint_edges(&cp.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            edges
+                .coverage
+                .iter()
+                .map(|entry| entry.source.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert!(
+            edges
+                .coverage
+                .iter()
+                .all(|entry| entry.source_thread == "thread")
+        );
+        assert!(edges.replay_aliases.is_empty());
+        assert!(edges.event_input_evidence.is_empty());
+        for table in [
+            "compaction_checkpoint_replay_alias",
+            "compaction_checkpoint_event_input",
+            "compaction_checkpoint_import",
+        ] {
+            let n: i64 = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    format!("SELECT count(*) AS n FROM {table} WHERE checkpoint_id=?1"),
+                    [cp.id.clone().into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "n")
+                .unwrap();
+            assert_eq!(n, 0, "raw proof set stays empty; K0 does not claim B");
+        }
+    }
+    let status: String = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT status FROM compaction_checkpoint WHERE id=?1",
+            [k1.id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "status")
+        .unwrap();
+    assert_eq!(status, "applied");
+    let operation = store
+        .compaction_operation(&snapshot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.status, "completed");
+    assert_eq!(operation.snapshot, admitted.snapshot);
+    assert!(
+        store
+            .compaction_runner_plan(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_runner_state(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let saved = store
+        .compaction_manifest_page(&snapshot.id, false, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(saved.len(), 2);
+    for (ordinal, (entry, expected)) in saved.iter().zip([a.reference(), b.reference()]).enumerate()
+    {
+        assert_eq!(entry.source, expected);
+        assert_eq!(entry.ordinal, ordinal as u64);
+        assert_eq!(entry.unit, ordinal as u64);
+        assert_eq!(entry.thread_id, "thread");
+        assert!(!entry.reference_only);
+    }
+    assert_eq!(
+        store.compaction_apply(&k1, None, &[a, b]).await.unwrap(),
+        CommitOutcome::AlreadyApplied
+    );
+}
+
+#[tokio::test]
+async fn raw_assertion_api_saves_permuted_prebuilt_manifest_and_publishes_exactly() {
+    let store = store().await;
+    let a1 = source(&store, "A1", 1, "first A").await;
+    let b1 = source(&store, "B1", 2, "only B").await;
+    let a2 = source(&store, "A2", 3, "second A").await;
+    let selection = ModelSelection {
+        transport: Transport::Api,
+        instance: "p".into(),
+        model: "m".into(),
+        effort: None,
+    };
+    let coverage = vec![a1.reference(), a2.reference(), b1.reference()];
+    let snapshot = OperationSnapshot {
+        id: "permuted-raw-op".into(),
+        owner: "owner".into(),
+        expected_checkpoint: None,
+        projection_version: 1,
+        source_epochs: Default::default(),
+        admission: CompactionSettings::default()
+            .admit(&selection, None, 10)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: CoverageDomain::OwnContribution,
+            compact: vec![0, 1],
+            retain: vec![],
+            coverage: coverage.clone(),
+            fingerprint: "permuted-raw-op".into(),
+        },
+    };
+    store
+        .compaction_admit("ws", "thread", &snapshot)
+        .await
+        .unwrap();
+    store
+        .compaction_prepare_runner(&snapshot.id, &ModelBudget::new(None, None, None), 3, 0)
+        .await
+        .unwrap();
+    let ordered = vec![a1.reference(), b1.reference(), a2.reference()];
+    let manifest = ordered
+        .iter()
+        .enumerate()
+        .map(|(ordinal, source)| ManifestEntry {
+            ordinal: ordinal as u64,
+            unit: 5,
+            reference_only: false,
+            thread_id: "thread".into(),
+            source: source.clone(),
+        })
+        .collect::<Vec<_>>();
+    store
+        .compaction_append_manifest(&snapshot.id, &manifest)
+        .await
+        .unwrap();
+    assert_ne!(coverage, ordered);
+    assert!(
+        store
+            .compaction_manifest_sources_current(&snapshot.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .compaction_bound_source_projection(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let cp = Checkpoint {
+        id: "permuted-raw-checkpoint".into(),
+        operation_id: snapshot.id.clone(),
+        owner: snapshot.owner.clone(),
+        previous: None,
+        summary: "Exact complete units A and B".into(),
+        selection,
+        coverage: coverage.clone(),
+        projection_version: 1,
+        format_version: 1,
+    };
+    for _ in 0..2 {
+        // This is the first public candidate save, not just a runner's retry.
+        store.compaction_save_candidate(&cp, 0).await.unwrap();
+        let saved = store
+            .compaction_manifest_page(&snapshot.id, false, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 3);
+        assert_eq!(
+            saved
+                .iter()
+                .map(|entry| entry.source.clone())
+                .collect::<Vec<_>>(),
+            ordered
+        );
+        for (entry, expected) in saved.iter().zip(&manifest) {
+            assert_eq!(entry.ordinal, expected.ordinal);
+            assert_eq!(entry.unit, expected.unit);
+            assert_eq!(entry.thread_id, expected.thread_id);
+            assert!(!entry.reference_only);
+        }
+        assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 0);
+        assert_eq!(store.compaction_head(&cp.owner).await.unwrap(), None);
+    }
+    assert_eq!(
+        store
+            .compaction_apply(&cp, None, &[a1, a2, b1])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 1);
+    assert_eq!(
+        store.compaction_head(&cp.owner).await.unwrap(),
+        Some(cp.id.clone())
+    );
+    let edges = store
+        .compaction_checkpoint_edges(&cp.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        edges
+            .coverage
+            .iter()
+            .map(|entry| entry.source.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        coverage
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert!(
+        edges
+            .coverage
+            .iter()
+            .all(|entry| entry.source_thread == "thread")
+    );
+}
+
+#[tokio::test]
+async fn raw_candidate_rejects_corrupt_or_missing_prepared_ownership_without_bootstrap() {
+    async fn manifest_identity(store: &CrudStore, op: &str) -> Vec<String> {
+        let mut rows = store
+            .compaction_manifest_page(op, false, 0, 0)
+            .await
+            .unwrap();
+        rows.extend(
+            store
+                .compaction_manifest_page(op, true, 0, 0)
+                .await
+                .unwrap(),
+        );
+        rows.sort_by_key(|row| row.ordinal);
+        rows.iter()
+            .map(|row| {
+                serde_json::to_string(&(
+                    row.ordinal,
+                    row.unit,
+                    row.reference_only,
+                    &row.thread_id,
+                    &row.source,
+                ))
+                .unwrap()
+            })
+            .collect()
+    }
+    for ready in [false, true] {
+        for defect in [
+            "thread",
+            "version",
+            "reference-only",
+            "ambiguous",
+            "missing",
+            "operation",
+        ] {
+            let store = store().await;
+            let db = store.database_connection();
+            db.execute_unprepared("PRAGMA foreign_keys=OFF")
                 .await
                 .unwrap();
-            if row.turn_id == "legacy-32" {
-                let claim = claim.unwrap();
+            let fk: i64 = db
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "PRAGMA foreign_keys",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "foreign_keys")
+                .unwrap();
+            assert_eq!(fk, 0);
+            let assertion = source(&store, "prepared-owner-source", 1, "original").await;
+            let cp = candidate_admission_fixture(
+                &store,
+                "prepared-owner-op",
+                None,
+                &assertion,
+                Default::default(),
+                true,
+            )
+            .await;
+            let record = store
+                .compaction_operation(&cp.operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if ready {
+                let snapshot: OperationSnapshot = serde_json::from_str(&record.snapshot).unwrap();
+                // Only activate. ready_operation also saves a candidate and
+                // closes ownership, which would make this corruption fixture
+                // hit the immutable guard before the action under test.
+                let budget = ModelBudget::new(None, None, None);
+                let initial = pioneer_compaction::runner::RunnerState::new(
+                    snapshot.admission.deadline_ms,
+                    &budget,
+                    1000,
+                    None,
+                )
+                .unwrap();
                 store
-                    .compaction_record_history_result(
-                        &row.turn_id,
-                        claim.revision,
-                        0,
-                        HistoryCheckOutcome::Failed,
-                        &HistoryCheckDiagnostic::new(
-                            "descriptor",
-                            "invalid_descriptor",
-                            "Malformed metadata quarantined",
-                        ),
-                        0,
-                    )
+                    .compaction_activate_runner(&cp.operation_id, &initial)
                     .await
                     .unwrap();
-            } else {
+            }
+            // Corrupt the unsealed fixture before candidate creation. No DDL or
+            // production guard is disabled; prepared/ready state remains intact.
+            let sql = match defect {
+                "thread" => {
+                    "UPDATE compaction_manifest SET source_thread='wrong-thread' WHERE operation_id='prepared-owner-op'"
+                }
+                "version" => {
+                    "UPDATE compaction_manifest SET source_version='event-revision:999' WHERE operation_id='prepared-owner-op'"
+                }
+                "reference-only" => {
+                    "UPDATE compaction_manifest SET reference_only=1 WHERE operation_id='prepared-owner-op'"
+                }
+                "ambiguous" => {
+                    "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) SELECT operation_id,7,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version FROM compaction_manifest WHERE operation_id='prepared-owner-op'"
+                }
+                "missing" => {
+                    "DELETE FROM compaction_manifest WHERE operation_id='prepared-owner-op'"
+                }
+                "operation" => {
+                    "UPDATE compaction_manifest SET operation_id='orphan-operation' WHERE operation_id='prepared-owner-op'"
+                }
+                _ => unreachable!(),
+            };
+            db.execute_unprepared(sql).await.unwrap();
+            assert_eq!(
+                store
+                    .compaction_reference_thread("ws", &assertion.reference())
+                    .await
+                    .unwrap(),
+                Some("thread".into()),
+                "current assertion itself must remain valid"
+            );
+            let before = manifest_identity(&store, &cp.operation_id).await;
+            let orphan_before = manifest_identity(&store, "orphan-operation").await;
+            let state = serde_json::to_string(
+                &store
+                    .compaction_runner_state(&cp.operation_id)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            for _ in 0..2 {
+                let error = store.compaction_save_candidate(&cp, 0).await.unwrap_err();
                 assert!(
-                    claim.is_none(),
-                    "newer turn must invalidate an old failed check"
+                    error
+                        .to_string()
+                        .contains("raw historical ownership conflict")
+                        || error
+                            .to_string()
+                            .contains("raw candidate missing expected manifest ownership"),
+                    "{ready}/{defect}: {error:#}"
+                );
+                assert!(store.compaction_checkpoint(&cp.id).await.unwrap().is_none());
+                assert_eq!(store.compaction_head(&cp.owner).await.unwrap(), None);
+                let after = store
+                    .compaction_operation(&cp.operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(after.status, record.status);
+                assert_eq!(after.next_portion, record.next_portion);
+                assert_eq!(after.snapshot, record.snapshot);
+                assert_eq!(
+                    serde_json::to_string(
+                        &store
+                            .compaction_runner_state(&cp.operation_id)
+                            .await
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    state
+                );
+                assert_eq!(
+                    store
+                        .compaction_runner_plan(&cp.operation_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .ready,
+                    ready
+                );
+                assert_eq!(manifest_identity(&store, &cp.operation_id).await, before);
+                assert_eq!(
+                    manifest_identity(&store, "orphan-operation").await,
+                    orphan_before
                 );
             }
         }
     }
+}
+
+#[tokio::test]
+async fn raw_assertion_missing_historical_ownership_is_not_empty_proofs() {
+    let store = store().await;
+    let assertion = source(&store, "lost-owner-source", 1, "original").await;
+    // Model an unsealed legacy checkpoint whose ownership was already lost,
+    // before the new candidate writers' atomic immutable portion boundary.
+    // A post-commit DELETE is now correctly rejected by the production guard.
+    let cp = candidate_admission_fixture(
+        &store,
+        "lost-owner-op",
+        None,
+        &assertion,
+        Default::default(),
+        false,
+    )
+    .await;
+    use sha2::{Digest, Sha256};
+    let identity = hex::encode(Sha256::digest(serde_json::to_vec(&cp).unwrap()));
+    let db = store.database_connection();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES(?1,?2,?3,0,?4,?5,?6,?7,1,'candidate')",
+        [cp.id.clone().into(),cp.operation_id.clone().into(),cp.owner.clone().into(),cp.summary.clone().into(),identity.into(),serde_json::to_string(&cp.selection).unwrap().into(),(cp.projection_version as i64).into()])).await.unwrap();
+    let r = assertion.reference();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES(?1,?2,?3,?4)",
+        [cp.id.clone().into(),r.scope.into(),r.id.into(),r.version.into()])).await.unwrap();
+    // Candidate retry must not reconstruct a historical node from current
+    // assertions, even when neither a runner nor any manifest row survived.
+    assert!(store.compaction_save_candidate(&cp, 0).await.is_err());
     assert!(
         store
-            .compaction_due_history_checks(i64::MAX)
+            .compaction_manifest_page(&cp.operation_id, false, 0, 0)
             .await
             .unwrap()
             .is_empty()
+    );
+    assert!(
+        store
+            .compaction_apply(&cp, None, &[assertion])
+            .await
+            .is_err()
+    );
+    assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 0);
+    assert_eq!(store.compaction_head("owner").await.unwrap(), None);
+}
+#[tokio::test]
+async fn extra_staging_evidence_prevents_seal_and_publication_without_overwrite() {
+    let store = store().await;
+    let assertion = source(&store, "staging-source", 1, "original").await;
+    let cp = candidate(&store, "staging-op", None, &assertion).await;
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_checkpoint_event_input(checkpoint_id,source_thread,source_scope,source_id,source_version,role) VALUES(?1,'thread','event:turn','poison','event-revision:1','deleted')",[cp.id.clone().into()])).await.unwrap();
+    for _ in 0..2 {
+        assert!(
+            store
+                .compaction_apply(&cp, None, &[assertion.clone()])
+                .await
+                .is_err()
+        );
+        assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 0);
+    }
+    assert_eq!(store.compaction_head("owner").await.unwrap(), None);
+    let n: i64 = store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_checkpoint_event_input WHERE checkpoint_id=?1",
+            [cp.id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(n, 1, "conflicting staging is not silently repaired");
+}
+#[tokio::test]
+async fn checkpoint_alias_null_identity_is_distinct_from_empty_tool_identity() {
+    let store = store().await;
+    let assertion = source(&store, "alias-source", 1, "original").await;
+    let cp = candidate(&store, "alias-op", None, &assertion).await;
+    let sql = "INSERT INTO compaction_checkpoint_replay_alias(checkpoint_id,covered_thread,covered_scope,covered_id,covered_version,replay_thread,replay_scope,replay_id,replay_version,tool_item_id) VALUES(?1,'thread','event:turn','source','event-revision:1','thread','context:turn','replay','revision:1',?2)";
+    for tool in [None, Some(String::new())] {
+        store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                [cp.id.clone().into(), tool.into()],
+            ))
+            .await
+            .unwrap();
+    }
+    assert!(
+        store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                [cp.id.clone().into(), Option::<String>::None.into()]
+            ))
+            .await
+            .is_err()
+    );
+    let n: i64 = store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_checkpoint_replay_alias WHERE checkpoint_id=?1",
+            [cp.id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(n, 2);
+}
+
+#[tokio::test]
+async fn deadline_saved_ready_candidate_commit_expiry_refuses_resume_without_changing_generation() {
+    use pioneer_compaction::runner::{AttemptPurpose, FailureKind, RunnerPhase, RunnerState};
+    for phase_name in ["Ready", "Candidate", "Commit"] {
+        let store = store().await;
+        let assertion = source(&store, "resume-source", 1, "original").await;
+        let cp = candidate_fixture(
+            &store,
+            "resume-op",
+            None,
+            &assertion,
+            std::collections::BTreeMap::new(),
+            true,
+        )
+        .await;
+        let descriptor = shared_descriptor("resume-origin", &[]);
+        store
+            .compaction_begin_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap();
+        let hold = store
+            .compaction_finish_frozen_history_held("ws", "thread", &descriptor)
+            .await
+            .unwrap();
+        let db = store.database_connection();
+        db.execute_unprepared("INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT 'resume-op',id,identity_sha256,imports_sha256,import_count FROM compaction_frozen_history WHERE id='resume-origin'").await.unwrap();
+        let phase = match phase_name {
+            "Ready" => RunnerPhase::Ready {
+                purpose: AttemptPurpose::Portion,
+            },
+            "Candidate" => RunnerPhase::Candidate {
+                checkpoint: cp.id.clone(),
+                final_portion: true,
+            },
+            _ => RunnerPhase::Commit {
+                checkpoint: cp.id.clone(),
+            },
+        };
+        let state = RunnerState {
+            generation: 0,
+            deadline_ms: 1000,
+            attempts: 1,
+            retries: 0,
+            portion_attempts: 0,
+            corrections: 0,
+            target_tokens: 10,
+            source_text_projection_version: 0,
+            cursor: pioneer_compaction::runner::SourceCursor {
+                unit: 1,
+                ..Default::default()
+            },
+            previous_checkpoint: Some(cp.id.clone()),
+            phase: RunnerPhase::Failed {
+                kind: FailureKind::Deadline,
+            },
+            resume_phase: Some(phase),
+            observation: None,
+            diagnostic: None,
+        };
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES('resume-op',0,?1)",[serde_json::to_string(&state).unwrap().into()])).await.unwrap();
+        db.execute_unprepared("UPDATE compaction_operation SET status='failed',outcome='deadline',deadline_ms=1000 WHERE id='resume-op'").await.unwrap();
+        drop(hold);
+        if phase_name == "Commit" {
+            assert!(
+                store
+                    .compaction_resume_deadline("resume-op", "turn", 2000)
+                    .await
+                    .unwrap(),
+                "resume first creates a running origin root"
+            );
+            let mut p = pioneer_crud::FrozenStorageLifetimeProgress::default();
+            for _ in 0..500 {
+                let _ = p.quantum(&store).await;
+            }
+            assert!(
+                store
+                    .compaction_bound_source_projection("resume-op")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            // Return to proven deadline terminal state at the new generation.
+            let mut terminal = store
+                .compaction_runner_state("resume-op")
+                .await
+                .unwrap()
+                .unwrap();
+            terminal.generation += 1;
+            terminal.phase = RunnerPhase::Failed {
+                kind: FailureKind::Deadline,
+            };
+            terminal.resume_phase = Some(RunnerPhase::Commit {
+                checkpoint: cp.id.clone(),
+            });
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_runner_state SET generation=?1,state=?2 WHERE operation_id='resume-op'",[(terminal.generation as i64).into(),serde_json::to_string(&terminal).unwrap().into()])).await.unwrap();
+            db.execute_unprepared("UPDATE compaction_operation SET status='failed',outcome='deadline' WHERE id='resume-op'").await.unwrap();
+        }
+        // Isolated fixture expiry models the durable winner before dispatch.
+        db.execute_unprepared(
+            "UPDATE compaction_frozen_history SET expired=1 WHERE id='resume-origin'",
+        )
+        .await
+        .unwrap();
+        let before = store
+            .compaction_runner_state("resume-op")
+            .await
+            .unwrap()
+            .unwrap();
+        let error = store
+            .compaction_resume_deadline("resume-op", "turn", 4000)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("expired"), "{phase_name}");
+        assert_eq!(
+            store
+                .compaction_runner_state("resume-op")
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            store
+                .compaction_operation("resume-op")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_large_raw_admission_and_coverage_are_paged_not_poisoned_by_aggregate_bytes() {
+    let recorded: RecordedStatements = Default::default();
+    let store = store_recording_statements(Some(recorded.clone())).await;
+    let mut assertions = Vec::new();
+    for i in 0..128 {
+        assertions.push(
+            source(
+                &store,
+                &format!("raw-{i:04}-{}", "x".repeat(3072)),
+                i + 1,
+                "{}",
+            )
+            .await,
+        );
+    }
+    let mut cp = candidate_admission_fixture(
+        &store,
+        "raw-large-op",
+        None,
+        &assertions[0],
+        Default::default(),
+        false,
+    )
+    .await;
+    cp.coverage = assertions.iter().map(SourceAssertion::reference).collect();
+    let db = store.database_connection();
+    let row = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT snapshot FROM compaction_operation WHERE id='raw-large-op'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut snapshot: OperationSnapshot =
+        serde_json::from_str(&row.try_get::<String>("", "snapshot").unwrap()).unwrap();
+    snapshot.plan.coverage = cp.coverage.clone();
+    snapshot.plan.compact = (0..cp.coverage.len()).collect();
+    let json = serde_json::to_string(&snapshot).unwrap();
+    assert!(json.len() > SOURCE_PAGE_BYTES);
+    // Original legacy admission predates the small current admission envelope.
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_operation SET snapshot=?1 WHERE id='raw-large-op'",
+        [json.into()],
+    ))
+    .await
+    .unwrap();
+    recorded.lock().unwrap().clear();
+    store.compaction_save_candidate(&cp, 0).await.unwrap();
+    assert_eq!(
+        store
+            .compaction_checkpoint(&cp.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .coverage,
+        cp.coverage
+    );
+    assert_eq!(
+        store
+            .compaction_checkpoint_edges(&cp.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .coverage
+            .len(),
+        128
+    );
+    assert_eq!(
+        store
+            .compaction_apply(&cp, None, &assertions)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 1);
+    let statements = recorded.lock().unwrap();
+    let fragments = statements
+        .iter()
+        .filter(|s| s.sql.contains("substr(CAST(o.snapshot AS BLOB)"))
+        .count();
+    assert!(
+        fragments >= 4,
+        "both raw preparation and proof extraction must read multiple fragments"
+    );
+    assert!(
+        !statements
+            .iter()
+            .any(|s| s.sql.starts_with("SELECT owner,snapshot")),
+        "no full snapshot payload read"
     );
 }

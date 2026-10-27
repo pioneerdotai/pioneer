@@ -1,6 +1,7 @@
 #[cfg(test)]
 use super::embedding::ordered_vectors;
 use super::embedding::validate_input;
+use crate::Provider;
 use crate::{
     attachments::{
         AttachmentOperationError, AttachmentPipelineConfig, AttachmentTransportKind,
@@ -16,8 +17,8 @@ use crate::{
     types::{
         ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, InputContentType,
         InputTypeSupport, ProviderCapabilities, ProviderFailureClassification,
-        ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, ReasoningConfig,
-        Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+        ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, Role, StreamChunk,
+        TokenUsage, ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -81,6 +82,34 @@ pub struct OpenAiProvider {
     client: Client,
 }
 
+/// Documented Chat-only input-audio families. Route depends only on model
+/// contract, never request attachments, mutable discovery or previous errors.
+pub(crate) fn chat_only_audio_model(model: &str) -> bool {
+    [
+        "gpt-audio",
+        "gpt-audio-mini",
+        "gpt-4o-audio-preview",
+        "gpt-4o-mini-audio-preview",
+    ]
+    .iter()
+    .any(|family| {
+        model == *family
+            || model
+                .strip_prefix(family)
+                .and_then(|tail| tail.strip_prefix('-'))
+                .is_some_and(|date| {
+                    date.len() == 10
+                        && date.bytes().enumerate().all(|(i, b)| {
+                            if i == 4 || i == 7 {
+                                b == b'-'
+                            } else {
+                                b.is_ascii_digit()
+                            }
+                        })
+                })
+    })
+}
+
 // ── OpenAI API request types ────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -102,6 +131,8 @@ struct ApiChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<serde_json::Value>,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +235,12 @@ struct ApiToolCallFunction {
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
+    #[serde(default)]
+    service_tier: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     choices: Vec<ApiChoice>,
     #[serde(default)]
     usage: Option<ApiUsage>,
@@ -238,13 +275,7 @@ impl ApiResponseMessage {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-}
+type ApiUsage = crate::usage::ChatUsage;
 
 #[derive(Debug, Serialize)]
 struct ApiEmbeddingRequest {
@@ -259,6 +290,12 @@ type ApiEmbeddingResponse = super::embedding::IndexedEmbeddingResponse;
 
 #[derive(Debug, Deserialize)]
 struct StreamResponse {
+    #[serde(default)]
+    service_tier: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     usage: Option<ApiUsage>,
     #[serde(default)]
@@ -370,6 +407,34 @@ struct OpenAiFileUploadResponse {
     id: String,
 }
 
+/// Embedding HTTP status must survive the intentionally discarded error body.
+#[derive(Debug)]
+struct OpenAiEmbeddingHttpFailure(ProviderFailureClassification);
+impl OpenAiEmbeddingHttpFailure {
+    fn new(status: u16, retry_after_ms: Option<u64>) -> Self {
+        let class = if matches!(status, 408 | 425) {
+            ProviderFailureClass::NetworkTransient
+        } else {
+            crate::failure::classify_provider_failure_class(
+                "",
+                ProviderFailureStage::Connect,
+                Some(status),
+                None,
+            )
+        };
+        let mut classification = ProviderFailureClassification::new(class);
+        classification.http_status = Some(status);
+        classification.retry_after_ms = retry_after_ms;
+        Self(classification)
+    }
+}
+impl std::fmt::Display for OpenAiEmbeddingHttpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpenAI embedding request failed")
+    }
+}
+impl std::error::Error for OpenAiEmbeddingHttpFailure {}
+
 /// Upload failures enter attachment observability before the registry can
 /// redact an endpoint override. Keep only classified, safe data here.
 #[derive(Debug)]
@@ -441,6 +506,230 @@ impl std::error::Error for OpenAiFileUploadError {}
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl OpenAiProvider {
+    fn responses_adapter(&self) -> super::ResponsesApiCompatibleProvider {
+        let mut input_types = <Self as crate::Provider>::capabilities(self).input_types;
+        input_types.audio = InputTypeSupport::disabled();
+        super::ResponsesApiCompatibleProvider::from_context(
+            "openai".into(),
+            self.base_url.clone(),
+            self.api_key.clone(),
+            super::AuthStyle::Bearer,
+            self.authority_fingerprint.clone(),
+            self.timeout_policy,
+            self.client.clone(),
+            input_types,
+        )
+    }
+    fn project_legacy_request(&self, mut request: ChatRequest) -> Result<ChatRequest> {
+        request.messages = crate::history::project_messages_matching(
+            self.name(),
+            &request.model,
+            None,
+            &request.messages,
+            crate::history::ProjectionProfile::ServiceDefault,
+            |state| {
+                !super::responses_api_compatible::replay::is_dialect(state)
+                    && state.is_compatible_with(self.name(), &request.model)
+            },
+        )?;
+        Ok(request)
+    }
+    async fn chat_legacy(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let request = self.project_legacy_request(request)?;
+        let mut prepared = prepare_messages_for_provider_async(
+            self.name(),
+            request.model.as_str(),
+            &self.capabilities(),
+            request.rendered_messages_with_compiled_prompt().as_slice(),
+        )
+        .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
+        ensure_no_unrendered_attachments(self.name(), &prepared)?;
+        let prepared = self
+            .materialize_upload_references(request.model.as_str(), prepared)
+            .await?;
+        let rendered_messages = Self::convert_messages(&prepared)?;
+        let api_request = Self::build_chat_request(&request, rendered_messages, false)?;
+
+        let request_builder = self
+            .client
+            .post(self.chat_completions_url())
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&api_request);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+
+        let native_request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
+        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
+        let mut usage = Some(
+            api_response
+                .usage
+                .map(|u| u.normalized())
+                .unwrap_or_default()
+                .with_native_id(api_response.id.as_deref())
+                .with_reported_model(api_response.model.as_deref())
+                .with_service_tier(api_response.service_tier.as_deref())
+                .with_request_id(native_request_id.as_deref()),
+        );
+
+        if let Some(usage) = &mut usage {
+            usage.api = Some("chat_completions".into());
+            usage.route = crate::usage::route(&self.base_url, "/chat/completions");
+        }
+        let choice = api_response
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no response from OpenAI"))?;
+        let termination = choice
+            .finish_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
+        let message = choice.message;
+
+        let text = message.effective_content();
+        let tool_calls =
+            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
+        let reasoning_content = message.reasoning_content.or(message.reasoning);
+
+        if text.is_empty()
+            && tool_calls.is_empty()
+            && reasoning_content.as_deref().unwrap_or_default().is_empty()
+        {
+            return Err(anyhow!("no response from OpenAI"));
+        }
+
+        Ok(ChatResponse {
+            messages: Vec::new(),
+            text,
+            usage,
+            termination,
+            reasoning_content,
+            tool_calls,
+            provider_replay_state: None,
+        })
+    }
+
+    async fn stream_chat_legacy(&self, request: ChatRequest) -> Result<crate::ProviderStream> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let request = self.project_legacy_request(request)?;
+        let mut prepared = prepare_messages_for_provider_async(
+            self.name(),
+            request.model.as_str(),
+            &self.capabilities(),
+            request.rendered_messages_with_compiled_prompt().as_slice(),
+        )
+        .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
+        ensure_no_unrendered_attachments(self.name(), &prepared)?;
+        let prepared = self
+            .materialize_upload_references(request.model.as_str(), prepared)
+            .await?;
+        let rendered_messages = Self::convert_messages(&prepared)?;
+        let api_request = Self::build_chat_request(&request, rendered_messages, true)?;
+
+        let request_builder = self
+            .client
+            .post(self.chat_completions_url())
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&api_request);
+        let response =
+            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
+
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+
+        let native_request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
+        let byte_stream = crate::http::bounded_response_stream(
+            response,
+            crate::types::ProviderResponseLimits::default().max_transport_bytes,
+            "provider_stream",
+        );
+
+        let diagnostics = crate::ProviderStreamDiagnostics::default();
+        if let Some(id) = native_request_id
+            .clone()
+            .and_then(|id| pioneer_protocol::ProviderRequestId::try_from(id).ok())
+        {
+            diagnostics.set_request_id(id);
+        }
+        let route = crate::usage::route(&self.base_url, "/chat/completions");
+        let stream = Self::decode_stream_with_request_id(byte_stream, native_request_id)
+            .map(move |result| {
+                result.map(|mut chunk| {
+                    if chunk.usage.is_some() || chunk.is_final {
+                        let usage = chunk.usage.get_or_insert_with(Default::default);
+                        usage.api = Some("chat_completions".into());
+                        usage.route = route.clone();
+                    }
+                    chunk
+                })
+            })
+            .boxed();
+        Ok(crate::ProviderStream {
+            stream,
+            diagnostics,
+            message_delivery: crate::ProviderMessageDelivery::default(),
+        })
+    }
+
+    fn build_chat_request(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let catalog = crate::catalog::model_catalog().ok();
+        Self::build_chat_request_with_catalog(request, messages, stream, catalog.as_deref())
+    }
+
+    fn build_chat_request_with_catalog(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<ApiChatRequest> {
+        let generation = crate::generation::chat_fields_from_catalog(catalog, "openai", request)?;
+        Ok(ApiChatRequest {
+            generation,
+            model: request.model.clone(),
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            reasoning_effort: None,
+            stream,
+            stream_options: stream.then(|| serde_json::json!({"include_usage": true})),
+        })
+    }
+
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
     }
@@ -940,21 +1229,32 @@ impl OpenAiProvider {
     }
 }
 
-fn reasoning_effort_for_openai_request(reasoning: Option<ReasoningConfig>) -> Option<String> {
-    match reasoning {
-        Some(ReasoningConfig::Effort(effort)) => Some(effort.as_str().to_owned()),
-        Some(ReasoningConfig::Disabled) | None => None,
-    }
-}
-
 // The same decoder is used by HTTP transport and in-memory regression fixtures.
 impl OpenAiProvider {
+    #[cfg(test)]
     pub(super) fn decode_stream(
         byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        Self::decode_stream_with_request_id(byte_stream, None)
+    }
+
+    fn decode_stream_with_request_id(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+        native_request_id: Option<String>,
     ) -> BoxStream<'static, Result<StreamChunk>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         tokio::spawn(async move {
+            if native_request_id.is_some()
+                && tx
+                    .send(Ok(StreamChunk::usage(
+                        TokenUsage::default().with_request_id(native_request_id.as_deref()),
+                    )))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
             let mut decoder = IncrementalSseDecoder::default();
             let mut tool_call_accumulator = StreamToolCallAccumulator::default();
             let mut terminal_reason = None;
@@ -1010,15 +1310,15 @@ impl OpenAiProvider {
                                     .await;
                                 return;
                             }
-                            if let Some(usage) = resp.usage {
-                                if tx
-                                    .send(Ok(StreamChunk::usage(TokenUsage {
-                                        input_tokens: usage.prompt_tokens,
-                                        output_tokens: usage.completion_tokens,
-                                    })))
-                                    .await
-                                    .is_err()
-                                {
+                            if resp.usage.is_some() || resp.id.is_some() {
+                                let usage = resp
+                                    .usage
+                                    .map(|u| u.normalized())
+                                    .unwrap_or_default()
+                                    .with_native_id(resp.id.as_deref())
+                                    .with_reported_model(resp.model.as_deref())
+                                    .with_service_tier(resp.service_tier.as_deref());
+                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
                                     return;
                                 }
                             }
@@ -1141,6 +1441,13 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl crate::traits::Provider for OpenAiProvider {
+    fn usage_api(&self) -> &'static str {
+        "responses"
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(&self.base_url, "/responses")
+    }
+
     fn name(&self) -> &str {
         "openai"
     }
@@ -1175,151 +1482,79 @@ impl crate::traits::Provider for OpenAiProvider {
         error
             .downcast_ref::<OpenAiFileUploadError>()
             .map(|upload| upload.classification.clone())
+            .or_else(|| {
+                error
+                    .downcast_ref::<OpenAiEmbeddingHttpFailure>()
+                    .map(|failure| failure.0.clone())
+            })
+            .or_else(|| super::responses_api_compatible::classify_failure(error))
             .or_else(|| crate::failure::classify_stream_error(error))
     }
 
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let request = crate::tools::policy::prepare_request(self.name(), request)?;
-        let mut prepared = prepare_messages_for_provider_async(
-            self.name(),
-            request.model.as_str(),
-            &self.capabilities(),
-            request.rendered_messages_with_compiled_prompt().as_slice(),
-        )
-        .await?;
-        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let prepared = self
-            .materialize_upload_references(request.model.as_str(), prepared)
-            .await?;
-        let rendered_messages = Self::convert_messages(&prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: rendered_messages,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning_effort: reasoning_effort_for_openai_request(request.reasoning),
-            stream: false,
-            stream_options: None,
-        };
-
-        let request_builder = self
-            .client
-            .post(self.chat_completions_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&api_request);
-        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
+    async fn prepare_input_budget(
+        &self,
+        request: ChatRequest,
+    ) -> Result<crate::attachments::PreparedInputBudget> {
+        if chat_only_audio_model(&request.model) {
+            let request = crate::tools::policy::prepare_request(self.name(), request)?;
+            crate::generation::chat_fields(self.name(), &request)?;
+            let request = self.project_legacy_request(request)?;
+            crate::attachments::input_estimate::prepare(self.name(), &self.capabilities(), request)
+                .await
+        } else {
+            self.responses_adapter().prepare_input_budget(request).await
         }
-
-        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
-            response,
-            Default::default(),
-            "provider_response",
-        )
-        .await?;
-        let usage = api_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
-
-        let choice = api_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("no response from OpenAI"))?;
-        let termination = choice
-            .finish_reason
-            .as_deref()
-            .map(ProviderTermination::from_openai_reason)
-            .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
-        let message = choice.message;
-
-        let text = message.effective_content();
-        let tool_calls =
-            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
-        let reasoning_content = message.reasoning_content.or(message.reasoning);
-
-        if text.is_empty()
-            && tool_calls.is_empty()
-            && reasoning_content.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(anyhow!("no response from OpenAI"));
-        }
-
-        Ok(ChatResponse {
-            text,
-            usage,
-            termination,
-            reasoning_content,
-            tool_calls,
-            provider_replay_state: None,
+    }
+    fn request_usage_profile(&self, request: &ChatRequest) -> Result<crate::ProviderUsageProfile> {
+        let audio = chat_only_audio_model(&request.model);
+        Ok(crate::ProviderUsageProfile {
+            api: if audio {
+                "chat_completions"
+            } else {
+                "responses"
+            }
+            .into(),
+            api_version: None,
+            route: crate::usage::route(
+                &self.base_url,
+                if audio {
+                    "/chat/completions"
+                } else {
+                    "/responses"
+                },
+            ),
         })
     }
-
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        if chat_only_audio_model(&request.model) {
+            return self.chat_legacy(request).await;
+        }
+        let adapter = self.responses_adapter();
+        let mut prepared = adapter.prepare(request, &adapter.capabilities()).await?;
+        prepared.messages = self
+            .materialize_upload_references(&prepared.request.model, prepared.messages)
+            .await?;
+        adapter.execute_chat(prepared).await
+    }
     async fn stream_chat(
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let request = crate::tools::policy::prepare_request(self.name(), request)?;
-        let mut prepared = prepare_messages_for_provider_async(
-            self.name(),
-            request.model.as_str(),
-            &self.capabilities(),
-            request.rendered_messages_with_compiled_prompt().as_slice(),
-        )
-        .await?;
-        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let prepared = self
-            .materialize_upload_references(request.model.as_str(), prepared)
-            .await?;
-        let rendered_messages = Self::convert_messages(&prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: rendered_messages,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning_effort: reasoning_effort_for_openai_request(request.reasoning),
-            stream: true,
-            stream_options: Some(serde_json::json!({"include_usage": true})),
-        };
-
-        let request_builder = self
-            .client
-            .post(self.chat_completions_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&api_request);
-        let response =
-            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
-
-        if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
+        Ok(self.stream_chat_with_diagnostics(request).await?.stream)
+    }
+    async fn stream_chat_with_diagnostics(
+        &self,
+        request: ChatRequest,
+    ) -> Result<crate::ProviderStream> {
+        if chat_only_audio_model(&request.model) {
+            return self.stream_chat_legacy(request).await;
         }
-
-        let byte_stream = crate::http::bounded_response_stream(
-            response,
-            crate::types::ProviderResponseLimits::default().max_transport_bytes,
-            "provider_stream",
-        );
-
-        Ok(Self::decode_stream(byte_stream))
+        let adapter = self.responses_adapter();
+        let mut prepared = adapter.prepare(request, &adapter.capabilities()).await?;
+        prepared.messages = self
+            .materialize_upload_references(&prepared.request.model, prepared.messages)
+            .await?;
+        adapter.execute_stream(prepared).await
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1388,7 +1623,37 @@ impl crate::traits::Provider for OpenAiProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
+            let retry_after_ms = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|seconds| seconds.saturating_mul(1000));
+            let status = response.status().as_u16();
+            let mut failure = OpenAiEmbeddingHttpFailure::new(status, retry_after_ms);
+            if status == 400 {
+                // A generic bad request can carry a context-limit rejection.
+                // Classify the bounded body here, then discard it before the
+                // error crosses observability or endpoint-redaction boundaries.
+                if let Ok(body) = crate::http::read_response_text_bounded(
+                    response,
+                    16 * 1024,
+                    "provider_error_body",
+                )
+                .await
+                {
+                    let class = crate::failure::classify_provider_failure_class(
+                        &body.to_ascii_lowercase(),
+                        ProviderFailureStage::Connect,
+                        Some(status),
+                        None,
+                    );
+                    if class == ProviderFailureClass::ContextTooLarge {
+                        failure.0.class = class;
+                    }
+                }
+            }
+            return Err(failure.into());
         }
 
         let response = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
@@ -1445,7 +1710,302 @@ fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> Provid
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discovered_51_and_52_fallback_vocabulary_agrees_with_direct_chat_bodies() {
+        for (id, xhigh) in [("gpt-5.1", false), ("gpt-5.2", true)] {
+            let entry: ApiModelEntry =
+                serde_json::from_value(serde_json::json!({"id":id})).unwrap();
+            let discovered = provider_model_from_openai_model_entry(entry);
+            assert_eq!(
+                discovered
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .effort_options
+                    .contains(&"xhigh".into()),
+                xhigh
+            );
+            for stream in [false, true] {
+                let mut request = crate::generation::test_request(id);
+                request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::XHigh));
+                let result =
+                    OpenAiProvider::build_chat_request_with_catalog(&request, vec![], stream, None);
+                assert_eq!(result.is_ok(), xhigh);
+                if xhigh {
+                    let body = serde_json::to_value(result.unwrap()).unwrap();
+                    assert_eq!(body["reasoning_effort"], "xhigh");
+                    assert_eq!(body["max_completion_tokens"], 1024);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mapped_efforts_obey_direct_chat_model_contract_in_both_modes() {
+        use crate::generation::{test_catalog_model, test_request};
+        let partial = test_catalog_model(
+            "openai",
+            "gpt-5.1",
+            "gpt-5.4",
+            serde_json::json!({"thinkingLevelMap":{}}),
+        );
+        let stale = test_catalog_model(
+            "openai",
+            "gpt-5.1",
+            "gpt-5.4",
+            serde_json::json!({"thinkingLevelMap":{"xhigh":"xhigh","max":"surprise"}}),
+        );
+        for catalog in [None, Some(&partial), Some(&stale)] {
+            for stream in [false, true] {
+                for (effort, valid) in [
+                    (ReasoningEffort::Low, true),
+                    (ReasoningEffort::High, true),
+                    (ReasoningEffort::XHigh, false),
+                    (ReasoningEffort::Max, false),
+                ] {
+                    let mut request = test_request("gpt-5.1");
+                    request.reasoning = Some(ReasoningConfig::Effort(effort));
+                    let result = OpenAiProvider::build_chat_request_with_catalog(
+                        &request,
+                        vec![],
+                        stream,
+                        catalog,
+                    );
+                    assert_eq!(result.is_ok(), valid);
+                    if valid {
+                        let body = serde_json::to_value(result.unwrap()).unwrap();
+                        assert_eq!(body["reasoning_effort"], effort.as_str());
+                        assert_eq!(body["max_completion_tokens"], 1024);
+                    }
+                }
+            }
+        }
+        let stale = test_catalog_model(
+            "openai",
+            "gpt-6-astra",
+            "gpt-5.4",
+            serde_json::json!({"thinkingLevelMap":{"off":"low"}}),
+        );
+        for catalog in [None, Some(&stale)] {
+            for off in [
+                ReasoningConfig::Disabled,
+                ReasoningConfig::Effort(ReasoningEffort::None),
+            ] {
+                let mut request = test_request("gpt-6-astra");
+                request.reasoning = Some(off);
+                for stream in [false, true] {
+                    assert!(
+                        OpenAiProvider::build_chat_request_with_catalog(
+                            &request,
+                            vec![],
+                            stream,
+                            catalog
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
+        let mut request = test_request("gpt-5.6");
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::Max));
+        for stream in [false, true] {
+            let body = serde_json::to_value(
+                OpenAiProvider::build_chat_request_with_catalog(&request, vec![], stream, None)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["reasoning_effort"], "max");
+        }
+    }
+
+    #[test]
+    fn native_openai_honors_negative_fresh_source_temperature() {
+        let catalog = crate::generation::test_source_temperature("openai", "gpt-4.1-nano");
+        for reasoning in [
+            None,
+            Some(ReasoningConfig::Disabled),
+            Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+        ] {
+            let mut request = crate::generation::test_request("gpt-4.1-nano");
+            request.reasoning = reasoning;
+            request.temperature = Some(0.7);
+            for stream in [false, true] {
+                assert!(
+                    OpenAiProvider::build_chat_request_with_catalog(
+                        &request,
+                        vec![],
+                        stream,
+                        Some(&catalog)
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_preferred_responses_does_not_certify_unknown_chat_family() {
+        use crate::catalog::ModelCatalog;
+        let mut models: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
+        let mut origins: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/provenance.json"))
+                .unwrap();
+        let id = "future-unverified-family";
+        let mut model = models["openai"]["gpt-5.4"].clone();
+        model["id"] = serde_json::json!(id);
+        models["openai"][id] = model;
+        origins["openai"][id] = origins["openai"]["gpt-5.4"].clone();
+        let responses = ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap();
+        let request = crate::generation::test_request(id);
+        for stream in [false, true] {
+            assert!(
+                OpenAiProvider::build_chat_request_with_catalog(
+                    &request,
+                    vec![],
+                    stream,
+                    Some(&responses)
+                )
+                .is_err()
+            );
+        }
+        models["openai"][id]["api"] = serde_json::json!("openai-completions");
+        let chat = ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap();
+        for stream in [false, true] {
+            let body = serde_json::to_value(
+                OpenAiProvider::build_chat_request_with_catalog(
+                    &request,
+                    vec![],
+                    stream,
+                    Some(&chat),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["max_completion_tokens"], 1024);
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn real_chat_bodies_select_family_cap_and_preserve_default_off_and_effort() {
+        for stream in [false, true] {
+            for (model, reasoning, field, expected_effort) in [
+                ("gpt-4o", None, "max_tokens", None),
+                ("o3-mini", None, "max_completion_tokens", None),
+                (
+                    "gpt-5.4",
+                    Some(ReasoningConfig::Disabled),
+                    "max_completion_tokens",
+                    Some("none"),
+                ),
+                (
+                    "gpt-5.4",
+                    Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                    "max_completion_tokens",
+                    Some("none"),
+                ),
+                (
+                    "gpt-5.4",
+                    Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                    "max_completion_tokens",
+                    Some("high"),
+                ),
+            ] {
+                let mut request = crate::generation::test_request(model);
+                request.reasoning = reasoning;
+                let body = serde_json::to_value(
+                    OpenAiProvider::build_chat_request(&request, vec![], stream).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(body[field], 1024);
+                assert_eq!(
+                    body.get("reasoning_effort")
+                        .and_then(serde_json::Value::as_str),
+                    expected_effort
+                );
+                assert!(body.get("max_output_tokens").is_none());
+                let other = if field == "max_tokens" {
+                    "max_completion_tokens"
+                } else {
+                    "max_tokens"
+                };
+                assert!(body.get(other).is_none());
+                assert_eq!(body["stream"], stream);
+            }
+        }
+    }
+
+    #[test]
+    fn chat_rejects_temperature_and_responses_only_combinations_without_downgrading() {
+        let mut request = crate::generation::test_request("gpt-5.4");
+        request.temperature = Some(0.4);
+        for stream in [false, true] {
+            assert!(OpenAiProvider::build_chat_request(&request, vec![], stream).is_err());
+            request.reasoning = Some(ReasoningConfig::Disabled);
+            let body = serde_json::to_value(
+                OpenAiProvider::build_chat_request(&request, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert!(body.get("temperature").is_some());
+            request.reasoning = None;
+        }
+        request.temperature = None;
+        request.tools = Some(vec![ToolDefinition {
+            name: "read".into(),
+            description: "Read".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-5.4-pro",
+            "gpt-5.3-codex",
+        ] {
+            request.model = model.into();
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+            for stream in [false, true] {
+                assert!(
+                    OpenAiProvider::build_chat_request(&request, vec![], stream).is_err(),
+                    "{model}"
+                );
+            }
+        }
+        request.model = "gpt-5.6-sol".into();
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::None));
+        assert!(OpenAiProvider::build_chat_request(&request, vec![], true).is_ok());
+        request.model = "gpt-6-astra".into();
+        request.tools = None;
+        assert!(OpenAiProvider::build_chat_request(&request, vec![], true).is_err());
+        request.model = "unknown-new-family".into();
+        request.reasoning = None;
+        assert!(OpenAiProvider::build_chat_request(&request, vec![], false).is_err());
+    }
     use super::*;
+
+    #[test]
+    fn embedding_http_failure_survives_provider_classifier_without_error_body() {
+        use crate::Provider;
+        let provider = OpenAiProvider::new("unused-fixture-key");
+        for (status, class) in [
+            (403, ProviderFailureClass::AuthOrPermission),
+            (429, ProviderFailureClass::RateLimit),
+            (503, ProviderFailureClass::Provider5xx),
+            (408, ProviderFailureClass::NetworkTransient),
+        ] {
+            let error = anyhow::Error::new(OpenAiEmbeddingHttpFailure::new(status, Some(2000)))
+                .context("embedding request");
+            let failure = provider
+                .classify_failure(&error)
+                .expect("typed embedding status");
+            assert_eq!(failure.class, class);
+            assert_eq!(failure.http_status, Some(status));
+            assert_eq!(failure.retry_after_ms, Some(2000));
+            assert!(!format!("{error:?}").contains("unused-fixture-key"));
+        }
+    }
 
     #[tokio::test]
     async fn g09_direct_embedding_adapter_rejects_invalid_batch_before_network() {
@@ -1732,7 +2292,7 @@ mod tests {
     #[test]
     fn convert_messages_tool_attachment_splits_into_tool_and_user_messages() {
         let mut tool_message =
-            ChatMessage::tool_result("call_1", "computer_use", "{\"status\":\"ok\"}");
+            ChatMessage::tool_result("call_1", "cua_get_window_state", "{\"status\":\"ok\"}");
         tool_message.content_parts.push(MessageContentPart::image(MessageAttachment {
             mime_type: "image/png".to_owned(),
             name: Some("snapshot.png".to_owned()),
@@ -1760,7 +2320,10 @@ mod tests {
         assert_eq!(api_messages[0].role, "user");
         assert_eq!(api_messages[1].role, "tool");
         assert_eq!(api_messages[1].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(api_messages[1].name.as_deref(), Some("computer_use"));
+        assert_eq!(
+            api_messages[1].name.as_deref(),
+            Some("cua_get_window_state")
+        );
         assert_eq!(api_messages[2].role, "user");
         match api_messages[2].content.as_ref() {
             Some(ApiMessageContent::Parts(parts)) => {
@@ -1777,6 +2340,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "gpt-4o".into(),
             messages: vec![
                 ApiMessage {
@@ -1818,6 +2382,7 @@ mod tests {
     #[test]
     fn api_request_serializes_with_max_tokens() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "gpt-4o".into(),
             messages: vec![],
             temperature: None,
@@ -1840,6 +2405,7 @@ mod tests {
     #[test]
     fn api_request_serializes_reasoning_effort_only_when_selected() {
         let request = ApiChatRequest {
+            generation: Default::default(),
             model: "gpt-5.4".into(),
             messages: vec![],
             temperature: None,
@@ -1864,20 +2430,6 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_mapping_omits_disabled_and_serializes_explicit_none() {
-        assert_eq!(
-            reasoning_effort_for_openai_request(Some(ReasoningConfig::disabled())),
-            None
-        );
-        assert_eq!(
-            reasoning_effort_for_openai_request(Some(ReasoningConfig::effort(
-                ReasoningEffort::None
-            ))),
-            Some("none".to_owned())
-        );
-    }
-
-    #[test]
     fn api_response_deserializes() {
         let json = r#"{"choices":[{"message":{"content":"Hi from OpenAI"}}]}"#;
         let response: ApiChatResponse = serde_json::from_str(json).unwrap();
@@ -1895,9 +2447,9 @@ mod tests {
             "usage": {"prompt_tokens": 42, "completion_tokens": 15}
         }"#;
         let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let usage = response.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, Some(42));
-        assert_eq!(usage.completion_tokens, Some(15));
+        let usage = response.usage.unwrap().normalized();
+        assert_eq!(usage.input_tokens, Some(42));
+        assert_eq!(usage.output_tokens, Some(15));
     }
 
     #[test]
@@ -2027,13 +2579,13 @@ mod confirmed_duration_wire_regressions {
         for (kind, mime, bytes) in fixture::confirmed_wire_inputs("openai") {
             let state = Arc::new(fixture::state(
                 "openai",
-                "media",
+                "gpt-audio",
                 serde_json::json!({"audio":{"maxDurationMillis":2400}}),
             ));
             let budget = fixture::scoped(
                 state.clone(),
                 provider.prepare_input_budget(fixture::request(
-                    "media",
+                    "gpt-audio",
                     vec![fixture::part(kind, mime, &bytes)],
                 )),
             )
@@ -2051,7 +2603,7 @@ mod confirmed_duration_wire_regressions {
                     state.clone(),
                     prepare_messages_for_provider_async(
                         "openai",
-                        "media",
+                        "gpt-audio",
                         &provider.capabilities(),
                         &replay.request.messages,
                     ),
@@ -2081,4 +2633,116 @@ mod wire_contract_tests {
         WireProvider::new("fixture")
     }
     include!("wire_tests/chat.rs");
+}
+
+#[cfg(test)]
+mod html_preview_contract_tests {
+    use super::*;
+    use crate::ChatMessage;
+    use crate::attachments::prepare_messages_for_provider_async;
+    use crate::attachments::regression::{html_preview_fixture, scoped};
+    use crate::traits::Provider;
+    #[tokio::test]
+    async fn html_preview_parallel_results_budget_wire_and_replay() {
+        let provider = OpenAiProvider::new("fixture-key");
+        let (state, canonical) = html_preview_fixture("openai", "openai-completions");
+        let before = serde_json::to_value(&canonical.messages).unwrap();
+        for replay in [false, true] {
+            let mut request = canonical.clone();
+            if replay {
+                request
+                    .messages
+                    .push(ChatMessage::user("Explain the six captures"));
+            }
+            let budget = scoped(state.clone(), provider.prepare_input_budget(request))
+                .await
+                .unwrap();
+            assert_eq!(budget.media.len(), 6);
+            assert!(budget.media.iter().all(|media| media.message == 3));
+            assert_eq!(
+                budget
+                    .media
+                    .iter()
+                    .map(|media| media.part)
+                    .collect::<Vec<_>>(),
+                vec![1, 3, 5, 7, 9, 11]
+            );
+            let mut prepared = scoped(
+                state.clone(),
+                prepare_messages_for_provider_async(
+                    provider.name(),
+                    &budget.request.model,
+                    &provider.capabilities(),
+                    &budget.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            crate::tools::policy::prepare_history(provider.name(), &mut prepared.messages).unwrap();
+            assert_eq!(prepared.attachments.len(), 6);
+            for (attachment, (appearance, width)) in prepared.attachments.iter().zip([
+                ("light", 360),
+                ("light", 768),
+                ("light", 1024),
+                ("dark", 360),
+                ("dark", 768),
+                ("dark", 1024),
+            ]) {
+                assert_eq!(attachment.message_index, 3);
+                assert_eq!(
+                    attachment
+                        .artifact
+                        .as_ref()
+                        .unwrap()
+                        .artifact_version_id
+                        .as_deref(),
+                    Some(format!("version-{appearance}-{width}").as_str())
+                );
+            }
+            let wire =
+                serde_json::to_value(OpenAiProvider::convert_messages(&prepared).unwrap()).unwrap();
+            assert_eq!(wire[0]["role"], "assistant");
+            assert_eq!(wire[1]["role"], "tool");
+            assert_eq!(wire[2]["role"], "tool");
+            assert_eq!(wire[3]["role"], "user");
+            let paired = [
+                wire[1]["tool_call_id"].as_str().unwrap(),
+                wire[2]["tool_call_id"].as_str().unwrap(),
+            ];
+            assert!(paired.contains(&"preview-call") && paired.contains(&"echo-call"));
+            let preview = wire
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["tool_call_id"] == "preview-call")
+                .unwrap();
+            assert!(
+                preview["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("resource load error")
+            );
+            let parts = wire[3]["content"].as_array().unwrap();
+            assert_eq!(parts.iter().filter(|p| p["type"] == "image_url").count(), 6);
+            assert!(parts.iter().filter(|p| p["type"] == "image_url").all(|p| {
+                p["image_url"]["url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("data:image/png;base64,")
+            }));
+            let caption = parts[0]["text"].as_str().unwrap();
+            for appearance in ["light", "dark"] {
+                for width in [360, 768, 1024] {
+                    assert!(caption.contains(&format!("{appearance}, {width} CSS px")));
+                }
+            }
+        }
+        assert_eq!(serde_json::to_value(&canonical.messages).unwrap(), before);
+        let (unsupported, request) = html_preview_fixture("openai", "unsupported-endpoint");
+        assert!(
+            scoped(unsupported, provider.prepare_input_budget(request))
+                .await
+                .is_err()
+        );
+    }
 }

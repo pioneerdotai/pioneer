@@ -130,7 +130,7 @@
 "chat.composer.model.select_label" = "Выбрать модель"
 "chat.composer.placeholder" = "Напишите сообщение"
 "chat.composer.reply.cancel" = "Отменить ответ"
-"chat.composer.send_failed" = "Сообщение не отправлено. Проверьте и повторите."
+"chat.composer.send_failed" = "Ошибка при отправке. Проверьте переписку перед повторной попыткой."
 "chat.composer.steer_cli_runtime" = "Отправить в текущий ход CLI"
 "chat.composer.stop_reason" = "Ход остановлен пользователем"
 "chat.composer.voice.desktop_hold_prompt" = "Отпустите вне круга, чтобы отменить"
@@ -219,6 +219,7 @@
 "timeline.system.capability_kind_skill" = "Скилл"
 "timeline.system.checkpoint_label" = "Чекпоинт"
 "timeline.system.code" = "Код:"
+"timeline.system.codex_request_retried" = "Codex сообщил о повторе запроса после временного сбоя."
 "timeline.system.continued_label" = "Продолжено"
 "timeline.system.detail_agent_rounds" = "Раунды агента"
 "timeline.system.detail_checkpoint" = "Чекпоинт"
@@ -356,3 +357,6 @@
 "plugins.select" = "Выбор плагинов"
 "plugins.unavailable" = "Недоступен"
 "plugins.updating" = "Обновляется…"
+
+"timeline.html.loading" = "Загрузка страницы…"
+"timeline.html.failed" = "Не удалось показать страницу"

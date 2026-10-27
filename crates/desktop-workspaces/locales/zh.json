@@ -1,4 +1,5 @@
 {
+  "sidebar.taskActivity": "任务正在运行",
   "buttons.cancel": "取消",
   "buttons.save": "保存",
   "common.name": "名称",

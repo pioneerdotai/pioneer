@@ -7,9 +7,19 @@ use std::time::{Duration, UNIX_EPOCH};
 
 const MAX_STARTUP_DURATION_MS: f64 = 10.0 * 60.0 * 1_000.0;
 
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MobileReportKind {
+    #[default]
+    AppStartup,
+    ThreadOpen,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClientMobileStartupRecordRequest {
+    #[serde(default)]
+    kind: MobileReportKind,
     enabled: bool,
     metrics_endpoint: String,
     traces_endpoint: String,
@@ -130,6 +140,10 @@ pub(crate) fn record_mobile_startup(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
+    if request.kind == MobileReportKind::ThreadOpen && !stages.is_empty() {
+        return Err("thread opening reports do not accept startup stages".to_owned());
+    }
+
     // Validate the complete FFI payload before initializing the process-wide
     // telemetry pipeline. A malformed first report must not permanently claim
     // the OnceLock with an unusable configuration and no recorded event.
@@ -147,12 +161,16 @@ pub(crate) fn record_mobile_startup(
     )
     .map_err(|error| format!("failed to initialize mobile observability: {error:#}"))?;
 
-    pioneer_observability::record_mobile_startup(MobileStartupReport {
+    let report = MobileStartupReport {
         started_at: UNIX_EPOCH + Duration::from_millis(request.started_at_unix_ms),
         duration,
         outcome,
         stages,
-    });
+    };
+    match request.kind {
+        MobileReportKind::AppStartup => pioneer_observability::record_mobile_startup(report),
+        MobileReportKind::ThreadOpen => pioneer_observability::record_mobile_thread_open(report),
+    }
     // The mobile app may move to the background before the periodic metrics
     // interval elapses. Flush this single lifecycle sample immediately, but
     // never block the JavaScript/UI thread on telemetry network I/O.
@@ -197,6 +215,36 @@ mod tests {
         }
         let json = serde_json::json!({"kind":"turn_startup","key":"x".repeat(513)}).to_string();
         assert!(super::record_mobile_startup(&json).is_err());
+    }
+
+    #[test]
+    fn mobile_report_kind_is_explicit_bounded_and_backwards_compatible() {
+        let base = serde_json::json!({
+            "enabled": true, "metrics_endpoint": "https://telemetry.getpioneer.dev/v1/metrics",
+            "traces_endpoint": "https://telemetry.getpioneer.dev/v1/traces",
+            "export_interval_ms": 30000, "export_timeout_ms": 15000,
+            "deployment_environment": "production", "started_at_unix_ms": 1000,
+            "duration_ms": 10, "outcome": "cancelled", "stages": []
+        });
+        let request: super::ClientMobileStartupRecordRequest =
+            serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(request.kind, super::MobileReportKind::AppStartup);
+        let mut opening = base;
+        opening["kind"] = "thread_open".into();
+        let request: super::ClientMobileStartupRecordRequest =
+            serde_json::from_value(opening.clone()).unwrap();
+        assert_eq!(request.kind, super::MobileReportKind::ThreadOpen);
+        opening["stages"] =
+            serde_json::json!([{"name":"composer.prepare","start_offset_ms":0,"duration_ms":5}]);
+        assert!(
+            super::record_mobile_startup(&opening.to_string())
+                .unwrap_err()
+                .contains("do not accept startup stages")
+        );
+        opening["kind"] = "unknown".into();
+        assert!(
+            serde_json::from_value::<super::ClientMobileStartupRecordRequest>(opening).is_err()
+        );
     }
 
     #[test]

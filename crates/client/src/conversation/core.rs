@@ -84,10 +84,47 @@ impl Conversation {
             return;
         }
 
+        if self.ignores_admission_response(&event) {
+            return;
+        }
         let ts_unix_ms = now_unix_ms();
         self.push_event_log(&event, ts_unix_ms);
         let in_flight_turn_id_before_event =
             self.state_machine.in_flight_turn_id().map(str::to_owned);
+        let admission = match &event {
+            ConversationEvent::TurnStarted { turn, .. }
+            | ConversationEvent::TurnCompleted { turn, .. }
+            | ConversationEvent::TurnFailed { turn, .. }
+            | ConversationEvent::TurnBlocked { turn, .. }
+                if self.state_machine.is_detached_admission(turn) =>
+            {
+                Some(turn)
+            }
+            _ => None,
+        };
+        if let Some(turn) = admission {
+            if self.state_machine.confirm_admission_outcome(
+                &turn.id,
+                turn.status,
+                turn.error.as_deref(),
+            ) {
+                self.projector.upsert_turn_snapshot_metadata(turn);
+                self.projector.apply_admission_outcome(
+                    &turn.id,
+                    turn.status,
+                    turn.error.as_deref(),
+                    ts_unix_ms,
+                    self.state_machine.is_current_turn(&turn.id),
+                    match &event {
+                        ConversationEvent::TurnBlocked { resume, .. } => resume.as_ref(),
+                        _ => None,
+                    },
+                );
+            }
+            self.projector.sync_flow_state(&self.state_machine);
+            self.projector.bump_revision();
+            return;
+        }
         self.state_machine.apply(&event);
 
         match event {
@@ -107,18 +144,40 @@ impl Conversation {
             }
             ConversationEvent::LocalTurnStartAccepted { turn_id, mode, .. } => {
                 self.pending_completion_turn_id = None;
-                if mode != pioneer_protocol::ThreadMode::Message {
+                if mode != pioneer_protocol::ThreadMode::Message
+                    && self.state_machine.is_local_admission(&turn_id)
+                {
+                    self.projector.apply_admission_outcome(
+                        &turn_id,
+                        TurnStatus::Completed,
+                        None,
+                        ts_unix_ms,
+                        self.state_machine.is_current_turn(&turn_id),
+                        None,
+                    );
+                } else if mode != pioneer_protocol::ThreadMode::Message {
                     self.projector
                         .apply_local_turn_start_accepted(turn_id.as_str(), ts_unix_ms);
                 }
             }
             ConversationEvent::LocalTurnStartRejected { turn_id, error, .. } => {
                 self.pending_completion_turn_id = None;
-                self.projector.apply_local_turn_start_rejected(
-                    turn_id.as_str(),
-                    error.as_str(),
-                    ts_unix_ms,
-                );
+                if self.state_machine.is_local_admission(&turn_id) {
+                    self.projector.apply_admission_outcome(
+                        &turn_id,
+                        TurnStatus::Failed,
+                        Some(&error),
+                        ts_unix_ms,
+                        self.state_machine.is_current_turn(&turn_id),
+                        None,
+                    );
+                } else {
+                    self.projector.apply_local_turn_start_rejected(
+                        turn_id.as_str(),
+                        error.as_str(),
+                        ts_unix_ms,
+                    );
+                }
             }
             ConversationEvent::LocalTurnCancelRequested { .. } => {
                 self.pending_completion_turn_id = None;
@@ -491,19 +550,117 @@ impl Conversation {
         self.projector.bump_revision();
     }
 
+    pub(crate) fn ignores_admission_response(&self, event: &ConversationEvent) -> bool {
+        self.state_machine.ignores_admission_response(event)
+    }
+
+    pub(crate) fn confirm_admission_timeline_blocks<'a>(
+        &mut self,
+        blocks: impl Iterator<Item = &'a pioneer_protocol::TimelineBlock>,
+    ) {
+        for block in blocks {
+            let Some(turn_id) = block.turn_id.as_deref() else {
+                continue;
+            };
+            if !self.state_machine.is_known_admission(turn_id) {
+                continue;
+            }
+            let pioneer_protocol::TimelineBlockKind::TurnState { state, message, .. } = &block.kind
+            else {
+                continue;
+            };
+            let status = match state {
+                pioneer_protocol::TurnWorkState::Failed => TurnStatus::Failed,
+                pioneer_protocol::TurnWorkState::Blocked => TurnStatus::Blocked,
+                pioneer_protocol::TurnWorkState::Interrupted => TurnStatus::Interrupted,
+                _ => continue,
+            };
+            if self
+                .state_machine
+                .confirm_admission_outcome(turn_id, status, message.as_deref())
+            {
+                self.projector.apply_admission_outcome(
+                    turn_id,
+                    status,
+                    message.as_deref(),
+                    now_unix_ms(),
+                    self.state_machine.is_current_turn(turn_id),
+                    None,
+                );
+            }
+        }
+        self.projector.sync_flow_state(&self.state_machine);
+    }
+
     pub fn sync_thread_snapshot(&mut self, thread: &Thread) {
         if thread.id != self.thread_id {
             return;
         }
 
-        let Some(turn) = thread.turns.iter().rev().find(|turn| {
-            turn.turn_kind == TurnKind::Conversation
+        let execution_mode = thread.origin_kind.composer_execution_mode();
+        self.state_machine
+            .set_composer_execution_mode(execution_mode);
+        let mut saw_admission = false;
+        for admission in thread.turns.iter().filter(|turn| {
+            execution_mode.is_detached_admission(turn)
                 && turn.mode != pioneer_protocol::ThreadMode::Message
-        }) else {
+        }) {
+            saw_admission = true;
+            if self.state_machine.confirm_admission_outcome(
+                &admission.id,
+                admission.status,
+                admission.error.as_deref(),
+            ) {
+                self.projector.upsert_turn_snapshot_metadata(admission);
+                self.projector.apply_admission_outcome(
+                    &admission.id,
+                    admission.status,
+                    admission.error.as_deref(),
+                    now_unix_ms(),
+                    self.state_machine.is_current_turn(&admission.id),
+                    None,
+                );
+            }
+        }
+        let current_in_flight_turn_id = self.state_machine.in_flight_turn_id().map(str::to_owned);
+        let current_turn_id = if saw_admission {
+            self.state_machine.current_turn_id().map(str::to_owned)
+        } else {
+            current_in_flight_turn_id.clone()
+        };
+        let eligible_turns = || {
+            thread.turns.iter().rev().filter(|turn| {
+                turn.turn_kind == TurnKind::Conversation
+                    && turn.mode != pioneer_protocol::ThreadMode::Message
+                    && !execution_mode.is_detached_admission(turn)
+            })
+        };
+        if saw_admission {
+            self.projector.sync_flow_state(&self.state_machine);
+            self.projector.bump_revision();
+            // Historical children cannot replace admission flow, but the exact
+            // current agent Conversation must receive its terminal snapshot.
+            let has_current_conversation = current_turn_id
+                .as_deref()
+                .is_some_and(|current| eligible_turns().any(|turn| turn.id == current));
+            if !has_current_conversation
+                && !eligible_turns().any(|turn| turn.status == TurnStatus::InProgress)
+            {
+                return;
+            }
+        }
+        // Apply the current Turn's terminal transition before considering any
+        // other Turn. Otherwise, a later completed Conversation must not hide
+        // the running Turn that a fresh or reset client needs to control.
+        let turn = current_turn_id
+            .as_deref()
+            .and_then(|current| eligible_turns().find(|turn| turn.id == current))
+            .or_else(|| eligible_turns().find(|turn| turn.status == TurnStatus::InProgress))
+            .or_else(|| eligible_turns().next());
+        let Some(turn) = turn else {
             return;
         };
 
-        let current_in_flight_turn_id = self.state_machine.in_flight_turn_id().map(str::to_owned);
         if current_in_flight_turn_id.as_deref().is_some_and(|current| {
             current != turn.id.as_str() && turn.status != TurnStatus::InProgress
         }) {
@@ -512,6 +669,16 @@ impl Conversation {
 
         self.state_machine.sync_snapshot_turn(turn);
         self.projector.upsert_turn_snapshot_metadata(turn);
+        // Finishing the current Turn must retain its terminal metadata while
+        // restoring control of any concurrent execution in this same snapshot.
+        if turn.status != TurnStatus::InProgress {
+            if let Some(running) =
+                eligible_turns().find(|turn| turn.status == TurnStatus::InProgress)
+            {
+                self.state_machine.sync_snapshot_turn(running);
+                self.projector.upsert_turn_snapshot_metadata(running);
+            }
+        }
         self.projector.sync_flow_state(&self.state_machine);
         self.projector.bump_revision();
     }

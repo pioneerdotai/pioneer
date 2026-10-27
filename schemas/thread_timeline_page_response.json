@@ -409,6 +409,14 @@
         "end"
       ]
     },
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude",
+        "opencode"
+      ]
+    },
     "CLIRuntimePendingRequest": {
       "type": "object",
       "properties": {
@@ -462,11 +470,73 @@
         "other"
       ]
     },
+    "CodexRetryNotice": {
+      "description": "Read-only presentation of a canonical Codex retry notice owned by a Task's\nhidden execution. This never becomes a canonical event in the viewing thread.",
+      "type": "object",
+      "properties": {
+        "itemId": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "occurredAtUnixMs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "sourceThreadId": {
+          "type": "string"
+        },
+        "sourceTurnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sourceThreadId",
+        "sourceTurnId",
+        "itemId",
+        "message",
+        "occurredAtUnixMs"
+      ]
+    },
     "CrossThreadSourceVisibility": {
       "type": "string",
       "enum": [
         "accessible",
         "inaccessible"
+      ]
+    },
+    "HtmlPublication": {
+      "description": "An exact Gateway-created HTML publication. Generic HTML attachments never\nacquire this descriptor based on MIME alone.",
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "callId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "workspaceId",
+        "threadId",
+        "turnId",
+        "callId",
+        "title",
+        "artifact"
       ]
     },
     "MarkdownBlock": {
@@ -559,6 +629,47 @@
           "required": [
             "type",
             "text"
+          ]
+        },
+        {
+          "description": "Structured cells and the original GFM fragment with its used reference\ndefinitions, without Quote/List prefixes.",
+          "type": "object",
+          "properties": {
+            "alignments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownTableAlignment"
+              }
+            },
+            "headers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownInline"
+              }
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/MarkdownInline"
+                }
+              }
+            },
+            "source": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "table"
+            }
+          },
+          "required": [
+            "type",
+            "headers",
+            "rows",
+            "alignments",
+            "source"
           ]
         },
         {
@@ -736,6 +847,15 @@
             "url"
           ]
         }
+      ]
+    },
+    "MarkdownTableAlignment": {
+      "type": "string",
+      "enum": [
+        "none",
+        "left",
+        "center",
+        "right"
       ]
     },
     "McpScopeKind": {
@@ -1211,6 +1331,12 @@
                 }
               ]
             },
+            "codexRetryNotices": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CodexRetryNotice"
+              }
+            },
             "kind": {
               "type": "string",
               "const": "detached_task_run"
@@ -1236,6 +1362,13 @@
                   "type": "null"
                 }
               ]
+            },
+            "htmlPublications": {
+              "description": "Exact HTML content of this canonical response; source ownership is unchanged.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/HtmlPublication"
+              }
             },
             "itemId": {
               "type": "string"
@@ -1465,6 +1598,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "cli_runtime_kind": {
+          "description": "CLI provider identity projected from persisted execution bindings, independent of artwork.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CLIAgentRuntimeKind"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "display_name": {
@@ -1718,6 +1862,12 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "htmlPublications": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HtmlPublication"
+          }
         },
         "lastWorkItemId": {
           "type": [

@@ -25,7 +25,7 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
                     | "azure-openai"
             )
     }) {
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             definition.name,
             definition.default_base_url.unwrap(),
             "fixture",
@@ -75,6 +75,9 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
                 compiled_prompt: None,
             };
             for stream in [false, true] {
+                // An unknown model keeps the ordinary cap and server defaults.
+                // SiliconFlow's separate thinking reserve requires catalog
+                // evidence, covered by the model-aware generation regressions.
                 let wire = serde_json::to_value(
                     provider
                         .build_chat_request(request.clone(), stream)
@@ -82,7 +85,8 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
                 )
                 .unwrap();
                 assert_eq!(wire["stream"], stream);
-                assert_eq!(wire["max_tokens"], 128);
+                assert_eq!(wire["max_tokens"], 128, "{}", definition.name);
+                assert!(wire.get("thinking_budget").is_none());
                 assert!(wire.get("temperature").is_none());
                 assert_eq!(wire["messages"][0]["role"], "system");
                 for previous in 0..=round {

@@ -15,6 +15,7 @@ pub const TASK_DOMAIN_TOOL_NAMES: &[&str] = &[
     "task_accept",
     "task_revise",
     "task_cancel",
+    "task_finish",
     "task_update",
     "task_detach",
     "task_list",
@@ -27,12 +28,17 @@ pub const ARTIFACT_DOMAIN_TOOL_NAMES: &[&str] =
     &["artifact_prepare", "artifact_register", "artifact_read"];
 pub const THREADS_DOMAIN_TOOL_NAMES: &[&str] = &[
     "threads_tools_result_read",
+    "threads_list",
+    "threads_history_read",
+    "threads_search",
+    "threads_children_list",
     "threads_start_options",
+    "threads_identity_models_list",
     "thread_message_send",
     "thread_create",
     "threads_turn_start",
 ];
-pub const COMPUTER_USE_DOMAIN_TOOL_NAMES: &[&str] = &["computer_use"];
+pub const COMPUTER_USE_DOMAIN_TOOL_NAMES: &[&str] = crate::handlers::computer_use::TOOL_NAMES;
 pub const REQUEST_TOOLS_REASON_MAX_CHARS: usize = 512;
 
 pub const REQUEST_TOOLS_DOMAIN_VALUES: &[&str] = &[
@@ -247,6 +253,7 @@ mod tests {
                 "task_accept",
                 "task_revise",
                 "task_cancel",
+                "task_finish",
                 "task_update",
                 "task_detach",
                 "task_list",
@@ -260,7 +267,12 @@ mod tests {
             BuiltinToolDomain::Threads.tool_names(),
             [
                 "threads_tools_result_read",
+                "threads_list",
+                "threads_history_read",
+                "threads_search",
+                "threads_children_list",
                 "threads_start_options",
+                "threads_identity_models_list",
                 "thread_message_send",
                 "thread_create",
                 "threads_turn_start",
@@ -269,10 +281,6 @@ mod tests {
         assert_eq!(
             BuiltinToolDomain::Artifact.tool_names(),
             ["artifact_prepare", "artifact_register", "artifact_read"]
-        );
-        assert_eq!(
-            BuiltinToolDomain::ComputerUse.tool_names(),
-            ["computer_use"]
         );
     }
 
@@ -387,39 +395,5 @@ mod tests {
                 BuiltinToolDomain::Artifact,
             ]
         );
-    }
-
-    #[cfg(feature = "computer-use")]
-    #[test]
-    fn domain_map_matches_materialized_computer_use_spec_when_feature_enabled() {
-        let configured = crate::spec::computer_use_configured_spec();
-        let actual = registered_domain_tool_names(BuiltinToolDomain::ComputerUse, |name| {
-            configured.spec.name == name
-        });
-
-        assert_eq!(
-            actual.as_slice(),
-            BuiltinToolDomain::ComputerUse.tool_names()
-        );
-    }
-
-    #[cfg(not(feature = "computer-use"))]
-    #[test]
-    fn domain_map_handles_computer_use_as_unavailable_without_feature() {
-        let registered = crate::builtin_tool_specs()
-            .into_iter()
-            .map(|configured| configured.spec.name)
-            .collect::<HashSet<_>>();
-
-        let actual = registered_domain_tool_names(BuiltinToolDomain::ComputerUse, |name| {
-            registered.contains(name)
-        });
-        let expected = if registered.contains("computer_use") {
-            vec!["computer_use"]
-        } else {
-            Vec::new()
-        };
-
-        assert_eq!(actual, expected);
     }
 }

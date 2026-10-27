@@ -1696,12 +1696,21 @@ add_confirm = "この参加者を追加しますか？"
 remove_confirm = "この参加者を削除しますか？"
 
 [tasks.notifications]
+mark_all_read = "すべて既読にする"
 title = "タスク結果"
 loading = "結果を読み込み中…"
-empty = "タスク結果はありません"
+empty = "未読のタスク結果はありません"
 task = "タスク"
 mark_read = "既読にする"
 completed = "タスクが完了しました"
+
+open = "スレッドを開く"
+more = "さらに読み込む"
+read = "既読"
+unread = "未読"
+retry = "再試行"
+loading_failed = "タスクの結果を更新できませんでした"
+timed_out = "タイムアウト"
 
 [settings.self_improvement.status]
 title = "アクティビティ"

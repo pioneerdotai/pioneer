@@ -1,3 +1,5 @@
+use crate::session::SessionOutbound;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,6 +25,39 @@ use crate::message::MessageProcessor;
 use crate::session::SessionManager;
 
 const ACCESS_CLOSE_GRACE: Duration = Duration::from_millis(250);
+
+/// Only the connection pump publishes leases, after durable admission and principal CAS.
+/// Publication and the final expiry check share the watch lock. A lease cannot be
+/// published at or after the previous deadline, even if the timer task runs late.
+#[derive(Clone)]
+pub(crate) struct ConnectionAccessLease {
+    pub(crate) principal: AuthenticatedSessionPrincipal,
+    deadline: tokio::time::Instant,
+}
+
+impl ConnectionAccessLease {
+    pub(crate) fn new(principal: AuthenticatedSessionPrincipal, lifetime: Duration) -> Self {
+        Self {
+            principal,
+            deadline: tokio::time::Instant::now() + lifetime,
+        }
+    }
+
+    fn publish(leases: &watch::Sender<Self>, mut next: Self) -> bool {
+        leases.send_if_modified(|lease| {
+            if tokio::time::Instant::now() >= lease.deadline {
+                return false;
+            }
+            // An idempotent presentation of the same access credential must
+            // retain its original deadline, including across wall-clock drift.
+            if next.principal.access_expires_at_unix == lease.principal.access_expires_at_unix {
+                next.deadline = lease.deadline;
+            }
+            *lease = next;
+            true
+        })
+    }
+}
 
 type WriterCompletion = std::result::Result<Result<()>, tokio::task::JoinError>;
 
@@ -80,6 +115,7 @@ pub async fn spawn_server(
         .local_addr()
         .context("failed to read bound gateway server address")?;
 
+    message_processor.set_gateway_listen_addr(local_addr);
     let state = GatewayHttpState::new(
         config,
         auth,
@@ -184,10 +220,12 @@ pub(crate) async fn run_normal_connection(
 ) -> Result<()> {
     let (mut ws_writer, mut ws_reader) = ws.split();
     let queue_capacity = config.gateway.outbound_queue_capacity.max(1);
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(queue_capacity);
+    let (outbound_tx, mut outbound_rx) =
+        mpsc::channel::<pioneer_observability::work::WorkItem<Message>>(queue_capacity);
 
+    let outbound_tx = SessionOutbound::observed(outbound_tx);
     let connection_id = session_manager
-        .register_connection(outbound_tx.clone(), principal)
+        .register_outbound_connection(outbound_tx.clone(), principal)
         .await?;
     let connection_setup = async {
         let connection_context = session_manager.connection_context(connection_id).await?;
@@ -210,45 +248,44 @@ pub(crate) async fn run_normal_connection(
             connection_context.principal().access_expires_at_unix,
             now_since_epoch,
         )?;
-        let access_warning_delay = remaining_access_warning_duration(
-            access_lifetime,
-            config.gateway.auth.token_refresh_leeway_seconds,
-        );
-        Ok::<_, anyhow::Error>((
-            connection_context,
-            termination_rx,
-            access_lifetime,
-            access_warning_delay,
-        ))
+        Ok::<_, anyhow::Error>((connection_context, termination_rx, access_lifetime))
     }
     .await;
-    let (connection_context, mut termination_rx, access_lifetime, access_warning_delay) =
-        match connection_setup {
-            Ok(setup) => setup,
-            Err(error) => {
-                session_manager.unregister_connection(connection_id).await;
-                return Err(error);
-            }
-        };
+    let (mut connection_context, mut termination_rx, access_lifetime) = match connection_setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            session_manager.unregister_connection(connection_id).await;
+            return Err(error);
+        }
+    };
 
     let (lease_cancel_tx, lease_cancel_rx) = watch::channel(false);
     let (access_expired_tx, mut access_expired_rx) = watch::channel(false);
-    let access_lease_principal = connection_context.principal().clone();
+    let (renewal_tx, renewal_rx) = watch::channel(ConnectionAccessLease::new(
+        connection_context.principal().clone(),
+        access_lifetime,
+    ));
     let access_lease_outbound = outbound_tx.clone();
+    let access_lease_leeway = config.gateway.auth.token_refresh_leeway_seconds;
     let access_lease_task = tokio::spawn(async move {
         enforce_access_lease(
             access_lease_outbound,
-            access_lease_principal,
-            access_lifetime,
-            access_warning_delay,
+            access_lease_leeway,
             lease_cancel_rx,
             access_expired_tx,
+            renewal_rx,
         )
         .await;
     });
 
     let mut writer_task = tokio::spawn(async move {
-        while let Some(message) = outbound_rx.recv().await {
+        while let Some(item) = outbound_rx.recv().await {
+            let mut queue = item.queue.as_ref().map(|(q, _)| q.processing());
+            let (message, work) = item.received(
+                pioneer_observability::work::Boundary::EventLane,
+                pioneer_observability::work::WorkKind::Event,
+                pioneer_observability::work::ExecutorRole::Gateway,
+            );
             let startup_output = if let Message::Text(text) = &message {
                 if !pioneer_observability::turn_startup::active() {
                     None
@@ -285,10 +322,15 @@ pub(crate) async fn run_normal_connection(
                 )
             });
             let terminal = matches!(message, Message::Close(_));
-            ws_writer
-                .send(message)
-                .await
-                .context("websocket write failed")?;
+            work.scope_result(pioneer_observability::live::waiting(
+                pioneer_observability::live::WaitKind::Network,
+                ws_writer.send(message),
+            ))
+            .await
+            .context("websocket write failed")?;
+            if let Some(queue) = queue.as_mut() {
+                queue.processed();
+            }
             drop(startup_write);
             if let Some((key, output, outcome)) = startup_output {
                 if output.is_some() {
@@ -310,6 +352,7 @@ pub(crate) async fn run_normal_connection(
         Ok::<(), anyhow::Error>(())
     });
     let mut writer_completion = None;
+    let mut deferred_ingress = VecDeque::new();
     let read_result = async {
         loop {
             let payload = tokio::select! {
@@ -345,7 +388,10 @@ pub(crate) async fn run_normal_connection(
                     writer_completion = Some(result);
                     break;
                 }
-                payload = ws_reader.next() => payload,
+                payload = async {
+                    if let Some(message) = deferred_ingress.pop_front() { Some(Ok(message)) }
+                    else { ws_reader.next().await }
+                } => payload,
             };
             let Some(payload) = payload else {
                 break;
@@ -360,9 +406,47 @@ pub(crate) async fn run_normal_connection(
                         send_close_bounded(&outbound_tx, 4401, reason).await;
                         break;
                     }
+                    // This transport control request deliberately bypasses domain dispatch;
+                    // auth/refresh remains restricted to credential issuance.
+                    let renewal =
+                        serde_json::from_str::<pioneer_protocol::JsonRpcRequest>(&payload)
+                            .ok()
+                            .filter(|request| {
+                                request.method
+                                    == pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW
+                            });
+                    let mut renewal_failed = false;
                     let outcome = await_message_processing(
-                        Arc::clone(&message_processor)
-                            .process_owned_request(connection_context.clone(), payload.to_string()),
+                        async {
+                            if let Some(request) = renewal {
+                                renewal_failed = !renew_normal_access(
+                                    request,
+                                    &auth_service,
+                                    &session_manager,
+                                    &mut connection_context,
+                                    &renewal_tx,
+                                    &outbound_tx,
+                                )
+                                .await;
+                            } else {
+                                let processing = Arc::clone(&message_processor)
+                                    .process_owned_request(
+                                        connection_context.clone(),
+                                        payload.to_string(),
+                                    );
+                                renewal_failed = !process_with_access_renewals(
+                                    processing,
+                                    &mut ws_reader,
+                                    &mut deferred_ingress,
+                                    &auth_service,
+                                    &session_manager,
+                                    &mut connection_context,
+                                    &renewal_tx,
+                                    &outbound_tx,
+                                )
+                                .await;
+                            }
+                        },
                         &mut termination_rx,
                         &mut server_cancellation,
                         &mut access_expired_rx,
@@ -376,6 +460,10 @@ pub(crate) async fn run_normal_connection(
                     )
                     .await?
                     {
+                        break;
+                    }
+                    if renewal_failed {
+                        send_close_bounded(&outbound_tx, 1012, "access_renewal_unconfirmed").await;
                         break;
                     }
                 }
@@ -386,9 +474,23 @@ pub(crate) async fn run_normal_connection(
                         send_close_bounded(&outbound_tx, 4401, reason).await;
                         break;
                     }
+                    let processing_context = connection_context.clone();
+                    let mut ingress_alive = true;
                     let outcome = await_message_processing(
-                        message_processor
-                            .process_binary_frame(&connection_context, payload.as_ref()),
+                        async {
+                            ingress_alive = process_with_access_renewals(
+                                message_processor
+                                    .process_binary_frame(&processing_context, payload.as_ref()),
+                                &mut ws_reader,
+                                &mut deferred_ingress,
+                                &auth_service,
+                                &session_manager,
+                                &mut connection_context,
+                                &renewal_tx,
+                                &outbound_tx,
+                            )
+                            .await;
+                        },
                         &mut termination_rx,
                         &mut server_cancellation,
                         &mut access_expired_rx,
@@ -402,6 +504,9 @@ pub(crate) async fn run_normal_connection(
                     )
                     .await?
                     {
+                        break;
+                    }
+                    if !ingress_alive {
                         break;
                     }
                 }
@@ -478,7 +583,7 @@ where
 
 async fn continue_after_message_processing(
     outcome: MessageProcessingOutcome,
-    outbound_tx: &mpsc::Sender<Message>,
+    outbound_tx: &SessionOutbound,
     writer_completion: &mut Option<WriterCompletion>,
 ) -> Result<bool> {
     match outcome {
@@ -507,56 +612,195 @@ async fn continue_after_message_processing(
     }
 }
 
+/// Keep transport control responsive while a domain RPC is awaiting completion.
+/// Ordinary frames retain their existing processing order and bounded backpressure.
+pub(crate) async fn process_with_access_renewals<F>(
+    processing: F,
+    reader: &mut (impl futures_util::Stream<Item = std::result::Result<Message, axum::Error>> + Unpin),
+    deferred: &mut VecDeque<Message>,
+    auth: &GatewayAuthService,
+    sessions: &SessionManager,
+    connection: &mut crate::request_context::ConnectionContext,
+    renewal_tx: &watch::Sender<ConnectionAccessLease>,
+    outbound: &SessionOutbound,
+) -> bool
+where
+    F: Future<Output = ()>,
+{
+    const MAX_DEFERRED_FRAMES: usize = 64;
+    const MAX_DEFERRED_BYTES: usize = 4 * 1024 * 1024;
+    let mut deferred_bytes: usize = deferred
+        .iter()
+        .map(|message| match message {
+            Message::Text(payload) => payload.len(),
+            Message::Binary(payload) => payload.len(),
+            _ => 0,
+        })
+        .sum();
+    tokio::pin!(processing);
+    loop {
+        tokio::select! {
+            () = &mut processing => return true,
+            incoming = reader.next(), if deferred.len() < MAX_DEFERRED_FRAMES && deferred_bytes < MAX_DEFERRED_BYTES => {
+                match incoming {
+                    Some(Ok(Message::Text(payload))) => {
+                        let request = serde_json::from_str::<pioneer_protocol::JsonRpcRequest>(&payload)
+                            .ok().filter(|request| request.method == pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW);
+                        if let Some(request) = request {
+                            let renewal = renew_normal_access(request, auth, sessions, connection, renewal_tx, outbound);
+                            tokio::pin!(renewal);
+                            // Renewal may need the writer currently owned by processing.
+                            // Keep polling both, and retain renewal ownership if the RPC
+                            // finishes first. The outer pump still owns cancellation.
+                            tokio::select! {
+                                accepted = &mut renewal => if !accepted { return false; },
+                                () = &mut processing => return renewal.await,
+                            }
+                        } else {
+                            deferred_bytes = deferred_bytes.saturating_add(payload.len());
+                            deferred.push_back(Message::Text(payload));
+                        }
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return false,
+                    Some(Ok(Message::Binary(payload))) => {
+                        deferred_bytes = deferred_bytes.saturating_add(payload.len());
+                        deferred.push_back(Message::Binary(payload));
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn renew_normal_access(
+    request: pioneer_protocol::JsonRpcRequest,
+    auth: &GatewayAuthService,
+    sessions: &SessionManager,
+    connection: &mut crate::request_context::ConnectionContext,
+    renewal_tx: &watch::Sender<ConnectionAccessLease>,
+    outbound: &SessionOutbound,
+) -> bool {
+    let result = async {
+        if request.jsonrpc != pioneer_protocol::JSONRPC_VERSION {
+            return Err(crate::auth::AuthError::new(
+                crate::auth::AuthErrorCode::InvalidCredential,
+            ));
+        }
+        let params = serde_json::from_value::<pioneer_protocol::AuthAccessRenewParams>(
+            request.params.unwrap_or(serde_json::Value::Null),
+        )
+        .map_err(|_| crate::auth::AuthError::new(crate::auth::AuthErrorCode::InvalidCredential))?;
+        let next = auth
+            .renew_connection_access(connection.principal(), &params)
+            .await?;
+        let updated = sessions
+            .renew_connection_principal(connection.connection_id(), connection.principal(), next)
+            .await
+            .map_err(|error| crate::auth::AuthError::new(error.auth_code()))?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+            crate::auth::AuthError::new(crate::auth::AuthErrorCode::TemporarilyUnavailable)
+        })?;
+        let remaining = remaining_access_duration(updated.principal().access_expires_at_unix, now)
+            .map_err(|_| {
+                crate::auth::AuthError::new(crate::auth::AuthErrorCode::CredentialExpired)
+            })?;
+        let next = ConnectionAccessLease::new(updated.principal().clone(), remaining);
+        let accepted = ConnectionAccessLease::publish(renewal_tx, next);
+        if !accepted {
+            return Err(crate::auth::AuthError::new(
+                crate::auth::AuthErrorCode::CredentialExpired,
+            ));
+        }
+        *connection = updated;
+        Ok::<_, crate::auth::AuthError>(pioneer_protocol::AuthAccessRenewResponse {
+            access_expires_at_unix: connection.principal().access_expires_at_unix,
+        })
+    }
+    .await;
+    let accepted = result.is_ok();
+    let response = match result {
+        Ok(response) => pioneer_protocol::JsonRpcResponse::from_result(request.id, &response)
+            .ok()
+            .and_then(|response| serde_json::to_string(&response).ok()),
+        Err(error) => serde_json::to_string(&pioneer_protocol::JsonRpcErrorResponse {
+            jsonrpc: pioneer_protocol::JSONRPC_VERSION.to_owned(),
+            id: Some(request.id),
+            error: pioneer_protocol::JsonRpcError {
+                code: -32040,
+                message: error.code().as_str().to_owned(),
+                data: Some(serde_json::json!({"code": error.code().as_str()})),
+            },
+        })
+        .ok(),
+    };
+    if let Some(response) = response {
+        // No database resources are retained across this bounded send.
+        if !matches!(
+            tokio::time::timeout(
+                ACCESS_CLOSE_GRACE,
+                outbound.send(Message::Text(response.into()))
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    accepted
+}
+
 async fn enforce_access_lease(
-    outbound_tx: mpsc::Sender<Message>,
-    principal: AuthenticatedSessionPrincipal,
-    access_lifetime: Duration,
-    access_warning_delay: Duration,
+    outbound_tx: SessionOutbound,
+    refresh_leeway_seconds: u64,
     mut cancellation_rx: watch::Receiver<bool>,
     access_expired_tx: watch::Sender<bool>,
+    mut renewal_rx: watch::Receiver<ConnectionAccessLease>,
 ) {
-    let lease_started_at = tokio::time::Instant::now();
-    let expiry_deadline = lease_started_at + access_lifetime;
-
-    if access_warning_delay < access_lifetime {
-        let warning_deadline = lease_started_at + access_warning_delay;
+    let mut warned_deadline = None;
+    loop {
+        let lease = renewal_rx.borrow_and_update().clone();
+        let now = tokio::time::Instant::now();
+        let warning = now
+            + remaining_access_warning_duration(
+                lease.deadline.saturating_duration_since(now),
+                refresh_leeway_seconds,
+            );
         tokio::select! {
-            _ = tokio::time::sleep_until(warning_deadline) => {
+            biased;
+            _ = wait_for_cancellation(&mut cancellation_rx) => return,
+            _ = tokio::time::sleep_until(lease.deadline) => {
+                // The publisher rejects an already expired old lease under the
+                // same watch lock. Observe a timely publication before expiring,
+                // even when both the old timer and changed() are ready.
+                let current = renewal_rx.borrow_and_update();
+                if current.deadline != lease.deadline { continue; }
+                let _ = access_expired_tx.send(true);
+                tracing::info!(event = "auth_access_expired", outcome = "connection_closed", reason_code = "access_expired");
+                return;
+            }
+            changed = renewal_rx.changed() => {
+                if changed.is_err() { return; }
+            }
+            _ = tokio::time::sleep_until(warning), if warned_deadline != Some(lease.deadline) => {
+                warned_deadline = Some(lease.deadline);
                 if let Ok(notification) = JsonRpcNotification::from_params(
                     events::AUTH_ACCESS_EXPIRING,
                     &AuthAccessExpiringNotification {
-                        session_id: principal.session_id.clone(),
-                        access_expires_at_unix: principal.access_expires_at_unix,
+                        session_id: lease.principal.session_id.clone(),
+                        access_expires_at_unix: lease.principal.access_expires_at_unix,
                     },
-                )
-                .and_then(|notification| serde_json::to_string(&notification))
-                {
-                    if matches!(
-                        outbound_tx.try_send(Message::Text(notification.into())),
-                        Err(mpsc::error::TrySendError::Full(_)),
-                    ) {
+                ).and_then(|notification| serde_json::to_string(&notification)) {
+                    if matches!(outbound_tx.try_send(Message::Text(notification.into())),
+                        Err(mpsc::error::TrySendError::Full(_))) {
                         record_outbound_queue_saturation("access_expiry_warning");
                     }
                 }
             }
-            _ = wait_for_cancellation(&mut cancellation_rx) => return,
         }
     }
-
-    tokio::select! {
-        _ = tokio::time::sleep_until(expiry_deadline) => {}
-        _ = wait_for_cancellation(&mut cancellation_rx) => return,
-    }
-
-    let _ = access_expired_tx.send(true);
-    tracing::info!(
-        event = "auth_access_expired",
-        gateway_id = %principal.gateway_id,
-        principal_id = %principal.principal_id,
-        auth_session_id = %principal.session_id,
-        outcome = "connection_closed",
-        reason_code = "access_expired",
-    );
 }
 
 async fn wait_for_cancellation(cancellation_rx: &mut watch::Receiver<bool>) {
@@ -592,7 +836,7 @@ async fn normal_ingress_lease_failure(
         })
 }
 
-async fn send_close_bounded(sender: &mpsc::Sender<Message>, code: u16, reason: &'static str) {
+async fn send_close_bounded(sender: &SessionOutbound, code: u16, reason: &'static str) {
     if sender.capacity() == 0 {
         record_outbound_queue_saturation("close_waited");
     }
@@ -698,19 +942,75 @@ mod tests {
         let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (expired_tx, expired_rx) = watch::channel(false);
-        let task = tokio::spawn(enforce_access_lease(
-            outbound_tx,
-            principal,
+        let (_renewal_tx, renewal_rx) = watch::channel(ConnectionAccessLease::new(
+            principal.clone(),
             Duration::from_secs(60),
-            Duration::from_secs(30),
+        ));
+        let task = tokio::spawn(enforce_access_lease(
+            outbound_tx.into(),
+            30,
             cancel_rx,
             expired_tx,
+            renewal_rx,
         ));
 
         cancel_tx.send(true).unwrap();
         task.await.unwrap();
         assert!(!*expired_rx.borrow());
         assert!(outbound_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_old_expiry_observes_timely_renewal_but_rejects_late_publication() {
+        for timely in [true, false] {
+            let mut principal =
+                (*crate::session::test_support::authenticated_test_superuser()).clone();
+            principal.access_expires_at_unix = 10_000;
+            let old = ConnectionAccessLease::new(principal.clone(), Duration::from_secs(1));
+            let (renewal_tx, renewal_rx) = watch::channel(old);
+            let (outbound_tx, _outbound_rx) = mpsc::channel(4);
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            let (expired_tx, expired_rx) = watch::channel(false);
+            let task =
+                enforce_access_lease(outbound_tx.into(), 0, cancel_rx, expired_tx, renewal_rx);
+            tokio::pin!(task);
+            assert!(
+                task.as_mut().now_or_never().is_none(),
+                "park on the old deadline"
+            );
+            tokio::time::advance(Duration::from_millis(if timely { 500 } else { 1_000 })).await;
+            let old_deadline = renewal_tx.borrow().deadline;
+            assert_eq!(
+                ConnectionAccessLease::publish(
+                    &renewal_tx,
+                    ConnectionAccessLease::new(principal.clone(), Duration::from_secs(60)),
+                ),
+                timely
+            );
+            assert_eq!(
+                renewal_tx.borrow().deadline,
+                old_deadline,
+                "same credential cannot move expiry"
+            );
+            principal.access_expires_at_unix += 60;
+            let accepted = ConnectionAccessLease::publish(
+                &renewal_tx,
+                ConnectionAccessLease::new(principal, Duration::from_secs(60)),
+            );
+            assert_eq!(accepted, timely);
+            if timely {
+                // Keep the lease future unpolled until BOTH its old timer and
+                // the accepted publication are ready.
+                tokio::time::advance(Duration::from_millis(500)).await;
+                assert!(task.as_mut().now_or_never().is_none());
+                assert!(!*expired_rx.borrow());
+                cancel_tx.send(true).unwrap();
+                task.await;
+            } else {
+                assert!(task.as_mut().now_or_never().is_some());
+                assert!(*expired_rx.borrow());
+            }
+        }
     }
 
     #[tokio::test]

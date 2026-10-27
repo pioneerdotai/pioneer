@@ -13,7 +13,7 @@ sha256_file() {
 usage() {
   cat <<'USAGE'
 Usage:
-  package-linux-appimage.sh --target <rust-target> [--out-dir <dir>] [--appimagetool <path>]
+  package-linux-appimage.sh --target <rust-target> [--out-dir <dir>] [--appimagetool <path>] [--skip-build]
 
 Examples:
   package-linux-appimage.sh --target x86_64-unknown-linux-gnu
@@ -24,9 +24,13 @@ USAGE
 TARGET=""
 OUT_DIR=""
 APPIMAGETOOL_BIN="${APPIMAGETOOL_BIN:-}"
+SKIP_BUILD=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --skip-build)
+      SKIP_BUILD=true
+      ;;
     --target)
       shift
       [[ $# -gt 0 ]] || {
@@ -105,9 +109,16 @@ if [[ ! -x "$APPIMAGETOOL_BIN" ]] && ! command -v "$APPIMAGETOOL_BIN" >/dev/null
   exit 1
 fi
 
-cargo build --release -p pioneer-desktop --target "$TARGET"
-cargo build --release -p pioneer-app-updater --target "$TARGET"
-cargo build --release -p pioneer-cli --features computer-use --target "$TARGET"
+if [[ "$SKIP_BUILD" != true ]]; then
+  cargo update -p cua-driver-sdk
+  cargo build --locked --release -p pioneer-desktop --target "$TARGET"
+  cargo build --locked --release -p pioneer-app-updater --target "$TARGET"
+  cargo build --locked --release -p pioneer-cli --features computer-use --target "$TARGET"
+  if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+    python3 scripts/packaging/symbol-inputs.py export --target "$TARGET" "$PIONEER_SYMBOL_INPUTS_DIR" \
+      "target/$TARGET/release/pioneer-app" "target/$TARGET/release/pioneer" "target/$TARGET/release/pioneer-app-updater"
+  fi
+fi
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -134,9 +145,9 @@ fi
 GATEWAY_BUNDLE_DIR="$APPDIR/usr/bin/gateway"
 mkdir -p "$GATEWAY_BUNDLE_DIR"
 
-GATEWAY_ASSET_NAME="pioneer-gateway-linux-${ARCH}.gz"
+GATEWAY_ASSET_NAME="pioneer-gateway-linux-${ARCH}-computer-use-package.zip"
 GATEWAY_ASSET_PATH="$GATEWAY_BUNDLE_DIR/$GATEWAY_ASSET_NAME"
-gzip -f --stdout --best "target/$TARGET/release/pioneer" > "$GATEWAY_ASSET_PATH"
+python3 scripts/packaging/cua-driver.py --target "$TARGET" --binary "target/$TARGET/release/pioneer" --archive "$GATEWAY_ASSET_PATH"
 
 GATEWAY_SHA256="$(sha256_file "$GATEWAY_ASSET_PATH")"
 printf 'sha256:%s %s\n' "$GATEWAY_SHA256" "$GATEWAY_ASSET_NAME" > "$GATEWAY_BUNDLE_DIR/SHA256SUMS"
@@ -169,6 +180,14 @@ ln -s "pioneer.png" "$APPDIR/.DirIcon"
 scripts/packaging/desktop/check-package-contents.sh linux-appdir "$APPDIR"
 
 APPIMAGE_NAME="pioneer-linux-${ARCH}.AppImage"
+strip --strip-debug "$APPDIR/usr/bin/pioneer-app" "$APPDIR/usr/bin/pioneer-app-updater" "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$APPDIR/usr/bin/pioneer-app" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+  python3 scripts/packaging/symbol-inputs.py record "$APPDIR/usr/bin/pioneer-app-updater" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
 APPIMAGE_PATH="$OUT_DIR/$APPIMAGE_NAME"
 
 if [[ -x "$APPIMAGETOOL_BIN" ]]; then

@@ -1,6 +1,6 @@
 //! Hermetic production bridge contract used by the provider conformance gates.
 
-use super::facade::{CliMcpFacadeProjection, CliMcpFacadeTool};
+use super::facade::{CliMcpCallContract, CliMcpFacadeProjection, CliMcpFacadeTool};
 use super::grants::{CliMcpGrantScope, CliMcpManifestHash};
 use super::limits::CliMcpFacadeLimits;
 use super::limits::CliMcpFacadeProjectionLimits;
@@ -168,6 +168,7 @@ struct SingleBridgeConformanceEvidence {
 
 async fn run_single_bridge_conformance(
     runtime_id: &str,
+    contract: CliMcpCallContract,
     thread_id: &str,
     callable_name: &str,
     wait_callable: &str,
@@ -241,6 +242,7 @@ async fn run_single_bridge_conformance(
         reservation.generation,
         projection,
         CliMcpFacadeLimits::default(),
+        contract,
     )?;
     let server = tokio::spawn(server.run());
     let mut provider = ProviderClient {
@@ -319,10 +321,12 @@ async fn run_single_bridge_conformance(
         .await;
 
     provider
-        .send(json!({
-            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {"name": callable_name, "arguments": {"value": 53}}
-        }))
+        .send(call_message(
+            contract,
+            3,
+            callable_name,
+            json!({"value": 53}),
+        ))
         .await?;
     let called = provider.response(&json!(3)).await?;
     let successful_call_observed = called["result"]["content"][0]["text"] == "bridge-ok"
@@ -330,10 +334,7 @@ async fn run_single_bridge_conformance(
     ensure!(successful_call_observed, "facade result contract drifted");
 
     provider
-        .send(json!({
-            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-            "params": {"name": wait_callable, "arguments": {}}
-        }))
+        .send(call_message(contract, 4, wait_callable, json!({})))
         .await?;
     wait_for_count(&invoker.waiting, 1).await?;
     provider
@@ -395,14 +396,58 @@ async fn run_single_bridge_conformance(
     })
 }
 
+// Deterministic provider wire requests still traverse the real helper/bridge.
+fn call_message(
+    contract: CliMcpCallContract,
+    id: u64,
+    name: &str,
+    arguments: JsonValue,
+) -> JsonValue {
+    let item = format!("call-{id}");
+    let (arguments, meta) = match contract {
+        CliMcpCallContract::Codex => (
+            arguments,
+            json!({
+                "callId": item, "threadId": "native-thread",
+                "x-codex-turn-metadata": {"thread_id": "native-thread", "turn_id": "native-turn"}
+            }),
+        ),
+        CliMcpCallContract::Claude => (arguments, json!({"claudecode/toolUseId": item})),
+        CliMcpCallContract::OpenCode => (
+            json!({
+                "__pioneer_mcp": {"sessionID": "native-thread", "messageID": "msg_assistant", "id": item},
+                "arguments": arguments,
+            }),
+            json!({"ai.opencode/sessionID": "native-thread"}),
+        ),
+    };
+    json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments, "_meta": meta}
+    })
+}
+
 pub(crate) async fn run_cli_mcp_bridge_conformance(
     runtime_id: &str,
+    contract: CliMcpCallContract,
 ) -> Result<CliMcpBridgeConformanceEvidence> {
     let runtime_a = format!("{runtime_id}-conformance-a");
     let runtime_b = format!("{runtime_id}-conformance-b");
     let (a, b) = tokio::try_join!(
-        run_single_bridge_conformance(runtime_a.as_str(), "thread-a", "fixture_a", "wait_a"),
-        run_single_bridge_conformance(runtime_b.as_str(), "thread-b", "fixture_b", "wait_b")
+        run_single_bridge_conformance(
+            runtime_a.as_str(),
+            contract,
+            "thread-a",
+            "fixture_a",
+            "wait_a"
+        ),
+        run_single_bridge_conformance(
+            runtime_b.as_str(),
+            contract,
+            "thread-b",
+            "fixture_b",
+            "wait_b"
+        )
     )?;
     let concurrent_isolation_observed = a.listed_names == ["fixture_a", "wait_a"]
         && b.listed_names == ["fixture_b", "wait_b"]

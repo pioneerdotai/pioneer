@@ -13,14 +13,13 @@ use sea_orm::sea_query::{ExprTrait, Query};
 const NOW: i64 = 4_000_000_000;
 const MIGRATION: &str = "m20261002_000001_task_run_occurrence_reconcile";
 
-// Event-driven fixture creation needs cancellation markers and the current
-// Turn's nullable plugin selection column. Use that production schema prefix,
-// without later irreversible migrations.
+// Keep rollback aimed at the tracker through the cancellation schema prefix;
+// current projector metadata is added separately by the legacy fixture helper.
 struct TrackerFixtureMigrator;
 
 impl MigratorTrait for TrackerFixtureMigrator {
     fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-        migrations_through("m20261005_000001_plugin_ownership")
+        migrations_through("m20261008_000008_native_cancellation_context")
     }
 }
 
@@ -671,6 +670,8 @@ async fn ordinary_event_driven_repair_can_overtake_claimed_background_work() {
 #[tokio::test]
 async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_objects() {
     let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
+    add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
+    add_thread_unread_column_to_legacy_fixture(&store).await;
     let (store, _, run) =
         terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
     let maintenance = store.with_maintenance_access();
@@ -1722,6 +1723,8 @@ async fn attempt_count_saturates_but_poison_row_stays_retryable_forever() {
 #[tokio::test]
 async fn recovery_completed_at_write_tracks_preinstall_run_without_history_discovery() {
     let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
+    add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
+    add_thread_unread_column_to_legacy_fixture(&store).await;
     let (store, _, run) =
         terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
     runs::Entity::update_many()
@@ -2080,12 +2083,15 @@ async fn background_repair_waits_for_predecessor_then_retries_without_source_pai
         .await
         .unwrap();
     assert_eq!(events_before.len(), 1);
-    assert!(
-        store
-            .reconcile_claimed_task_run_occurrence(&claim, NOW)
-            .await
-            .is_err()
-    );
+    let error = store
+        .reconcile_claimed_task_run_occurrence(&claim, NOW)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<crate::TaskRunOccurrenceRepairPhase>(),
+        Some(crate::TaskRunOccurrenceRepairPhase::Commit)
+    ));
+
     assert_eq!(
         row(&store, &run.id).await.unwrap().next_attempt_at,
         claim.next_attempt_at

@@ -78,6 +78,7 @@ pub(crate) fn effective_input_model(
         let model = discovery?;
         let api = match provider {
             "ollama" => "ollama-chat",
+            "vercel-ai-gateway" => "openai-responses",
             "anthropic" => "anthropic-messages",
             "gemini" => "google-generative-ai",
             "bedrock" => "bedrock-converse-stream",

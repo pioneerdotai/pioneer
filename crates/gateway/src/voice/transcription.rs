@@ -1,12 +1,40 @@
 // Gateway transcription boundary. The concrete Parakeet backend plugs in here.
 
-use super::vad::{VoiceNoSpeechReason, VoiceSpeechSegment, VoiceVadSegmentationOutcome};
+use super::vad::VoiceSpeechSegment;
+#[cfg(test)]
+use super::vad::{VoiceNoSpeechReason, VoiceVadSegmentationOutcome};
 use pioneer_config::GatewayVoiceTranscriptionStrategy;
 use pioneer_protocol::{VoiceError, VoiceErrorKind};
 #[cfg(test)]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
+
+// Private one-shot result, retaining only timing actually supplied by the SDK.
+// No confidence, fabricated word times, or persistent decoder state.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct VoiceSpeechHypothesis {
+    pub(crate) text: String,
+    pub(crate) segments: Option<Vec<transcribe_rs::TranscriptionSegment>>,
+}
+
+impl VoiceSpeechHypothesis {
+    pub(crate) fn text_only(text: String) -> Self {
+        Self {
+            text,
+            segments: None,
+        }
+    }
+}
+
+impl From<transcribe_rs::TranscriptionResult> for VoiceSpeechHypothesis {
+    fn from(result: transcribe_rs::TranscriptionResult) -> Self {
+        Self {
+            text: result.text,
+            segments: result.segments,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PreparedSpeechBuffer {
@@ -16,6 +44,7 @@ pub(crate) struct PreparedSpeechBuffer {
 }
 
 impl PreparedSpeechBuffer {
+    #[cfg(test)]
     pub(crate) fn from_segments(
         sample_rate_hz: u32,
         total_samples: usize,
@@ -35,6 +64,7 @@ impl PreparedSpeechBuffer {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn from_vad_outcome(
         sample_rate_hz: u32,
         outcome: VoiceVadSegmentationOutcome,
@@ -70,6 +100,7 @@ impl PreparedSpeechBuffer {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum VoiceTranscriptionOutcome {
     Ready(PreparedSpeechBuffer),
@@ -84,12 +115,15 @@ pub(crate) struct VoiceTranscriptionNoSpeech {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VoiceTranscriptionNoSpeechReason {
+    #[cfg(test)]
     TooShort,
     NoSpeechDetected,
+    #[cfg(test)]
     EmptyBuffer,
     EmptyTranscript,
 }
 
+#[cfg(test)]
 impl From<VoiceNoSpeechReason> for VoiceTranscriptionNoSpeechReason {
     fn from(reason: VoiceNoSpeechReason) -> Self {
         match reason {
@@ -116,6 +150,7 @@ pub(crate) struct VoiceTranscriptionDiagnostics {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VoiceTranscriptionStrategy {
+    IncrementalGatewaySession,
     BufferedGatewaySession,
     ExperimentalStreaming,
 }
@@ -212,6 +247,14 @@ pub(crate) trait VoiceSpeechTranscriber: Send {
         &self,
         buffer: &PreparedSpeechBuffer,
     ) -> Result<String, VoiceTranscriptionError>;
+
+    fn transcribe_hypothesis(
+        &self,
+        buffer: &PreparedSpeechBuffer,
+    ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        self.transcribe_speech(buffer)
+            .map(VoiceSpeechHypothesis::text_only)
+    }
 }
 
 impl VoiceSpeechTranscriber for Box<dyn VoiceSpeechTranscriber> {
@@ -220,6 +263,13 @@ impl VoiceSpeechTranscriber for Box<dyn VoiceSpeechTranscriber> {
         buffer: &PreparedSpeechBuffer,
     ) -> Result<String, VoiceTranscriptionError> {
         self.as_ref().transcribe_speech(buffer)
+    }
+
+    fn transcribe_hypothesis(
+        &self,
+        buffer: &PreparedSpeechBuffer,
+    ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        self.as_ref().transcribe_hypothesis(buffer)
     }
 }
 
@@ -278,6 +328,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(crate) fn transcribe_prepared_speech_buffer<T>(
     transcriber: &T,
     buffer: PreparedSpeechBuffer,
@@ -292,6 +343,7 @@ where
     )
 }
 
+#[cfg(test)]
 pub(crate) fn transcribe_prepared_speech_buffer_with_strategy<T>(
     transcriber: &T,
     buffer: PreparedSpeechBuffer,

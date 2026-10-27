@@ -65,6 +65,8 @@ pub enum TurnWorkState {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnWorkBlock {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub html_publications: Vec<crate::HtmlPublication>,
     pub turn_id: String,
     pub presentation: TurnWorkPresentation,
     pub state: TurnWorkState,
@@ -95,6 +97,18 @@ pub struct TurnWorkBlock {
     pub first_work_item_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_work_item_id: Option<String>,
+}
+
+/// Read-only presentation of a canonical Codex retry notice owned by a Task's
+/// hidden execution. This never becomes a canonical event in the viewing thread.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRetryNotice {
+    pub source_thread_id: String,
+    pub source_turn_id: String,
+    pub item_id: String,
+    pub message: String,
+    pub occurred_at_unix_ms: i64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -132,11 +146,16 @@ pub enum TimelineBlockKind {
     #[serde(rename_all = "camelCase")]
     DetachedTaskRun {
         task: TaskTurnItem,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        codex_retry_notices: Vec<CodexRetryNotice>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         author: Option<TurnAuthorSnapshot>,
     },
     #[serde(rename_all = "camelCase")]
     AssistantMessage {
+        /// Exact HTML content of this canonical response; source ownership is unchanged.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        html_publications: Vec<crate::HtmlPublication>,
         item_id: String,
         text: String,
         #[serde(default = "completed_turn_work_item_status")]

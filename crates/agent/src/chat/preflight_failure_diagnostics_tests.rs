@@ -653,6 +653,7 @@ async fn preflight_diagnostics_orchestrator_resolution_failure_has_no_request_at
     );
     let (result, events) = capture_preflight(run_turn_preflight_orchestrator(
         TurnPreflightOrchestratorInput {
+            usage_context: None,
             provider_registry: Arc::new(registry),
             workspace_id: "ws_1".to_owned(),
             thread_provider: thread_provider.clone(),

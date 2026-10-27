@@ -4,9 +4,12 @@ use crate::file_opener::local_file_target;
 use crate::timeline::row_view::RowPresentation;
 use gpui_kit::component::IconName;
 use gpui_kit::component::IconNamed;
+use gpui_kit::component::Sizable;
 use gpui_kit::component::StyledExt;
 use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::h_flex;
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow};
 use gpui_kit::component::theme::ActiveTheme;
 use gpui_kit::component::v_flex;
 use gpui_kit::prelude::*;
@@ -18,7 +21,10 @@ use pioneer_client::timeline::types::MarkdownInline;
 use pioneer_client::timeline::types::MarkdownList;
 use pioneer_client::timeline::types::MarkdownMark;
 use pioneer_client::timeline::types::MarkdownMarkKind;
+use pioneer_client::timeline::types::{MarkdownTable, MarkdownTableAlignment};
+use std::cell::Cell;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -50,6 +56,7 @@ pub(super) fn timeline_message_text_bottom_inset(window: &Window) -> Pixels {
 #[derive(Clone, Copy, Debug)]
 enum MarkdownTextVariant {
     Paragraph,
+    TableCell(MarkdownTableAlignment),
     Heading(u8),
 }
 
@@ -71,11 +78,102 @@ impl CodeHighlightPolicy {
 
 struct MarkdownLinkText {
     id: ElementId,
-    text: InteractiveText,
+    text: MarkdownLinkTextContent,
     text_layout: TextLayout,
     icons: Vec<MarkdownLinkIcon>,
     icon_color: Hsla,
     accessible_text: SharedString,
+}
+
+#[derive(Default)]
+struct TableLinkState {
+    mouse_down: Rc<Cell<Option<usize>>>,
+    hovered_index: Rc<Cell<Option<usize>>>,
+}
+
+enum MarkdownLinkTextContent {
+    Interactive(InteractiveText),
+    Table {
+        text: StyledText,
+        ranges: Vec<Range<usize>>,
+        on_click: Option<Box<dyn Fn(usize, &mut Window, &mut App)>>,
+    },
+}
+
+// Table-only mapping of the existing shaped lines. Each row uses the same wrap
+// boundary and alignment width as GPUI's text painter; no text is measured here.
+struct TableTextRow {
+    range: Range<usize>,
+    line_start: usize,
+    start_x: Pixels,
+    origin: Point<Pixels>,
+    layout: Arc<WrappedLineLayout>,
+}
+
+impl TableTextRow {
+    fn from_layout(text: &TextLayout, alignment: TextAlign) -> Vec<Self> {
+        let bounds = text.bounds();
+        let mut rows = Vec::new();
+        let mut origin = bounds.origin;
+        let mut line_start = 0;
+        for line in text.line_layouts() {
+            let mut start = 0;
+            let mut start_x = px(0.);
+            for (end, end_x) in line
+                .wrap_boundaries
+                .iter()
+                .map(|boundary| {
+                    let glyph =
+                        &line.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix];
+                    (glyph.index, glyph.position.x)
+                })
+                .chain([(line.len(), line.unwrapped_layout.width)])
+            {
+                let width = end_x - start_x;
+                let x = match alignment {
+                    TextAlign::Left => bounds.origin.x,
+                    TextAlign::Center => (bounds.origin.x * 2. + bounds.size.width - width) / 2.,
+                    TextAlign::Right => bounds.origin.x + bounds.size.width - width,
+                };
+                rows.push(Self {
+                    range: line_start + start..line_start + end,
+                    line_start,
+                    start_x,
+                    origin: point(x, origin.y),
+                    layout: line.clone(),
+                });
+                start = end;
+                start_x = end_x;
+                origin.y += text.line_height();
+            }
+            line_start += line.len() + 1;
+        }
+        rows
+    }
+
+    fn position(&self, index: usize) -> Point<Pixels> {
+        point(
+            self.origin.x
+                + self
+                    .layout
+                    .unwrapped_layout
+                    .x_for_index(index - self.line_start)
+                - self.start_x,
+            self.origin.y,
+        )
+    }
+
+    fn index_at(rows: &[Self], position: Point<Pixels>, line_height: Pixels) -> Option<usize> {
+        let row = rows
+            .iter()
+            .find(|row| position.y >= row.origin.y && position.y < row.origin.y + line_height)?;
+        let x = position.x - row.origin.x + row.start_x;
+        if x < row.start_x {
+            return None;
+        }
+        let index = row.line_start + row.layout.unwrapped_layout.index_for_x(x)?;
+        row.range.contains(&index).then_some(index)
+    }
 }
 
 struct MarkdownLinkIcon {
@@ -118,8 +216,14 @@ impl Element for MarkdownLinkText {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        self.text
-            .request_layout(global_id, inspector_id, window, cx)
+        match &mut self.text {
+            MarkdownLinkTextContent::Interactive(text) => {
+                text.request_layout(global_id, inspector_id, window, cx)
+            }
+            MarkdownLinkTextContent::Table { text, .. } => {
+                text.request_layout(None, inspector_id, window, cx)
+            }
+        }
     }
 
     fn prepaint(
@@ -131,8 +235,15 @@ impl Element for MarkdownLinkText {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        self.text
-            .prepaint(global_id, inspector_id, bounds, request_layout, window, cx)
+        match &mut self.text {
+            MarkdownLinkTextContent::Interactive(text) => {
+                text.prepaint(global_id, inspector_id, bounds, request_layout, window, cx)
+            }
+            MarkdownLinkTextContent::Table { text, .. } => {
+                text.prepaint(None, inspector_id, bounds, request_layout, window, cx);
+                window.insert_hitbox(bounds, HitboxBehavior::Normal)
+            }
+        }
     }
 
     fn paint(
@@ -145,31 +256,144 @@ impl Element for MarkdownLinkText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        self.text.paint(
-            global_id,
-            inspector_id,
-            bounds,
-            request_layout,
-            hitbox,
-            window,
-            cx,
-        );
+        let table_rows = match &mut self.text {
+            MarkdownLinkTextContent::Interactive(text) => {
+                text.paint(
+                    global_id,
+                    inspector_id,
+                    bounds,
+                    request_layout,
+                    hitbox,
+                    window,
+                    cx,
+                );
+                None
+            }
+            MarkdownLinkTextContent::Table {
+                text,
+                ranges,
+                on_click,
+            } => {
+                text.paint(
+                    None,
+                    inspector_id,
+                    bounds,
+                    request_layout,
+                    &mut (),
+                    window,
+                    cx,
+                );
+                let rows = Rc::new(TableTextRow::from_layout(
+                    &self.text_layout,
+                    window.text_style().text_align,
+                ));
+                let line_height = self.text_layout.line_height();
+                if hitbox.is_hovered(window)
+                    && let Some(index) =
+                        TableTextRow::index_at(&rows, window.mouse_position(), line_height)
+                    && ranges.iter().any(|range| range.contains(&index))
+                {
+                    window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+                }
+                window.with_element_state::<TableLinkState, _>(
+                    global_id.unwrap(),
+                    |state, window| {
+                        let state = state.unwrap_or_default();
+                        let mouse_down = &state.mouse_down;
+                        let hovered_index = state.hovered_index.clone();
+                        let hover_rows = rows.clone();
+                        let hover_hitbox = hitbox.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, _| {
+                            if phase == DispatchPhase::Bubble {
+                                let index = hover_hitbox
+                                    .is_hovered(window)
+                                    .then(|| {
+                                        TableTextRow::index_at(
+                                            &hover_rows,
+                                            event.position,
+                                            line_height,
+                                        )
+                                    })
+                                    .flatten();
+                                if hovered_index.replace(index) != index {
+                                    window.refresh();
+                                }
+                            }
+                        });
+                        let rows = rows.clone();
+                        let hitbox = hitbox.clone();
+                        if let Some(down_index) = mouse_down.get() {
+                            let ranges = std::mem::take(ranges);
+                            let on_click = on_click.take();
+                            let mouse_down = mouse_down.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseUpEvent, phase, window, cx| {
+                                    if phase == DispatchPhase::Bubble {
+                                        if hitbox.is_hovered(window)
+                                            && let Some(up_index) = TableTextRow::index_at(
+                                                &rows,
+                                                event.position,
+                                                line_height,
+                                            )
+                                            && let Some(on_click) = &on_click
+                                        {
+                                            for (index, range) in ranges.iter().enumerate() {
+                                                if range.contains(&down_index)
+                                                    && range.contains(&up_index)
+                                                {
+                                                    on_click(index, window, cx);
+                                                }
+                                            }
+                                        }
+                                        mouse_down.take();
+                                        window.refresh();
+                                    }
+                                },
+                            );
+                        } else {
+                            let mouse_down = mouse_down.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseDownEvent, phase, window, _| {
+                                    if phase == DispatchPhase::Bubble
+                                        && hitbox.is_hovered(window)
+                                        && let Some(index) = TableTextRow::index_at(
+                                            &rows,
+                                            event.position,
+                                            line_height,
+                                        )
+                                    {
+                                        mouse_down.set(Some(index));
+                                        window.refresh();
+                                    }
+                                },
+                            );
+                        }
+                        ((), state)
+                    },
+                );
+                Some(rows)
+            }
+        };
 
         let line_height = self.text_layout.line_height();
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
         for icon in &self.icons {
-            let Some(start) = self.text_layout.position_for_index(icon.offset) else {
+            let end_index = icon
+                .offset
+                .saturating_add(MARKDOWN_LINK_ICON_PLACEHOLDER.len());
+            let positions = if let Some(rows) = &table_rows {
+                rows.iter()
+                    .find(|row| row.range.contains(&icon.offset) && end_index <= row.range.end)
+                    .map(|row| (row.position(icon.offset), row.position(end_index)))
+            } else {
+                self.text_layout
+                    .position_for_index(icon.offset)
+                    .zip(self.text_layout.position_for_index(end_index))
+                    .filter(|(start, end)| start.y == end.y)
+            };
+            let Some((start, end)) = positions else {
                 continue;
             };
-            let Some(end) = self.text_layout.position_for_index(
-                icon.offset
-                    .saturating_add(MARKDOWN_LINK_ICON_PLACEHOLDER.len()),
-            ) else {
-                continue;
-            };
-            if start.y != end.y {
-                continue;
-            }
 
             let reserved_width = end.x - start.x;
             let icon_size =
@@ -197,7 +421,7 @@ impl Element for MarkdownLinkText {
     }
 }
 
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct MarkdownDocumentSurface {
     content: AnyElement,
 }
@@ -384,6 +608,7 @@ impl RowPresentation {
                 interaction_id,
                 cx,
             ),
+            MarkdownBlock::Table(table) => self.render_markdown_table(table, interaction_id, cx),
             MarkdownBlock::Rule => div()
                 .w_full()
                 .h(px(1.))
@@ -391,6 +616,82 @@ impl RowPresentation {
                 .opacity(0.8)
                 .into_any_element(),
         }
+    }
+
+    fn render_markdown_table(
+        &self,
+        table: &MarkdownTable,
+        interaction_id: u64,
+        cx: &mut App,
+    ) -> AnyElement {
+        let empty = MarkdownInline::default();
+        let cell_content =
+            |row_ix: usize, column_ix: usize, inline: &MarkdownInline, cx: &mut App| {
+                let id = markdown_node_interaction_id(
+                    &format!("table:{interaction_id}:{row_ix}"),
+                    column_ix as u64,
+                );
+                self.render_markdown_inline(
+                    inline,
+                    MarkdownTextVariant::TableCell(
+                        table
+                            .alignments
+                            .get(column_ix)
+                            .copied()
+                            .unwrap_or(MarkdownTableAlignment::None),
+                    ),
+                    id,
+                    cx,
+                )
+            };
+        let mut header = TableRow::new();
+        for (column_ix, inline) in table.headers.iter().enumerate() {
+            header = header.child(
+                TableHead::new()
+                    .w_48()
+                    .min_w_48()
+                    .flex_grow_1()
+                    .flex_shrink_0()
+                    .font_semibold()
+                    .child(cell_content(0, column_ix, inline, cx)),
+            );
+        }
+        let mut body = TableBody::new();
+        for (row_ix, row) in table.rows.iter().enumerate() {
+            let mut rendered_row = TableRow::new();
+            // GFM uses the header's column count, filling missing cells and ignoring extras.
+            for column_ix in 0..table.headers.len() {
+                rendered_row = rendered_row.child(
+                    TableCell::new()
+                        .w_48()
+                        .min_w_48()
+                        .flex_grow_1()
+                        .flex_shrink_0()
+                        .child(cell_content(
+                            row_ix + 1,
+                            column_ix,
+                            row.get(column_ix).unwrap_or(&empty),
+                            cx,
+                        )),
+                );
+            }
+            body = body.child(rendered_row);
+        }
+        // The same rem-based minimum and cell geometry apply to every row.
+        div()
+            .w_full()
+            .h_auto()
+            .min_w_0()
+            .child(
+                Table::new()
+                    .small()
+                    .min_w(rems(12. * table.headers.len() as f32))
+                    .child(TableHeader::new().child(header))
+                    .child(body),
+            )
+            .overflow_x_scrollbar()
+            .id(("timeline-markdown-table", interaction_id))
+            .into_any_element()
     }
 
     fn render_markdown_inline(
@@ -401,6 +702,19 @@ impl RowPresentation {
         cx: &mut App,
     ) -> AnyElement {
         let base = div().w_full().overflow_hidden().whitespace_normal();
+        let base = match variant {
+            MarkdownTextVariant::TableCell(alignment) => base
+                .flex()
+                .flex_col()
+                .text_left()
+                .when(alignment == MarkdownTableAlignment::Center, |this| {
+                    this.text_center()
+                })
+                .when(alignment == MarkdownTableAlignment::Right, |this| {
+                    this.text_right()
+                }),
+            _ => base,
+        };
         let links = normalized_markdown_links(inline.text.as_str(), &inline.marks);
         let base = if links.is_empty() {
             base.child(self.styled_markdown_inline_text(inline.text.as_str(), &inline.marks, cx))
@@ -436,29 +750,38 @@ impl RowPresentation {
             let selected_file_opener = self.active_thread_file_opener(cx);
             let owner = self.actions.owner.clone();
             let element_id: ElementId = ("timeline-markdown-inline", interaction_id).into();
-            let text = InteractiveText::new(element_id.clone(), styled_text).on_click(
-                ranges,
-                move |range_index, _, cx| {
-                    let Some(target) = targets.get(range_index) else {
-                        return;
-                    };
-                    let result = owner.update(cx, |view, _| match target {
-                        MarkdownClickTarget::Web(url) => view.open_external_link(url.as_ref()),
-                        MarkdownClickTarget::LocalFile(target) => {
-                            view.open_local_file(&selected_file_opener, target)
-                        }
-                    });
-                    let Ok(result) = result else {
-                        return;
-                    };
-                    if let Err(error) = result {
-                        tracing::warn!(
-                            error = %format!("{error:#}"),
-                            "failed to open timeline markdown link"
-                        );
+            let on_click = move |range_index: usize, _: &mut Window, cx: &mut App| {
+                let Some(target) = targets.get(range_index) else {
+                    return;
+                };
+                let result = owner.update(cx, |view, _| match target {
+                    MarkdownClickTarget::Web(url) => view.open_external_link(url.as_ref()),
+                    MarkdownClickTarget::LocalFile(target) => {
+                        view.open_local_file(&selected_file_opener, target)
                     }
-                },
-            );
+                });
+                let Ok(result) = result else {
+                    return;
+                };
+                if let Err(error) = result {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "failed to open timeline markdown link"
+                    );
+                }
+            };
+            let text = if matches!(variant, MarkdownTextVariant::TableCell(_)) {
+                MarkdownLinkTextContent::Table {
+                    text: styled_text,
+                    ranges,
+                    on_click: Some(Box::new(on_click)),
+                }
+            } else {
+                MarkdownLinkTextContent::Interactive(
+                    InteractiveText::new(element_id.clone(), styled_text)
+                        .on_click(ranges, on_click),
+                )
+            };
             base.child(MarkdownLinkText {
                 id: element_id,
                 text,
@@ -469,7 +792,9 @@ impl RowPresentation {
             })
         };
         let styled = match variant {
-            MarkdownTextVariant::Paragraph => base.text_sm().line_height(relative(1.65)),
+            MarkdownTextVariant::Paragraph | MarkdownTextVariant::TableCell(_) => {
+                base.text_sm().line_height(relative(1.65))
+            }
             MarkdownTextVariant::Heading(level) => match level {
                 1 => base.text_2xl().font_bold().line_height(relative(1.2)),
                 2 => base.text_xl().font_bold().line_height(relative(1.25)),

@@ -289,15 +289,23 @@ impl ClientCore {
             cancellation: CancellationToken::new(),
         };
         owner.requests.insert(thread_id.clone(), request.clone());
+        let mut previews = current
+            .as_ref()
+            .map_or_else(Vec::new, |p| p.previews.clone());
+        if retry {
+            for preview in &mut previews {
+                if preview.state == super::preview_workflow::ArtifactPreviewRequestState::Failed {
+                    preview.state = super::preview_workflow::ArtifactPreviewRequestState::Cancelled;
+                }
+            }
+        }
         let next = ArtifactPublication {
             thread_id,
             workspace_id,
             revision: 0,
             generation,
             request: ArtifactReadState::Loading,
-            previews: current
-                .as_ref()
-                .map_or_else(Vec::new, |p| p.previews.clone()),
+            previews,
             actions: current
                 .as_ref()
                 .map_or_else(Vec::new, |p| p.actions.clone()),
@@ -490,13 +498,14 @@ impl ClientCore {
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new().name("client-artifacts".into()).spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().expect("artifact retry timer unavailable");
+        let _runtime_observer=pioneer_observability::runtime::register(runtime.handle(),pioneer_observability::runtime::RuntimeRole::ClientHttp);
             while let Ok(request) = receiver.recv() {
                 let Some(core) = weak.upgrade() else { return; };
                 if !core.artifact_read_matches(&request) { core.complete_artifact_read(&request, Err("Artifact request cancelled".into())); continue; }
                 let sender = core.transport_runtime().ws_command_sender();
                 drop(core);
                 let current = || weak.upgrade().is_some_and(|core| core.artifact_read_matches(&request));
-                let result = load_artifacts(&request, &sender, current, |delay| runtime.block_on(async {
+                let result = load_artifacts(&request, &sender, current, |delay| _runtime_observer.block_on(&runtime, async {
                     tokio::select! { _ = request.cancellation.cancelled() => false, _ = tokio::time::sleep(delay) => true }
                 }));
                 let Some(core) = weak.upgrade() else { return; };

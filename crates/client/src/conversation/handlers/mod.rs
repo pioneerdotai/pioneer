@@ -122,6 +122,16 @@ impl TurnItemHandlerRegistry {
         markdown_version: Option<u16>,
         ts_unix_ms: i64,
     ) {
+        if payload
+            .and_then(|p| p.get("runtimeDeltaKind"))
+            .and_then(JsonValue::as_str)
+            == Some("provider_message_preview")
+        {
+            if stream == Some(pioneer_protocol::ItemDeltaStream::Generic) {
+                projector.preview_provider_message(turn_id, item_id, delta, ts_unix_ms);
+            }
+            return;
+        }
         if projector.item_type_by_id(item_id).is_none()
             && should_start_reasoning_from_delta(payload)
         {

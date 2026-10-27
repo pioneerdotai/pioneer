@@ -445,6 +445,8 @@ pub enum GatewayThreadEpisodicVectorProvider {
     OpenAi,
     #[serde(rename = "openrouter")]
     OpenRouter,
+    #[serde(rename = "vercel-ai-gateway")]
+    VercelAiGateway,
     #[serde(rename = "local")]
     Local,
 }
@@ -540,6 +542,7 @@ impl Default for GatewayCliRuntimeSettings {
             instances: vec![
                 GatewayCliRuntimeInstanceSettings::default_codex(),
                 GatewayCliRuntimeInstanceSettings::default_claude(),
+                GatewayCliRuntimeInstanceSettings::default_opencode(),
             ],
         }
     }
@@ -591,6 +594,20 @@ impl GatewayCliRuntimeInstanceSettings {
             enabled: true,
             binary_path: "claude".to_owned(),
             home_path: "~/.claude".to_owned(),
+            shadow_home_path: None,
+        }
+    }
+
+    pub fn default_opencode() -> Self {
+        Self {
+            compaction_model: None,
+            id: "opencode".to_owned(),
+            kind: CLIAgentRuntimeKind::OpenCode,
+            display_name: "OpenCode".to_owned(),
+            nickname: "opencode".to_owned(),
+            enabled: true,
+            binary_path: "opencode".to_owned(),
+            home_path: "~/.config/opencode".to_owned(),
             shadow_home_path: None,
         }
     }
@@ -661,6 +678,9 @@ impl Default for GatewayRemoteAccessTransport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayRemoteAccessStatusSnapshot {
+    /// Present only for the currently authenticated relay connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<crate::GatewayBaseUrl>,
     #[serde(default)]
     pub state: GatewayRemoteAccessState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -679,6 +699,7 @@ pub struct GatewayRemoteAccessStatusChangedNotification {
 impl Default for GatewayRemoteAccessStatusSnapshot {
     fn default() -> Self {
         Self {
+            public_base_url: None,
             state: GatewayRemoteAccessState::Disabled,
             error_kind: None,
             message: None,
@@ -927,7 +948,7 @@ mod tests {
     fn cli_runtime_settings_default_to_enabled_cli_runtimes() {
         let settings = GatewayCliRuntimeSettings::default();
 
-        assert_eq!(settings.instances.len(), 2);
+        assert_eq!(settings.instances.len(), 3);
         assert_eq!(settings.instances[0].id, "codex");
         assert_eq!(settings.instances[0].kind, CLIAgentRuntimeKind::Codex);
         assert_eq!(settings.instances[0].display_name, "Codex");
@@ -944,6 +965,10 @@ mod tests {
         assert_eq!(settings.instances[1].binary_path, "claude");
         assert_eq!(settings.instances[1].home_path, "~/.claude");
         assert!(settings.instances[1].shadow_home_path.is_none());
+        assert_eq!(
+            settings.instances[2],
+            GatewayCliRuntimeInstanceSettings::default_opencode()
+        );
     }
 
     #[test]
@@ -1209,6 +1234,10 @@ mod tests {
             (
                 GatewayThreadEpisodicVectorProvider::OpenRouter,
                 "openai/text-embedding-3-small",
+            ),
+            (
+                GatewayThreadEpisodicVectorProvider::VercelAiGateway,
+                "private/team-embedding",
             ),
         ] {
             let settings = GatewayThreadEpisodicVectorSearchSettings {

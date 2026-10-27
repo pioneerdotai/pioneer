@@ -407,175 +407,37 @@ fn extract_dynamic_skill_permission_intent(
 }
 
 fn extract_computer_use_permission_intent(invocation: &ToolInvocation) -> Option<PermissionIntent> {
-    if invocation.tool_name != "computer_use" {
+    if !crate::is_computer_use_tool(&invocation.tool_name) {
         return None;
     }
-
-    let arguments = function_arguments(invocation);
-    let action = arguments
-        .and_then(|arguments| string_field(arguments, "action"))
-        .map(|action| action.trim().to_ascii_lowercase())
-        .filter(|action| !action.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned());
-
     let mut scope = base_scope(invocation);
     scope
         .entries
-        .insert("operation".to_owned(), "computer use".to_owned());
-    scope.entries.insert("action".to_owned(), action.clone());
-
-    match arguments {
-        Some(arguments) => {
+        .insert("operation".to_owned(), invocation.tool_name.clone());
+    if let Some(arguments) = function_arguments(invocation) {
+        // Approval is for the complete invocation; metadata contains no screen or typed text.
+        if let Ok(encoded) = serde_json::to_vec(arguments) {
             scope
                 .entries
-                .insert("parse_status".to_owned(), "arguments_present".to_owned());
-            // Turn-scoped approvals are cached by the normalized scope hash.
-            // Bind that cache to the complete model-visible operation so an
-            // approval for one app, URL, path or input target cannot authorize
-            // a different desktop effect whose abbreviated UI fields happen
-            // to share the same action/session pair.
-            if let Ok(encoded) = serde_json::to_vec(arguments) {
-                scope
-                    .entries
-                    .insert("payload_hash".to_owned(), sha256_hex(encoded.as_slice()));
-            }
-            if let Some(session_id) = u64_field(arguments, "session_id") {
-                scope
-                    .entries
-                    .insert("session_id".to_owned(), session_id.to_string());
-            }
-            if let Some(target_type) = nested_string_field(arguments, "target", "type") {
-                scope
-                    .entries
-                    .insert("target_type".to_owned(), target_type.to_owned());
-            }
-            for (field, scope_key) in [
-                ("name", "target_name"),
-                ("identity_key", "target_identity_key"),
-                ("bundle_id", "target_bundle_id"),
-                ("executable_path", "target_executable_path"),
-            ] {
-                if let Some(value) = nested_string_field(arguments, "target", field) {
-                    scope
-                        .entries
-                        .insert(scope_key.to_owned(), normalize_scope_value(value));
-                }
-            }
-            if let Some(pid) = arguments
-                .get("target")
-                .and_then(JsonValue::as_object)
-                .and_then(|target| target.get("pid"))
-                .and_then(JsonValue::as_u64)
-            {
-                scope
-                    .entries
-                    .insert("target_pid".to_owned(), pid.to_string());
-            }
-            if let Some(display_id) = arguments
-                .get("target")
-                .and_then(JsonValue::as_object)
-                .and_then(|target| target.get("display_id"))
-                .and_then(JsonValue::as_u64)
-                .or_else(|| u64_field(arguments, "display_id"))
-            {
-                scope
-                    .entries
-                    .insert("display_id".to_owned(), display_id.to_string());
-            }
-            if let Some(launch_if_missing) = arguments
-                .get("target")
-                .and_then(JsonValue::as_object)
-                .and_then(|target| target.get("launch_if_missing"))
-                .and_then(JsonValue::as_bool)
-                .or_else(|| bool_field(arguments, "launch_if_missing"))
-            {
-                scope.entries.insert(
-                    "launch_if_missing".to_owned(),
-                    launch_if_missing.to_string(),
-                );
-            }
-            if let Some(command) = nested_string_field(arguments, "target", "launch_command")
-                .or_else(|| string_field(arguments, "launch_command"))
-            {
-                scope
-                    .entries
-                    .insert("launch_command".to_owned(), normalize_scope_value(command));
-            }
-            if let Some(screenshot_path) = string_field(arguments, "screenshot_path") {
-                scope.entries.insert(
-                    "screenshot_path".to_owned(),
-                    normalize_scope_value(screenshot_path),
-                );
-            }
-            if let Some(act_type) = nested_string_field(arguments, "act", "type") {
-                scope
-                    .entries
-                    .insert("act_type".to_owned(), act_type.to_owned());
-            }
-            if let Some(act) = arguments.get("act").and_then(JsonValue::as_object) {
-                for (field, scope_key) in [
-                    ("app", "act_app"),
-                    ("path", "act_path"),
-                    ("action_name", "act_action_name"),
-                    ("condition", "act_condition"),
-                    ("title", "act_title"),
-                ] {
-                    if let Some(value) = act.get(field).and_then(JsonValue::as_str) {
-                        scope
-                            .entries
-                            .insert(scope_key.to_owned(), normalize_scope_value(value));
-                    }
-                }
-                if let Some(url) = act.get("url").and_then(JsonValue::as_str) {
-                    apply_url_scope(&mut scope, url);
-                }
-                if let Some(keys) = act.get("keys").and_then(JsonValue::as_array) {
-                    scope.entries.insert(
-                        "act_keys".to_owned(),
-                        serde_json::to_string(keys).unwrap_or_else(|_| "[]".to_owned()),
-                    );
-                }
-                if let Some(text) = act.get("text").and_then(JsonValue::as_str) {
-                    scope
-                        .entries
-                        .insert("input_text_present".to_owned(), "true".to_owned());
-                    scope
-                        .entries
-                        .insert("input_text_bytes".to_owned(), text.len().to_string());
-                }
-                for (field, scope_key) in [
-                    ("target", "act_target"),
-                    ("from", "act_from"),
-                    ("to", "act_to"),
-                    ("menu_path", "act_menu_path"),
-                ] {
-                    if let Some(value) = act.get(field) {
-                        scope.entries.insert(
-                            scope_key.to_owned(),
-                            serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()),
-                        );
-                    }
-                }
-            }
+                .insert("payload_hash".to_owned(), sha256_hex(&encoded));
         }
-        None => {
-            scope.entries.insert(
-                "parse_status".to_owned(),
-                "missing_function_arguments".to_owned(),
-            );
-        }
+    } else {
+        scope.entries.insert(
+            "parse_status".to_owned(),
+            "missing_function_arguments".to_owned(),
+        );
     }
-
     Some(PermissionIntent {
         action: PermissionActionKind::ComputerUse,
         scope,
-        summary: Some(format!("computer_use {action}")),
+        summary: Some(invocation.tool_name.clone()),
     })
 }
 
 fn extract_agent_action_permission_intent(invocation: &ToolInvocation) -> Option<PermissionIntent> {
     let (operation, mutation) = match invocation.tool_name.as_str() {
         "threads_start_options" => ("read agent start options", false),
+        "threads_identity_models_list" => ("read identity model options", false),
         "thread_message_send" => ("send message to thread", true),
         "thread_create" => ("create thread", true),
         "threads_turn_start" => ("start agent", true),
@@ -751,6 +613,7 @@ fn extract_task_permission_intent(invocation: &ToolInvocation) -> Option<Permiss
         "task_accept" => "accept task/subagent result",
         "task_revise" => "revise task/subagent result",
         "task_cancel" => "cancel task/subagent",
+        "task_finish" => "finish task gracefully",
         "task_update" => "update task/subagent",
         "task_detach" => "detach task/subagent",
         "task_list" => "list task/subagent state",
@@ -779,6 +642,7 @@ fn extract_task_permission_intent(invocation: &ToolInvocation) -> Option<Permiss
                 | "task_accept"
                 | "task_revise"
                 | "task_cancel"
+                | "task_finish"
                 | "task_update"
                 | "task_detach"
                 | "task_reschedule"
@@ -795,8 +659,8 @@ fn extract_task_permission_intent(invocation: &ToolInvocation) -> Option<Permiss
             // lifecycle/review control, consumes the profile's explicit
             // task/subagent authority; otherwise `Internal` would bypass
             // supervised consent for durable task graph changes.
-            "task_create" | "task_accept" | "task_revise" | "task_cancel" | "task_update"
-            | "task_detach" | "task_reschedule" | "task_pause" | "task_resume" => {
+            "task_create" | "task_accept" | "task_revise" | "task_cancel" | "task_finish"
+            | "task_update" | "task_detach" | "task_reschedule" | "task_pause" | "task_resume" => {
                 PermissionActionKind::TaskSubagent
             }
             _ => PermissionActionKind::Internal,
@@ -2350,7 +2214,7 @@ mod tests {
             .map(str::to_owned),
         );
 
-        assert_eq!(registered.len(), 38, "native tool inventory changed");
+        assert_eq!(registered.len(), 68, "native tool inventory changed");
         let unknown = registered
             .iter()
             .filter(|name| {
@@ -2395,6 +2259,7 @@ mod tests {
             ("task_accept", PermissionActionKind::TaskSubagent),
             ("task_revise", PermissionActionKind::TaskSubagent),
             ("task_cancel", PermissionActionKind::TaskSubagent),
+            ("task_finish", PermissionActionKind::TaskSubagent),
             ("task_update", PermissionActionKind::TaskSubagent),
             ("task_detach", PermissionActionKind::TaskSubagent),
             ("task_list", PermissionActionKind::Internal),
@@ -2406,9 +2271,44 @@ mod tests {
             ("artifact_register", PermissionActionKind::Internal),
             ("artifact_read", PermissionActionKind::Internal),
             ("threads_tools_result_read", PermissionActionKind::Internal),
-            ("computer_use", PermissionActionKind::ComputerUse),
+            ("threads_list", PermissionActionKind::Internal),
+            ("threads_history_read", PermissionActionKind::Internal),
+            ("threads_search", PermissionActionKind::Internal),
+            ("threads_children_list", PermissionActionKind::Internal),
+            ("cua_click", PermissionActionKind::ComputerUse),
+            ("cua_clipboard_read", PermissionActionKind::ComputerUse),
+            ("cua_clipboard_write", PermissionActionKind::ComputerUse),
+            ("cua_drag", PermissionActionKind::ComputerUse),
+            ("cua_get_cursor_position", PermissionActionKind::ComputerUse),
+            ("cua_get_desktop_state", PermissionActionKind::ComputerUse),
+            ("cua_get_screen_size", PermissionActionKind::ComputerUse),
+            ("cua_get_window_state", PermissionActionKind::ComputerUse),
+            ("cua_hotkey", PermissionActionKind::ComputerUse),
+            ("cua_invoke_menu", PermissionActionKind::ComputerUse),
+            ("cua_list_apps", PermissionActionKind::ComputerUse),
+            ("cua_list_windows", PermissionActionKind::ComputerUse),
+            ("cua_press_key", PermissionActionKind::ComputerUse),
+            ("cua_scroll", PermissionActionKind::ComputerUse),
+            ("cua_set_window_frame", PermissionActionKind::ComputerUse),
+            ("cua_type_text", PermissionActionKind::ComputerUse),
+            ("cua_verify_state", PermissionActionKind::ComputerUse),
+            ("cua_get_browser_state", PermissionActionKind::ComputerUse),
+            ("cua_browser_prepare", PermissionActionKind::ComputerUse),
+            ("cua_browser_navigate", PermissionActionKind::ComputerUse),
+            ("cua_browser_click", PermissionActionKind::ComputerUse),
+            ("cua_browser_type", PermissionActionKind::ComputerUse),
+            ("cua_browser_select", PermissionActionKind::ComputerUse),
+            ("cua_browser_dialog", PermissionActionKind::ComputerUse),
+            (
+                "cua_browser_set_input_files",
+                PermissionActionKind::ComputerUse,
+            ),
             ("read_skill", PermissionActionKind::Internal),
             ("threads_start_options", PermissionActionKind::Internal),
+            (
+                "threads_identity_models_list",
+                PermissionActionKind::Internal,
+            ),
             ("thread_message_send", PermissionActionKind::AgentAction),
             ("thread_create", PermissionActionKind::AgentAction),
             ("threads_turn_start", PermissionActionKind::AgentAction),
@@ -2432,7 +2332,7 @@ mod tests {
             .map(str::to_owned),
         );
 
-        assert_eq!(registered.len(), 38, "native tool inventory changed");
+        assert_eq!(registered.len(), 68, "native tool inventory changed");
         assert_eq!(
             registered,
             expected_actions
@@ -3605,170 +3505,6 @@ mod tests {
     }
 
     #[test]
-    fn extractor_requires_computer_use_permission_for_preflight() {
-        let invocation = invocation_for_tool(
-            "computer_use",
-            ToolPayload::Function {
-                arguments: serde_json::json!({ "action": "preflight" }),
-            },
-        );
-        let intent = extract_permission_intent(&invocation);
-        let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
-
-        assert_eq!(intent.action, PermissionActionKind::ComputerUse);
-        assert_eq!(
-            intent.scope.entries.get("action"),
-            Some(&"preflight".to_owned())
-        );
-        assert!(matches!(
-            ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
-            PermissionDecision::Ask {
-                reason: PermissionDecisionReason::PolicyRequiresApproval,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn restricted_profiles_ask_for_computer_use_desktop_actions() {
-        let cases = [
-            serde_json::json!({
-                "action": "start",
-                "goal": "Inspect app",
-                "target": { "type": "active_app" }
-            }),
-            serde_json::json!({ "action": "snapshot", "session_id": 42 }),
-            serde_json::json!({
-                "action": "act",
-                "session_id": 42,
-                "act": { "type": "click", "target": { "node_id": "n1" } }
-            }),
-        ];
-        let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
-
-        for arguments in cases {
-            let invocation =
-                invocation_for_tool("computer_use", ToolPayload::Function { arguments });
-            let intent = extract_permission_intent(&invocation);
-
-            assert_eq!(intent.action, PermissionActionKind::ComputerUse);
-            assert!(matches!(
-                ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
-                PermissionDecision::Ask {
-                    reason: PermissionDecisionReason::PolicyRequiresApproval,
-                    ..
-                }
-            ));
-        }
-    }
-
-    #[test]
-    fn computer_use_permission_scope_binds_effective_launch_target_and_command() {
-        let first = invocation_for_tool(
-            "computer_use",
-            ToolPayload::Function {
-                arguments: serde_json::json!({
-                    "action": "start",
-                    "goal": "Inspect app",
-                    "launch_command": "ignored-top-level-command",
-                    "target": {
-                        "type": "bundle_id",
-                        "bundle_id": "com.example.First",
-                        "launch_if_missing": true,
-                        "launch_command": "open -b com.example.First"
-                    }
-                }),
-            },
-        );
-        let second = invocation_for_tool(
-            "computer_use",
-            ToolPayload::Function {
-                arguments: serde_json::json!({
-                    "action": "start",
-                    "goal": "Inspect app",
-                    "target": {
-                        "type": "bundle_id",
-                        "bundle_id": "com.example.Second",
-                        "launch_if_missing": true,
-                        "launch_command": "open -b com.example.Second"
-                    }
-                }),
-            },
-        );
-
-        let first_intent = extract_permission_intent(&first);
-        let second_intent = extract_permission_intent(&second);
-
-        assert_eq!(
-            first_intent.scope.entries.get("target_bundle_id"),
-            Some(&"com.example.First".to_owned())
-        );
-        assert_eq!(
-            first_intent.scope.entries.get("launch_command"),
-            Some(&"open -b com.example.First".to_owned()),
-            "the nested target command is the effective runtime command"
-        );
-        assert_ne!(
-            first_intent.scope.normalized_hash(),
-            second_intent.scope.normalized_hash(),
-            "turn approval for one desktop target must not authorize another"
-        );
-    }
-
-    #[test]
-    fn computer_use_permission_scope_binds_act_payload_without_exposing_typed_text() {
-        let invocation = invocation_for_tool(
-            "computer_use",
-            ToolPayload::Function {
-                arguments: serde_json::json!({
-                    "action": "act",
-                    "session_id": 42,
-                    "act": {
-                        "type": "input_type_text",
-                        "target": { "node_id": "password-field", "snapshot_id": "s1" },
-                        "text": "super-secret-password"
-                    }
-                }),
-            },
-        );
-
-        let intent = extract_permission_intent(&invocation);
-        let rendered_scope = serde_json::to_string(&intent.scope.entries).expect("scope JSON");
-
-        assert_eq!(
-            intent.scope.entries.get("act_type"),
-            Some(&"input_type_text".to_owned())
-        );
-        assert_eq!(
-            intent.scope.entries.get("input_text_present"),
-            Some(&"true".to_owned())
-        );
-        assert_eq!(
-            intent.scope.entries.get("input_text_bytes"),
-            Some(&"21".to_owned())
-        );
-        assert!(!rendered_scope.contains("super-secret-password"));
-        assert!(intent.scope.entries.contains_key("payload_hash"));
-    }
-
-    #[test]
-    fn malformed_computer_use_is_still_computer_use() {
-        let invocation = invocation_for_tool(
-            "computer_use",
-            ToolPayload::Function {
-                arguments: serde_json::json!({ "session_id": 7 }),
-            },
-        );
-        let intent = extract_permission_intent(&invocation);
-
-        assert_eq!(intent.action, PermissionActionKind::ComputerUse);
-        assert_eq!(
-            intent.scope.entries.get("action"),
-            Some(&"unknown".to_owned())
-        );
-    }
-
-    #[test]
     fn read_only_domain_tools_remain_allowed_but_domain_mutations_require_approval() {
         let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
         let invocations = [
@@ -3901,6 +3637,12 @@ mod tests {
                 },
             ),
             invocation_for_tool(
+                "task_finish",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "taskId": "task_a" }),
+                },
+            ),
+            invocation_for_tool(
                 "task_detach",
                 ToolPayload::Function {
                     arguments: serde_json::json!({ "taskId": "task_a" }),
@@ -3934,6 +3676,7 @@ mod tests {
                     | "task_accept"
                     | "task_revise"
                     | "task_cancel"
+                    | "task_finish"
                     | "task_update"
                     | "task_detach"
                     | "task_reschedule"
@@ -4207,5 +3950,43 @@ mod tests {
         );
         let rendered = serde_json::to_string(&first_intent.scope.entries).expect("scope JSON");
         assert!(!rendered.contains("first-private-body"));
+    }
+    #[test]
+    fn cua_approval_binds_every_argument_without_disclosing_input() {
+        let invocation = invocation_for_tool(
+            "cua_type_text",
+            ToolPayload::Function {
+                arguments: serde_json::json!({"text":"secret-one", "target":{"kind":"window","pid":7,"window_id":9}, "delivery_mode":"background"}),
+            },
+        );
+        let first = extract_permission_intent(&invocation);
+        let mut changed = invocation.clone();
+        changed.payload = ToolPayload::Function {
+            arguments: serde_json::json!({"text":"secret-two", "target":{"kind":"window","pid":7,"window_id":9}, "delivery_mode":"background"}),
+        };
+        let second = extract_permission_intent(&changed);
+        assert_eq!(first.action, PermissionActionKind::ComputerUse);
+        assert_ne!(
+            first.scope.normalized_hash(),
+            second.scope.normalized_hash()
+        );
+        assert!(
+            !serde_json::to_string(&first.scope.entries)
+                .unwrap()
+                .contains("secret-one")
+        );
+        assert!(matches!(
+            ProfileToolPermissionEvaluator.evaluate(
+                &test_context(pioneer_protocol::TurnPermissionMode::Supervised),
+                &invocation,
+                &first
+            ),
+            PermissionDecision::Ask { .. }
+        ));
+        changed.tool_name = "cua_unlisted_admin".to_owned();
+        assert_ne!(
+            extract_permission_intent(&changed).action,
+            PermissionActionKind::ComputerUse
+        );
     }
 }

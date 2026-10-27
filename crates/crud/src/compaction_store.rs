@@ -1,11 +1,11 @@
 //! CrudStore facade; persistence operations live in repositories.
 use crate::compaction::{
     AcceptedTaskBasis, CanonicalFragment, CanonicalSource, CheckpointEdges, CheckpointMetadata,
-    CommitOutcome, CompletedHistoryCheck, DeliveredTaskOutputPage, DeliveryCheckpointImportSource,
-    FrozenImportRecord, HistoricalEventProjection, HistoryCausalBoundary, HistoryReadFence,
-    HistoryTurnBoundary, ManifestEntry, OperationRecord, PagedSource, PreparedFrozenImport,
-    RunnerPlanRecord, SourceAssertion, SourcePage, TaskDeliveryOutputSnapshot, TaskInputCopyAlias,
-    TaskOutputSnapshot,
+    CommitOutcome, CompletedHistoryCheck, DeliveredTaskOutputCursor, DeliveredTaskOutputPage,
+    DeliveryCheckpointImportSource, FrozenImportRecord, HistoricalEventProjection,
+    HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary, ManifestEntry, OperationRecord,
+    PagedSource, PreparedFrozenImport, RunnerPlanRecord, SourceAssertion, SourcePage,
+    TaskDeliveryOutputSnapshot, TaskInputCopyAlias, TaskOutputSnapshot,
 };
 use crate::{CanonicalTurnEventPayload, CrudStore, repositories};
 use anyhow::Result;
@@ -14,6 +14,20 @@ use pioneer_compaction::runner::RunnerState;
 use pioneer_compaction::{Checkpoint, ModelBudget, OperationSnapshot, SourceRef};
 
 impl CrudStore {
+    /// Canonical ownership and disclosure metadata, independent of full result
+    /// payload size. Every canonical tool item is visible in timeline projection;
+    /// non-tool/hidden system records are excluded in the repository query.
+    pub async fn tool_result_access_source(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        item: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        repositories::compaction::tool_result_access_source(self, workspace, thread, turn, item)
+            .await
+    }
+
     /// One restart-safe, payload-free page of legacy history preparation.
     /// Dropping the caller cancels work; a later caller resumes its durable cursor.
     pub async fn compaction_prepare_history_quantum(
@@ -133,6 +147,31 @@ impl CrudStore {
         )
         .await
     }
+    /// Apply the historical cutoff during metadata discovery, before payloads.
+    pub async fn compaction_source_metadata_page_before(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        kind: PagedSource,
+        after: i64,
+        capture_order: i64,
+        before: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+    ) -> Result<SourcePage> {
+        repositories::compaction::compaction_source_page_inner_bounded(
+            &self.connection,
+            workspace,
+            thread,
+            turn,
+            kind,
+            after,
+            false,
+            capture_order,
+            before,
+        )
+        .await
+    }
+
     pub async fn compaction_item_created_at(
         &self,
         workspace: &str,
@@ -202,6 +241,20 @@ impl CrudStore {
             thread,
             owner,
             fingerprint,
+        )
+        .await
+    }
+    pub async fn compaction_invalid_completion_progress(
+        &self,
+        workspace: &str,
+        thread: &str,
+        owner: &str,
+    ) -> Result<Option<OperationRecord>> {
+        repositories::compaction::compaction_invalid_completion_progress(
+            &self.connection,
+            workspace,
+            thread,
+            owner,
         )
         .await
     }
@@ -297,7 +350,7 @@ impl CrudStore {
     }
     /// Read bounded historical coverage metadata without loading summary text.
     pub async fn compaction_checkpoint_edges(&self, id: &str) -> Result<Option<CheckpointEdges>> {
-        repositories::compaction::compaction_checkpoint_edges(&self.connection, id).await
+        repositories::compaction::compaction_checkpoint_edges(self, id).await
     }
     pub async fn compaction_checkpoint(&self, id: &str) -> Result<Option<Checkpoint>> {
         repositories::compaction::compaction_checkpoint(&self.connection, id).await
@@ -623,6 +676,55 @@ impl CrudStore {
         repositories::compaction::background::compaction_history_check_is_current(
             &self.connection,
             turn,
+            None,
+        )
+        .await
+    }
+    pub async fn compaction_history_check_revision_is_current(
+        &self,
+        turn: &str,
+        revision: i64,
+    ) -> Result<bool> {
+        repositories::compaction::background::compaction_history_check_is_current(
+            &self.connection,
+            turn,
+            Some(revision),
+        )
+        .await
+    }
+    pub async fn compaction_root_history_activity(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+    ) -> Result<Option<i64>> {
+        repositories::compaction::background::root_history_activity(
+            &self.connection,
+            workspace,
+            thread,
+            turn,
+        )
+        .await
+    }
+    pub async fn compaction_root_history_busy(
+        &self,
+        workspace: &str,
+        thread: &str,
+    ) -> Result<bool> {
+        repositories::compaction::background::root_history_busy(&self.connection, workspace, thread)
+            .await
+    }
+    pub async fn compaction_root_for_execution(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+    ) -> Result<Option<String>> {
+        repositories::compaction::background::root_for_history_execution(
+            &self.connection,
+            workspace,
+            thread,
+            turn,
         )
         .await
     }
@@ -708,6 +810,7 @@ impl CrudStore {
     }
     /// Ready is published only after the bounded writer has filled all exact
     /// ordinals. The content digest is checked by the caller before this CAS.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn compaction_finish_frozen_history(
         &self,
         workspace: &str,
@@ -720,6 +823,31 @@ impl CrudStore {
             owner_thread,
             descriptor,
         )
+        .await
+    }
+    /// Finish and register the capture handoff before releasing the writer.
+    pub async fn compaction_finish_frozen_history_held(
+        &self,
+        workspace: &str,
+        owner: &str,
+        descriptor: &FrozenHistoryRef,
+    ) -> Result<crate::FrozenReadHold> {
+        self.run_serialized_write(|| async {
+            use sea_orm::TransactionTrait;
+            let tx = self.connection.begin().await?;
+            anyhow::ensure!(
+                repositories::compaction::frozen::compaction_finish_frozen_history(
+                    &tx, workspace, owner, descriptor
+                )
+                .await?,
+                "frozen history publication failed"
+            );
+            crate::frozen_lifetime::exact_header(&tx, workspace, descriptor).await?;
+            let hold =
+                crate::FrozenReadHold::register(&self.frozen_readers, &descriptor.manifest_id);
+            tx.commit().await?;
+            Ok(hold)
+        })
         .await
     }
     pub async fn compaction_frozen_history_owner(
@@ -1032,6 +1160,7 @@ impl CrudStore {
         command: Option<&str>,
         source: Option<&SourceRef>,
         event_fence: i64,
+        before: Option<sea_orm::prelude::DateTimeWithTimeZone>,
     ) -> Result<Option<String>> {
         repositories::compaction::history::compaction_failed_delivery_command(
             &self.connection,
@@ -1040,6 +1169,7 @@ impl CrudStore {
             command,
             source,
             event_fence,
+            before,
         )
         .await
     }
@@ -1059,6 +1189,35 @@ impl CrudStore {
         )
         .await
     }
+    /// Resolve the durable parent and initial child turn without reading Task input.
+    pub async fn compaction_child_history_parent(
+        &self,
+        workspace: &str,
+        child: &str,
+    ) -> Result<Option<crate::compaction::ChildHistoryParent>> {
+        repositories::compaction::history::compaction_child_history_parent(
+            &self.connection,
+            workspace,
+            child,
+        )
+        .await
+    }
+
+    pub async fn compaction_history_source_created_at(
+        &self,
+        workspace: &str,
+        thread: &str,
+        source: &SourceRef,
+    ) -> Result<Option<sea_orm::prelude::DateTimeWithTimeZone>> {
+        repositories::compaction::history::compaction_history_source_created_at(
+            &self.connection,
+            workspace,
+            thread,
+            source,
+        )
+        .await
+    }
+
     /// One read fixes the append boundary before enumerating any turns. Source
     /// bounds use retained metadata with explicit insertion order; deleting or
     /// vacuuming canonical rows cannot change that order. MAX uses indexes and
@@ -1215,6 +1374,41 @@ impl CrudStore {
         .await
     }
 
+    /// Called only by foreground admission for a distinct user execution.
+    pub async fn compaction_resume_invalid_completion(
+        &self,
+        operation: &str,
+        execution_turn: &str,
+        deadline_ms: u64,
+    ) -> Result<bool> {
+        repositories::compaction::runner::compaction_resume_invalid_completion(
+            self,
+            operation,
+            execution_turn,
+            deadline_ms,
+        )
+        .await
+    }
+
+    pub async fn compaction_finish_execution(
+        &self,
+        operation: &str,
+        execution_turn: Option<&str>,
+        deadline_ms: u64,
+        status: &str,
+        outcome: &str,
+    ) -> Result<()> {
+        repositories::compaction::runner::compaction_finish_execution(
+            &self.connection,
+            operation,
+            execution_turn,
+            deadline_ms,
+            status,
+            outcome,
+        )
+        .await
+    }
+
     /// Complete the state record after a control-plane terminal fence. No
     /// attempt can advance past that fence. Preparation reads one bounded row;
     /// the write revalidates its generation and durable terminal classification.
@@ -1347,21 +1541,39 @@ impl CrudStore {
         repositories::compaction::task_output::compaction_delivery_output(self, workspace, delivery)
             .await
     }
-    /// Inspect at most 128 event revisions below the common capture fence.
-    /// The caller retains the first acknowledgement for each delivery ID across
-    /// pages; replayed notifications may occur in later quanta. No payload is read.
+    /// Select at most one local delivery Turn and 127 event metadata rows.
+    /// Callers order acknowledgements by capture_order across all local pages
+    /// before selecting the first per delivery. No payload is read.
     pub async fn compaction_delivered_output_page(
         &self,
         workspace: &str,
         thread: &str,
-        after: i64,
+        cursor: &DeliveredTaskOutputCursor,
         fence: &HistoryReadFence,
     ) -> Result<DeliveredTaskOutputPage> {
         repositories::compaction::task_output::compaction_delivered_output_page(
             &self.connection,
             workspace,
             thread,
-            after,
+            cursor,
+            fence,
+        )
+        .await
+    }
+    /// Revalidate only the metadata sources selected by the original page.
+    /// Append never changes the selected set or its saved continuation.
+    pub async fn compaction_recheck_delivered_output_page(
+        &self,
+        workspace: &str,
+        thread: &str,
+        page: &DeliveredTaskOutputPage,
+        fence: &HistoryReadFence,
+    ) -> Result<DeliveredTaskOutputPage> {
+        repositories::compaction::task_output::compaction_recheck_delivered_output_page(
+            &self.connection,
+            workspace,
+            thread,
+            page,
             fence,
         )
         .await
@@ -1430,8 +1642,12 @@ impl CrudStore {
             .await?;
         Ok((messages, imports))
     }
-    pub async fn compact_frozen_storage_quantum(&self) -> Result<bool> {
-        repositories::compaction_frozen_storage::maintain(&self.with_maintenance_access()).await
+    pub async fn compact_frozen_storage_quantum(
+        &self,
+        progress: &mut crate::FrozenStorageLifetimeProgress,
+    ) -> Result<bool> {
+        repositories::compaction_frozen_storage::maintain(&self.with_maintenance_access(), progress)
+            .await
     }
 }
 

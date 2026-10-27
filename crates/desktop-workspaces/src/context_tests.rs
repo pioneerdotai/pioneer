@@ -52,18 +52,39 @@ fn folder_pointer_and_keyboard_expansion_survives_reconciliation(cx: &mut TestAp
     use pioneer_client::workspaces::projection::thread_tree_snapshot_from_parts;
 
     cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
     let core = Arc::new(ClientCore::new());
     core.open_workspace_thread("w".into(), None, None);
     let saves = Rc::new(RefCell::new(Vec::new()));
     let saved = saves.clone();
-    let mut config = config(core, Rc::new(RefCell::new(HashSet::new())));
+    let mut config = config(core.clone(), Rc::new(RefCell::new(HashSet::new())));
     config.save_expansion = Rc::new(move |_, state, _| saved.borrow_mut().push(state));
     let folders = vec![
         serde_json::from_value(serde_json::json!({"id":"parent","workspace_id":"w","name":"Parent","created_at":1,"updated_at":1})).unwrap(),
         serde_json::from_value(serde_json::json!({"id":"child","workspace_id":"w","parent_folder_id":"parent","name":"Child","created_at":1,"updated_at":1})).unwrap(),
     ];
-    let snapshot =
-        thread_tree_snapshot_from_parts("w".into(), vec![], vec![], folders, vec![], vec![]);
+    let thread: pioneer_client::workspaces::Thread = serde_json::from_value(serde_json::json!({
+        "id":"t","workspace_id":"w","name":"Thread","preview":"","mode":"Chat",
+        "model":"m","model_provider":"p","created_at":1,"updated_at":1,"status":"Idle","turns":[]
+    }))
+    .unwrap();
+    core.upsert_thread(thread.clone());
+    let snapshot = thread_tree_snapshot_from_parts(
+        "w".into(),
+        vec![thread],
+        vec![],
+        vec![
+            serde_json::from_value(serde_json::json!({"thread_id":"t","unread_count":9})).unwrap(),
+        ],
+        folders,
+        vec![
+            serde_json::from_value(serde_json::json!({
+                "thread_id":"t","workspace_id":"w","folder_id":"child"
+            }))
+            .unwrap(),
+        ],
+        vec![],
+    );
     let publication = Arc::new(serde_json::from_value(serde_json::json!({
         "revision":1,"snapshot":snapshot,"changes":{"changed":[],"removed":[],"reordered_folders":[]},"loading":false,"error":null
     })).unwrap());
@@ -71,7 +92,7 @@ fn folder_pointer_and_keyboard_expansion_survives_reconciliation(cx: &mut TestAp
         let sidebar = cx.new(|cx| {
             let mut sidebar = super::sidebar::ThreadSidebarView::new(config, cx);
             sidebar.input = Some(publication);
-            sidebar.rebuild_sidebar_tree_state(cx);
+            sidebar.refresh_sidebar_tree_state(false, false, cx);
             sidebar
         });
         Root::new(sidebar, window, cx)
@@ -108,7 +129,23 @@ fn folder_pointer_and_keyboard_expansion_survives_reconciliation(cx: &mut TestAp
             saves.borrow().last().unwrap().get("parent"),
             Some(&expanded)
         );
-        sidebar.update(cx, |sidebar, cx| sidebar.rebuild_sidebar_tree_state(cx));
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.visible_node_count),
+            if expanded { 3 } else { 2 },
+            "root context area must track pointer disclosure immediately"
+        );
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar
+                .input
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unread_by_folder_id["parent"]),
+            9
+        );
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.refresh_sidebar_tree_state(false, false, cx);
+        });
         cx.run_until_parked();
         assert_eq!(
             tree.read_with(cx, |tree, _| (
@@ -120,6 +157,54 @@ fn folder_pointer_and_keyboard_expansion_survives_reconciliation(cx: &mut TestAp
             (expanded, expanded)
         );
     }
+    // Counter-only publications must keep the selected folder and its expansion.
+    let selected = tree.read_with(cx, |tree, _| tree.selected_index());
+    assert!(selected.is_some());
+    for (revision, count, running) in [(2, 5, false), (3, 0, true), (4, 0, false)] {
+        let mut next = snapshot.clone();
+        if running {
+            next.running_task_thread_ids.insert("t".into());
+            next.running_task_folder_ids
+                .extend(["parent".into(), "child".into()]);
+        }
+        next.unread[0].unread_count = count;
+        for total in next.unread_by_folder_id.values_mut() {
+            *total = count;
+        }
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.input = Some(Arc::new(serde_json::from_value(serde_json::json!({
+                "revision": revision, "snapshot": next,
+                "changes":{"changed":[{"kind":"folder","id":"parent"},{"kind":"folder","id":"child"}],
+                           "removed":[],"reordered_folders":[]},"loading":false,"error":null
+            })).unwrap()));
+            if sidebar.refresh_sidebar_tree_state(false, false, cx) {
+                cx.notify();
+            }
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.task_activity_indicators.len()),
+            if running { 3 } else { 0 }
+        );
+        assert_eq!(
+            tree.read_with(cx, |tree, _| tree.selected_index()),
+            selected
+        );
+        assert!(!tree.read_with(cx, |tree, _| {
+            tree.entry(tree.index_of(&folder_id).unwrap())
+                .unwrap()
+                .is_expanded()
+        }));
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar
+                .input
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unread_by_folder_id["parent"]),
+            count
+        );
+    }
     cx.update(|window, cx| tree.update(cx, |tree, cx| tree.focus(window, cx)));
     for (key, expanded) in [("right", true), ("left", false)] {
         let before = saves.borrow().len();
@@ -129,6 +214,11 @@ fn folder_pointer_and_keyboard_expansion_survives_reconciliation(cx: &mut TestAp
         assert_eq!(
             saves.borrow().last().unwrap().get("parent"),
             Some(&expanded)
+        );
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.visible_node_count),
+            if expanded { 3 } else { 2 },
+            "root context area must track keyboard disclosure immediately"
         );
     }
 }
@@ -273,7 +363,12 @@ fn workspace_lock_uses_canonical_composer_operations_without_a_shell_callback(
     };
     use pioneer_client::core::ClientTransitionOutcome;
     cx.update(gpui_kit::init);
-    let core = Arc::new(ClientCore::new());
+    let core = pioneer_client::catalog_test_support::settings_client();
+    assert!(core.current_auth().is_some());
+    core.upsert_thread(serde_json::from_value(serde_json::json!({
+        "id":"a","workspace_id":"w","name":"Thread","preview":"","mode":"Chat",
+        "model":"m","model_provider":"p","created_at":1,"updated_at":1,"status":"Idle","turns":[]
+    })).unwrap());
     core.activate_thread(Some("a".into()), Some("w".into()));
     core.composer_intent(ComposerIntent::Open {
         thread_id: "a".into(),
@@ -293,11 +388,36 @@ fn workspace_lock_uses_canonical_composer_operations_without_a_shell_callback(
             .sidebar
             .clone()
     });
+    cx.run_until_parked();
+    let tree = sidebar.read_with(cx, |sidebar, _| sidebar.thread_tree_state.clone());
+    let notifications = Rc::new(RefCell::new(0usize));
+    let tree_notifications = Rc::new(RefCell::new(0usize));
+    let _observations = cx.update(|_, cx| {
+        let notifications = notifications.clone();
+        let tree_notifications = tree_notifications.clone();
+        (
+            cx.observe(&sidebar, move |_, _| *notifications.borrow_mut() += 1),
+            cx.observe(&tree, move |_, _| *tree_notifications.borrow_mut() += 1),
+        )
+    });
+    // Text publications share the same sidebar inputs and effective lock.
+    for text in ["one", "two", ""] {
+        core.composer_intent(ComposerIntent::EditText {
+            thread_id: "a".into(),
+            draft_id: core.composer_snapshot("a").unwrap().draft_id(),
+            text: text.into(),
+        });
+        sidebar.update(cx, |sidebar, cx| sidebar.sync(cx));
+        cx.run_until_parked();
+        assert_eq!(*notifications.borrow(), 0);
+        assert_eq!(*tree_notifications.borrow(), 0);
+    }
     for (operation, locked) in [
         (ComposerOperationKind::Send, true),
         (ComposerOperationKind::Voice, true),
         (ComposerOperationKind::PickFiles, false),
     ] {
+        let before = *notifications.borrow();
         let draft = core.composer_snapshot("a").unwrap().draft_id();
         assert_eq!(
             core.composer_intent(ComposerIntent::BeginOperation {
@@ -311,9 +431,16 @@ fn workspace_lock_uses_canonical_composer_operations_without_a_shell_callback(
         let input = core.composer_snapshot("a").unwrap();
         let identity = input.operation().unwrap().identity.clone();
         sidebar.update(cx, |sidebar, cx| sidebar.sync(cx));
+        cx.run_until_parked();
         assert_eq!(
             sidebar.read_with(cx, |sidebar, _| sidebar.context_locked),
             locked
+        );
+        assert_eq!(*notifications.borrow() > before, locked);
+        assert_eq!(
+            *tree_notifications.borrow(),
+            0,
+            "lock changes preserve the tree"
         );
         assert!(
             Arc::ptr_eq(&input, &core.composer_snapshot("a").unwrap()),
@@ -321,9 +448,58 @@ fn workspace_lock_uses_canonical_composer_operations_without_a_shell_callback(
         );
         core.complete_composer_operation(identity.clone(), ComposerOperationCompletion::Cancelled);
         sidebar.update(cx, |sidebar, cx| sidebar.sync(cx));
+        cx.run_until_parked();
         assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.context_locked));
         assert!(
             !core.complete_composer_operation(identity, ComposerOperationCompletion::Cancelled)
         );
+    }
+    let selected = tree.read_with(cx, |tree, _| tree.selected_item().unwrap().id.clone());
+    let input = sidebar.read_with(cx, |sidebar, _| sidebar.input.clone().unwrap());
+    let navigation = core.navigation_snapshot();
+    let catalog = core.workspace_catalog();
+    let owner = core.authorization_connection_generation();
+    let capabilities = core.authorization_snapshot(Some("w"), Some("a"));
+    assert!(!core.gateway_refresh_in_flight());
+    assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.workspace_unavailable()));
+    let refresh = core.schedule_gateway_refresh().unwrap();
+    for unavailable in [true, false] {
+        if unavailable {
+            assert!(core.start_gateway_refresh(refresh));
+        } else {
+            assert!(core.finish_gateway_refresh(refresh));
+        }
+        let before = *notifications.borrow();
+        sidebar.update(cx, |sidebar, cx| sidebar.sync(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.workspace_unavailable()),
+            unavailable
+        );
+        assert_eq!(*notifications.borrow(), before + 1);
+        assert_eq!(*tree_notifications.borrow(), 0);
+        assert_eq!(
+            tree.read_with(cx, |tree, _| tree.selected_item().unwrap().id.clone()),
+            selected
+        );
+        assert!(sidebar.read_with(cx, |sidebar, _| Arc::ptr_eq(
+            &input,
+            sidebar.input.as_ref().unwrap()
+        )));
+        assert_eq!(core.authorization_connection_generation(), owner);
+        assert_eq!(core.navigation_snapshot(), navigation);
+        assert_eq!(core.workspace_catalog(), catalog);
+        assert_eq!(
+            core.authorization_snapshot(Some("w"), Some("a")),
+            capabilities
+        );
+        sidebar.update(cx, |sidebar, cx| sidebar.sync(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            *notifications.borrow(),
+            before + 1,
+            "unchanged availability must not notify again"
+        );
+        assert_eq!(*tree_notifications.borrow(), 0);
     }
 }

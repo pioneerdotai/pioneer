@@ -1,10 +1,13 @@
 use super::audio_normalization::{VoiceAudioNormalizationError, normalize_voice_pcm_chunk};
+use super::incremental::VoiceProcessingCompletion;
 use pioneer_protocol::{
     VOICE_AUDIO_MAX_CHUNK_BYTES, VoiceAudioFormat, VoiceChunkFrameHeader, VoiceError,
     VoiceErrorKind,
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) const VOICE_SESSION_MAX_BUFFERED_BYTES: usize = VOICE_AUDIO_MAX_CHUNK_BYTES * 1_920;
 
@@ -17,6 +20,7 @@ pub(crate) struct BufferedVoiceChunk {
     pub(crate) duration_ms: Option<u32>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BufferedVoiceSessionAudio {
     pub(crate) session_id: String,
@@ -106,12 +110,57 @@ impl VoiceChunkIngestError {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct GatewayVoiceSessionBufferStore {
     sessions: Arc<Mutex<HashMap<String, VoiceSessionBuffer>>>,
+    ready: Arc<Condvar>,
+    // Worker views deliberately do not own gateway lifetime. Dropping the last
+    // gateway store also wakes/cancels idle workers (including fixture teardown).
+    _lifetime: Option<Arc<VoiceBufferLifetime>>,
+}
+
+struct VoiceBufferLifetime {
+    sessions: Arc<Mutex<HashMap<String, VoiceSessionBuffer>>>,
+    ready: Arc<Condvar>,
+}
+impl Drop for VoiceBufferLifetime {
+    fn drop(&mut self) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for buffer in sessions.values() {
+            buffer.cancel_processing();
+        }
+        sessions.clear();
+        self.ready.notify_all();
+    }
+}
+impl Default for GatewayVoiceSessionBufferStore {
+    fn default() -> Self {
+        let sessions = Arc::default();
+        let ready = Arc::default();
+        Self {
+            _lifetime: Some(Arc::new(VoiceBufferLifetime {
+                sessions: Arc::clone(&sessions),
+                ready: Arc::clone(&ready),
+            })),
+            sessions,
+            ready,
+        }
+    }
 }
 
 impl GatewayVoiceSessionBufferStore {
+    pub(super) fn worker_view(&self) -> Self {
+        Self {
+            sessions: self.sessions.clone(),
+            ready: self.ready.clone(),
+            _lifetime: None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn start_session(
         &self,
         session_id: impl Into<String>,
@@ -135,6 +184,111 @@ impl GatewayVoiceSessionBufferStore {
         Ok(())
     }
 
+    pub(crate) fn start_processing(
+        &self,
+        session_id: String,
+        audio_format: VoiceAudioFormat,
+        cancellation: CancellationToken,
+        completion: oneshot::Receiver<VoiceProcessingCompletion>,
+    ) -> Result<(), VoiceChunkIngestError> {
+        let mut sessions = self.sessions.lock().map_err(|_| store_unavailable())?;
+        if sessions.contains_key(&session_id) {
+            return Err(ingest_error(
+                VoiceChunkIngestErrorKind::DuplicateSession,
+                "voice buffer already exists",
+            ));
+        }
+        let mut buffer = VoiceSessionBuffer::new(audio_format);
+        buffer.processing = Some(VoiceProcessingInput {
+            cancellation,
+            completion: Some(completion),
+            startup_key: None,
+        });
+        sessions.insert(session_id, buffer);
+        Ok(())
+    }
+
+    // Close and append share a mutex: every successful append before this
+    // boundary is drained in sequence, including backlog behind native work.
+    pub(crate) fn finish_processing(
+        &self,
+        session_id: &str,
+    ) -> Result<oneshot::Receiver<VoiceProcessingCompletion>, VoiceChunkIngestError> {
+        let mut sessions = self.sessions.lock().map_err(|_| store_unavailable())?;
+        let buffer = sessions.get_mut(session_id).ok_or_else(inactive_session)?;
+        let processing = buffer.processing.as_mut().ok_or_else(inactive_session)?;
+        let completion = processing.completion.take().ok_or_else(inactive_session)?;
+        processing.startup_key = pioneer_observability::turn_startup::current_key();
+        buffer.closed = true;
+        self.ready.notify_all();
+        Ok(completion)
+    }
+
+    pub(super) fn next_processing_chunk(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<BufferedVoiceChunk>, VoiceChunkIngestError> {
+        let mut sessions = self.sessions.lock().map_err(|_| store_unavailable())?;
+        loop {
+            let buffer = sessions.get_mut(session_id).ok_or_else(inactive_session)?;
+            if let Some(chunk) = buffer.chunks.pop_front() {
+                return Ok(Some(chunk));
+            }
+            if buffer.closed {
+                return Ok(None);
+            }
+            sessions = self.ready.wait(sessions).map_err(|_| store_unavailable())?;
+        }
+    }
+
+    pub(super) fn processing_startup_key(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .ok()?
+            .get(session_id)?
+            .processing
+            .as_ref()?
+            .startup_key
+            .clone()
+    }
+
+    // Only a hint for skipping superseded preview inference, never for audio
+    // ownership or Commit. Append/close and the actual drain stay serialized.
+    pub(super) fn processing_skip_preview(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| {
+                sessions
+                    .get(session_id)
+                    .map(|buffer| buffer.closed || !buffer.chunks.is_empty())
+            })
+            .unwrap_or(true)
+    }
+
+    pub(super) fn processing_finished(&self, session_id: &str) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            if let Some(buffer) = sessions.get_mut(session_id) {
+                buffer.closed = true;
+                buffer.chunks.clear();
+            }
+        }
+    }
+
+    pub(crate) fn cancel_all(&self) {
+        // Teardown must still drop completion leases if another operation
+        // poisoned the buffer mutex. Admission remains fail-closed.
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for buffer in sessions.values() {
+            buffer.cancel_processing();
+        }
+        sessions.clear();
+        self.ready.notify_all();
+    }
+
     pub(crate) fn remove_session(&self, session_id: &str) -> Result<(), VoiceChunkIngestError> {
         let mut sessions = self.sessions.lock().map_err(|_| {
             ingest_error(
@@ -142,14 +296,20 @@ impl GatewayVoiceSessionBufferStore {
                 "voice session buffer store is unavailable",
             )
         })?;
-        sessions.remove(session_id).map(|_| ()).ok_or_else(|| {
-            ingest_error(
-                VoiceChunkIngestErrorKind::UnknownSession,
-                format!("voice session `{session_id}` is not active"),
-            )
-        })
+        let result = sessions
+            .remove(session_id)
+            .map(|buffer| buffer.cancel_processing())
+            .ok_or_else(|| {
+                ingest_error(
+                    VoiceChunkIngestErrorKind::UnknownSession,
+                    format!("voice session `{session_id}` is not active"),
+                )
+            });
+        self.ready.notify_all();
+        result
     }
 
+    #[cfg(test)]
     pub(crate) fn take_session_audio(
         &self,
         session_id: &str,
@@ -166,6 +326,8 @@ impl GatewayVoiceSessionBufferStore {
                 format!("voice session `{session_id}` is not active"),
             )
         })?;
+        state.cancel_processing();
+        self.ready.notify_all();
         Ok(state.into_session_audio(session_id))
     }
 
@@ -188,7 +350,9 @@ impl GatewayVoiceSessionBufferStore {
                     format!("voice session `{}` is not active", header.session_id),
                 )
             })?;
-        state.append_chunk(header, audio_payload)
+        let result = state.append_chunk(header, audio_payload);
+        self.ready.notify_all();
+        result
     }
 
     #[cfg(test)]
@@ -212,12 +376,20 @@ impl GatewayVoiceSessionBufferStore {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+struct VoiceProcessingInput {
+    cancellation: CancellationToken,
+    completion: Option<oneshot::Receiver<VoiceProcessingCompletion>>,
+    startup_key: Option<String>,
+}
+
 struct VoiceSessionBuffer {
     audio_format: VoiceAudioFormat,
     next_sequence: u64,
     buffered_bytes: usize,
     chunks: VecDeque<BufferedVoiceChunk>,
+    accepted_chunks: usize,
+    closed: bool,
+    processing: Option<VoiceProcessingInput>,
 }
 
 impl VoiceSessionBuffer {
@@ -227,6 +399,15 @@ impl VoiceSessionBuffer {
             next_sequence: 0,
             buffered_bytes: 0,
             chunks: VecDeque::new(),
+            accepted_chunks: 0,
+            closed: false,
+            processing: None,
+        }
+    }
+
+    fn cancel_processing(&self) {
+        if let Some(processing) = &self.processing {
+            processing.cancellation.cancel();
         }
     }
 
@@ -235,6 +416,9 @@ impl VoiceSessionBuffer {
         header: VoiceChunkFrameHeader,
         audio_payload: Vec<u8>,
     ) -> Result<VoiceChunkIngestReport, VoiceChunkIngestError> {
+        if self.closed {
+            return Err(inactive_session());
+        }
         if header.audio_format() != self.audio_format {
             return Err(ingest_error(
                 VoiceChunkIngestErrorKind::AudioFormatMismatch,
@@ -248,7 +432,7 @@ impl VoiceSessionBuffer {
             return Ok(VoiceChunkIngestReport {
                 session_id: header.session_id,
                 sequence: header.sequence,
-                buffered_chunks: self.chunks.len(),
+                buffered_chunks: self.accepted_chunks,
                 buffered_bytes: self.buffered_bytes,
                 missing_chunks: 0,
                 already_buffered: true,
@@ -298,7 +482,10 @@ impl VoiceSessionBuffer {
         let session_id = header.session_id;
         let duration_ms = header.duration_ms;
         let captured_at_unix_ms = header.captured_at_unix_ms;
+        // This is a lifetime budget, not a rolling allowance. Draining audio
+        // never permits an infinitely long recording.
         self.buffered_bytes = next_buffered_bytes;
+        self.accepted_chunks += 1;
         self.next_sequence = sequence.saturating_add(1);
         self.chunks.push_back(BufferedVoiceChunk {
             sequence,
@@ -311,13 +498,14 @@ impl VoiceSessionBuffer {
         Ok(VoiceChunkIngestReport {
             session_id,
             sequence,
-            buffered_chunks: self.chunks.len(),
+            buffered_chunks: self.accepted_chunks,
             buffered_bytes: self.buffered_bytes,
             missing_chunks,
             already_buffered: false,
         })
     }
 
+    #[cfg(test)]
     fn into_session_audio(self, session_id: &str) -> BufferedVoiceSessionAudio {
         let chunks = self.chunks.into_iter().collect::<Vec<_>>();
         let normalized_samples = chunks
@@ -332,6 +520,20 @@ impl VoiceSessionBuffer {
             buffered_bytes: self.buffered_bytes,
         }
     }
+}
+
+fn store_unavailable() -> VoiceChunkIngestError {
+    ingest_error(
+        VoiceChunkIngestErrorKind::StoreUnavailable,
+        "voice session buffer store is unavailable",
+    )
+}
+
+fn inactive_session() -> VoiceChunkIngestError {
+    ingest_error(
+        VoiceChunkIngestErrorKind::UnknownSession,
+        "voice processing input is closed or unavailable",
+    )
 }
 
 fn ingest_error(
@@ -493,6 +695,110 @@ mod tests {
                 .expect("buffered bytes"),
             VOICE_SESSION_MAX_BUFFERED_BYTES
         );
+    }
+
+    #[test]
+    fn voice_incremental_drain_retains_lifetime_budget_and_sequence_history() {
+        let store = GatewayVoiceSessionBufferStore::default();
+        store.start_session("session", target_format()).unwrap();
+        store
+            .append_chunk(
+                header("session", 0),
+                vec![0; VOICE_SESSION_MAX_BUFFERED_BYTES / 3],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .next_processing_chunk("session")
+                .unwrap()
+                .unwrap()
+                .sequence,
+            0
+        );
+        let duplicate = store
+            .append_chunk(header("session", 0), vec![0; 2])
+            .unwrap();
+        assert!(duplicate.already_buffered);
+        assert_eq!(duplicate.buffered_chunks, 1);
+        assert_eq!(
+            store
+                .append_chunk(header("session", 1), vec![0; 2])
+                .unwrap_err()
+                .kind,
+            VoiceChunkIngestErrorKind::BufferLimitExceeded
+        );
+    }
+
+    #[test]
+    fn voice_incremental_close_drains_accepted_gaps_once_and_rejects_late_input() {
+        let store = GatewayVoiceSessionBufferStore::default();
+        let token = CancellationToken::new();
+        let (_sender, receiver) = oneshot::channel();
+        store
+            .start_processing(
+                "session".to_owned(),
+                target_format(),
+                token.clone(),
+                receiver,
+            )
+            .unwrap();
+        store
+            .append_chunk(header("session", 0), vec![0; 640])
+            .unwrap();
+        assert_eq!(
+            store
+                .append_chunk(header("session", 3), vec![0; 640])
+                .unwrap()
+                .missing_chunks,
+            2
+        );
+        assert!(
+            store
+                .append_chunk(header("session", 0), vec![0; 640])
+                .unwrap()
+                .already_buffered
+        );
+        let _completion = store.finish_processing("session").unwrap();
+        assert!(store.finish_processing("session").is_err());
+        assert!(
+            store
+                .append_chunk(header("session", 4), vec![0; 640])
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .next_processing_chunk("session")
+                .unwrap()
+                .unwrap()
+                .sequence,
+            0
+        );
+        assert_eq!(
+            store
+                .next_processing_chunk("session")
+                .unwrap()
+                .unwrap()
+                .sequence,
+            3
+        );
+        assert!(store.next_processing_chunk("session").unwrap().is_none());
+        store.remove_session("session").unwrap();
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn voice_incremental_last_owner_drop_wakes_idle_worker() {
+        let store = GatewayVoiceSessionBufferStore::default();
+        store.start_session("session", target_format()).unwrap();
+        let worker = store.worker_view();
+        let tasks = tokio_util::task::TaskTracker::new();
+        let handle = tasks.spawn_blocking(move || worker.next_processing_chunk("session"));
+        drop(store);
+        tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(5), tasks.wait())
+            .await
+            .unwrap();
+        assert!(handle.await.unwrap().is_err());
     }
 
     fn target_format() -> VoiceAudioFormat {

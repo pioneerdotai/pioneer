@@ -1,5 +1,8 @@
 //! Workspace request lifecycle, independent from shell transport delivery.
-use super::intents::WorkspaceIntent;
+use super::{
+    directory::{InitialDirectoryRestore, ThreadTreeLoadState},
+    intents::WorkspaceIntent,
+};
 use crate::core::{ClientCore, ClientMutationAuthority, ClientTransition};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -18,6 +21,7 @@ pub(crate) struct ThreadDraftRetry {
     pub plan: crate::threads::start::ThreadStartRetryPlan,
 }
 enum WorkspaceRequest {
+    ReconcilePush(String),
     ReconcileDraft,
     RetryDraft(ThreadDraftRetry),
     Bootstrap {
@@ -35,6 +39,8 @@ enum WorkspaceRequest {
 }
 #[derive(Default)]
 pub(crate) struct WorkspaceController {
+    pub(super) push: super::push::PushController,
+    queue: Option<pioneer_observability::queues::QueueObserver>,
     sender: Option<mpsc::SyncSender<()>>,
     // At most one refresh per retained workspace; hints during a request leave
     // one follow-up. The wake channel carries no domain data and cannot lose it.
@@ -49,14 +55,34 @@ impl WorkspaceController {
     pub(crate) fn stop(&mut self) {
         self.sender.take();
         self.refresh.clear();
+        self.push = Default::default();
         self.bootstrap = None;
         self.commands.clear();
         self.draft_retry = None;
         self.reconcile_draft = false;
     }
-    fn wake(&self) {
+    pub(super) fn wake(&self) {
+        let queue = self
+            .queue
+            .as_ref()
+            .map(pioneer_observability::queues::QueueObserver::in_current_epoch);
         if let Some(sender) = &self.sender {
-            let _ = sender.try_send(());
+            if let Some(queue) = &queue {
+                queue.enqueued(pioneer_observability::queues::QueueBytes::Known(0));
+            }
+            match sender.try_send(()) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    if let Some(queue) = &queue {
+                        queue.coalesced_send(pioneer_observability::queues::QueueBytes::Known(0));
+                    }
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    if let Some(queue) = &queue {
+                        queue.rejected_send(pioneer_observability::queues::QueueBytes::Known(0));
+                    }
+                }
+            }
         }
     }
     fn retry_wait(&self, now: Instant) -> Option<Duration> {
@@ -80,13 +106,16 @@ impl WorkspaceController {
             .is_some_and(|retry| retry.plan.next_attempt_at <= now)
         {
             self.draft_retry.take().map(WorkspaceRequest::RetryDraft)
+        } else if let Some((workspace, connection)) = self.refresh.pop_first() {
+            Some(WorkspaceRequest::Refresh {
+                workspace,
+                connection,
+            })
         } else {
-            self.refresh
+            self.push
+                .pending
                 .pop_first()
-                .map(|(workspace, connection)| WorkspaceRequest::Refresh {
-                    workspace,
-                    connection,
-                })
+                .map(WorkspaceRequest::ReconcilePush)
         }
     }
 }
@@ -99,6 +128,44 @@ impl Drop for WorkspaceController {
             }
         }
     }
+}
+/// One actual post-wake quantum. The native recv/timeout remains outside this
+/// scope; early shutdown/owner loss and unwind drop an unfinished guard.
+fn run_workspace_cycle(
+    weak: &std::sync::Weak<ClientCore>,
+    mut handle: impl FnMut(&ClientCore, WorkspaceRequest),
+) -> bool {
+    use pioneer_observability::{
+        live::WorkGuard,
+        work::{Boundary, ExecutorRole, Outcome, Trigger, WorkCarrier, WorkKind},
+    };
+    let cycle = WorkCarrier::independent(
+        Boundary::Timer,
+        WorkKind::ClientCommand,
+        Trigger::Reconcile,
+        ExecutorRole::ClientController,
+    );
+    let _scope = cycle.enter();
+    let mut guard = WorkGuard::start(cycle.context(), false);
+    loop {
+        let Some(core) = weak.upgrade() else {
+            return false;
+        };
+        if core.is_stopped() {
+            return false;
+        }
+        let request = core
+            .workspace_controller
+            .lock()
+            .expect("workspace controller poisoned")
+            .next(Instant::now());
+        let Some(request) = request else {
+            break;
+        };
+        handle(&core, request);
+    }
+    guard.finish(Outcome::Completed);
+    true
 }
 impl ClientCore {
     pub(crate) fn queue_workspace_draft_reconciliation(&self) {
@@ -149,6 +216,12 @@ impl ClientCore {
     }
     pub(crate) fn start_workspace_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel(1);
+        let queue = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(1),
+            "coalescing wake tokens only; zero payload bytes; domain state is reconciled separately",
+        );
+        let receiver_queue = queue.clone();
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-workspace-directory".into())
@@ -166,81 +239,42 @@ impl ClientCore {
                     match wait {
                         Some(wait) => {
                             if matches!(
-                                receiver.recv_timeout(wait),
+                                receiver.recv_timeout(wait).map(|()| {
+                                    receiver_queue.dequeued(
+                                        pioneer_observability::queues::QueueBytes::Known(0),
+                                    );
+                                    receiver_queue.outcome(
+                                        pioneer_observability::queues::QueueOutcome::Processed,
+                                        1,
+                                    );
+                                }),
                                 Err(mpsc::RecvTimeoutError::Disconnected)
                             ) {
                                 return;
                             }
                         }
                         None => {
-                            if receiver.recv().is_err() {
+                            if receiver
+                                .recv()
+                                .map(|()| {
+                                    receiver_queue.dequeued(
+                                        pioneer_observability::queues::QueueBytes::Known(0),
+                                    );
+                                    receiver_queue.outcome(
+                                        pioneer_observability::queues::QueueOutcome::Processed,
+                                        1,
+                                    );
+                                })
+                                .is_err()
+                            {
                                 return;
                             }
                         }
                     }
-                    loop {
-                        let Some(core) = weak.upgrade() else {
-                            return;
-                        };
-                        if core.is_stopped() {
-                            return;
-                        }
-                        let request = core
-                            .workspace_controller
-                            .lock()
-                            .expect("workspace controller poisoned")
-                            .next(Instant::now());
-                        match request {
-                            Some(WorkspaceRequest::ReconcileDraft) => {
-                                if let Some(workspace) = core.navigation_snapshot().workspace_id() {
-                                    core.restore_selected_workspace_thread(workspace);
-                                }
-                            }
-                            Some(WorkspaceRequest::RetryDraft(retry)) => {
-                                let current = core.thread_draft_retry_is_current(&retry);
-                                core.retire_thread_draft_retry(&retry);
-                                if current {
-                                    let _ =
-                                        core.execute_workspace_intent(WorkspaceIntent::NewThread {
-                                            workspace_id: retry.workspace,
-                                        });
-                                }
-                            }
-                            Some(WorkspaceRequest::Bootstrap {
-                                preferred,
-                                connection,
-                            }) if core.gateway_http_generation() == connection => {
-                                if let Ok(reduction) = core.bootstrap_workspace_catalog(preferred) {
-                                    core.load_selected_workspace_directory(
-                                        &reduction.selected.workspace_id,
-                                    );
-                                }
-                            }
-                            Some(WorkspaceRequest::Refresh {
-                                workspace,
-                                connection,
-                            }) if core.gateway_http_generation() == connection
-                                && core.workspace_refresh_is_demanded(&workspace) =>
-                            {
-                                let _ = core.refresh_workspace_tree(&workspace);
-                            }
-                            Some(WorkspaceRequest::Command { intent, connection })
-                                if core.gateway_http_generation() == connection =>
-                            {
-                                let operation = core.begin_directory_action(&intent);
-                                let result = core.execute_workspace_intent(intent);
-                                if core.gateway_http_generation() == connection {
-                                    if let Some(operation) = operation {
-                                        core.complete_directory_action(
-                                            operation,
-                                            result.err().map(|error| format!("{error:#}")),
-                                        );
-                                    }
-                                }
-                            }
-                            Some(_) => {}
-                            None => break,
-                        }
+                    if !run_workspace_cycle(&weak, |core, request| {
+                        core.execute_workspace_request(request)
+                    }) {
+                        return;
                     }
                 }
             })
@@ -249,8 +283,63 @@ impl ClientCore {
             .workspace_controller
             .lock()
             .expect("workspace controller poisoned");
+        owner.queue = Some(queue);
         owner.sender = Some(sender);
         owner.task = Some(task);
+    }
+    fn execute_workspace_request(&self, request: WorkspaceRequest) {
+        let core = self;
+        match request {
+            WorkspaceRequest::ReconcilePush(workspace) => core.reconcile_workspace_push(&workspace),
+            WorkspaceRequest::ReconcileDraft => {
+                if let Some(workspace) = core.navigation_snapshot().workspace_id() {
+                    core.restore_selected_workspace_thread(workspace);
+                }
+            }
+            WorkspaceRequest::RetryDraft(retry) => {
+                let current = core.thread_draft_retry_is_current(&retry);
+                core.retire_thread_draft_retry(&retry);
+                if current {
+                    let _ = core.execute_workspace_intent(WorkspaceIntent::NewThread {
+                        workspace_id: retry.workspace,
+                    });
+                }
+            }
+            WorkspaceRequest::Bootstrap {
+                preferred,
+                connection,
+            } if core.gateway_http_generation() == connection => {
+                if let Ok(reduction) = core.bootstrap_workspace_catalog(preferred) {
+                    core.load_selected_workspace_directory(&reduction.selected.workspace_id);
+                }
+            }
+            WorkspaceRequest::Refresh {
+                workspace,
+                connection,
+            } if core.gateway_http_generation() == connection
+                && core.workspace_refresh_is_demanded(&workspace) =>
+            {
+                core.refresh_workspace_directory_with_transport(
+                    &workspace,
+                    &core.transport_runtime().ws_command_sender(),
+                );
+            }
+            WorkspaceRequest::Command { intent, connection }
+                if core.gateway_http_generation() == connection =>
+            {
+                let operation = core.begin_directory_action(&intent);
+                let result = core.execute_workspace_intent(intent);
+                if core.gateway_http_generation() == connection {
+                    if let Some(operation) = operation {
+                        core.complete_directory_action(
+                            operation,
+                            result.err().map(|error| format!("{error:#}")),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     pub fn request_workspace_bootstrap(&self, preferred: Option<String>) {
         let mut owner = self
@@ -268,6 +357,16 @@ impl ClientCore {
     ) -> bool {
         use pioneer_protocol::GatewayNotification;
         match notification {
+            GatewayNotification::Unknown(change)
+                if change.method == pioneer_protocol::constants::events::WORKSPACE_PUSH_CHANGED =>
+            {
+                self.recover_malformed_workspace_push();
+                true
+            }
+            GatewayNotification::WorkspacePush(change) => {
+                self.observe_workspace_push(change);
+                true
+            }
             GatewayNotification::WorkspaceChanged(_) => {
                 self.observe_workspace_catalog(notification);
                 true
@@ -297,19 +396,77 @@ impl ClientCore {
         self.queue_directory_refresh(workspace);
     }
     pub(crate) fn load_selected_workspace_directory(&self, workspace: &str) {
-        let Ok(directory) = self.refresh_workspace_tree(workspace) else {
-            return;
-        };
-        if directory.error().is_some() {
-            return;
+        self.load_selected_workspace_directory_with_transport(
+            workspace,
+            &self.transport_runtime().ws_command_sender(),
+        );
+    }
+    fn load_selected_workspace_directory_with_transport(
+        &self,
+        workspace: &str,
+        transport: &impl crate::rpc::JsonRpcRequestTransport,
+    ) {
+        {
+            let mut registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            if !self.is_stopped() && registry.navigation.workspace_id() == Some(workspace) {
+                registry.directory.initial_restore = Some(InitialDirectoryRestore {
+                    workspace: workspace.to_owned(),
+                    connection: self.gateway_http_generation(),
+                    navigation_revision: registry.navigation_revision,
+                });
+            }
         }
-        self.restore_selected_workspace_thread(workspace);
+        self.refresh_workspace_directory_with_transport(workspace, transport);
+    }
+    fn refresh_workspace_directory_with_transport(
+        &self,
+        workspace: &str,
+        transport: &impl crate::rpc::JsonRpcRequestTransport,
+    ) {
+        let _ = self.refresh_workspace_tree_with_transport(workspace, transport);
+        let mut registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        let directory = registry.directory.snapshot(workspace);
+        let state = directory
+            .as_ref()
+            .filter(|p| p.error().is_none())
+            .and_then(|p| p.load())
+            .map(|load| load.state);
+        let ready = state == Some(ThreadTreeLoadState::Ready);
+        let mut continue_initial = false;
+        if let Some(initial) = &registry.directory.initial_restore
+            && initial.workspace == workspace
+        {
+            let current = !self.is_stopped()
+                && initial.connection == self.gateway_http_generation()
+                && initial.navigation_revision == registry.navigation_revision
+                && registry.navigation.workspace_id() == Some(workspace);
+            if !current || state != Some(ThreadTreeLoadState::Pending) {
+                // Consume before restore can mutate navigation or start a draft.
+                continue_initial = current && ready;
+                registry.directory.initial_restore = None;
+            }
+        }
+        let remembered = registry.navigation.last_active(workspace).is_some()
+            || registry.navigation.draft(workspace).is_some();
+        drop(registry);
+        if ready && (continue_initial || remembered) {
+            self.restore_selected_workspace_thread(workspace);
+        }
     }
     fn restore_selected_workspace_thread(&self, workspace: &str) {
-        if self
-            .workspace_tree(workspace)
-            .is_none_or(|directory| directory.is_loading() || directory.error().is_some())
-        {
+        if self.workspace_tree(workspace).is_none_or(|directory| {
+            directory.is_loading()
+                || directory.error().is_some()
+                || directory
+                    .load()
+                    .is_some_and(|load| load.state != ThreadTreeLoadState::Ready)
+        }) {
             return;
         }
         let navigation = self.navigation_snapshot();
@@ -323,9 +480,20 @@ impl ClientCore {
             |id, workspace| {
                 self.thread_snapshot(id)
                     .is_some_and(|snapshot| snapshot.coordinator().workspace_id == workspace)
+                    || self
+                        .thread_registry
+                        .lock()
+                        .expect("thread registry poisoned")
+                        .directory
+                        .threads
+                        .get(id)
+                        .is_some_and(|thread| thread.workspace_id == workspace)
             },
         );
         if let Some(thread_id) = restored.active_thread_id {
+            // Directory loading no longer creates every coordinator. Restore
+            // the selected one through the existing registry owner only.
+            drop(self.thread_mutation(&thread_id, workspace));
             self.navigate(
                 crate::navigation::NavigationIntent::SelectThread {
                     workspace_id: Some(workspace.to_owned()),
@@ -369,6 +537,20 @@ impl ClientCore {
             .commands
             .retain(|(intent, _)| intent.workspace_id() != Some(workspace));
         drop(owner);
+        {
+            let mut registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            if registry
+                .directory
+                .initial_restore
+                .as_ref()
+                .is_some_and(|initial| initial.workspace == workspace)
+            {
+                registry.directory.cancel_initial_restore();
+            }
+        }
         if let Some(retry) = retry {
             self.retire_thread_draft_retry(&retry);
         }
@@ -442,6 +624,144 @@ impl ClientCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paused_combined_scope_resumes_after_renewal_or_page_deferred_action() {
+        super::super::push::tests::paused_combined_scope_resumes_after_renewal_or_page_deferred_action(
+            |core| {
+                assert!(run_workspace_cycle(&Arc::downgrade(core), |core, request| {
+                    core.execute_workspace_request(request);
+                }));
+            },
+        );
+    }
+    #[test]
+    fn actual_workspace_quantum_is_live_during_handlers_and_terminal_before_idle() {
+        use pioneer_observability::{
+            live::{self, JournalPayload, WorkState},
+            work::{self, Outcome},
+        };
+        let _lock = crate::OBSERVABILITY_TEST_LOCK.lock().unwrap();
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(false);
+        pioneer_observability::set_telemetry_enabled(true);
+        let core = Arc::new(ClientCore::new());
+        struct Cleanup {
+            core: Arc<ClientCore>,
+            enabled: bool,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.core.shutdown();
+                pioneer_observability::set_telemetry_enabled(self.enabled);
+            }
+        }
+        let _cleanup = Cleanup {
+            core: core.clone(),
+            enabled: old,
+        };
+        {
+            let mut owner = core.workspace_controller.lock().unwrap();
+            owner.bootstrap = Some((None, None));
+            owner.refresh.insert("ws".into(), None);
+            owner.commands.push_back((
+                WorkspaceIntent::NewThread {
+                    workspace_id: "ws".into(),
+                },
+                None,
+            ));
+        }
+        let mut order = Vec::new();
+        let mut token = None;
+        run_workspace_cycle(&Arc::downgrade(&core), |_, request| {
+            let current = work::current().unwrap();
+            token = Some(current.token);
+            let snapshot = live::snapshot().unwrap();
+            assert!(
+                snapshot
+                    .active
+                    .iter()
+                    .any(|entry| entry.context.token == current.token
+                        && entry.state == WorkState::Running)
+            );
+            assert!(!snapshot.journal.iter().any(|r| matches!(&r.payload, JournalPayload::Work(w) if w.context.token == current.token && matches!(w.state, WorkState::Terminal(_)))));
+            order.push(match request {
+                WorkspaceRequest::Bootstrap { .. } => "bootstrap",
+                WorkspaceRequest::Command { .. } => "command",
+                WorkspaceRequest::Refresh { .. } => "refresh",
+                _ => panic!("unexpected fixture request"),
+            });
+        });
+        assert_eq!(order, ["bootstrap", "command", "refresh"]);
+        assert!(token.is_some());
+        assert!(
+            live::snapshot()
+                .unwrap()
+                .active
+                .iter()
+                .all(|entry| Some(entry.context.token) != token)
+        ); // native next wake wait owns no active cycle
+        let terminals: Vec<_> = live::snapshot()
+            .unwrap()
+            .journal
+            .iter()
+            .filter_map(|r| match &r.payload {
+                JournalPayload::Work(w) if Some(w.context.token) == token => match w.state {
+                    WorkState::Terminal(outcome) => Some(outcome),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminals, [Outcome::Completed]);
+        core.workspace_controller.lock().unwrap().bootstrap = Some((None, None));
+        let mut panic_token = None;
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_workspace_cycle(
+                &Arc::downgrade(&core),
+                |_, _| {
+                    panic_token = work::current().map(|c| c.token);
+                    panic!("fake handler panic")
+                }
+            )))
+            .is_err()
+        );
+        core.workspace_controller.lock().unwrap().bootstrap = Some((None, None));
+        let mut cancelled_token = None;
+        assert!(!run_workspace_cycle(&Arc::downgrade(&core), |core, _| {
+            cancelled_token = work::current().map(|c| c.token);
+            core.shutdown();
+        }));
+        assert_eq!(work::current(), None);
+        assert!(!run_workspace_cycle(
+            &std::sync::Weak::new(),
+            |_, _| unreachable!()
+        ));
+        let snapshot = live::snapshot().unwrap();
+        assert!(snapshot.active.iter().all(|entry| {
+            ![token, panic_token, cancelled_token].contains(&Some(entry.context.token))
+        }));
+        for (token, outcome) in [
+            (panic_token, Outcome::Panicked),
+            (cancelled_token, Outcome::Cancelled),
+        ] {
+            assert!(token.is_some());
+            let terminal: Vec<_> = snapshot
+                .journal
+                .iter()
+                .filter_map(|r| match &r.payload {
+                    JournalPayload::Work(w)
+                        if Some(w.context.token) == token
+                            && matches!(w.state, WorkState::Terminal(_)) =>
+                    {
+                        Some(w.state)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(terminal, [WorkState::Terminal(outcome)]);
+        }
+    }
+
     use pioneer_protocol::{
         SandboxMode, SandboxPolicy, ThreadStartParams, ThreadStartResponse, ThreadVisibility,
     };
@@ -751,6 +1071,7 @@ mod tests {
 
         struct DirectoryTransport<'a> {
             before_response: &'a dyn Fn(),
+            running: bool,
         }
         impl crate::rpc::JsonRpcRequestTransport for DirectoryTransport<'_> {
             fn send_json_rpc_request(
@@ -768,7 +1089,11 @@ mod tests {
                         "threads": [{"id":"existing","workspace_id":"ws","preview":"history",
                             "mode":"Chat","model":"model","model_provider":"provider",
                             "created_at":1,"updated_at":1,"status":"Idle","turns":[]}],
-                        "unread":[],"folders":[],"placements":[],"agents_docs":[]
+                        "running_task_thread_ids": if self.running { vec!["existing"] } else { vec![] },
+                        "unread":[],"folders":[
+                            {"id":"parent","workspace_id":"ws","name":"Parent","created_at":1,"updated_at":1},
+                            {"id":"child","workspace_id":"ws","parent_folder_id":"parent","name":"Child","created_at":1,"updated_at":1}
+                        ],"placements":[{"thread_id":"existing","workspace_id":"ws","folder_id":"child"}],"agents_docs":[]
                     })))
                     .unwrap();
                 Ok(())
@@ -779,12 +1104,10 @@ mod tests {
             let core = Arc::new(ClientCore::new());
             let (sender, _receiver) = mpsc::sync_channel(1);
             core.workspace_controller.lock().unwrap().sender = Some(sender);
-            let _subscription = core.subscribe(
-                ClientScope::WorkspaceTree {
-                    workspace_id: Some("ws".into()),
-                },
-                NonZeroUsize::new(8).unwrap(),
-            );
+            let scope = ClientScope::WorkspaceTree {
+                workspace_id: Some("ws".into()),
+            };
+            let subscription = core.subscribe(scope.clone(), NonZeroUsize::new(8).unwrap());
             core.activate_thread(None, Some("ws"));
             let capabilities = crate::catalog_test_support::client()
                 .authorization_snapshot(None, None)
@@ -809,6 +1132,7 @@ mod tests {
                 "ws",
                 &DirectoryTransport {
                     before_response: &before_response,
+                    running: true,
                 },
             );
             if during_request {
@@ -846,16 +1170,72 @@ mod tests {
                     "ws",
                     &DirectoryTransport {
                         before_response: &|| {},
+                        running: true,
                     },
                 )
                 .unwrap();
             assert_eq!(loaded.snapshot().threads_by_id.len(), 1);
+            assert!(
+                loaded
+                    .snapshot()
+                    .running_task_thread_ids
+                    .contains("existing")
+            );
+            assert!(loaded.snapshot().running_task_folder_ids.contains("parent"));
+            assert!(
+                core.thread_snapshot("existing").is_none(),
+                "directory refresh must not hydrate unopened threads"
+            );
+            drop(core.thread_mutation("existing", "ws"));
+            let coordinator = core.thread_snapshot("existing").unwrap().coordinator();
+            assert!(
+                !coordinator.history_loaded,
+                "directory recovery needs no timeline"
+            );
+            assert!(!coordinator.history_loading);
+            assert!(coordinator.thread().unwrap().turns.is_empty());
             assert_eq!(core.navigation_snapshot().workspace_id(), Some("ws"));
             accept();
             assert!(
                 core.workspace_controller.lock().unwrap().refresh.is_empty(),
                 "equal capabilities must not cause a reload loop"
             );
+            assert!(core.observe_workspace_notification(
+                &pioneer_protocol::GatewayNotification::ThreadTreeChanged(
+                    pioneer_protocol::ThreadTreeChangedNotification {
+                        workspace_id: "ws".into()
+                    }
+                )
+            ));
+            assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
+            core.workspace_controller.lock().unwrap().refresh.clear();
+            core.workspace_demand_changed(&scope, crate::core::ClientDemand::Suspended);
+            let changed = pioneer_protocol::GatewayNotification::ThreadTreeChanged(
+                pioneer_protocol::ThreadTreeChangedNotification {
+                    workspace_id: "ws".into(),
+                },
+            );
+            core.observe_workspace_notification(&changed);
+            assert!(core.workspace_controller.lock().unwrap().refresh.is_empty());
+            core.workspace_demand_changed(&scope, crate::core::ClientDemand::Visible);
+            assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
+            let resumed = core
+                .refresh_workspace_tree_with_transport(
+                    "ws",
+                    &DirectoryTransport {
+                        before_response: &|| {},
+                        running: false,
+                    },
+                )
+                .unwrap();
+            assert!(resumed.snapshot().running_task_thread_ids.is_empty());
+            assert!(resumed.snapshot().running_task_folder_ids.is_empty());
+            core.workspace_controller.lock().unwrap().refresh.clear();
+            drop(subscription);
+            core.observe_workspace_notification(&changed);
+            assert!(core.workspace_controller.lock().unwrap().refresh.is_empty());
+            let _resubscribed = core.subscribe(scope, NonZeroUsize::new(8).unwrap());
+            assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
         }
     }
 
@@ -891,6 +1271,272 @@ mod tests {
         drop(subscription);
         assert!(!core.workspace_refresh_is_demanded("ws"));
         assert!(core.workspace_controller.lock().unwrap().refresh.is_empty());
+    }
+
+    #[test]
+    fn initial_read_reconciliation_continues_draft_bootstrap_once_without_new_auth_events() {
+        use pioneer_protocol::*;
+
+        struct TreeReply<'a> {
+            core: &'a ClientCore,
+            read_during_request: bool,
+        }
+        impl crate::rpc::JsonRpcRequestTransport for TreeReply<'_> {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                tx: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(request["method"], "thread/tree");
+                if self.read_during_request {
+                    assert!(self.core.observe_workspace_notification(
+                        &GatewayNotification::ThreadReadCursorChanged(
+                            ThreadReadCursorChangedNotification {
+                                workspace_id: "ws".into(),
+                                thread_id: "existing".into(),
+                                cursor: ThreadReadCursor {
+                                    sort_key: "002".into(),
+                                    through_turn_id: "turn".into()
+                                },
+                                unread_count: 0,
+                            }
+                        )
+                    ));
+                }
+                tx.send(Ok(serde_json::json!({
+                    "workspace_id":"ws", "threads":[{"id":"existing","workspace_id":"ws","preview":"history","mode":"Chat","model":"model","model_provider":"provider","created_at":1,"updated_at":1,"status":"Idle","turns":[]}],
+                    "running_task_thread_ids":["existing"], "unread":[{"thread_id":"existing","unread_count":1}], "folders":[], "placements":[], "agents_docs":[]
+                }))).unwrap();
+                Ok(())
+            }
+        }
+        let core = Arc::new(ClientCore::new());
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        core.workspace_controller.lock().unwrap().sender = Some(sender);
+        core.activate_thread(None, Some("ws"));
+        let mut authorization = crate::catalog_test_support::client()
+            .authorization_snapshot(None, None)
+            .unwrap();
+        let resources = AuthorizationOperationalResourceProjection {
+            fingerprint: "synthetic".into(),
+            ..Default::default()
+        };
+        authorization.workspace = Some(AuthorizationWorkspaceCapabilitySnapshot {
+            workspace_id: "ws".into(),
+            capabilities: AuthorizationWorkspaceCapabilities {
+                can_create_thread: true,
+                thread_visibility_options: vec![ThreadVisibility::Private],
+                ..Default::default()
+            },
+            operational_resources: resources.clone(),
+            execution_draft_policy: AuthorizationExecutionDraftPolicyProjection {
+                fingerprint: "synthetic".into(),
+                resources,
+                permission_options: vec![],
+                can_attach_artifacts: false,
+                mcp_invocation_limits: Default::default(),
+            },
+        });
+        assert_eq!(
+            core.accept_authorization_projection(0, None, authorization),
+            crate::authorization::AuthorizationProjectionAcceptance::Accepted
+        );
+        // The one earlier capability wake has already been handled. No further
+        // authorization or Administration event rescues the pending load.
+        assert!(matches!(
+            core.workspace_controller
+                .lock()
+                .unwrap()
+                .next(Instant::now()),
+            Some(WorkspaceRequest::ReconcileDraft)
+        ));
+        let steady = TreeReply {
+            core: &core,
+            read_during_request: false,
+        };
+        core.refresh_workspace_directory_with_transport("ws", &steady);
+        assert!(core.navigation_snapshot().active_thread_id().is_none());
+        assert!(core.navigation_snapshot().last_active("ws").is_none());
+        assert!(core.navigation_snapshot().draft("ws").is_none());
+        assert!(
+            core.thread_start_snapshot().pending_thread_id.is_none(),
+            "an ordinary hint cannot start a draft"
+        );
+
+        core.load_selected_workspace_directory_with_transport(
+            "ws",
+            &TreeReply {
+                core: &core,
+                read_during_request: true,
+            },
+        );
+        assert_eq!(
+            core.workspace_tree("ws").unwrap().load().unwrap().state,
+            ThreadTreeLoadState::Pending
+        );
+        assert!(
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .directory
+                .initial_restore
+                .is_some()
+        );
+        assert!(core.thread_start_snapshot().pending_thread_id.is_none());
+        let Some(WorkspaceRequest::Refresh {
+            workspace,
+            connection,
+        }) = core
+            .workspace_controller
+            .lock()
+            .unwrap()
+            .next(Instant::now())
+        else {
+            panic!("read conflict must queue one follow-up")
+        };
+        assert_eq!(workspace, "ws");
+        assert_eq!(connection, core.gateway_http_generation());
+        core.refresh_workspace_directory_with_transport(&workspace, &steady);
+        assert_eq!(
+            core.workspace_tree("ws").unwrap().load().unwrap().state,
+            ThreadTreeLoadState::Ready
+        );
+        assert!(
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .directory
+                .initial_restore
+                .is_none()
+        );
+        // The unchanged restore/create rule reaches thread/start. Without a
+        // configured endpoint it prepares one identity and the existing retry.
+        let start = core.thread_start_snapshot();
+        let id = start.pending_thread_id.unwrap();
+        assert_eq!(start.retry_attempt, 1);
+        assert!(
+            core.workspace_controller
+                .lock()
+                .unwrap()
+                .draft_retry
+                .is_some()
+        );
+        for _ in 0..2 {
+            core.queue_directory_refresh("ws");
+        }
+        assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
+        core.workspace_controller
+            .lock()
+            .unwrap()
+            .refresh
+            .remove("ws");
+        core.refresh_workspace_directory_with_transport("ws", &steady);
+        assert_eq!(
+            core.thread_start_snapshot().pending_thread_id.as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            core.thread_start_snapshot().retry_attempt,
+            1,
+            "hints must not restart the bootstrap"
+        );
+        core.cancel_workspace_requests("ws");
+    }
+
+    #[test]
+    fn initial_restore_cancels_with_navigation_suspend_and_invalidation() {
+        let core = ClientCore::new();
+        core.activate_thread(None, Some("ws"));
+        for teardown in 0..3 {
+            {
+                let mut registry = core.thread_registry.lock().unwrap();
+                registry.directory.initial_restore = Some(InitialDirectoryRestore {
+                    workspace: "ws".into(),
+                    connection: core.gateway_http_generation(),
+                    navigation_revision: registry.navigation_revision,
+                });
+            }
+            match teardown {
+                0 => {
+                    core.activate_thread(None, Some("other"));
+                    core.activate_thread(None, Some("ws"));
+                }
+                1 => core.workspace_demand_changed(
+                    &crate::core::ClientScope::WorkspaceTree {
+                        workspace_id: Some("ws".into()),
+                    },
+                    crate::core::ClientDemand::Suspended,
+                ),
+                _ => core.thread_registry.lock().unwrap().directory.invalidate(),
+            }
+            assert!(
+                core.thread_registry
+                    .lock()
+                    .unwrap()
+                    .directory
+                    .initial_restore
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn last_active_thread_restores_from_directory_without_creating_other_stores() {
+        let core = crate::catalog_test_support::client();
+        core.navigate(
+            crate::navigation::NavigationIntent::SelectWorkspace {
+                workspace_id: Some("ws".into()),
+            },
+            None,
+        );
+        core.navigate(
+            crate::navigation::NavigationIntent::RememberLast {
+                workspace_id: "ws".into(),
+                thread_id: Some("last".into()),
+            },
+            None,
+        );
+        {
+            let mut registry = core.thread_registry.lock().unwrap();
+            for id in ["last", "unopened"] {
+                let t = serde_json::from_value::<pioneer_protocol::Thread>(serde_json::json!({"id":id,"workspace_id":"ws","preview":"","mode":"Chat","model":"model","model_provider":"provider","created_at":1,"updated_at":1,"status":"Idle","turns":[]})).unwrap();
+                registry.directory.threads.insert(id.into(), t);
+            }
+            registry.directory.project("ws", None, false, None);
+        }
+        assert!(core.thread_snapshots().is_empty());
+        core.restore_selected_workspace_thread("ws");
+        assert_eq!(core.navigation_snapshot().active_thread_id(), Some("last"));
+        assert!(core.thread_snapshot("last").is_some());
+        assert!(core.thread_snapshot("unopened").is_none());
+    }
+
+    #[test]
+    fn read_reconciliation_uses_one_existing_queue_slot_and_suspension_cancels_it() {
+        let core = crate::catalog_test_support::client();
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        core.workspace_controller.lock().unwrap().sender = Some(sender);
+        // Reconciliation follows a tree load; hints for an unknown directory
+        // deliberately do not enqueue work.
+        core.thread_registry
+            .lock()
+            .unwrap()
+            .directory
+            .project("ws", None, false, None);
+        let scope = crate::core::ClientScope::WorkspaceTree {
+            workspace_id: Some("ws".into()),
+        };
+        let _subscription = core.subscribe(scope.clone(), std::num::NonZeroUsize::new(8).unwrap());
+        for _ in 0..1000 {
+            core.queue_directory_refresh("ws");
+        }
+        assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
+        core.workspace_demand_changed(&scope, crate::core::ClientDemand::Suspended);
+        assert!(core.workspace_controller.lock().unwrap().refresh.is_empty());
+        core.workspace_demand_changed(&scope, crate::core::ClientDemand::Visible);
+        assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
     }
 
     #[test]

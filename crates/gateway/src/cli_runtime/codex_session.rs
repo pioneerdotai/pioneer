@@ -23,7 +23,9 @@ use crate::cli_runtime::manager::{
 use crate::cli_runtime::mcp::coordinator::{
     CliMcpProjectionFingerprint, CliMcpProjectionGeneration,
 };
-use crate::cli_runtime::mcp::facade::{CliMcpFacadeProjection, CliMcpFacadeTool};
+use crate::cli_runtime::mcp::facade::{
+    CliMcpCallContract, CliMcpFacadeProjection, CliMcpFacadeTool,
+};
 use crate::cli_runtime::mcp::grants::{CliMcpGrantScope, CliMcpManifestHash};
 use crate::cli_runtime::mcp::limits::{
     CliMcpFacadeLimits, CliMcpFacadeProjectionLimits, CliMcpRuntimeLimits,
@@ -61,11 +63,10 @@ use pioneer_config::{
     EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
 };
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::BufReader;
@@ -268,6 +269,7 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
                 "contract": "codex-managed-mcp-readiness-v1",
             }))?,
             overlay_policy_version: CodexHomeOverlayPolicy::v1().version,
+            tool_timeout_secs: None,
             tools: semantic_tools,
         },
         limits: CodexManagedMcpConfigLimits { max_tools },
@@ -332,6 +334,7 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
             reservation.generation,
             projection_for_server.clone(),
             CliMcpFacadeLimits::default(),
+            CliMcpCallContract::Codex,
         )?;
         let server = tokio::spawn(server.run());
         tokio_timeout(
@@ -348,25 +351,10 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
         Ok::<_, anyhow::Error>(server)
     };
     let probe_result = async {
-        let initialize = client
+        client
             .initialize(timeout)
             .await
             .map_err(|error| anyhow!("Codex readiness initialization failed: {error}"))?;
-        if initialize
-            .version
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-            && initialize
-                .user_agent
-                .as_deref()
-                .unwrap_or_default()
-                .trim()
-                .is_empty()
-        {
-            bail!("Codex readiness initialize identity is unavailable");
-        }
         let cwd = probe_config
             .cwd
             .as_deref()
@@ -541,6 +529,16 @@ impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory 
                 .start_session_with_launch_spec(process_instance, launch_spec, startup)
                 .await
             }
+            GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                crate::cli_runtime::opencode_session::OpenCodeCLIAgentRuntimeSessionFactory::new(
+                    self.runtime_home.clone(),
+                    self.bridge_supervisor.clone(),
+                    self.mcp_limits,
+                    self.turn_mcp_invoker.clone(),
+                )
+                .start_session_with_launch_spec(process_instance, launch_spec, startup)
+                .await
+            }
         }
     }
 }
@@ -574,147 +572,16 @@ struct CodexRequiredMcpBridge {
     invoker: Arc<dyn TurnMcpInvoker>,
     facade_limits: CliMcpFacadeLimits,
     native_items: Arc<CodexNativeMcpCorrelationLedger>,
+    // Monotonic, generation-local mirror of fail_closed for synchronous session reuse checks.
+    failed: AtomicBool,
     state: tokio::sync::Mutex<CodexRequiredMcpBridgeState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct CodexNativeMcpItemKey {
-    native_thread_id: String,
-    native_turn_id: String,
-    native_item_id: String,
-}
-
-struct CodexNativeMcpItemCorrelation {
-    canonical_callable_name: String,
-    arguments_fingerprint: String,
-    sequence: u64,
-    facade_request_id: Option<String>,
-}
-
-#[derive(Default)]
-struct CodexNativeMcpCorrelationLedger {
-    items: StdMutex<HashMap<CodexNativeMcpItemKey, CodexNativeMcpItemCorrelation>>,
-    next_sequence: AtomicU64,
-    changed: tokio::sync::Notify,
-}
-
-impl CodexNativeMcpCorrelationLedger {
-    fn register(
-        &self,
-        binding: crate::cli_runtime::codex_mcp::CodexNativeMcpItemBinding,
-    ) -> Result<()> {
-        let key = CodexNativeMcpItemKey {
-            native_thread_id: binding.native_thread_id,
-            native_turn_id: binding.native_turn_id,
-            native_item_id: binding.native_item_id,
-        };
-        let mut items = self
-            .items
-            .lock()
-            .expect("Codex native MCP correlation ledger should not be poisoned");
-        if let Some(existing) = items.get(&key) {
-            if existing.canonical_callable_name != binding.canonical_callable_name
-                || existing.arguments_fingerprint != binding.arguments_fingerprint
-            {
-                bail!("Codex native MCP item identity changed during replay")
-            }
-            return Ok(());
-        }
-        items.insert(
-            key,
-            CodexNativeMcpItemCorrelation {
-                canonical_callable_name: binding.canonical_callable_name,
-                arguments_fingerprint: binding.arguments_fingerprint,
-                sequence: self.next_sequence.fetch_add(1, AtomicOrdering::Relaxed),
-                facade_request_id: None,
-            },
-        );
-        drop(items);
-        self.changed.notify_waiters();
-        Ok(())
-    }
-
-    fn callable(&self, key: &CodexNativeMcpItemKey) -> Option<String> {
-        self.items
-            .lock()
-            .expect("Codex native MCP correlation ledger should not be poisoned")
-            .get(key)
-            .map(|item| item.canonical_callable_name.clone())
-    }
-
-    fn contains(&self, key: &CodexNativeMcpItemKey) -> bool {
-        self.items
-            .lock()
-            .expect("Codex native MCP correlation ledger should not be poisoned")
-            .contains_key(key)
-    }
-
-    async fn claim(
-        &self,
-        canonical_callable_name: &str,
-        arguments_fingerprint: &str,
-        facade_request_id: &str,
-    ) -> Option<CodexNativeMcpItemKey> {
-        let notified = self.changed.notified();
-        if let Some(key) = self.claim_now(
-            canonical_callable_name,
-            arguments_fingerprint,
-            facade_request_id,
-        ) {
-            return Some(key);
-        }
-        let _ = tokio_timeout(Duration::from_millis(250), notified).await;
-        self.claim_now(
-            canonical_callable_name,
-            arguments_fingerprint,
-            facade_request_id,
-        )
-    }
-
-    fn claim_now(
-        &self,
-        canonical_callable_name: &str,
-        arguments_fingerprint: &str,
-        facade_request_id: &str,
-    ) -> Option<CodexNativeMcpItemKey> {
-        let mut items = self
-            .items
-            .lock()
-            .expect("Codex native MCP correlation ledger should not be poisoned");
-        let key = items
-            .iter()
-            .filter(|(_, item)| {
-                item.facade_request_id.is_none()
-                    && item.canonical_callable_name == canonical_callable_name
-                    && item.arguments_fingerprint == arguments_fingerprint
-            })
-            .min_by_key(|(_, item)| item.sequence)
-            .map(|(key, _)| key.clone())?;
-        items
-            .get_mut(&key)
-            .expect("selected Codex MCP correlation must exist")
-            .facade_request_id = Some(facade_request_id.to_owned());
-        Some(key)
-    }
-
-    fn clear_turn(&self, native_thread_id: Option<&str>, native_turn_id: Option<&str>) {
-        let (Some(native_thread_id), Some(native_turn_id)) = (native_thread_id, native_turn_id)
-        else {
-            return;
-        };
-        self.items
-            .lock()
-            .expect("Codex native MCP correlation ledger should not be poisoned")
-            .retain(|key, _| {
-                key.native_thread_id != native_thread_id || key.native_turn_id != native_turn_id
-            });
-    }
-}
-
-struct CodexCorrelatingTurnMcpInvoker {
-    inner: Arc<dyn TurnMcpInvoker>,
-    native_items: Arc<CodexNativeMcpCorrelationLedger>,
-}
+use crate::cli_runtime::mcp::native_correlation::{
+    CodexMcpCorrelationBinding, CorrelatingTurnMcpInvoker as CodexCorrelatingTurnMcpInvoker,
+    NativeMcpCorrelationLedger as CodexNativeMcpCorrelationLedger,
+    NativeMcpItemKey as CodexNativeMcpItemKey,
+};
 
 pub(crate) fn codex_native_approval_fallback_response(
     requested_permissions: JsonValue,
@@ -732,45 +599,6 @@ pub(crate) fn codex_native_approval_fallback_response(
             "strictAutoReview": true,
         })
     })
-}
-
-#[async_trait]
-impl TurnMcpInvoker for CodexCorrelatingTurnMcpInvoker {
-    async fn invoke(
-        &self,
-        mut invocation: crate::turn_mcp::invoker::TurnMcpInvocation,
-        cancellation: CancellationToken,
-    ) -> std::result::Result<
-        crate::turn_mcp::result::CanonicalMcpToolResult,
-        crate::turn_mcp::invoker::TurnMcpInvocationError,
-    > {
-        let arguments_fingerprint =
-            crate::cli_runtime::codex_mcp::canonical_value_fingerprint(&invocation.arguments)
-                .map_err(|_| {
-                    crate::turn_mcp::invoker::TurnMcpInvocationError::new(
-                        crate::turn_mcp::invoker::TurnMcpInvocationErrorCode::InvalidRequest,
-                        "Codex MCP invocation arguments are not canonicalizable",
-                    )
-                })?;
-        let facade_request_id = invocation.provider_call_id.clone();
-        let native_item = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => None,
-            native_item = self.native_items.claim(
-                invocation.canonical_callable_name.as_str(),
-                arguments_fingerprint.as_str(),
-                facade_request_id.as_str(),
-            ) => native_item,
-        }
-        .ok_or_else(|| {
-            crate::turn_mcp::invoker::TurnMcpInvocationError::new(
-                crate::turn_mcp::invoker::TurnMcpInvocationErrorCode::SessionBindingUnavailable,
-                "Codex MCP facade call has no matching native lifecycle item",
-            )
-        })?;
-        invocation.provider_call_id = native_item.native_item_id;
-        self.inner.invoke(invocation, cancellation).await
-    }
 }
 
 struct CodexActiveMcpTurn {
@@ -837,10 +665,16 @@ impl CodexRequiredMcpBridge {
                         Arc::new(CodexCorrelatingTurnMcpInvoker {
                             inner: self.invoker.clone(),
                             native_items: self.native_items.clone(),
+                            opencode_binding: None,
+                            codex_binding: Some(CodexMcpCorrelationBinding {
+                                coordinator: self.supervisor.coordinator(),
+                                bound_grant: attachment.bound_grant.clone(),
+                            }),
                         }),
                         self.projection_generation,
                         self.projection.clone(),
                         self.facade_limits.clone(),
+                        CliMcpCallContract::Codex,
                     )
                     .map_err(|error| anyhow!("Codex MCP facade build failed: {error}"))?;
                     let server = tokio::spawn(server.run());
@@ -892,6 +726,7 @@ impl CodexRequiredMcpBridge {
     }
 
     async fn request_stop(&self) {
+        self.failed.store(true, Ordering::Release);
         let mut state = self.state.lock().await;
         if let CodexRequiredMcpBridgeState::Stopping { handle, .. } = &*state {
             if let Some(handle) = handle {
@@ -1112,10 +947,14 @@ impl CodexRequiredMcpBridge {
             )
             .await
             .map_err(|error| anyhow!("failed to retarget Codex MCP turn: {error:?}"))?;
-        self.native_items.clear_turn(
-            turn.native_thread_id.as_deref(),
-            turn.native_turn_id.as_deref(),
-        );
+        if turn.native_thread_id.as_deref() != Some(native_thread_id)
+            || turn.native_turn_id.as_deref() != Some(native_turn_id)
+        {
+            self.native_items.clear_turn(
+                turn.native_thread_id.as_deref(),
+                turn.native_turn_id.as_deref(),
+            );
+        }
         turn.native_thread_id = Some(native_thread_id.to_owned());
         turn.native_turn_id = Some(native_turn_id.to_owned());
         Ok(())
@@ -1220,6 +1059,7 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
             }
             CliProviderContinuation::ClaudeNew { .. }
             | CliProviderContinuation::ClaudeResume { .. }
+            | CliProviderContinuation::OpenCodeServerSession { .. }
             | CliProviderContinuation::ClaudeFork { .. } => {
                 bail!("Codex CLI runtime requires a typed Codex thread continuation")
             }
@@ -1227,8 +1067,8 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         let launch_projection = match &launch_spec.mcp {
             CliMcpSessionLaunch::Disabled | CliMcpSessionLaunch::ManagementOnly => None,
             CliMcpSessionLaunch::Codex(projection) => Some(projection),
-            CliMcpSessionLaunch::Claude(_) => {
-                bail!("Codex CLI runtime cannot consume a Claude MCP launch projection")
+            CliMcpSessionLaunch::Claude(_) | CliMcpSessionLaunch::OpenCode(_) => {
+                bail!("Codex CLI runtime cannot consume another provider's MCP launch projection")
             }
         };
         let mcp_launch_projection = launch_projection.cloned();
@@ -1337,7 +1177,8 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                 let artifact = build_codex_managed_mcp_config(
                     &launch_projection.preflight,
                     bootstrap_path.as_deref(),
-                    self.mcp_limits.max_tools(),
+                    self.mcp_limits.max_tools()
+                        + launch_projection.canonical_projection.native_tool_count(),
                 )
                 .map_err(|error| anyhow!("failed to build managed Codex MCP config: {error}"))?;
                 if artifact.semantic_restart_fingerprint
@@ -1373,7 +1214,11 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                     .effective_mcp_servers_fingerprint
                     .clone(),
                 requires_staged_artifact: true,
-                max_config_origins: self.mcp_limits.max_codex_config_origins(),
+                max_config_origins: codex_config_read_max_origins(
+                    self.mcp_limits.max_tools()
+                        + launch_projection.canonical_projection.native_tool_count(),
+                )
+                .context("managed Codex HTML origin evidence limit overflow")?,
             };
         }
         process_config = process_config
@@ -1427,6 +1272,7 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                 invoker: self.turn_mcp_invoker.clone(),
                 facade_limits: self.mcp_limits.facade_limits(),
                 native_items: Arc::new(CodexNativeMcpCorrelationLedger::default()),
+                failed: AtomicBool::new(false),
                 state: tokio::sync::Mutex::new(CodexRequiredMcpBridgeState::Pending),
             }))
         } else {
@@ -2061,6 +1907,12 @@ fn codex_turn_observation_from_snapshot(
 
 #[async_trait]
 impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
+    fn is_usable(&self) -> bool {
+        self.required_mcp_bridge
+            .as_ref()
+            .is_none_or(|bridge| !bridge.failed.load(Ordering::Acquire))
+    }
+
     async fn close(&self) -> Result<()> {
         self.stop_and_wait().await?;
         self.cleanup_after_stop().await
@@ -2070,7 +1922,7 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
             bridge.request_stop().await;
         }
         let mut process = self.process.lock().await;
-        process.terminate_with_grace(self.shutdown_grace).await?;
+        let process_result = process.terminate_with_grace(self.shutdown_grace).await;
         drop(process);
         let bridge_result = if let Some(bridge) = self.required_mcp_bridge.as_ref() {
             bridge.stop_and_wait().await
@@ -2087,6 +1939,7 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
             .abort_and_join_result()
             .await
             .context("failed to drain Codex runtime transport");
+        process_result?;
         bridge_result?;
         transport_result?;
         Ok(())
@@ -2097,15 +1950,18 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
             .lock()
             .expect("Codex generation overlay mutex should not be poisoned")
             .clone();
-        if let Some(overlay) = overlay {
+        // A termination/reaping error must not skip generation resource
+        // cleanup. The bridge is already fail-closed for this generation.
+        let overlay_result = overlay.map_or(Ok(()), |overlay| {
             cleanup_codex_generation_overlay(&overlay)
                 .map_err(|error| anyhow!("failed to clean up Codex generation overlay: {error}"))?;
             self.generation_overlay
                 .lock()
                 .expect("Codex generation overlay mutex should not be poisoned")
                 .take();
-        }
-        Ok(())
+            Ok(())
+        });
+        overlay_result
     }
 
     fn take_codex_event_receivers(&self) -> Option<CLIAgentRuntimeCodexEventReceivers> {
@@ -2728,6 +2584,385 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    mod recovery {
+        use super::*;
+        use crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection;
+        use crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions;
+        use crate::turn_mcp::projection::{
+            McpProjectionLimits, McpSelectionReason, ResolvedMcpTurnProjection, ResolvedMcpTurnTool,
+        };
+
+        // Only the process and provider RPC boundary are fake. The manager,
+        // Codex session, bridge, supervisor and generation revocation are real.
+        struct RecoveryFactory {
+            root: PathBuf,
+            supervisor: Arc<CliMcpBridgeSupervisor>,
+            starts: AtomicUsize,
+            fail_start: AtomicBool,
+            sessions: StdMutex<Vec<(Arc<CodexCLIAgentRuntimeSession>, FakeCodexIsolationServer)>>,
+        }
+
+        impl RecoveryFactory {
+            fn new(root: &std::path::Path) -> Arc<Self> {
+                Arc::new(Self {
+                    root: root.to_path_buf(),
+                    supervisor: CliMcpBridgeSupervisor::new(root.join("bridge")),
+                    starts: AtomicUsize::new(0),
+                    fail_start: AtomicBool::new(false),
+                    sessions: StdMutex::new(Vec::new()),
+                })
+            }
+        }
+
+        #[async_trait]
+        impl CLIAgentRuntimeSessionFactory for RecoveryFactory {
+            async fn start_session_with_launch_spec(
+                &self,
+                instance: &CliSessionInstanceId,
+                spec: &CliSessionLaunchSpec,
+                _startup: &crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
+            ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+                if self.fail_start.load(Ordering::SeqCst) {
+                    bail!("injected replacement startup failure");
+                }
+                let CliProviderContinuation::CodexRpcThread { native_thread_id } =
+                    &spec.continuation
+                else {
+                    bail!("expected Codex continuation");
+                };
+                let config = CodexAccountProbeConfig {
+                    executable: "/bin/cat".to_owned(),
+                    home_path: self.root.join("shared-home").to_string_lossy().into_owned(),
+                    shadow_home_path: None,
+                    cwd: Some(self.root.clone()),
+                    home_dir: None,
+                    env: SensitiveEnvironment::new(),
+                    initialize_timeout: Duration::from_secs(2),
+                    request_timeout: Duration::from_secs(2),
+                    shutdown_grace: Duration::from_secs(2),
+                    stderr_ring_lines: 0,
+                };
+                std::fs::create_dir_all(&config.home_path)?;
+                let (mut process_config, overlay) = codex_generation_app_server_process_config(
+                    &config,
+                    &self.root.join("overlays"),
+                    codex_generation_overlay_identity(instance)?,
+                )?;
+                process_config.args.clear();
+                process_config = process_config.with_process_generation(instance.generation())?;
+                let process = spawn_cli_agent_process(&process_config)?;
+                let fake = FakeCodexIsolationServer::new();
+                let launch_projection = match &spec.mcp {
+                    CliMcpSessionLaunch::Codex(projection) => Some(projection.clone()),
+                    CliMcpSessionLaunch::Disabled => None,
+                    _ => bail!("unexpected MCP launch"),
+                };
+                let required_mcp_bridge = if let Some(projection) = &launch_projection {
+                    let facade =
+                        projection.facade_projection(CliMcpFacadeProjectionLimits::default())?;
+                    let launch = self
+                        .supervisor
+                        .prepare(
+                            CliMcpGrantScope::new(
+                                instance.clone(),
+                                CliMcpManifestHash::new(
+                                    projection.preflight.canonical_manifest_hash.clone(),
+                                )
+                                .expect("manifest"),
+                            ),
+                            codex_mcp_bootstrap_expiry(2_000)?,
+                        )
+                        .await?;
+                    let reservation = self
+                        .supervisor
+                        .coordinator()
+                        .stage_projection(launch.grant_ref(), facade.fingerprint().clone())
+                        .await
+                        .map_err(|error| anyhow!("stage projection: {error:?}"))?;
+                    self.supervisor
+                        .associate_provider_process(
+                            instance,
+                            process.id().expect("process id"),
+                            None,
+                        )
+                        .await?;
+                    Some(Arc::new(CodexRequiredMcpBridge {
+                        supervisor: self.supervisor.clone(),
+                        process_instance: instance.clone(),
+                        launch,
+                        projection_fingerprint: facade.fingerprint().clone(),
+                        projection: facade,
+                        projection_generation: reservation.generation,
+                        canonical_manifest_hash: projection
+                            .preflight
+                            .canonical_manifest_hash
+                            .clone(),
+                        provider_contract_fingerprint: projection
+                            .preflight
+                            .provider_contract_fingerprint
+                            .clone(),
+                        isolation_contract_fingerprint: "c".repeat(64),
+                        invoker: Arc::new(NeverCalledInvoker),
+                        facade_limits: CliMcpFacadeLimits::default(),
+                        native_items: Arc::new(CodexNativeMcpCorrelationLedger::default()),
+                        failed: AtomicBool::new(false),
+                        state: tokio::sync::Mutex::new(CodexRequiredMcpBridgeState::Pending),
+                    }))
+                } else {
+                    None
+                };
+                let session = Arc::new(CodexCLIAgentRuntimeSession {
+                    client: fake.client.clone(),
+                    _stderr: process.stderr(),
+                    process: tokio::sync::Mutex::new(process),
+                    request_timeout: Duration::from_secs(2),
+                    shutdown_grace: Duration::from_secs(2),
+                    event_receivers: StdMutex::new(None),
+                    generation_overlay: StdMutex::new(Some(overlay)),
+                    required_mcp_bridge,
+                    mcp_attestation: empty_attestation(),
+                    mcp_launch_projection: launch_projection,
+                    continuation: tokio::sync::Mutex::new(CodexThreadContinuationState {
+                        expected_native_thread_id: native_thread_id.clone(),
+                        bound_native_thread_id: None,
+                    }),
+                });
+                self.sessions.lock().unwrap().push((session.clone(), fake));
+                Ok(session)
+            }
+        }
+
+        fn launch_spec() -> CliSessionLaunchSpec {
+            let mut projection = ResolvedMcpTurnProjection::empty("workspace", "requested-turn");
+            projection.tools.push(ResolvedMcpTurnTool {
+                canonical_callable_name: String::new(),
+                workspace_id: "workspace".into(),
+                server_installation_id: "installation".into(),
+                server_name: "server".into(),
+                raw_tool_name: "tool".into(),
+                description: None,
+                input_schema: json!({"type": "object"}),
+                annotations: None,
+                timeout_ms: 20_000,
+                catalog_version: "catalog".into(),
+                installation_fingerprint: "installation-fingerprint".into(),
+                schema_fingerprint: String::new(),
+                runtime_generation: 1,
+                selection_reason: McpSelectionReason::ExplicitTool,
+                capability_id: Some("capability".into()),
+            });
+            projection
+                .finalize_identity(McpProjectionLimits::default())
+                .unwrap();
+            CliSessionLaunchSpec::codex(
+                CLIAgentRuntimeSessionStartOptions::default(),
+                CliMcpSessionLaunch::Codex(
+                    build_codex_mcp_session_launch_projection(projection, "b".repeat(64)).unwrap(),
+                ),
+                Some("native-thread".into()),
+            )
+        }
+
+        #[tokio::test]
+        async fn codex_failed_bridge_is_replaced_only_on_next_acquisition() {
+            for fail_replacement in [false, true] {
+                let root = tempfile::tempdir_in("/tmp").unwrap();
+                let factory = RecoveryFactory::new(root.path());
+                let manager =
+                    CLIAgentRuntimeManager::new(factory.clone(), Duration::from_secs(60)).unwrap();
+                let key = CLIAgentRuntimeSessionKey::new("workspace", "codex", "failed").unwrap();
+                let other_key =
+                    CLIAgentRuntimeSessionKey::new("workspace", "codex", "other").unwrap();
+                let spec = launch_spec();
+                let first = manager
+                    .get_or_start_with_launch_spec(key.clone(), spec.clone())
+                    .await
+                    .unwrap();
+                let other = manager
+                    .get_or_start_with_launch_spec(other_key.clone(), spec.clone())
+                    .await
+                    .unwrap();
+                let reused = manager
+                    .get_or_start_with_launch_spec(key.clone(), spec.clone())
+                    .await
+                    .unwrap();
+                assert!(Arc::ptr_eq(&first.session(), &reused.session()));
+                let (session, mut fake) = factory.sessions.lock().unwrap().remove(0);
+                let bridge = session.required_mcp_bridge.as_ref().unwrap();
+                let bootstrap = bridge.launch.bootstrap_path().to_path_buf();
+                {
+                    let _busy = bridge.state.lock().await;
+                    assert!(session.is_usable(), "a busy Pending bridge is reusable");
+                }
+                // Cancel an individual resume while waiting for metadata. It
+                // must not mark the entire generation as failed.
+                let mut resume = Box::pin(session.resume_thread(
+                    "native-thread",
+                    thread_open_params("/workspace"),
+                    Duration::from_secs(2),
+                ));
+                assert!(futures_util::poll!(&mut resume).is_pending());
+                let cancelled_read = fake.read_request().await;
+                assert_eq!(cancelled_read["method"], "thread/read");
+                drop(resume);
+                fake.write_result(
+                    cancelled_read["id"].clone(),
+                    json!({"thread": {"id": "native-thread", "cwd": "/workspace"}}),
+                )
+                .await;
+                assert!(session.is_usable());
+
+                // Exercise a real production fail_closed caller. Invalid
+                // persisted metadata fails the current operation before dispatch.
+                let mut resume = Box::pin(session.resume_thread(
+                    "native-thread",
+                    thread_open_params("/workspace"),
+                    Duration::from_secs(2),
+                ));
+                assert!(futures_util::poll!(&mut resume).is_pending());
+                let read = fake.read_request().await;
+                assert_eq!(read["method"], "thread/read");
+                assert_eq!(read["params"]["threadId"], "native-thread");
+                fake.write_result(
+                    read["id"].clone(),
+                    json!({"thread": {"id": "native-thread", "cwd": "relative"}}),
+                )
+                .await;
+                assert!(resume.await.is_err());
+                assert!(!session.is_usable());
+                assert!(matches!(
+                    *bridge.state.lock().await,
+                    CodexRequiredMcpBridgeState::Failed
+                ));
+                assert!(!bootstrap.exists());
+                assert_eq!(
+                    factory.starts.load(Ordering::SeqCst),
+                    2,
+                    "failure must not start a replacement automatically"
+                );
+                assert!(
+                    futures_util::poll!(Box::pin(fake.read_request())).is_pending(),
+                    "no automatic RPC replay"
+                );
+
+                factory.fail_start.store(fail_replacement, Ordering::SeqCst);
+                let next = manager
+                    .get_or_start_with_launch_spec(key.clone(), spec.clone())
+                    .await;
+                assert_eq!(
+                    factory.starts.load(Ordering::SeqCst),
+                    3,
+                    "one replacement attempt"
+                );
+                let reused_other = manager
+                    .get_or_start_with_launch_spec(other_key, spec.clone())
+                    .await
+                    .unwrap();
+                assert!(Arc::ptr_eq(&other.session(), &reused_other.session()));
+                assert!(
+                    session.generation_overlay.lock().unwrap().is_none(),
+                    "old resources were closed"
+                );
+                if fail_replacement {
+                    assert!(
+                        format!("{:#}", next.err().expect("startup failure"))
+                            .contains("injected replacement startup failure")
+                    );
+                    assert!(manager.existing_session(&key).await.is_none());
+                } else {
+                    let next = next.unwrap();
+                    assert_ne!(first.instance(), next.instance());
+                    assert!(next.instance().generation() > first.instance().generation());
+                    let (replacement, mut replacement_rpc) =
+                        factory.sessions.lock().unwrap().pop().unwrap();
+                    assert_eq!(
+                        replacement
+                            .continuation
+                            .lock()
+                            .await
+                            .expected_native_thread_id
+                            .as_deref(),
+                        Some("native-thread")
+                    );
+                    assert!(
+                        replacement
+                            .start_thread(thread_open_params("/workspace"), Duration::from_secs(2))
+                            .await
+                            .is_err(),
+                        "replacement cannot create a new native thread"
+                    );
+                    let reused = manager
+                        .get_or_start_with_launch_spec(key.clone(), spec)
+                        .await
+                        .unwrap();
+                    assert!(Arc::ptr_eq(&next.session(), &reused.session()));
+                    session.close().await.unwrap();
+                    assert!(!manager.remove_if_generation(first.instance()).await);
+                    assert!(manager.is_current_instance(next.instance()).await);
+                    assert!(replacement.is_usable());
+                    assert!(
+                        replacement
+                            .generation_overlay
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .effective_home_path
+                            .exists()
+                    );
+                    assert!(
+                        replacement
+                            .required_mcp_bridge
+                            .as_ref()
+                            .unwrap()
+                            .launch
+                            .bootstrap_path()
+                            .exists()
+                    );
+                    assert!(
+                        futures_util::poll!(Box::pin(replacement_rpc.read_request())).is_pending(),
+                        "acquisition must not replay a user operation"
+                    );
+                }
+                manager.close_all().await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn codex_without_required_mcp_remains_reusable() {
+            let root = tempfile::tempdir_in("/tmp").unwrap();
+            let factory = RecoveryFactory::new(root.path());
+            let manager =
+                CLIAgentRuntimeManager::new(factory.clone(), Duration::from_secs(60)).unwrap();
+            let key = CLIAgentRuntimeSessionKey::new("workspace", "codex", "unmanaged").unwrap();
+            let spec = CliSessionLaunchSpec::codex(
+                CLIAgentRuntimeSessionStartOptions::default(),
+                CliMcpSessionLaunch::Disabled,
+                Some("native-thread".into()),
+            );
+            let first = manager
+                .get_or_start_with_launch_spec(key.clone(), spec.clone())
+                .await
+                .unwrap();
+            assert!(first.session().is_usable());
+            assert!(
+                factory.sessions.lock().unwrap()[0]
+                    .0
+                    .required_mcp_bridge
+                    .is_none()
+            );
+            let reused = manager
+                .get_or_start_with_launch_spec(key, spec)
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&first.session(), &reused.session()));
+            assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+            manager.close_all().await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn codex_liveness_probe_confirms_active_thread_without_loading_turns() {
         let mut fake = FakeCodexIsolationServer::new();
@@ -3272,6 +3507,62 @@ mod tests {
         );
     }
 
+    async fn active_correlation_binding() -> (
+        Arc<crate::cli_runtime::mcp::coordinator::CliMcpCoordinator>,
+        crate::cli_runtime::mcp::grants::CliMcpBoundGrant,
+    ) {
+        use crate::cli_runtime::mcp::grants::CliMcpConnectionId;
+        use pioneer_cli_mcp_bridge::{AttachRequest, BridgeGeneration};
+        let coordinator =
+            Arc::new(crate::cli_runtime::mcp::coordinator::CliMcpCoordinator::default());
+        let instance = CliSessionGenerationAllocator::default()
+            .allocate(CLIAgentRuntimeSessionKey::new("workspace", "codex", "thread").unwrap())
+            .unwrap();
+        let scope =
+            CliMcpGrantScope::new(instance, CliMcpManifestHash::new("a".repeat(64)).unwrap());
+        let issued = coordinator
+            .issue_grant(scope.clone(), codex_mcp_bootstrap_expiry(60_000).unwrap())
+            .await
+            .unwrap();
+        let projection = coordinator
+            .stage_projection(
+                &issued.grant_ref(),
+                CliMcpProjectionFingerprint::new("b".repeat(64)).unwrap(),
+            )
+            .await
+            .unwrap();
+        let bound = coordinator
+            .attach(
+                &AttachRequest {
+                    session_id: issued.bridge_session_id.clone(),
+                    generation: BridgeGeneration::new(1).unwrap(),
+                    nonce: issued.nonce.clone(),
+                },
+                &scope,
+                CliMcpConnectionId::for_test(1),
+            )
+            .await
+            .unwrap();
+        coordinator
+            .mark_projection_ready(&bound, projection.generation, &projection.fingerprint)
+            .await
+            .unwrap();
+        let turn = coordinator
+            .reserve_turn(&issued.grant_ref(), projection.generation, "thread", "turn")
+            .await
+            .unwrap();
+        coordinator
+            .activate_turn(
+                &bound,
+                turn.activation_generation,
+                "native-thread",
+                "native-turn",
+            )
+            .await
+            .unwrap();
+        (coordinator, bound)
+    }
+
     #[tokio::test]
     async fn codex_mcp_timeline_correlation_uses_native_item_identity_in_invoker_audit() {
         let ledger = Arc::new(CodexNativeMcpCorrelationLedger::default());
@@ -3289,9 +3580,15 @@ mod tests {
             })
             .expect("native lifecycle registration");
         let inner = Arc::new(RecordingProviderCallInvoker::default());
+        let (coordinator, bound_grant) = active_correlation_binding().await;
         let invoker = CodexCorrelatingTurnMcpInvoker {
             inner: inner.clone(),
             native_items: ledger,
+            opencode_binding: None,
+            codex_binding: Some(CodexMcpCorrelationBinding {
+                coordinator,
+                bound_grant,
+            }),
         };
         let error = invoker
             .invoke(
@@ -3302,6 +3599,12 @@ mod tests {
                     runtime_id: Some("codex".to_owned()),
                     session_generation: Some(1),
                     provider_call_id: "jsonrpc:7".to_owned(),
+                    native_call: Some(crate::turn_mcp::invoker::NativeMcpCallIdentity {
+                        native_thread_id: "native-thread".into(),
+                        native_turn_id: "native-turn".into(),
+                        native_item_id: "native-item".into(),
+                    }),
+                    admission_deadline: Some(tokio::time::Instant::now() + Duration::from_secs(30)),
                     canonical_callable_name: "mcp__server__tool".to_owned(),
                     arguments,
                     origin: crate::turn_mcp::invoker::TurnMcpInvocationOrigin::CliFacade,
@@ -3379,6 +3682,7 @@ mod tests {
             invoker: Arc::new(NeverCalledInvoker),
             facade_limits: CliMcpFacadeLimits::default(),
             native_items: Arc::new(CodexNativeMcpCorrelationLedger::default()),
+            failed: AtomicBool::new(false),
             state: tokio::sync::Mutex::new(CodexRequiredMcpBridgeState::Pending),
         });
         let mcp_servers = json!({
@@ -3445,6 +3749,10 @@ mod tests {
             .read_line(&mut line)
             .await
             .expect("read initialize response");
+        assert!(
+            !required_bridge.failed.load(Ordering::Acquire),
+            "Serving is not a terminal failure"
+        );
         assert_eq!(
             serde_json::from_str::<JsonValue>(&line).expect("initialize JSON")["id"],
             json!(1)
@@ -3476,6 +3784,10 @@ mod tests {
             .await
             .expect("start task should join")
             .expect("exact list and native thread must complete barrier");
+        assert!(
+            !required_bridge.failed.load(Ordering::Acquire),
+            "Ready remains usable"
+        );
 
         required_bridge
             .prepare_turn("pioneer-thread", "pioneer-turn")
@@ -3497,6 +3809,57 @@ mod tests {
                 .expect("arguments fingerprint"),
             })
             .expect("register exact native item");
+        let used_key = CodexNativeMcpItemKey {
+            native_thread_id: "native-thread".into(),
+            native_turn_id: "native-turn".into(),
+            native_item_id: "native-item".into(),
+        };
+        let fingerprint =
+            crate::cli_runtime::codex_mcp::canonical_value_fingerprint(&json!({"value": 7}))
+                .unwrap();
+        assert!(
+            required_bridge
+                .native_items
+                .claim_codex_exact(
+                    &used_key,
+                    "mcp__server__tool",
+                    &fingerprint,
+                    "first-rpc",
+                    &CancellationToken::new(),
+                    tokio::time::Instant::now() + CliMcpFacadeLimits::default().max_queue_wait
+                )
+                .unwrap()
+        );
+        required_bridge
+            .retarget_turn("pioneer-turn", "native-thread", "native-turn")
+            .await
+            .unwrap();
+        // A repeated native turn notification must preserve the used mark,
+        // including when that same native item is registered again.
+        required_bridge
+            .register_native_item(crate::cli_runtime::codex_mcp::CodexNativeMcpItemBinding {
+                native_thread_id: used_key.native_thread_id.clone(),
+                native_turn_id: used_key.native_turn_id.clone(),
+                native_item_id: used_key.native_item_id.clone(),
+                canonical_callable_name: "mcp__server__tool".into(),
+                arguments_fingerprint: fingerprint.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            required_bridge
+                .native_items
+                .claim_codex_exact(
+                    &used_key,
+                    "mcp__server__tool",
+                    &fingerprint,
+                    "second-rpc",
+                    &CancellationToken::new(),
+                    tokio::time::Instant::now() + CliMcpFacadeLimits::default().max_queue_wait
+                )
+                .unwrap_err()
+                .code,
+            TurnMcpInvocationErrorCode::InvalidRequest
+        );
         let requested_permissions = json!({"network": ["example.com"]});
         let exact = required_bridge
             .native_approval_response(CLIAgentRuntimeNativeMcpApprovalRequest {
@@ -3531,6 +3894,10 @@ mod tests {
             .terminal_turn("pioneer-turn")
             .await
             .expect("terminalize exact MCP turn");
+        assert!(
+            !required_bridge.failed.load(Ordering::Acquire),
+            "a terminal operation does not fail its generation"
+        );
         let terminal = required_bridge
             .native_approval_response(CLIAgentRuntimeNativeMcpApprovalRequest {
                 native_thread_id: "native-thread".to_owned(),
@@ -3605,6 +3972,7 @@ mod tests {
             invoker: Arc::new(NeverCalledInvoker),
             facade_limits: CliMcpFacadeLimits::default(),
             native_items: Arc::new(CodexNativeMcpCorrelationLedger::default()),
+            failed: AtomicBool::new(false),
             state: tokio::sync::Mutex::new(CodexRequiredMcpBridgeState::Pending),
         };
 
@@ -3613,6 +3981,7 @@ mod tests {
             .await
             .expect_err("missing helper must fail the bounded attach barrier");
         bridge.fail_closed().await;
+        assert!(bridge.failed.load(Ordering::Acquire));
         assert!(!bootstrap_path.exists());
         assert!(!supervisor.revoke_session(&process_instance).await);
         assert!(matches!(

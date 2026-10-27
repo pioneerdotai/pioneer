@@ -22,8 +22,44 @@ pub struct PreparedInputBudget {
 pub(crate) async fn prepare(
     provider: &str,
     capabilities: &crate::ProviderCapabilities,
-    mut request: ChatRequest,
+    request: ChatRequest,
 ) -> Result<PreparedInputBudget> {
+    prepare_with_profile(
+        provider,
+        capabilities,
+        request,
+        crate::history::ProjectionProfile::ServiceDefault,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_responses(
+    provider: &str,
+    capabilities: &crate::ProviderCapabilities,
+    request: ChatRequest,
+) -> Result<PreparedInputBudget> {
+    prepare_with_profile(
+        provider,
+        capabilities,
+        request,
+        crate::history::ProjectionProfile::Responses,
+    )
+    .await
+}
+
+async fn prepare_with_profile(
+    provider: &str,
+    capabilities: &crate::ProviderCapabilities,
+    mut request: ChatRequest,
+    profile: crate::history::ProjectionProfile,
+) -> Result<PreparedInputBudget> {
+    // Budget indexes must address the same provider view that materialization
+    // emits, including tool-to-user preview media follow-ups.
+    if let std::borrow::Cow::Owned(messages) =
+        super::project_html_preview_media(provider, &request.messages)
+    {
+        request.messages = messages;
+    }
     if !request
         .messages
         .iter()
@@ -34,11 +70,12 @@ pub(crate) async fn prepare(
             media: vec![],
         });
     }
-    let prepared = super::prepare_messages_for_provider_async(
+    let prepared = super::prepare_messages_for_request_with_profile(
         provider,
-        request.model.as_str(),
         capabilities,
+        &request,
         &request.messages,
+        profile,
     )
     .await?;
     super::ensure_no_unrendered_attachments(provider, &prepared)?;
@@ -46,7 +83,7 @@ pub(crate) async fn prepare(
     let provider = provider.to_owned();
     // Header/document parsing and base64 encoding remain outside async workers
     // and outside every DB scope. The pipeline bounds both count and bytes.
-    tokio::task::spawn_blocking(move || {
+    pioneer_observability::work::spawn_blocking(move || {
         let mut media = Vec::with_capacity(prepared.attachments.len());
         for attachment in prepared.attachments {
             let tokens = estimate(&provider, &request.model, &attachment)?;
@@ -241,7 +278,9 @@ pub fn image_tokens(provider: &str, model: &str, width: u32, height: u32) -> Res
         .div_ceil(100))
 }
 
-/// Exact rational seconds for native limits; rounding is only for estimates.
+/// Rational duration bound for native limits; rounding is only for estimates.
+/// Unsupported optional MP3 trim metadata retains the fully scanned,
+/// untrimmed sample span, which can overestimate but never shorten admission.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct NativeDuration {
     numer: u128,
@@ -1088,16 +1127,12 @@ mod confirmed_duration_regressions {
             )
             .is_err()
         );
-        let mut bad_trim = crate::attachments::regression::mp3().to_vec();
-        // Pinned Lavc encoder string starts at0xb9. Mutating it invalidates tag
-        // CRC while retaining media/frame layout; no bytes are decoded here.
-        bad_trim[0xb9 + 5] ^= 1;
+        let mut bad_trim = crate::attachments::media_fixtures::trimmed_xing_mp3(b"Info");
+        // LAME requires the tag CRC; mutate descriptive data without changing
+        // the MPEG frames. Unlike unprotected Lavc, this checksum is required.
+        bad_trim[33 + 10] ^= 1;
         assert!(native_duration(&bad_trim, "audio/mpeg").is_err());
-        // The pinned codec asset has an unproven tag CRC; hard timing must
-        // reject it. Supported CRC/count/trim domains have independent fixtures.
-        let unproven =
-            native_duration(crate::attachments::regression::mp3(), "audio/mpeg").unwrap_err();
-        assert!(unproven.to_string().contains("CRC"));
+        assert!(native_duration(crate::attachments::regression::mp3(), "audio/mpeg").is_ok());
     }
     #[test]
     fn full_mp4_edit_table_requires_exact_single_identity_in_both_scales() {

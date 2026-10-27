@@ -12,16 +12,22 @@ impl TurnItemHandler for ReasoningHandler {
         item: &TurnItem,
         ts_unix_ms: i64,
     ) {
-        let TurnItem::Reasoning { id, .. } = item else {
+        let TurnItem::Reasoning {
+            id,
+            summary,
+            content,
+        } = item
+        else {
             return;
         };
+        let text = if content.is_empty() { summary } else { content }.join("\n");
 
         projector.start_item_view(
             id,
             turn_id,
             ITEM_TYPE_REASONING,
             TimelineEntryStatus::Running,
-            "".to_owned(),
+            text,
             None,
             item.clone(),
             None,
@@ -92,6 +98,6 @@ impl TurnItemHandler for ReasoningHandler {
 
 impl ReasoningHandler {
     fn is_supported_markdown_version(version: Option<u16>) -> bool {
-        version.is_none_or(|version| version == MARKDOWN_AST_VERSION)
+        version.is_none_or(|version| version == 1 || version == MARKDOWN_AST_VERSION)
     }
 }

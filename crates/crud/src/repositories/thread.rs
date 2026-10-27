@@ -310,7 +310,13 @@ pub async fn insert_user_thread_with_creator<C: ConnectionTrait>(
 
     let (created_by_actor_kind, created_by_actor_id) = actor_ref_to_db(creator);
     let preview_author_json = prepare_preview_author_json(thread_model.preview_author.as_ref())?;
+    let public_start = if access_class == super::membership::PersistedThreadAccessClass::Workspace {
+        Some(super::task_completion_inbox::current_completion_sequence(db).await?)
+    } else {
+        None
+    };
     thread::Entity::insert(thread::ActiveModel {
+        workspace_unread_started_at: sea_orm::NotSet,
         id: Set(thread_model.id.clone()),
         workspace_id: Set(thread_model.workspace_id.clone()),
         name: Set(thread_model.name.clone()),
@@ -331,10 +337,13 @@ pub async fn insert_user_thread_with_creator<C: ConnectionTrait>(
         agent_role: Set(thread_model.agent_role.clone()),
         created_by_actor_id: Set(created_by_actor_id),
         created_by_actor_kind: Set(created_by_actor_kind),
+        inbox_workspace_after_sequence: Set(public_start),
+        inbox_workspace_started_at: Set(public_start.map(|_| created_at)),
         summary: Set(None),
         summary_turn_count: Set(None),
         created_at: Set(created_at),
         updated_at: Set(updated_at),
+        ..Default::default()
     })
     .exec_without_returning(db)
     .await
@@ -378,6 +387,7 @@ async fn upsert_thread_with_actor_columns_prepared<C: ConnectionTrait>(
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
     thread::Entity::insert(thread::ActiveModel {
+        workspace_unread_started_at: sea_orm::NotSet,
         id: Set(thread_model.id.clone()),
         workspace_id: Set(thread_model.workspace_id.clone()),
         name: Set(thread_model.name.clone()),
@@ -416,6 +426,7 @@ async fn upsert_thread_with_actor_columns_prepared<C: ConnectionTrait>(
         summary_turn_count: Set(None),
         created_at: Set(created_at),
         updated_at: Set(updated_at),
+        ..Default::default()
     })
     .on_conflict(
         OnConflict::column(thread::Column::Id)
@@ -560,6 +571,9 @@ pub async fn update_user_thread_management(
 
     let current_name = model.name.clone();
     let current_status = model.status.clone();
+    // Metadata timestamps can be ahead of this operation. Access begins at
+    // the actual management operation, not that unrelated monotonic maximum.
+    let access_started_at = updated_at;
     let updated_at = model.updated_at.max(updated_at);
     let mut changed = false;
     let mut active: thread::ActiveModel = model.into();
@@ -572,8 +586,17 @@ pub async fn update_user_thread_management(
     if let Some(access_class) = access_class
         && current_access != access_class
     {
+        if access_class == super::membership::PersistedThreadAccessClass::Workspace {
+            active.inbox_workspace_after_sequence = Set(Some(
+                super::task_completion_inbox::current_completion_sequence(db).await?,
+            ));
+            active.inbox_workspace_started_at = Set(Some(access_started_at));
+        }
         active.access_class =
             Set(super::membership::persisted_thread_access_class_to_db(access_class).to_owned());
+        if access_class == super::membership::PersistedThreadAccessClass::Workspace {
+            active.workspace_unread_started_at = Set(updated_at.timestamp());
+        }
         changed = true;
     }
     if let Some(archived) = archived {
@@ -600,6 +623,35 @@ pub async fn update_user_thread_management(
         changed,
         access_changed: access_class.is_some_and(|next| next != current_access),
     }))
+}
+
+/// Raw observation candidates, including hidden and archived (Closed) threads.
+/// Authorization belongs to the caller. Advance by the last *candidate* ID,
+/// including rows the caller cannot disclose; a filtered empty page is not EOF.
+pub async fn list_read_candidates_page<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    after_thread_id: Option<&str>,
+    limit: u64,
+) -> Result<Vec<String>> {
+    anyhow::ensure!(
+        (1..=200).contains(&limit),
+        "thread candidate page limit must be 1..=200"
+    );
+    let mut query = thread::Entity::find()
+        .select_only()
+        .column(thread::Column::Id)
+        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()));
+    if let Some(after) = after_thread_id {
+        query = query.filter(thread::Column::Id.gt(after.to_owned()));
+    }
+    query
+        .order_by_asc(thread::Column::Id)
+        .limit(limit)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to list thread read candidates")
 }
 
 pub async fn list_threads_by_workspace<C: ConnectionTrait>(
@@ -695,6 +747,51 @@ pub async fn update_thread_name_if_changed<C: ConnectionTrait>(
         .context("failed to conditionally update thread name")?;
 
     Ok(true)
+}
+
+/// A single writer statement revalidates the title and, for native names, its
+/// exact durable owner at commit. No provider work happens under DB capacity.
+pub async fn update_automatic_thread_name<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    name: &str,
+    fallback: Option<&str>,
+    binding: Option<&crate::CliRuntimeThreadBindingRecord>,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let mut sql = String::from(
+        "UPDATE thread SET name = ?, updated_at = ? WHERE id = ? \
+         AND (name IS NULL OR name = '' OR name = ?) AND (name IS NULL OR name != ?)",
+    );
+    let mut values: Vec<sea_orm::Value> = vec![
+        name.into(),
+        updated_at.into(),
+        thread_id.into(),
+        fallback.map(str::to_owned).into(),
+        name.into(),
+    ];
+    if let Some(binding) = binding {
+        sql.push_str(
+            " AND workspace_id = ? AND EXISTS (SELECT 1 FROM thread_cli_runtime_binding b \
+            WHERE b.thread_id = thread.id AND b.workspace_id = ? AND b.runtime_id = ? \
+            AND b.runtime_kind = 'codex' AND b.native_thread_id = ? AND b.status = 'active')",
+        );
+        values.extend([
+            binding.workspace_id.clone().into(),
+            binding.workspace_id.clone().into(),
+            binding.runtime_id.clone().into(),
+            binding.native_thread_id.clone().into(),
+        ]);
+    }
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .await
+        .context("failed to accept automatic thread name")?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn update_thread_summary<C: ConnectionTrait>(

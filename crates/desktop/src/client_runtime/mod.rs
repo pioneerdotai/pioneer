@@ -73,6 +73,13 @@ impl DesktopRuntimeCoordinator {
     }
 
     pub(crate) fn install(cx: &mut App) {
+        Self::install_with_startup(None, cx);
+    }
+
+    pub(crate) fn install_with_startup(
+        trace: Option<pioneer_observability::DesktopStartupTrace>,
+        cx: &mut App,
+    ) {
         if cx.has_global::<Self>() {
             return;
         }
@@ -91,7 +98,8 @@ impl DesktopRuntimeCoordinator {
             ),
         ));
         let effect_router = Arc::new(DesktopPlatformEffectRouter);
-        let storage_adapter = DesktopSessionStorageAdapter::start(core.clone(), &effect_router);
+        let storage_adapter =
+            DesktopSessionStorageAdapter::start(core.clone(), &effect_router, trace);
         let binding_router = cx.new(|cx| DesktopClientBindingRouter::new(core.clone(), cx));
         let registrar = DesktopClientBindingRouter::registrar(&binding_router, &core, cx);
         let session_demand =
@@ -165,8 +173,7 @@ impl DesktopRuntimeCoordinator {
 
     pub(crate) fn observe_startup(trace: pioneer_observability::DesktopStartupTrace, cx: &mut App) {
         let owner = cx.global::<Self>();
-        let startup =
-            startup::DesktopStartupCoordinator::new(trace, owner.core(), owner.registrar(), cx);
+        let startup = startup::DesktopStartupCoordinator::new(trace, owner.core(), cx);
         cx.global_mut::<Self>().startup = Some(startup);
     }
 

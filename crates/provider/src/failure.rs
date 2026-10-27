@@ -332,11 +332,24 @@ fn is_tool_calling_capability_mismatch(message_lower: &str) -> bool {
 }
 
 fn is_streaming_capability_mismatch(message_lower: &str) -> bool {
-    message_lower.contains("stream")
-        && (message_lower.contains("does not support")
-            || message_lower.contains("not support")
-            || message_lower.contains("unsupported")
-            || message_lower.contains("streaming disabled"))
+    // Match the capability itself, not words such as "upstream" or a
+    // transport wrapper ("provider stream error: unsupported history").
+    [
+        "does not support streaming",
+        "does not support stream",
+        "not support streaming",
+        "streaming is not supported",
+        "stream is not supported",
+        "streaming not supported",
+        "stream not supported",
+        "unsupported streaming",
+        "unsupported stream",
+        "streaming unsupported",
+        "stream unsupported",
+        "streaming disabled",
+    ]
+    .iter()
+    .any(|pattern| message_lower.contains(pattern))
 }
 
 fn is_unsupported_parameter(message_lower: &str, provider_code: Option<&str>) -> bool {
@@ -386,6 +399,44 @@ pub fn extract_provider_code(message: &str) -> Option<String> {
     let rest = &message[start + marker.len()..];
     let end = rest.find('"')?;
     Some(rest[..end].to_owned())
+}
+
+#[cfg(test)]
+mod replay_classification_tests {
+    use super::*;
+
+    #[test]
+    fn history_errors_wrapped_by_stream_transport_do_not_disable_streaming() {
+        for message in [
+            "provider stream error: native replay unsupported: upstream binding authority is unproven",
+            "provider stream error: OpenRouter opaque native replay unsupported: upstream prefix/account authority is not exposed by this Chat transport",
+            "provider stream error: unsupported history for this endpoint",
+        ] {
+            assert_ne!(
+                classify_provider_failure_class(message, ProviderFailureStage::Connect, None, None),
+                ProviderFailureClass::UnsupportedStreaming,
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_streaming_rejection_is_still_a_streaming_capability_failure() {
+        for message in [
+            "model does not support streaming",
+            "streaming is not supported",
+            "unsupported streaming",
+        ] {
+            assert_eq!(
+                classify_provider_failure_class(
+                    message,
+                    ProviderFailureStage::Connect,
+                    Some(400),
+                    None
+                ),
+                ProviderFailureClass::UnsupportedStreaming,
+            );
+        }
+    }
 }
 
 /// Read a numeric retry interval from already-lowercased adapter text.

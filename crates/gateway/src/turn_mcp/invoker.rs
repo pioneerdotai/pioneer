@@ -35,6 +35,14 @@ impl TurnMcpInvocationOrigin {
     }
 }
 
+/// Native identity captured by the managed CLI adapter, never from model input.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct NativeMcpCallIdentity {
+    pub(crate) native_thread_id: String,
+    pub(crate) native_turn_id: String,
+    pub(crate) native_item_id: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TurnMcpInvocation {
     pub(crate) workspace_id: String,
@@ -43,6 +51,9 @@ pub(crate) struct TurnMcpInvocation {
     pub(crate) runtime_id: Option<String>,
     pub(crate) session_generation: Option<u64>,
     pub(crate) provider_call_id: String,
+    pub(crate) native_call: Option<NativeMcpCallIdentity>,
+    /// Admission only, not the lifetime of an admitted tool execution.
+    pub(crate) admission_deadline: Option<tokio::time::Instant>,
     pub(crate) canonical_callable_name: String,
     pub(crate) arguments: JsonValue,
     pub(crate) origin: TurnMcpInvocationOrigin,
@@ -465,34 +476,55 @@ impl GatewayTurnMcpInvoker {
                     "MCP projection is stale or is not bound to this execution",
                 )
             })?;
-        let revalidated = self
-            .execution_leases
-            .revalidate_for_turn(
-                self.crud_store.as_ref(),
-                &context,
-                invocation.workspace_id.as_str(),
-                invocation.thread_id.as_str(),
-                invocation.turn_id.as_str(),
-                ResourceAction::McpUse,
-                self.authorization_invalidation_hub
-                    .current_revision()
-                    .await
-                    .map_err(|_| {
-                        invocation_error(
-                            TurnMcpInvocationErrorCode::ProjectionUnavailable,
-                            "MCP authorization policy generation is unavailable",
-                        )
-                    })?,
-            )
+        let native_family =
+            super::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id);
+        let actions = native_family
+            .map(|family| family.actions(&binding.raw_tool_name))
+            .transpose()
+            .map_err(|_| {
+                invocation_error(
+                    TurnMcpInvocationErrorCode::ToolUnbound,
+                    "unknown native callable",
+                )
+            })?
+            .unwrap_or_else(|| vec![ResourceAction::McpUse]);
+        let revision = self
+            .authorization_invalidation_hub
+            .current_revision()
             .await
             .map_err(|_| {
                 invocation_error(
-                    TurnMcpInvocationErrorCode::PermissionDenied,
-                    "current execution authorization no longer permits MCP use",
+                    TurnMcpInvocationErrorCode::ProjectionUnavailable,
+                    "MCP authorization policy generation is unavailable",
                 )
             })?;
+        let mut revalidated = None;
+        for action in actions {
+            if let Ok(proof) = self
+                .execution_leases
+                .revalidate_for_turn(
+                    self.crud_store.as_ref(),
+                    &context,
+                    invocation.workspace_id.as_str(),
+                    invocation.thread_id.as_str(),
+                    invocation.turn_id.as_str(),
+                    action,
+                    revision,
+                )
+                .await
+            {
+                revalidated = Some(proof);
+                break;
+            }
+        }
+        let revalidated = revalidated.ok_or_else(|| {
+            invocation_error(
+                TurnMcpInvocationErrorCode::PermissionDenied,
+                "current execution authorization no longer permits MCP use",
+            )
+        })?;
 
-        if binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID {
+        if binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID && native_family.is_none() {
             let action_gate = AuthorizationService::new().authorize_action(
                 revalidated.principal().kind,
                 revalidated.principal().role_key.as_ref(),

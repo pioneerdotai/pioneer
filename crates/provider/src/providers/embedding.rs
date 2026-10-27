@@ -1,4 +1,4 @@
-//! Validation shared only by the two implemented indexed embeddings APIs.
+//! Validation shared by the implemented indexed embeddings APIs.
 use anyhow::{Result, bail};
 use serde::Deserialize;
 
@@ -11,9 +11,8 @@ pub(super) struct ApiEmbeddingData {
 }
 
 #[derive(Debug, Deserialize)]
-pub(super) struct ApiEmbeddingUsage {
-    pub prompt_tokens: Option<u64>,
-}
+#[serde(transparent)]
+pub(super) struct ApiEmbeddingUsage(crate::usage::ChatUsage);
 
 /// Actual indexed float response schema shared by both implemented endpoints.
 #[derive(Debug, Deserialize)]
@@ -33,11 +32,12 @@ impl IndexedEmbeddingResponse {
 
 impl From<ApiEmbeddingUsage> for TokenUsage {
     fn from(usage: ApiEmbeddingUsage) -> Self {
-        Self {
-            input_tokens: usage.prompt_tokens,
-            // Embeddings have no generated output tokens.
-            output_tokens: Some(0),
-        }
+        let mut usage = usage.0.normalized();
+        // Embeddings have no generated output or reasoning tokens. Preserve
+        // reported totals/cache evidence and the shared bounded metric record.
+        usage.output_tokens = Some(0);
+        usage.reasoning_tokens = None;
+        usage
     }
 }
 
@@ -118,12 +118,19 @@ mod tests {
 
     #[test]
     fn embedding_usage_preserves_missing_input_as_unknown() {
-        let usage: TokenUsage = ApiEmbeddingUsage {
-            prompt_tokens: None,
-        }
-        .into();
+        let usage: TokenUsage = serde_json::from_value::<ApiEmbeddingUsage>(serde_json::json!({}))
+            .unwrap()
+            .into();
         assert_eq!(usage.input_tokens, None);
         assert_eq!(usage.output_tokens, Some(0));
+        let reported: TokenUsage = serde_json::from_value::<ApiEmbeddingUsage>(serde_json::json!({
+            "prompt_tokens":7,"total_tokens":7,"private_payload":"must not survive"
+        }))
+        .unwrap()
+        .into();
+        assert_eq!(reported.input_tokens, Some(7));
+        assert_eq!(reported.reported_total_tokens, Some(7));
+        assert!(reported.raw_usage.unwrap().get("private_payload").is_none());
     }
 }
 

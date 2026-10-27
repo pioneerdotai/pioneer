@@ -25,6 +25,30 @@ pub trait Provider: Send + Sync {
     /// Human-readable provider name (e.g. "openrouter", "anthropic").
     fn name(&self) -> &str;
 
+    /// Actual adapter API, independent of the API preferred by the model catalog.
+    fn usage_api(&self) -> &'static str {
+        "chat_completions"
+    }
+
+    fn usage_api_version(&self) -> Option<String> {
+        None
+    }
+
+    /// Public route identity: an opaque endpoint fingerprint and API template.
+    /// Never credentials, query, private host or configured path fragments.
+    fn usage_route(&self) -> Option<String> {
+        None
+    }
+
+    /// Immutable per-request route evidence, captured before physical dispatch.
+    fn request_usage_profile(&self, _request: &ChatRequest) -> Result<crate::ProviderUsageProfile> {
+        Ok(crate::ProviderUsageProfile {
+            api: self.usage_api().into(),
+            api_version: self.usage_api_version(),
+            route: self.usage_route(),
+        })
+    }
+
     /// Non-secret identity of the credential/account/endpoint authority that
     /// created this instance. Registry-managed providers always expose one;
     /// directly constructed test providers may remain unbound.
@@ -35,6 +59,27 @@ pub trait Provider: Send + Sync {
     /// Declares what features this provider supports.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
+    }
+
+    /// Prepare connection-owned model facts before selecting tools or admitting input.
+    /// The default does no work; providers with lazy discovery own its caching.
+    /// Callers must keep this future within their cancellation/deadline scope.
+    async fn prepare_model(&self, _model: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Budget facts for the selected connection, including discovered private
+    /// models. Public providers retain the existing catalog resolution.
+    async fn model_limits(&self, model: &str) -> Result<crate::catalog::CatalogLimits> {
+        Ok(crate::catalog::model_catalog()?.limits(self.name(), model))
+    }
+
+    /// Optional authority-owned model facts, including usage accounting evidence.
+    /// When present, the owning provider also decides `model_tool_calling`;
+    /// wrappers must not substitute public facts for that model decision.
+    /// These facts must never be published into the process-wide public catalog.
+    fn model_catalog_entry(&self, _model: &str) -> Option<crate::catalog::CatalogModel> {
+        None
     }
 
     /// Adapter capability is a protocol ceiling; known catalog model support
@@ -168,10 +213,12 @@ mod tests {
 
         async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse> {
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "mock response".into(),
                 usage: Some(TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
+                    ..Default::default()
                 }),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -219,6 +266,8 @@ mod tests {
     #[tokio::test]
     async fn mock_provider_chat() {
         let provider = MockProvider;
+        // Default preparation must not require a catalog entry or discovery.
+        provider.prepare_model("test-model").await.unwrap();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![ChatMessage::user("hello")],

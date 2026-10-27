@@ -1192,6 +1192,7 @@ pub enum SystemEventMessage {
     RecoveryAttached,
     RetryScheduled,
     RetryStarted,
+    CodexRequestRetried,
     RecoverySucceeded,
     RecoveryFailed,
     ToolRetryScheduled { tool_name: String },
@@ -1609,6 +1610,10 @@ pub fn system_event_presentation(
             message: SystemEventMessage::RecoveryFailed,
             label: SystemEventLabel::Error,
         },
+        Some("codex_request_retried") => SystemEventPresentation {
+            message: SystemEventMessage::CodexRequestRetried,
+            label: SystemEventLabel::Retry,
+        },
         Some("item_tool_retry_scheduled") => {
             let tool_name = tool_name_from_details(details);
             SystemEventPresentation {
@@ -1668,6 +1673,7 @@ mod tests {
 
     fn item_view_with_origin(timeline_origin: Option<TimelineOrigin>) -> ItemView {
         ItemView {
+            html_publications: Vec::new(),
             id: "item_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             item_type: "agentMessage".to_owned(),
@@ -2299,6 +2305,7 @@ mod tests {
                 resume: None,
             }],
             items: vec![ItemView {
+                html_publications: Vec::new(),
                 id: "agent_1".to_owned(),
                 turn_id: "turn_1".to_owned(),
                 item_type: "agent_message".to_owned(),

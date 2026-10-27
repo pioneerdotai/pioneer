@@ -274,6 +274,7 @@ pub(super) async fn resolve_turn_author_snapshot(
         .context("failed to resolve Turn author avatar")?
         .map(|avatar| hex::encode(avatar.content_hash));
     Ok(Some(pioneer_protocol::TurnAuthorSnapshot {
+        cli_runtime_kind: None,
         actor: actor.clone(),
         display_name: principal.display_name,
         nickname: principal.nickname,
@@ -287,6 +288,7 @@ pub(super) async fn resolve_turn_author_snapshot(
 /// instead of calling this helper.
 pub(super) fn system_turn_author_snapshot() -> pioneer_protocol::TurnAuthorSnapshot {
     pioneer_protocol::TurnAuthorSnapshot {
+        cli_runtime_kind: None,
         actor: pioneer_protocol::PersistedActorRef::System,
         display_name: "System".to_owned(),
         nickname: "system".to_owned(),
@@ -1047,6 +1049,18 @@ impl MessageProcessor {
                 }
                 return;
             }
+            let sidebar_visible = outcome.materialization.thread.sidebar_visibility
+                == pioneer_protocol::ThreadSidebarVisibility::Visible;
+            if sidebar_visible {
+                self.dirty_push(
+                    &outcome.completed_notification.workspace_id,
+                    Some(&outcome.completed_notification.thread_id),
+                    None,
+                    None,
+                    false,
+                    None,
+                );
+            }
             log_message_turn_outcome(
                 &params,
                 input_metrics,
@@ -1103,8 +1117,13 @@ impl MessageProcessor {
                 outcome.completed_notification.turn.id.as_str(),
             )
             .await;
-            self.notify_thread_tree_changed(outcome.completed_notification.workspace_id.clone())
+            if sidebar_visible {
+                self.notify_thread_unread_legacy(
+                    &outcome.completed_notification.workspace_id,
+                    &outcome.completed_notification.thread_id,
+                )
                 .await;
+            }
         })
     }
 }

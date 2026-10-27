@@ -8,6 +8,7 @@ mod owner;
 mod permission_selector;
 mod plugin_picker;
 mod queries;
+mod startup;
 mod view;
 mod voice;
 mod voice_owner;
@@ -39,13 +40,7 @@ impl ComposerView {
     pub(crate) fn can_submit_message(&self, cx: &Context<Self>) -> bool {
         let composer_text = self.composer_state.read(cx).value();
         let effective_capabilities = self.effective_composer_capabilities();
-        let scoped_write_allowed = if self.composer_domain().selected_mode
-            == pioneer_client::timeline::types::ThreadMode::Message
-        {
-            self.can_write_active_thread_presentation()
-        } else {
-            self.can_start_active_thread_agent_presentation()
-        };
+        let scoped_write_allowed = self.composer_scoped_write_allowed();
         can_submit_composer_message(ComposerSubmitAvailabilityInput {
             gateway_connected: desktop_composer_transport_ready(self.connection_state)
                 && scoped_write_allowed,
@@ -61,6 +56,16 @@ impl ComposerView {
             has_capabilities: !effective_capabilities.is_empty()
                 || !self.composer_domain().skill_selections.is_empty(),
         })
+    }
+
+    fn composer_scoped_write_allowed(&self) -> bool {
+        if self.composer_domain().selected_mode
+            == pioneer_client::timeline::types::ThreadMode::Message
+        {
+            self.can_write_active_thread_presentation()
+        } else {
+            self.can_start_active_thread_agent_presentation()
+        }
     }
 }
 

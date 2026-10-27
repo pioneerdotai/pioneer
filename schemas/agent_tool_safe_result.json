@@ -33,6 +33,13 @@
     },
     "status": {
       "$ref": "#/$defs/AgentToolResultStatus"
+    },
+    "targetOptions": {
+      "description": "Refreshed opaque destinations after thread creation, including replay.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentToolTargetOption"
+      }
     }
   },
   "additionalProperties": false,
@@ -75,6 +82,23 @@
         "completed",
         "denied",
         "failed"
+      ]
+    },
+    "AgentToolTargetOption": {
+      "description": "Opaque action target projected by the server. The model never receives a\nthread, route, workspace, capsule or Gateway identifier and therefore\ncannot turn guessed infrastructure IDs into an existence oracle.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label"
       ]
     }
   }

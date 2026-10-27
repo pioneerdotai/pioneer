@@ -1696,12 +1696,21 @@ add_confirm = "Добавить этого участника?"
 remove_confirm = "Удалить этого участника?"
 
 [tasks.notifications]
+mark_all_read = "Прочитать всё"
 title = "Результаты задач"
 loading = "Загрузка результатов…"
-empty = "Результатов задач нет"
+empty = "Нет непрочитанных результатов задач"
 task = "Задача"
 mark_read = "Отметить прочитанным"
 completed = "Задача завершена"
+
+open = "Открыть тред"
+more = "Загрузить ещё"
+read = "Прочитано"
+unread = "Не прочитано"
+retry = "Повторить"
+loading_failed = "Не удалось обновить результаты задач"
+timed_out = "Время истекло"
 
 [settings.self_improvement.status]
 title = "Активность"

@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 const OPENAI_PROVIDER_ID: &str = "openai";
 const OPENROUTER_PROVIDER_ID: &str = "openrouter";
+const VERCEL_PROVIDER_ID: &str = "vercel-ai-gateway";
 const LOCAL_PROVIDER_ID: &str = "local";
 const LOCAL_EMBEDDING_MODELS_RELATIVE_DIR: &[&str] = &["models", "embedding", "text"];
 const LOCAL_EMBEDDING_DOWNLOAD_TIMEOUT_SECS: u64 = 15 * 60;
@@ -535,7 +536,7 @@ pub(crate) fn spawn_local_embedding_model_download_if_needed(
     };
 
     let files_for_task = files;
-    tokio::task::spawn_blocking(move || {
+    pioneer_observability::work::spawn_blocking(move || {
         let cancellation = download_lease.cancellation();
         let result =
             download_local_embedding_model_files(&files_for_task, info, None, &cancellation);
@@ -557,7 +558,7 @@ pub(crate) async fn ensure_local_embedding_model_downloaded_if_needed(
         return Ok(false);
     };
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = pioneer_observability::work::spawn_blocking(move || {
         let cancellation = download_lease.cancellation();
         let result = download_local_embedding_model_files(
             &files,
@@ -768,9 +769,11 @@ pub(crate) async fn remove_local_embedding_model_install(
         .ok_or_else(|| format!("unknown local embedding model `{model}`"))?;
     cancel_active_local_embedding_model_download(&files).await?;
 
-    tokio::task::spawn_blocking(move || remove_local_embedding_model_files_with_retry(&files))
-        .await
-        .map_err(|error| format!("local embedding model cleanup task failed: {error}"))?
+    pioneer_observability::work::spawn_blocking(move || {
+        remove_local_embedding_model_files_with_retry(&files)
+    })
+    .await
+    .map_err(|error| format!("local embedding model cleanup task failed: {error}"))?
 }
 
 fn remove_local_embedding_model_files_with_retry(
@@ -1166,7 +1169,13 @@ pub(crate) fn embedding_provider_readiness_from_settings(
     }
 
     if settings.embedding_dimension.is_none()
-        && settings.provider != Some(GatewayThreadEpisodicVectorProvider::OpenRouter)
+        && !matches!(
+            settings.provider,
+            Some(
+                GatewayThreadEpisodicVectorProvider::OpenRouter
+                    | GatewayThreadEpisodicVectorProvider::VercelAiGateway
+            )
+        )
     {
         return EmbeddingProviderReadinessDiagnostic::new(
             EmbeddingProviderReadinessState::MissingConfiguration,
@@ -1231,6 +1240,7 @@ fn vector_provider_id(provider: Option<GatewayThreadEpisodicVectorProvider>) -> 
     match provider {
         Some(GatewayThreadEpisodicVectorProvider::OpenAi) => OPENAI_PROVIDER_ID,
         Some(GatewayThreadEpisodicVectorProvider::OpenRouter) => OPENROUTER_PROVIDER_ID,
+        Some(GatewayThreadEpisodicVectorProvider::VercelAiGateway) => VERCEL_PROVIDER_ID,
         Some(GatewayThreadEpisodicVectorProvider::Local) => LOCAL_PROVIDER_ID,
         None => "none",
     }
@@ -1601,29 +1611,53 @@ impl RemoteEmbeddingProvider {
         use_search_instructions: bool,
         provider: Arc<dyn Provider>,
     ) -> Result<Self, ThreadEpisodicEmbeddingError> {
-        Self::ensure_provider_supports_embeddings(
+        Self::aggregator_with_max_input_tokens(
             OPENROUTER_PROVIDER_ID,
-            model,
-            provider.as_ref(),
-        )?;
-        let model_info = match openrouter_embedding_model_info_with_input_limit(
             model,
             explicit_dimension,
             explicit_max_input_tokens,
-        ) {
-            Ok(model_info) => model_info,
-            Err(_) if explicit_dimension.is_none() => {
-                let dimension = Self::probe_embedding_dimension(
-                    OPENROUTER_PROVIDER_ID,
-                    model,
-                    provider.as_ref(),
-                )?;
+            normalized,
+            use_search_instructions,
+            provider,
+        )
+    }
+
+    pub(crate) fn aggregator_with_max_input_tokens(
+        provider_id: &'static str,
+        model: &str,
+        explicit_dimension: Option<usize>,
+        explicit_max_input_tokens: Option<usize>,
+        normalized: bool,
+        use_search_instructions: bool,
+        provider: Arc<dyn Provider>,
+    ) -> Result<Self, ThreadEpisodicEmbeddingError> {
+        Self::ensure_provider_supports_embeddings(provider_id, model, provider.as_ref())?;
+        let known = if provider_id == OPENROUTER_PROVIDER_ID {
+            match openrouter_embedding_model_info_with_input_limit(
+                model,
+                explicit_dimension,
+                explicit_max_input_tokens,
+            ) {
+                Ok(info) => Some(info),
+                Err(error) if explicit_dimension.is_some() => return Err(error),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let model_info = match known {
+            Some(model_info) => model_info,
+            None => {
+                let dimension = match explicit_dimension.filter(|dimension| *dimension > 0) {
+                    Some(dimension) => dimension,
+                    None => Self::probe_embedding_dimension(provider_id, model, provider.as_ref())?,
+                };
                 OpenRouterEmbeddingModelInfo {
                     model: model.to_owned(),
                     dimension,
                     max_batch_size:
                         pioneer_provider::providers::embedding::EmbeddingBatchLimits::for_model(
-                            OPENROUTER_PROVIDER_ID,
+                            provider_id,
                             model,
                             Some(dimension),
                             None,
@@ -1631,7 +1665,7 @@ impl RemoteEmbeddingProvider {
                         )
                         .map_err(|error| {
                             ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-                                OPENROUTER_PROVIDER_ID,
+                                provider_id,
                                 model,
                                 error.to_string(),
                             )
@@ -1643,11 +1677,10 @@ impl RemoteEmbeddingProvider {
                     custom: true,
                 }
             }
-            Err(error) => return Err(error),
         };
 
         Ok(Self {
-            provider_id: OPENROUTER_PROVIDER_ID,
+            provider_id,
             model: model_info.model,
             dimension: model_info.dimension,
             max_batch_size: model_info.max_batch_size,
@@ -1716,10 +1749,14 @@ impl RemoteEmbeddingProvider {
                         format!("failed to create embedding runtime bridge: {error}"),
                     )
                 })?;
-            runtime.block_on(provider.embed(request))
+            let _runtime_observer = pioneer_observability::runtime::register(
+                runtime.handle(),
+                pioneer_observability::runtime::RuntimeRole::GatewayPatch,
+            );
+            _runtime_observer.block_on(&runtime, provider.embed(request))
         };
 
-        result.map_err(|error| Self::map_provider_error(provider_id, model, error))
+        result.map_err(|error| Self::map_provider_error(provider_id, model, provider, error))
     }
 
     fn probe_embedding_dimension(
@@ -1757,10 +1794,30 @@ impl RemoteEmbeddingProvider {
     fn map_provider_error(
         provider_id: &str,
         model: &str,
+        provider: &dyn Provider,
         error: anyhow::Error,
     ) -> ThreadEpisodicEmbeddingError {
-        let message = format!("{error:#}");
-        if provider_embedding_error_is_retryable(&error) {
+        // Adapter facts must be consumed before the intentionally opaque error is dropped.
+        let classification = provider.classify_failure(&error);
+        let retryable = classification.as_ref().map_or_else(
+            || provider_embedding_error_is_retryable(&error),
+            |failure| {
+                matches!(
+                    failure.class,
+                    pioneer_protocol::ProviderFailureClass::NetworkTransient
+                        | pioneer_protocol::ProviderFailureClass::RateLimit
+                        | pioneer_protocol::ProviderFailureClass::Provider5xx
+                )
+            },
+        );
+        let message = classification.map_or_else(
+            || "embedding provider request failed (unclassified transport)".to_owned(),
+            |failure| format!(
+                "embedding provider request failed (class={:?}, stage=embedding_request, http_status={:?}, retry_after_ms={:?})",
+                failure.class, failure.http_status, failure.retry_after_ms
+            ),
+        );
+        if retryable {
             ThreadEpisodicEmbeddingError::retryable_provider_failure(provider_id, model, message)
         } else {
             ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
@@ -1773,7 +1830,7 @@ impl RemoteEmbeddingProvider {
 }
 
 fn provider_embedding_error_is_retryable(error: &anyhow::Error) -> bool {
-    if error.chain().any(|cause| {
+    error.chain().any(|cause| {
         cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
             error.is_timeout()
                 || error.is_connect()
@@ -1788,11 +1845,7 @@ fn provider_embedding_error_is_retryable(error: &anyhow::Error) -> bool {
                     ) || status.is_server_error()
                 })
         })
-    }) {
-        return true;
-    }
-
-    provider_embedding_error_message_is_retryable(format!("{error:#}").as_str())
+    })
 }
 
 pub(crate) fn provider_embedding_error_message_is_retryable(message: &str) -> bool {
@@ -2242,6 +2295,17 @@ mod tests {
         ));
     }
 
+    #[derive(Debug)]
+    struct OpaqueEmbeddingFailure(pioneer_provider::ProviderFailureClassification);
+
+    impl std::fmt::Display for OpaqueEmbeddingFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("provider request failed: timeout rate limit")
+        }
+    }
+
+    impl std::error::Error for OpaqueEmbeddingFailure {}
+
     struct FakeRemoteProvider {
         name: &'static str,
         embeddings: bool,
@@ -2278,6 +2342,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for FakeRemoteProvider {
+        fn classify_failure(
+            &self,
+            error: &anyhow::Error,
+        ) -> Option<pioneer_provider::ProviderFailureClassification> {
+            error
+                .downcast_ref::<OpaqueEmbeddingFailure>()
+                .map(|error| error.0.clone())
+        }
+
         fn name(&self) -> &str {
             self.name
         }
@@ -2570,7 +2643,12 @@ mod tests {
             false,
             Arc::new(FakeRemoteProvider::with_responses(
                 "openai",
-                vec![Err(anyhow::anyhow!("OpenAI API error (429): rate limit"))],
+                vec![Err(OpaqueEmbeddingFailure(
+                    pioneer_provider::ProviderFailureClassification::new(
+                        pioneer_protocol::ProviderFailureClass::RateLimit,
+                    ),
+                )
+                .into())],
             )),
         )
         .expect("provider")
@@ -2584,13 +2662,52 @@ mod tests {
             false,
             Arc::new(FakeRemoteProvider::with_responses(
                 "openai",
-                vec![Err(anyhow::anyhow!("OpenAI API error (401): invalid key"))],
+                vec![Err(OpaqueEmbeddingFailure(
+                    pioneer_provider::ProviderFailureClassification::new(
+                        pioneer_protocol::ProviderFailureClass::AuthOrPermission,
+                    ),
+                )
+                .into())],
             )),
         )
         .expect("provider")
         .embed_text("hello")
         .expect_err("invalid key should fail");
         assert!(!invalid_key.is_retryable());
+    }
+
+    #[test]
+    fn embedding_adapter_classification_overrides_opaque_or_misleading_display() {
+        use pioneer_protocol::ProviderFailureClass as Class;
+        let provider = FakeRemoteProvider::with_responses("openrouter", vec![]);
+        for (class, status, retryable) in [
+            (Class::AuthOrPermission, 403, false),
+            (Class::RateLimit, 429, true),
+            (Class::Provider5xx, 503, true),
+            (Class::Unknown, 400, false),
+        ] {
+            let mut facts = pioneer_provider::ProviderFailureClassification::new(class);
+            facts.http_status = Some(status);
+            facts.retry_after_ms = Some(1200);
+            let error = RemoteEmbeddingProvider::map_provider_error(
+                "openrouter",
+                "fixture",
+                &provider,
+                OpaqueEmbeddingFailure(facts).into(),
+            );
+            assert_eq!(error.is_retryable(), retryable);
+            assert!(error.message.contains(&status.to_string()));
+            assert!(error.message.contains("1200"));
+            assert_eq!(error.provider_id, "openrouter");
+            assert_eq!(error.model, "fixture");
+        }
+        let unknown = RemoteEmbeddingProvider::map_provider_error(
+            "openrouter",
+            "fixture",
+            &provider,
+            anyhow::anyhow!("timeout rate limit 503"),
+        );
+        assert!(!unknown.is_retryable());
     }
 
     #[test]
@@ -2681,6 +2798,31 @@ mod tests {
     }
 
     #[test]
+    fn vercel_remote_embeddings_probe_dimension_without_direct_vendor_assumptions() {
+        let provider = RemoteEmbeddingProvider::aggregator_with_max_input_tokens(
+            "vercel-ai-gateway",
+            "openai/text-embedding-3-small",
+            None,
+            Some(4096),
+            true,
+            false,
+            Arc::new(FakeRemoteProvider::with_responses(
+                "vercel-ai-gateway",
+                vec![
+                    Ok(embedding_response(vec![vec![0.1; 3]])),
+                    Ok(embedding_response(vec![vec![0.2; 3]])),
+                ],
+            )),
+        )
+        .expect("Vercel remote embeddings");
+        assert_eq!(provider.provider_id(), "vercel-ai-gateway");
+        assert_eq!(provider.model(), "openai/text-embedding-3-small");
+        assert_eq!(provider.dimension(), 3);
+        assert_eq!(provider.max_input_tokens(), 4096);
+        assert_eq!(provider.embed_text("hello").unwrap(), vec![0.2; 3]);
+    }
+
+    #[test]
     fn remote_embedding_provider_bounds_oversized_documents_and_pools_all_chunks() {
         let text = "bounded multilingual document ".repeat(80);
         let prepared = prepare_embedding_input(text.as_str(), 64, false)
@@ -2727,9 +2869,12 @@ mod tests {
             "openrouter",
             vec![
                 Ok(embedding_response(vec![vec![3.0, 4.0]])),
-                Err(anyhow::anyhow!(
-                    "error decoding response body: missing field `data`"
-                )),
+                Err(
+                    OpaqueEmbeddingFailure(pioneer_provider::ProviderFailureClassification::new(
+                        pioneer_protocol::ProviderFailureClass::NetworkTransient,
+                    ))
+                    .into(),
+                ),
                 Ok(embedding_response(vec![vec![3.0, 4.0]])),
             ],
         ));

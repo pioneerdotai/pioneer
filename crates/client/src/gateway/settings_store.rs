@@ -126,18 +126,20 @@ impl ClientCore {
     }
 
     pub fn request_gateway_settings(&self) -> anyhow::Result<ClientGeneration> {
-        self.request_gateway_settings_scoped(None)
+        self.request_gateway_settings_scoped(None)?.ok_or_else(|| {
+            anyhow::anyhow!("Settings refresh deferred until the pending save finishes")
+        })
     }
     pub(crate) fn request_gateway_settings_for_epoch(
         &self,
         epoch: &crate::settings::runtime::SettingsEpoch,
-    ) -> anyhow::Result<ClientGeneration> {
+    ) -> anyhow::Result<Option<ClientGeneration>> {
         self.request_gateway_settings_scoped(Some(epoch))
     }
     fn request_gateway_settings_scoped(
         &self,
         expected: Option<&crate::settings::runtime::SettingsEpoch>,
-    ) -> anyhow::Result<ClientGeneration> {
+    ) -> anyhow::Result<Option<ClientGeneration>> {
         let mut owner = self
             .identity_authorization
             .lock()
@@ -153,6 +155,16 @@ impl ClientCore {
             owner.connection_matches(connection),
             "Settings connection scope was replaced"
         );
+        // A read must not retire the ACK of a write admitted in this scope.
+        if owner.settings.saving
+            && owner.settings_request_workspace == workspace
+            && owner.settings_request_connection == connection
+        {
+            self.defer_settings_refresh_until_save(&owner, workspace.clone());
+            return Ok(None);
+        }
+        // A different scope replaces the save ticket and retires its deferred demand.
+        self.resume_settings_refresh_after_save(&owner);
         owner.settings_request = owner
             .settings_request
             .checked_add(1)
@@ -163,9 +175,10 @@ impl ClientCore {
         owner.settings_request_vector_refill_notifications.clear();
         owner.settings.vector_refill_refresh_requested = false;
         owner.settings.loading = true;
+        owner.settings.saving = false;
         owner.settings.error = None;
         self.publish_gateway_settings(&owner.settings);
-        Ok(ClientGeneration::new(owner.settings_request))
+        Ok(Some(ClientGeneration::new(owner.settings_request)))
     }
 
     pub(crate) fn finish_gateway_settings(
@@ -180,15 +193,24 @@ impl ClientCore {
         if self.is_stopped()
             || owner.settings_request != generation.get()
             || (!owner.settings.loading && !owner.settings.saving)
-            || owner.settings_request_connection != self.gateway_http_generation()
-            || owner.settings_request_workspace != self.settings_workspace()
         {
             return false;
         }
+        let applicable = owner.settings_request_connection == self.gateway_http_generation()
+            && owner.settings_request_workspace == self.settings_workspace();
+        let saving = owner.settings.saving;
         owner.settings.loading = false;
         owner.settings.saving = false;
         let pending_vector_refill_notifications =
             std::mem::take(&mut owner.settings_request_vector_refill_notifications);
+        // Completion releases only its own ticket, even when its data is fenced out.
+        if !applicable {
+            if saving {
+                self.resume_settings_refresh_after_save(&owner);
+            }
+            self.publish_gateway_settings(&owner.settings);
+            return false;
+        }
         match result {
             Ok(settings) => {
                 let delivered = owner.settings_notifications;
@@ -229,7 +251,19 @@ impl ClientCore {
                 owner.settings.settings = Some(settings.clone());
                 owner.settings.error = None;
             }
-            Err(_) => owner.settings.error = Some("settings_load_failed".into()),
+            Err(_) => {
+                owner.settings.error = Some(
+                    if saving {
+                        "settings_save_failed"
+                    } else {
+                        "settings_load_failed"
+                    }
+                    .into(),
+                )
+            }
+        }
+        if saving {
+            self.resume_settings_refresh_after_save(&owner);
         }
         self.publish_gateway_settings(&owner.settings);
         true
@@ -314,16 +348,24 @@ impl ClientCore {
             owner.connection_matches(connection),
             "Settings connection scope was replaced"
         );
+        let superseded_read = owner.settings.loading;
+        // Transfer an older save's demand through the existing coalesced queue.
+        self.resume_settings_refresh_after_save(&owner);
         owner.settings_request = owner
             .settings_request
             .checked_add(1)
             .expect("settings generation exhausted");
         owner.settings_request_connection = connection;
-        owner.settings_request_workspace = workspace;
+        owner.settings_request_workspace = workspace.clone();
         owner.settings_request_notifications = owner.settings_notifications;
         owner.settings_request_vector_refill_notifications.clear();
         owner.settings.vector_refill_refresh_requested = false;
         owner.settings.saving = true;
+        owner.settings.loading = false;
+        // The old read ticket is retired; its demand now belongs to this write.
+        if superseded_read {
+            self.defer_settings_refresh_until_save(&owner, workspace);
+        }
         owner.settings.error = None;
         if let Some(snapshot) = optimistic {
             owner.settings.settings = Some(snapshot);
@@ -345,15 +387,21 @@ impl ClientCore {
             anyhow::ensure!(
                 !self.is_stopped()
                     && owner.settings_request == generation.get()
-                    && owner.settings.saving
-                    && owner.settings_request_workspace == self.settings_workspace(),
+                    && owner.settings.saving,
                 "Settings update is no longer pending"
             );
-            owner.settings_request_connection
+            // Scope rejection still completes this owned save through the path below.
+            if owner.settings_request_workspace == self.settings_workspace() {
+                Ok(owner.settings_request_connection)
+            } else {
+                Err(anyhow::anyhow!("Settings update is no longer pending"))
+            }
         };
         let sender = self.transport_runtime().ws_command_sender();
         let mut result = connection
-            .ok_or_else(|| anyhow::anyhow!("Settings connection unavailable"))
+            .and_then(|connection| {
+                connection.ok_or_else(|| anyhow::anyhow!("Settings connection unavailable"))
+            })
             .and_then(|connection| {
                 crate::transport::ws::command_sender::gateway_settings_update(
                     &sender.requests_for_connection(connection),
@@ -1102,6 +1150,7 @@ mod tests {
             &pioneer_protocol::GatewayNotification::GatewayRemoteAccessStatusChanged(
                 pioneer_protocol::GatewayRemoteAccessStatusChangedNotification {
                     status: pioneer_protocol::GatewayRemoteAccessStatusSnapshot {
+                        public_base_url: None,
                         state: pioneer_protocol::GatewayRemoteAccessState::Connected,
                         error_kind: None,
                         message: None,
@@ -1143,6 +1192,133 @@ mod tests {
             &core.snapshot(&ClientScope::Settings).unwrap().snapshot()
         ));
         assert!(!core.gateway_settings().saving);
+    }
+
+    #[test]
+    fn loaded_settings_allow_cli_disable_and_read_errors_are_distinct_from_write_errors() {
+        use crate::providers::cli_runtime_settings::{
+            CLIRuntimeProviderSettingsPlan, plan_cli_runtime_provider_enabled_update,
+        };
+        let core = ClientCore::new();
+        let load = core.request_gateway_settings().unwrap();
+        assert!(core.finish_gateway_settings(load, &mut Err(anyhow::anyhow!("read failed"))));
+        assert_eq!(
+            core.gateway_settings().error.as_deref(),
+            Some("settings_load_failed")
+        );
+        let load = core.request_gateway_settings().unwrap();
+        assert!(core.finish_gateway_settings(load, &mut Ok(snapshot(false))));
+        let CLIRuntimeProviderSettingsPlan::Send(plan) = plan_cli_runtime_provider_enabled_update(
+            core.gateway_settings().settings.as_ref(),
+            "codex",
+            false,
+        ) else {
+            panic!("loaded settings must allow disabling Codex")
+        };
+        assert!(!plan.snapshot.cli_runtimes.instances[0].enabled);
+        let save = core
+            .prepare_gateway_settings_update(Some(plan.snapshot))
+            .unwrap();
+        assert!(core.finish_gateway_settings(save, &mut Err(anyhow::anyhow!("write failed"))));
+        assert_eq!(
+            core.gateway_settings().error.as_deref(),
+            Some("settings_save_failed")
+        );
+    }
+
+    #[test]
+    fn pre_rpc_scope_rejection_releases_only_its_save_and_refresh() {
+        use crate::{core::ClientTransitionOutcome, settings::runtime::SettingsIntent};
+        let core = crate::catalog_test_support::settings_model_picker_client();
+        let epoch = core.settings_epoch();
+        let load = core.request_gateway_settings().unwrap();
+        assert!(core.finish_gateway_settings(load, &mut Ok(snapshot(false))));
+        let save = core
+            .prepare_gateway_settings_update_for_epoch(&epoch)
+            .unwrap();
+        core.settings_intent(SettingsIntent::Refresh);
+        let deferred = core.take_settings_refresh_for_test().unwrap();
+        assert!(
+            core.request_gateway_settings_for_epoch(&deferred)
+                .unwrap()
+                .is_none()
+        );
+        core.navigate(
+            crate::navigation::NavigationIntent::SelectWorkspace {
+                workspace_id: Some("other-workspace".into()),
+            },
+            None,
+        );
+        assert!(
+            core.execute_gateway_settings_update(save, Default::default())
+                .is_err()
+        );
+        let released = core.gateway_settings();
+        assert!(!released.saving && !released.loading);
+        assert_eq!(released.settings, Some(snapshot(false)));
+        assert!(released.error.is_none());
+        core.navigate(
+            crate::navigation::NavigationIntent::SelectWorkspace {
+                workspace_id: Some("workspace".into()),
+            },
+            None,
+        );
+        assert_eq!(
+            core.settings_intent(SettingsIntent::Refresh).outcome(),
+            ClientTransitionOutcome::Changed
+        );
+        let refresh = core.take_settings_refresh_for_test().unwrap();
+        let read = core
+            .request_gateway_settings_for_epoch(&refresh)
+            .unwrap()
+            .expect("aborted save must release its ticket");
+        let reading = core.gateway_settings();
+        assert!(
+            core.execute_gateway_settings_update(save, Default::default())
+                .is_err()
+        );
+        assert_eq!(core.gateway_settings(), reading);
+        assert!(core.finish_gateway_settings(read, &mut Ok(snapshot(true))));
+        core.complete_settings_refresh_for_test(&refresh, true);
+        assert_eq!(
+            core.settings_intent(SettingsIntent::Refresh).outcome(),
+            ClientTransitionOutcome::Changed
+        );
+
+        let refresh = core.take_settings_refresh_for_test().unwrap();
+        let newer_save = core
+            .prepare_gateway_settings_update_for_epoch(&epoch)
+            .unwrap();
+        assert!(
+            core.request_gateway_settings_for_epoch(&refresh)
+                .unwrap()
+                .is_none()
+        );
+        let saving = core.gateway_settings();
+        assert!(
+            core.execute_gateway_settings_update(save, Default::default())
+                .is_err()
+        );
+        assert_eq!(core.gateway_settings(), saving);
+        assert_eq!(
+            core.settings_intent(SettingsIntent::Refresh).outcome(),
+            ClientTransitionOutcome::Noop
+        );
+        assert!(core.finish_gateway_settings(newer_save, &mut Ok(snapshot(false))));
+        let followup = core
+            .take_settings_refresh_for_test()
+            .expect("new save keeps one follow-up");
+        assert!(core.take_settings_refresh_for_test().is_none());
+        let read = core
+            .request_gateway_settings_for_epoch(&followup)
+            .unwrap()
+            .unwrap();
+        assert!(core.finish_gateway_settings(read, &mut Ok(snapshot(false))));
+        core.complete_settings_refresh_for_test(&followup, true);
+        assert_eq!(
+            core.settings_intent(SettingsIntent::Refresh).outcome(),
+            ClientTransitionOutcome::Changed
+        );
     }
 
     #[test]

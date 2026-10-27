@@ -95,6 +95,7 @@ pub const EMPTY_FROZEN_IMPORT_SHA256: &str =
 pub const FROZEN_IMPORT_PAGE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrozenImportRecord {
     pub message_ordinal: u64,
     pub source_thread: String,
@@ -104,6 +105,34 @@ pub struct FrozenImportRecord {
     pub output_manifest: String,
     pub output_ordinal: u64,
     pub acknowledgement: SourceRef,
+    /// The grant above remains the immutable output source. Only a verified
+    /// temporary preview may render a diagnostic at this distinct revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_archive: Option<PreviewArchiveProjection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewArchiveProjection {
+    pub source: SourceRef,
+    pub wire_sha256: String,
+}
+impl FrozenImportRecord {
+    pub fn render_source(&self) -> &SourceRef {
+        self.preview_archive
+            .as_ref()
+            .map_or(&self.source, |p| &p.source)
+    }
+    pub fn matches_render_target(&self, target: &FrozenMessageRef) -> bool {
+        target.source_thread == self.source_thread
+            && target.sources.contains(self.render_source())
+            && self.preview_archive.as_ref().is_none_or(|p| {
+                target.tool_name.as_deref() == Some("html_preview")
+                    && target.sources.as_slice() == std::slice::from_ref(&p.source)
+                    && target.replay_source.as_ref().is_none_or(|s| s == &p.source)
+                    && target.wire_sha256 == p.wire_sha256
+            })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,10 +145,12 @@ pub struct DeliveryCheckpointImportSource {
 /// Fields are private: callers cannot mint an own claim from a delivery ID.
 #[derive(Clone, Debug)]
 pub struct PreparedFrozenImport {
+    _frozen_hold: std::sync::Arc<crate::FrozenReadHold>,
     workspace: String,
     destination: String,
     output_digest: String,
     original_json: String,
+    archive_guards: Option<(sea_orm::Statement, sea_orm::Statement)>,
     record: FrozenImportRecord,
     accepted_basis: Option<AcceptedImportBasis>,
     /// A forwarded immutable grant may be attached to the published checkpoint
@@ -142,7 +173,7 @@ struct AcceptedImportBasis {
 }
 impl PreparedFrozenImport {
     pub fn source(&self) -> &SourceRef {
-        &self.record.source
+        self.record.render_source()
     }
     pub fn source_thread(&self) -> &str {
         &self.record.source_thread
@@ -189,6 +220,11 @@ pub(crate) async fn compaction_prepare_frozen_import(
         .compaction_delivery_output(workspace, delivery)
         .await?
         .ok_or_else(|| anyhow::anyhow!("accepted output binding is unavailable"))?;
+    let frozen_hold = std::sync::Arc::new(
+        store
+            .compaction_acquire_frozen_history(workspace, &snapshot.output.history)
+            .await?,
+    );
     let acknowledged = task_delivery::Entity::find_by_id(delivery)
         .select_only()
         .column(task_delivery::Column::Id)
@@ -290,6 +326,7 @@ pub(crate) async fn compaction_prepare_frozen_import(
         )
         .filter(compaction_frozen_message::Column::Ordinal.eq(i64::try_from(output_ordinal)?))
         .filter(compaction_frozen_message::Column::Bytes.lte(SOURCE_PAGE_BYTES as i64))
+            .filter(Expr::cust("length(CAST(compaction_frozen_message.reference_json AS BLOB))=compaction_frozen_message.bytes AND compaction_frozen_message.bytes>=0"))
         .into_tuple::<String>()
         .one(&store.connection)
         .await?
@@ -310,8 +347,25 @@ pub(crate) async fn compaction_prepare_frozen_import(
     // An independently published summary is the imported source, not a grant
     // to extract arbitrary raw leaves from its historical coverage. Direct raw
     // references remain exact-current.
-    let mut found = false;
+    let archive = store
+        .html_preview_archived_frozen_result(workspace, &original)
+        .await?;
+    let projection = archive
+        .as_ref()
+        .filter(|(_, _, current)| current == source && source_thread == original.source_thread)
+        .map(|(_, hash, current)| PreviewArchiveProjection {
+            source: current.clone(),
+            wire_sha256: hash.clone(),
+        });
+    let mut found = None;
     for reference in &original.sources {
+        if projection.is_some()
+            && original.sources.len() == 1
+            && reference.scope.starts_with("context:")
+        {
+            found = Some(reference.clone());
+            break;
+        }
         let thread = store
             .compaction_reference_thread(workspace, reference)
             .await?
@@ -321,28 +375,147 @@ pub(crate) async fn compaction_prepare_frozen_import(
             "output source changed ownership"
         );
         if reference == source && thread == source_thread {
-            found = true;
+            found = Some(reference.clone());
         }
     }
-    ensure!(found, "source is outside the accepted own output message");
+    let grant = found
+        .ok_or_else(|| anyhow::anyhow!("source is outside the accepted own output message"))?;
+    let record = FrozenImportRecord {
+        message_ordinal: 0,
+        source_thread: source_thread.into(),
+        source: grant,
+        delivery_id: delivery.into(),
+        candidate_id: snapshot.candidate_id,
+        output_manifest: snapshot.output.history.manifest_id,
+        output_ordinal,
+        acknowledgement: acknowledgement.clone(),
+        preview_archive: projection,
+    };
+    let archive_guards = prepare_preview_archive_guards(store, workspace, &record).await?;
     Ok(PreparedFrozenImport {
+        _frozen_hold: frozen_hold,
         workspace: workspace.into(),
         destination: destination.into(),
         accepted_basis: None,
         target_checkpoint: None,
         output_digest: snapshot.output.history.identity_sha256,
         original_json,
-        record: FrozenImportRecord {
-            message_ordinal: 0,
-            source_thread: source_thread.into(),
-            source: source.clone(),
-            delivery_id: delivery.into(),
-            candidate_id: snapshot.candidate_id,
-            output_manifest: snapshot.output.history.manifest_id,
-            output_ordinal,
-            acknowledgement: acknowledgement.clone(),
-        },
+        archive_guards,
+        record,
     })
+}
+
+/// Only the existing archive receipt can translate an immutable grant to a
+/// body revision. Prepared SQL revalidates that receipt inside publication;
+/// no parsing or hashing is done while holding writer capacity.
+async fn prepare_preview_archive_guards(
+    store: &CrudStore,
+    workspace: &str,
+    record: &FrozenImportRecord,
+) -> Result<Option<(sea_orm::Statement, sea_orm::Statement)>> {
+    let Some(projection) = &record.preview_archive else {
+        return Ok(None);
+    };
+    use super::html_preview_retention::queries;
+    use pioneer_entity::{
+        compaction_source_revision as revision, html_preview_frozen_result as receipt, thread,
+        turn, turn_llm_context as context,
+    };
+    use queries::{bytes, col};
+    let base = queries::archive_receipt(
+        workspace,
+        &record.source_thread,
+        &record.output_manifest,
+        i64::try_from(record.output_ordinal)?,
+    );
+    let query = base
+        .clone()
+        .clear_selects()
+        .columns([
+            ("r", receipt::Column::ReferenceJson),
+            ("r", receipt::Column::ArchiveWireSha256),
+        ])
+        .expr_as(
+            col("m", compaction_frozen_message::Column::ReferenceJson),
+            "output_reference_json",
+        )
+        .and_where(col("r", receipt::Column::SourceId).eq(&record.source.id))
+        .and_where(col("r", receipt::Column::SourceVersion).eq(&record.source.version))
+        .and_where(bytes(col("r", receipt::Column::ReferenceJson)).lte(262144))
+        .and_where(col("m", compaction_frozen_message::Column::Bytes).between(0, 262144))
+        .and_where(
+            bytes(col("m", compaction_frozen_message::Column::ReferenceJson))
+                .eq(col("m", compaction_frozen_message::Column::Bytes)),
+        )
+        .to_owned();
+    let row = store
+        .connection
+        .query_one(&query)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("archival preview grant receipt is unavailable"))?;
+    let json: String = row.try_get("", "reference_json")?;
+    let original: FrozenMessageRef = serde_json::from_str(&json)?;
+    original.validate()?;
+    let output_reference_json: String = row.try_get("", "output_reference_json")?;
+    let output_reference: FrozenMessageRef = serde_json::from_str(&output_reference_json)?;
+    ensure!(
+        original == output_reference,
+        "archival preview receipt/output mismatch"
+    );
+    let revision = record
+        .source
+        .version
+        .strip_prefix("revision:")
+        .and_then(|s| s.parse::<u64>().ok())
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("invalid preview grant revision"))?;
+    // Indexing an already archived diagnostic also yields a receipt. Its
+    // unchanged wire body proves no retirement and cannot grant a new revision.
+    ensure!(
+        original.tool_name.as_deref() == Some("html_preview")
+            && original.source_thread == record.source_thread
+            && original.sources.as_slice() == std::slice::from_ref(&record.source)
+            && record.source.scope.starts_with("context:")
+            && projection.source.scope == record.source.scope
+            && projection.source.id == record.source.id
+            && projection.source.version == format!("revision:{revision}")
+            && projection.wire_sha256 != original.wire_sha256
+            && projection.wire_sha256 == row.try_get::<String>("", "archive_wire_sha256")?,
+        "archival preview grant does not match its exact diagnostic"
+    );
+    let historical = base
+        .clone()
+        .and_where(col("r", receipt::Column::ReferenceJson).eq(json))
+        .and_where(col("r", receipt::Column::ArchiveWireSha256).eq(&projection.wire_sha256))
+        .and_where(
+            col("m", compaction_frozen_message::Column::ReferenceJson).eq(output_reference_json),
+        )
+        .to_owned();
+    let canonical = queries::canonical_preview()
+        .and_where(col("c", context::Column::Id).eq(col("r", receipt::Column::SourceId)))
+        .and_where(col("c", context::Column::TurnId).eq(col("r", receipt::Column::TurnId)))
+        .and_where(
+            queries::revision(col("v", revision::Column::Revision)).eq(&projection.source.version),
+        )
+        .and_where(col("th", thread::Column::WorkspaceId).eq(workspace))
+        .and_where(col("t", turn::Column::ThreadId).eq(&record.source_thread))
+        .and_where(Expr::exists(queries::released_marker(workspace)))
+        .to_owned();
+    let current = historical
+        .clone()
+        .and_where(Expr::exists(canonical))
+        .to_owned();
+    let historical = store.connection.get_database_backend().build(&historical);
+    let current = store.connection.get_database_backend().build(&current);
+    Ok(Some((current, historical)))
+}
+impl FrozenImportRecord {
+    /// Historical proof validation does not grant access or accept a fresh body.
+    /// Direct import preparation/publication separately requires current guard.
+    pub async fn validate_preview_archive(&self, store: &CrudStore, workspace: &str) -> Result<()> {
+        let _ = prepare_preview_archive_guards(store, workspace, self).await?;
+        Ok(())
+    }
 }
 
 /// Attach exact immutable grants from one delivered Task output to the
@@ -403,7 +576,7 @@ pub(crate) async fn compaction_prepare_delivery_checkpoint_imports(
         .map(|import| {
             (
                 import.record.source_thread.clone(),
-                import.record.source.clone(),
+                import.record.render_source().clone(),
             )
         })
         .collect::<std::collections::BTreeSet<_>>();
@@ -508,7 +681,7 @@ pub(crate) async fn compaction_prepare_accepted_checkpoint_imports(
         .map(|import| {
             (
                 import.record.source_thread.clone(),
-                import.record.source.clone(),
+                import.record.render_source().clone(),
             )
         })
         .collect::<std::collections::BTreeSet<_>>();
@@ -543,6 +716,11 @@ async fn prepare_accepted_import(
         .ok_or_else(|| anyhow::anyhow!("accepted Task basis is unavailable"))?;
     let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
         serde_json::from_str(&basis.history_json)?;
+    let frozen_hold = std::sync::Arc::new(
+        store
+            .compaction_acquire_frozen_history(workspace, &descriptor)
+            .await?,
+    );
     let (import_count, imports_digest) = store
         .compaction_frozen_import_state(workspace, &basis.parent_thread, &descriptor.manifest_id)
         .await?
@@ -557,16 +735,22 @@ async fn prepare_accepted_import(
             .select_only()
             .column(compaction_frozen_import::Column::ProofJson)
             .filter(compaction_frozen_import::Column::Bytes.lte(SOURCE_PAGE_BYTES as i64))
+            .filter(Expr::cust(
+                "length(CAST(proof_json AS BLOB))=bytes AND bytes>=0",
+            ))
             .into_tuple::<String>()
             .one(&store.connection)
             .await?
             .ok_or_else(|| anyhow::anyhow!("accepted import is unavailable"))?;
     let record: FrozenImportRecord = serde_json::from_str(&proof_json)?;
+    let archive_guards = prepare_preview_archive_guards(store, workspace, &record).await?;
     Ok(PreparedFrozenImport {
+        _frozen_hold: frozen_hold,
         workspace: workspace.into(),
         destination: destination.into(),
         output_digest: String::new(),
         original_json: String::new(),
+        archive_guards,
         record,
         accepted_basis: Some(AcceptedImportBasis {
             turn: turn.into(),
@@ -586,6 +770,10 @@ async fn accepted_import_current<C: ConnectionTrait>(
     db: &C,
     prepared: &PreparedFrozenImport,
 ) -> Result<bool> {
+    if let Some((current, _)) = &prepared.archive_guards {
+        return Ok(accepted_import_binding_current(db, prepared).await?
+            && db.query_one_raw(current.clone()).await?.is_some());
+    }
     Ok(db
         .query_one_raw(accepted_import_current_statement(
             ACCEPTED_IMPORT_CURRENT_SQL,
@@ -676,7 +864,7 @@ async fn checkpoint_historically_contains(
         ensure!(visiting.insert(key), "cyclic checkpoint coverage");
         #[cfg(any(test, feature = "test-support"))]
         observe_checkpoint_import_graph_read(store, workspace);
-        let edges = compaction_checkpoint_edges(&store.connection, &source.id)
+        let edges = compaction_checkpoint_edges(store, &source.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("checkpoint coverage node disappeared"))?;
         ensure!(
@@ -691,7 +879,7 @@ async fn checkpoint_historically_contains(
         if let Some(previous) = edges.previous {
             #[cfg(any(test, feature = "test-support"))]
             observe_checkpoint_import_graph_read(store, workspace);
-            let previous_edges = compaction_checkpoint_edges(&store.connection, &previous)
+            let previous_edges = compaction_checkpoint_edges(store, &previous)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("previous checkpoint disappeared"))?;
             ensure!(
@@ -741,7 +929,10 @@ WHERE execution.thread_id=?
   AND execution.turn_id=?
   AND snapshot.workspace_id=?
   AND snapshot.history_json=?
-  AND h.ready=1
+  AND h.ready=1 AND h.expired=0
+  AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count
+  AND i.ordinal>=0 AND i.ordinal<h.import_count
+  AND i.message_ordinal>=0 AND i.message_ordinal<h.message_count
   AND h.identity_sha256=?
   AND h.next_import=h.import_count
   AND i.proof_json=?
@@ -772,7 +963,10 @@ WHERE execution.thread_id=?
   AND execution.turn_id=?
   AND snapshot.workspace_id=?
   AND snapshot.history_json=?
-  AND h.ready=1
+  AND h.ready=1 AND h.expired=0
+  AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count
+  AND i.ordinal>=0 AND i.ordinal<h.import_count
+  AND i.message_ordinal>=0 AND i.message_ordinal<h.message_count
   AND h.identity_sha256=?
   AND h.next_import=h.import_count
   AND i.proof_json=?
@@ -933,6 +1127,7 @@ pub(crate) async fn compaction_append_frozen_imports(
             .filter(compaction_frozen_history::Column::OwnerThread.eq(owner))
             .filter(compaction_frozen_message::Column::Ordinal.eq(i64::try_from(*message)?))
             .filter(compaction_frozen_message::Column::Bytes.lte(SOURCE_PAGE_BYTES as i64))
+            .filter(Expr::cust("length(CAST(compaction_frozen_message.reference_json AS BLOB))=compaction_frozen_message.bytes AND compaction_frozen_message.bytes>=0"))
             .into_tuple::<String>()
             .one(&store.connection)
             .await?
@@ -944,8 +1139,7 @@ pub(crate) async fn compaction_append_frozen_imports(
                 target.source_thread == *checkpoint_thread
                     && target.sources.as_slice() == std::slice::from_ref(checkpoint)
             } else {
-                target.source_thread == prepared.record.source_thread
-                    && target.sources.contains(&prepared.record.source)
+                prepared.record.matches_render_target(&target)
             };
         ensure!(
             !target.inherited
@@ -985,7 +1179,8 @@ pub(crate) async fn compaction_append_frozen_imports(
         .one(&tx)
         .await?
         .ok_or_else(|| anyhow::anyhow!("import target manifest is unavailable"))?;
-    let ready = row.ready != 0;
+    crate::frozen_lifetime::logical_bounds(&row)?;
+    let ready = row.ready == 1;
     let count = row.import_count;
     let next = row.next_import;
     let start = i64::try_from(start)?;
@@ -998,6 +1193,18 @@ pub(crate) async fn compaction_append_frozen_imports(
     );
     for (ordinal, record, prepared, target_json, json) in &batch {
         if !ready && *ordinal >= next {
+            if let Some((current, historical)) = &prepared.archive_guards {
+                let query =
+                    if prepared.accepted_basis.is_some() && prepared.target_checkpoint.is_some() {
+                        historical
+                    } else {
+                        current
+                    };
+                ensure!(
+                    tx.query_one_raw(query.clone()).await?.is_some(),
+                    "archival preview import changed before publication"
+                );
+            }
             // The existing transaction holds the validated dependency snapshot
             // through insertion; exact retries below retain their prior behavior.
             let forwarded = if prepared.accepted_basis.is_some() {
@@ -1268,21 +1475,21 @@ pub(crate) async fn compaction_append_frozen_imports(
                                 compaction_live_sources::Column::Table,
                                 compaction_live_sources::Column::SourceScope,
                             ))
-                            .eq(Expr::Value(record.source.scope.clone().into())),
+                            .eq(Expr::Value(prepared.source().scope.clone().into())),
                         )
                         .filter(
                             Expr::col((
                                 compaction_live_sources::Column::Table,
                                 compaction_live_sources::Column::SourceId,
                             ))
-                            .eq(Expr::Value(record.source.id.clone().into())),
+                            .eq(Expr::Value(prepared.source().id.clone().into())),
                         )
                         .filter(
                             Expr::col((
                                 compaction_live_sources::Column::Table,
                                 compaction_live_sources::Column::SourceVersion,
                             ))
-                            .eq(Expr::Value(record.source.version.clone().into())),
+                            .eq(Expr::Value(prepared.source().version.clone().into())),
                         )
                         .filter(
                             Expr::col((
@@ -1394,28 +1601,6 @@ pub(crate) async fn compaction_append_frozen_imports(
                 .await?;
             }
         }
-        ensure!(
-            compaction_frozen_import::Entity::find()
-                .select_only()
-                .expr(Expr::val(1_i64))
-                .filter(
-                    Expr::col(compaction_frozen_import::Column::ManifestId)
-                        .eq(Expr::Value(manifest.into()))
-                        .and(
-                            Expr::col(compaction_frozen_import::Column::Ordinal)
-                                .eq(Expr::Value((*ordinal).into()))
-                        )
-                        .and(
-                            Expr::col(compaction_frozen_import::Column::ProofJson)
-                                .eq(Expr::Value(json.clone().into()))
-                        )
-                )
-                .into_tuple::<i64>()
-                .one(&tx)
-                .await?
-                .is_some(),
-            "import binding changed or retry changed immutable metadata"
-        );
     }
     if start == next && !ready {
         compaction_frozen_history::Entity::update_many()
@@ -1435,6 +1620,34 @@ pub(crate) async fn compaction_append_frozen_imports(
             .exec(&tx)
             .await?;
     }
+    for (ordinal, _, _, _, json) in &batch {
+        ensure!(
+            compaction_frozen_import::Entity::find()
+                .select_only()
+                .expr(Expr::val(1_i64))
+                .filter(
+                    Expr::col(compaction_frozen_import::Column::ManifestId)
+                        .eq(Expr::Value(manifest.into()))
+                        .and(
+                            Expr::col(compaction_frozen_import::Column::Ordinal)
+                                .eq(Expr::Value((*ordinal).into()))
+                        )
+                        .and(
+                            Expr::col(compaction_frozen_import::Column::ProofJson)
+                                .eq(Expr::Value(json.clone().into()))
+                        )
+                        .and(
+                            Expr::col(compaction_frozen_import::Column::Bytes)
+                                .eq(Expr::val(i64::try_from(json.len())?))
+                        )
+                )
+                .into_tuple::<i64>()
+                .one(&tx)
+                .await?
+                .is_some(),
+            "import binding changed or retry changed immutable metadata"
+        );
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -1445,6 +1658,14 @@ pub(crate) async fn compaction_frozen_import_state<C: ConnectionTrait>(
     owner: &str,
     manifest: &str,
 ) -> Result<Option<(u64, String)>> {
+    if let Some(h) = compaction_frozen_history::Entity::find_by_id(manifest)
+        .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
+        .filter(compaction_frozen_history::Column::OwnerThread.eq(owner))
+        .one(db)
+        .await?
+    {
+        crate::frozen_lifetime::logical_bounds(&h)?;
+    }
     use sea_orm::ColumnTrait;
     let row = compaction_frozen_history::Entity::find_by_id(manifest)
         .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
@@ -1467,6 +1688,27 @@ pub(crate) async fn compaction_frozen_import_page<C: ConnectionTrait>(
     manifest: &str,
     start: u64,
 ) -> Result<Vec<FrozenImportRecord>> {
+    let mut complete_count = None;
+    if let Some(h) = compaction_frozen_history::Entity::find_by_id(manifest)
+        .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
+        .filter(compaction_frozen_history::Column::OwnerThread.eq(owner))
+        .one(db)
+        .await?
+    {
+        crate::frozen_lifetime::logical_bounds(&h)?;
+        if let Some(layout) = pioneer_entity::compaction_frozen_layout::Entity::find_by_id((
+            manifest.to_owned(),
+            1_i64,
+        ))
+        .one(db)
+        .await?
+        {
+            ensure!(layout.failed == 0, "invalid frozen layout state");
+        }
+        if h.ready == 1 {
+            complete_count = Some(u64::try_from(h.import_count)?);
+        }
+    }
     let scoped = compaction_frozen_import::Entity::find()
         .inner_join(compaction_frozen_history::Entity)
         .filter(compaction_frozen_history::Column::Id.eq(manifest))
@@ -1496,14 +1738,23 @@ pub(crate) async fn compaction_frozen_import_page<C: ConnectionTrait>(
         bytes += size;
         end += 1;
     }
+    ensure!(
+        complete_count.is_none_or(|count| start >= count || end > start),
+        "import page missing before declared count"
+    );
     let rows = scoped
         .select_only()
         .column(compaction_frozen_import::Column::ProofJson)
         .filter(compaction_frozen_import::Column::Ordinal.lt(i64::try_from(end)?))
+        .filter(Expr::cust("length(CAST(compaction_frozen_import.proof_json AS BLOB))=compaction_frozen_import.bytes AND compaction_frozen_import.bytes BETWEEN 0 AND 262144"))
         .order_by_asc(compaction_frozen_import::Column::Ordinal)
         .into_tuple::<String>()
         .all(db)
         .await?;
+    ensure!(
+        rows.len() == usize::try_from(end - start)?,
+        "import bounded readback incomplete"
+    );
     rows.into_iter()
         .map(|json| Ok(serde_json::from_str(&json)?))
         .collect()

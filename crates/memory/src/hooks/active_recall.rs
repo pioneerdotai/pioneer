@@ -793,7 +793,7 @@ async fn execute_episodic_active_recall_mode(
                 timeout,
                 provider.recall_current_thread(MemoryCurrentThreadRecallRequest {
                     workspace_id: context.workspace_id.clone(),
-                    thread_id: context.effective_conversation_thread_id().to_owned(),
+                    thread_id: context.thread_id.clone(),
                     turn_id: context.turn_id.clone(),
                     principal_id: context.principal_id.clone(),
                     query: query.to_owned(),
@@ -2965,11 +2965,15 @@ fn episodic_prompt_context_contribution(
     let mut lines = Vec::new();
     let mut source_refs = Vec::new();
     let mut seen_lines = BTreeSet::new();
-    let mut remaining_chars = max_chars.max(1);
+    let mut remaining_chars = max_chars;
     let mut truncated = snapshot_truncated;
 
     for item in items {
-        let Some(line) = episodic_prompt_line(&item, remaining_chars) else {
+        let separator_chars = usize::from(!lines.is_empty());
+        let Some((line, text_truncated)) =
+            episodic_prompt_line(&item, remaining_chars.saturating_sub(separator_chars))
+        else {
+            truncated |= item.content.split_whitespace().next().is_some();
             continue;
         };
         let Some(fingerprint) = rendered_line_fingerprint(line.as_str()) else {
@@ -2979,12 +2983,12 @@ fn episodic_prompt_context_contribution(
             continue;
         }
         let line_chars = line.chars().count();
-        let separator_chars = usize::from(!lines.is_empty());
         if separator_chars + line_chars > remaining_chars {
             truncated = true;
             break;
         }
         remaining_chars = remaining_chars.saturating_sub(separator_chars + line_chars);
+        truncated |= text_truncated;
         if let Some(source_ref) = episodic_source_ref(&item) {
             source_refs.push(source_ref);
         }
@@ -3008,8 +3012,10 @@ fn episodic_prompt_context_contribution(
     })
 }
 
-fn episodic_prompt_line(item: &MemoryEpisodicRecallItem, max_chars: usize) -> Option<String> {
-    let content = bounded_nonempty_text(item.content.as_str(), max_chars)?;
+fn episodic_prompt_line(
+    item: &MemoryEpisodicRecallItem,
+    max_chars: usize,
+) -> Option<(String, bool)> {
     let source = match item.provenance.source {
         MemoryEpisodicRecallSourceKind::CurrentThread => "current thread",
         MemoryEpisodicRecallSourceKind::RelatedThread => "related thread",
@@ -3019,21 +3025,45 @@ fn episodic_prompt_line(item: &MemoryEpisodicRecallItem, max_chars: usize) -> Op
         MemoryEpisodicRecallSourceKind::CompletedTask => "completed task",
     };
     let boundary = item.provenance.boundary.as_str().replace('_', " ");
-    let id = item.id.trim();
-    if id.starts_with("thread:")
-        && matches!(
-            item.provenance.source,
-            MemoryEpisodicRecallSourceKind::CurrentThread
-                | MemoryEpisodicRecallSourceKind::RelatedThread
-                | MemoryEpisodicRecallSourceKind::WorkspaceThread
-                | MemoryEpisodicRecallSourceKind::TranscriptSummary
-        )
-    {
-        return Some(format!(
-            "- [{id}, source={source}, boundary={boundary}]: {content}"
-        ));
+    let prefix = if let (Some(thread), Some(turn), Some(item_id)) = (
+        item.provenance.thread_id.as_deref(),
+        item.provenance.turn_id.as_deref(),
+        item.provenance.item_id.as_deref(),
+    ) {
+        let reference = serde_json::json!({"workspaceId":item.provenance.workspace_id,"threadId":thread,
+            "anchor":{"turnId":turn,"itemId":item_id},"sourceKind":item.provenance.source_kind});
+        format!("- [{source}, {boundary}, source={reference}]: ")
+    } else {
+        let id = item.id.trim();
+        if id.starts_with("thread:")
+            && matches!(
+                item.provenance.source,
+                MemoryEpisodicRecallSourceKind::CurrentThread
+                    | MemoryEpisodicRecallSourceKind::RelatedThread
+                    | MemoryEpisodicRecallSourceKind::WorkspaceThread
+                    | MemoryEpisodicRecallSourceKind::TranscriptSummary
+            )
+        {
+            format!("- [{id}, source={source}, boundary={boundary}]: ")
+        } else {
+            format!("- {source} {boundary}: ")
+        }
+    };
+    let text_budget = max_chars.checked_sub(prefix.chars().count())?;
+    if text_budget == 0 {
+        return None;
     }
-    Some(format!("- {source} {boundary}: {content}"))
+    let normalized = item
+        .content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let truncated = normalized.chars().count() > text_budget;
+    let content = truncate_chars(&normalized, text_budget);
+    Some((format!("{prefix}{content}"), truncated))
 }
 
 fn episodic_source_ref(item: &MemoryEpisodicRecallItem) -> Option<HookSourceRef> {

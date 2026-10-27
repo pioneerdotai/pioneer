@@ -27,6 +27,7 @@ pub(crate) struct CodexMcpSchemaPreflight {
     pub(crate) canonical_manifest_hash: String,
     pub(crate) provider_manifest_hash: String,
     pub(crate) provider_contract_fingerprint: String,
+    pub(crate) tool_timeout_secs: Option<u64>,
     pub(crate) tools: Vec<CodexMcpTransformedTool>,
 }
 
@@ -107,6 +108,8 @@ impl CodexMcpSessionLaunchProjection {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut limits = limits;
+        limits.max_tools += self.canonical_projection.native_tool_count();
         CliMcpFacadeProjection::new(tools, limits)
     }
 
@@ -301,14 +304,7 @@ impl CodexMcpSessionLaunchProjection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CodexNativeMcpItemBinding {
-    pub(crate) native_thread_id: String,
-    pub(crate) native_turn_id: String,
-    pub(crate) native_item_id: String,
-    pub(crate) canonical_callable_name: String,
-    pub(crate) arguments_fingerprint: String,
-}
+pub(crate) use crate::cli_runtime::mcp::native_correlation::NativeMcpItemBinding as CodexNativeMcpItemBinding;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexNativeMcpEventError {
@@ -499,6 +495,11 @@ pub(crate) fn preflight_codex_mcp_schemas(
         canonical_manifest_hash: projection.manifest_hash.clone(),
         provider_manifest_hash,
         provider_contract_fingerprint: transformer.provider_contract_fingerprint().to_owned(),
+        tool_timeout_secs: projection
+            .tools
+            .iter()
+            .any(crate::turn_mcp::native_tools::requires_extended_provider_deadline)
+            .then_some(crate::cli_runtime::mcp::limits::MANAGED_DURABLE_TOOL_TIMEOUT_SECS),
         tools,
     })
 }
@@ -564,6 +565,7 @@ fn codex_managed_mcp_semantic_input(
         provider_manifest_hash: preflight.provider_manifest_hash.clone(),
         provider_contract_fingerprint: preflight.provider_contract_fingerprint.clone(),
         overlay_policy_version: CodexHomeOverlayPolicy::v1().version,
+        tool_timeout_secs: preflight.tool_timeout_secs,
         tools: preflight
             .tools
             .iter()
@@ -820,6 +822,78 @@ mod tests {
         assert!(artifact.config_toml.contains("approval_mode = \"approve\""));
         assert!(!artifact.config_toml.contains("default_tools_approval_mode"));
         assert!(!artifact.config_toml.contains("disabled_tools"));
+    }
+
+    #[test]
+    fn html_required_definitions_fit_configured_external_boundary_through_launch() {
+        for external in [8, 128, 512] {
+            let runtime =
+                crate::cli_runtime::mcp::limits::CliMcpRuntimeLimits::new(external, 1_048_576, 8)
+                    .unwrap();
+            let projection = projection_with_tool_count(external)
+                .with_html_tools(McpProjectionLimits {
+                    max_tools: external,
+                    max_total_schema_bytes: runtime.max_total_schema_bytes(),
+                    ..McpProjectionLimits::default()
+                })
+                .unwrap();
+            let frozen = projection.manifest_hash.clone();
+            let launch =
+                build_codex_mcp_session_launch_projection(projection, "a".repeat(64)).unwrap();
+            let facade = launch
+                .facade_projection(runtime.facade_projection_limits())
+                .unwrap();
+            assert_eq!(facade.tools().len(), external + 2);
+            assert_eq!(launch.canonical_projection.manifest_hash, frozen);
+            for definition in pioneer_tools::html::html_tool_specs() {
+                let canonical = launch
+                    .canonical_projection
+                    .tools
+                    .iter()
+                    .find(|t| t.raw_tool_name == definition.spec.name)
+                    .unwrap();
+                assert_eq!(canonical.input_schema, definition.spec.parameters);
+                assert!(facade.contains_tool(&canonical.canonical_callable_name));
+                let transformed = launch
+                    .preflight
+                    .tools
+                    .iter()
+                    .find(|t| t.canonical_callable_name == canonical.canonical_callable_name)
+                    .unwrap();
+                assert_eq!(
+                    transformed.canonical_schema_fingerprint,
+                    canonical.schema_fingerprint
+                );
+            }
+            let smaller = crate::cli_runtime::mcp::limits::CliMcpRuntimeLimits::new(
+                external - 1,
+                1_048_576,
+                8,
+            )
+            .unwrap();
+            assert!(
+                launch
+                    .facade_projection(smaller.facade_projection_limits())
+                    .is_err()
+            );
+            let config = build_codex_managed_mcp_config_with_helper(
+                &launch.preflight,
+                Some(PathBuf::from("/opt/pioneer/pioneer")),
+                Some(PathBuf::from("/private/pioneer/session/bootstrap")),
+                runtime.max_tools() + launch.canonical_projection.native_tool_count(),
+            )
+            .unwrap();
+            assert_eq!(config.enabled_tools.len(), external + 2);
+            assert!(
+                build_codex_managed_mcp_config_with_helper(
+                    &launch.preflight,
+                    Some(PathBuf::from("/opt/pioneer/pioneer")),
+                    Some(PathBuf::from("/private/pioneer/session/bootstrap")),
+                    runtime.max_tools()
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

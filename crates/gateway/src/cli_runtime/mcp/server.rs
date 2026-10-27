@@ -98,6 +98,7 @@ impl CliMcpBridgeFacadeServer {
         projection_generation: CliMcpProjectionGeneration,
         projection: CliMcpFacadeProjection,
         limits: CliMcpFacadeLimits,
+        call_contract: super::facade::CliMcpCallContract,
     ) -> Result<(CliMcpBridgeFacadeHandle, Self), CliMcpFacadeConfigurationError> {
         Self::build_with_cleanup_owner(
             transport,
@@ -148,6 +149,7 @@ impl CliMcpBridgeFacadeServer {
                 outbound: outbound_sender.clone(),
             }),
             limits.clone(),
+            call_contract,
         )?;
         if retained_cleanup {
             transport.defer_cleanup_until_join();
@@ -374,7 +376,8 @@ mod tests {
     use crate::cli_runtime::mcp::coordinator::CliMcpProjectionFingerprint;
     use crate::cli_runtime::mcp::facade::CliMcpFacadeTool;
     use crate::cli_runtime::mcp::grants::{
-        CliMcpConnectionId, CliMcpGrantError, CliMcpGrantScope, CliMcpManifestHash,
+        CliMcpConnectionId, CliMcpGrantError, CliMcpGrantRegistryState, CliMcpGrantScope,
+        CliMcpManifestHash,
     };
     use crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits;
     use crate::cli_runtime::session_instance::CliSessionInstanceId;
@@ -731,6 +734,7 @@ mod tests {
             reservation.generation,
             projection,
             CliMcpFacadeLimits::default(),
+            super::super::facade::CliMcpCallContract::Codex,
         )
         .expect("server");
         let mut server = tokio::spawn(server.run());
@@ -790,7 +794,8 @@ mod tests {
                 "jsonrpc": "2.0", "id": 3, "method": "tools/call",
                 "params": {
                     "name": "echo", "arguments": {"value": 7},
-                    "_meta": {"progressToken": "progress-3"}
+                    "_meta": {"progressToken": "progress-3", "callId": "echo-3", "threadId": "native-thread",
+                        "x-codex-turn-metadata": {"thread_id": "native-thread", "turn_id": "native-turn"}}
                 }
             }))
             .await;
@@ -805,7 +810,10 @@ mod tests {
         provider
             .send(json!({
                 "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-                "params": {"name": "wait", "arguments": {}}
+                "params": {"name": "wait", "arguments": {}, "_meta": {
+                    "callId": "wait-4", "threadId": "native-thread",
+                    "x-codex-turn-metadata": {"thread_id": "native-thread", "turn_id": "native-turn"}
+                }}
             }))
             .await;
         wait_for_count(&invoker.wait_calls, 1).await;
@@ -955,24 +963,22 @@ mod tests {
                 .is_err()
         );
 
-        let expired = coordinator
-            .issue_grant(exact_scope.clone(), expiry(1))
-            .await
-            .expect("grant");
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        assert!(
-            coordinator
-                .attach(
-                    &AttachRequest {
-                        session_id: expired.bridge_session_id.clone(),
-                        generation: BridgeGeneration::new(1).expect("generation"),
-                        nonce: expired.nonce.clone(),
-                    },
-                    &exact_scope,
-                    CliMcpConnectionId::for_test(23),
-                )
-                .await
-                .is_err()
+        // The coordinator delegates expiry checks to this registry. Supply
+        // explicit times so a scheduler delay cannot expire the grant at issue.
+        let mut grants = CliMcpGrantRegistryState::default();
+        let expired = grants
+            .issue(exact_scope.clone(), 101, 100)
+            .expect("grant is valid when issued");
+        assert_eq!(
+            grants.attach(
+                &expired.bridge_session_id,
+                BridgeGeneration::new(1).expect("generation"),
+                &exact_scope,
+                &expired.nonce,
+                CliMcpConnectionId::for_test(23),
+                101,
+            ),
+            Err(CliMcpGrantError::Expired)
         );
 
         let facade_projection = projection();
@@ -983,12 +989,15 @@ mod tests {
             after_cancel_entered: tokio::sync::Notify::new(),
             after_cancel_release: tokio::sync::Notify::new(),
         });
-        let facade = CliMcpToolFacade::new(
+        let facade = CliMcpToolFacade::try_new(
             coordinator.clone(),
             invoker.clone(),
             facade_projection,
             Arc::new(super::super::facade::CliMcpNoopProgressSink),
-        );
+            CliMcpFacadeLimits::default(),
+            super::super::facade::CliMcpCallContract::Codex,
+        )
+        .expect("facade");
         let context = CliMcpFacadeRequestContext {
             bound_grant: bound,
             projection_generation: projection_reservation.generation,

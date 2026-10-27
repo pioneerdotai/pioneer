@@ -96,6 +96,95 @@ fn apply_in_progress_turn(conversation: &mut Conversation) {
 }
 
 #[test]
+fn recovered_turn_snapshot_applies_current_terminal_before_another_running_turn() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let mut current = turn_snapshot(TURN_ID, TurnStatus::InProgress, None);
+    current.mode = ThreadMode::Agent;
+    conversation.sync_thread_snapshot(&thread_snapshot_with_turn(current.clone()));
+    current.status = TurnStatus::Completed;
+    current.permission_profile =
+        pioneer_protocol::system_turn_permission_profile_snapshot(TurnPermissionMode::FullAccess);
+    let mut another = turn_snapshot("another", TurnStatus::InProgress, None);
+    another.mode = ThreadMode::Agent;
+    let mut snapshot = thread_snapshot_with_turn(current.clone());
+    snapshot.turns.push(another);
+
+    for _ in 0..2 {
+        conversation.sync_thread_snapshot(&snapshot);
+        assert_eq!(conversation.in_flight_turn_id(), Some("another"));
+        assert_eq!(conversation.status_label(), "running");
+        let completed = conversation
+            .projection()
+            .turns
+            .iter()
+            .find(|turn| turn.id == TURN_ID)
+            .unwrap();
+        assert_eq!(completed.phase, TurnPhase::Completed);
+        assert_eq!(
+            completed.permission_profile.as_ref(),
+            Some(&current.permission_profile)
+        );
+    }
+}
+
+#[test]
+fn recovered_turn_snapshot_current_terminal_ignores_running_message_and_task_marker() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let mut current = turn_snapshot(TURN_ID, TurnStatus::InProgress, None);
+    current.mode = ThreadMode::Agent;
+    conversation.sync_thread_snapshot(&thread_snapshot_with_turn(current.clone()));
+    current.status = TurnStatus::Completed;
+    let mut snapshot = thread_snapshot_with_turn(current);
+    let mut message = turn_snapshot("message", TurnStatus::InProgress, None);
+    message.mode = ThreadMode::Message;
+    let mut marker = turn_snapshot("task-marker", TurnStatus::InProgress, None);
+    marker.turn_kind = TurnKind::TaskRun;
+    marker.origin = TurnOrigin::DetachedTask;
+    snapshot.turns.extend([message, marker]);
+    conversation.sync_thread_snapshot(&snapshot);
+    assert_eq!(conversation.in_flight_turn_id(), None);
+    assert_eq!(conversation.status_label(), "completed");
+    assert!(conversation.can_submit_message());
+    assert_eq!(
+        conversation
+            .projection()
+            .turns
+            .iter()
+            .find(|turn| turn.id == TURN_ID)
+            .unwrap()
+            .phase,
+        TurnPhase::Completed
+    );
+}
+
+#[test]
+fn recovered_turn_snapshot_keeps_current_running_or_cancelling_turn() {
+    for cancelling in [false, true] {
+        let mut conversation = Conversation::new(THREAD_ID);
+        let mut current = turn_snapshot(TURN_ID, TurnStatus::InProgress, None);
+        current.mode = ThreadMode::Agent;
+        let mut snapshot = thread_snapshot_with_turn(current);
+        conversation.sync_thread_snapshot(&snapshot);
+        if cancelling {
+            conversation.apply(ConversationEvent::LocalTurnCancelRequested {
+                thread_id: THREAD_ID.to_owned(),
+                turn_id: TURN_ID.to_owned(),
+            });
+        }
+        let mut another = turn_snapshot("another", TurnStatus::InProgress, None);
+        another.mode = ThreadMode::Agent;
+        snapshot.turns.push(another);
+        conversation.sync_thread_snapshot(&snapshot);
+        assert_eq!(conversation.in_flight_turn_id(), Some(TURN_ID));
+        assert_eq!(conversation.is_cancelling_turn(), cancelling);
+        assert_eq!(
+            conversation.projection().in_flight_turn_id.as_deref(),
+            Some(TURN_ID)
+        );
+    }
+}
+
+#[test]
 fn thread_snapshot_hydration_locks_composer_for_running_turn() {
     let mut conversation = Conversation::new(THREAD_ID);
 
@@ -1168,6 +1257,192 @@ fn cancel_request_locks_until_rejected_or_interrupted() {
     assert!(conversation.can_submit_message());
     assert_eq!(conversation.status_label(), "cancelled");
     assert_eq!(conversation.in_flight_turn_id(), None);
+}
+
+#[test]
+fn provider_previews_are_runtime_only_and_retired_by_canonical_items_or_terminal_turn() {
+    use pioneer_protocol::AgentMessagePhase as Phase;
+    let preview = |id: &str, text: &str| ConversationEvent::ItemDelta {
+        thread_id: THREAD_ID.into(),
+        turn_id: TURN_ID.into(),
+        item_id: id.into(),
+        delta: text.into(),
+        stream: Some(ItemDeltaStream::Generic),
+        payload: Some(serde_json::json!({"runtimeDeltaKind":"provider_message_preview"})),
+        markdown: None,
+        markdown_version: None,
+    };
+    let item = |id: &str, text: &str, phase| TurnItem::AgentMessage {
+        id: id.into(),
+        text: text.into(),
+        phase,
+        markdown: None,
+        markdown_version: None,
+    };
+    let mut c = Conversation::new(THREAD_ID);
+    c.apply(preview("pending", "work"));
+    c.apply(preview("pending", "ing"));
+    assert_eq!(c.projection().items.len(), 1);
+    assert_eq!(c.projection().items[0].partial_text, "working");
+    assert_eq!(c.projection().items[0].status, TimelineEntryStatus::Running);
+    assert!(c.projection().items[0].final_text.is_none());
+    // A late semantic resolution replaces the exact preview rather than adding
+    // a second commentary copy. Delayed lossy preview events cannot reopen it.
+    c.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.into(),
+        turn_id: TURN_ID.into(),
+        item: item("pending", "working", Phase::Commentary),
+    });
+    c.apply(ConversationEvent::ItemCompleted {
+        thread_id: THREAD_ID.into(),
+        turn_id: TURN_ID.into(),
+        item: item("pending", "working", Phase::Commentary),
+    });
+    c.apply(preview("pending", "stale preview"));
+    assert_eq!(c.projection().items.len(), 1);
+    assert_eq!(c.projection().items[0].partial_text, "working");
+    c.apply(preview("pending-final", "answer"));
+    c.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.into(),
+        turn_id: TURN_ID.into(),
+        item: item("final", "", Phase::FinalAnswer),
+    });
+    c.apply(ConversationEvent::ItemCompleted {
+        thread_id: THREAD_ID.into(),
+        turn_id: TURN_ID.into(),
+        item: item("final", "answer", Phase::FinalAnswer),
+    });
+    c.apply(preview("pending-final", "late"));
+    assert_eq!(c.projection().items.len(), 2);
+    assert_eq!(c.projection().timeline.len(), 2);
+    assert_eq!(
+        c.projection()
+            .item_by_id("final")
+            .unwrap()
+            .final_text
+            .as_deref(),
+        Some("answer")
+    );
+    assert!(c.projection().item_by_id("pending-final").is_none());
+    for entry in &c.projection().timeline {
+        assert_eq!(
+            c.projection().item_for_timeline_entry(entry).unwrap().id,
+            entry.item_id
+        );
+    }
+    let mut failed = Conversation::new(THREAD_ID);
+    failed.apply(preview("interrupted", "partial"));
+    failed.apply(ConversationEvent::TurnFailed {
+        thread_id: THREAD_ID.into(),
+        turn: turn_snapshot(TURN_ID, TurnStatus::Failed, Some("failed".into())),
+    });
+    failed.apply(preview("interrupted", "late"));
+    assert!(
+        failed
+            .projection()
+            .items
+            .iter()
+            .all(|item| item.id != "interrupted")
+    );
+}
+
+#[test]
+fn recovered_turn_snapshot_discards_only_its_provider_previews() {
+    let preview = |turn_id: &str, id: &str, text: &str| ConversationEvent::ItemDelta {
+        thread_id: THREAD_ID.into(),
+        turn_id: turn_id.into(),
+        item_id: id.into(),
+        delta: text.into(),
+        stream: Some(ItemDeltaStream::Generic),
+        payload: Some(serde_json::json!({"runtimeDeltaKind":"provider_message_preview"})),
+        markdown: None,
+        markdown_version: None,
+    };
+    for (status, phase) in [
+        (TurnStatus::Completed, TurnPhase::Completed),
+        (TurnStatus::Failed, TurnPhase::Failed),
+        (TurnStatus::Interrupted, TurnPhase::Cancelled),
+        (TurnStatus::Blocked, TurnPhase::Blocked),
+    ] {
+        let mut conversation = Conversation::new(THREAD_ID);
+        let mut snapshot =
+            thread_snapshot_with_turn(turn_snapshot(TURN_ID, TurnStatus::InProgress, None));
+        conversation.sync_thread_snapshot(&snapshot);
+        conversation.apply(preview(TURN_ID, "pending", "partial answer"));
+        let canonical_item = TurnItem::AgentMessage {
+            id: "canonical".into(),
+            text: "accepted commentary".into(),
+            phase: pioneer_protocol::AgentMessagePhase::Commentary,
+            markdown: None,
+            markdown_version: None,
+        };
+        conversation.apply(ConversationEvent::ItemStarted {
+            thread_id: THREAD_ID.into(),
+            turn_id: TURN_ID.into(),
+            item: canonical_item.clone(),
+        });
+        conversation.apply(ConversationEvent::ItemCompleted {
+            thread_id: THREAD_ID.into(),
+            turn_id: TURN_ID.into(),
+            item: canonical_item,
+        });
+        snapshot
+            .turns
+            .push(turn_snapshot("other", TurnStatus::InProgress, None));
+        conversation.apply(preview("other", "other-preview", "other partial"));
+        let canonical = conversation
+            .projection()
+            .item_by_id("canonical")
+            .unwrap()
+            .clone();
+
+        conversation.sync_thread_snapshot(&snapshot);
+        let running = conversation.projection();
+        assert_eq!(running.items.len(), 3);
+        assert_eq!(running.timeline.len(), 3);
+        let pending = running.item_by_id("pending").unwrap();
+        assert_eq!(pending.partial_text, "partial answer");
+        assert_eq!(pending.status, TimelineEntryStatus::Running);
+
+        // No live terminal event: the same Conversation receives only the
+        // recovered snapshot, while another execution remains active.
+        snapshot.turns[0].status = status;
+        for _ in 0..2 {
+            conversation.sync_thread_snapshot(&snapshot);
+            conversation.apply(preview(TURN_ID, "pending", "late old preview"));
+            conversation.apply(preview(TURN_ID, "late-new-preview", "late new preview"));
+            let state = conversation.projection();
+            assert_eq!(state.turn_by_id(TURN_ID).unwrap().phase, phase);
+            assert_eq!(state.items.len(), 2);
+            assert_eq!(state.timeline.len(), 2);
+            assert!(state.item_by_id("pending").is_none());
+            assert!(state.item_by_id("late-new-preview").is_none());
+            assert_eq!(state.item_by_id("canonical"), Some(&canonical));
+            let other = state.item_by_id("other-preview").unwrap();
+            assert_eq!(other.partial_text, "other partial");
+            assert_eq!(other.status, TimelineEntryStatus::Running);
+            for entry in &state.timeline {
+                // Check the stored index too: the public lookup has a fallback
+                // that could otherwise conceal an index left stale by removal.
+                assert_eq!(state.items[entry.item_index].id, entry.item_id);
+                assert_eq!(
+                    state.item_for_timeline_entry(entry),
+                    state.item_by_id(&entry.item_id)
+                );
+            }
+        }
+        // Updating a survivor exercises the projector's private item index after
+        // removing the earlier preview, without inspecting private structures.
+        conversation.apply(preview("other", "other-preview", " continued"));
+        let state = conversation.projection();
+        assert_eq!(state.items.len(), 2);
+        assert_eq!(state.timeline.len(), 2);
+        assert_eq!(state.item_by_id("canonical"), Some(&canonical));
+        assert_eq!(
+            state.item_by_id("other-preview").unwrap().partial_text,
+            "other partial continued"
+        );
+    }
 }
 
 #[test]

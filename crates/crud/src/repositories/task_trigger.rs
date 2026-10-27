@@ -30,6 +30,7 @@ pub async fn upsert_prepared_trigger<C: ConnectionTrait>(
             OnConflict::column(task_trigger::Column::Id)
                 .update_columns([
                     task_trigger::Column::TaskId,
+                    task_trigger::Column::WebhookSecretRef,
                     task_trigger::Column::Kind,
                     task_trigger::Column::Status,
                     task_trigger::Column::SpecJson,
@@ -145,6 +146,7 @@ fn active_model_from_trigger(trigger: &TaskTrigger) -> Result<task_trigger::Acti
     Ok(task_trigger::ActiveModel {
         id: Set(trigger.id.clone()),
         task_id: Set(trigger.task_id.clone()),
+        webhook_secret_ref: Set(trigger.webhook_secret_ref.clone()),
         kind: Set(task_trigger_kind_to_db(trigger.kind()).to_owned()),
         status: Set(task_trigger_status_to_db(trigger.status).to_owned()),
         spec_json: Set(spec_json),

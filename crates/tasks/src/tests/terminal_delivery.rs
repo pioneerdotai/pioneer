@@ -420,6 +420,12 @@ async fn different_result_or_terminal_outcome_is_a_conflict_without_partial_even
         .await
         .unwrap_err();
     assert!(error.downcast_ref::<TaskTerminalConflict>().is_some());
+    assert!(
+        error
+            .downcast_ref::<crate::executor::TerminalCommitPhase>()
+            .is_some(),
+        "terminal phase must survive alongside the original domain conflict"
+    );
     assert_eq!(events(&runtime, &run).await, before);
 }
 
@@ -1058,6 +1064,7 @@ async fn delivery_output_binding_and_candidate_keep_the_original_delivery_identi
             next_import: Set(0),
             ready: Set(1),
             storage_registered: Set(0),
+            expired: Set(0),
         },
     )
     .exec(&db)

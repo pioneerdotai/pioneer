@@ -28,7 +28,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-const MINIMUM_CLAUDE_CODE_VERSION: &str = "2.0.0";
 const CLAUDE_EMPTY_MCP_CONFIG_FILE_NAME: &str = "mcp-config.json";
 const CLAUDE_EMPTY_MCP_CONFIG_MARKER_FILE_NAME: &str = ".pioneer-claude-mcp-config.json";
 const CLAUDE_SYSTEM_PROMPT_EXTENSION_FILE_NAME: &str = "pioneer-system-prompt.md";
@@ -183,12 +182,8 @@ pub fn claude_executable_cache_identity(
 ) -> anyhow::Result<ClaudeExecutableCacheIdentity> {
     claude_validate_sha256("probe contract hash", probe_contract_hash)?;
     let provider_version = provider_version.trim();
-    if provider_version.is_empty()
-        || provider_version.len() > 256
-        || provider_version.contains('\0')
-    {
-        anyhow::bail!("Claude provider version is unavailable or invalid");
-    }
+    // Empty metadata represents an unreported version in the existing cache schema.
+    // Executable identity and protocol checks do not depend on release strings.
     let realpath = resolve_claude_executable(configured_executable)?;
     let metadata = fs::metadata(realpath.as_path()).map_err(|error| {
         anyhow::anyhow!(
@@ -1369,90 +1364,62 @@ impl ClaudeProbe {
         // not leave a detached `claude --version` process behind.
         command.kill_on_drop(true);
 
-        let output = match timeout(config.request_timeout, command.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => return spawn_error_probe_snapshot(&config, error),
-            Err(_) => {
-                let message = format!(
-                    "Claude CLI version probe timed out after {} ms",
-                    config.request_timeout.as_millis()
+        // --version only supplies display/cache metadata. The initialize operation
+        // below determines readiness even when that metadata cannot be obtained.
+        let mut version_diagnostics = Vec::new();
+        let (version, stderr) = match timeout(config.request_timeout, command.output()).await {
+            Ok(Ok(output)) => {
+                let stdout = config
+                    .env
+                    .redact_text(String::from_utf8_lossy(&output.stdout).into_owned());
+                let stderr = stderr_lines(
+                    config
+                        .env
+                        .redact_text(String::from_utf8_lossy(&output.stderr).into_owned()),
                 );
-                return ClaudeAccountProbeSnapshot {
-                    status: ClaudeAccountProbeStatus::Error,
-                    message: Some(message.clone()),
-                    version: None,
-                    account: None,
-                    diagnostics: vec![ClaudeProbeDiagnostic {
-                        level: ClaudeProbeDiagnosticLevel::Error,
-                        code: "claude_probe.version_timeout".to_owned(),
-                        message,
-                    }],
-                    stderr: Vec::new(),
+                let version = if output.status.success() {
+                    parse_semver(&stdout)
+                        .or_else(|| stderr.iter().find_map(|line| parse_semver(line)))
+                        .or_else(|| {
+                            stdout
+                                .lines()
+                                .map(str::trim)
+                                .find(|line| !line.is_empty())
+                                .map(str::to_owned)
+                        })
+                } else {
+                    version_diagnostics.push(ClaudeProbeDiagnostic {
+                        level: ClaudeProbeDiagnosticLevel::Warning,
+                        code: "claude_probe.version_failed".to_owned(),
+                        message: format!("Claude CLI version metadata is unavailable (exit {}); checking initialize", output.status),
+                    });
+                    None
                 };
+                (version, stderr)
+            }
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return spawn_error_probe_snapshot(&config, error);
+            }
+            Ok(Err(error)) => {
+                version_diagnostics.push(ClaudeProbeDiagnostic {
+                    level: ClaudeProbeDiagnosticLevel::Warning,
+                    code: "claude_probe.version_failed".to_owned(),
+                    message: config.env.redact_text(format!(
+                        "Claude CLI version metadata is unavailable: {error}; checking initialize"
+                    )),
+                });
+                (None, Vec::new())
+            }
+            Err(_) => {
+                version_diagnostics.push(ClaudeProbeDiagnostic {
+                    level: ClaudeProbeDiagnosticLevel::Warning,
+                    code: "claude_probe.version_timeout".to_owned(),
+                    message: "Claude CLI version metadata request timed out; checking initialize"
+                        .to_owned(),
+                });
+                (None, Vec::new())
             }
         };
-
-        let stdout = config
-            .env
-            .redact_text(String::from_utf8_lossy(&output.stdout).into_owned());
-        let stderr = stderr_lines(
-            config
-                .env
-                .redact_text(String::from_utf8_lossy(&output.stderr).into_owned()),
-        );
-        if !output.status.success() {
-            let message = stderr.first().cloned().unwrap_or_else(|| {
-                format!("Claude CLI version probe exited with {}", output.status)
-            });
-            return ClaudeAccountProbeSnapshot {
-                status: ClaudeAccountProbeStatus::Error,
-                message: Some(message.clone()),
-                version: None,
-                account: None,
-                diagnostics: vec![ClaudeProbeDiagnostic {
-                    level: ClaudeProbeDiagnosticLevel::Error,
-                    code: "claude_probe.version_failed".to_owned(),
-                    message,
-                }],
-                stderr,
-            };
-        }
-
-        let version = parse_semver(stdout.as_str())
-            .or_else(|| stderr.iter().find_map(|line| parse_semver(line.as_str())));
-        let Some(version) = version else {
-            let message = "Claude CLI version probe did not return a parseable version".to_owned();
-            return ClaudeAccountProbeSnapshot {
-                status: ClaudeAccountProbeStatus::Error,
-                message: Some(message.clone()),
-                version: None,
-                account: None,
-                diagnostics: vec![ClaudeProbeDiagnostic {
-                    level: ClaudeProbeDiagnosticLevel::Error,
-                    code: "claude_probe.version_unparseable".to_owned(),
-                    message,
-                }],
-                stderr,
-            };
-        };
-
-        if semver_lt(version.as_str(), MINIMUM_CLAUDE_CODE_VERSION) {
-            let message = format!(
-                "Claude CLI version {version} is older than required {MINIMUM_CLAUDE_CODE_VERSION}"
-            );
-            return ClaudeAccountProbeSnapshot {
-                status: ClaudeAccountProbeStatus::UnsupportedVersion,
-                message: Some(message.clone()),
-                version: Some(version),
-                account: None,
-                diagnostics: vec![ClaudeProbeDiagnostic {
-                    level: ClaudeProbeDiagnosticLevel::Error,
-                    code: "claude_probe.unsupported_version".to_owned(),
-                    message,
-                }],
-                stderr,
-            };
-        }
 
         match run_initialize_probe(&config, config_dir.as_path()).await {
             Ok(initialize) => {
@@ -1461,19 +1428,24 @@ impl ClaudeProbe {
                     code: "claude_probe.ready".to_owned(),
                     message: "Claude CLI initialize probe succeeded".to_owned(),
                 }];
+                diagnostics.extend(version_diagnostics);
                 diagnostics.extend(initialize.diagnostics.clone());
                 let mut stderr = stderr;
                 stderr.extend(initialize.stderr);
                 ClaudeAccountProbeSnapshot {
                     status: ClaudeAccountProbeStatus::Ready,
                     message: None,
-                    version: Some(version),
+                    version,
                     account: initialize.account,
                     diagnostics,
                     stderr,
                 }
             }
-            Err(error) => error.into_account_snapshot(Some(version), stderr),
+            Err(error) => {
+                let mut snapshot = error.into_account_snapshot(version, stderr);
+                snapshot.diagnostics.extend(version_diagnostics);
+                snapshot
+            }
         }
     }
 
@@ -1665,6 +1637,11 @@ async fn run_initialize_probe(
             message: format!("failed to spawn Claude CLI initialize probe: {error}"),
             stderr: Vec::new(),
         })?;
+    let mut observation = pioneer_observability::resources::ChildRegistration::register(
+        child.id(),
+        pioneer_observability::resources::ChildRole::CliAgent,
+        None,
+    );
     if let Some(mut stdin) = child.stdin.take() {
         let initialize_line = serde_json::json!({
             "type": "control_request",
@@ -1700,6 +1677,7 @@ async fn run_initialize_probe(
             });
         }
     };
+    observation.exited(output.status.success());
     let stderr = stderr_lines(
         config
             .env
@@ -2033,28 +2011,6 @@ fn parse_semver(value: &str) -> Option<String> {
                     .is_some_and(|patch| patch.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
         })
         .map(str::to_owned)
-}
-
-fn semver_lt(left: &str, right: &str) -> bool {
-    let left = semver_core(left);
-    let right = semver_core(right);
-    left < right
-}
-
-fn semver_core(value: &str) -> (u64, u64, u64) {
-    let mut parts = value.split('.');
-    let major = parts.next().and_then(parse_semver_part).unwrap_or(0);
-    let minor = parts.next().and_then(parse_semver_part).unwrap_or(0);
-    let patch = parts.next().and_then(parse_semver_part).unwrap_or(0);
-    (major, minor, patch)
-}
-
-fn parse_semver_part(value: &str) -> Option<u64> {
-    let digits = value
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    digits.parse().ok()
 }
 
 pub fn claude_redacted_native_event(method: impl Into<String>, raw: JsonValue) -> JsonValue {
@@ -2393,6 +2349,17 @@ mod tests {
             "a".repeat(64).as_str(),
         )
         .expect("cache identity");
+        for version in ["", "1.0.0", "dev-build+local"] {
+            let other = claude_executable_cache_identity(
+                executable.to_string_lossy().as_ref(),
+                version,
+                &"a".repeat(64),
+            )
+            .expect("release metadata does not gate identity");
+            assert_eq!(other.realpath, identity.realpath);
+            assert_eq!(other.provider_version, version);
+            assert_ne!(other, identity);
+        }
         let attestation = attest_claude_executable_identity(identity.clone())
             .expect("Claude executable attestation");
         assert_eq!(attestation.cache_identity, identity);

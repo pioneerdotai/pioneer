@@ -84,7 +84,7 @@ impl WorkspaceNavigationView {
         }
     }
     pub fn close(&mut self, cx: &mut Context<Self>) {
-        self.sidebar.update(cx, |view, _| view.close());
+        self.sidebar.update(cx, |view, cx| view.close(cx));
     }
 }
 impl Render for WorkspaceNavigationView {

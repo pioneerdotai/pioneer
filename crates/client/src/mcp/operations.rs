@@ -83,6 +83,7 @@ pub struct McpActionPublication {
     pub field_error: Option<super::actions::McpInstallFieldError>,
 }
 struct Work {
+    work_context: pioneer_observability::work::WorkCarrier,
     workspace: String,
     target: String,
     operation: u64,
@@ -98,6 +99,7 @@ pub(crate) struct McpController {
     next: u64,
     publications: BTreeMap<(String, String), Arc<McpActionPublication>>,
     sender: Option<mpsc::SyncSender<Work>>,
+    observer: Option<pioneer_observability::queues::QueueObserver>,
     task: Option<std::thread::JoinHandle<()>>,
 }
 impl McpController {
@@ -219,6 +221,12 @@ impl ClientCore {
             .expect("MCP operation identity exhausted");
         let operation = owner.next;
         let work = Work {
+            work_context: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
             workspace: workspace.into(),
             target: target.clone(),
             operation,
@@ -228,12 +236,18 @@ impl ClientCore {
             intent,
             previous_policy,
         };
-        owner
-            .sender
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("client_stopped"))?
-            .try_send(work)
-            .map_err(|_| anyhow::anyhow!("mcp_action_backpressure"))?;
+        pioneer_observability::queues::observe_try_send(
+            owner.observer.as_ref(),
+            pioneer_observability::queues::QueueBytes::Unsupported,
+            || {
+                owner
+                    .sender
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("client_stopped"))?
+                    .try_send(work)
+                    .map_err(|_| anyhow::anyhow!("mcp_action_backpressure"))
+            },
+        )?;
         self.publish_mcp_action(
             &mut owner,
             workspace,
@@ -313,8 +327,33 @@ impl ClientCore {
                         })
             }
     }
+    fn retire_mcp_action(&self, work: &Work) {
+        let mut owner = self.mcp_controller.lock().expect("MCP controller poisoned");
+        if !owner
+            .publications
+            .get(&(work.workspace.clone(), work.target.clone()))
+            .is_some_and(|p| p.operation_id == work.operation && p.state == McpActionState::Pending)
+        {
+            return;
+        }
+        self.publish_mcp_action(
+            &mut owner,
+            &work.workspace,
+            &work.target,
+            work.operation,
+            McpActionState::Cancelled,
+            work.intent.action_kind(),
+        );
+        drop(owner);
+        // A mutation may have committed before its response was lost. Reconcile
+        // canonical state through the existing authorized read owner, never replay it.
+        if self.capability_management_allowed(&work.workspace) {
+            self.fence_mcp_reads_after_action(&work.workspace, &work.target);
+        }
+    }
     fn complete_mcp_action(&self, work: Work, result: anyhow::Result<()>) {
         if !self.mcp_action_current(&work) {
+            self.retire_mcp_action(&work);
             return;
         }
         let mut owner = self.mcp_controller.lock().expect("MCP controller poisoned");
@@ -381,11 +420,9 @@ impl ClientCore {
                 vec![],
             );
         }
-        let refresh_cleanup =
-            matches!(work.intent, McpIntent::Disconnect { .. }) && result.is_err();
         drop(owner);
-        if refresh_cleanup {
-            self.refresh_mcp(&work.workspace);
+        if result.is_err() {
+            self.fence_mcp_reads_after_action(&work.workspace, &work.target);
         }
         self.refresh_plugin_publication(&work.workspace);
     }
@@ -395,6 +432,7 @@ impl ClientCore {
         result: anyhow::Result<pioneer_protocol::McpInstallResponse>,
     ) {
         if !self.mcp_action_current(&work) {
+            self.retire_mcp_action(&work);
             return;
         }
         let mut owner = self.mcp_controller.lock().expect("MCP controller poisoned");
@@ -423,7 +461,7 @@ impl ClientCore {
                     reduction.queue_refresh,
                 )
             }
-            Err(_) => (McpActionState::Failed, None, false),
+            Err(_) => (McpActionState::Failed, None, true),
         };
         if refresh {
             self.fence_mcp_reads_after_action(&work.workspace, "configuration");
@@ -504,15 +542,34 @@ impl ClientCore {
     }
     pub(crate) fn start_mcp_operation_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel::<Work>(32);
+        let queue_observer = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(32),
+            "unsupported: controller request payload/shared references are not serialized",
+        );
+        let worker_queue = queue_observer.clone();
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-mcp-actions".into())
             .spawn(move || {
                 while let Ok(work) = receiver.recv() {
+                    worker_queue.dequeued(pioneer_observability::queues::QueueBytes::Unsupported);
+                    let mut processing = worker_queue.processing();
+                    let carrier = work.work_context.clone().received(
+                        pioneer_observability::work::Boundary::StdThread,
+                        pioneer_observability::work::WorkKind::ClientCommand,
+                        pioneer_observability::work::ExecutorRole::ClientController,
+                    );
+                    let _scope = carrier.enter();
+                    let mut active_work = pioneer_observability::live::WorkGuard::start(
+                        pioneer_observability::work::current(),
+                        false,
+                    );
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
                     if !core.mcp_action_current(&work) {
+                        core.retire_mcp_action(&work);
                         continue;
                     }
                     let sender = core.transport_runtime().ws_command_sender();
@@ -533,9 +590,16 @@ impl ClientCore {
                             configuration_params(&work.workspace, config_json, oauth_redirect);
                         let result =
                             crate::transport::ws::command_sender::mcp_install(&bound, params);
+                        let outcome = if result.is_ok() {
+                            pioneer_observability::work::Outcome::Completed
+                        } else {
+                            pioneer_observability::work::Outcome::Failed
+                        };
                         if let Some(core) = weak.upgrade() {
                             core.complete_mcp_configuration(work, result);
                         }
+                        processing.processed();
+                        active_work.finish(outcome);
                         continue;
                     }
                     let result = match &work.intent {
@@ -629,13 +693,21 @@ impl ClientCore {
                             unreachable!("configuration uses typed validation completion")
                         }
                     };
+                    let outcome = if result.is_ok() {
+                        pioneer_observability::work::Outcome::Completed
+                    } else {
+                        pioneer_observability::work::Outcome::Failed
+                    };
                     if let Some(core) = weak.upgrade() {
                         core.complete_mcp_action(work, result);
                     }
+                    processing.processed();
+                    active_work.finish(outcome);
                 }
             })
             .expect("MCP action controller could not start");
         let mut owner = self.mcp_controller.lock().expect("MCP controller poisoned");
+        owner.observer = Some(queue_observer);
         owner.sender = Some(sender);
         owner.task = Some(task);
     }
@@ -734,6 +806,44 @@ mod tests {
             assert_eq!(work.epoch, admitted);
             assert!(!core.mcp_action_current(&work));
         }
+    }
+    #[test]
+    fn retired_ticket_releases_its_action_and_cannot_finish_the_replacement() {
+        let (core, queue) = fixture();
+        let intent = || McpIntent::Restart {
+            server_id: "a".into(),
+        };
+        core.mcp_intent("workspace", intent()).unwrap();
+        let work = queue.try_recv().unwrap();
+        let late = Work {
+            work_context: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
+            workspace: work.workspace.clone(),
+            target: work.target.clone(),
+            operation: work.operation,
+            epoch: work.epoch,
+            name: work.name.clone(),
+            scope_kind: work.scope_kind,
+            intent: intent(),
+            previous_policy: None,
+        };
+        crate::catalog_test_support::replace_connection(&core, 8);
+        core.complete_mcp_action(work, Ok(()));
+        assert_eq!(
+            core.mcp_action_snapshot("workspace", "a").unwrap().state,
+            McpActionState::Cancelled
+        );
+        core.mcp_intent("workspace", intent()).unwrap();
+        let pending = core.mcp_action_snapshot("workspace", "a").unwrap();
+        core.complete_mcp_action(late, Err(anyhow::anyhow!("lost response")));
+        assert!(Arc::ptr_eq(
+            &pending,
+            &core.mcp_action_snapshot("workspace", "a").unwrap()
+        ));
     }
     struct UnavailableListener;
     impl super::super::oauth::McpOAuthShell for UnavailableListener {

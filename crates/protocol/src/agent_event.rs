@@ -180,6 +180,9 @@ pub enum AgentDurableEvent {
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recovery: Option<RecoveryAttemptContext>,
+        /// Initial native Stop retains its durable completion owner until ACK.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancellation_owner: Option<(String, u64)>,
     },
     TaskEvent {
         event: TaskEvent,
@@ -685,6 +688,7 @@ impl TaskEventPayload {
             | Self::TaskScheduled { .. }
             | Self::TaskQueued { .. }
             | Self::RunCreated { .. }
+            | Self::RunStarting { .. }
             | Self::RunStarted { .. }
             | Self::RunCompleted { .. }
             | Self::RunFailed { .. }
@@ -801,6 +805,7 @@ mod tests {
             turn_id: "turn_1".to_owned(),
             reason: "user clicked stop".to_owned(),
             recovery: None,
+            cancellation_owner: None,
         };
 
         assert_eq!(
@@ -810,6 +815,28 @@ mod tests {
             }
         );
         assert!(event.is_terminal());
+        let legacy = serde_json::to_value(&event).unwrap();
+        assert!(legacy.get("cancellation_owner").is_none());
+        assert_eq!(
+            serde_json::from_value::<AgentDurableEvent>(legacy).unwrap(),
+            event
+        );
+        let owned = AgentDurableEvent::TurnInterrupted {
+            thread_id: "thread_1".into(),
+            turn_id: "turn_1".into(),
+            reason: "Stop".into(),
+            recovery: None,
+            cancellation_owner: Some(("owner_1".into(), 7)),
+        };
+        let wire = serde_json::to_value(&owned).unwrap();
+        assert_eq!(
+            wire["cancellation_owner"],
+            serde_json::json!(["owner_1", 7])
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentDurableEvent>(wire).unwrap(),
+            owned
+        );
     }
 
     #[test]

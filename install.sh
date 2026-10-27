@@ -15,13 +15,13 @@ DOWNLOAD_BASE="${PIONEER_RELEASE_DOWNLOAD_BASE:-https://github.com/${REPO}/relea
 usage() {
   cat <<'USAGE'
 Usage:
-  install.sh [--channel stable|beta|canary] [--version x.y.z] [--computer-use] [--no-start] [--force-start]
+  install.sh [--channel stable|beta|canary] [--version x.y.z] [--headless|--computer-use] [--no-start] [--force-start]
 
 Options:
   --channel <name>   Release channel (default: stable)
   --version <value>  Install explicit version (for example: 0.2.1 or v0.2.1)
-  --computer-use     Install the native computer-use gateway variant
-  --headless         Install the headless gateway variant (default)
+  --headless         Install the server gateway without computer use (default)
+  --computer-use     Install the Gateway with its complete CUA driver package
   --no-start         Do not start service after install/update
   --force-start      Start service even if an existing install is currently stopped
   --help             Show this help
@@ -208,7 +208,10 @@ work_dir = installer.parent
 found = False
 with zipfile.ZipFile(asset) as archive:
     for entry in archive.infolist():
-        name = pathlib.Path(entry.filename).name
+        member = pathlib.PurePosixPath(entry.filename)
+        if len(member.parts) != 1:
+            continue
+        name = member.name
         if not name:
             continue
         if name == "pioneer":
@@ -221,8 +224,12 @@ if not found:
     raise SystemExit(f"{asset} does not contain pioneer")
 PY
       ;;
-    *)
+    *.gz)
+      need_cmd gunzip
       gunzip -c "$asset_file" > "$installer_bin"
+      ;;
+    *)
+      fail "Gateway installation requires a .gz server archive or a complete ZIP archive"
       ;;
   esac
   chmod 0755 "$installer_bin"
@@ -247,7 +254,6 @@ PY
 main() {
   need_cmd curl
   need_cmd python3
-  need_cmd gunzip
 
   read_env_flags
   parse_args "$@"
@@ -267,12 +273,11 @@ main() {
     asset_name="$(basename "$asset_file")"
     tag="local-bundle"
   else
-    local asset_suffix=""
+    local asset_suffix="" asset_ext="gz"
     if [[ "$COMPUTER_USE" -eq 1 ]]; then
-      asset_suffix="-computer-use"
-    fi
-    local asset_ext="gz"
-    if [[ "$os" == "macos" && "$arch" == "x86_64" ]]; then
+      asset_suffix="-computer-use-package"
+      asset_ext="zip"
+    elif [[ "$os" == "macos" && "$arch" == "x86_64" ]]; then
       asset_ext="zip"
     fi
     asset_name="pioneer-gateway-${os}-${arch}${asset_suffix}.${asset_ext}"

@@ -267,7 +267,10 @@ pub struct PreparedCLIAgentCommand {
 }
 
 pub struct CLIAgentProcess {
+    observation: pioneer_observability::resources::ChildRegistration,
     child: Box<dyn ChildWrapper>,
+    #[cfg(unix)]
+    owned_process_group: Option<u32>,
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     stderr: StderrRing,
@@ -298,7 +301,14 @@ impl CLIAgentProcess {
     }
 
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-        self.child.try_wait().context("failed to poll CLI process")
+        let status = self
+            .child
+            .try_wait()
+            .context("failed to poll CLI process")?;
+        if let Some(status) = status {
+            self.observation.exited(status.success());
+        }
+        Ok(status)
     }
 
     pub async fn wait(&mut self) -> Result<ExitStatus> {
@@ -307,6 +317,7 @@ impl CLIAgentProcess {
             .wait()
             .await
             .context("failed to wait for CLI process")?;
+        self.observation.exited(status.success());
         self.wait_for_stderr().await?;
         Ok(status)
     }
@@ -338,8 +349,74 @@ impl CLIAgentProcess {
                     .context("failed to wait for force-killed CLI process")
             }
         }?;
+        self.observation.exited(status.success());
         self.wait_for_stderr().await?;
         Ok(status)
+    }
+
+    /// Kill remaining members and confirm removal of an owned service group
+    /// after its parent was reaped.
+    /// Unlike `terminate_with_grace`, this also covers descendants which closed
+    /// their pipes before the parent exited. Only callers requiring this stronger
+    /// barrier opt in; the supplied deadline is never extended here. Platforms
+    /// without group observation fail closed instead of claiming completion.
+    pub async fn terminate_service_group(&mut self, deadline: tokio::time::Instant) -> Result<()> {
+        #[cfg(unix)]
+        {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "service group cleanup deadline exhausted"
+            );
+            anyhow::ensure!(
+                self.try_wait()?.is_some(),
+                "service parent exit has not been confirmed"
+            );
+            let pgid = self
+                .owned_process_group
+                .and_then(|pid| i32::try_from(pid).ok())
+                .filter(|pid| *pid > 0)
+                .context("owned service process group is unavailable")?;
+            let group_gone = || -> Result<bool> {
+                // SAFETY: this is the positive PGID captured when spawning our
+                // own group leader. Signal zero observes the entire group.
+                if unsafe { libc::kill(-pgid, 0) } == 0 {
+                    return Ok(false);
+                }
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    Ok(true)
+                } else {
+                    Err(error).context("failed to observe owned service process group")
+                }
+            };
+            if group_gone()? {
+                return Ok(());
+            }
+            if let Err(error) = self.child.start_kill()
+                && error.raw_os_error() != Some(libc::ESRCH)
+            {
+                return Err(error).context("failed to kill owned service process group");
+            }
+            tokio::time::timeout_at(deadline, async {
+                loop {
+                    anyhow::ensure!(
+                        tokio::time::Instant::now() < deadline,
+                        "owned service process group cleanup was not confirmed before deadline"
+                    );
+                    if group_gone()? {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .context("owned service process group cleanup was not confirmed before deadline")?
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = deadline;
+            bail!("service process group cleanup confirmation is unavailable on this platform")
+        }
     }
 
     async fn wait_for_stderr(&mut self) -> Result<()> {
@@ -507,6 +584,11 @@ pub fn spawn_prepared_cli_agent_process(
     let mut child = wrapped
         .spawn()
         .with_context(|| format!("failed to spawn CLI process `{}`", prepared.executable))?;
+    let observation = pioneer_observability::resources::ChildRegistration::register(
+        child.id(),
+        pioneer_observability::resources::ChildRole::CliAgent,
+        prepared.process_generation,
+    );
     let stdin = child.stdin().take();
     let stdout = child.stdout().take();
     let stderr = StderrRing::new_with_redactions(
@@ -525,6 +607,9 @@ pub fn spawn_prepared_cli_agent_process(
     });
 
     Ok(CLIAgentProcess {
+        observation,
+        #[cfg(unix)]
+        owned_process_group: prepared.process_group.then(|| child.id()).flatten(),
         child,
         stdin,
         stdout,

@@ -6,7 +6,8 @@ use pioneer_protocol::{TaskError, TaskResult, TaskRun, TaskRunStatus};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, ExprTrait, OnConflict, Query};
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, Statement,
 };
 
 use crate::convention::{
@@ -49,6 +50,7 @@ pub async fn upsert_prepared_run<C: ConnectionTrait>(
                 .update_columns([
                     task_run::Column::TaskId,
                     task_run::Column::TriggerId,
+                    task_run::Column::TriggerInputJson,
                     task_run::Column::ParentRunId,
                     task_run::Column::RunGroupId,
                     task_run::Column::AttemptNumber,
@@ -98,6 +100,110 @@ pub async fn find_retry_successor<C: ConnectionTrait>(
         anyhow::bail!("terminal Task run has multiple retry successors");
     }
     Ok(rows.pop())
+}
+
+/// Validate the exact new queue watermark without loading any request body.
+/// A retry must descend from a failed sibling in this task/trigger, preserve its
+/// bytes and run group, and advance its attempt. Its logical occurrence keeps
+/// the original webhook identity while dispatch rebinds it from source to retry.
+/// Ordinary POSTs have the durable webhook occurrence installed by admission.
+pub async fn is_webhook_queue_run<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+    trigger_id: &str,
+    completing_run_id: &str,
+    latest_number: i64,
+) -> Result<bool> {
+    Ok(db
+        .query_one_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT 1 FROM task_run r
+         LEFT JOIN task_run source ON source.id = r.retry_of_run_id
+         WHERE r.task_id = ? AND r.trigger_id = ? AND r.run_number = ?
+           AND r.executor_kind = 'agent' AND r.trigger_input_json IS NOT NULL
+           AND (
+             (r.retry_of_run_id IS NULL AND r.attempt_number = 1 AND EXISTS (
+               SELECT 1 FROM task_occurrence_contract o
+               WHERE o.run_id = r.id AND o.task_id = r.task_id AND o.trigger_id = r.trigger_id
+                 AND o.occurrence_key = 'webhook:' || r.id
+             )) OR (
+               source.id <> ? AND source.task_id = r.task_id AND source.trigger_id = r.trigger_id
+               AND source.executor_kind = 'agent' AND source.status = 'failed'
+               AND source.completed_at IS NOT NULL AND source.run_number < r.run_number
+               AND r.parent_run_id = source.id AND r.run_group_id = source.run_group_id
+               AND r.attempt_number = source.attempt_number + 1
+               AND r.trigger_input_json = source.trigger_input_json AND EXISTS (
+                 SELECT 1 FROM task_occurrence_contract o
+                 JOIN task_run origin ON origin.id = o.occurrence_id
+                 WHERE o.run_id IN (source.id, r.id)
+                   AND o.task_id = source.task_id AND o.trigger_id = source.trigger_id
+                   AND origin.task_id = source.task_id AND origin.trigger_id = source.trigger_id
+                   AND origin.run_group_id = source.run_group_id
+                   AND origin.executor_kind = 'agent' AND origin.attempt_number = 1
+                   AND origin.retry_of_run_id IS NULL AND origin.parent_run_id IS NULL
+                   AND origin.run_number <= source.run_number
+                   AND o.occurrence_key = 'webhook:' || origin.id
+                   AND o.action_idempotency_key = 'task:' || source.task_id || ':' || origin.id
+                   AND o.retry_attempt = CASE
+                     WHEN o.run_id = r.id THEN r.attempt_number
+                     WHEN source.attempt_number = 1 THEN 0 ELSE source.attempt_number END
+               )
+             )
+           ) LIMIT 1",
+            [
+                task_id.to_owned().into(),
+                trigger_id.to_owned().into(),
+                latest_number.into(),
+                completing_run_id.to_owned().into(),
+            ],
+        ))
+        .await?
+        .is_some())
+}
+
+/// Prove which admitted sibling last set the shared activity label. The event
+/// remains authoritative if that sibling terminalizes before this commit.
+pub async fn has_webhook_sibling_activity<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+    trigger_id: &str,
+    completing_run_id: &str,
+    status: &str,
+) -> Result<bool> {
+    use pioneer_protocol::constants::events;
+    let activity = match status {
+        "running" => [events::TASK_RUN_STARTED, events::TASK_REVISION_REQUESTED],
+        "waiting_review" => [events::TASK_RUN_ENTERED_REVIEW; 2],
+        _ => return Ok(false),
+    };
+    Ok(db
+        .query_one_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT 1 FROM (
+           SELECT task_id, run_id, event_type FROM task_event
+           WHERE task_id = ? AND event_type IN (?, ?, ?, ?)
+           ORDER BY sequence DESC LIMIT 1
+         ) e JOIN task_run r ON r.id = e.run_id AND r.task_id = e.task_id
+         WHERE r.trigger_id = ? AND r.id <> ? AND e.event_type IN (?, ?)
+           AND r.executor_kind = 'agent' AND r.trigger_input_json IS NOT NULL
+           AND r.started_at IS NOT NULL AND EXISTS (
+             SELECT 1 FROM task_occurrence_contract o
+             WHERE o.run_id = r.id AND o.task_id = r.task_id AND o.trigger_id = r.trigger_id
+           ) LIMIT 1",
+            [
+                task_id.to_owned().into(),
+                events::TASK_QUEUED.into(),
+                events::TASK_RUN_STARTED.into(),
+                events::TASK_RUN_ENTERED_REVIEW.into(),
+                events::TASK_REVISION_REQUESTED.into(),
+                trigger_id.to_owned().into(),
+                completing_run_id.to_owned().into(),
+                activity[0].into(),
+                activity[1].into(),
+            ],
+        ))
+        .await?
+        .is_some())
 }
 
 pub async fn find_latest_numbered_run<C: ConnectionTrait>(
@@ -223,6 +329,65 @@ pub async fn list_due_retry_runs<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list due retry task runs")
+}
+
+/// Cleanup after an accepted finish is independent of dispatch eligibility,
+/// including the retry delay and the Task's possibly terminal status.
+pub async fn list_task_finish_queue_candidates<C: ConnectionTrait>(
+    db: &C,
+    limit: u64,
+) -> Result<Vec<String>> {
+    let finishing_tasks = Query::select()
+        .column(pioneer_entity::task::Column::Id)
+        .from(pioneer_entity::task::Entity)
+        .and_where(Expr::cust(
+            "json_extract(metadata_json, '$.finishRequest') IS NOT NULL",
+        ))
+        .to_owned();
+    task_run::Entity::find()
+        .select_only()
+        .column(task_run::Column::TaskId)
+        .distinct()
+        .filter(task_run::Column::Status.eq(task_run_status_to_db(TaskRunStatus::Queued)))
+        .filter(task_run::Column::TaskId.in_subquery(finishing_tasks))
+        .order_by_asc(task_run::Column::TaskId)
+        .limit(limit)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to list Task finish queue cleanup candidates")
+}
+
+/// The writer transaction owns this check and the subsequent Queued→Starting
+/// claim. Queued siblings reserve order, rather than occupying active slots.
+pub async fn has_dispatch_capacity<C: ConnectionTrait>(
+    db: &C,
+    run: &task_run::Model,
+    max_parallel_runs: u32,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let occupied = task_run::Entity::find()
+        .filter(task_run::Column::TaskId.eq(run.task_id.clone()))
+        .filter(task_run::Column::Status.is_in([
+            "starting",
+            "running",
+            "waiting",
+            "waiting_review",
+        ]))
+        .count(db)
+        .await?;
+    let earlier_ready = task_run::Entity::find()
+        .filter(task_run::Column::TaskId.eq(run.task_id.clone()))
+        .filter(task_run::Column::Status.eq("queued"))
+        .filter(task_run::Column::RunNumber.lt(run.run_number))
+        .filter(
+            Condition::any()
+                .add(task_run::Column::ReadyAt.is_null())
+                .add(task_run::Column::ReadyAt.lte(now)),
+        )
+        .count(db)
+        .await?;
+    Ok(occupied.saturating_add(earlier_ready) < u64::from(std::cmp::max(max_parallel_runs, 1)))
 }
 
 pub async fn claim_run_for_dispatch<C: ConnectionTrait>(
@@ -373,6 +538,7 @@ pub async fn update_run_result_json<C: ConnectionTrait>(
         return Ok(outcome);
     }
 
+    let inbox_sequence = super::task_completion_inbox::next_completion_sequence(db).await?;
     let result = task_run::Entity::update_many()
         .filter(task_run::Column::Id.eq(run_id.to_owned()))
         .col_expr(
@@ -382,6 +548,7 @@ pub async fn update_run_result_json<C: ConnectionTrait>(
         .col_expr(task_run::Column::ResultJson, Expr::value(result_json))
         .col_expr(task_run::Column::CompletedAt, Expr::value(completed_at))
         .col_expr(task_run::Column::UpdatedAt, Expr::value(completed_at))
+        .col_expr(task_run::Column::InboxSequence, Expr::value(inbox_sequence))
         .exec(db)
         .await
         .context("failed to update task run result")?;
@@ -420,6 +587,7 @@ pub async fn update_run_error_json<C: ConnectionTrait>(
         return Ok(outcome);
     }
 
+    let inbox_sequence = super::task_completion_inbox::next_completion_sequence(db).await?;
     let result = task_run::Entity::update_many()
         .filter(task_run::Column::Id.eq(run_id.to_owned()))
         .col_expr(
@@ -429,6 +597,7 @@ pub async fn update_run_error_json<C: ConnectionTrait>(
         .col_expr(task_run::Column::ErrorJson, Expr::value(error_json))
         .col_expr(task_run::Column::CompletedAt, Expr::value(completed_at))
         .col_expr(task_run::Column::UpdatedAt, Expr::value(completed_at))
+        .col_expr(task_run::Column::InboxSequence, Expr::value(inbox_sequence))
         .exec(db)
         .await
         .context("failed to update task run error")?;
@@ -472,6 +641,7 @@ fn active_model_from_run(run: &TaskRun) -> Result<task_run::ActiveModel> {
         id: Set(run.id.clone()),
         task_id: Set(run.task_id.clone()),
         trigger_id: Set(run.trigger_id.clone()),
+        trigger_input_json: Set(optional_typed_json_to_db(&run.trigger_input)?),
         parent_run_id: Set(run.parent_run_id.clone()),
         run_group_id: Set(run.run_group_id.clone()),
         attempt_number: Set(i64::from(run.attempt_number)),
@@ -489,5 +659,6 @@ fn active_model_from_run(run: &TaskRun) -> Result<task_run::ActiveModel> {
         error_json: Set(optional_typed_json_to_db(&run.error)?),
         created_at: Set(unix_to_datetime(run.created_at)),
         updated_at: Set(unix_to_datetime(run.updated_at)),
+        ..Default::default()
     })
 }

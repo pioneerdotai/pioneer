@@ -183,6 +183,12 @@ pub struct MemoryEpisodicRecallProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_unix: Option<i64>,

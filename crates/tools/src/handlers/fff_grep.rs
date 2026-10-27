@@ -84,7 +84,7 @@ pub(super) async fn search(
     let worker_cancelled = Arc::clone(&cancelled);
     let cancellation = request.cancellation.clone();
     let timeout_ms = request.timeout_ms;
-    let mut worker = tokio::task::spawn_blocking(move || {
+    let mut worker = pioneer_observability::work::spawn_blocking(move || {
         let _filesystem_slot = filesystem_slot;
         search_blocking(request, &worker_cancelled)
     });

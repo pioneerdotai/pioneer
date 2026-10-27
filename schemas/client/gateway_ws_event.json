@@ -383,6 +383,33 @@
           "required": [
             "exact"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "object",
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                },
+                "provider_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "model_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "model"
+          ]
         }
       ]
     },
@@ -873,6 +900,12 @@
           ]
         },
         "turn_item_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version_id": {
           "type": [
             "string",
             "null"
@@ -1505,7 +1538,8 @@
       "type": "string",
       "enum": [
         "codex",
-        "claude"
+        "claude",
+        "opencode"
       ]
     },
     "CLIRuntimeAccountUpdatedNotification": {
@@ -2005,6 +2039,9 @@
         "blocked",
         "failed"
       ]
+    },
+    "GatewayBaseUrl": {
+      "type": "string"
     },
     "GatewayEndpointKind": {
       "type": "string",
@@ -3364,6 +3401,22 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "task_completion_inbox_changed"
+            },
+            "params": {
+              "$ref": "#/$defs/TaskCompletionInboxChangedNotification"
+            }
+          },
+          "required": [
+            "kind",
+            "params"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "task_tree_changed"
             },
             "params": {
@@ -3659,6 +3712,17 @@
             "null"
           ]
         },
+        "public_base_url": {
+          "description": "Present only for the currently authenticated relay connection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayBaseUrl"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "state": {
           "$ref": "#/$defs/GatewayRemoteAccessState",
           "default": "disabled"
@@ -3836,6 +3900,39 @@
       },
       "required": [
         "settings"
+      ]
+    },
+    "HtmlPublication": {
+      "description": "An exact Gateway-created HTML publication. Generic HTML attachments never\nacquire this descriptor based on MIME alone.",
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "callId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "workspaceId",
+        "threadId",
+        "turnId",
+        "callId",
+        "title",
+        "artifact"
       ]
     },
     "InvitationChangedNotification": {
@@ -4673,6 +4770,47 @@
           ]
         },
         {
+          "description": "Structured cells and the original GFM fragment with its used reference\ndefinitions, without Quote/List prefixes.",
+          "type": "object",
+          "properties": {
+            "alignments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownTableAlignment"
+              }
+            },
+            "headers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownInline"
+              }
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/MarkdownInline"
+                }
+              }
+            },
+            "source": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "table"
+            }
+          },
+          "required": [
+            "type",
+            "headers",
+            "rows",
+            "alignments",
+            "source"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "type": {
@@ -4847,6 +4985,15 @@
             "url"
           ]
         }
+      ]
+    },
+    "MarkdownTableAlignment": {
+      "type": "string",
+      "enum": [
+        "none",
+        "left",
+        "center",
+        "right"
       ]
     },
     "McpChangedAction": {
@@ -7833,6 +7980,18 @@
         "manual"
       ]
     },
+    "TaskCompletionInboxChangedNotification": {
+      "description": "An invalidation only: clients reload authoritative rows and count.",
+      "type": "object",
+      "properties": {
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId"
+      ]
+    },
     "TaskComposerWork": {
       "type": "object",
       "properties": {
@@ -9004,6 +9163,17 @@
         "updatedAt": {
           "type": "integer",
           "format": "int64"
+        },
+        "triggerInput": {
+          "description": "External data accepted for this occurrence, preserved across retries.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskRunTriggerInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -9219,6 +9389,13 @@
         "updatedAt": {
           "type": "integer",
           "format": "int64"
+        },
+        "webhookSecretRef": {
+          "description": "Opaque keystore reference; the bearer secret is never persisted here.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -11271,6 +11448,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "cli_runtime_kind": {
+          "description": "CLI provider identity projected from persisted execution bindings, independent of artwork.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CLIAgentRuntimeKind"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "display_name": {
@@ -13879,6 +14067,12 @@
           "format": "uint64",
           "minimum": 0
         },
+        "htmlPublications": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HtmlPublication"
+          }
+        },
         "lastWorkItemId": {
           "type": [
             "string",
@@ -14733,6 +14927,34 @@
       "required": [
         "revision",
         "workspace_id"
+      ]
+    },
+    "TaskRunTriggerInput": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "contentType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "encoding": {
+          "$ref": "#/$defs/TaskRunInputEncoding"
+        }
+      },
+      "required": [
+        "encoding",
+        "body"
+      ]
+    },
+    "TaskRunInputEncoding": {
+      "type": "string",
+      "enum": [
+        "utf8",
+        "base64"
       ]
     }
   }

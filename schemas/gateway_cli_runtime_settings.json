@@ -16,7 +16,8 @@
       "type": "string",
       "enum": [
         "codex",
-        "claude"
+        "claude",
+        "opencode"
       ]
     },
     "GatewayCliRuntimeInstanceSettings": {
@@ -126,7 +127,8 @@
       "enum": [
         "api",
         "codex",
-        "claude"
+        "claude",
+        "opencode"
       ]
     }
   }

@@ -107,3 +107,6 @@ pub use error::{ClientError, ClientResult};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod catalog_test_support;
+
+#[cfg(test)]
+pub(crate) static OBSERVABILITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

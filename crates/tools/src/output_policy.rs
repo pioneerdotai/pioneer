@@ -109,14 +109,32 @@ impl ToolResultEnvelope {
 
     pub fn to_model_input_item(&self, call_id: &str, tool_name: &str) -> ModelInputItem {
         let payload = self.llm_payload();
-        if let Some(attachment_part) = attachment_part_from_llm_context(&payload) {
+        // Retain the existing artifact/HTML producers' attachment contract.
+        // Other tools (including external proxies and CUA-looking JSON) get
+        // media only through their executing handler's typed output channel.
+        let parts = if matches!(tool_name, crate::html::HTML_PREVIEW | "artifact_read") {
+            attachment_parts_from_llm_context(&payload)
+        } else {
+            Vec::new()
+        };
+        if tool_name == crate::html::HTML_PREVIEW && parts.is_empty() && self.success {
+            return ModelInputItem::tool_result(
+                call_id,
+                tool_name,
+                "HTML preview delivery failed: a complete ordered set of exact image parts are required",
+                Some(
+                    serde_json::json!({"error":"preview_image_delivery_failed","tool_outcome":{"status":"failed"}}),
+                ),
+            );
+        }
+        if !parts.is_empty() {
             let content = serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string());
             return ModelInputItem::message(ChatMessage {
                 provenance: None,
                 role: Role::Tool,
                 content,
                 reasoning_content: None,
-                content_parts: vec![attachment_part],
+                content_parts: parts,
                 tool_call_id: Some(call_id.to_owned()),
                 name: Some(tool_name.to_owned()),
                 tool_calls: None,
@@ -127,10 +145,52 @@ impl ToolResultEnvelope {
         ModelInputItem::tool_result(
             call_id.to_owned(),
             tool_name.to_owned(),
-            self.llm_text(),
+            if is_thread_paged_tool(tool_name) {
+                serde_json::to_string(&payload).expect("tool page is serializable")
+            } else {
+                self.llm_text()
+            },
             Some(payload),
         )
     }
+}
+
+/// These producers paginate before projection. Keep the list scoped to their contracts.
+pub fn is_thread_paged_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "threads_list"
+            | "threads_history_read"
+            | "threads_children_list"
+            | "threads_tools_result_read"
+            | "threads_start_options"
+    ) || name == pioneer_protocol::AgentModelToolName::IdentityModelsList.as_str()
+}
+
+/// Count actual JSON escaping and both the projection and delivery envelopes.
+/// This is Pioneer's projection limit, not a transport limit.
+pub fn thread_read_page_fits(value: &JsonValue) -> bool {
+    thread_read_page_bytes(value) <= pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
+}
+
+pub fn thread_read_page_bytes(value: &JsonValue) -> usize {
+    let view = ToolResultView::Json {
+        value: value.clone(),
+        truncated: false,
+    };
+    let view_bytes = view.serialized_size_bytes();
+    let envelope = ToolResultEnvelope {
+        llm_view: view,
+        display: ToolDisplayPayload::Hidden,
+        storage: ToolStoragePayload::None,
+        recovery: None,
+        outcome: ToolOutcome::ok(),
+        success: true,
+        output_policy: ToolOutputPolicySnapshot::for_tool_name("threads_history_read"),
+    };
+    view_bytes.max(
+        serde_json::to_vec(&envelope.llm_payload()).map_or(usize::MAX, |encoded| encoded.len()),
+    )
 }
 
 impl ToolResultView {
@@ -254,6 +314,60 @@ where
     text[..best].to_owned()
 }
 
+fn attachment_parts_from_llm_context(payload: &JsonValue) -> Vec<MessageContentPart> {
+    if let Some(images) = payload
+        .pointer("/llm_context/images")
+        .and_then(JsonValue::as_array)
+    {
+        // A preview is atomic: never turn malformed or truncated references into a
+        // successful partial image set. Other attachment tools retain their format.
+        let Some(layout) = crate::html::preview_image_layout(payload) else {
+            return Vec::new();
+        };
+        let mut parts = Vec::with_capacity(images.len() * 2);
+        let mut identities = std::collections::HashSet::new();
+        for (entry, (appearance, width)) in images.iter().zip(layout) {
+            if entry.get("width").and_then(JsonValue::as_u64) != Some(u64::from(width)) {
+                return Vec::new();
+            }
+            let Ok(attachment) =
+                serde_json::from_value::<MessageAttachment>(entry["attachment"].clone())
+            else {
+                return Vec::new();
+            };
+            if attachment.mime_type != "image/png"
+                || !attachment.artifact.as_ref().is_some_and(|a| {
+                    a.artifact_version_id
+                        .as_ref()
+                        .is_some_and(|v| !v.is_empty())
+                })
+            {
+                return Vec::new();
+            }
+            let artifact = attachment
+                .artifact
+                .as_ref()
+                .expect("validated exact artifact");
+            if !identities.insert((
+                artifact.artifact_id.clone(),
+                artifact.artifact_version_id.clone(),
+            )) {
+                return Vec::new();
+            }
+            let caption = match appearance {
+                Some(appearance) => format!("HTML preview: {appearance} {width} CSS px"),
+                None => format!("HTML preview: {width} CSS px"),
+            };
+            parts.push(MessageContentPart::text(caption));
+            parts.push(MessageContentPart::image(attachment));
+        }
+        return parts;
+    }
+    attachment_part_from_llm_context(payload)
+        .into_iter()
+        .collect()
+}
+
 fn attachment_part_from_llm_context(payload: &JsonValue) -> Option<MessageContentPart> {
     let attachment = payload.get("llm_context")?.get("attachment")?;
     let path = attachment
@@ -328,7 +442,7 @@ pub fn download_output_policy() -> ToolOutputPolicy {
 }
 
 pub fn computer_use_output_policy() -> ToolOutputPolicy {
-    ToolOutputPolicySnapshot::for_tool_name("computer_use")
+    ToolOutputPolicySnapshot::for_tool_name("cua_click")
 }
 
 pub fn dynamic_unknown_output_policy() -> ToolOutputPolicy {
@@ -357,6 +471,129 @@ pub fn builtin_output_policy(tool_name: &str) -> ToolOutputPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn preview_payload() -> JsonValue {
+        let images = [360, 768, 1024].map(|width| {
+            let mut attachment =
+                MessageAttachment::from_path(format!("/fixture/{width}.png"), "image/png");
+            attachment.artifact = Some(pioneer_provider::AttachmentArtifactContext {
+                workspace_id: "workspace".into(),
+                artifact_id: format!("image-{width}"),
+                artifact_version_id: Some(format!("version-{width}")),
+            });
+            serde_json::json!({"width":width,"attachment":attachment})
+        });
+        serde_json::json!({"llm_context":{"images":images}})
+    }
+
+    fn six_preview_payload() -> JsonValue {
+        let images = crate::html::PREVIEW_FRAMES.map(|(appearance, width)| {
+            let mut attachment = MessageAttachment::from_path(
+                format!("/fixture/{appearance}-{width}.png"),
+                "image/png",
+            );
+            attachment.artifact = Some(pioneer_provider::AttachmentArtifactContext {
+                workspace_id: "workspace".into(),
+                artifact_id: format!("{appearance}-{width}"),
+                artifact_version_id: Some(format!("version-{appearance}-{width}")),
+            });
+            serde_json::json!({"appearance":appearance,"width":width,"attachment":attachment})
+        });
+        serde_json::json!({"formatVersion":2,"llm_context":{"images":images}})
+    }
+
+    #[test]
+    fn preview_delivers_six_distinct_ordered_exact_images_and_labels() {
+        let parts = attachment_parts_from_llm_context(&six_preview_payload());
+        assert_eq!(parts.len(), 12);
+        for (pair, (appearance, width)) in parts.chunks_exact(2).zip([
+            ("light", 360),
+            ("light", 768),
+            ("light", 1024),
+            ("dark", 360),
+            ("dark", 768),
+            ("dark", 1024),
+        ]) {
+            assert!(
+                matches!(&pair[0], MessageContentPart::Text { text } if text.contains(appearance) && text.contains(&width.to_string()))
+            );
+            assert!(
+                matches!(&pair[1], MessageContentPart::Image { image } if image.artifact.as_ref().unwrap().artifact_version_id.as_deref() == Some(format!("version-{appearance}-{width}").as_str()))
+            );
+        }
+    }
+
+    #[test]
+    fn versioned_preview_rejects_partial_reordered_repeated_or_unversioned_images() {
+        for fault in 0..5 {
+            let mut payload = six_preview_payload();
+            match fault {
+                0 => {
+                    payload["llm_context"]["images"]
+                        .as_array_mut()
+                        .unwrap()
+                        .pop();
+                }
+                1 => payload["llm_context"]["images"]
+                    .as_array_mut()
+                    .unwrap()
+                    .swap(0, 3),
+                2 => {
+                    payload["llm_context"]["images"][3]["attachment"] =
+                        payload["llm_context"]["images"][0]["attachment"].clone()
+                }
+                3 => {
+                    payload.as_object_mut().unwrap().remove("formatVersion");
+                }
+                _ => {
+                    payload["llm_context"]["images"][0]["attachment"]["artifact"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("artifact_version_id");
+                }
+            }
+            assert!(
+                attachment_parts_from_llm_context(&payload).is_empty(),
+                "fault {fault}"
+            );
+        }
+        let mut old = preview_payload();
+        old["formatVersion"] = 2.into();
+        assert!(attachment_parts_from_llm_context(&old).is_empty());
+    }
+
+    #[test]
+    fn preview_is_three_ordered_images_with_exact_replay_versions() {
+        let parts = attachment_parts_from_llm_context(&preview_payload());
+        assert_eq!(parts.len(), 6);
+        for (pair, width) in parts.chunks_exact(2).zip([360, 768, 1024]) {
+            assert!(
+                matches!(&pair[0],MessageContentPart::Text {text} if text == &format!("HTML preview: {width} CSS px"))
+            );
+            assert!(
+                matches!(&pair[1],MessageContentPart::Image {image} if image.artifact.as_ref().unwrap().artifact_version_id.as_deref() == Some(format!("version-{width}").as_str()))
+            );
+        }
+    }
+
+    #[test]
+    fn preview_never_projects_a_partial_or_reordered_set_as_media() {
+        let mut payload = preview_payload();
+        payload["llm_context"]["images"]
+            .as_array_mut()
+            .unwrap()
+            .remove(1);
+        assert!(attachment_parts_from_llm_context(&payload).is_empty());
+        let mut payload = preview_payload();
+        payload["llm_context"]["images"][0]["width"] = 1024.into();
+        assert!(attachment_parts_from_llm_context(&payload).is_empty());
+        let mut payload = preview_payload();
+        payload["llm_context"]["images"][2]["attachment"]["artifact"]
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_version_id");
+        assert!(attachment_parts_from_llm_context(&payload).is_empty());
+    }
 
     #[test]
     fn web_fetch_never_uses_full_storage_policy() {

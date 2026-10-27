@@ -21,6 +21,10 @@ impl crate::rpc::JsonRpcRequestTransport for GatewayWsCommandSender {
         payload: String,
         response_tx: crate::rpc::JsonRpcResponseSender,
     ) -> std::result::Result<(), String> {
+        #[cfg(test)]
+        if let Some(transport) = self.test_requests.lock().unwrap().clone() {
+            return transport.send_json_rpc_request(request_id, payload, response_tx);
+        }
         self.command_tx
             .send(GatewayWsCommand::Request {
                 expected_connection: None,
@@ -145,6 +149,9 @@ impl GatewayWsCommandSender {
             })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
 
+        let _wait = pioneer_observability::live::WaitGuard::new(
+            pioneer_observability::live::WaitKind::Reply,
+        );
         let result = result_rx
             .recv()
             .map_err(|_| anyhow!("websocket worker dropped initial connect result"))?;
@@ -186,11 +193,70 @@ impl GatewayWsCommandSender {
                 result_tx,
             })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
+        let _wait = pioneer_observability::live::WaitGuard::new(
+            pioneer_observability::live::WaitKind::Reply,
+        );
         result_rx
             .recv()
             .map_err(|_| anyhow!("websocket worker dropped access replacement result"))?
             .map_err(anyhow::Error::msg)?;
         attempt.complete(session_access)
+    }
+
+    /// Update only an acknowledged lease on the currently owned physical transport.
+    pub(crate) fn renew_access_and_wait(
+        &self,
+        connection_id: u64,
+        spec: GatewayWsConnectSpec,
+        refresh_generation: u64,
+    ) -> Result<u64> {
+        let previous = self
+            .current_gateway_http_access()
+            .map_err(|_| anyhow!("connection renewal unavailable"))?;
+        anyhow::ensure!(
+            previous.generation == connection_id,
+            "connection renewal retired"
+        );
+        let access = http_access_from_spec(&spec, connection_id);
+        let (response_tx, response_rx) = mpsc::channel();
+        self.command_tx
+            .send(GatewayWsCommand::RenewAccess {
+                connection_id,
+                spec,
+                refresh_generation,
+                deadline: tokio::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+                response_tx,
+            })
+            .map_err(|_| anyhow!("websocket worker is not available"))?;
+        let _wait = pioneer_observability::live::WaitGuard::with_timeout(
+            pioneer_observability::live::WaitKind::Reply,
+            crate::rpc::RPC_REQUEST_TIMEOUT + Duration::from_secs(1),
+        );
+        response_rx
+            .recv_timeout(crate::rpc::RPC_REQUEST_TIMEOUT + Duration::from_secs(1))
+            .map_err(|_| anyhow!("connection renewal unavailable"))?
+            .map_err(anyhow::Error::new)?;
+        let generations = self
+            .connection_generations
+            .lock()
+            .map_err(|_| anyhow!("Gateway connection owner poisoned"))?;
+        anyhow::ensure!(
+            generations.active == Some(connection_id) && generations.pending.is_none(),
+            "connection renewal retired"
+        );
+        let mut current = self
+            .session_access
+            .lock()
+            .map_err(|_| anyhow!("Gateway access owner poisoned"))?;
+        anyhow::ensure!(
+            current
+                .as_ref()
+                .is_some_and(|current| current.generation == connection_id
+                    && current.access_token == previous.access_token),
+            "connection renewal superseded"
+        );
+        *current = access;
+        Ok(connection_id)
     }
 
     pub fn shutdown(&self) -> Result<()> {
@@ -257,6 +323,11 @@ impl GatewayWsCommandSender {
             .map_err(|_| GatewayHttpAuthorityError::TemporarilyUnavailable)?
             .clone()
             .ok_or(GatewayHttpAuthorityError::TemporarilyUnavailable)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_http_session_access_for_test(&self, access: Option<GatewayHttpAccess>) {
+        self.replace_http_session_access(access).unwrap();
     }
 
     pub(super) fn replace_http_session_access(
@@ -818,6 +889,10 @@ impl GatewayWsCommandSender {
     ) -> Result<pioneer_protocol::PluginItem> {
         client_ws_commands::plugins_install(self, params)
     }
+    pub fn task_finish(&self, params: TaskFinishParams) -> Result<TaskFinishResponse> {
+        client_ws_commands::task_finish(self, params)
+    }
+
     pub fn skills_list(&self, params: SkillListParams) -> Result<SkillListResponse> {
         client_ws_commands::skills_list(self, params)
     }
@@ -1002,6 +1077,10 @@ impl GatewayWsCommandSender {
             })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
 
+        let _wait = pioneer_observability::live::WaitGuard::with_timeout(
+            pioneer_observability::live::WaitKind::Reply,
+            UPLOAD_CHUNK_ACK_TIMEOUT,
+        );
         let response = response_rx
             .recv_timeout(UPLOAD_CHUNK_ACK_TIMEOUT)
             .map_err(|_| anyhow!("timed out waiting for artifact upload chunk ack"))?;
@@ -1107,6 +1186,10 @@ impl GatewayWsCommandSender {
             })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
 
+        let _wait = pioneer_observability::live::WaitGuard::with_timeout(
+            pioneer_observability::live::WaitKind::Reply,
+            UPLOAD_CHUNK_ACK_TIMEOUT,
+        );
         let response = response_rx
             .recv_timeout(UPLOAD_CHUNK_ACK_TIMEOUT)
             .map_err(|_| anyhow!("timed out waiting for skill upload chunk ack"))?;

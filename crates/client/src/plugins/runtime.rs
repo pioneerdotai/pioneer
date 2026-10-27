@@ -78,6 +78,7 @@ pub struct PluginOAuthPresentation {
 }
 #[derive(Clone)]
 struct Work {
+    work_context: pioneer_observability::work::WorkCarrier,
     workspace: String,
     generation: u64,
     plugin_id: Option<String>,
@@ -90,6 +91,7 @@ pub(crate) struct PluginController {
     suspended: std::collections::BTreeSet<String>,
     refresh_requested: std::collections::BTreeSet<String>,
     sender: Option<mpsc::SyncSender<Work>>,
+    observer: Option<pioneer_observability::queues::QueueObserver>,
     task: Option<std::thread::JoinHandle<()>>,
     publications: BTreeMap<String, PluginPublication>,
 }
@@ -204,6 +206,12 @@ impl ClientCore {
         p.error = None;
         p.managing = managing;
         let work = Work {
+            work_context: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
             workspace: workspace.into(),
             generation: p.generation,
             plugin_id: p.plugin_id.clone(),
@@ -211,10 +219,19 @@ impl ClientCore {
             intent,
         };
         let out = self.publish_plugins(workspace, p);
-        if !owner
-            .sender
-            .as_ref()
-            .is_some_and(|s| s.try_send(work.clone()).is_ok())
+        if pioneer_observability::queues::observe_try_send(
+            owner.observer.as_ref(),
+            pioneer_observability::queues::QueueBytes::Unsupported,
+            || {
+                owner
+                    .sender
+                    .as_ref()
+                    .ok_or(())?
+                    .try_send(work)
+                    .map_err(|_| ())
+            },
+        )
+        .is_err()
         {
             let p = owner.publications.get_mut(workspace).unwrap();
             p.busy = false;
@@ -324,8 +341,23 @@ impl ClientCore {
     }
     pub(crate) fn start_plugins_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel::<Work>(16);
+        let queue_observer = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(16),
+            "plugin controller requests; payload bytes unavailable without traversal",
+        );
+        let worker_queue = queue_observer.clone();
         let weak = Arc::downgrade(self);
         let task=std::thread::Builder::new().name("client-plugins".into()).spawn(move||while let Ok(work)=receiver.recv(){
+            worker_queue.dequeued(pioneer_observability::queues::QueueBytes::Unsupported);
+            let mut processing = worker_queue.processing();
+            let carrier = work.work_context.clone().received(
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            );
+            let _scope = carrier.enter();
+            let mut active = pioneer_observability::live::WorkGuard::start(carrier.context(), false);
             let Some(core)=weak.upgrade() else{return;}; if !core.plugin_work_current(&work){continue;}
             let current=||weak.upgrade().is_some_and(|c|c.plugin_work_current(&work));
             let result=(||->anyhow::Result<PluginPublication>{
@@ -400,6 +432,7 @@ impl ClientCore {
                 } else { anyhow::ensure!(!matches!(work.intent,PluginIntent::Skill{..}|PluginIntent::Mcp{..}|PluginIntent::RemoveSkill{..}|PluginIntent::ConfigureMcp{..}),"plugin_child_unavailable"); }
                 Ok(p)
             })();
+            let outcome = if result.is_ok() { pioneer_observability::work::Outcome::Completed } else { pioneer_observability::work::Outcome::Failed };
             if !core.plugin_work_current(&work){continue;}
             let mut owner=core.plugins_controller.lock().expect("plugins poisoned");
             if let Some(p)=owner.publications.get_mut(&work.workspace).filter(|p|p.generation==work.generation){
@@ -409,8 +442,11 @@ impl ClientCore {
             let refresh=owner.refresh_requested.remove(&work.workspace);
             drop(owner);
             if refresh { core.refresh_plugin_publication(&work.workspace); }
+            processing.processed();
+            active.finish(outcome);
         }).expect("plugins worker start");
         let mut owner = self.plugins_controller.lock().expect("plugins poisoned");
+        owner.observer = Some(queue_observer);
         owner.sender = Some(sender);
         owner.task = Some(task);
     }

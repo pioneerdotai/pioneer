@@ -3,6 +3,7 @@
 use crate::cli_runtime::claude_mcp::ClaudeMcpSessionLaunchProjection;
 use crate::cli_runtime::codex_mcp::CodexMcpSessionLaunchProjection;
 use crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions;
+use crate::cli_runtime::opencode_mcp::OpenCodeMcpSessionLaunchProjection;
 use std::fmt;
 use uuid::Uuid;
 
@@ -18,6 +19,7 @@ pub(crate) enum CliMcpSessionLaunch {
     ManagementOnly,
     Codex(CodexMcpSessionLaunchProjection),
     Claude(ClaudeMcpSessionLaunchProjection),
+    OpenCode(OpenCodeMcpSessionLaunchProjection),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -36,6 +38,9 @@ pub(crate) enum CliProviderContinuation {
         boundary_message_uuid: Uuid,
         provider_session_id: Uuid,
     },
+    OpenCodeServerSession {
+        native_session_id: Option<String>,
+    },
 }
 
 impl fmt::Debug for CliProviderContinuation {
@@ -52,6 +57,10 @@ impl fmt::Debug for CliProviderContinuation {
             Self::ClaudeResume { .. } => formatter
                 .debug_struct("ClaudeResume")
                 .field("provider_session_id", &"<redacted>")
+                .finish(),
+            Self::OpenCodeServerSession { native_session_id } => formatter
+                .debug_struct("OpenCodeServerSession")
+                .field("native_session_id", native_session_id)
                 .finish(),
             Self::ClaudeFork { .. } => formatter
                 .debug_struct("ClaudeFork")
@@ -75,6 +84,7 @@ impl CliProviderContinuation {
                 ..
             } => Some(*provider_session_id),
             Self::CodexRpcThread { .. } => None,
+            Self::OpenCodeServerSession { .. } => None,
         }
     }
 }
@@ -108,6 +118,24 @@ impl CliSessionLaunchSpec {
 
     pub(crate) fn codex_management(options: CLIAgentRuntimeSessionStartOptions) -> Self {
         Self::codex(options, CliMcpSessionLaunch::ManagementOnly, None)
+    }
+
+    pub(crate) fn management(
+        options: CLIAgentRuntimeSessionStartOptions,
+        kind: pioneer_protocol::CLIAgentRuntimeKind,
+        native_thread_id: String,
+    ) -> anyhow::Result<Self> {
+        match kind {
+            pioneer_protocol::CLIAgentRuntimeKind::Codex => Ok(Self::codex_management(options)),
+            pioneer_protocol::CLIAgentRuntimeKind::OpenCode => Ok(Self::opencode(
+                options,
+                CliMcpSessionLaunch::ManagementOnly,
+                Some(native_thread_id),
+            )),
+            pioneer_protocol::CLIAgentRuntimeKind::Claude => {
+                anyhow::bail!("Claude forks require a typed transcript continuation")
+            }
+        }
     }
 
     pub(crate) fn claude_new(
@@ -155,6 +183,19 @@ impl CliSessionLaunchSpec {
                 boundary_message_uuid,
                 provider_session_id,
             },
+            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
+        }
+    }
+
+    pub(crate) fn opencode(
+        options: CLIAgentRuntimeSessionStartOptions,
+        mcp: CliMcpSessionLaunch,
+        native_session_id: Option<String>,
+    ) -> Self {
+        Self {
+            options,
+            mcp,
+            continuation: CliProviderContinuation::OpenCodeServerSession { native_session_id },
             native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
         }
     }
@@ -242,6 +283,10 @@ fn continuation_identity_changed(
                 ..
             },
         ) => old != new,
+        (
+            CliProviderContinuation::OpenCodeServerSession { .. },
+            CliProviderContinuation::OpenCodeServerSession { .. },
+        ) => false,
         _ => true,
     }
 }

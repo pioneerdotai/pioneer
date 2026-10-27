@@ -8,6 +8,8 @@ pub enum ModelSelectionTransport {
     Api,
     Codex,
     Claude,
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 /// Inherit is a real absence of an override. It never stores a resolved fallback.
@@ -105,6 +107,7 @@ mod tests {
             ModelSelectionTransport::Api,
             ModelSelectionTransport::Codex,
             ModelSelectionTransport::Claude,
+            ModelSelectionTransport::OpenCode,
         ] {
             let selected = GatewayModelSelection::Explicit {
                 transport,

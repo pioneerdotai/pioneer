@@ -14,10 +14,12 @@ async fn fixture(
     Turn,
     pioneer_protocol::NativeTerminalEffectPreparation,
 ) {
-    fixture_with_migrator::<Migrator>(suffix).await
+    let store = test_store_with_workspace(&format!("ws_cancel_{suffix}")).await;
+    fixture_with_store(store, suffix).await
 }
 
-async fn fixture_with_migrator<M: MigratorTrait>(
+async fn fixture_with_store(
+    store: CrudStore,
     suffix: &str,
 ) -> (
     CrudStore,
@@ -27,7 +29,6 @@ async fn fixture_with_migrator<M: MigratorTrait>(
     let ws = format!("ws_cancel_{suffix}");
     let thread = format!("thread_cancel_{suffix}");
     let id = format!("turn_cancel_{suffix}");
-    let store = test_store_with_workspace_migrator::<M>(&ws).await;
     let (store, _, turn) = start_test_turn(store, &ws, &thread, &id).await;
     let mut plan = cleanup_effect_preparation(&ws, &thread, &id, "original");
     plan.effects[0].effect_id = format!("{id}:cancellation-effect:attached-task-cleanup");
@@ -514,6 +515,10 @@ async fn native_cancellation_physical_routes_atomic_event_order_and_cancelled_re
         .persist_native_cancellation_context(plan.clone(), OWNER, NOW, true)
         .await
         .unwrap();
+    maintenance
+        .persist_native_cancellation_context(plan.clone(), OWNER, NOW, false)
+        .await
+        .unwrap();
     let context = maintenance
         .native_cancellation_context(&turn.id)
         .await
@@ -735,6 +740,16 @@ async fn native_cancellation_competing_terminal_append_before_projection_is_fenc
         Some("turn/completed")
     );
     assert!(marker.accepted_terminal_sequence.unwrap() > marker.projected_through_sequence);
+    // The accepted terminal marker fences the pre-start ACK even while the
+    // projected Turn status is still running and its old context is present.
+    for initial_turn in [false, true] {
+        assert!(
+            store
+                .persist_native_cancellation_context(plan.clone(), OWNER, NOW, initial_turn)
+                .await
+                .is_err()
+        );
+    }
     turn.status = TurnStatus::InProgress;
     assert!(cancel(&store, &turn, &plan, "too late").await.is_err());
     assert!(
@@ -1275,6 +1290,31 @@ struct HistoricalMigrationRows {
     obligation: pioneer_entity::native_terminal_effect_outbox::Model,
 }
 
+fn historical_thread_query(id: &str) -> sea_orm::Select<pioneer_entity::thread::Entity> {
+    use pioneer_entity::thread;
+    use sea_orm::Iterable;
+
+    // Compare every historical field without selecting a column that did not
+    // exist yet. Zero is only a decoding placeholder for today's Entity; it
+    // is never written to this historical schema or used as a read receipt.
+    thread::Entity::find_by_id(id.to_owned())
+        .select_only()
+        .columns(thread::Column::iter().filter(|column| {
+            !matches!(
+                column,
+                thread::Column::WorkspaceUnreadStartedAt
+                    | thread::Column::InboxWorkspaceAfterSequence
+                    | thread::Column::InboxWorkspaceStartedAt
+            )
+        }))
+        .expr_as(Expr::val(0_i64), "workspace_unread_started_at")
+        .expr_as(Expr::val(None::<i64>), "inbox_workspace_after_sequence")
+        .expr_as(
+            Expr::val(None::<sea_orm::prelude::DateTimeWithTimeZone>),
+            "inbox_workspace_started_at",
+        )
+}
+
 // An already projected, failed legacy turn with one activated cleanup retry.
 // Only pre-cancellation entities/columns and the canonical append repository
 // are used: the current terminal projector needs columns this schema lacks.
@@ -1374,6 +1414,13 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
     let stream = DatabaseBackend::Sqlite.build(&stream);
     // All JSON, hashing and statement preparation above precede the writer.
     let transaction = db.begin().await.unwrap();
+    assert!(
+        !migration::SchemaManager::new(&*transaction)
+            .has_column("thread", "inbox_workspace_after_sequence")
+            .await
+            .unwrap(),
+        "the production upgrade fixture must retain its historical schema"
+    );
     let workspace = pioneer_entity::workspace::ActiveModel {
         id: Set(workspace_id.to_owned()),
         name: Set("upgrade fixture".to_owned()),
@@ -1385,7 +1432,8 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
     .insert(&transaction)
     .await
     .unwrap();
-    let thread = pioneer_entity::thread::ActiveModel {
+    pioneer_entity::thread::Entity::insert(pioneer_entity::thread::ActiveModel {
+        workspace_unread_started_at: sea_orm::NotSet,
         id: Set(thread_id.to_owned()),
         workspace_id: Set(workspace_id.to_owned()),
         preview: Set(String::new()),
@@ -1400,10 +1448,15 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
         created_at: Set(at),
         updated_at: Set(terminal_at),
         ..Default::default()
-    }
-    .insert(&transaction)
+    })
+    .exec_without_returning(&transaction)
     .await
     .unwrap();
+    let thread = historical_thread_query(thread_id)
+        .one(&transaction)
+        .await
+        .unwrap()
+        .unwrap();
     let turn = pioneer_entity::turn::ActiveModel {
         id: Set(turn_id.to_owned()),
         thread_id: Set(thread_id.to_owned()),
@@ -1512,7 +1565,7 @@ impl HistoricalMigrationRows {
             Some(self.workspace.clone())
         );
         assert_eq!(
-            pioneer_entity::thread::Entity::find_by_id(self.thread.id.clone())
+            historical_thread_query(&self.thread.id)
                 .one(db)
                 .await
                 .unwrap(),
@@ -1714,13 +1767,13 @@ async fn native_cancellation_production_upgrade_and_latest_down() {
     const OLD_NAME: &str = "m20261001_000001_native_cancellation_context";
     const LATER_MAIN: [&str; 4] = [
         "m20261002_000001_task_run_occurrence_reconcile",
-        "m20261004_000001_task_occurrence_reconcile",
-        "m20261004_000004_compaction_lifecycle_pending",
-        "m20261004_000007_agent_action_outbox_ranges",
+        "m20261008_000002_background_access_indexes",
+        "m20261008_000003_task_occurrence_reconcile",
+        "m20261008_000004_compaction_lifecycle_pending",
     ];
     let cancellation = cancellation_migration_name();
     // Upgrade and down(1) exercise the production registry through cancellation.
-    assert_eq!(cancellation, "m20261005_000001_native_cancellation_context");
+    assert_eq!(cancellation, "m20261008_000008_native_cancellation_context");
     assert_ne!(cancellation, OLD_NAME);
     assert!(cancellation.as_str() > *LATER_MAIN.last().unwrap());
     assert_eq!(
@@ -2544,4 +2597,733 @@ async fn native_cancellation_migration_down_rejects_duplicate_effect_kinds_atomi
             .unwrap()
     );
     transaction.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_cancellation_recovery_confirmation_rejects_existing_terminal_context() {
+    for status in [TurnStatus::Completed, TurnStatus::Interrupted] {
+        let (store, turn, plan) = fixture(&format!("confirmation_{status:?}")).await;
+        if status == TurnStatus::Interrupted {
+            cancel(&store, &turn, &plan, "cancel before recovery ACK")
+                .await
+                .unwrap();
+        } else {
+            assert!(
+                store
+                    .update_turn_status(&plan.thread_id, &turn.id, status, None, NOW + 1)
+                    .await
+                    .unwrap()
+            );
+        }
+        for initial in [false, true] {
+            assert!(
+                store
+                    .persist_native_cancellation_context(plan.clone(), OWNER, NOW + 2, initial)
+                    .await
+                    .is_err(),
+                "an existing immutable context cannot admit a terminal Turn"
+            );
+        }
+        assert_eq!(
+            store
+                .native_cancellation_context(&turn.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .preparation,
+            plan
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_cancellation_recovery_confirmation_checks_current_owner_and_exact_scope() {
+    let (store, turn, plan) = fixture("confirmation_owner").await;
+    repositories::turn_execution::insert_immutable(
+        &store.connection,
+        crate::NewTurnExecution {
+            turn_id: turn.id.clone(),
+            thread_id: plan.thread_id.clone(),
+            workspace_id: plan.workspace_id.clone(),
+            executor_kind: crate::TurnExecutorKind::ApiProvider,
+            executor_key: Some("test-provider".into()),
+            status: crate::TurnExecutionStatus::Running,
+            owner_id: OWNER.into(),
+            lease_until: unix_to_datetime(NOW - 1),
+            created_at: unix_to_datetime(NOW - 10),
+        },
+    )
+    .await
+    .unwrap();
+    let previous = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+    store
+        .claim_expired_turn_execution(&previous, "replacement-owner", NOW, NOW + 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .persist_native_cancellation_context(plan.clone(), OWNER, NOW, false)
+            .await
+            .is_err()
+    );
+    store
+        .persist_native_cancellation_context(plan.clone(), "replacement-owner", NOW, false)
+        .await
+        .unwrap();
+    let mut changed_scope = plan.clone();
+    changed_scope.workspace_id = "different-workspace".into();
+    assert!(
+        store
+            .persist_native_cancellation_context(changed_scope, "replacement-owner", NOW, false)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .native_cancellation_context(&turn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .preparation,
+        plan
+    );
+}
+
+#[tokio::test]
+async fn native_recovery_pre_start_and_refusal_share_attempt_owner_and_terminal_fences() {
+    use crate::{NewTurnExecution, TurnExecutionStatus, TurnExecutorKind};
+    for kind in [TurnExecutorKind::NativeAgent, TurnExecutorKind::ApiProvider] {
+        for fence in [
+            "accepted_marker",
+            "durable_terminal",
+            "new_owner",
+            "new_attempt",
+        ] {
+            let (store, turn, plan) = fixture(&format!("start_fence_{kind:?}_{fence}")).await;
+            repositories::turn_execution::insert_immutable(
+                &store.connection,
+                NewTurnExecution {
+                    turn_id: turn.id.clone(),
+                    thread_id: plan.thread_id.clone(),
+                    workspace_id: plan.workspace_id.clone(),
+                    executor_kind: kind,
+                    executor_key: Some("test-provider".into()),
+                    status: TurnExecutionStatus::Running,
+                    owner_id: OWNER.into(),
+                    lease_until: unix_to_datetime(NOW + 100),
+                    created_at: unix_to_datetime(NOW),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                repositories::turn_execution::mark_recovering_owned(
+                    &store.connection,
+                    &turn.id,
+                    OWNER,
+                    unix_to_datetime(NOW),
+                )
+                .await
+                .unwrap()
+            );
+            let execution = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+            assert_eq!(execution.status, TurnExecutionStatus::Recovering);
+            let job = store
+                .enqueue_recovery_job(
+                    turn.id.clone(),
+                    "reasoning_start_fence".into(),
+                    TurnItemType::Reasoning,
+                    None,
+                    RecoveryTrigger::Timeout,
+                    RecoveryAction::RestartTurn,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                    2,
+                    serde_json::json!({}),
+                    serde_json::json!({}),
+                    NOW,
+                )
+                .await
+                .unwrap();
+            let claimed = store.claim_due_recovery_jobs(NOW, 45, 1).await.unwrap();
+            assert!(matches!(
+                store
+                    .mark_claimed_recovery_job_active(
+                        &job.id,
+                        claimed[0].claim_token.as_deref().unwrap(),
+                        "original-attempt",
+                        NOW
+                    )
+                    .await
+                    .unwrap(),
+                ClaimedRecoveryActivation::Activated
+            ));
+            let source = pioneer_protocol::RecoveryAttemptContext {
+                job_id: job.id.clone(),
+                attempt_id: "original-attempt".into(),
+            };
+            store
+                .confirm_native_recovery_cancellation_context(
+                    plan.clone(),
+                    &execution,
+                    &source,
+                    OWNER,
+                    NOW,
+                )
+                .await
+                .unwrap();
+            let now = match fence {
+                "accepted_marker" => {
+                    let mut completed = turn.clone();
+                    completed.status = TurnStatus::Completed;
+                    let payload =
+                        CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                            workspace_id: plan.workspace_id.clone(),
+                            thread_id: plan.thread_id.clone(),
+                            turn: completed,
+                        });
+                    let prepared = repositories::turn_event::PreparedTurnEvent::prepare(payload)
+                        .unwrap()
+                        .preflight_idempotency(&store.connection)
+                        .await
+                        .unwrap();
+                    // Commit real canonical acceptance without its aggregate projection.
+                    store
+                        .run_serialized_write(|| async {
+                            let tx = store.connection.begin().await?;
+                            let event = repositories::turn_event::append_prepared_event(
+                                &tx,
+                                prepared.clone(),
+                                unix_to_datetime(NOW + 1),
+                            )
+                            .await?;
+                            repositories::turn_event_projection_stream_state::accept_terminal(
+                                &tx, &event,
+                            )
+                            .await?;
+                            tx.commit().await?;
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        store
+                            .get_turn(&plan.thread_id, &turn.id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .1
+                            .status,
+                        TurnStatus::InProgress
+                    );
+                    assert!(
+                        store
+                            .native_turn_has_accepted_terminal(&turn.id)
+                            .await
+                            .unwrap()
+                    );
+                    NOW + 1
+                }
+                "durable_terminal" => {
+                    store
+                        .update_turn_status(
+                            &plan.thread_id,
+                            &turn.id,
+                            TurnStatus::Completed,
+                            None,
+                            NOW + 1,
+                        )
+                        .await
+                        .unwrap();
+                    NOW + 1
+                }
+                "new_owner" => {
+                    store
+                        .claim_expired_turn_execution(
+                            &execution,
+                            "replacement-owner",
+                            NOW + 101,
+                            NOW + 200,
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    NOW + 101
+                }
+                "new_attempt" => {
+                    assert!(
+                        store
+                            .record_native_recovery_start_failure_owned(
+                                &execution,
+                                &source,
+                                RecoveryJobStatus::Pending,
+                                Some(NOW + 1),
+                                Some("first refusal".into()),
+                                None,
+                                NOW
+                            )
+                            .await
+                            .unwrap()
+                    );
+                    let claimed = store.claim_due_recovery_jobs(NOW + 1, 45, 1).await.unwrap();
+                    assert!(matches!(
+                        store
+                            .mark_claimed_recovery_job_active(
+                                &job.id,
+                                claimed[0].claim_token.as_deref().unwrap(),
+                                "replacement-attempt",
+                                NOW + 1
+                            )
+                            .await
+                            .unwrap(),
+                        ClaimedRecoveryActivation::Activated
+                    ));
+                    NOW + 1
+                }
+                _ => unreachable!(),
+            };
+            let job_before = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+            let execution_before = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+            for _ in 0..2 {
+                assert!(
+                    store
+                        .confirm_native_recovery_cancellation_context(
+                            plan.clone(),
+                            &execution,
+                            &source,
+                            OWNER,
+                            now
+                        )
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    !store
+                        .mark_native_recovery_start_running_owned(
+                            &execution,
+                            &source,
+                            now,
+                            now + 45
+                        )
+                        .await
+                        .unwrap()
+                );
+                assert!(
+                    !store
+                        .record_native_recovery_start_failure_owned(
+                            &execution,
+                            &source,
+                            RecoveryJobStatus::Pending,
+                            Some(now + 2),
+                            Some("late refusal".into()),
+                            None,
+                            now
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+            let after = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+            assert_eq!(after.status, job_before.status);
+            assert_eq!(after.active_attempt_id, job_before.active_attempt_id);
+            assert_eq!(after.run_count, job_before.run_count);
+            assert_eq!(
+                after.last_failure_attempt_id,
+                job_before.last_failure_attempt_id
+            );
+            assert_eq!(
+                store.get_turn_execution(&turn.id).await.unwrap().unwrap(),
+                execution_before
+            );
+            assert_eq!(
+                store
+                    .native_cancellation_context(&turn.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .preparation,
+                plan
+            );
+        }
+    }
+}
+
+async fn unactivated_fixture(
+    suffix: &str,
+) -> (
+    CrudStore,
+    Turn,
+    pioneer_protocol::NativeTerminalEffectPreparation,
+    crate::TurnExecutionRecord,
+) {
+    let workspace = format!("ws_early_{suffix}");
+    let thread = format!("thread_early_{suffix}");
+    let turn_id = format!("turn_early_{suffix}");
+    let store = test_store_with_workspace(&workspace).await;
+    let (store, _, turn) = start_test_turn(store, &workspace, &thread, &turn_id).await;
+    repositories::turn_execution::insert_immutable(
+        &store.connection,
+        crate::NewTurnExecution {
+            turn_id: turn_id.clone(),
+            thread_id: thread.clone(),
+            workspace_id: workspace.clone(),
+            executor_kind: crate::TurnExecutorKind::ApiProvider,
+            executor_key: Some("openai".into()),
+            status: crate::TurnExecutionStatus::Starting,
+            owner_id: OWNER.into(),
+            lease_until: crate::utc_now() + chrono::Duration::seconds(100),
+            created_at: unix_to_datetime(NOW),
+        },
+    )
+    .await
+    .unwrap();
+    let expected = store.get_turn_execution(&turn_id).await.unwrap().unwrap();
+    let plan = cleanup_effect_preparation(&workspace, &thread, &turn_id, "original");
+    (store, turn, plan, expected)
+}
+
+#[tokio::test]
+async fn accepted_unactivated_stop_and_activation_share_a_durable_writer_fence() {
+    for claim_before_stop in [false, true] {
+        let suffix = if claim_before_stop {
+            "claimed"
+        } else {
+            "starting"
+        };
+        let (store, turn, plan, expected) = unactivated_fixture(suffix).await;
+        if claim_before_stop {
+            assert!(store.claim_unactivated_agent_turn(&expected).await.unwrap());
+            let claimed = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+            assert_eq!(claimed.status, crate::TurnExecutionStatus::Starting);
+            assert!(claimed.started_at.is_some());
+            assert!(!store.claim_unactivated_agent_turn(&expected).await.unwrap());
+        }
+        let event = interrupted(&turn, &plan, "Stop before runtime");
+        store
+            .materialize_unactivated_turn_cancellation_owned_as(
+                event.clone(),
+                NOW + 1,
+                expected.clone(),
+                OWNER,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_turn(&plan.thread_id, &turn.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::Interrupted
+        );
+        assert_eq!(
+            store
+                .get_turn_execution(&turn.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::TurnExecutionStatus::Interrupted
+        );
+        assert!(
+            store
+                .native_cancellation_context(&turn.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .persist_native_cancellation_context(plan.clone(), OWNER, NOW + 2, true)
+                .await
+                .is_err()
+        );
+        assert!(!store.claim_unactivated_agent_turn(&expected).await.unwrap());
+        store
+            .materialize_unactivated_turn_cancellation_owned_as(
+                event,
+                NOW + 2,
+                expected,
+                OWNER,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    // Both real writer contenders are legal; exactly one may accept its fence.
+    let (store, turn, plan, expected) = unactivated_fixture("race").await;
+    let stop_event = interrupted(&turn, &plan, "racing Stop");
+    let (stop, activation) = tokio::join!(
+        store.materialize_unactivated_turn_cancellation_owned_as(
+            stop_event,
+            NOW + 1,
+            expected,
+            OWNER,
+            None
+        ),
+        store.persist_native_cancellation_context(plan.clone(), OWNER, NOW + 1, true),
+    );
+    assert_ne!(stop.is_ok(), activation.is_ok());
+    if stop.is_ok() {
+        assert!(
+            store
+                .native_cancellation_context(&turn.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_turn_execution(&turn.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::TurnExecutionStatus::Interrupted
+        );
+    } else {
+        assert!(
+            store
+                .native_cancellation_context(&turn.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        cancel(&store, &turn, &plan, "ordinary activated Stop")
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn early_stop_never_bypasses_an_activated_owner_or_missing_immutable_context() {
+    let (store, turn, plan, expected) = unactivated_fixture("active_missing").await;
+    assert!(
+        store
+            .mark_turn_execution_running_owned(&turn.id, OWNER, NOW, NOW + 100)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .materialize_unactivated_turn_cancellation_owned_as(
+                interrupted(&turn, &plan, "invalid early Stop"),
+                NOW + 1,
+                expected,
+                OWNER,
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_turn(&plan.thread_id, &turn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    assert_eq!(
+        store
+            .get_turn_execution(&turn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::TurnExecutionStatus::Running
+    );
+    assert!(
+        store
+            .native_cancellation_context(&turn.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn unactivated_refusal_and_stop_preserve_activation_terminal_results_and_recovery_ownership()
+{
+    // Deterministically exercise activation winning the cancellation fence.
+    let (store, turn, plan, expected) = unactivated_fixture("activation_first").await;
+    store
+        .persist_native_cancellation_context(plan.clone(), OWNER, NOW, true)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .materialize_unactivated_turn_cancellation_owned_as(
+                interrupted(&turn, &plan, "late early Stop"),
+                NOW + 1,
+                expected.clone(),
+                OWNER,
+                None,
+            )
+            .await
+            .is_err()
+    );
+    let mut refused = turn.clone();
+    refused.status = TurnStatus::Failed;
+    refused.error = Some("outbox_start_integrity_rejected".into());
+    assert!(
+        store
+            .materialize_unactivated_turn_refusal_owned(
+                CanonicalTurnEventPayload::TurnFailed(TurnFailedNotification {
+                    workspace_id: plan.workspace_id.clone(),
+                    thread_id: plan.thread_id.clone(),
+                    turn: refused,
+                }),
+                NOW + 1,
+                expected,
+            )
+            .await
+            .is_err()
+    );
+    cancel(&store, &turn, &plan, "ordinary activated cancellation")
+        .await
+        .unwrap();
+
+    // A previously accepted completion cannot become an early interruption.
+    let (store, turn, plan, expected) = unactivated_fixture("terminal_first").await;
+    let mut completed = turn.clone();
+    completed.status = TurnStatus::Completed;
+    store
+        .materialize_native_agent_turn_event_owned(
+            CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                workspace_id: plan.workspace_id.clone(),
+                thread_id: plan.thread_id.clone(),
+                turn: completed,
+            }),
+            NOW,
+            None,
+            OWNER,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .materialize_unactivated_turn_cancellation_owned_as(
+                interrupted(&turn, &plan, "late Stop"),
+                NOW + 1,
+                expected,
+                OWNER,
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_turn(&plan.thread_id, &turn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::Completed
+    );
+
+    // Late delivery refusal belongs to the old owner/generation, never to a
+    // recovery which has already claimed the durable execution.
+    let (store, turn, plan, expected) = unactivated_fixture("new_owner").await;
+    let replacement = store
+        .claim_expired_turn_execution(
+            &expected,
+            "replacement-owner",
+            expected.lease_until.timestamp() + 1,
+            expected.lease_until.timestamp() + 101,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(replacement.owner_generation > expected.owner_generation);
+    let mut refused = turn.clone();
+    refused.status = TurnStatus::Failed;
+    refused.error = Some("outbox_foreground_conflict".into());
+    assert!(
+        store
+            .materialize_unactivated_turn_refusal_owned(
+                CanonicalTurnEventPayload::TurnFailed(TurnFailedNotification {
+                    workspace_id: plan.workspace_id.clone(),
+                    thread_id: plan.thread_id.clone(),
+                    turn: refused,
+                }),
+                NOW + 102,
+                expected,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.get_turn_execution(&turn.id).await.unwrap().unwrap(),
+        replacement
+    );
+    assert_eq!(
+        store
+            .get_turn(&plan.thread_id, &turn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+
+    // The bounded phase fallback must fence generation even if recovery keeps
+    // the same process owner ID and a real immutable context already exists.
+    let (store, turn, plan, expected) = unactivated_fixture("same_owner_generation").await;
+    store
+        .persist_native_cancellation_context(plan.clone(), OWNER, NOW, true)
+        .await
+        .unwrap();
+    let context = store
+        .native_cancellation_context(&turn.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let replacement = store
+        .claim_expired_turn_execution(
+            &expected,
+            OWNER,
+            expected.lease_until.timestamp() + 1,
+            expected.lease_until.timestamp() + 101,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(replacement.owner_generation > expected.owner_generation);
+    assert!(
+        store
+            .materialize_native_cancellation_owned_at_generation(
+                interrupted(&turn, &plan, "old phase Stop"),
+                NOW + 102,
+                context,
+                plan.clone(),
+                OWNER,
+                None,
+                expected.owner_generation,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        !store
+            .native_turn_has_accepted_terminal(&turn.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.get_turn_execution(&turn.id).await.unwrap().unwrap(),
+        replacement
+    );
 }
