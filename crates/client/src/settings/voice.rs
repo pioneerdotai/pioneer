@@ -11,6 +11,9 @@ use pioneer_protocol::{
 pub enum VoiceInputSettingsAction {
     Enable,
     Disable,
+    SetTranscribeWhileRecording {
+        enabled: bool,
+    },
     Select {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
@@ -78,6 +81,9 @@ pub fn voice_input_settings_plan(request: VoiceInputSettingsPlanRequest) -> Voic
     match request.action {
         VoiceInputSettingsAction::Enable => voice_input_enable_plan(&request.current),
         VoiceInputSettingsAction::Disable => voice_input_disable_plan(&request.current),
+        VoiceInputSettingsAction::SetTranscribeWhileRecording { enabled } => {
+            voice_input_transcribe_while_recording_plan(&request.current, enabled)
+        }
         VoiceInputSettingsAction::Select { provider, model } => {
             voice_input_model_selection_plan(&request.current, provider.as_deref(), model)
         }
@@ -114,6 +120,22 @@ pub fn voice_input_disable_plan(current: &GatewayVoiceInputSettings) -> VoiceInp
     }
 }
 
+pub fn voice_input_transcribe_while_recording_plan(
+    current: &GatewayVoiceInputSettings,
+    enabled: bool,
+) -> VoiceInputSettingsPlan {
+    if current.transcribe_while_recording == enabled {
+        return VoiceInputSettingsPlan::Noop;
+    }
+
+    VoiceInputSettingsPlan::Update {
+        update: voice_input_update(GatewayVoiceInputSettingsUpdate {
+            transcribe_while_recording: Some(enabled),
+            ..GatewayVoiceInputSettingsUpdate::default()
+        }),
+    }
+}
+
 pub fn voice_input_model_selection_plan(
     current: &GatewayVoiceInputSettings,
     provider: Option<&str>,
@@ -145,6 +167,7 @@ pub fn voice_input_model_selection_plan(
             provider: Some(Some(GatewayVoiceInputProvider::Local)),
             model: Some(Some(model)),
             retry_install: false,
+            ..GatewayVoiceInputSettingsUpdate::default()
         }),
     }
 }
@@ -230,6 +253,7 @@ mod tests {
     ) -> GatewayVoiceInputSettings {
         GatewayVoiceInputSettings {
             enabled,
+            transcribe_while_recording: true,
             provider: selected.then_some(GatewayVoiceInputProvider::Local),
             model: selected.then(|| "parakeet-tdt-0.6b-v3".to_owned()),
             runtime: pioneer_protocol::GatewayVoiceInputRuntimeSnapshot {
@@ -307,6 +331,43 @@ mod tests {
                 reason: VoiceInputSettingsPlanRejection::MissingModel
             }
         ));
+    }
+
+    #[test]
+    fn voice_mode_plan_is_independent_of_selection_enablement_and_runtime() {
+        for enabled in [false, true] {
+            let mut current = settings(enabled, true, GatewayVoiceInputRuntimePhase::Loading);
+            let VoiceInputSettingsPlan::Update { update } =
+                voice_input_settings_plan(VoiceInputSettingsPlanRequest {
+                    current: current.clone(),
+                    action: VoiceInputSettingsAction::SetTranscribeWhileRecording {
+                        enabled: false,
+                    },
+                })
+            else {
+                panic!("mode must update")
+            };
+            assert_eq!(
+                update.voice_input.unwrap(),
+                GatewayVoiceInputSettingsUpdate {
+                    transcribe_while_recording: Some(false),
+                    ..Default::default()
+                }
+            );
+            current.transcribe_while_recording = false;
+            assert!(matches!(
+                voice_input_transcribe_while_recording_plan(&current, false),
+                VoiceInputSettingsPlan::Noop
+            ));
+            let VoiceInputSettingsPlan::Update { update } = voice_input_model_selection_plan(
+                &current,
+                Some("local"),
+                Some("moonshine-base".into()),
+            ) else {
+                panic!("selection must update")
+            };
+            assert_eq!(update.voice_input.unwrap().transcribe_while_recording, None);
+        }
     }
 
     #[test]

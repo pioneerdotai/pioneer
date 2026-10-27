@@ -169,6 +169,8 @@ select_model = "モデルを選択"
 dialog_title = "Preflight モデルを選択"
 
 [settings.voice_input]
+transcribe_while_recording = "録音中に文字起こし"
+transcribe_while_recording_description = "オフにすると、録音終了後に文字起こしを開始します。"
 label = "音声入力"
 description = "音声メッセージにローカル文字起こしモデルを使用します。"
 no_model_selected = "モデルが選択されていません"

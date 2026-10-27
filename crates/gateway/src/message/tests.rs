@@ -16467,7 +16467,7 @@ macro_rules! owned_voice_ingress_test {
             // and connection-cleanup frames on the libtest thread.
             run_standard_stack_message_test(
                 stringify!($name),
-                owned_voice_ingress_case($terminal, $action, false),
+                owned_voice_ingress_case($terminal, $action, false, false),
             );
         }
     };
@@ -16476,11 +16476,81 @@ macro_rules! owned_voice_ingress_test {
         fn $name() {
             run_standard_stack_message_test(
                 stringify!($name),
-                owned_voice_ingress_case($terminal, $action, true),
+                owned_voice_ingress_case($terminal, $action, true, false),
+            );
+        }
+    };
+    ($name:ident, $terminal:literal, $action:literal, buffered) => {
+        #[test]
+        fn $name() {
+            run_standard_stack_message_test(
+                stringify!($name),
+                owned_voice_ingress_case($terminal, $action, true, true),
             );
         }
     };
 }
+
+owned_voice_ingress_test!(
+    owned_voice_buffered_full_recording_one_authorized_turn,
+    "buffered_long",
+    "winner",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_cancel_during_inference,
+    "transcript",
+    "cancel",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_disconnect_during_inference,
+    "transcript",
+    "disconnect",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_revocation_during_inference,
+    "transcript",
+    "revocation",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_shutdown_during_inference,
+    "transcript",
+    "shutdown",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_empty_transcript,
+    "no_speech",
+    "winner",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_native_error_no_partial_turn,
+    "runtime_error",
+    "winner",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_silence_no_inference_or_turn,
+    "silence",
+    "winner",
+    buffered
+);
+owned_voice_ingress_test!(
+    owned_voice_incremental_session_pins_mode_and_peer_next_session_buffers,
+    "transcript",
+    "mode_switch",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_buffered_session_pins_mode_and_peer_next_session_is_incremental,
+    "transcript",
+    "mode_switch",
+    buffered
+);
 
 owned_voice_ingress_test!(
     owned_voice_incremental_inference_before_commit_and_backlog,
@@ -16642,6 +16712,7 @@ fn owned_voice_ingress_case(
     terminal: &'static str,
     action: &'static str,
     early: bool,
+    buffered: bool,
 ) -> MessageFuture<'static, ()> {
     message_future(async move {
         use crate::voice::transcription::{VoiceTranscriptionErrorKind, transcription_error};
@@ -16656,9 +16727,13 @@ fn owned_voice_ingress_case(
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let release = PendingVoiceRelease(gate.clone());
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (calls_tx, mut calls_rx) = tokio::sync::mpsc::unbounded_channel();
         let entered_tx = std::sync::Mutex::new(Some(entered_tx));
         let captured = Arc::new(std::sync::Mutex::new(Vec::<Vec<f32>>::new()));
         let worker_captured = captured.clone();
+        // Every case owns its settings file. Persist through the production
+        // settings mutation below; never use a test-only mode override.
+        let runtime_home = tempfile::tempdir().unwrap();
         let mut processor = MessageProcessor::new(
             Arc::new(ThreadManager::new("test-model", "openai")),
             test_provider(),
@@ -16669,6 +16744,7 @@ fn owned_voice_ingress_case(
             test_summary_config(),
             test_tool_loop_config(),
         )
+        .with_runtime_home_for_tests(runtime_home.path().to_path_buf())
         .with_voice_input_supervisor(ready_gateway_voice_supervisor_for_model(
             "unused native stub",
             if early {
@@ -16691,6 +16767,7 @@ fn owned_voice_ingress_case(
                 calls.push(buffer.flattened_samples());
                 calls.len()
             };
+            let _ = calls_tx.send(call_count);
             // Observe the production blocking scope before installing anything
             // in the fake. This must come from the actual request dispatcher.
             if let Some(sender) = entered_tx.lock().unwrap().take() {
@@ -16744,13 +16821,60 @@ fn owned_voice_ingress_case(
                 "no_speech" => Ok("  ".to_owned()),
                 // Context changes the hypothesis across the old 3 s cut. The
                 // final assertion must observe the correction, never append it.
-                _ if early && buffer.speech_samples() <= 48000 => {
+                _ if early && !buffered && buffer.speech_samples() <= 48000 => {
                     Ok("incorrect early boundary".to_owned())
                 }
                 _ => Ok("controlled transcript".to_owned()),
             }
         }));
         let processor = Arc::new(processor);
+        let mode_context =
+            registered_request_context(&processor, connection_id, "settings/update").await;
+        let generation = processor
+            .voice_input_supervisor
+            .as_ref()
+            .unwrap()
+            .generation();
+        let snapshot = processor
+            .update_gateway_settings(
+                &mode_context,
+                pioneer_protocol::GatewaySettingsUpdate {
+                    voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                        enabled: Some(true),
+                        provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
+                        model: Some(Some(
+                            if early {
+                                "moonshine-base"
+                            } else {
+                                "parakeet-tdt-0.6b-v3"
+                            }
+                            .to_owned(),
+                        )),
+                        transcribe_while_recording: Some(!buffered),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.voice_input.transcribe_while_recording, !buffered);
+        assert!(snapshot.voice_input.enabled);
+        assert!(
+            processor
+                .voice_input_supervisor
+                .as_ref()
+                .unwrap()
+                .has_loaded_engine()
+        );
+        assert_eq!(
+            processor
+                .voice_input_supervisor
+                .as_ref()
+                .unwrap()
+                .generation(),
+            generation
+        );
         // Revocation cases materialize thread_membership, whose CHECK requires
         // a 21-character alphanumeric ID even though thread/start accepts more.
         let thread_id = "T00000000000000000116";
@@ -16835,7 +16959,7 @@ fn owned_voice_ingress_case(
                         &session.session_id,
                         sequence,
                         if early { 1600 } else { 960 },
-                        12000,
+                        if terminal == "silence" { 0 } else { 12000 },
                     ),
                 )
                 .await
@@ -16843,14 +16967,21 @@ fn owned_voice_ingress_case(
             let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
         }
         if early {
-            let key = tokio::time::timeout(Duration::from_secs(5), entered_rx.take().unwrap())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                key, None,
-                "pre-Commit inference must not be charged to turn startup"
-            );
+            if buffered {
+                assert!(
+                    captured.lock().unwrap().is_empty(),
+                    "buffered must not call ASR before Commit"
+                );
+            } else {
+                let key = tokio::time::timeout(Duration::from_secs(5), entered_rx.take().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    key, None,
+                    "pre-Commit inference must not be charged to turn startup"
+                );
+            }
             assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
             assert_eq!(
                 processor
@@ -16863,7 +16994,7 @@ fn owned_voice_ingress_case(
             // Duplicate accepted sequence is ACKed without replay. Keep a full
             // second source span and a seven-sample tail behind native work.
             let last_sequence = match terminal {
-                "long_context" | "long_tail_error" => 200,
+                "long_context" | "long_tail_error" | "buffered_long" => 200,
                 "closed_13" => 129,
                 "closed_17" => 169,
                 _ => 60,
@@ -16876,7 +17007,9 @@ fn owned_voice_ingress_case(
                 } else {
                     1600
                 };
-                let amplitude = if sequence == 29 {
+                let amplitude = if terminal == "silence" {
+                    0
+                } else if sequence == 29 {
                     12000
                 } else if sequence == last_sequence {
                     3000
@@ -16894,6 +17027,69 @@ fn owned_voice_ingress_case(
                     .unwrap();
                 let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
             }
+            if buffered {
+                assert!(
+                    captured.lock().unwrap().is_empty(),
+                    "full buffered backlog must stay untranscribed before Commit"
+                );
+                assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
+            }
+        }
+        if action == "mode_switch" {
+            let update_id = generate_test_request_id("voice", "switch_active_mode");
+            processor
+                .clone()
+                .process_owned_request(
+                    foreign_context.clone(),
+                    json!({
+                        "jsonrpc":"2.0", "id":update_id, "method":"settings/update",
+                        "params":{"update":{"voice_input":{"transcribe_while_recording":buffered}}}
+                    })
+                    .to_string(),
+                )
+                .await;
+            let response = recv_response_by_id(&mut foreign_rx, &update_id).await;
+            let response: pioneer_protocol::GatewaySettingsUpdateResponse =
+                serde_json::from_value(response.result).unwrap();
+            assert_eq!(
+                response.settings.voice_input.transcribe_while_recording,
+                buffered
+            );
+            assert!(response.settings.voice_input.enabled);
+            assert_eq!(
+                response.settings.voice_input.model.as_deref(),
+                Some("moonshine-base")
+            );
+            let notification =
+                recv_notification_by_method(&mut rx, events::GATEWAY_VOICE_INPUT_STATUS_CHANGED)
+                    .await;
+            let notification: pioneer_protocol::GatewayVoiceInputStatusChangedNotification =
+                serde_json::from_value(notification.params.unwrap()).unwrap();
+            assert_eq!(notification.settings.transcribe_while_recording, buffered);
+            assert_eq!(
+                processor
+                    .voice_input_supervisor
+                    .as_ref()
+                    .unwrap()
+                    .generation(),
+                generation
+            );
+            assert!(
+                processor
+                    .voice_input_supervisor
+                    .as_ref()
+                    .unwrap()
+                    .has_loaded_engine()
+            );
+            assert_eq!(
+                processor
+                    .voice_sessions
+                    .lookup_session(&session.session_id, connection_id)
+                    .unwrap()
+                    .state,
+                crate::voice::session_store::GatewayVoiceSessionState::Recording
+            );
+            assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
         }
         if early && action == "winner" && terminal == "transcript" {
             let occupied: Vec<_> = (1..=3)
@@ -16932,6 +17128,13 @@ fn owned_voice_ingress_case(
             .await
             .unwrap()
             .expect("voice target history must exist");
+        assert!(
+            before.events.iter().all(|event| !matches!(
+                &event.payload,
+                pioneer_protocol::ThreadHistoryEventPayload::TurnStarted { .. }
+            )),
+            "no user turn may be created before Commit, including under another ID"
+        );
         let before_events = serde_json::to_value(&before.events).unwrap();
         let finalize = json!({"jsonrpc":"2.0","id":finalize_id,"method":"voice/session/finalize","params":{
             "session_id":session.session_id,"context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":turn_id}
@@ -16942,6 +17145,7 @@ fn owned_voice_ingress_case(
             Some(turn_id.to_owned())
         };
         let request = &finalize;
+        let mut completed_result = None;
         assert_eq!(
             pioneer_observability::turn_startup::request_key(&request["params"]),
             expected_startup_key
@@ -16960,9 +17164,22 @@ fn owned_voice_ingress_case(
             )
             .await
             .expect("reader must return at ACK while transcriber remains pending");
-            let ack = recv_response_by_id(&mut rx, finalize_id.as_str()).await;
+            let ack = if terminal == "silence" {
+                // No fake native gate exists for silence. Collect both so an
+                // immediate terminal result cannot be discarded by an ACK helper.
+                let (ack, result) = recv_response_and_notification_by_id_method(
+                    &mut rx,
+                    finalize_id.as_str(),
+                    events::VOICE_SESSION_RESULT,
+                )
+                .await;
+                completed_result = Some(result);
+                ack
+            } else {
+                recv_response_by_id(&mut rx, finalize_id.as_str()).await
+            };
             assert_eq!(ack.result["status"], json!("transcribing"));
-            if let Some(entered_rx) = entered_rx {
+            if let Some(entered_rx) = entered_rx.filter(|_| terminal != "silence") {
                 let worker_startup_key = tokio::time::timeout(Duration::from_secs(5), entered_rx)
                     .await
                     .unwrap()
@@ -16971,13 +17188,15 @@ fn owned_voice_ingress_case(
             }
             // Same owner repeated finalize is bounded/rejected; another connection
             // cannot claim the authenticated owner's session (connection_id retained).
-            let mut repeated_finalize = finalize.clone();
-            repeated_finalize["id"] = json!(repeat_id);
-            processor
-                .clone()
-                .process_owned_request(context.clone(), repeated_finalize.to_string())
-                .await;
-            let _ = recv_error_by_id(&mut rx, repeat_id.as_str()).await;
+            if terminal != "silence" {
+                let mut repeated_finalize = finalize.clone();
+                repeated_finalize["id"] = json!(repeat_id);
+                processor
+                    .clone()
+                    .process_owned_request(context.clone(), repeated_finalize.to_string())
+                    .await;
+                let _ = recv_error_by_id(&mut rx, repeat_id.as_str()).await;
+            }
         }
         let mut cancel = json!({"jsonrpc":"2.0","id":foreign_request_id,"method":"voice/session/cancel","params":{"session_id":session.session_id}});
         processor
@@ -16986,6 +17205,18 @@ fn owned_voice_ingress_case(
             .await;
         let _ = recv_error_by_id(&mut foreign_rx, foreign_request_id.as_str()).await;
         assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
+        let other_capacity: Vec<_> = if matches!(action, "winner" | "mode_switch") {
+            Vec::new()
+        } else {
+            (1..=3)
+                .map(|offset| {
+                    processor
+                        .voice_finalizations
+                        .reserve(u64::MAX - offset)
+                        .unwrap()
+                })
+                .collect()
+        };
         if action.starts_with("cancel") {
             cancel["id"] = json!(cancel_id);
             tokio::time::timeout(
@@ -17059,7 +17290,7 @@ fn owned_voice_ingress_case(
         } else {
             None
         };
-        if action != "winner" {
+        if !matches!(action, "winner" | "mode_switch") {
             assert!(
                 processor
                     .voice_finalizations
@@ -17069,6 +17300,10 @@ fn owned_voice_ingress_case(
             );
             assert!(processor.voice_finalizations.has_active_work());
             assert!(!processor.voice_finalizations.tasks.is_empty());
+            assert!(
+                processor.voice_finalizations.reserve(foreign_id).is_none(),
+                "all native slots remain occupied while cancelled inference is blocked"
+            );
         }
         if terminal == "generation_change" {
             // The next contextual call must use the recording's admitted
@@ -17088,6 +17323,7 @@ fn owned_voice_ingress_case(
                 .unwrap();
         }
         release.release();
+        drop(other_capacity);
         // Closing the tracker enables waiting for completion; it does
         // not cancel the pipeline or forbid spawning by itself. Await exact worker completion, no sleeps.
         processor.voice_finalizations.tasks.close();
@@ -17106,8 +17342,31 @@ fn owned_voice_ingress_case(
         assert!(!processor.voice_finalizations.has_active_work());
         {
             let calls = captured.lock().unwrap();
-            if early
-                && action == "winner"
+            if buffered {
+                if terminal == "silence" {
+                    assert!(
+                        calls.is_empty(),
+                        "silent buffered input must never enter ASR"
+                    );
+                } else {
+                    let mut source = vec![12000.0 / 32768.0; 48000];
+                    source.extend(vec![
+                        6000.0 / 32768.0;
+                        if terminal == "buffered_long" {
+                            272000
+                        } else {
+                            48000
+                        }
+                    ]);
+                    source.extend([3000.0 / 32768.0; 7]);
+                    assert_eq!(
+                        *calls,
+                        vec![source],
+                        "one full prepared PCM call, including final residual"
+                    );
+                }
+            } else if early
+                && matches!(action, "winner" | "mode_switch")
                 && matches!(terminal, "transcript" | "no_speech" | "tail_error")
             {
                 assert_eq!(
@@ -17169,31 +17428,86 @@ fn owned_voice_ingress_case(
                 );
             }
         }
-        if action == "winner" {
-            let event = recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
+        if matches!(action, "winner" | "mode_switch") {
+            let event = if let Some(result) = completed_result {
+                result
+            } else if action == "mode_switch" {
+                // Provider completion and voice publication may race; preserve
+                // both before starting another voice turn on the same thread.
+                let mut result = None;
+                let mut turn_completed = false;
+                while result.is_none() || !turn_completed {
+                    let event = recv_next_notification(&mut rx).await;
+                    if event.method == events::VOICE_SESSION_RESULT {
+                        assert!(
+                            result.replace(event).is_none(),
+                            "one first-session terminal result"
+                        );
+                    } else if event.method == events::TURN_COMPLETED {
+                        turn_completed = true;
+                    }
+                }
+                result.unwrap()
+            } else {
+                recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await
+            };
             let result: VoiceSessionResultNotification =
                 serde_json::from_value(event.params.unwrap()).unwrap();
             let expected = match terminal {
-                "transcript" | "long_context" | "closed_13" | "closed_17" => {
+                "transcript" | "long_context" | "closed_13" | "closed_17" | "buffered_long" => {
                     VoiceSessionOutcome::TurnStarted
                 }
-                "no_speech" => VoiceSessionOutcome::NoSpeech,
+                "no_speech" | "silence" => VoiceSessionOutcome::NoSpeech,
                 _ => VoiceSessionOutcome::Failed,
             };
             assert_eq!(result.outcome, expected);
+            assert_eq!(result.session_id, session.session_id);
+            if matches!(expected, VoiceSessionOutcome::TurnStarted) {
+                assert_eq!(result.turn_id.as_deref(), Some(turn_id));
+            }
             assert_eq!(
                 crud.get_turn(thread_id, turn_id).await.unwrap().is_some(),
                 matches!(
                     terminal,
-                    "transcript" | "long_context" | "closed_13" | "closed_17"
+                    "transcript" | "long_context" | "closed_13" | "closed_17" | "buffered_long"
                 )
             );
-            if early && matches!(terminal, "transcript" | "closed_13" | "closed_17") {
+            if !matches!(expected, VoiceSessionOutcome::TurnStarted) {
+                let after = crud
+                    .get_thread_history(thread_id, Some(64))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&after.events).unwrap(),
+                    before_events,
+                    "silent, empty and failed inference must not commit any partial user input"
+                );
+            }
+            if early
+                && matches!(
+                    terminal,
+                    "transcript" | "closed_13" | "closed_17" | "buffered_long"
+                )
+            {
                 let history = crud
                     .get_thread_history(thread_id, Some(64))
                     .await
                     .unwrap()
                     .unwrap();
+                assert_eq!(
+                    history
+                        .events
+                        .iter()
+                        .filter(|event| matches!(
+                            &event.payload,
+                            pioneer_protocol::ThreadHistoryEventPayload::TurnStarted { turn, .. }
+                                if turn.id == turn_id
+                        ))
+                        .count(),
+                    1,
+                    "one authorized user turn for the committed recording"
+                );
                 let history = serde_json::to_string(&history.events).unwrap();
                 assert!(history.contains("controlled transcript"));
                 assert!(!history.contains("incorrect early boundary"));
@@ -17210,12 +17524,166 @@ fn owned_voice_ingress_case(
                 assert!(!history.contains("incorrect early boundary"));
                 assert!(!history.contains("Да, да. Да, да."));
             }
+            // Worker/finalizer completion is joined above. Inspect queued
+            // terminal events before another response helper can consume them.
+            while let Ok(message) = rx.try_recv() {
+                if let Message::Text(text) = message {
+                    let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                    assert_ne!(
+                        value.get("method").and_then(JsonValue::as_str),
+                        Some(events::VOICE_SESSION_RESULT),
+                        "one terminal result per Commit"
+                    );
+                }
+            }
             cancel["id"] = json!(late_cancel_id);
             processor
                 .clone()
                 .process_owned_request(context, cancel.to_string())
                 .await;
             let _ = recv_error_by_id(&mut rx, late_cancel_id.as_str()).await;
+            if action == "mode_switch" {
+                while calls_rx.try_recv().is_ok() {}
+                let prior_calls = captured.lock().unwrap().len();
+                assert_eq!(prior_calls, if buffered { 1 } else { 2 });
+                subscribe_test_connection_to_materialized_thread(
+                    &processor,
+                    foreign_id,
+                    &workspace_id,
+                    thread_id,
+                )
+                .await;
+                let next_turn = "turn_voice_mode_peer_next";
+                let next_start = generate_test_request_id("voice", "peer_next_start");
+                let next_session = start_test_voice_session(
+                    &processor,
+                    foreign_id,
+                    &mut foreign_rx,
+                    &workspace_id,
+                    thread_id,
+                    next_turn,
+                    &next_start,
+                )
+                .await;
+                for sequence in 0..40 {
+                    processor
+                        .process_binary_frame_for_connection(
+                            foreign_id,
+                            &voice_test_frame(&next_session.session_id, sequence, 1600, 9000),
+                        )
+                        .await
+                        .unwrap();
+                    let _ =
+                        recv_notification_by_method(&mut foreign_rx, events::VOICE_CHUNK_ACK).await;
+                }
+                assert!(crud.get_turn(thread_id, next_turn).await.unwrap().is_none());
+                let peer_context = processor
+                    .session_manager
+                    .connection_context(foreign_id)
+                    .await
+                    .unwrap();
+                if buffered {
+                    // First session was buffered; the peer now uses incremental
+                    // and must actually call ASR while its input remains open.
+                    tokio::time::timeout(Duration::from_secs(5), calls_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(captured.lock().unwrap().len() > prior_calls);
+                    let cancel_id = generate_test_request_id("voice", "peer_next_cancel");
+                    processor
+                        .clone()
+                        .process_owned_request(
+                            peer_context,
+                            json!({
+                                "jsonrpc":"2.0", "id":cancel_id, "method":"voice/session/cancel",
+                                "params":{"session_id":next_session.session_id}
+                            })
+                            .to_string(),
+                        )
+                        .await;
+                    let (response, result) = recv_response_and_notification_by_id_method(
+                        &mut foreign_rx,
+                        &cancel_id,
+                        events::VOICE_SESSION_RESULT,
+                    )
+                    .await;
+                    assert_eq!(response.result["cancelled"], json!(true));
+                    let result: VoiceSessionResultNotification =
+                        serde_json::from_value(result.params.unwrap()).unwrap();
+                    assert_eq!(result.outcome, VoiceSessionOutcome::Cancelled);
+                    assert_eq!(result.session_id, next_session.session_id);
+                    assert!(crud.get_turn(thread_id, next_turn).await.unwrap().is_none());
+                } else {
+                    // First session was incremental; the peer now buffers its
+                    // entire recording, with no local/client mode override.
+                    assert_eq!(captured.lock().unwrap().len(), prior_calls);
+                    let finalize_id = generate_test_request_id("voice", "peer_next_finalize");
+                    processor.clone().process_owned_request(peer_context, json!({
+                        "jsonrpc":"2.0", "id":finalize_id, "method":"voice/session/finalize",
+                        "params":{"session_id":next_session.session_id,
+                            "context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":next_turn}}
+                    }).to_string()).await;
+                    let (ack, result) = recv_response_and_notification_by_id_method(
+                        &mut foreign_rx,
+                        &finalize_id,
+                        events::VOICE_SESSION_RESULT,
+                    )
+                    .await;
+                    assert_eq!(ack.result["status"], json!("transcribing"));
+                    let result: VoiceSessionResultNotification =
+                        serde_json::from_value(result.params.unwrap()).unwrap();
+                    assert_eq!(result.outcome, VoiceSessionOutcome::TurnStarted);
+                    assert_eq!(result.session_id, next_session.session_id);
+                    assert_eq!(result.turn_id.as_deref(), Some(next_turn));
+                    assert!(crud.get_turn(thread_id, next_turn).await.unwrap().is_some());
+                    let history = crud
+                        .get_thread_history(thread_id, Some(64))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(history.events.iter().filter(|event| matches!(
+                        &event.payload,
+                        pioneer_protocol::ThreadHistoryEventPayload::TurnStarted { turn, .. }
+                            if turn.id == next_turn
+                    )).count(), 1);
+                    let calls = captured.lock().unwrap();
+                    assert_eq!(calls.len(), prior_calls + 1);
+                    assert_eq!(calls.last().unwrap(), &vec![9000.0 / 32768.0; 64000]);
+                }
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    processor.voice_finalizations.tasks.wait(),
+                )
+                .await
+                .unwrap();
+                assert!(!processor.voice_finalizations.has_active_work());
+                assert_eq!(
+                    processor
+                        .voice_input_supervisor
+                        .as_ref()
+                        .unwrap()
+                        .generation(),
+                    generation
+                );
+                assert!(
+                    processor
+                        .voice_input_supervisor
+                        .as_ref()
+                        .unwrap()
+                        .has_loaded_engine()
+                );
+                while let Ok(message) = foreign_rx.try_recv() {
+                    if let Message::Text(text) = message {
+                        let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                        assert_ne!(
+                            value.get("method").and_then(JsonValue::as_str),
+                            Some(events::VOICE_SESSION_RESULT),
+                            "one peer-session terminal result"
+                        );
+                    }
+                }
+            }
         } else {
             assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
             let after = crud
@@ -18501,6 +18969,26 @@ async fn voice_session_requires_ready_for_every_non_ready_phase() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn voice_input_status_notification_reports_transitions_and_coalesces_progress() {
+    let runtime_home = unique_temp_dir("voice_mode_status_publication");
+    std::fs::create_dir_all(&runtime_home).unwrap();
+    let config = crate::isolated_test_app_config().unwrap();
+    let settings_path = runtime_home.join(&config.gateway.settings_file_name);
+    let mut persisted = crate::settings::load_or_create_gateway_settings(
+        &settings_path,
+        config.gateway.settings_version,
+        &config.gateway.settings_file_name,
+    )
+    .unwrap();
+    persisted
+        .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+            voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                transcribe_while_recording: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    crate::settings::save_gateway_settings(&settings_path, &persisted).unwrap();
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let _connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -18517,7 +19005,8 @@ async fn voice_input_status_notification_reports_transitions_and_coalesces_progr
             test_summary_config(),
             test_tool_loop_config(),
         )
-        .with_voice_input_supervisor(supervisor.clone()),
+        .with_voice_input_supervisor(supervisor.clone())
+        .with_runtime_home_for_tests(runtime_home.clone()),
     );
     processor.start_voice_input_status_notifications();
 
@@ -18536,6 +19025,7 @@ async fn voice_input_status_notification_reports_transitions_and_coalesces_progr
     let missing: pioneer_protocol::GatewayVoiceInputStatusChangedNotification =
         serde_json::from_value(missing.params.expect("missing notification params"))
             .expect("missing notification payload");
+    assert!(!missing.settings.transcribe_while_recording);
     assert_eq!(
         missing.settings.runtime.phase,
         pioneer_protocol::GatewayVoiceInputRuntimePhase::Missing
@@ -18564,8 +19054,10 @@ async fn voice_input_status_notification_reports_transitions_and_coalesces_progr
     let progress: pioneer_protocol::GatewayVoiceInputStatusChangedNotification =
         serde_json::from_value(progress.params.expect("progress notification params"))
             .expect("progress notification payload");
+    assert!(!progress.settings.transcribe_while_recording);
     assert_eq!(progress.settings.runtime.downloaded_bytes, Some(3));
     assert_eq!(progress.settings.runtime.total_bytes, Some(10));
+    let _ = std::fs::remove_dir_all(runtime_home);
 }
 
 async fn start_test_voice_session(
@@ -18608,11 +19100,15 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let (peer_tx, mut peer_rx) = mpsc::channel(32);
+    let _peer = register_authenticated_test_connection(session_manager.as_ref(), peer_tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
+    let supervisor = test_gateway_voice_supervisor();
+    let engine_generation = supervisor.generation();
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -18623,7 +19119,8 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
         test_summary_config(),
         test_tool_loop_config(),
     )
-    .with_runtime_home_for_tests(runtime_home.clone());
+    .with_runtime_home_for_tests(runtime_home.clone())
+    .with_voice_input_supervisor(supervisor.clone());
     processor
         .voice_sessions
         .create_session(
@@ -18695,6 +19192,42 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
                 .and_then(JsonValue::as_str),
             Some("voice_reconfiguration_busy")
         );
+        let mode_request_id = generate_test_request_id("voice_mode", state);
+        let transcribe_while_recording = state == "finalizing";
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0", "id": mode_request_id,
+                    "method": "settings/update",
+                    "params": { "update": { "voice_input": {
+                    "transcribe_while_recording": transcribe_while_recording
+                    } } }
+                })
+                .to_string(),
+            )
+            .await;
+        let response = recv_response_by_id(&mut rx, &mode_request_id).await;
+        let response: pioneer_protocol::GatewaySettingsUpdateResponse =
+            serde_json::from_value(response.result).unwrap();
+        assert_eq!(
+            response.settings.voice_input.transcribe_while_recording,
+            transcribe_while_recording
+        );
+        assert!(!response.settings.voice_input.enabled);
+        assert_eq!(response.settings.voice_input.model, None);
+        assert_eq!(supervisor.generation(), engine_generation);
+        assert!(processor.voice_sessions.has_active_sessions().unwrap());
+        if state == "recording" {
+            let peer = recv_notification_by_method(
+                &mut peer_rx,
+                events::GATEWAY_VOICE_INPUT_STATUS_CHANGED,
+            )
+            .await;
+            let peer: pioneer_protocol::GatewayVoiceInputStatusChangedNotification =
+                serde_json::from_value(peer.params.unwrap()).unwrap();
+            assert!(!peer.settings.transcribe_while_recording);
+        }
     }
 
     let unrelated_request_id = generate_test_request_id("voicebusy", "unrelated");
@@ -18779,7 +19312,65 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
         serde_json::from_value(response.result).expect("settings update response");
     assert!(payload.settings.voice_input.enabled);
     assert_eq!(payload.settings.voice_input.model.as_deref(), Some("small"));
+    assert!(!payload.settings.voice_input.transcribe_while_recording);
 
+    let _ = std::fs::remove_dir_all(runtime_home);
+}
+
+#[tokio::test]
+async fn voice_mode_save_failure_preserves_persistence_and_does_not_notify_peers() {
+    let runtime_home = unique_temp_dir("voice_mode_save_failure");
+    std::fs::create_dir_all(&runtime_home).unwrap();
+    let (tx, mut rx) = mpsc::channel(32);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let (workspaces, crud, _) = setup_workspace_manager().await;
+    let supervisor = test_gateway_voice_supervisor();
+    let generation = supervisor.generation();
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        sessions,
+        workspaces,
+        crud,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    )
+    .with_runtime_home_for_tests(runtime_home.clone())
+    .with_voice_input_supervisor(supervisor.clone());
+    let context = registered_request_context(&processor, connection, "settings/update").await;
+    let config = crate::isolated_test_app_config().unwrap();
+    let path = runtime_home.join(&config.gateway.settings_file_name);
+    crate::settings::load_or_create_gateway_settings(
+        &path,
+        config.gateway.settings_version,
+        &config.gateway.settings_file_name,
+    )
+    .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let result = processor
+        .update_gateway_settings_with_saver(
+            &context,
+            pioneer_protocol::GatewaySettingsUpdate {
+                voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                    transcribe_while_recording: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            |_, _| anyhow::bail!("injected mode save failure"),
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(supervisor.generation(), generation);
+    while let Ok(message) = rx.try_recv() {
+        if let Message::Text(text) = message {
+            let value: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
+            assert_ne!(value["method"], events::GATEWAY_VOICE_INPUT_STATUS_CHANGED);
+        }
+    }
     let _ = std::fs::remove_dir_all(runtime_home);
 }
 
@@ -18818,6 +19409,7 @@ async fn voice_settings_disable_removes_model_files_and_preserves_selection() {
                 provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
                 model: Some(Some(entry.id.to_owned())),
                 retry_install: false,
+                transcribe_while_recording: None,
             }),
             ..pioneer_protocol::GatewaySettingsUpdate::default()
         })
@@ -18940,6 +19532,7 @@ async fn voice_settings_two_client_race_serializes_to_one_consistent_outcome() {
                 provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
                 model: Some(Some("parakeet-tdt-0.6b-v3".to_owned())),
                 retry_install: false,
+                transcribe_while_recording: None,
             }),
             ..pioneer_protocol::GatewaySettingsUpdate::default()
         })

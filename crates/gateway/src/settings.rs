@@ -113,6 +113,8 @@ struct GatewayVoiceInputSettingsOverride {
     #[serde(default)]
     enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    transcribe_while_recording: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     provider: Option<GatewayVoiceInputProviderConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
@@ -125,6 +127,9 @@ impl GatewayVoiceInputSettingsOverride {
 
     fn apply_to_voice_config(&self, mut config: GatewayVoiceConfig) -> GatewayVoiceConfig {
         config.enabled = self.enabled;
+        if let Some(enabled) = self.transcribe_while_recording {
+            config.transcribe_while_recording = enabled;
+        }
         config.provider = self.provider;
         config.model.clone_from(&self.model);
         config
@@ -139,6 +144,9 @@ impl GatewayVoiceInputSettingsOverride {
         let selection_changed = update.provider.is_some() || update.model.is_some();
         if let Some(enabled) = update.enabled {
             next.enabled = enabled;
+        }
+        if let Some(enabled) = update.transcribe_while_recording {
+            next.transcribe_while_recording = Some(enabled);
         }
         if let Some(provider) = update.provider {
             next.provider = provider.map(voice_input_provider_from_protocol);
@@ -177,6 +185,9 @@ impl GatewayVoiceInputSettingsOverride {
 
         Ok(GatewayVoiceInputChangeSet {
             changed: *self != previous,
+            reconfigure: self.enabled != previous.enabled
+                || self.provider != previous.provider
+                || self.model != previous.model,
             retry_install: update.retry_install,
         })
     }
@@ -511,7 +522,7 @@ impl GatewaySettings {
     ) -> Result<bool> {
         let mut candidate = self.voice_input.clone();
         let changes = candidate.apply_protocol_update(update.clone())?;
-        Ok(changes.changed || changes.retry_install)
+        Ok(changes.reconfigure || changes.retry_install)
     }
 
     pub fn effective_general_settings(
@@ -703,6 +714,7 @@ impl GatewaySettings {
         let effective = self.effective_voice_input_config(config);
         pioneer_protocol::GatewayVoiceInputSettings {
             enabled: effective.enabled,
+            transcribe_while_recording: effective.transcribe_while_recording,
             provider: effective.provider.map(voice_input_provider_to_protocol),
             model: effective.model,
             runtime: pioneer_protocol::GatewayVoiceInputRuntimeSnapshot::default(),
@@ -1801,6 +1813,8 @@ pub struct GatewaySettingsChangeSet {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GatewayVoiceInputChangeSet {
     pub changed: bool,
+    /// Only engine selection/enabled changes; mode is captured by new sessions.
+    pub reconfigure: bool,
     pub retry_install: bool,
 }
 
@@ -2752,6 +2766,7 @@ backend = "keystore"
                         provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
                         model: Some(Some("parakeet-tdt-0.6b-v3".to_owned())),
                         retry_install: false,
+                        transcribe_while_recording: None,
                     }),
                     ..pioneer_protocol::GatewaySettingsUpdate::default()
                 },
@@ -2790,6 +2805,102 @@ backend = "keystore"
     }
 
     #[test]
+    fn voice_mode_persists_without_engine_changes_and_survives_model_and_partial_updates() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings =
+            load_or_create_gateway_settings(&path, 1, "gateway-settings.toml").unwrap();
+        let mut config = gateway_config_with_keepawake(false);
+        assert!(
+            settings
+                .effective_voice_input_config(&config.voice)
+                .transcribe_while_recording
+        );
+        config.voice.transcribe_while_recording = false;
+        assert!(
+            !settings
+                .effective_voice_input_config(&config.voice)
+                .transcribe_while_recording
+        );
+        config.voice.transcribe_while_recording = true;
+        let mode = pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+            transcribe_while_recording: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            !settings
+                .voice_input_update_would_reconfigure(&mode)
+                .unwrap()
+        );
+        let changes = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                voice_input: Some(mode),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(changes.voice_input.changed);
+        assert!(!changes.voice_input.reconfigure);
+        assert!(!changes.voice_input.retry_install);
+        save_gateway_settings(&path, &settings).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("transcribe_while_recording = false")
+        );
+        let mut loaded =
+            load_or_create_gateway_settings(&path, 1, "gateway-settings.toml").unwrap();
+        let snapshot = loaded.snapshot(&config);
+        assert!(!snapshot.voice_input.transcribe_while_recording);
+        assert!(!snapshot.voice_input.enabled);
+        assert_eq!(snapshot.voice_input.provider, None);
+        assert_eq!(snapshot.voice_input.model, None);
+        for model in ["small", "moonshine-base"] {
+            loaded
+                .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                    voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                        enabled: Some(true),
+                        provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
+                        model: Some(Some(model.into())),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(
+                !loaded
+                    .snapshot(&config)
+                    .voice_input
+                    .transcribe_while_recording
+            );
+        }
+        loaded
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate::default())
+            .unwrap();
+        save_gateway_settings(&path, &loaded).unwrap();
+        let reloaded = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml").unwrap();
+        assert!(
+            !reloaded
+                .snapshot(&config)
+                .voice_input
+                .transcribe_while_recording
+        );
+        assert_eq!(
+            reloaded.snapshot(&config).voice_input.model.as_deref(),
+            Some("moonshine-base")
+        );
+        let independent =
+            load_or_create_gateway_settings(&temp_dir.join("other.toml"), 1, "other.toml").unwrap();
+        assert!(
+            independent
+                .snapshot(&config)
+                .voice_input
+                .transcribe_while_recording
+        );
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn gateway_voice_settings_disable_preserves_selection_and_retry_is_transient() {
         let temp_dir = unique_temp_dir();
         fs::create_dir_all(&temp_dir).expect("create temp dir");
@@ -2803,6 +2914,7 @@ backend = "keystore"
                     provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
                     model: Some(Some("small".to_owned())),
                     retry_install: false,
+                    transcribe_while_recording: None,
                 }),
                 ..pioneer_protocol::GatewaySettingsUpdate::default()
             })
@@ -2872,6 +2984,7 @@ backend = "keystore"
                 provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
                 model: Some(Some("not-in-the-catalog".to_owned())),
                 retry_install: true,
+                transcribe_while_recording: None,
             }),
             ..pioneer_protocol::GatewaySettingsUpdate::default()
         });
@@ -2899,12 +3012,14 @@ backend = "keystore"
                 provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
                 model: Some(Some("not-in-the-catalog".to_owned())),
                 retry_install: false,
+                transcribe_while_recording: None,
             },
             pioneer_protocol::GatewayVoiceInputSettingsUpdate {
                 enabled: Some(true),
                 provider: Some(None),
                 model: Some(Some("small".to_owned())),
                 retry_install: false,
+                transcribe_while_recording: None,
             },
         ] {
             let result = settings.apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
@@ -2943,6 +3058,7 @@ backend = "keystore"
             provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
             model: Some(Some("small".to_owned())),
             retry_install: false,
+            transcribe_while_recording: None,
         };
         assert!(
             settings
