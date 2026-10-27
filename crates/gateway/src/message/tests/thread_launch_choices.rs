@@ -3525,7 +3525,9 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
                     db.execute_unprepared(&format!("UPDATE turn_execution SET heartbeat_at='1999-12-31 23:59:59+00:00', lease_until='2000-01-01 00:00:00+00:00' WHERE turn_id='{}'", params.turn_id)).await.unwrap();
                 }
                 "claim_storage" | "exhausted_storage" => {
-                    db.execute_unprepared(&format!("CREATE TRIGGER fail_activation_claim BEFORE UPDATE OF status ON turn_execution WHEN OLD.turn_id='{}' AND NEW.status='running' BEGIN SELECT RAISE(ABORT,'fixture storage unavailable'); END", params.turn_id)).await.unwrap();
+                    // Initial activation can claim started_at while remaining
+                    // starting, before runtime registration marks it running.
+                    db.execute_unprepared(&format!("CREATE TRIGGER fail_activation_claim BEFORE UPDATE OF status, started_at ON turn_execution WHEN OLD.turn_id='{}' AND OLD.started_at IS NULL AND (NEW.started_at IS NOT NULL OR NEW.status='running') BEGIN SELECT RAISE(ABORT,'fixture storage unavailable'); END", params.turn_id)).await.unwrap();
                 }
                 "authority_read" => {
                     // Earlier admission/provenance reads succeeded. Fail the actual
@@ -3568,6 +3570,17 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
                     owner.update(&db).await.unwrap();
                 }
                 "claim_storage" | "exhausted_storage" => {
+                    assert!(
+                        processor
+                            .crud_store
+                            .get_turn_execution(&params.turn_id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .started_at
+                            .is_none(),
+                        "{fault}: failed activation claim must not advance the receipt"
+                    );
                     db.execute_unprepared("DROP TRIGGER fail_activation_claim")
                         .await
                         .unwrap();
