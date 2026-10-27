@@ -324,8 +324,12 @@ mod tests {
     #[tokio::test]
     async fn request_tools_result_reports_computer_use_only_when_registered() {
         let visibility = visibility(&["request_tools"]);
-        let available_handler =
-            RequestToolsHandler::new(visibility.clone(), ["computer_use".to_owned()]);
+        let available_handler = RequestToolsHandler::new(
+            visibility.clone(),
+            crate::COMPUTER_USE_DOMAIN_TOOL_NAMES
+                .iter()
+                .map(|name| name.to_string()),
+        );
 
         let available = available_handler
             .resolve(&serde_json::json!({
@@ -337,7 +341,12 @@ mod tests {
 
         assert_eq!(
             available.added.get("computer_use"),
-            Some(&vec!["computer_use".to_owned()])
+            Some(
+                &crate::COMPUTER_USE_DOMAIN_TOOL_NAMES
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>()
+            )
         );
         assert!(available.already_visible.is_empty());
         assert!(available.blocked.is_empty());
@@ -359,7 +368,10 @@ mod tests {
         assert_eq!(unavailable.unknown_or_unavailable[0].domain, "computer_use");
         assert_eq!(
             unavailable.unknown_or_unavailable[0].tools,
-            vec!["computer_use".to_owned()]
+            crate::COMPUTER_USE_DOMAIN_TOOL_NAMES
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
         );
     }
 

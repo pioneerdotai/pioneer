@@ -110,8 +110,51 @@ Install Rust with [rustup](https://rustup.rs). See [rust-toolchain.toml](./rust-
 ```bash
 git clone https://github.com/pioneerdotai/pioneer.git
 cd pioneer
+cargo update -p cua-driver-sdk
 cargo build --workspace
 ```
+
+Gateway releases provide a default server build and an opt-in computer-use build
+for Windows, macOS and Linux on x86_64 and aarch64. `install.sh` and `install.ps1`
+install the server build by default. Use `--headless` / `-Headless` to select it
+explicitly, or `--computer-use` / `-ComputerUse` for computer use. The environment
+variable `PIONEER_INSTALL_COMPUTER_USE=1` also selects computer use; an explicit
+switch overrides it. Source builds enable it with `--features computer-use` on
+`pioneer-cli` or `pioneer-gateway`; on macOS set `MACOSX_DEPLOYMENT_TARGET=13.0`
+for those CU builds. Desktop bundles the computer-use variant.
+Release packaging refreshes the SDK and fetches the current upstream driver
+before building. Cargo.lock records the dependencies selected for that build.
+
+The server assets retain their existing names and formats: gzip for Linux and
+macOS aarch64, ZIP for Windows and macOS x86_64. Computer-use assets are named
+`pioneer-gateway-{os}-{arch}-computer-use-package.zip` and contain the CUA driver built from the current upstream default branch
+package. Install the complete CU archive; copying only `pioneer` cannot install
+the driver. The installer keeps the executable and `bin/cua` together and retains
+recovery files when schema compatibility is unknown.
+
+Existing computer-use installations use their normal `pioneer update` or
+`pioneer self-update` command. The old `-computer-use.gz` / `-computer-use.zip`
+assets contain a compatibility executable with the complete new package embedded.
+Its candidate version probe prepares a verified private package generation;
+the existing updater retains schema admission, replacement and restart. The
+bridge then runs the actual packaged Gateway, including its signed macOS app.
+It requires no Desktop, manual script bootstrap or intermediate release. New
+installers and subsequent updates select the complete `-computer-use-package.zip`
+asset directly. Server asset names and formats remain unchanged. Use the existing
+bootstrap with `--headless` / `-Headless` for an explicit switch back to server.
+OS permission requests still belong to the Gateway machine; existing OS grants
+are not promised to transfer automatically to the new responsible application.
+
+The macOS computer-use package targets macOS 13.0 or later and runs
+`Pioneer Gateway.app` (`ai.pioneer.gateway`) as the existing per-user GUI
+LaunchAgent. Grant permissions to that signed Gateway app on the Gateway machine;
+Desktop permissions do not authorize a remote Gateway. The server build does
+not require the CUA app or its Swift build inputs. Its deployment policy follows
+the existing server dependencies and toolchain, without a CUA-specific minimum.
+Linux computer use needs a compatible graphical user session and capture/input
+dependencies. Windows retains the current-user logon task with Limited
+privileges; Linux retains the systemd user service. Actual binary dependencies,
+minimum OS versions and computer-use readiness still require platform qualification.
 
 Run these in separate terminals:
 

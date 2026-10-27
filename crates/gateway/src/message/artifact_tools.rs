@@ -18,6 +18,156 @@ use pioneer_tools::{
 use std::sync::{Arc, Weak};
 use tracing::warn;
 
+pub(super) struct GatewayCuaImageSink(pub Weak<MessageProcessor>);
+impl std::fmt::Debug for GatewayCuaImageSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GatewayCuaImageSink")
+    }
+}
+
+#[async_trait]
+impl pioneer_tools::handlers::computer_use::ComputerUseImageSink for GatewayCuaImageSink {
+    async fn admit(
+        &self,
+        owner: &str,
+        call_id: &str,
+        index: usize,
+        bytes: Vec<u8>,
+        mime: &str,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<pioneer_provider::MessageAttachment, ToolError> {
+        use pioneer_artifacts::{ArtifactBindingTarget, IngestArtifactBytesRequest};
+        use pioneer_protocol::{
+            ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
+            ArtifactRole,
+        };
+        use sha2::{Digest, Sha256};
+        let processor = self
+            .0
+            .upgrade()
+            .ok_or_else(|| ToolError::execution_failed("CUA artifact service unavailable"))?;
+        let (thread_id, workspace_id) = processor
+            .crud_store
+            .get_turn_location(owner)
+            .await
+            .map_err(|_| ToolError::execution_failed("CUA artifact turn lookup failed"))?
+            .ok_or_else(|| ToolError::execution_failed("CUA artifact turn missing"))?;
+        let mut generation = None;
+        for action in [
+            crate::authorization::ResourceAction::ArtifactCreateThread,
+            crate::authorization::ResourceAction::ArtifactBindThread,
+            crate::authorization::ResourceAction::ArtifactRead,
+        ] {
+            let authorized = processor
+                .revalidate_tool_execution_authorization(
+                    &workspace_id,
+                    &thread_id,
+                    owner,
+                    None,
+                    action,
+                )
+                .await
+                .map_err(|_| {
+                    ToolError::execution_failed(
+                        "CUA artifact authorization denied; do not replay operation",
+                    )
+                })?;
+            let current = authorized.validated_policy_generation();
+            if generation.is_some_and(|previous| previous != current) {
+                return Err(ToolError::execution_failed(
+                    "CUA artifact authorization changed",
+                ));
+            }
+            generation = Some(current);
+        }
+        // A CLI process generation may reuse a JSON-RPC request ID. Never let
+        // same owner/call/part identity return different capture bytes from an
+        // earlier generation's idempotent ArtifactService admission.
+        let capture_digest = hex::encode(Sha256::digest(&bytes));
+        let summary = processor
+            .artifact_service
+            .ingest_tool_bytes(
+                IngestArtifactBytesRequest {
+                    workspace_id: workspace_id.clone(),
+                    primary_thread_id: Some(thread_id.clone()),
+                    bytes,
+                    display_name: "Computer capture".into(),
+                    kind: ArtifactKind::Image,
+                    mime_type: Some(mime.into()),
+                    created_by_kind: ArtifactCreatedByKind::Tool,
+                    created_by_actor_id: Some("cua_capture".into()),
+                    binding: Some(ArtifactBindingTarget {
+                        thread_id: Some(thread_id.clone()),
+                        turn_id: Some(owner.into()),
+                        message_id: None,
+                        turn_item_id: None,
+                        tool_call_id: Some(call_id.into()),
+                        task_id: None,
+                        task_run_id: None,
+                        binding_kind: ArtifactBindingKind::ToolOutput,
+                        direction: ArtifactBindingDirection::Output,
+                        role: Some(ArtifactRole::Tool),
+                        item_index: Some(index as i64),
+                    }),
+                    metadata: Default::default(),
+                },
+                hex::encode(Sha256::digest(
+                    serde_json::to_vec(&serde_json::json!([
+                        "cua_capture",
+                        workspace_id,
+                        thread_id,
+                        owner,
+                        call_id,
+                        index,
+                        mime,
+                        capture_digest
+                    ]))
+                    .expect("CUA identity serializes"),
+                )),
+                generation.expect("artifact authorization actions"),
+                cancellation.clone(),
+            )
+            .await
+            .map_err(|_| {
+                ToolError::execution_failed(
+                    "CUA artifact admission failed; do not replay operation",
+                )
+            })?;
+        processor
+            .revalidate_tool_execution_authorization(
+                &workspace_id,
+                &thread_id,
+                owner,
+                None,
+                crate::authorization::ResourceAction::ArtifactRead,
+            )
+            .await
+            .map_err(|_| ToolError::execution_failed("CUA artifact read authorization changed"))?;
+        if cancellation.is_cancelled() {
+            return Err(ToolError::execution_failed(
+                "CUA image admission cancelled; do not replay operation",
+            ));
+        }
+        // Retain an artifact-backed original-byte path instead of duplicating
+        // base64 in canonical history. CLI ignores this local representation and
+        // performs its own bounded read using the exact artifact identity.
+        let resolved = processor
+            .artifact_service
+            .resolve_provider_attachment(
+                &workspace_id,
+                &summary.artifact.artifact_id,
+                summary.artifact.version_id.as_deref(),
+            )
+            .await
+            .map_err(|_| {
+                ToolError::execution_failed(
+                    "CUA artifact resolution failed; do not replay operation",
+                )
+            })?;
+        Ok(resolved.attachment)
+    }
+}
+
 pub(crate) struct GatewayArtifactToolProvider {
     processor: Weak<MessageProcessor>,
 }

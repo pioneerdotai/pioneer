@@ -263,6 +263,267 @@ async fn wait_for_task_cli_activation(processor: &MessageProcessor, turn_id: &st
     .expect("CLI task fixture activation");
 }
 
+#[test]
+fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
+    run_standard_stack_message_test("Threads committed CLI first dispatch", async {
+        // The parent exercises ordinary fresh CLI admission. The child below
+        // must go through the same dispatcher with its already-admitted Turn.
+        let (harness, processor, parent) = start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let starts_before = harness.cli_session.turn_starts.lock().await.len();
+        let options = invoke_task(
+            &processor,
+            &parent,
+            "first-cli-options",
+            "threads_start_options",
+            json!({}),
+        )
+        .await
+        .unwrap();
+        assert!(!options.is_error, "{options:?}");
+        let options = options.structured_content.unwrap();
+        let creation = options["threadCreationOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["label"] == "New delegated root")
+            .unwrap();
+        let created = invoke_task(
+            &processor,
+            &parent,
+            "first-cli-target",
+            "thread_create",
+            json!({"optionId": creation["id"]}),
+        )
+        .await
+        .unwrap();
+        assert!(!created.is_error, "{created:?}");
+        let created = created.structured_content.unwrap();
+        let target = created["targetOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| {
+                !options["targetOptions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|old| old["id"] == target["id"])
+            })
+            .unwrap();
+        let arguments = json!({
+            "targetOptionId": target["id"],
+            "input": [{"type":"text", "text":"First command in the delegated CLI root"}]
+        });
+        let accepted = invoke_task(
+            &processor,
+            &parent,
+            "first-cli-start",
+            "threads_turn_start",
+            arguments.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!accepted.is_error, "{accepted:?}");
+        let db = processor.crud_store.database_connection();
+        let accepted = accepted.structured_content.unwrap();
+        let outbox = pioneer_entity::agent_action_outbox::Entity::find_by_id(
+            accepted["outboxId"].as_str().unwrap(),
+        )
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+        let action_id = outbox.action_id.clone();
+        let payload: JsonValue = serde_json::from_str(&outbox.payload_json).unwrap();
+        let params: pioneer_protocol::TurnStartParams =
+            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        let child = &params.turn_id;
+        assert!(
+            processor
+                .crud_store
+                .get_turn_runtime_snapshot(child)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            processor
+                .crud_store
+                .get_cli_runtime_turn_binding(child)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            processor
+                .crud_store
+                .latest_cli_runtime_turn_attempt(child)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let before = processor
+            .crud_store
+            .get_turn(&params.thread_id, child)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert!(matches!(&before.author.as_ref().unwrap().actor,
+            pioneer_protocol::PersistedActorRef::AgentExecution(id) if id.as_str() == outbox.owner_execution_id));
+        let admission = processor
+            .crud_store
+            .get_turn_admission(child)
+            .await
+            .unwrap()
+            .unwrap();
+        let grant = pioneer_crud::load_agent_execution_grant(
+            &db,
+            payload["spawned_execution_id"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let authority = processor
+            .load_turn_execution_authorization_context(child)
+            .await
+            .unwrap()
+            .authorization_fingerprint()
+            .unwrap();
+        let security = processor
+            .crud_store
+            .get_turn_execution_security_snapshot(child)
+            .await
+            .unwrap()
+            .unwrap();
+        // Canonical admission must not be inserted again, even idempotently.
+        db.execute_unprepared(&format!(
+            "CREATE TRIGGER reject_repeat_thread_admission BEFORE INSERT ON turn_admission WHEN NEW.turn_id='{child}' BEGIN SELECT RAISE(ABORT,'repeated committed admission'); END"
+        )).await.unwrap();
+        // The recording session otherwise reuses the parent's native ID,
+        // which the durable attempt ledger correctly rejects for a new Turn.
+        harness
+            .cli_session
+            .set_next_native_turn_id("first-delegated-cli-child")
+            .await;
+        let batch =
+            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                .await
+                .unwrap();
+        assert!(batch.errors.is_empty(), "{:#?}", batch.errors);
+        wait_for_task_cli_activation(&processor, child).await;
+        let starts = harness.cli_session.turn_starts.lock().await.clone();
+        assert_eq!(starts.len(), starts_before + 1);
+        assert!(
+            starts
+                .last()
+                .unwrap()
+                .input
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["text"] == "First command in the delegated CLI root" })
+        );
+        assert_eq!(starts.last().unwrap().model, params.model);
+        assert_eq!(
+            starts.last().unwrap().effort.as_deref(),
+            params.reasoning.as_ref().map(|r| r.effort.as_str())
+        );
+        assert_eq!(
+            processor
+                .crud_store
+                .get_turn_admission(child)
+                .await
+                .unwrap()
+                .unwrap(),
+            admission
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_execution_grant(&db, &grant.execution_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            grant
+        );
+        // Preparation binds MCP and Skill projections after admission. The
+        // immutable authority ceiling and provenance must stay the same.
+        assert_eq!(
+            processor
+                .load_turn_execution_authorization_context(child)
+                .await
+                .unwrap()
+                .authorization_fingerprint()
+                .unwrap(),
+            authority
+        );
+        assert_eq!(
+            processor
+                .crud_store
+                .get_turn_execution_security_snapshot(child)
+                .await
+                .unwrap()
+                .unwrap(),
+            security
+        );
+        let after = processor
+            .crud_store
+            .get_turn(&params.thread_id, child)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(after.author, before.author);
+        assert_eq!(after.mode, before.mode);
+        assert_eq!(after.origin, before.origin);
+        assert_eq!(
+            processor.crud_store.get_turn_inputs(child).await.unwrap(),
+            params.input
+        );
+        assert_eq!(
+            processor
+                .thread_manager
+                .thread_get(&params.thread_id)
+                .await
+                .unwrap()
+                .turns
+                .iter()
+                .filter(|turn| &turn.id == child)
+                .count(),
+            1
+        );
+        assert!(
+            processor
+                .crud_store
+                .latest_cli_runtime_turn_attempt(child)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let delivered = pioneer_crud::load_agent_action_outbox(&db, action_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.status, "delivered");
+        let replay = invoke_task(
+            &processor,
+            &parent,
+            "first-cli-start",
+            "threads_turn_start",
+            arguments,
+        )
+        .await
+        .unwrap();
+        assert!(!replay.is_error, "{replay:?}");
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+            .await
+            .unwrap();
+        assert_eq!(
+            harness.cli_session.turn_starts.lock().await.len(),
+            starts_before + 1
+        );
+    });
+}
+
 // Creation returns a durable TaskRun before its asynchronously admitted child
 // necessarily exists. Observe that run's authoritative binding, rather than
 // assuming nullable child ids in a creation response are already populated.
@@ -287,7 +548,14 @@ async fn wait_for_task_cli_child(
                 && binding.status == "running"
                 && binding.native_turn_id.is_some()
                 && binding.mcp.is_some()
+                && let Some(transition) = processor
+                    .try_cli_runtime_turn_transition(&binding)
+                    .await
+                    .unwrap()
             {
+                // Activation persists the binding before releasing its gate.
+                // Return an active child only after that startup handoff.
+                drop(transition);
                 return binding;
             }
             tokio::task::yield_now().await;
@@ -3956,6 +4224,9 @@ async fn start_threads_cli_fixture_with_policy(
         .await
         .unwrap()
         .unwrap();
+    let mut params = params;
+    params.model = Some(source.model.clone());
+    params.model_provider = Some(cli_runtime_provider_key(&harness.runtime_id));
     let admission = ExecutionAdmissionRequest::for_turn(
         ExecutionAdmissionEntryPoint::CliRuntime,
         ResourceAction::AgentTurnStart,
@@ -4003,6 +4274,62 @@ async fn start_threads_cli_fixture_with_policy(
     let (sender, receiver) = tokio::sync::oneshot::channel();
     // Durable authority must use the committed-agent response and activation
     // path; a fresh TurnStart response is rejected before native preparation.
+    let author = super::super::message_turn::resolve_turn_author_snapshot(
+        processor.crud_store.as_ref(),
+        &pioneer_protocol::PersistedActorRef::Principal(
+            connection.principal().principal_id.clone(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let outcome = processor
+        .thread_manager
+        .agent_turn_start_with_permission_profile(params.clone(), profile.clone(), author.clone())
+        .await
+        .unwrap();
+    let admission = context
+        .durable_turn_admission_after_revalidation(
+            &thread,
+            &turn,
+            params.execution_backend.as_ref(),
+            &revalidation,
+        )
+        .unwrap();
+    processor
+        .crud_store
+        .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+            &outcome.materialization.thread,
+            outcome.materialization.sandbox_mode,
+            &outcome.materialization.turn,
+            &outcome.materialization.input,
+            params
+                .reasoning
+                .as_ref()
+                .map(|reasoning| reasoning.effort.as_str()),
+            Default::default(),
+            author.actor.clone(),
+            processor
+                .turn_profile_selected_audit_event(&outcome)
+                .unwrap(),
+            &context.to_persisted_json().unwrap(),
+            None,
+            Some(admission),
+            Some(
+                crate::message::turn_handlers::new_turn_execution(
+                    processor.turn_execution_owner_id.as_ref(),
+                    params.execution_backend.as_ref(),
+                    &outcome.materialization,
+                )
+                .unwrap(),
+            ),
+            &security,
+            Vec::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     // Threads-only catalogs do not include task_create, whose normal launch
     // path persists this snapshot before binding the root Agent execution.
     processor
@@ -4034,15 +4361,8 @@ async fn start_threads_cli_fixture_with_policy(
         execution_security_snapshot: security,
         continuation_thread_id: thread.clone(),
         context_thread_id: thread.clone(),
-        agent_author: super::super::message_turn::resolve_turn_author_snapshot(
-            processor.crud_store.as_ref(),
-            &pioneer_protocol::PersistedActorRef::Principal(
-                connection.principal().principal_id.clone(),
-            ),
-        )
-        .await
-        .expect("Threads fixture principal author should resolve")
-        .expect("Threads fixture principal should have an author snapshot"),
+        agent_author: author,
+        admitted_outcome: Some(Box::new(outcome)),
         completion: Arc::new(std::sync::Mutex::new(Some(sender))),
     };
     let (_, diagnostics) =
@@ -4075,6 +4395,242 @@ async fn start_threads_cli_fixture_with_policy(
     wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
     wait_for_task_cli_activation(&processor, &turn).await;
     (harness, processor, turn)
+}
+
+#[tokio::test]
+async fn early_public_stop_and_cli_initial_attempt_share_the_exact_writer_fence() {
+    for phase in [
+        "stop_first",
+        "cli_first",
+        "replacement_generation",
+        "same_owner_generation",
+    ] {
+        let kind = CLIAgentRuntimeKind::Codex;
+        let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+        *harness.cli_session.projected_mcp_store.lock().await = Some(harness.crud_store.clone());
+        let thread = "cli_early_stop_race";
+        let turn = "cli_early_stop_race_turn";
+        seed_cli_runtime_skill_preflight_thread(&harness, thread).await;
+        let processor = Arc::new(harness.processor.clone());
+        processor.bind_agent_tool_bridges().await;
+        processor.arm_completed_history_preparation_barrier("__cli_before_initial_binding__");
+        let request = cli_runtime_turn_start_request_with_capabilities(
+            &generate_test_request_id("early-cli", "start"),
+            thread,
+            turn,
+            &harness.runtime_id,
+            kind,
+            vec![],
+        );
+        let start = tokio::spawn({
+            let processor = processor.clone();
+            let connection = harness.connection_id;
+            async move {
+                processor
+                    .process_request_for_connection(connection, &request)
+                    .await
+            }
+        });
+        timeout(
+            Duration::from_secs(10),
+            processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .unwrap();
+        let store = &harness.crud_store;
+        let owner = store.get_turn_execution(turn).await.unwrap().unwrap();
+        assert!(
+            store
+                .latest_cli_runtime_turn_attempt(turn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .native_cancellation_context(turn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let cancel_id = generate_test_request_id("early-cli", "cancel");
+        let cancel_request = json!({"jsonrpc":"2.0", "id":cancel_id, "method":"turn/cancel",
+            "params":{"thread_id":thread,"turn_id":turn}})
+        .to_string();
+        if phase == "stop_first" {
+            processor
+                .process_request_for_connection(harness.connection_id, &cancel_request)
+                .await;
+            let reply = recv_response_by_id(&mut harness.rx, &cancel_id).await;
+            let reply: TurnCancelResponse = serde_json::from_value(reply.result).unwrap();
+            assert_eq!(reply.turn.status, TurnStatus::Interrupted);
+            processor.release_completed_history_preparation_barrier();
+            timeout(Duration::from_secs(10), start)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .latest_cli_runtime_turn_attempt(turn)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            // Stop has observed no CLI attempt, but has not entered its writer.
+            let reached = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            *processor
+                .native_cancellation_materialization_barrier
+                .lock()
+                .await = Some((reached.clone(), release.clone()));
+            let stop = tokio::spawn({
+                let processor = processor.clone();
+                let connection = harness.connection_id;
+                async move {
+                    processor
+                        .process_request_for_connection(connection, &cancel_request)
+                        .await
+                }
+            });
+            timeout(Duration::from_secs(10), reached.notified())
+                .await
+                .unwrap();
+            processor.arm_completed_history_preparation_barrier("__cli_after_initial_binding__");
+            processor.release_completed_history_preparation_barrier();
+            timeout(
+                Duration::from_secs(10),
+                processor.wait_for_completed_history_preparation_barrier(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                store
+                    .latest_cli_runtime_turn_attempt(turn)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            if matches!(phase, "replacement_generation" | "same_owner_generation") {
+                let replacement = store
+                    .claim_expired_turn_execution(
+                        &owner,
+                        if phase == "same_owner_generation" {
+                            &owner.owner_id
+                        } else {
+                            "replacement-cli-owner"
+                        },
+                        owner.lease_until.timestamp() + 1,
+                        owner.lease_until.timestamp() + 100,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let before = store.get_turn(thread, turn).await.unwrap().unwrap();
+                release.notify_one();
+                timeout(Duration::from_secs(10), stop)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                recv_error_by_id(&mut harness.rx, &cancel_id).await;
+                assert!(!store.native_turn_has_accepted_terminal(turn).await.unwrap());
+                assert_eq!(store.get_turn(thread, turn).await.unwrap().unwrap(), before);
+                assert_eq!(
+                    store.get_turn_execution(turn).await.unwrap().unwrap(),
+                    replacement
+                );
+                // The stale launch is held at the real preparation boundary.
+                start.abort();
+                let _ = start.await;
+                processor.release_completed_history_preparation_barrier();
+                assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+                continue;
+            }
+            // Keep activation's gate owned until Stop loses its early writer.
+            processor
+                .arm_completed_history_preparation_barrier("__early_stop_cli_after_phase_change__");
+            release.notify_one();
+            timeout(
+                Duration::from_secs(10),
+                processor.wait_for_completed_history_preparation_barrier(),
+            )
+            .await
+            .unwrap();
+            processor.release_completed_history_preparation_barrier();
+            processor.release_completed_history_preparation_barrier();
+            timeout(Duration::from_secs(10), start)
+                .await
+                .unwrap()
+                .unwrap();
+            timeout(Duration::from_secs(10), stop)
+                .await
+                .unwrap()
+                .unwrap();
+            let reply = recv_response_by_id(&mut harness.rx, &cancel_id).await;
+            let reply: TurnCancelResponse = serde_json::from_value(reply.result).unwrap();
+            assert_eq!(reply.turn.status, TurnStatus::Interrupted);
+            let binding = store
+                .get_cli_runtime_turn_binding(turn)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(binding.status, "interrupted");
+            assert_eq!(
+                store
+                    .latest_cli_runtime_turn_attempt(turn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Interrupted
+            );
+            assert!(!harness.cli_session.interrupts.lock().await.is_empty());
+        }
+        assert!(
+            store
+                .native_cancellation_context(turn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let saved = store.get_turn(thread, turn).await.unwrap().unwrap().1;
+        assert_eq!(saved.status, TurnStatus::Interrupted);
+        assert_eq!(
+            processor
+                .thread_manager
+                .turn_get(thread, turn)
+                .await
+                .unwrap()
+                .1,
+            saved
+        );
+        let stopped = store.get_turn_execution(turn).await.unwrap().unwrap();
+        assert_eq!(stopped.owner_id, owner.owner_id);
+        assert_eq!(stopped.owner_generation, owner.owner_generation);
+        assert_eq!(
+            stopped.status,
+            pioneer_crud::TurnExecutionStatus::Interrupted
+        );
+        let db = store.database_connection();
+        let response = pioneer_crud::load_agent_turn_response(&db, turn)
+            .await
+            .unwrap()
+            .unwrap();
+        let resource =
+            pioneer_crud::load_agent_execution_resource_state(&db, &response.execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(resource.status, "cancelled");
+        let permit =
+            pioneer_entity::agent_running_permit::Entity::find_by_id(resource.permit_id.unwrap())
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(permit.status, "released");
+        assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+    }
 }
 
 struct ThreadsFacade {
@@ -4373,8 +4929,12 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
             CLIAgentRuntimeKind::Claude,
             CLIAgentRuntimeKind::OpenCode,
         ] {
-            let (harness, processor, turn) =
-                start_threads_cli_fixture(kind, &["threads_search"]).await;
+            let (harness, processor, turn) = start_task_cli_fixture_with_models(
+                kind,
+                pioneer_tasks::TaskRuntimeConfig::default(),
+                &["threads-cli-choice"],
+            )
+            .await;
             let bindings = processor
                 .crud_store
                 .list_turn_mcp_bindings(&turn)
@@ -4387,10 +4947,17 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                     .count(),
                 1
             );
+            let authority = processor
+                .load_turn_execution_authorization_context(&turn)
+                .await
+                .unwrap();
+            let permission =
+                pioneer_protocol::task_permission_cap_snapshot(authority.permission_profile_cap());
+            assert!(permission.effective_policy.allowed_tools.is_empty());
+            assert!(!permission.effective_policy.allowed_tools_restricted);
             assert!(
-                !bindings
-                    .iter()
-                    .any(|tool| tool.raw_tool_name == "threads_search")
+                authority
+                    .grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
             );
             for tool in bindings.iter().filter(|tool| {
                 pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&tool.raw_tool_name.as_str())
@@ -4457,7 +5024,7 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 .unwrap()
                 .iter()
                 .filter(|thread| {
-                    thread["parentThreadId"] == format!("cli_threads_{kind:?}").to_lowercase()
+                    thread["parentThreadId"] == format!("cli_tasks_{kind:?}").to_lowercase()
                 })
                 .collect::<Vec<_>>();
             assert_eq!(
@@ -4552,11 +5119,40 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 effort.as_str().unwrap()
             );
             assert_eq!(payload["dispatch"]["identity"]["id"], identity);
+            harness
+                .cli_session
+                .set_next_native_turn_id("threads-facade-explicit-child")
+                .await;
+            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                .await
+                .unwrap();
+            let calls = wait_for_cli_runtime_turn_starts(&harness.cli_session, 2).await;
+            assert_eq!(calls[1].model.as_deref(), model["id"].as_str());
+            assert_eq!(calls[1].effort.as_deref(), effort.as_str());
             // One replayed start has one persisted child execution and payload.
             assert_eq!(replay["outcome"], "agent_action_already_committed");
-            let denied = facade.facade.handle_message(&facade.context, json!({"jsonrpc":"2.0","id":"denied","method":"tools/call","params":{"name":"threads_search","arguments":{"query":"test","limit":1}}})).await.unwrap();
-            assert_eq!(denied["error"]["data"]["kind"], "tool_unbound");
         }
+        let (_harness, processor, turn) =
+            start_threads_cli_fixture(CLIAgentRuntimeKind::Codex, &["threads_search"]).await;
+        assert!(
+            !processor
+                .crud_store
+                .list_turn_mcp_bindings(&turn)
+                .await
+                .unwrap()
+                .iter()
+                .any(|binding| binding.raw_tool_name == "threads_search")
+        );
+        let denied = ThreadsFacade::new(&processor, &turn, CLIAgentRuntimeKind::Codex)
+            .await
+            .call_response(
+                "denied-search",
+                "denied-search",
+                "threads_search",
+                json!({"query":"test","limit":1}),
+            )
+            .await;
+        assert_eq!(denied["error"]["data"]["kind"], "tool_unbound");
         let (_harness, processor, turn) =
             start_threads_cli_fixture(CLIAgentRuntimeKind::Codex, &["threads_start_options"]).await;
         let bindings = processor

@@ -2363,23 +2363,41 @@ impl ExecutionAuthorizationContext {
                 )
                 .await?
                 .context("direct Agent child author execution is missing")?;
-                let expected_child_generation = parent_execution
-                    .execution_generation
-                    .checked_add(1)
-                    .context("direct Agent child generation exceeds persistence bounds")?;
+                let independent_root = child_execution.parent_execution_id.is_none()
+                    && child_execution.id == child_execution.work_graph_root_execution_id
+                    && child_execution.home_root_thread_id == scope.thread_id;
+                if independent_root {
+                    self.verify_independent_agent_start(
+                        store,
+                        &child_execution,
+                        parent_execution.id.as_str(),
+                        turn.id.as_str(),
+                    )
+                    .await?;
+                }
+                let expected_child_generation = if independent_root {
+                    1
+                } else {
+                    parent_execution
+                        .execution_generation
+                        .checked_add(1)
+                        .context("direct Agent child generation exceeds persistence bounds")?
+                };
                 if child_response.presentation_snapshot_id
                     != child_execution
                         .presentation_snapshot_id
                         .as_deref()
                         .unwrap_or_default()
                     || child_execution.id == parent_execution.id
-                    || child_execution.parent_execution_id.as_deref()
-                        != Some(parent_execution.id.as_str())
+                    || (!independent_root
+                        && child_execution.parent_execution_id.as_deref()
+                            != Some(parent_execution.id.as_str()))
                     || child_execution.parent_task_id.is_some()
                     || child_execution.parent_thread_id.as_deref() != Some(scope.thread_id.as_str())
                     || child_execution.home_root_thread_id != self.root_thread_id
-                    || child_execution.work_graph_root_execution_id
-                        != parent_execution.work_graph_root_execution_id
+                    || (!independent_root
+                        && child_execution.work_graph_root_execution_id
+                            != parent_execution.work_graph_root_execution_id)
                     || child_execution.execution_generation != expected_child_generation
                     || child_execution.authorization_context_fingerprint
                         != self.authorization_fingerprint()?
@@ -2504,6 +2522,61 @@ impl ExecutionAuthorizationContext {
 
             Ok(Some(parent_turn_id.to_owned()))
         })
+    }
+
+    /// Validate provenance independently from parent liveness. A source may
+    /// finish or be cancelled after the atomic action/turn admission.
+    pub(crate) async fn verify_independent_agent_start(
+        &self,
+        store: &CrudStore,
+        execution: &pioneer_entity::agent_execution::Model,
+        author_execution_id: &str,
+        turn_id: &str,
+    ) -> Result<()> {
+        let db = store.database_connection();
+        let grant = pioneer_crud::load_agent_execution_grant(&db, &execution.id)
+            .await?
+            .context("independent Agent start has no immutable grant")?;
+        let grant: serde_json::Value = serde_json::from_str(&grant.grant_json)?;
+        let action_id = grant
+            .get("source_action_id")
+            .and_then(serde_json::Value::as_str)
+            .context("independent Agent start has no source action")?;
+        let action = pioneer_crud::load_agent_action(&db, action_id)
+            .await?
+            .context("independent Agent source action is missing")?;
+        let receipt = pioneer_crud::load_agent_action_receipt(&db, action_id)
+            .await?
+            .context("independent Agent source receipt is missing")?;
+        let outbox = pioneer_crud::load_agent_action_outbox(&db, action_id)
+            .await?
+            .context("independent Agent source outbox is missing")?;
+        let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json)?;
+        if execution.parent_execution_id.is_some()
+            || execution.id != execution.work_graph_root_execution_id
+            || execution.workspace_id != self.workspace_id
+            || execution.home_root_thread_id != self.root_thread_id
+            || execution.authorization_context_fingerprint != self.authorization_fingerprint()?
+            || grant
+                .get("source_execution_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(author_execution_id)
+            || grant.get("turn_id").and_then(serde_json::Value::as_str) != Some(turn_id)
+            || action.execution_id != author_execution_id
+            || action.action_kind != "start_agent"
+            || action.status != "committed"
+            || receipt.decision != "allowed"
+            || receipt.actor_kind != "agent_execution"
+            || receipt.actor_id.as_deref() != Some(author_execution_id)
+            || outbox.owner_execution_id != author_execution_id
+            || payload
+                .get("spawned_execution_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(execution.id.as_str())
+        {
+            bail!("independent Agent start differs from its canonical source action");
+        }
+        Ok(())
     }
 
     fn verify_authority_derivation(&self, admitted: &Self) -> Result<()> {
@@ -3003,6 +3076,47 @@ impl ExecutionAuthorizationContext {
             skill_projection: None,
             cli_runtime_projection: cli_runtime_projection(execution_backend),
         })
+    }
+
+    /// A standalone conversation is new work for the initiating user. Prove
+    /// its current admission without replacing or widening this inherited
+    /// immutable context. Shared continuation authority alone is insufficient.
+    pub(crate) async fn revalidate_new_root_launch(
+        &self,
+        store: &CrudStore,
+        request: &ExecutionAdmissionRequest,
+        permission: &TurnPermissionProfileSnapshot,
+        revision: u64,
+    ) -> Result<AuthenticatedSessionPrincipal> {
+        if request.workspace_id != self.workspace_id
+            || request.root_thread_id != self.root_thread_id
+        {
+            bail!("new root launch differs from its inherited authority scope");
+        }
+        let principal =
+            super::lease::collaboration_authority_principal(store, &self.initiating_principal_id)
+                .await?;
+        let proof = ExecutionAdmissionService::new(store.clone())
+            .admit_context(
+                &principal,
+                revision,
+                request,
+                Some(&pioneer_protocol::task_permission_cap_from_snapshot(
+                    permission,
+                )),
+            )
+            .await?;
+        let current_cap =
+            pioneer_protocol::task_permission_cap_snapshot(proof.permission_profile_cap());
+        if pioneer_protocol::intersect_turn_permission_profiles(
+            permission,
+            &current_cap,
+            permission.source,
+        ) != *permission
+        {
+            bail!("new root launch exceeds the initiating user's current permission cap");
+        }
+        Ok(principal)
     }
 
     /// Derives an agent child continuation and, for an already-authorized

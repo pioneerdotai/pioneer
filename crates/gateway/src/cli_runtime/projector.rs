@@ -101,6 +101,7 @@ pub(crate) fn project_cli_runtime_event(
                 turn_id: context.turn_id.clone(),
                 reason: interrupted.reason.clone(),
                 recovery: context.recovery.clone(),
+                cancellation_owner: None,
             })
         }
         RuntimeEvent::TurnRetrying(_) => {
@@ -3394,6 +3395,7 @@ mod tests {
                 thread_id: "thread_1".to_owned(),
                 turn_id: "turn_1".to_owned(),
                 reason: "interrupted".to_owned(),
+                cancellation_owner: None,
                 recovery: None
             }]
         );

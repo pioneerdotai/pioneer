@@ -235,7 +235,7 @@ pub(crate) fn prepare_messages_for_request(
     )
 }
 
-// Chat adapters render HTML preview images in user messages. Derive the
+// Chat adapters render typed tool images in user messages. Derive the
 // follow-up before wire conversion so it follows the entire parallel-result
 // group. Native nested-media adapters retain their existing tool blocks.
 // Keep canonical history intact; derive a paired tool result
@@ -251,7 +251,6 @@ fn project_html_preview_media<'a>(
     let needs_projection = !matches!(adapter, "anthropic" | "gemini" | "bedrock")
         && messages.iter().any(|message| {
             message.role == Role::Tool
-                && message.name.as_deref() == Some("html_preview")
                 && message
                     .content_parts
                     .iter()
@@ -268,7 +267,6 @@ fn project_html_preview_media<'a>(
         }
         let mut tool = message.clone();
         if message.role == Role::Tool
-            && message.name.as_deref() == Some("html_preview")
             && message
                 .content_parts
                 .iter()
@@ -277,7 +275,7 @@ fn project_html_preview_media<'a>(
             let mut followup = message.clone();
             followup.role = Role::User;
             followup.content = format!(
-                "Images from html_preview call {} (width captions in capture order).",
+                "Images from tool call {} (captions in capture order).",
                 message.tool_call_id.as_deref().unwrap_or("unknown")
             );
             followup.tool_call_id = None;
@@ -775,6 +773,32 @@ mod tests {
     use crate::types::{AttachmentDataSource, InputTypeSupport, ProviderInputCapabilities, Role};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
+
+    #[test]
+    fn typed_tool_images_follow_the_complete_result_group() {
+        let mut capture = ChatMessage::tool_result("capture", "cua_get_desktop_state", "geometry");
+        capture
+            .content_parts
+            .push(MessageContentPart::image(MessageAttachment::from_path(
+                "/gateway/capture.png",
+                "image/png",
+            )));
+        let other = ChatMessage::tool_result("other", "echo", "done");
+        let messages = vec![capture, other];
+        let projected = project_html_preview_media("openai", &messages);
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected[0].tool_call_id.as_deref(), Some("capture"));
+        assert_eq!(projected[1].tool_call_id.as_deref(), Some("other"));
+        assert!(projected[0].content_parts.is_empty());
+        assert_eq!(projected[2].role, Role::User);
+        assert_eq!(projected[2].content_parts, messages[0].content_parts);
+        assert!(projected[2].tool_call_id.is_none());
+        assert!(messages[0].has_attachments());
+        assert_eq!(
+            project_html_preview_media("anthropic", &messages).as_ref(),
+            messages
+        );
+    }
 
     fn caps_with_native_declared() -> ProviderCapabilities {
         ProviderCapabilities {

@@ -541,6 +541,28 @@ struct ParsedRequest {
     params: Option<JsonValue>,
 }
 
+// Host-only typed delivery receipts. This task scope follows the invocation
+// future (no detached work) and never trusts result JSON or tool names.
+tokio::task_local! {
+    static CUA_DELIVERIES: std::cell::RefCell<Option<crate::mcp_service::CuaCliDeliveryGuard>>;
+}
+
+pub(crate) fn defer_cua_delivery(
+    guard: crate::mcp_service::CuaCliDeliveryGuard,
+) -> Result<(), crate::mcp_service::CuaCliDeliveryGuard> {
+    let mut guard = Some(guard);
+    if CUA_DELIVERIES
+        .try_with(|receipts| {
+            receipts.replace(guard.take());
+        })
+        .is_ok()
+    {
+        Ok(())
+    } else {
+        Err(guard.unwrap())
+    }
+}
+
 /// Selected at adapter construction; instance names and request data do not
 /// select the provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -605,6 +627,19 @@ impl CliMcpToolFacade {
         context: &CliMcpFacadeRequestContext,
         bytes: &[u8],
     ) -> Option<Vec<u8>> {
+        CUA_DELIVERIES
+            .scope(
+                std::cell::RefCell::new(None),
+                self.handle_bytes_with_delivery(context, bytes),
+            )
+            .await
+    }
+
+    async fn handle_bytes_with_delivery(
+        &self,
+        context: &CliMcpFacadeRequestContext,
+        bytes: &[u8],
+    ) -> Option<Vec<u8>> {
         if bytes.len() > self.limits.max_frame_bytes {
             return encode_response(&json_rpc_error(
                 None,
@@ -619,10 +654,31 @@ impl CliMcpToolFacade {
                 return encode_response(&json_rpc_error(None, PARSE_ERROR, "parse error", None));
             }
         };
-        self.handle_message(context, message)
-            .await
-            .as_ref()
-            .and_then(encode_response)
+        let response = self.handle_message(context, message).await?;
+        let encoded = encode_response(&response)?;
+        if encoded.len() <= self.limits.max_frame_bytes {
+            if response.get("result").is_some() {
+                CUA_DELIVERIES.with(|receipts| {
+                    if let Some(receipt) = receipts.borrow_mut().as_mut() {
+                        receipt.commit();
+                    }
+                });
+            }
+            return Some(encoded);
+        }
+        // Execution has already completed. Preserve correlation, but never
+        // suggest repeating a mutation whose result could not be delivered.
+        let error = json_rpc_error(
+            response.get("id").cloned(),
+            FACADE_LIMIT_EXCEEDED,
+            "MCP response frame exceeds the configured limit",
+            Some(
+                json!({"kind": "response_frame_too_large", "retryable": false,
+                "outcome": "unknown", "noReplay": true}),
+            ),
+        );
+        let encoded = encode_response(&error)?;
+        (encoded.len() <= self.limits.max_frame_bytes).then_some(encoded)
     }
 
     pub(crate) async fn shutdown(&self) -> CliMcpFacadeShutdownOutcome {
@@ -2138,6 +2194,119 @@ mod tests {
         let response: JsonValue = serde_json::from_slice(&response).expect("json");
         assert_eq!(response["error"]["data"]["kind"], "frame_too_large");
         assert_eq!(invoker.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_final_response_keeps_correlation_without_reexecution() {
+        // A transport receipt, not a simulated OS/grant success: the real
+        // facade must keep this pending until the escaped envelope fits.
+        struct Receipt {
+            committed: Arc<std::sync::atomic::AtomicBool>,
+            revoked: Arc<AtomicUsize>,
+        }
+        impl pioneer_tools::ToolDeliveryReceipt for Receipt {
+            fn commit(&self) {
+                self.committed.store(true, AtomicOrdering::SeqCst);
+            }
+        }
+        impl Drop for Receipt {
+            fn drop(&mut self) {
+                if !self.committed.load(AtomicOrdering::SeqCst) {
+                    self.revoked.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+            }
+        }
+        struct DeliveryInvoker {
+            calls: AtomicUsize,
+            committed: Arc<std::sync::atomic::AtomicBool>,
+            revoked: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl TurnMcpInvoker for DeliveryInvoker {
+            async fn invoke(
+                &self,
+                invocation: TurnMcpInvocation,
+                _: CancellationToken,
+            ) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                if invocation
+                    .arguments
+                    .get("action")
+                    .and_then(JsonValue::as_bool)
+                    == Some(true)
+                {
+                    if self.committed.load(AtomicOrdering::SeqCst) {
+                        return Ok(basic_result(
+                            json!([{"type":"text", "text":"transport-authorized action"}]),
+                        ));
+                    }
+                    return Err(TurnMcpInvocationError::new(
+                        crate::turn_mcp::invoker::TurnMcpInvocationErrorCode::ResultInvalid,
+                        "fresh observation required",
+                    ));
+                }
+                let mut guard =
+                    crate::mcp_service::CuaCliDeliveryGuard::new(None, invocation.turn_id);
+                guard.hold_receipt(Some(Arc::new(Receipt {
+                    committed: self.committed.clone(),
+                    revoked: self.revoked.clone(),
+                })));
+                assert!(defer_cua_delivery(guard).is_ok());
+                // Canonical payload fits the facade ceiling, but the actual
+                // escaped 256-byte ID makes the final response exceed it.
+                Ok(basic_result(
+                    json!([{"type":"text", "text":"x".repeat(2500)}]),
+                ))
+            }
+        }
+        let invoker = Arc::new(DeliveryInvoker {
+            calls: AtomicUsize::new(0),
+            committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            revoked: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut limits = CliMcpFacadeLimits::default();
+        limits.max_frame_bytes = 4096;
+        let (facade, mut context, coordinator) =
+            fixture_with_invoker(vec![fixture_tool("read")], invoker.clone(), limits).await;
+        initialize(&facade, &context).await;
+        activate(&facade, &mut context, &coordinator, "large-result").await;
+        let id = "\u{1}".repeat(256);
+        let mut message = call_message(json!(id), json!({}));
+        message["params"]["_meta"]["claudecode/toolUseId"] = json!("toolu_large_observation");
+        let request = serde_json::to_vec(&message).unwrap();
+        for _ in 0..2 {
+            let encoded = facade.handle_bytes(&context, &request).await.unwrap();
+            assert!(encoded.len() <= 4096);
+            let response: JsonValue = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(response["id"], id);
+            assert_eq!(
+                response["error"]["data"]["kind"],
+                "response_frame_too_large"
+            );
+            assert_eq!(response["error"]["data"]["noReplay"], true);
+        }
+        assert_eq!(invoker.calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(invoker.revoked.load(AtomicOrdering::SeqCst), 1);
+        assert!(!invoker.committed.load(AtomicOrdering::SeqCst));
+        let action =
+            serde_json::to_vec(&call_message(json!("new-action"), json!({"action":true}))).unwrap();
+        let encoded = facade.handle_bytes(&context, &action).await.unwrap();
+        let response: JsonValue = serde_json::from_slice(&encoded).unwrap();
+        assert!(response.get("error").is_some());
+        assert_eq!(invoker.calls.load(AtomicOrdering::SeqCst), 2);
+        let fresh =
+            serde_json::to_vec(&call_message(json!("fresh-observation"), json!({}))).unwrap();
+        let encoded = facade.handle_bytes(&context, &fresh).await.unwrap();
+        let response: JsonValue = serde_json::from_slice(&encoded).unwrap();
+        assert!(response.get("result").is_some());
+        assert!(invoker.committed.load(AtomicOrdering::SeqCst));
+        let action =
+            serde_json::to_vec(&call_message(json!("after-fresh"), json!({"action":true})))
+                .unwrap();
+        let encoded = facade.handle_bytes(&context, &action).await.unwrap();
+        let response: JsonValue = serde_json::from_slice(&encoded).unwrap();
+        assert!(response.get("result").is_some());
+        assert_eq!(invoker.calls.load(AtomicOrdering::SeqCst), 4);
     }
 
     #[tokio::test]

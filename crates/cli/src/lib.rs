@@ -5,6 +5,8 @@ mod secrets;
 mod service;
 mod task_invariants;
 
+#[cfg(feature = "legacy-cu-bootstrap")]
+use anyhow::Context;
 use anyhow::Result;
 use pioneer_config::InstallManagedBy;
 use serde_json::json;
@@ -13,6 +15,38 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Write};
 use tracing::warn;
+
+/// Binary-only legacy updaters deliver this bridge under the old CU asset name.
+/// Preparation touches only a private package generation; the old updater owns
+/// schema admission, binary replacement, restart and its existing recovery.
+#[cfg(feature = "legacy-cu-bootstrap")]
+pub fn legacy_cu_update_main(package: &[u8]) {
+    std::hint::black_box(&PIONEER_BUILD_SECTION);
+    let result = (|| -> Result<()> {
+        let executable = env::current_exe()?;
+        let directory = executable
+            .parent()
+            .context("legacy CU executable has no directory")?;
+        let gateway = installer::prepare_legacy_cu_package(directory, package)?;
+        installer::probe_legacy_cu_package(&gateway)?;
+        let mut command = std::process::Command::new(gateway);
+        command.args(env::args_os().skip(1));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            Err(command.exec().into())
+        }
+        #[cfg(not(unix))]
+        {
+            let status = command.status()?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    })();
+    if let Err(error) = result {
+        eprintln!("legacy CU update package rejected: {error:#}");
+        std::process::exit(1);
+    }
+}
 
 pub fn main_entry() {
     // This must remain the first dispatch in the signed binary. The hidden
@@ -587,6 +621,7 @@ fn print_version(json_output: bool) -> Result<()> {
                 "version": env!("CARGO_PKG_VERSION"),
                 "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH,
+                "computer_use": cfg!(feature = "computer-use"),
                 "compiled_database_migrations": pioneer_gateway::compiled_database_migration_names()
             }))?
         );

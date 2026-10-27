@@ -24,13 +24,18 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
+
+      # apple-metal (through the CUA SDK) uses macOS 26.2 SDK APIs.
+      - name: select-cua-xcode
+        if: runner.os == 'macOS'
+        run: sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
 
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
@@ -47,7 +52,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo update -p cua-driver-sdk
           cargo check --locked --workspace
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            export MACOSX_DEPLOYMENT_TARGET=13.0
+          fi
+          cargo check --locked --workspace --features pioneer-cli/computer-use
 
   linux-build:
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-build
@@ -133,12 +143,33 @@ jobs:
           # Official pre-built binary; use the same version to archive and run.
           curl -LsSf https://get.nexte.st/0.9.149/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
+      - name: cargo-check-default-server
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo update -p cua-driver-sdk
+          cargo check --locked -p pioneer-cli
+
+      # A separate Cargo invocation keeps CU features out of these server owners.
+      - name: cargo-nextest-default-server-contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo nextest run --locked --no-default-features \
+            -p pioneer-cli -p pioneer-gateway -p pioneer-tools -p pioneer-promt -p pioneer-agent \
+            --test-threads 2 --no-fail-fast --retries 0 \
+            -E '(package(pioneer-cli) & test(installer::tests::)) |
+                (package(pioneer-tools) & test(computer_use_registration_matches_build_and_backend_and_starts_hidden)) |
+                (package(pioneer-promt) & (test(request_tools) | test(continuation_prompt_assistant_))) |
+                (package(pioneer-agent) & (test(phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized) | test(computer_use_) | test(request_tools_catalog_is_compiled_for_tool_enabled_native_delivery_plan))) |
+                (package(pioneer-gateway) & test(capability_persistence_order_materializes_before_skill_install_and_native_start))'
+
       - name: archive-workspace-tests
         id: archive
         shell: bash
         run: |
           set -euo pipefail
-          cargo nextest archive --locked --workspace \
+          cargo nextest archive --locked --workspace --features pioneer-cli/computer-use \
             --archive-file "$RUNNER_TEMP/nextest-tests.tar.zst"
 
       - name: upload-workspace-tests
@@ -156,7 +187,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked --workspace --doc
+          cargo test --locked --workspace --features pioneer-cli/computer-use --doc
 
   linux-tests:
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-shard-${{ matrix.shard }}
