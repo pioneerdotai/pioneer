@@ -22,6 +22,7 @@ fn independent_direct_and_ffi_onboarding_replay_preserves_scope_and_single_submi
 
             diagnostics: Default::default(),
             avatar_cache: Default::default(),
+            voice_capture: Default::default(),
         };
         runtime
             .initialize(&format!(r#"{{"platform":"{platform}"}}"#))

@@ -238,7 +238,7 @@ impl McpInvocationGovernor {
 
         state
             .queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
                 (queued < limits.max_queued_calls).then_some(queued + 1)
             })
             .map_err(|_| {

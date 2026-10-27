@@ -169,6 +169,8 @@ select_model = "Выбрать модель"
 dialog_title = "Выбор модели preflight"
 
 [settings.voice_input]
+transcribe_while_recording = "Распознавать во время записи"
+transcribe_while_recording_description = "Если выключено, распознавание начнётся после завершения записи"
 label = "Голосовой ввод"
 description = "Используйте локальную модель распознавания речи для голосовых сообщений."
 no_model_selected = "Модель не выбрана"

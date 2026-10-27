@@ -14,8 +14,6 @@ pub const SERVICE_MODE_ARG: &str = "gateway-service";
 pub(crate) struct ServiceSettings {
     pub service_name: String,
     pub legacy_service_names: Vec<String>,
-    pub runtime_home_dir: PathBuf,
-    pub macos_background_item_name: String,
     pub macos_associated_bundle_identifier: String,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub managed_by: InstallManagedBy,
@@ -220,11 +218,10 @@ fn load_service_settings_from_config(config: &AppConfig) -> Result<ServiceSettin
     legacy_service_names.sort();
     legacy_service_names.dedup();
 
+    config.runtime_home_dir()?;
     Ok(ServiceSettings {
         service_name,
         legacy_service_names,
-        runtime_home_dir: config.runtime_home_dir()?,
-        macos_background_item_name: config.install.macos_background_item_name.trim().to_owned(),
         macos_associated_bundle_identifier: config
             .install
             .macos_associated_bundle_identifier

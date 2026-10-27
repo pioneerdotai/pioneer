@@ -42,6 +42,11 @@ def build(target):
     if "windows" in target:
         command += ["-p", "cua-driver-uia"]
     environment = os.environ.copy()
+    # Keep the compiler and installed targets aligned with Pioneer when changing
+    # into the upstream workspace, which has its own rust-toolchain.toml.
+    environment["RUSTUP_TOOLCHAIN"] = tomllib.loads(
+        (Path(__file__).resolve().parents[2] / "rust-toolchain.toml").read_text()
+    )["toolchain"]["channel"]
     environment["CARGO_TARGET_DIR"] = str(Path("target/cua-build").resolve())
     if "apple-darwin" in target:
         environment["MACOSX_DEPLOYMENT_TARGET"] = "13.0"

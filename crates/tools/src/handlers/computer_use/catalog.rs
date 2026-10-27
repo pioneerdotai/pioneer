@@ -1,9 +1,12 @@
 // Canonical CUA native tool schemas from trycua/cua (MIT).
+#[cfg(feature = "computer-use")]
 use crate::output_policy::computer_use_output_policy;
+#[cfg(feature = "computer-use")]
 use crate::spec::{
     ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolIdempotencyMode, ToolRecoveryMetadata,
     ToolRetryClass, ToolSpec,
 };
+#[cfg(feature = "computer-use")]
 use serde_json::Value;
 
 pub use pioneer_protocol::CUA_TOOL_NAMES as TOOL_NAMES;
@@ -13,6 +16,7 @@ pub fn upstream_name(name: &str) -> Option<&str> {
         .then(|| name.strip_prefix("cua_"))
         .flatten()
 }
+#[cfg(feature = "computer-use")]
 pub fn configured_specs() -> Vec<ConfiguredToolSpec> {
     let native: Value = serde_json::from_str(include_str!("native-contract.json"))
         .expect("pinned native contract is valid JSON");

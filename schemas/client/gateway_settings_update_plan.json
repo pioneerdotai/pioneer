@@ -703,7 +703,8 @@
             "runtime": {
               "effective_enabled": false,
               "phase": "disabled"
-            }
+            },
+            "transcribe_while_recording": true
           }
         }
       },
@@ -1295,6 +1296,10 @@
             "effective_enabled": false,
             "phase": "disabled"
           }
+        },
+        "transcribe_while_recording": {
+          "type": "boolean",
+          "default": true
         }
       }
     },
@@ -1325,6 +1330,12 @@
         },
         "retry_install": {
           "type": "boolean"
+        },
+        "transcribe_while_recording": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       }
     },

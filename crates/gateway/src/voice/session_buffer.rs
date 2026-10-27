@@ -241,6 +241,23 @@ impl GatewayVoiceSessionBufferStore {
         }
     }
 
+    // Buffered sessions keep the accepted inbox until Commit. Moving the deque
+    // is constant-time; normalization ownership and heavy VAD work leave the
+    // shared lock together. Removal/cancel wakes this wait and fails closed.
+    pub(super) fn take_closed_processing_chunks(
+        &self,
+        session_id: &str,
+    ) -> Result<VecDeque<BufferedVoiceChunk>, VoiceChunkIngestError> {
+        let mut sessions = self.sessions.lock().map_err(|_| store_unavailable())?;
+        loop {
+            let buffer = sessions.get_mut(session_id).ok_or_else(inactive_session)?;
+            if buffer.closed {
+                return Ok(std::mem::take(&mut buffer.chunks));
+            }
+            sessions = self.ready.wait(sessions).map_err(|_| store_unavailable())?;
+        }
+    }
+
     pub(super) fn processing_startup_key(&self, session_id: &str) -> Option<String> {
         self.sessions
             .lock()
@@ -799,6 +816,59 @@ mod tests {
             .await
             .unwrap();
         assert!(handle.await.unwrap().is_err());
+    }
+
+    #[test]
+    fn buffered_commit_racing_append_transfers_every_accepted_chunk_once() {
+        let store = GatewayVoiceSessionBufferStore::default();
+        let (_sender, receiver) = oneshot::channel();
+        store
+            .start_processing(
+                "session".to_owned(),
+                target_format(),
+                CancellationToken::new(),
+                receiver,
+            )
+            .unwrap();
+        let packet_header = |sequence| VoiceChunkFrameHeader {
+            payload_len: 2,
+            duration_ms: None,
+            ..header("session", sequence)
+        };
+        store.append_chunk(packet_header(0), vec![0, 32]).unwrap();
+        let boundary = std::sync::Barrier::new(2);
+        let accepted = std::thread::scope(|scope| {
+            let append = scope.spawn(|| {
+                boundary.wait();
+                store.append_chunk(packet_header(1), vec![0, 64])
+            });
+            boundary.wait();
+            let _completion = store.finish_processing("session").unwrap();
+            match append.join().unwrap() {
+                Ok(report) => {
+                    assert!(!report.already_buffered);
+                    true
+                }
+                Err(error) => {
+                    assert_eq!(error.kind, VoiceChunkIngestErrorKind::UnknownSession);
+                    false
+                }
+            }
+        });
+        let chunks = store.take_closed_processing_chunks("session").unwrap();
+        assert_eq!(chunks.len(), if accepted { 2 } else { 1 });
+        assert_eq!(chunks[0].sequence, 0);
+        assert_eq!(chunks[0].normalized_samples, vec![0.25]);
+        if accepted {
+            assert_eq!(chunks[1].sequence, 1);
+            assert_eq!(chunks[1].normalized_samples, vec![0.5]);
+        }
+        assert!(
+            store
+                .take_closed_processing_chunks("session")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn target_format() -> VoiceAudioFormat {

@@ -27,7 +27,7 @@ impl Default for CLIAgentProcessGenerationAllocator {
 impl CLIAgentProcessGenerationAllocator {
     pub fn allocate(&self) -> Option<CLIAgentProcessGeneration> {
         self.next
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 (current != u64::MAX).then_some(current + 1)
             })
             .ok()

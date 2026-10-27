@@ -335,7 +335,6 @@ mod tests {
     use crate::service::ServiceSettings;
     use pioneer_config::InstallManagedBy;
     use std::path::Path;
-    use std::path::PathBuf;
 
     #[test]
     fn launchd_plist_includes_path_environment_when_provided() {
@@ -372,8 +371,6 @@ mod tests {
         ServiceSettings {
             service_name: "com.pioneer.gateway.test".to_owned(),
             legacy_service_names: Vec::new(),
-            runtime_home_dir: PathBuf::from("/tmp/pioneer-test"),
-            macos_background_item_name: "Pioneer".to_owned(),
             macos_associated_bundle_identifier: "ai.pioneer.test".to_owned(),
             managed_by,
         }

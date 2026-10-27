@@ -57,6 +57,7 @@ fn fixture(wire_core: Arc<ClientCore>) -> ClientFfiRuntime {
 
         diagnostics: Default::default(),
         avatar_cache: Default::default(),
+        voice_capture: Default::default(),
     }
 }
 

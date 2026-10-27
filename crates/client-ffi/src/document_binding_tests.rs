@@ -23,6 +23,7 @@ fn direct_and_ffi_document_replay_preserve_drafts_failure_retry_and_scope_releas
 
             diagnostics: Default::default(),
             avatar_cache: Default::default(),
+            voice_capture: Default::default(),
         };
         runtime
             .initialize(&format!(r#"{{"platform":"{platform}"}}"#))

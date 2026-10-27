@@ -135,6 +135,9 @@ pub enum SettingsIntent {
     VoiceEnabled {
         enabled: bool,
     },
+    VoiceTranscribeWhileRecording {
+        enabled: bool,
+    },
     VoiceModel {
         provider: Option<String>,
         model: Option<String>,
@@ -166,9 +169,10 @@ impl SettingsIntent {
             Self::SelfImprovement { .. }
             | Self::ImprovementEnabled { .. }
             | Self::ImprovementModel { .. } => SettingsPage::SelfImprovement,
-            Self::VoiceEnabled { .. } | Self::VoiceModel { .. } | Self::VoiceRetry => {
-                SettingsPage::Voice
-            }
+            Self::VoiceEnabled { .. }
+            | Self::VoiceTranscribeWhileRecording { .. }
+            | Self::VoiceModel { .. }
+            | Self::VoiceRetry => SettingsPage::Voice,
         })
     }
     fn update(&self, snapshot: &GatewaySettingsSnapshot) -> Option<GatewaySettingsUpdate> {
@@ -300,6 +304,9 @@ impl SettingsIntent {
                 provider.as_deref(),
                 model.clone(),
             )),
+            Self::VoiceTranscribeWhileRecording { enabled } => voice(
+                v::voice_input_transcribe_while_recording_plan(&snapshot.voice_input, *enabled),
+            ),
             Self::VoiceRetry => voice(v::voice_input_retry_plan(&snapshot.voice_input)),
             _ => None,
         }
@@ -1254,6 +1261,69 @@ mod tests {
             ),
             Some("vercel-ai-gateway")
         );
+    }
+
+    #[test]
+    fn voice_mode_intent_uses_shared_plan_and_failed_save_preserves_authoritative_page() {
+        let core = crate::catalog_test_support::settings_model_picker_client();
+        let mut authoritative = store();
+        authoritative
+            .settings
+            .as_mut()
+            .unwrap()
+            .voice_input
+            .transcribe_while_recording = false;
+        let intent = SettingsIntent::VoiceTranscribeWhileRecording { enabled: true };
+        assert_eq!(intent.page(), Some(SettingsPage::Voice));
+        let update = intent
+            .update(authoritative.settings.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(
+            update.voice_input.unwrap(),
+            GatewayVoiceInputSettingsUpdate {
+                transcribe_while_recording: Some(true),
+                ..Default::default()
+            }
+        );
+        {
+            let mut owner = core.identity_authorization.lock().unwrap();
+            owner.settings = authoritative;
+            core.publish_settings_pages_locked(&owner.settings);
+        }
+        core.settings_intent(intent);
+        let pending = core
+            .snapshot(&ClientScope::SettingsPage {
+                page: SettingsPage::Voice,
+            })
+            .unwrap()
+            .typed::<SettingsPagePublication>()
+            .unwrap();
+        assert!(pending.payload().pending);
+        let work = core
+            .settings_runtime
+            .lock()
+            .unwrap()
+            .queue
+            .pop_front()
+            .unwrap();
+        core.execute_settings_work(work); // No connection: exercises the existing failed-save path.
+        let failed = core
+            .snapshot(&ClientScope::SettingsPage {
+                page: SettingsPage::Voice,
+            })
+            .unwrap()
+            .typed::<SettingsPagePublication>()
+            .unwrap();
+        assert!(!failed.payload().pending);
+        assert_eq!(
+            failed.payload().error.as_deref(),
+            Some("settings_save_failed")
+        );
+        let Some(SettingsPageValue::Voice { settings }) = &failed.payload().value else {
+            panic!("Voice page retains the authoritative value")
+        };
+        assert!(!settings.transcribe_while_recording);
+        core.shutdown();
     }
 
     #[test]

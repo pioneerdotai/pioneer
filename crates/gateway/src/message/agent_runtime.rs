@@ -1143,18 +1143,6 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) fn tool_item_output(item: &TurnItem) -> Option<String> {
-        match item {
-            TurnItem::CommandExecution { display, .. } => tool_display_text(display),
-            TurnItem::FileChange { display, .. }
-            | TurnItem::WebSearch { display, .. }
-            | TurnItem::WebFetch { display, .. }
-            | TurnItem::Download { display, .. }
-            | TurnItem::DynamicToolCall { display, .. } => tool_display_text(display),
-            _ => None,
-        }
-    }
-
     pub(super) fn force_fail_tool_item(
         mut item: TurnItem,
         error_message: &str,

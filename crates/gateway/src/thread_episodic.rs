@@ -313,7 +313,7 @@ pub(crate) struct StoreThreadEpisodicIndexPayloadProvider {
     storage_uri_root: String,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) struct VectorThreadEpisodicIndexPayloadProvider {
     inner: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
     embedding_provider: Arc<dyn ThreadEpisodicEmbeddingProvider>,
@@ -357,7 +357,7 @@ impl StoreThreadEpisodicIndexPayloadProvider {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl VectorThreadEpisodicIndexPayloadProvider {
     pub(crate) fn new(
         inner: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
@@ -704,6 +704,7 @@ impl ThreadEpisodicIndexEmbeddingProviderResolver
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl ThreadEpisodicIndexPayloadProvider for VectorThreadEpisodicIndexPayloadProvider {
     async fn resolve_index_request(
@@ -883,6 +884,7 @@ fn validate_embedding_artifact(
     Ok(())
 }
 
+#[cfg(test)]
 fn attach_embedding_to_resolved_request(
     resolved: &mut ThreadEpisodicResolvedIndexRequest,
     embedding_provider: &dyn ThreadEpisodicEmbeddingProvider,
