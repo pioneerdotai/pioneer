@@ -107,6 +107,7 @@ impl CliMcpBridgeFacadeServer {
             projection_generation,
             projection,
             limits,
+            call_contract,
             false,
         )
     }
@@ -117,6 +118,7 @@ impl CliMcpBridgeFacadeServer {
         projection_generation: CliMcpProjectionGeneration,
         projection: CliMcpFacadeProjection,
         limits: CliMcpFacadeLimits,
+        call_contract: super::facade::CliMcpCallContract,
     ) -> Result<(CliMcpBridgeFacadeHandle, Self), CliMcpFacadeConfigurationError> {
         Self::build_with_cleanup_owner(
             transport,
@@ -125,6 +127,7 @@ impl CliMcpBridgeFacadeServer {
             projection_generation,
             projection,
             limits,
+            call_contract,
             true,
         )
     }
@@ -135,6 +138,7 @@ impl CliMcpBridgeFacadeServer {
         projection_generation: CliMcpProjectionGeneration,
         projection: CliMcpFacadeProjection,
         limits: CliMcpFacadeLimits,
+        call_contract: super::facade::CliMcpCallContract,
         retained_cleanup: bool,
     ) -> Result<(CliMcpBridgeFacadeHandle, Self), CliMcpFacadeConfigurationError> {
         let channel_capacity = limits
