@@ -52,11 +52,14 @@ pub(crate) trait VoiceActivityDetector {
     fn speech_probability(&mut self, frame: &[f32]) -> Result<f32>;
 }
 
+// Deterministic pipeline fixture only; never a production fallback.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct EnergyVoiceActivityDetector {
     threshold_floor: f32,
 }
 
+#[cfg(test)]
 impl EnergyVoiceActivityDetector {
     pub(crate) fn new(threshold_floor: f32) -> Result<Self> {
         if !(0.0..=1.0).contains(&threshold_floor) {
@@ -66,10 +69,11 @@ impl EnergyVoiceActivityDetector {
     }
 }
 
+#[cfg(test)]
 impl VoiceActivityDetector for EnergyVoiceActivityDetector {
     fn speech_probability(&mut self, frame: &[f32]) -> Result<f32> {
-        if frame.is_empty() {
-            return Ok(0.0);
+        if frame.len() != VOICE_VAD_FRAME_SAMPLES {
+            bail!("test detector requires a full SDK-sized frame");
         }
         let rms = (frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32)
             .sqrt()
@@ -204,17 +208,26 @@ where
     }
 
     pub(super) fn finish_incremental_tail(&mut self, tail: &[f32]) -> Result<Vec<f32>> {
+        if tail.len() >= self.config.frame_samples {
+            bail!("voice VAD tail must be shorter than a frame");
+        }
         if self.in_speech {
             return Ok(tail.to_vec());
         }
-        // A final onset need not contain two full frames. Classify the actual
-        // remainder, without padding it away or dropping short voiced input.
-        let voiced_tail = !tail.is_empty()
-            && self.detector.speech_probability(tail)? > self.config.speech_threshold;
+        // The SDK requires a full frame, including at Commit. Padding belongs
+        // only to this classification; downstream owns exactly the source PCM.
+        let voiced_tail = if tail.is_empty() {
+            false
+        } else {
+            let mut frame = vec![0.0; self.config.frame_samples];
+            frame[..tail.len()].copy_from_slice(tail);
+            self.detector.speech_probability(&frame)? > self.config.speech_threshold
+        };
         if self.onset_counter == 0 && !voiced_tail {
             return Ok(Vec::new());
         }
         let mut samples: Vec<_> = self.frame_buffer.drain(..).flatten().collect();
+        self.onset_counter = 0;
         samples.extend_from_slice(tail);
         Ok(samples)
     }
@@ -281,18 +294,21 @@ mod tests {
 
     struct ScriptedVad {
         probabilities: VecDeque<f32>,
+        frames: Vec<Vec<f32>>,
     }
 
     impl ScriptedVad {
         fn new(probabilities: impl IntoIterator<Item = f32>) -> Self {
             Self {
                 probabilities: probabilities.into_iter().collect(),
+                frames: Vec::new(),
             }
         }
     }
 
     impl VoiceActivityDetector for ScriptedVad {
-        fn speech_probability(&mut self, _frame: &[f32]) -> Result<f32> {
+        fn speech_probability(&mut self, frame: &[f32]) -> Result<f32> {
+            self.frames.push(frame.to_vec());
             Ok(self.probabilities.pop_front().unwrap_or(0.0))
         }
     }
@@ -376,5 +392,69 @@ mod tests {
             voice_vad_frame_samples_for_target_rate(),
             VOICE_VAD_FRAME_SAMPLES
         );
+    }
+
+    #[test]
+    fn final_onset_classifies_only_full_frames_and_emits_only_real_samples_once() {
+        for tail_samples in [0, 1, 137, 479] {
+            let mut vad =
+                SmoothedVoiceVad::new(ScriptedVad::new([0.0, 0.9, 0.9]), VoiceVadConfig::default())
+                    .unwrap();
+            let noise = vec![0.1; VOICE_VAD_FRAME_SAMPLES];
+            let onset = vec![0.2; VOICE_VAD_FRAME_SAMPLES];
+            assert!(matches!(
+                vad.push_incremental_frame(&noise).unwrap(),
+                SmoothedVadFrame::Noise
+            ));
+            assert!(matches!(
+                vad.push_incremental_frame(&onset).unwrap(),
+                SmoothedVadFrame::Noise
+            ));
+            let tail = vec![0.3; tail_samples];
+            let mut expected = noise;
+            expected.extend(onset);
+            expected.extend(&tail);
+            assert_eq!(vad.finish_incremental_tail(&tail).unwrap(), expected);
+            assert!(vad.finish_incremental_tail(&[]).unwrap().is_empty());
+            assert_eq!(
+                vad.detector.frames.len(),
+                if tail_samples == 0 { 2 } else { 3 }
+            );
+            for frame in &vad.detector.frames {
+                assert_eq!(frame.len(), VOICE_VAD_FRAME_SAMPLES);
+            }
+            if tail_samples != 0 {
+                let classified = &vad.detector.frames[2];
+                assert_eq!(&classified[..tail_samples], tail);
+                assert!(
+                    classified[tail_samples..]
+                        .iter()
+                        .all(|sample| *sample == 0.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_and_subframe_input_have_no_synthetic_audio_or_synthetic_next_frame() {
+        for tail_samples in [0, 1, 137, 479] {
+            for probability in [0.0, 0.9] {
+                let mut vad = SmoothedVoiceVad::new(
+                    ScriptedVad::new([probability, 0.9, 0.9]),
+                    VoiceVadConfig::default(),
+                )
+                .unwrap();
+                let tail = vec![0.4; tail_samples];
+                let result = vad.finish_incremental_tail(&tail).unwrap();
+                assert_eq!(result, if probability == 0.0 { Vec::new() } else { tail });
+                assert!(vad.finish_incremental_tail(&[]).unwrap().is_empty());
+                assert!(vad.frame_buffer.is_empty());
+                // A later real frame cannot contain VAD-only padding or old prefill.
+                let real = vec![0.5; VOICE_VAD_FRAME_SAMPLES];
+                let _ = vad.push_incremental_frame(&real).unwrap();
+                assert_eq!(vad.detector.frames.last().unwrap(), &real);
+                assert_eq!(vad.frame_buffer.front().unwrap(), &real);
+            }
+        }
     }
 }
