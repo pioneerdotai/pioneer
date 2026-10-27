@@ -484,3 +484,33 @@ crates/migration/src/m20261027_000005_portable_task_event.rs
 crates/migration/src/portable_payload_target.rs
 docs/reviews/portable-payload-compression/implementation.md
 ```
+
+
+## Commit ledger and delivery checkpoint
+
+| Stage | Commit |
+| --- | --- |
+| 1–2: byte codec, SQLite lifecycle/storage and complete tool chunks | `ad3c3d703a802cdc5f5ec4b74743f2433f619d1f` |
+| 3: CLI mapping, exact sent bytes and SQL projection | `8c65b37a90516a18d1187007738acfcb1e712b0c` |
+| 4: immutable Task history, root/revision and bounded reference reads | `689641bc3f5e4baa6c308737c0bb2a2ca58f3c64` |
+| 5: Task events/fanout, streaming legacy roots and final cross-table corrections | `5c5ab9c6b2375f3f9c2a1dd3e72c46467ea8615b` |
+
+After the stage-5 commit, `git status --short` produced no output: the worktree
+was clean. The subsequent documentation-only delivery commit records this ledger
+and checkpoint; its exact SHA is supplied in the final handoff. All changes are
+local to the one named branch/worktree. The main checkout and adjacent worktree
+were not modified, and no fetch/merge/rebase/push/PR/deploy was performed.
+
+The final review traversed the complete base-to-stage-5 changed-file inventory,
+including untracked files before staging, dependencies/exports, all new schema
+objects and triggers, manual Entity synchronization, production readers/writers,
+maintenance cleanup/publication, tests and this record. It did not stop at the
+first issue. Corrected areas were re-read, formatted and checked with Git diff;
+no additional concrete finding remains from that static pass. Residual supported
+bounds, unmeasured SQLite TEXT costs and all missing dynamic evidence remain
+explicit above. This is preparation for external review, not external acceptance.
+
+Тесты, cargo check, сборки, новый Migrator и генерация Entity не запускались.
+Выполнены только разрешённые статические проверки и cargo fmt. Реализация
+подготовлена к внешнему ревью; компилируемость, штатная генерация Entity и
+прохождение тестов пока не подтверждены.
