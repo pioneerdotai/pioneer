@@ -1635,6 +1635,10 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (workspaces, store, workspace) = setup_workspace_manager().await;
     ensure_test_superuser_execution_authority(store.as_ref()).await;
+    let secrets = test_gateway_secrets();
+    secrets
+        .set_workspace_provider_api_key(&workspace, "openai", "fixture-key")
+        .unwrap();
     let calls = Arc::new(AtomicU64::new(0));
     let provider_cancelled = Arc::new(AtomicU64::new(0));
     let provider = Arc::new(RecoveryProvider {
@@ -1653,7 +1657,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
         sessions,
         workspaces,
         store.clone(),
-        test_gateway_secrets(),
+        secrets,
         test_summary_config(),
         test_tool_loop_config(),
     ));
@@ -1735,6 +1739,12 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
             );
             processor.agent_manager.remove_thread(thread).await;
             assert!(!processor.agent_manager.has_thread(thread).await);
+            // Drive the durable live consumer explicitly after replay. A failed
+            // background delivery can otherwise remain in retry backoff when
+            // the synchronous repeat Stop returns its successful response.
+            processor
+                .native_turn_event_delivery_kick_running
+                .store(true, Ordering::SeqCst);
             db.execute_unprepared("CREATE TRIGGER reject_early_projection BEFORE UPDATE OF status ON turn WHEN NEW.status = 'interrupted' BEGIN SELECT RAISE(ABORT, 'fixture projection unavailable'); END").await.unwrap();
             for suffix in ["first-pending", "repeat-pending"] {
                 let id = generate_test_request_id("initialstop", suffix);
@@ -1780,6 +1790,14 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
             processor
                 .process_request_for_connection(connection, &request)
                 .await;
+            deliver_completion_live(&processor, &store, turn).await;
+            assert_eq!(
+                completion_live_delivery(&store, turn).await.status,
+                "delivered"
+            );
+            processor
+                .native_turn_event_delivery_kick_running
+                .store(false, Ordering::SeqCst);
         }
         InitialStopPhase::NativeTaskBeforeRegistration => {
             processor.bind_task_bridge().await;
