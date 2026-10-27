@@ -1025,6 +1025,8 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_text_ranges_avoid_full_allocations_and_release_maintenance_reader() {
+        use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
+
         // SQLITE_STATUS_MALLOC_SIZE is process-global. This owner runs in its
         // own nextest process, as required by AGENTS, never parallel cargo test.
         fn allocation_peak(reset: bool) -> i64 {
@@ -1085,18 +1087,19 @@ mod tests {
         )
         .maintenance();
         assert!(database.reader_query_only_enabled().await.unwrap());
-        let guard = |revision: i64| {
-            Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT rowid FROM legacy_range_probe WHERE id=? AND revision=? AND identity=? AND created_at=? LIMIT 1",
-                [
-                    "legacy".into(),
-                    revision.into(),
-                    "incarnation".into(),
-                    created_at.into(),
-                ],
-            )
+        let guard_query = |revision: i64| {
+            Query::select()
+                .column(Alias::new("rowid"))
+                .from(Alias::new("legacy_range_probe"))
+                .and_where(Expr::col(Alias::new("id")).eq("legacy"))
+                .and_where(Expr::col(Alias::new("revision")).eq(revision))
+                .and_where(Expr::col(Alias::new("identity")).eq("incarnation"))
+                .and_where(Expr::col(Alias::new("created_at")).eq(created_at))
+                // Prepared LIMIT has the same u64 bind as production guards.
+                .limit(1)
+                .to_owned()
         };
+        let guard = |revision| DbBackend::Sqlite.build(&guard_query(revision));
         let source = crate::SqliteBlobSource {
             table: "legacy_range_probe",
             column: "payload",
@@ -1187,6 +1190,55 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .is_empty()
+        );
+
+        // Exercise unsigned SQL semantics at the public storage boundary,
+        // including NULL and the largest SQLite integer, without another suite.
+        for (value, expected) in [
+            (None, None),
+            (Some(0u64), Some(0i64)),
+            (Some(i64::MAX as u64), Some(i64::MAX)),
+        ] {
+            let mut query = guard_query(7);
+            query.and_where(match expected {
+                None => Expr::val(value).is_null(),
+                Some(expected) => Expr::val(value).eq(expected),
+            });
+            assert_eq!(
+                database
+                    .read_blob_range(
+                        source,
+                        DbBackend::Sqlite.build(&query),
+                        0,
+                        8,
+                        original.len() as u64
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                original.as_bytes()[..8]
+            );
+        }
+        let mut overflow = guard_query(7);
+        overflow.and_where(Expr::val(i64::MAX as u64 + 1).is_not_null());
+        let events_before_overflow = observer.events().len();
+        let error = database
+            .read_blob_range(
+                source,
+                DbBackend::Sqlite.build(&overflow),
+                0,
+                8,
+                original.len() as u64,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, sea_orm::DbErr::Custom(message) if message == "SQLite blob guard unsigned integer overflow")
+        );
+        assert_eq!(
+            observer.events().len(),
+            events_before_overflow,
+            "overflow must fail before reader admission"
         );
 
         // Independent negative control: the former SQL shape returns the same

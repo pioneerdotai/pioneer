@@ -39,6 +39,14 @@ pub(crate) fn bindings(statement: &mut Statement) -> Result<Vec<NativeValue>, Db
             Ok(match value {
                 Value::String(value) => value.map_or(NativeValue::Null, NativeValue::Text),
                 Value::BigInt(value) => value.map_or(NativeValue::Null, NativeValue::Integer),
+                // SeaQuery's prepared LIMIT is u64 even for .limit(1).
+                Value::BigUnsigned(value) => match value {
+                    None => NativeValue::Null,
+                    Some(value) => NativeValue::Integer(
+                        i64::try_from(value)
+                            .map_err(|_| error("SQLite blob guard unsigned integer overflow"))?,
+                    ),
+                },
                 Value::Int(value) => {
                     value.map_or(NativeValue::Null, |v| NativeValue::Integer(v.into()))
                 }

@@ -1,7 +1,8 @@
 # Portable payload compression — implementation record
 
-Review status (2026-10-27): candidate `f4c09602973c82d555e1286bf6e5efb8b5ccbcae`
-was **not accepted** by external review. The repeat-review corrections and their
+Review status (2026-10-27): candidate `50f6611e7e4200bd7864ac2fbee2cc234401158d`
+was **not accepted** by external review, following the previously rejected
+`f4c09602973c82d555e1286bf6e5efb8b5ccbcae`. The repeat-review corrections and their
 limits are recorded at the end of this document. Internal review or a local commit
 does not constitute external acceptance; execution remains prohibited.
 
@@ -805,3 +806,107 @@ changes require another full external review before continuing dynamic checks.
 Код подготовлен к повторному внешнему ревью; тесты, сборки, cargo check, Migrator
 и codegen не запускались. После любых исправлений снова требуется полное внешнее
 ревью. Саморевью и локальные коммиты не являются внешним принятием реализации.
+
+
+## Prepared LIMIT bind correction after candidate 50f6611e
+
+Starting HEAD: `50f6611e7e4200bd7864ac2fbee2cc234401158d`; branch
+`feature/portable-payload-compression`; worktree
+`/Users/alexander/Code/pioneer/pioneer/.worktrees/portable-payload-compression`.
+Initial porcelain status was empty, with no staged, unstaged or untracked changes.
+Original base remains `dcc63b7142bf681cba96de8267a15e8383e82b11`. This revision has
+one local correction commit including this record; its exact SHA is supplied in
+the handoff. Candidate 50f6611e remains unaccepted. No other checkout was changed.
+
+The external P1 finding is valid: the native binding converter rejected the
+BigUnsigned value generated for every prepared `.limit(1)`. The previous resource
+regression used a literal SQL LIMIT and therefore did not exercise that production
+bind shape. This prevented nonempty legacy/raw native reads before reader
+admission; it affected compression preparation and the modified Task readers,
+while the literal-LIMIT LocatorRead was unaffected.
+
+Production change is confined to `crates/sqlite/src/blob_range.rs`: the existing
+converter now maps BigUnsigned(None) to SQL NULL and Some(u64) to SQLite Integer
+using checked i64::try_from. Values above i64::MAX return only the fixed custom
+message `SQLite blob guard unsigned integer overflow`. There is no panic, numeric
+wrap, truncation, SQL interpolation or fallback. Unsupported variants still take
+the existing rejection branch. Signed integer, boolean, string and date conversions
+are unchanged. Conversion still precedes SqliteReadOperation creation, admission,
+pool acquisition and native-handle locking.
+
+Static dependency evidence (installed sources, not executed):
+
+* SeaQuery 1.0.2 SelectStatement::limit stores u64 via limit.into(); value.rs maps
+  u64 to Value::BigUnsigned. QueryBuilder::prepare_select_limit_offset delegates
+  to prepare_value, and SqlWriterValues::push_param records the prepared value.
+* SeaORM 2.0.4 DbBackend::build/StatementBuilder preserves SQL plus Values in the
+  Statement. No literal rendering or LIMIT removal is introduced by this fix.
+* The installed sea-query-sqlx 0.9.1 SQLite adapter used by SeaORM maps BigUnsigned
+  to Option<i64> with TryFrom before binding. The new converter preserves that
+  adapter's NULL/in-range integer semantics but returns a sanitized error instead
+  of its overflow unwrap. SQLx 0.9 DateTime encoding uses RFC3339 AutoSi with an
+  explicit offset, consistent with the unchanged native date conversion.
+
+All current native range callers were traced: portable_payload preparation for
+all five families binds String owner/incarnation/stamp, i64 revision/byte length,
+and the u64 LIMIT; Task-basis character guards also bind String scope/version and
+i64 metadata; accepted Task-basis snapshot guards add String execution/scope/raw
+created_at and i64 lengths/revision; snapshot hydration uses String owner/source/
+created_at/incarnation/ref and i64 length/revision. Its optional source/ref guards
+use IS NULL instead of a nullable bind. The legacy character continuation forwards
+that guard unchanged. LocatorRead binds two Strings and i64 size with literal
+LIMIT. No additional Value variant beyond BigUnsigned was demonstrated necessary.
+Existing Int/Bool/date support is retained, including the regression's date bind.
+
+The existing SQLite resource regression was repaired in place in the cfg(test)
+region of `crates/sqlite/src/database.rs`, using SeaQuery Query::select and
+DbBackend::Sqlite.build with `.limit(1)`. It keeps timestamp, revision and
+incarnation predicates and passes the resulting Statement into the real public
+read_blob_range. The primary far misaligned 64 KiB Unicode range must now cross
+the same prepared unsigned LIMIT conversion as production. Existing physical
+mode=ro/query_only, allocation peak, reader/limiter release, stale revision,
+range/length/empty assertions and independent old substr SQL negative control
+remain intact.
+
+Compact boundary cases in that same owner send builder-bound unsigned NULL, 0
+and i64::MAX through actual guarded range reads, checking the original bytes.
+i64::MAX+1 must yield the sanitized error with no new read-observer events,
+establishing the intended before-admission boundary when the test can be run.
+There is no second storage suite, bindings-Vec-only test, source-grep assertion,
+new Entity or production test hook. The test-audit skill/reference were applied
+only to test edits, separately from the authorized converter repair. Protected
+tracked source/config hashes and the database.rs production prefix were compared
+around the test-only edit batch; they remained unchanged in that batch.
+
+Self-audit reread the complete three-file diff and all native callers. It checked
+prepared LIMIT routing into BigUnsigned, NULL/zero/maximum/overflow behavior,
+unsupported-type refusal, error sanitization and unchanged scheduling/resource
+boundaries. Reader routing/query_only, native snapshot/ownership/revision/CAS and
+ABA guards, cancellation/RAII, serialized writer, the existing format and dictionary
+rules were not changed. Schema, Entity, dependencies and the earlier fixture,
+ten-bind oracle and post-commit owned-materialization fixes were not changed.
+The documented SQLite overflow-map/prefix traversal costs remain unmeasured and
+are not grounds for a redesign in this revision.
+
+Changed files: `crates/sqlite/src/blob_range.rs`,
+`crates/sqlite/src/database.rs` (only cfg(test) changes), and this report.
+Performed checks: HEAD/branch/status inspection, source and installed dependency
+reads, caller/type inspection, full working/staged diff review, git diff --check,
+and scoped cargo fmt / cargo fmt --check for the two changed Rust files with
+child traversal disabled. The initial fmt check reported formatting differences
+only in those edited regions; formatting was applied and the check then passed.
+A local commit uses command-local core.hooksPath=/dev/null and commit.gpgsign=false;
+no hook or global Git configuration is modified. Final porcelain status is checked
+after the commit; the handoff records the resulting clean/dirty state.
+
+No tests, compilation, cargo check/build/clippy/test/nextest/bench/run, rustc,
+Migrator, Entity codegen, application/reproducer, production database access,
+VACUUM, CI, push/merge/rebase/reset/deploy or restart was performed. There is no
+dynamic pre-fix/post-fix proof, confirmed compilation or runtime-success claim.
+After full external review and explicit acceptance, the existing nextest resource
+owner must run in its isolated process along with the previously listed
+verification. Any further code changes require renewed external review.
+
+Код подготовлен к повторному внешнему ревью; тесты, сборки, cargo check, Migrator
+и codegen не запускались. Саморевью и локальный коммит не снимают запрет на
+динамические проверки; после исправления снова требуется полное внешнее ревью.
