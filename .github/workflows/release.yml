@@ -49,6 +49,8 @@ jobs:
 
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -117,6 +119,7 @@ jobs:
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.99.0"
           targets: ${{ matrix.platform.target }}
       - name: configure-native-release-environment
         run: python scripts/packaging/build-gateway.py --target "${{ matrix.platform.target }}" --configure
@@ -344,6 +347,7 @@ jobs:
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.99.0"
           targets: ${{ matrix.target }}
 
       - name: install-linux-build-dependencies

@@ -27,6 +27,8 @@ jobs:
 
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
 
       - name: build-cli-and-prepare-local-assets
         shell: bash
@@ -115,6 +117,8 @@ jobs:
 
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
 
       - name: install-linux-build-dependencies
         if: runner.os == 'Linux'
@@ -223,6 +227,7 @@ jobs:
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.99.0"
           targets: x86_64-pc-windows-msvc
 
       - name: build-cli-and-prepare-local-assets
@@ -321,6 +326,8 @@ jobs:
 
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
 
       - name: install-linux-build-dependencies
         if: runner.os == 'Linux'
@@ -427,6 +434,7 @@ jobs:
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.99.0"
           targets: x86_64-pc-windows-msvc
 
       - name: build-cli-and-prepare-local-assets
@@ -532,6 +540,8 @@ jobs:
 
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
 
       - name: install-linux-build-dependencies
         if: runner.os == 'Linux'
