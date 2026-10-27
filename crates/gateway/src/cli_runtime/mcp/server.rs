@@ -617,6 +617,7 @@ mod tests {
                     reservation.generation,
                     projection,
                     limits,
+                    super::super::facade::CliMcpCallContract::Codex,
                 );
                 if mode == "joined-owned" {
                     let (handle, server) = result.unwrap();

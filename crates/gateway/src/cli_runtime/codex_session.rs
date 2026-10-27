@@ -2549,6 +2549,7 @@ mod tests {
 
     struct FakeCodexIsolationServer {
         client: CodexAppServerClient,
+        rpc_owner: Option<CodexJsonlRpcOwner>,
         reader: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
         writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     }
@@ -2558,9 +2559,11 @@ mod tests {
             let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
             let (client_read, client_write) = split(client_stream);
             let (server_read, server_write) = split(server_stream);
-            let rpc = CodexJsonlRpcClient::new(BufReader::new(client_read), client_write);
+            let (rpc, rpc_owner) =
+                CodexJsonlRpcClient::new_owned(BufReader::new(client_read), client_write);
             Self {
                 client: CodexAppServerClient::new(rpc),
+                rpc_owner: Some(rpc_owner),
                 reader: BufReader::new(server_read),
                 writer: server_write,
             }
@@ -2653,7 +2656,7 @@ mod tests {
                 process_config.args.clear();
                 process_config = process_config.with_process_generation(instance.generation())?;
                 let process = spawn_cli_agent_process(&process_config)?;
-                let fake = FakeCodexIsolationServer::new();
+                let mut fake = FakeCodexIsolationServer::new();
                 let launch_projection = match &spec.mcp {
                     CliMcpSessionLaunch::Codex(projection) => Some(projection.clone()),
                     CliMcpSessionLaunch::Disabled => None,
@@ -2715,8 +2718,11 @@ mod tests {
                 };
                 let session = Arc::new(CodexCLIAgentRuntimeSession {
                     client: fake.client.clone(),
+                    rpc_owner: tokio::sync::Mutex::new(
+                        fake.rpc_owner.take().expect("fake RPC owner"),
+                    ),
                     _stderr: process.stderr(),
-                    process: tokio::sync::Mutex::new(process),
+                    process: Arc::new(tokio::sync::Mutex::new(process)),
                     request_timeout: Duration::from_secs(2),
                     shutdown_grace: Duration::from_secs(2),
                     event_receivers: StdMutex::new(None),
