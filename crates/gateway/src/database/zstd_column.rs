@@ -68,7 +68,7 @@ pub(crate) const TURN_EVENT_PAYLOAD: ZstdColumnConfig = ZstdColumnConfig {
     dict_column: "_payload_dict",
     dict_chooser: "'turn_event.payload'",
     dictionary_key: "turn_event.payload",
-    compression_level: 19,
+    compression_level: 6,
     count_source: ZstdColumnCountSource::TurnEvent,
 };
 
@@ -81,7 +81,7 @@ pub(crate) const TURN_ITEM_PAYLOAD: ZstdColumnConfig = ZstdColumnConfig {
     dict_column: "_payload_dict",
     dict_chooser: "'turn_item.payload'",
     dictionary_key: "turn_item.payload",
-    compression_level: 19,
+    compression_level: 6,
     count_source: ZstdColumnCountSource::TurnItem,
 };
 
@@ -1330,6 +1330,29 @@ async fn ensure_compression_enabled(
             enabled_now = true;
         }
     } else {
+        // Extension-owned metadata has no Entity. Patch only the level so an
+        // existing installation keeps its dictionary/training configuration;
+        // already-compressed payloads and their dictionary IDs stay untouched.
+        zstd_database_phase(cancellation, async {
+            db.execute_raw(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "UPDATE _zstd_configs \
+                 SET config = json_set(config, '$.compression_level', ?) \
+                 WHERE json_extract(config, '$.table') = ? \
+                   AND json_extract(config, '$.column') = ? \
+                   AND json_extract(config, '$.compression_level') IS NOT ?",
+                [
+                    config.compression_level.into(),
+                    config.table.into(),
+                    config.column.into(),
+                    config.compression_level.into(),
+                ],
+            ))
+            .await
+            .with_context(|| format!("failed to reconcile zstd level for {}", config.label()))?;
+            Ok(())
+        })
+        .await?;
         zstd_database_phase(
             cancellation,
             mark_existing_compression_complete(db, config, total_rows, cancellation),
@@ -2036,7 +2059,7 @@ mod tests {
             raw[0].compressed_payload,
             pioneer_sqlite::zstd::compress_column_value(
                 raw[0].original_payload.as_bytes(),
-                19,
+                6,
                 None
             )
             .unwrap()
@@ -2771,6 +2794,197 @@ mod tests {
         .await
         .expect("bounded maintenance read should work");
         assert_eq!(batch.len(), COMPRESSION_BATCH_MAX_ROWS);
+    }
+
+    #[tokio::test]
+    async fn payload_level_upgrade_preserves_configs_dictionaries_and_compressed_rows() {
+        let fixture = budget_fixture(&[
+            "legacy dictionary payload",
+            "pending dictionary payload one",
+            "pending dictionary payload two",
+        ])
+        .await;
+        let db = fixture
+            .store
+            .with_maintenance_access()
+            .database_connection();
+        let fresh_configs = stored_zstd_configs(&db).await;
+        assert_eq!(fresh_configs.len(), 2);
+        for (_, config) in &fresh_configs {
+            let config: serde_json::Value = serde_json::from_str(config).unwrap();
+            assert_eq!(config["compression_level"], 6);
+        }
+
+        // Simulate an existing installation, including non-default training
+        // settings and an unknown field that must survive reconciliation.
+        db.execute_unprepared(
+            "UPDATE _zstd_configs SET config = json_set(config, \
+             '$.compression_level', 19, '$.min_dict_size_bytes_for_training', 8192, \
+             '$.dict_size_ratio', 0.02, '$.train_dict_samples_ratio', 50, \
+             '$.incremental_compression_step_bytes', 123456, \
+             '$.future_option', json('{\"keep\":true}'))",
+        )
+        .await
+        .unwrap();
+        // Both selectors matter: unrelated columns and unrelated tables must
+        // retain their original configuration bytes.
+        db.execute_unprepared(
+            r#"INSERT INTO _zstd_configs(config) VALUES
+            ('{"table":"turn_event","column":"other_payload","compression_level":19}'),
+            ('{"table":"other_table","column":"payload","compression_level":19}')"#,
+        )
+        .await
+        .unwrap();
+        let old_configs = stored_zstd_configs(&db).await;
+        let mut cache = super::PreparedDictionaryCache::new(&fixture.store);
+        let mut historical = Vec::new();
+        for &config in ZSTD_PAYLOAD_COLUMNS {
+            let dictionary = super::persist_compression_dictionary(
+                &db,
+                config,
+                b"legacy dictionary payload content".to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+            let rows = load_pending_payload_rows(&db, config, 1, 1024 * 1024)
+                .await
+                .unwrap();
+            let legacy = super::ZstdColumnConfig {
+                compression_level: 19,
+                ..config
+            };
+            let prepared = super::prepare_payload_batch(
+                &mut cache,
+                &db,
+                legacy,
+                rows,
+                dictionary.clone(),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                apply_prepared_payload_rows(&db, config, dictionary.id, &prepared, None)
+                    .await
+                    .unwrap(),
+                (1, 0)
+            );
+            historical.push((prepared[0].compressed_payload.clone(), dictionary));
+        }
+
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        for _ in 0..2 {
+            ensure_compression_schema(&fixture.store, ZSTD_PAYLOAD_COLUMNS, &cancellation)
+                .await
+                .unwrap();
+            let configs = stored_zstd_configs(&db).await;
+            assert_eq!(configs.len(), old_configs.len());
+            for ((id, config), (old_id, old_config)) in configs.iter().zip(&old_configs) {
+                assert_eq!(id, old_id);
+                if fresh_configs.iter().any(|(fresh_id, _)| fresh_id == id) {
+                    let mut expected: serde_json::Value = serde_json::from_str(old_config).unwrap();
+                    expected["compression_level"] = serde_json::json!(6);
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(config).unwrap(),
+                        expected
+                    );
+                } else {
+                    assert_eq!(config, old_config);
+                }
+            }
+            for &config in ZSTD_PAYLOAD_COLUMNS {
+                assert_eq!(
+                    super::pending_uncompressed_rows(&db, config).await.unwrap(),
+                    2
+                );
+            }
+        }
+
+        let outcome = super::run_cooperative_maintenance_cycle(
+            &fixture.store,
+            &mut cache,
+            ZSTD_PAYLOAD_COLUMNS,
+            None,
+            1.0,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.summaries.len(), 2);
+        for (index, &config) in ZSTD_PAYLOAD_COLUMNS.iter().enumerate() {
+            assert_eq!(outcome.summaries[index].compressed_rows, 2);
+            let (old_bytes, dictionary) = &historical[index];
+            assert_eq!(
+                load_compression_dictionary(&db, config)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(dictionary)
+            );
+            let rows = db
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!(
+                        "SELECT payload, _payload_dict FROM {} ORDER BY rowid",
+                        config.backing_table
+                    ),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 3);
+            assert_eq!(
+                rows[0].try_get::<Vec<u8>>("", "payload").unwrap(),
+                *old_bytes
+            );
+            for (row_index, row) in rows.iter().enumerate() {
+                assert_eq!(
+                    row.try_get::<i64>("", "_payload_dict").unwrap(),
+                    dictionary.id
+                );
+                if row_index != 0 {
+                    assert_eq!(
+                        row.try_get::<Vec<u8>>("", "payload").unwrap(),
+                        pioneer_sqlite::zstd::compress_column_value(
+                            fixture.payloads[index][row_index].as_bytes(),
+                            6,
+                            dictionary.bytes.as_deref(),
+                        )
+                        .unwrap()
+                    );
+                }
+            }
+            let readable = db
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("SELECT payload FROM {} ORDER BY id", config.table),
+                ))
+                .await
+                .unwrap();
+            let actual = readable
+                .iter()
+                .map(|row| row.try_get::<String>("", "payload").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, fixture.payloads[index]);
+        }
+    }
+
+    async fn stored_zstd_configs(db: &pioneer_sqlite::SqliteDatabase) -> Vec<(i64, String)> {
+        db.query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT id, config FROM _zstd_configs ORDER BY id",
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get("", "id").unwrap(),
+                row.try_get("", "config").unwrap(),
+            )
+        })
+        .collect()
     }
 
     #[tokio::test]
