@@ -2550,20 +2550,24 @@ async fn capability_persistence_order_impl() {
             .expect("committed MCP capability event should arrive")
             .expect("committed lane should stay open");
         // This unrestricted turn admits the Threads catalog alongside the
-        // default HTML and task tools.
+        // default HTML and task tools, plus CUA when this build enables it.
         let thread_actions = [
             "threads_identity_models_list",
             "thread_create",
             "thread_message_send",
             "threads_turn_start",
         ];
-        let expected_mcp_bindings = 2
-            + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+        let expected_mcp_bindings =
+            2 + if cfg!(feature = "computer-use") {
+                pioneer_protocol::CUA_TOOL_NAMES.len()
+            } else {
+                0
+            } + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
                 .definitions()
                 .len()
-            + crate::turn_mcp::native_tools::NativeToolFamily::Threads
-                .definitions()
-                .len();
+                + crate::turn_mcp::native_tools::NativeToolFamily::Threads
+                    .definitions()
+                    .len();
         assert!(matches!(
             committed_capabilities,
             AgentDurableEvent::TurnCapabilitiesResolved {
@@ -9442,7 +9446,7 @@ pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
         },
         computer_use: ComputerUseToolsConfig {
             runtime_home_dir: std::env::temp_dir().join("pioneer-gateway-message-tests"),
-            artifacts_subdir: "tools/computer_use".to_owned(),
+
             ..ComputerUseToolsConfig::default()
         },
         skills: SkillsLoopConfig {

@@ -4457,6 +4457,34 @@ pub struct ToolRecoveryView {
     pub continuation: Option<JsonValue>,
 }
 
+pub const CUA_TOOL_NAMES: &[&str] = &[
+    "cua_click",
+    "cua_clipboard_read",
+    "cua_clipboard_write",
+    "cua_drag",
+    "cua_get_cursor_position",
+    "cua_get_desktop_state",
+    "cua_get_screen_size",
+    "cua_get_window_state",
+    "cua_hotkey",
+    "cua_invoke_menu",
+    "cua_list_apps",
+    "cua_list_windows",
+    "cua_press_key",
+    "cua_scroll",
+    "cua_set_window_frame",
+    "cua_type_text",
+    "cua_verify_state",
+    "cua_get_browser_state",
+    "cua_browser_prepare",
+    "cua_browser_navigate",
+    "cua_browser_click",
+    "cua_browser_type",
+    "cua_browser_select",
+    "cua_browser_dialog",
+    "cua_browser_set_input_files",
+];
+
 impl ToolOutputPolicySnapshot {
     pub fn for_tool_name(tool_name: &str) -> Self {
         match tool_name {
@@ -4464,7 +4492,7 @@ impl ToolOutputPolicySnapshot {
             "web_fetch" => web_fetch_output_policy_snapshot(),
             "web_search" => web_search_output_policy_snapshot(),
             "download_url" | "download" => download_output_policy_snapshot(),
-            "computer_use" => computer_use_output_policy_snapshot(),
+            name if CUA_TOOL_NAMES.contains(&name) => computer_use_output_policy_snapshot(),
             "html_preview" | "html_render" => html_output_policy_snapshot(),
             "artifact_prepare" | "artifact_register" | "read_file" | "read_skill" | "list_dir"
             | "grep_files" | "apply_patch" | "tool_search" | "tool_suggest" => {
@@ -4480,7 +4508,7 @@ impl ToolOutputPolicySnapshot {
             "web_fetch" => web_fetch_output_policy_snapshot(),
             "web_search" => web_search_output_policy_snapshot(),
             "download_url" | "download" => download_output_policy_snapshot(),
-            "computer_use" => computer_use_output_policy_snapshot(),
+            name if CUA_TOOL_NAMES.contains(&name) => computer_use_output_policy_snapshot(),
             "html_preview" | "html_render" => html_output_policy_snapshot(),
             "artifact_prepare" | "artifact_register" | "read_file" | "list_dir" | "grep_files"
             | "apply_patch" | "tool_search" | "tool_suggest" => {

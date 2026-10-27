@@ -8,8 +8,10 @@ default-run = "pioneer"
 
 [features]
 default = []
-dev = []
 computer-use = ["pioneer-gateway/computer-use"]
+# Release-only bridge consumed by the already installed binary-only CU updater.
+legacy-cu-bootstrap = ["computer-use"]
+dev = []
 
 [[bin]]
 name = "pioneer"
@@ -19,6 +21,11 @@ path = "src/main.rs"
 name = "pioneer-dev"
 path = "src/dev.rs"
 required-features = ["dev"]
+
+[[bin]]
+name = "pioneer-cu-update"
+path = "src/cu_update.rs"
+required-features = ["legacy-cu-bootstrap"]
 
 [dependencies]
 anyhow.workspace = true

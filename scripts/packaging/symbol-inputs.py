@@ -55,6 +55,10 @@ def export(args):
         binary = binary.resolve(strict=True)
         data = binary.read_bytes()
         fmt, module = native["identity"](data)
+        if getattr(args, "variant", None) is not None:
+            actual_cu = "COMPUTER_USE" in native["build_manifest"](data)["features"]
+            if actual_cu != (args.variant == "computer-use"):
+                raise ValueError("Gateway binary does not match requested variant")
         entry = dict(filename=binary.name, format=fmt, module_id=module,
                      sha256=hashlib.sha256(data).hexdigest())
         binaries.append(entry)
@@ -91,6 +95,8 @@ def export(args):
                     catalog_sha256=(digest(Path(os.environ["PIONEER_BUNDLED_MODEL_CATALOG"]))
                                     if os.environ.get("PIONEER_BUNDLED_MODEL_CATALOG") else None),
                     binaries=binaries, files=records)
+    if getattr(args, "variant", None) is not None:
+        metadata["variant"] = args.variant
     (args.out / "inputs.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
 
@@ -113,6 +119,9 @@ def process(args, expected_run_id=None, packaged_override=None, inventory_name="
         raise ValueError("symbol inputs are from a different workflow run")
     if metadata["target"] != os.environ["SYMBOL_TARGET"]:
         raise ValueError("symbol inputs are for a different target")
+    expected_variant = os.environ.get("SYMBOL_VARIANT", "")
+    if expected_run_id is None and metadata.get("variant") is not None and metadata["variant"] != expected_variant:
+        raise ValueError("symbol inputs are for a different Gateway variant")
     records = {row["path"]: row for row in metadata["files"]}
     args.work.mkdir(parents=True, exist_ok=False)
     with tarfile.open(args.inputs / "inputs.tar.gz", "r:gz") as archive:
@@ -150,6 +159,10 @@ def process(args, expected_run_id=None, packaged_override=None, inventory_name="
     for binary in metadata["binaries"]:
         original = args.work / "binaries" / binary["filename"]
         fmt, module = native["identity"](original.read_bytes())
+        if metadata.get("variant") is not None:
+            actual_cu = "COMPUTER_USE" in native["build_manifest"](original.read_bytes())["features"]
+            if actual_cu != (metadata["variant"] == "computer-use"):
+                raise ValueError("Gateway binary does not match symbol input variant")
         if (fmt, module) != (binary["format"], binary["module_id"]):
             raise ValueError("restored executable module mismatch")
         matches = [row for row in packaged
@@ -172,7 +185,9 @@ def process(args, expected_run_id=None, packaged_override=None, inventory_name="
             raise ValueError("nested Gateway reuse is not supported")
         receipt = json.loads((gateway / "reuse.json").read_text())
         original = json.loads((gateway / "inputs.json").read_text())
-        if (receipt.get("schema_version") != 1 or receipt.get("variant") != "computer-use"
+        if (receipt.get("schema_version") != 1
+                or (original.get("variant") is not None and
+                    (original["variant"] != "computer-use" or receipt.get("variant") != "computer-use"))
                 or receipt.get("commit") != metadata["commit"] or receipt.get("target") != metadata["target"]
                 or str(receipt.get("run_id")) != str(original["run_id"])
                 or len(original["binaries"]) != 1
@@ -183,6 +198,17 @@ def process(args, expected_run_id=None, packaged_override=None, inventory_name="
         child = argparse.Namespace(inputs=gateway, work=args.work / "gateway", out=args.out)
         process(child, str(receipt["run_id"]), packaged, "gateway-release-inputs.json")
         metadata["reused_gateway"] = receipt
+    compatibility = args.inputs / "compatibility"
+    if expected_run_id is None and compatibility.exists():
+        bridge = json.loads((compatibility / "inputs.json").read_text())
+        if (metadata.get("variant") != "computer-use" or bridge.get("variant") != "computer-use"
+                or any(bridge.get(key) != metadata.get(key)
+                       for key in ("commit", "run_id", "target", "catalog_sha256"))
+                or [row["filename"] for row in bridge["binaries"]] not in
+                   (["pioneer-cu-update"], ["pioneer-cu-update.exe"])):
+            raise ValueError("compatibility bridge provenance mismatch")
+        child = argparse.Namespace(inputs=compatibility, work=args.work / "compatibility", out=args.out)
+        process(child, str(metadata["run_id"]), inventory_name="compatibility-release-inputs.json")
     (args.out / inventory_name).write_text(json.dumps(metadata, indent=2) + "\n")
 
 
@@ -191,6 +217,7 @@ def main():
     sub = parser.add_subparsers(dest="mode", required=True)
     create = sub.add_parser("export")
     create.add_argument("--target", required=True)
+    create.add_argument("--variant", choices=("default", "computer-use"))
     create.add_argument("out", type=Path)
     create.add_argument("binaries", nargs="+", type=Path)
     note = sub.add_parser("record")

@@ -100,6 +100,9 @@ notify = { version = "=8.2.0", default-features = true }
 same-file = "=1.0.6"
 async-stream = "0.3"
 
+# Computer use
+cua-driver-sdk = { git = "https://github.com/trycua/cua" }
+
 # Error handling
 anyhow = "1"
 
@@ -159,8 +162,6 @@ nono = { git = "https://github.com/nolabs-ai/nono", tag = "v0.66.0", default-fea
 scraper = "0.27"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
-xcap = "0.9"
-xa11y = "0.15"
 tempfile = "3"
 fs4 = "1.1"
 lazy_static = "1.5"

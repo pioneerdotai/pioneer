@@ -66,16 +66,24 @@ jobs:
               if (!match || artifact.expired || !platforms[match[2]]) continue;
               if (!products.includes(match[1])) throw new Error('Unexpected input producer');
               include.push({artifact_id: artifact.id, name: artifact.name,
-                            target: match[2], os: platforms[match[2]]});
+                            target: match[2], os: platforms[match[2]], variant: match[3] || ''});
             }
             core.setOutput('matrix', JSON.stringify({include}));
             core.setOutput('count', include.length);
             core.setOutput('has_macos', include.some(row => row.os.startsWith('macos')));
-            const expected = Object.keys(platforms).flatMap(target => products.flatMap(product => product === 'desktop'
-              ? [`symbol-inputs-desktop-${target}`]
-              : ['default', 'computer-use'].map(feature => `symbol-inputs-gateway-${target}-${feature}`)));
+            // Variant Gateway producers emit both variants. Select one complete
+            // generation for this trusted run; mixed/incomplete inventories are rejected.
+            const variantGateway = include.some(row => row.variant);
+            const expected = Object.keys(platforms).flatMap(target => products.flatMap(product =>
+              product === 'gateway' && variantGateway
+                ? ['default', 'computer-use'].map(variant => `symbol-inputs-gateway-${target}-${variant}`)
+                : [`symbol-inputs-${product}-${target}`]));
             const names = new Set(include.map(row => row.name));
             if (expected.some(name => !names.has(name))) throw new Error('Missing release symbol inputs');
+            if (include.length !== expected.length || names.size !== expected.length ||
+                include.some(row => !expected.includes(row.name))) {
+              throw new Error('Mixed or duplicate release symbol input generations');
+            }
 
   macos-tool:
     name: build-dsymutil
@@ -123,6 +131,7 @@ jobs:
       SYMBOL_SOURCE_SHA: ${{ needs.inputs.outputs.source_sha }}
       SYMBOL_SOURCE_RUN_ID: ${{ needs.inputs.outputs.source_run_id }}
       SYMBOL_TARGET: ${{ matrix.target }}
+      SYMBOL_VARIANT: ${{ matrix.variant }}
     steps:
       - uses: actions/checkout@v5
         with:

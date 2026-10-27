@@ -375,9 +375,10 @@ fi
 mkdir -p "$OUT_DIR"
 
 if [[ "$SKIP_BUILD" != true ]]; then
+  cargo update -p cua-driver-sdk
   cargo build --locked --release -p pioneer-desktop --target "$TARGET"
   cargo build --locked --release -p pioneer-app-updater --target "$TARGET"
-  cargo build --locked --release -p pioneer-cli --features computer-use --target "$TARGET"
+  MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --locked --release -p pioneer-cli --features computer-use --target "$TARGET"
   if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
     python3 scripts/packaging/symbol-inputs.py export --target "$TARGET" "$PIONEER_SYMBOL_INPUTS_DIR" \
       "target/$TARGET/release/pioneer-app" "target/$TARGET/release/pioneer" "target/$TARGET/release/pioneer-app-updater"
@@ -435,11 +436,7 @@ GATEWAY_BUNDLE_DIR="$RESOURCES_DIR/gateway"
 mkdir -p "$GATEWAY_BUNDLE_DIR"
 copy_macos_x86_64_onnxruntime_dylibs "$GATEWAY_BUNDLE_DIR"
 
-if [[ "$TARGET" == "x86_64-apple-darwin" ]]; then
-  GATEWAY_ASSET_NAME="pioneer-gateway-macos-${ARCH}.zip"
-else
-  GATEWAY_ASSET_NAME="pioneer-gateway-macos-${ARCH}.gz"
-fi
+GATEWAY_ASSET_NAME="pioneer-gateway-macos-${ARCH}-computer-use-package.zip"
 GATEWAY_ASSET_PATH="$GATEWAY_BUNDLE_DIR/$GATEWAY_ASSET_NAME"
 GATEWAY_BINARY_RAW="$WORK_DIR/pioneer-gateway-${ARCH}"
 cp "target/$TARGET/release/pioneer" "$GATEWAY_BINARY_RAW"
@@ -459,19 +456,7 @@ fi
 cp "$GATEWAY_BINARY_RAW" "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
 chmod 0755 "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
 
-if [[ "$TARGET" == "x86_64-apple-darwin" ]]; then
-  require_cmd zip
-  GATEWAY_ASSET_BINARY_PATH="$GATEWAY_BUNDLE_DIR/pioneer"
-  cp "$GATEWAY_BINARY_RAW" "$GATEWAY_ASSET_BINARY_PATH"
-  chmod 0755 "$GATEWAY_ASSET_BINARY_PATH"
-  (
-    cd "$GATEWAY_BUNDLE_DIR"
-    zip -9 "$GATEWAY_ASSET_PATH" pioneer libonnxruntime*.dylib
-  )
-  rm -f "$GATEWAY_ASSET_BINARY_PATH"
-else
-  gzip -f --stdout --best "$GATEWAY_BINARY_RAW" > "$GATEWAY_ASSET_PATH"
-fi
+python3 scripts/packaging/cua-driver.py --target "$TARGET" --binary "$GATEWAY_BINARY_RAW" --archive "$GATEWAY_ASSET_PATH"
 
 GATEWAY_SHA256="$(sha256_file "$GATEWAY_ASSET_PATH")"
 printf 'sha256:%s %s\n' "$GATEWAY_SHA256" "$GATEWAY_ASSET_NAME" > "$GATEWAY_BUNDLE_DIR/SHA256SUMS"
@@ -509,7 +494,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     </dict>
   </array>
   <key>LSMinimumSystemVersion</key>
-  <string>12.0</string>
+  <string>13.0</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Pioneer uses your microphone for voice input while you hold to talk.</string>
 </dict>
