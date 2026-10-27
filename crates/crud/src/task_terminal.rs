@@ -420,8 +420,11 @@ impl CrudStore {
 
     async fn commit_task_terminal_transition_once(
         &self,
-        prepared: PreparedTaskTerminalTransition,
+        mut prepared: PreparedTaskTerminalTransition,
     ) -> Result<TaskTerminalCommitOutcome> {
+        // A retry may receive a clone of the original prepared transition.
+        // Refresh semantic caches before begin while retaining domain fences.
+        prepared.events = self.refresh_task_event_preflight(prepared.events).await?;
         let tx = self
             .connection
             .begin()
@@ -678,13 +681,11 @@ impl CrudStore {
                 Some(persisted.id)
             }
             (None, Some(_)) => {
-                let delivery_events = prepared
-                    .events
-                    .iter()
+                let delivery_events = std::mem::take(&mut prepared.events)
+                    .into_iter()
                     .filter(|event| {
                         matches!(event.payload(), TaskEventPayload::DeliveryQueued { .. })
                     })
-                    .cloned()
                     .collect();
                 events = self
                     .append_task_events_in_connection(db, delivery_events, at)

@@ -1,16 +1,16 @@
 //! SQLite lifecycle/storage for the byte-only portable codec.
-//! Raw SQL is confined to fixed source projections, byte substrings and guarded
-//! physical publication, which Entity cannot express for heterogeneous owners.
+//! Owner discovery, fragments and publication use their existing Entities.
+//! Custom expressions are confined to SQLite scalar metadata/ownership facts.
 use crate::{CrudStore, portable_payload_codec as codec};
 use anyhow::{Context, Result, ensure};
 use pioneer_entity::{
     portable_payload as value, portable_payload_block as block,
     portable_payload_dictionary as dictionary,
 };
-use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, OnConflict};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Statement, TransactionTrait,
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -143,8 +143,95 @@ impl Family {
         }
     }
 }
-fn sql(query: String, values: impl IntoIterator<Item = sea_orm::Value>) -> Statement {
-    Statement::from_sql_and_values(DbBackend::Sqlite, query, values)
+// The only varying schema facts are these five existing Entity columns. Keep
+// ordinary owner access typed rather than dispatching SQL table/column strings.
+macro_rules! target {
+    ($family:expr, |$entity:ident, $col:ident, $key:ident, $field:ident, $reference:ident| $body:block) => {{
+        macro_rules! apply {
+            ($module:ident, $key_variant:ident, $field_variant:ident, $ref_variant:ident) => {{
+                use pioneer_entity::$module::{Column as $col, Entity as $entity};
+                let $key = $col::$key_variant;
+                let $field = $col::$field_variant;
+                let $reference = $col::$ref_variant;
+                $body
+            }};
+        }
+        match $family {
+            Family::ToolText => apply!(tool_output_chunk, Id, Text, TextPayloadId),
+            Family::ToolMetadata => apply!(tool_output_chunk, Id, Metadata, MetadataPayloadId),
+            Family::CliMapping => apply!(
+                turn_cli_runtime_binding,
+                TurnId,
+                InputMappingJson,
+                InputMappingJsonPayloadId
+            ),
+            Family::TaskHistory => apply!(
+                task_run_conversation_snapshot,
+                RunId,
+                HistoryJson,
+                HistoryJsonPayloadId
+            ),
+            Family::TaskEvent => apply!(task_event, Id, PayloadJson, PayloadJsonPayloadId),
+        }
+    }};
+}
+
+#[derive(sea_orm::FromQueryResult)]
+struct PendingSource {
+    owner: String,
+    portable_revision: i64,
+    portable_identity: String,
+    owner_stamp: String,
+    bytes: i64,
+}
+
+async fn pending_source(
+    store: &CrudStore,
+    family: Family,
+    after: Option<&str>,
+    upper: Option<&str>,
+    descending: bool,
+) -> Result<Option<PendingSource>> {
+    store
+        .run_background_database_quantum(|| async {
+            target!(family, |Target, Col, key, field, reference| {
+                let mut query = Target::find()
+                    .select_only()
+                    .column_as(key, "owner")
+                    .columns([Col::PortableRevision, Col::PortableIdentity])
+                    .expr_as(Expr::cust(owner_stamp_sql(family)), "owner_stamp")
+                    .expr_as(
+                        Func::cust(Alias::new("octet_length")).arg(Expr::col(field)),
+                        "bytes",
+                    )
+                    .filter(reference.is_null())
+                    .filter(field.is_not_null());
+                if matches!(family, Family::CliMapping | Family::TaskHistory) {
+                    query = query.filter(
+                        Expr::col(Alias::new("frozen_manifest_id"))
+                            .is_null()
+                            .or(Expr::col(Alias::new("frozen_manifest_id")).ne("")),
+                    );
+                }
+                if let Some(after) = after {
+                    query = query.filter(key.gt(after));
+                }
+                if let Some(upper) = upper {
+                    query = query.filter(key.lte(upper));
+                }
+                query = if descending {
+                    query.order_by_desc(key)
+                } else {
+                    query.order_by_asc(key)
+                };
+                Ok(query
+                    .limit(1)
+                    .into_model::<PendingSource>()
+                    .one(&store.connection)
+                    .await?)
+            })
+        })
+        .await
 }
 
 /// Only this worker owns its pending preparation. Staged headers are retired
@@ -154,6 +241,9 @@ pub struct PortablePayloadProgress {
     family: usize,
     pending: Option<Preparation>,
     after: [Option<String>; 5],
+    // Finite per-pass fence only: reset/re-discover after EOF. A hot stream
+    // of higher keys cannot prevent revisiting logical updates below cursor.
+    upper: [Option<String>; 5],
     cleanup_after: Option<String>,
 }
 struct Preparation {
@@ -196,6 +286,12 @@ impl PortablePayloadProgress {
                     // Database phases already retry transient lock failures.
                     // Advance this pass; a failed source is diagnosed and
                     // revisited after EOF. It cannot starve later sources.
+                    // Only the fixed field family is diagnostic; source IDs,
+                    // JSON, dictionary bytes and driver errors stay out of logs.
+                    tracing::warn!(
+                        family = pending.family.name(),
+                        "portable payload preparation failed; source remains pending"
+                    );
                     return Err(error);
                 }
             }
@@ -215,37 +311,38 @@ impl PortablePayloadProgress {
             Family::ToolMetadata,
             Family::CliMapping,
             Family::TaskHistory,
+            Family::TaskEvent,
         ];
         let family = FAMILIES[self.family];
         self.family = (self.family + 1) % FAMILIES.len();
-        let (table, key, field) = family.spec();
-        let eligibility = match family {
-            Family::CliMapping | Family::TaskHistory => {
-                " AND (frozen_manifest_id IS NULL OR frozen_manifest_id<>'')"
-            }
-            _ => "",
-        };
         // NULL metadata is final SQL NULL, not an empty/pending value.
-        let after = self.after[family as usize].as_deref();
-        let seek = if after.is_some() {
-            format!(" AND {key}>?1")
-        } else {
-            String::new()
+        let index = family as usize;
+        if self.after[index].is_none() {
+            self.upper[index] = pending_source(store, family, None, None, true)
+                .await?
+                .map(|row| row.owner);
+        }
+        let Some(upper) = self.upper[index].as_deref() else {
+            return Ok(false);
         };
-        let bindings = after.map(|s| vec![s.into()]).unwrap_or_default();
-        let stamp = owner_stamp_sql(family);
-        let row = select(store,sql(format!(
-            "SELECT {key} AS owner,portable_revision,portable_identity,{stamp} AS owner_stamp,octet_length({field}) AS bytes FROM {table} WHERE {field}_payload_id IS NULL AND {field} IS NOT NULL{eligibility}{seek} ORDER BY {key} LIMIT 1"), bindings)).await?;
+        let row = pending_source(
+            store,
+            family,
+            self.after[index].as_deref(),
+            Some(upper),
+            false,
+        )
+        .await?;
         if let Some(row) = row {
-            self.after[family as usize] = Some(row.try_get("", "owner")?);
+            self.after[family as usize] = Some(row.owner.clone());
             let payload_id = uuid::Uuid::new_v4().to_string();
             self.pending = Some(Preparation {
                 family,
-                owner: row.try_get("", "owner")?,
-                revision: row.try_get("", "portable_revision")?,
-                identity: row.try_get("", "portable_identity")?,
-                owner_stamp: row.try_get("", "owner_stamp")?,
-                size: usize::try_from(row.try_get::<i64>("", "bytes")?)?,
+                owner: row.owner,
+                revision: row.portable_revision,
+                identity: row.portable_identity,
+                owner_stamp: row.owner_stamp,
+                size: usize::try_from(row.bytes)?,
                 offset: 0,
                 bytes: Vec::new(),
                 digest: Sha256::new(),
@@ -258,7 +355,7 @@ impl PortablePayloadProgress {
                     header: value::Model {
                         id: payload_id,
                         family: family.name().into(),
-                        original_bytes: row.try_get("", "bytes")?,
+                        original_bytes: row.bytes,
                         original_chars: 0,
                         sha256: "0".repeat(64),
                         raw: 1,
@@ -279,13 +376,12 @@ impl PortablePayloadProgress {
             return Ok(true);
         }
         self.after[family as usize] = None;
+        self.upper[family as usize] = None;
         Ok(false)
     }
 }
 impl Preparation {
     async fn step(&mut self, store: &CrudStore) -> Result<bool> {
-        let (table, key, field) = self.family.spec();
-        let stamp = owner_stamp_sql(self.family);
         let prepared = &mut self.prepared;
         if !prepared.installed {
             store
@@ -336,13 +432,46 @@ impl Preparation {
                 "portable UTF-8 carry exceeds one scalar"
             );
             let count = (BLOCK - self.bytes.len()).min(self.size - self.offset);
-            let row=select(store,sql(format!(
-                "SELECT substr(CAST({field} AS BLOB),?3,?4) AS fragment FROM {table} WHERE {key}=?1 AND portable_revision=?2 AND {field}_payload_id IS NULL AND octet_length({field})=?5 AND portable_identity=?6 AND {stamp}=?7"),
-                [self.owner.clone().into(),self.revision.into(),i64::try_from(self.offset+1)?.into(),i64::try_from(count)?.into(),i64::try_from(self.size)?.into(),self.identity.clone().into(),self.owner_stamp.clone().into()])).await?;
-            let Some(row) = row else {
+            let family = self.family;
+            let source_offset = i64::try_from(self.offset + 1)?;
+            let source_size = i64::try_from(self.size)?;
+            let source_owner = &self.owner;
+            let source_revision = self.revision;
+            let source_identity = &self.identity;
+            let source_stamp = &self.owner_stamp;
+            let row = store
+                .run_background_database_quantum(|| async {
+                    target!(family, |Target, Col, key, field, reference| {
+                        Ok(Target::find()
+                            .select_only()
+                            .expr_as(
+                                Func::cust(Alias::new("substr")).args([
+                                    Expr::col(field).cast_as(Alias::new("BLOB")),
+                                    Expr::val(source_offset).into(),
+                                    Expr::val(i64::try_from(count)?).into(),
+                                ]),
+                                "fragment",
+                            )
+                            .filter(key.eq(source_owner))
+                            .filter(Col::PortableRevision.eq(source_revision))
+                            .filter(reference.is_null())
+                            .filter(
+                                Expr::expr(
+                                    Func::cust(Alias::new("octet_length")).arg(Expr::col(field)),
+                                )
+                                .eq(source_size),
+                            )
+                            .filter(Col::PortableIdentity.eq(source_identity))
+                            .filter(Expr::cust(owner_stamp_sql(family)).eq(source_stamp))
+                            .into_tuple::<Vec<u8>>()
+                            .one(&store.connection)
+                            .await?)
+                    })
+                })
+                .await?;
+            let Some(fragment) = row else {
                 return Ok(true);
             };
-            let fragment: Vec<u8> = row.try_get("", "fragment")?;
             ensure!(
                 fragment.len() == count,
                 "portable source fragment incomplete"
@@ -868,7 +997,6 @@ pub(crate) async fn read_range(
         .filter(block::Column::PayloadId.eq(&meta.id))
         .filter(column.lte(start))
         .order_by_desc(column)
-        .order_by_desc(block::Column::Ordinal)
         .limit(1)
         .into_model::<BlockPosition>()
         .one(db)
@@ -907,14 +1035,36 @@ pub(crate) async fn read_range(
         anchor_offset <= start && start < anchor_offset + anchor_length,
         "portable range anchor does not contain start"
     );
-    let blocks = block::Entity::find()
-        .filter(block::Column::PayloadId.eq(&meta.id))
-        .filter(block::Column::Ordinal.gte(anchor.ordinal))
-        .filter(column.lt(end))
-        .order_by_asc(block::Column::Ordinal)
-        .limit(3)
-        .all(db)
-        .await?;
+    // Use composite-PK point reads. A LIMIT on an offset-filtered ordinal
+    // range can scan the entire tail when fewer than three blocks overlap.
+    let mut blocks = Vec::new();
+    let mut ordinal = anchor.ordinal;
+    for _ in 0..3 {
+        let b = block::Entity::find_by_id((meta.id.clone(), ordinal))
+            .one(db)
+            .await?
+            .context("portable range block missing")?;
+        let offset = if characters {
+            b.char_offset
+        } else {
+            b.byte_offset
+        };
+        let length = if characters {
+            b.original_chars
+        } else {
+            b.original_bytes
+        };
+        let block_end = offset
+            .checked_add(length)
+            .context("portable range block overflow")?;
+        blocks.push(b);
+        if block_end >= end {
+            break;
+        }
+        ordinal = ordinal
+            .checked_add(1)
+            .context("portable range ordinal overflow")?;
+    }
     let dictionary_id = meta
         .dictionary_id
         .as_deref()
@@ -1019,7 +1169,7 @@ async fn publish(
     owner_stamp: &str,
     prepared: &Prepared,
 ) -> Result<()> {
-    let (table, key, field) = family.spec();
+    let (table, _, _) = family.spec();
     let tx = store.connection.begin().await?;
     // Source revision triggers cover logical payload and ownership updates.
     // Unknown/expired roots cannot pass the existing verified root trigger.
@@ -1043,21 +1193,23 @@ async fn publish(
     } else {
         String::new()
     };
-    let assignment = if prepared.projection.is_some() {
-        format!("{field}=?4,")
-    } else {
-        String::new()
-    };
-    let mut bindings = vec![
-        owner.into(),
-        revision.into(),
-        prepared.header.id.clone().into(),
-    ];
-    bindings.push(prepared.projection.clone().unwrap_or_default().into());
-    bindings.push(identity.into());
-    bindings.push(owner_stamp.into());
-    let stamp = owner_stamp_sql(family);
-    let affected=tx.execute_raw(sql(format!("UPDATE {table} SET {assignment}{field}_payload_id=?3 WHERE {key}=?1 AND portable_revision=?2 AND portable_identity=?5 AND {stamp}=?6 AND {field}_payload_id IS NULL{owner_guard}{root_guard}"),bindings)).await?.rows_affected();
+    let affected = target!(family, |Target, Col, key, field, reference| {
+        let mut update = Target::update_many()
+            .col_expr(reference, Expr::value(prepared.header.id.clone()))
+            .filter(key.eq(owner))
+            .filter(Col::PortableRevision.eq(revision))
+            .filter(Col::PortableIdentity.eq(identity))
+            .filter(Expr::cust(owner_stamp_sql(family)).eq(owner_stamp))
+            .filter(reference.is_null())
+            .filter(Expr::cust(owner_guard.trim_start_matches(" AND ")));
+        if !root_guard.is_empty() {
+            update = update.filter(Expr::cust(root_guard.trim_start_matches(" AND ")));
+        }
+        if let Some(projection) = &prepared.projection {
+            update = update.col_expr(field, Expr::value(projection.clone()));
+        }
+        update.exec(&tx).await?.rows_affected
+    });
     if affected == 1 {
         let published = value::Entity::update_many()
             .col_expr(value::Column::Retired, Expr::value(0))
@@ -1071,16 +1223,12 @@ async fn publish(
         );
     }
     tx.commit().await?;
+    // A stale/unavailable owner is not committed completion. Diagnose it and
+    // use the existing worker's bounded backoff rather than repeatedly encoding
+    // an expired root or orphan source without an observable refusal.
+    ensure!(affected == 1, "portable source changed before publication");
     Ok(())
 }
-async fn select(store: &CrudStore, statement: Statement) -> Result<Option<sea_orm::QueryResult>> {
-    store
-        .run_background_database_quantum(|| async {
-            Ok(store.connection.query_one_raw(statement.clone()).await?)
-        })
-        .await
-}
-
 async fn dictionary_row(store: &CrudStore, family: Family) -> Result<Option<dictionary::Model>> {
     store
         .run_background_database_quantum(|| async {
@@ -1115,17 +1263,18 @@ async fn clear_blocks(store: &CrudStore, id: &str) -> Result<bool> {
 }
 
 // Fixed, small relational ownership facts. A Task completion/reparent, parent
-// workspace change or delete cannot publish preparation captured before it.
+// workspace/root owner or identity change, expiry or delete cannot publish
+// preparation captured before it. Only fixed-size relational facts are read.
 fn owner_stamp_sql(family: Family) -> &'static str {
     match family {
         Family::ToolText | Family::ToolMetadata => {
             "coalesce((SELECT json_array(th.workspace_id,t.thread_id) FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=tool_output_chunk.turn_id),'')"
         }
         Family::CliMapping => {
-            "coalesce((SELECT json_array(th.workspace_id,t.thread_id) FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=turn_cli_runtime_binding.turn_id),'')"
+            "coalesce((SELECT json_array(th.workspace_id,t.thread_id,(SELECT json_array(h.workspace_id,h.owner_thread,h.identity_sha256,h.message_count,h.import_count,h.imports_sha256,h.expired,h.ready,h.next_ordinal,h.next_import) FROM compaction_frozen_history h WHERE h.id=turn_cli_runtime_binding.frozen_manifest_id)) FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=turn_cli_runtime_binding.turn_id),'')"
         }
         Family::TaskHistory => {
-            "coalesce((SELECT json_array(t.workspace_id,t.owner_kind,t.owner_id,t.status,t.updated_at) FROM task t WHERE t.id=task_run_conversation_snapshot.task_id),'')"
+            "coalesce((SELECT json_array(t.workspace_id,t.owner_kind,t.owner_id,t.status,t.updated_at,(SELECT json_array(h.workspace_id,h.owner_thread,h.identity_sha256,h.message_count,h.import_count,h.imports_sha256,h.expired,h.ready,h.next_ordinal,h.next_import) FROM compaction_frozen_history h WHERE h.id=task_run_conversation_snapshot.frozen_manifest_id)) FROM task t WHERE t.id=task_run_conversation_snapshot.task_id),'')"
         }
         Family::TaskEvent => {
             "coalesce((SELECT json_array(t.workspace_id,t.owner_kind,t.owner_id,t.status,t.updated_at) FROM task t WHERE t.id=task_event.task_id),'')"

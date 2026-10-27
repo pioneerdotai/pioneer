@@ -17808,22 +17808,24 @@ impl CrudStore {
     pub async fn load_task_runtime_invariant_snapshot(
         &self,
     ) -> Result<TaskRuntimeInvariantSnapshot> {
-        let task_events = pioneer_entity::task_event::Entity::find()
-            .order_by_asc(pioneer_entity::task_event::Column::TaskId)
-            .order_by_asc(pioneer_entity::task_event::Column::Sequence)
-            .all(&self.connection)
-            .await
-            .context("failed to load task events for runtime invariant scan")?
-            .into_iter()
-            .map(|row| TaskRuntimeInvariantEventRecord {
-                id: row.id,
-                task_id: row.task_id,
-                run_id: row.run_id,
-                sequence: row.sequence,
-                event_type: row.event_type,
-                payload_json: row.payload_json,
-            })
-            .collect::<Vec<_>>();
+        let task_events = task_event::load_rows(
+            &self.connection,
+            pioneer_entity::task_event::Entity::find()
+                .order_by_asc(pioneer_entity::task_event::Column::TaskId)
+                .order_by_asc(pioneer_entity::task_event::Column::Sequence),
+        )
+        .await
+        .context("failed to load task events for runtime invariant scan")?
+        .into_iter()
+        .map(|row| TaskRuntimeInvariantEventRecord {
+            id: row.id,
+            task_id: row.task_id,
+            run_id: row.run_id,
+            sequence: row.sequence,
+            event_type: row.event_type,
+            payload_json: row.payload_json,
+        })
+        .collect::<Vec<_>>();
 
         let task_runs_by_id = pioneer_entity::task_run::Entity::find()
             .all(&self.connection)
@@ -18281,7 +18283,9 @@ impl CrudStore {
             run_id: run_id.clone(),
             started_at,
         };
-        let prepared_event = task_event::PreparedTaskEvent::prepare(payload)?;
+        let prepared_event = task_event::PreparedTaskEvent::prepare(payload)?
+            .preflight_idempotency(&self.connection)
+            .await?;
         let transaction = self
             .connection
             .begin()
@@ -18327,8 +18331,6 @@ impl CrudStore {
             transaction.rollback().await?;
             return Ok(None);
         }
-
-        let prepared_event = prepared_event.preflight_idempotency(&transaction).await?;
 
         let mut appended_event =
             match task_event::append_prepared_event(&transaction, prepared_event, created_at).await
@@ -33521,9 +33523,24 @@ impl CrudStore {
                     .await?,
                 );
             }
-            prepared.push(event);
+            prepared.push(event.preflight_idempotency(&self.connection).await?);
         }
+        task_event::prepare_batch_idempotency(&mut prepared);
         Ok(prepared)
+    }
+
+    /// Refresh only portable/idempotency facts. Preserve every domain fence,
+    /// projection and delivery boundary of a caller-owned prepared transition.
+    async fn refresh_task_event_preflight(
+        &self,
+        events: Vec<task_event::PreparedTaskEvent>,
+    ) -> Result<Vec<task_event::PreparedTaskEvent>> {
+        let mut refreshed = Vec::with_capacity(events.len());
+        for event in events {
+            refreshed.push(event.preflight_idempotency(&self.connection).await?);
+        }
+        task_event::prepare_batch_idempotency(&mut refreshed);
+        Ok(refreshed)
     }
 
     async fn prepare_candidate_writes_for_task_event<C: ConnectionTrait>(
@@ -33709,6 +33726,7 @@ impl CrudStore {
         let created_at = unix_to_datetime(event_timestamp_secs);
         let mut appended_events = Vec::with_capacity(events.len());
         let mut batch_run_turns = HashMap::<String, PreparedLegacyTaskRunTurn>::new();
+        let mut batch_identities = task_event::TaskEventBatchIdentities::new();
 
         for event in events {
             let mut event = if delivery_cancellation {
@@ -33768,7 +33786,6 @@ impl CrudStore {
                     _ => None,
                 }
             };
-            let event = event.preflight_idempotency(db).await?;
             let gate_resolution = self
                 .prepare_candidate_writes_for_task_event(
                     db,
@@ -33785,8 +33802,13 @@ impl CrudStore {
             let event = event
                 .with_candidate_gate_resolution(gate_resolution)
                 .with_delivery_authority(delivery_authority);
-            let mut appended_event =
-                task_event::append_prepared_event(db, event, created_at).await?;
+            let mut appended_event = task_event::append_prepared_event_with_batch(
+                db,
+                event,
+                created_at,
+                &mut batch_identities,
+            )
+            .await?;
 
             if appended_event.append_status.is_inserted() {
                 self.task_projector
@@ -35604,7 +35626,7 @@ mod tests {
 
     fn migrations_through(name: &str) -> Vec<Box<dyn migration::MigrationTrait>> {
         let mut found = false;
-        let migrations = Migrator::migrations()
+        let mut migrations = Migrator::migrations()
             .into_iter()
             .take_while(|migration| {
                 let include = !found;
@@ -35615,6 +35637,28 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(found, "target migration {name} must remain registered");
+        if let Some(tracker) = migrations.iter().position(|migration| {
+            migration.name() == "m20261002_000001_task_run_occurrence_reconcile"
+        }) {
+            // Tracker fixtures use current TaskEvent CRUD. Its physical storage
+            // columns are independent of tracking installation/history policy.
+            // Install only that projection (and its shared tables) before the
+            // earliest tracker so tracker down/up never removes these columns.
+            // Earlier exact-schema fixtures retain their original prefix.
+            let storage = Migrator::migrations()
+                .into_iter()
+                .filter(|candidate| {
+                    matches!(
+                        candidate.name(),
+                        "m20261027_000001_portable_payload"
+                            | "m20261027_000005_portable_task_event"
+                    ) && !migrations
+                        .iter()
+                        .any(|migration| migration.name() == candidate.name())
+                })
+                .collect::<Vec<_>>();
+            migrations.splice(tracker..tracker, storage);
+        }
         migrations
     }
 

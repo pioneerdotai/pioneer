@@ -17,8 +17,9 @@ const NOW: i64 = 4_000_000_000;
 const AT: i64 = 1_700_000_000;
 const MIGRATION: &str = "m20261008_000003_task_occurrence_reconcile";
 
-// Pin migration fixtures to the schema under test so later, irreversible
-// migrations do not participate in its rollback or installation checks.
+// Keep this tracker last for rollback/installation checks. The shared helper
+// supplies only orthogonal current TaskEvent storage before the trackers;
+// later irreversible migrations remain excluded.
 struct TrackerMigrator;
 
 impl MigratorTrait for TrackerMigrator {

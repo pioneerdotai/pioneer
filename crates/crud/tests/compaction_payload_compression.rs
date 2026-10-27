@@ -707,6 +707,96 @@ async fn portable_tool_storage_survives_staging_restart_and_preserves_retry_and_
 }
 
 #[tokio::test]
+async fn portable_hot_append_stream_does_not_starve_updates_below_cursor() {
+    let (_file, store, _writer) = fixture().await;
+    let output = pioneer_protocol::ItemDeltaNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        item_id: "rescan".into(),
+        delta: "legacy".into(),
+        stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+        payload: None,
+        markdown: None,
+        markdown_version: None,
+    };
+    for id in ["a", "m"] {
+        store.record_tool_output(id, &output).await.unwrap();
+    }
+    let mut progress = pioneer_crud::PortablePayloadProgress::default();
+    for _ in 0..64 {
+        progress.quantum(&store).await.unwrap();
+        if scalar(
+            &store,
+            "SELECT count(*) n FROM tool_output_chunk WHERE id='a' AND text_payload_id IS NOT NULL",
+        )
+        .await
+            == 1
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM tool_output_chunk WHERE id='a' AND text_payload_id IS NOT NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM tool_output_chunk WHERE id='m' AND text_payload_id IS NULL"
+        )
+        .await,
+        1
+    );
+    // A legacy source mutation invalidates completed backing below the pass's
+    // current cursor. Higher keys arrive faster than this worker can encode.
+    let replacement = "replacement 界🙂";
+    store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE tool_output_chunk SET text=?1 WHERE id='a'",
+            [replacement.into()],
+        ))
+        .await
+        .unwrap();
+    let mut revisited = false;
+    for index in 0..128 {
+        store
+            .record_tool_output(&format!("z{index:04}"), &output)
+            .await
+            .unwrap();
+        progress.quantum(&store).await.unwrap();
+        if scalar(
+            &store,
+            "SELECT count(*) n FROM tool_output_chunk WHERE id='a' AND text_payload_id IS NOT NULL",
+        )
+        .await
+            == 1
+        {
+            revisited = true;
+            break;
+        }
+    }
+    assert!(
+        revisited,
+        "a never-ending higher-key stream cannot starve lower-key updates"
+    );
+    let rows = store
+        .tool_output_page("ws", "thread", "turn", "rescan", 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter().find(|row| row.1.id == "a").unwrap().1.text,
+        replacement
+    );
+}
+
+#[tokio::test]
 async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() {
     let (_file, store, _writer) = fixture().await;
     let at = chrono::Utc::now().fixed_offset();
@@ -714,7 +804,7 @@ async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() 
         &serde_json::json!([{"role":"user","content":"контекст🦀".repeat(12000)}]),
     )
     .unwrap();
-    let original = format!(
+    let mut original = format!(
         "  {}\n",
         serde_json::json!({"pioneerContextBasis":{"historyJson":history,"executionThreadId":"thread","pendingTurn":{"turnId":"turn","messageRevision":0,"messageDeleted":false}},"input":"original sent bytes"})
     );
@@ -742,8 +832,33 @@ async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() 
         .await
         .unwrap();
     let mut progress = pioneer_crud::PortablePayloadProgress::default();
-    for _ in 0..180 {
+    let mut staged = false;
+    for _ in 0..100 {
         progress.quantum(&store).await.unwrap();
+        if scalar(&store, "SELECT count(*) n FROM portable_payload_block b JOIN portable_payload p ON p.id=b.payload_id WHERE p.family='cli.mapping' AND p.retired=1").await > 0 {
+            staged = true;
+            break;
+        }
+    }
+    assert!(staged, "replace a real staged source before publication");
+    assert_eq!(scalar(&store, "SELECT count(*) n FROM turn_cli_runtime_binding WHERE turn_id='turn' AND input_mapping_json_payload_id IS NULL").await, 1);
+    // Interleave an authoritative logical UPSERT with the old CPU preparation.
+    // Even insignificant JSON whitespace is part of the exact sent bytes.
+    original.push_str(" \n");
+    binding.input_mapping_json = original.clone();
+    store
+        .upsert_cli_runtime_turn_binding(binding.clone())
+        .await
+        .unwrap();
+    for _ in 0..180 {
+        if let Err(error) = progress.quantum(&store).await {
+            // A CAS miss is a diagnosed maintenance refusal. Only the old
+            // staged source may be discarded; the replacement must converge.
+            assert_eq!(
+                error.to_string(),
+                "portable source changed before publication"
+            );
+        }
     }
     assert_eq!(scalar(&store,"SELECT count(*) n FROM turn_cli_runtime_binding WHERE input_mapping_json_payload_id IS NOT NULL AND octet_length(input_mapping_json)<256").await,1);
     assert_eq!(
@@ -1008,6 +1123,20 @@ async fn portable_task_snapshot_fragment_does_not_decode_distant_corrupt_block()
         .unwrap()
         .unwrap();
     assert_eq!(intact.text, expected_distant);
+    // Content checksums alone do not authenticate a block's position. A bad
+    // offset must fail before valid bytes from the wrong block are returned.
+    store.database_connection().execute_unprepared(
+        "UPDATE portable_payload_block SET char_offset=1 WHERE ordinal=3 AND payload_id=(SELECT history_json_payload_id FROM task_run_conversation_snapshot WHERE run_id='run')"
+    ).await.unwrap();
+    assert!(
+        store
+            .compaction_reference_fragment("ws", "thread", &reference, 1)
+            .await
+            .is_err()
+    );
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "UPDATE portable_payload_block SET char_offset=?1 WHERE ordinal=3 AND payload_id=(SELECT history_json_payload_id FROM task_run_conversation_snapshot WHERE run_id='run')",
+        [i64::try_from(distant_offset).unwrap().into()])).await.unwrap();
     let changed = store.database_connection().execute_unprepared(
         "UPDATE portable_payload_block SET data=zeroblob(78) WHERE ordinal=3 AND payload_id=(SELECT history_json_payload_id FROM task_run_conversation_snapshot WHERE run_id='run')"
     ).await.unwrap();

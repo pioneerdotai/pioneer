@@ -14,6 +14,7 @@ mod m20261027_000001_portable_payload;
 mod m20261027_000002_portable_tool_output;
 mod m20261027_000003_portable_cli_mapping;
 mod m20261027_000004_portable_task_history;
+mod m20261027_000005_portable_task_event;
 mod portable_payload_target;
 
 pub struct Migrator;
@@ -223,6 +224,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261027_000002_portable_tool_output::Migration),
             Box::new(m20261027_000003_portable_cli_mapping::Migration),
             Box::new(m20261027_000004_portable_task_history::Migration),
+            Box::new(m20261027_000005_portable_task_event::Migration),
         ]
     }
 }

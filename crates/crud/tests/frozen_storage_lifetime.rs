@@ -1103,26 +1103,44 @@ async fn malformed_legacy_locator_is_scoped_and_reconciliation_continues_after_r
 }
 
 #[tokio::test]
-async fn oversized_legacy_locator_keeps_unknown_scope_without_starving_other_workspace() {
-    // This is a pre-cutover legacy record, not a new authoritative writer.
-    // Its size exceeds the bounded reconciliation limit; guessing NULL would
-    // allow cleanup of a descriptor hidden in the uninspected remainder.
-    let legacy =
-        serde_json::json!({"provider":"claude","padding":"x".repeat(9 * 1024 * 1024)}).to_string();
+async fn oversized_legacy_locator_validates_descriptor_in_tail_without_starving_other_workspace() {
+    // A valid descriptor after >8 MiB of ignored data must be verified, never
+    // guessed absent from a bounded prefix or retained unknown just for size.
+    let descriptor = FrozenHistoryRef {
+        format: 1,
+        manifest_id: "blocked".into(),
+        messages: 1,
+        identity_sha256: "a".repeat(64),
+    };
+    let legacy = serde_json::json!({
+        "padding":"x".repeat(9 * 1024 * 1024),
+        "pioneerContext": {
+            "version":4,"nativeThreadId":"native","acceptedTurnId":"accepted",
+            "acceptedTurnRevision":0,"acceptedTurnDeleted":false,
+            "contextOwnerThreadId":"thread",
+            "contextHistoryJson":serde_json::to_string(&descriptor).unwrap(),
+        }
+    })
+    .to_string();
     let store = legacy_binding(&legacy).await;
     header(&store, "blocked", "ws", "thread", 1, 0).await;
     header(&store, "free", "other", "other-thread", 1, 0).await;
     let mut progress = FrozenStorageLifetimeProgress::default();
-    assert_eq!(
-        drive(&store, &mut progress, 2500).await,
-        0,
-        "an oversized locator must hold its scope without worker backoff"
-    );
-    assert_eq!(n(&store, "SELECT count(*) AS n FROM thread_cli_runtime_binding WHERE thread_id=?1 AND frozen_manifest_id='';", "thread").await, 1);
+    assert_eq!(drive(&store, &mut progress, 2500).await, 0);
+    assert_eq!(n(&store, "SELECT count(*) AS n FROM thread_cli_runtime_binding WHERE thread_id=?1 AND frozen_manifest_id='blocked'", "thread").await, 1);
     assert_eq!(expired(&store, "blocked").await, 0);
     assert_eq!(physical(&store, "blocked").await, 1);
     assert_eq!(expired(&store, "free").await, 1);
     assert_eq!(physical(&store, "free").await, 0);
+    assert_eq!(
+        store
+            .get_cli_runtime_thread_binding("thread")
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_cursor_json,
+        legacy
+    );
     store
         .upsert_cli_runtime_thread_binding(binding("{}".into()))
         .await
@@ -1130,6 +1148,61 @@ async fn oversized_legacy_locator_keeps_unknown_scope_without_starving_other_wor
     drive(&store, &mut progress, 2000).await;
     assert_eq!(expired(&store, "blocked").await, 1);
     assert_eq!(physical(&store, "blocked").await, 0);
+}
+
+#[tokio::test]
+async fn oversized_unknown_cli_and_task_history_restart_then_publish_portable_storage() {
+    let db = db_fixture(true).await;
+    let legacy_store = CrudStore::new(db.clone()).with_maintenance_access();
+    task(&legacy_store, "task", "running").await;
+    let history =
+        serde_json::json!([{"role":"user","content":"x".repeat(8 * 1024 * 1024)}]).to_string();
+    let mapping = serde_json::json!({"pioneerContextBasis":{
+        "executionThreadId":"thread",
+        "pendingTurn":{"turnId":"turn","messageRevision":0,"messageDeleted":false},
+        "historyJson":history,
+    }})
+    .to_string();
+    sql(&legacy_store,"INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",vec![]).await;
+    sql(&legacy_store,"INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run','task','run',1,1,'succeeded','agent')",vec![]).await;
+    sql(&legacy_store,"INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,input_mapping_json) VALUES('turn','thread','thread','ws','runtime','codex','native','completed',?1)",vec![mapping.clone().into()]).await;
+    sql(&legacy_store,"INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES('run','task','ws','thread',?1,CURRENT_TIMESTAMP)",vec![history.clone().into()]).await;
+    drop(legacy_store);
+    Migrator::up(&db, None).await.unwrap();
+    let store = CrudStore::new(db).with_maintenance_access();
+    let unknown = "SELECT (SELECT count(*) FROM turn_cli_runtime_binding WHERE turn_id=?1 AND frozen_manifest_id='')+(SELECT count(*) FROM task_run_conversation_snapshot WHERE run_id='run' AND frozen_manifest_id='') n";
+    assert_eq!(n(&store, unknown, "turn").await, 2);
+    let mut interrupted = FrozenStorageLifetimeProgress::default();
+    assert_eq!(drive(&store, &mut interrupted, 64).await, 0);
+    assert_eq!(
+        n(&store, unknown, "turn").await,
+        2,
+        "both sources exceed one unfinished locator pass"
+    );
+    drop(interrupted);
+    let mut restarted = FrozenStorageLifetimeProgress::default();
+    assert_eq!(drive(&store, &mut restarted, 5000).await, 0);
+    assert_eq!(n(&store,"SELECT (SELECT count(*) FROM turn_cli_runtime_binding WHERE turn_id=?1 AND frozen_manifest_id IS NULL)+(SELECT count(*) FROM task_run_conversation_snapshot WHERE run_id='run' AND frozen_manifest_id IS NULL) n","turn").await,2);
+    portable_schema_backfill(&store).await;
+    assert_eq!(n(&store,"SELECT (SELECT count(*) FROM turn_cli_runtime_binding b JOIN portable_payload p ON p.id=b.input_mapping_json_payload_id WHERE b.turn_id=?1 AND p.raw=0 AND p.retired=0 AND p.original_bytes>8388608 AND octet_length(b.input_mapping_json)<128)+(SELECT count(*) FROM task_run_conversation_snapshot s JOIN portable_payload p ON p.id=s.history_json_payload_id WHERE s.run_id='run' AND p.raw=0 AND p.retired=0 AND p.original_bytes>8388608 AND octet_length(s.history_json)<128) n","turn").await,2);
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding("turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .input_mapping_json,
+        mapping
+    );
+    assert_eq!(
+        store
+            .get_task_run_conversation_snapshot("run")
+            .await
+            .unwrap()
+            .unwrap()
+            .history_json,
+        history
+    );
 }
 
 #[tokio::test]
@@ -1344,6 +1417,284 @@ async fn released_schema_upgrade_matches_fresh_triggers_and_releases_existing_in
             .await,
             1
         );
+    }
+}
+
+// Keep schema rollback local to these drafts. Never down historical migrations
+// (some are irreversible), or include a future migration appended after them.
+fn portable_schema_migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+    let mut migrations = Migrator::migrations();
+    let first = migrations
+        .iter()
+        .position(|m| m.name() == "m20261027_000001_portable_payload")
+        .unwrap();
+    let last = migrations
+        .iter()
+        .position(|m| m.name() == "m20261027_000005_portable_task_event")
+        .unwrap();
+    migrations.drain(first..=last).collect()
+}
+
+async fn portable_schema_step(
+    store: &CrudStore,
+    migration: &dyn migration::MigrationTrait,
+    up: bool,
+) -> Result<(), sea_orm::DbErr> {
+    let db = store.database_connection();
+    let tx = db.begin().await?;
+    // SchemaManager needs SeaORM's transaction type. The existing deref keeps
+    // this isolated DDL under the scoped serialized writer reservation.
+    let result = {
+        let manager = migration::SchemaManager::new(&*tx);
+        if up {
+            migration.up(&manager).await
+        } else {
+            migration.down(&manager).await
+        }
+    };
+    match result {
+        Ok(()) => tx.commit().await,
+        Err(error) => {
+            tx.rollback().await.unwrap();
+            Err(error)
+        }
+    }
+}
+
+async fn portable_upgrade_fixture(large: bool) -> (CrudStore, [String; 5]) {
+    let db = db_fixture_before(Some("m20261027_000001_portable_payload")).await;
+    let store = CrudStore::new(db.clone()).with_maintenance_access();
+    let text = "界🙂".repeat(if large { 4096 } else { 1 });
+    let event = pioneer_protocol::TaskEventPayload::Progress {
+        task_id: "task".into(),
+        run_id: None,
+        message: text.clone(),
+        details: None,
+    };
+    let originals = [
+        text.clone(),
+        serde_json::json!({"text": text}).to_string(),
+        serde_json::json!({"input": text}).to_string(),
+        if large {
+            serde_json::json!([{"role":"user","content":text}]).to_string()
+        } else {
+            "[]".into()
+        },
+        serde_json::to_string(&event).unwrap(),
+    ];
+    task(&store, "task", "running").await;
+    sql(&store,"INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",vec![]).await;
+    sql(&store,"INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run','task','run',1,1,'succeeded','agent')",vec![]).await;
+    // Seed actual pre-portable rows, without today's Entity storage columns.
+    // NULL locators mean these valid legacy values contain no frozen reference;
+    // existing verified-root triggers remain enabled throughout the fixture.
+    sql(&store,"INSERT INTO tool_output_chunk(id,turn_id,item_id,stream,text,metadata) VALUES('chunk','turn','item','stdout',?1,?2)",vec![originals[0].clone().into(),originals[1].clone().into()]).await;
+    sql(&store,"INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,input_mapping_json,frozen_manifest_id) VALUES('turn','thread','thread','ws','runtime','codex','native','completed',?1,NULL)",vec![originals[2].clone().into()]).await;
+    sql(&store,"INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) VALUES('run','task','ws','thread',?1,CURRENT_TIMESTAMP,NULL)",vec![originals[3].clone().into()]).await;
+    sql(&store,"INSERT INTO task_event(id,task_id,sequence,event_type,payload_json,created_at) VALUES('event','task',1,'progress',?1,CURRENT_TIMESTAMP)",vec![originals[4].clone().into()]).await;
+    drop(store);
+    Migrator::up(&db, None).await.unwrap();
+    (CrudStore::new(db).with_maintenance_access(), originals)
+}
+
+async fn assert_portable_plain_values(store: &CrudStore, originals: &[String; 5]) {
+    // Historical schema reads also work while portable columns are absent.
+    let row = store.database_connection().query_one_raw(Statement::from_string(
+        DbBackend::Sqlite,
+        "SELECT c.text,c.metadata,b.input_mapping_json,s.history_json,e.payload_json FROM tool_output_chunk c JOIN turn_cli_runtime_binding b ON b.turn_id=c.turn_id JOIN task_run_conversation_snapshot s ON s.run_id='run' JOIN task_event e ON e.task_id=s.task_id WHERE c.id='chunk' AND e.id='event'",
+    )).await.unwrap().unwrap();
+    for (field, original) in [
+        "text",
+        "metadata",
+        "input_mapping_json",
+        "history_json",
+        "payload_json",
+    ]
+    .into_iter()
+    .zip(originals)
+    {
+        assert_eq!(
+            row.try_get::<String>("", field).unwrap(),
+            *original,
+            "{field}"
+        );
+    }
+}
+
+async fn assert_portable_logical_reads(store: &CrudStore, originals: &[String; 5]) {
+    let chunks = store
+        .tool_output_page("ws", "thread", "turn", "item", 0)
+        .await
+        .unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].1.text, originals[0]);
+    assert_eq!(chunks[0].1.metadata.as_ref(), Some(&originals[1]));
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding("turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .input_mapping_json,
+        originals[2]
+    );
+    assert_eq!(
+        store
+            .get_task_run_conversation_snapshot("run")
+            .await
+            .unwrap()
+            .unwrap()
+            .history_json,
+        originals[3]
+    );
+    let events = store.list_task_events_after("task", 0).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, "event");
+    assert_eq!(events[0].sequence, 1);
+    assert_eq!(
+        events[0].payload,
+        serde_json::from_str::<pioneer_protocol::TaskEventPayload>(&originals[4]).unwrap()
+    );
+}
+
+async fn portable_schema_backfill(store: &CrudStore) {
+    let mut progress = pioneer_crud::PortablePayloadProgress::default();
+    let mut idle = 0;
+    for _ in 0..1024 {
+        if progress.quantum(store).await.unwrap() {
+            idle = 0;
+        } else {
+            idle += 1;
+            if idle == 16 {
+                return;
+            }
+        }
+    }
+    panic!("portable schema fixture exceeded its maintenance budget");
+}
+
+#[tokio::test]
+async fn portable_schema_upgrade_and_raw_rollback_reapply_preserve_values_and_reclaim_headers() {
+    let (store, originals) = portable_upgrade_fixture(false).await;
+    assert_portable_plain_values(&store, &originals).await;
+    assert_portable_logical_reads(&store, &originals).await;
+    assert_eq!(
+        n(
+            &store,
+            "SELECT count(*) n FROM portable_payload WHERE id<>?1",
+            ""
+        )
+        .await,
+        0,
+        "schema upgrade must leave legacy conversion to maintenance"
+    );
+    assert_eq!(n(&store,"SELECT count(*) n FROM tool_output_chunk c JOIN turn_cli_runtime_binding b ON b.turn_id=c.turn_id JOIN task_run_conversation_snapshot s ON s.run_id='run' JOIN task_event e ON e.task_id=s.task_id WHERE c.id=?1 AND c.text_payload_id IS NULL AND c.metadata_payload_id IS NULL AND b.input_mapping_json_payload_id IS NULL AND s.history_json_payload_id IS NULL AND e.payload_json_payload_id IS NULL", "chunk").await,1);
+    let migrations = portable_schema_migrations();
+    // All five drafts can roll back/reapply with pending legacy values. Keep
+    // the migration ledger alone: these are direct schema contracts, and no
+    // subsequent Migrator call relies on the ledger during this round trip.
+    for migration in migrations.iter().rev() {
+        portable_schema_step(&store, migration.as_ref(), false)
+            .await
+            .unwrap();
+    }
+    assert_portable_plain_values(&store, &originals).await;
+    for migration in &migrations {
+        portable_schema_step(&store, migration.as_ref(), true)
+            .await
+            .unwrap();
+    }
+    portable_schema_backfill(&store).await;
+    assert_portable_logical_reads(&store, &originals).await;
+    let headers = store
+        .database_connection()
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT id,raw,retired FROM portable_payload",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        headers.len(),
+        5,
+        "every legacy field reached completed raw storage"
+    );
+    let ids: Vec<String> = headers
+        .into_iter()
+        .map(|row| {
+            assert_eq!(row.try_get::<i32>("", "raw").unwrap(), 1);
+            assert_eq!(row.try_get::<i32>("", "retired").unwrap(), 0);
+            row.try_get("", "id").unwrap()
+        })
+        .collect();
+    // Keep common storage installed so retirement and actual worker cleanup
+    // are observable, rather than making old headers disappear via DROP TABLE.
+    for migration in migrations[1..].iter().rev() {
+        portable_schema_step(&store, migration.as_ref(), false)
+            .await
+            .unwrap();
+    }
+    assert_portable_plain_values(&store, &originals).await;
+    for id in &ids {
+        assert_eq!(
+            n(
+                &store,
+                "SELECT retired n FROM portable_payload WHERE id=?1",
+                id
+            )
+            .await,
+            1,
+            "raw metadata must become reclaimable before its reference column disappears"
+        );
+    }
+    for migration in &migrations[1..] {
+        portable_schema_step(&store, migration.as_ref(), true)
+            .await
+            .unwrap();
+    }
+    portable_schema_backfill(&store).await;
+    for id in &ids {
+        assert_eq!(
+            n(
+                &store,
+                "SELECT count(*) n FROM portable_payload WHERE id=?1",
+                id
+            )
+            .await,
+            0,
+            "reapply must not strand the old live raw header"
+        );
+    }
+    assert_portable_logical_reads(&store, &originals).await;
+}
+
+#[tokio::test]
+async fn portable_schema_rollback_refuses_live_compressed_values_without_losing_reads() {
+    let (store, originals) = portable_upgrade_fixture(true).await;
+    portable_schema_backfill(&store).await;
+    assert_eq!(
+        n(
+            &store,
+            "SELECT count(*) n FROM portable_payload WHERE raw=0 AND retired=0 AND id<>?1",
+            ""
+        )
+        .await,
+        5,
+        "exercise live compressed storage in every target, not raw fallback"
+    );
+    assert_portable_logical_reads(&store, &originals).await;
+    for migration in portable_schema_migrations().iter().rev() {
+        let error = portable_schema_step(&store, migration.as_ref(), false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, sea_orm::DbErr::Custom(message) if message.contains("restoring") && message.contains("TEXT")),
+            "{} must reject destructive rollback at the live-value guard: {error}",
+            migration.name()
+        );
+        // In particular the snapshot down drops a basis trigger before its
+        // guard. Roll the entire failed migration back, then use real readers.
+        assert_portable_logical_reads(&store, &originals).await;
     }
 }
 

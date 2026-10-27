@@ -75,13 +75,13 @@ pub(super) async fn down(m: &SchemaManager<'_>, table: &str, fields: &[&str]) ->
     if m.get_connection()
         .query_one(Statement::from_string(
             DbBackend::Sqlite,
-            format!("SELECT 1 FROM portable_payload p WHERE p.raw=0 AND p.id IN ({refs}) LIMIT 1"),
+            format!("SELECT 1 FROM ({refs}) referenced LEFT JOIN portable_payload p ON p.id=referenced.id WHERE referenced.id IS NOT NULL AND (p.id IS NULL OR p.raw<>1) LIMIT 1"),
         ))
         .await?
         .is_some()
     {
         return Err(DbErr::Custom(
-            "portable rollback requires restoring original TEXT first".into(),
+            "portable rollback requires restoring original TEXT or verified raw storage".into(),
         ));
     }
     // Raw values retain original TEXT. Retire their auxiliary metadata before

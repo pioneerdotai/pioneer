@@ -118,6 +118,7 @@ impl CrudStore {
         };
         let prepared = self.prepare_task_events_for_write(events).await?;
         self.run_serialized_write(|| async {
+            let prepared = self.refresh_task_event_preflight(prepared.clone()).await?;
             let transaction = self.connection.begin().await?;
             let outcome = async {
                 let Some(current_trigger) =
@@ -165,11 +166,7 @@ impl CrudStore {
                     return Ok(None);
                 }
                 let appended = self
-                    .append_task_events_in_connection(
-                        &transaction,
-                        prepared.clone(),
-                        run.created_at,
-                    )
+                    .append_task_events_in_connection(&transaction, prepared, run.created_at)
                     .await?;
                 task_occurrence_contract::Entity::insert(prepared_occurrence.clone())
                     .exec(&transaction)
