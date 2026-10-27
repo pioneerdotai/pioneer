@@ -1,3 +1,5 @@
+pub mod portable_payload_codec;
+pub use repositories::portable_payload::PortablePayloadProgress;
 mod codex_retry_notice;
 pub use codex_retry_notice::{CodexRetryNoticeTarget, codex_retry_notice_item_id};
 mod frozen_lifetime;
@@ -4891,7 +4893,11 @@ impl CrudStore {
         retry_with_backoff(
             || operation(),
             |error| {
-                is_anyhow_sqlite_lock(error) || task_event::is_idempotency_preflight_race(error)
+                is_anyhow_sqlite_lock(error)
+                    || task_event::is_idempotency_preflight_race(error)
+                    || error
+                        .downcast_ref::<repositories::portable_payload::PreflightRace>()
+                        .is_some()
             },
             DEFAULT_LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
@@ -33602,7 +33608,11 @@ impl CrudStore {
         retry_with_backoff(
             || operation(),
             |error| {
-                is_anyhow_sqlite_lock(error) || task_event::is_idempotency_preflight_race(error)
+                is_anyhow_sqlite_lock(error)
+                    || task_event::is_idempotency_preflight_race(error)
+                    || error
+                        .downcast_ref::<repositories::portable_payload::PreflightRace>()
+                        .is_some()
             },
             DEFAULT_LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),

@@ -9,6 +9,11 @@ mod m20261024_000001_root_conversation_compaction;
 mod m20261026_000001_frozen_locator_discovery_indexes;
 mod m20261026_000002_frozen_proof_discovery_index;
 
+mod m20261027_000001_portable_payload;
+
+mod m20261027_000002_portable_tool_output;
+mod portable_payload_target;
+
 pub struct Migrator;
 
 pub mod stable_skill_id;
@@ -212,6 +217,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261024_000001_root_conversation_compaction::Migration),
             Box::new(m20261026_000001_frozen_locator_discovery_indexes::Migration),
             Box::new(m20261026_000002_frozen_proof_discovery_index::Migration),
+            Box::new(m20261027_000001_portable_payload::Migration),
+            Box::new(m20261027_000002_portable_tool_output::Migration),
         ]
     }
 }
