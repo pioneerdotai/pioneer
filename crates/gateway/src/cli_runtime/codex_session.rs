@@ -2838,9 +2838,15 @@ mod tests {
                 .await;
                 assert!(resume.await.is_err());
                 assert!(!session.is_usable());
+                assert!(bridge.failed.load(Ordering::Acquire));
                 assert!(matches!(
                     *bridge.state.lock().await,
-                    CodexRequiredMcpBridgeState::Failed
+                    CodexRequiredMcpBridgeState::Stopping {
+                        server: None,
+                        outcome: Some(Ok(())),
+                        cleanup_done: true,
+                        ..
+                    }
                 ));
                 assert!(!bootstrap.exists());
                 assert_eq!(
@@ -4077,7 +4083,7 @@ mod tests {
                 "thread": {
                     "id": "native-thread",
                     "cwd": "/persisted-cwd",
-                    "turns": ["x".repeat(1024 * 1024 + 256)]
+                    "turns": ["x".repeat(9 * 1024 * 1024)]
                 }
             }),
         )

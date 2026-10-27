@@ -36982,6 +36982,28 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
     } else {
         let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
         assert_eq!(starts.len(), 1);
+        // Recording start_turn entry precedes the persisted native identity.
+        // Composer Stop here exercises an active turn after admission handoff.
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(binding) = crud_store
+                    .get_cli_runtime_turn_binding(&lineage.child_turn_id)
+                    .await
+                    .unwrap()
+                    && binding.native_turn_id.as_deref() == Some("native_child_turn_cancel")
+                    && let Some(transition) = processor
+                        .try_cli_runtime_turn_transition(&binding)
+                        .await
+                        .unwrap()
+                {
+                    drop(transition);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native child must finish admission before Composer Stop");
     }
 
     thread_manager
@@ -65848,8 +65870,11 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_retry_notice_storage_failure_preserves_native_execution_and_rejects_commit() {
-    use crate::cli_runtime::session_instance::CliSessionInstanceOrigin;
-    let harness = setup_live_semantic_timeline_harness("retry_storage_failure").await;
+    let mut harness = setup_live_semantic_timeline_harness("retry_storage_failure").await;
+    let manager = test_cli_runtime_manager(Arc::new(RecordingCliRuntimeSession::default()));
+    harness.processor = harness
+        .processor
+        .with_cli_runtime_manager_for_tests(manager.clone());
     let processor = &harness.processor;
     let store = processor.crud_store.clone();
     let now = chrono::Utc::now().fixed_offset();
@@ -65883,6 +65908,7 @@ async fn codex_retry_notice_storage_failure_preserves_native_execution_and_rejec
         .unwrap();
     let key =
         CLIAgentRuntimeSessionKey::new(&harness.workspace_id, "codex", &harness.thread_id).unwrap();
+    let handle = manager.get_or_start(key.clone()).await.unwrap();
     store.database_connection().execute_unprepared(
         "CREATE TRIGGER reject_codex_retry_notice BEFORE INSERT ON turn_event \
          WHEN NEW.event_type='item/completed' AND json_extract(NEW.payload,'$.payload.item.code')='codex_request_retried' \
@@ -65890,7 +65916,7 @@ async fn codex_retry_notice_storage_failure_preserves_native_execution_and_rejec
     ).await.unwrap();
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            handle.instance(),
             RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
                 native_thread_id: Some("retry_storage_thread".into()),
                 native_turn_id: Some("retry_storage_turn".into()),
@@ -65923,7 +65949,7 @@ async fn codex_retry_notice_storage_failure_preserves_native_execution_and_rejec
     );
     let event = projection.durable.into_iter().next().unwrap();
     let result = processor
-        .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), event.clone())
+        .publish_cli_runtime_durable_and_wait(handle.instance(), event.clone())
         .await;
     match result {
         Err(pioneer_runtime_events::ExecutionEventHubError::CommitRejected(rejection)) => {
@@ -65981,7 +66007,7 @@ async fn codex_retry_notice_storage_failure_preserves_native_execution_and_rejec
         .await
         .unwrap();
     processor
-        .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), event)
+        .publish_cli_runtime_durable_and_wait(handle.instance(), event)
         .await
         .expect("same valid attempt must ACK after removing the INSERT fault");
     let saved = store

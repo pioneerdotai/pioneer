@@ -833,7 +833,12 @@ mod tests {
 
         // Normal shutdown must retain the server and nested call even after
         // cancellation has been observed by the invoker.
-        provider.send(json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "wait", "arguments": {"delay_after_cancel": true}}})).await;
+        provider.send(json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+            "name": "wait", "arguments": {"delay_after_cancel": true}, "_meta": {
+                "callId": "wait-5", "threadId": "native-thread",
+                "x-codex-turn-metadata": {"thread_id": "native-thread", "turn_id": "native-turn"}
+            }
+        }})).await;
         wait_for_count(&invoker.wait_calls, 2).await;
         handle.request_shutdown();
         invoker.after_cancel_entered.notified().await;

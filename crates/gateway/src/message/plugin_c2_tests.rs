@@ -435,7 +435,14 @@ fn ordinary_owned_cli_start_uses_native_skill_and_ready_parent_for_both_provider
                     .list_turn_skill_bindings(&turn)
                     .await
                     .unwrap();
-                assert_eq!(bindings[0].skill_id, skill);
+                assert_eq!(
+                    bindings
+                        .iter()
+                        .filter(|binding| binding.skill_id == skill)
+                        .count(),
+                    1,
+                    "the selected plugin skill has exactly one committed binding"
+                );
                 let alias = crate::cli_runtime::skills::plugin_skill_alias(&parent, &skill);
                 let context = harness
                     .native_home

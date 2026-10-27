@@ -8343,14 +8343,15 @@ mod tests {
         assert_eq!(active_child.turn_id.as_deref(), Some("revision-active"));
         // Standalone still uses its original parent-thread targeting semantics.
         assert_eq!(active_child.thread_id.as_deref(), Some("thread-cancel"));
-        // Existing admission cancellation ignores terminal rows on retry.
+        // A committed execution fence must still rediscover its live direct
+        // response until the caller has interrupted that Turn.
         let transaction = db.begin().await.unwrap();
-        assert!(
-            cancel_agent_work_graph(&transaction, root_id, "repeat", now)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let retry = cancel_agent_work_graph(&transaction, root_id, "repeat", now)
+            .await
+            .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].execution_id, child_id);
+        assert_eq!(retry[0].turn_id.as_deref(), Some("revision-active"));
         transaction.rollback().await.unwrap();
         // Completion must retain the exact graph after that same durable fence.
         let transaction = db.begin().await.unwrap();

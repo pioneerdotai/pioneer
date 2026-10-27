@@ -294,7 +294,19 @@ async fn exhausted_discovery_uses_indexed_null_and_timed_ranges_with_a_large_clo
     // Upgrade existing ledger data after rolling back both draft indexes.
     // The old immediate range must be restored while the exhausted index is
     // absent; reapplying must restore the production selectors and their plans.
-    Migrator::down(&db, Some(2)).await.unwrap();
+    let migrations = Migrator::migrations();
+    let first_draft_index = migrations
+        .iter()
+        .position(|migration| {
+            migration.name() == "m20261026_000001_agent_start_reconciliation_index"
+        })
+        .unwrap();
+    Migrator::down(
+        &db,
+        Some((migrations.len() - first_draft_index).try_into().unwrap()),
+    )
+    .await
+    .unwrap();
     assert!(db.query_all_raw(Statement::from_string(DatabaseBackend::Sqlite,
         "EXPLAIN QUERY PLAN SELECT id FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_immediate WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 ORDER BY created_at,id LIMIT 1"
     )).await.is_ok());
