@@ -12,6 +12,7 @@ use super::model_install::{
 use super::runtime::LoadedVoiceEngine;
 use super::transcription::{
     PreparedSpeechBuffer, VoiceSpeechHypothesis, VoiceSpeechTranscriber, VoiceTranscriptionError,
+    VoiceTranscriptionErrorKind, transcription_error,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -187,6 +188,17 @@ impl VoiceModelInstaller for FilesystemVoiceModelInstaller {
 }
 
 pub(crate) trait VoiceEngineLoader: Send + Sync {
+    // Required runtime preparation, independent of ASR install/model selection.
+    // Reconcile invokes this on a blocking worker before its operation gate.
+    fn prepare_vad(&self, cancellation: &CancellationToken) -> Result<(), VoiceTranscriptionError> {
+        super::silero::prepare_voice_vad(cancellation).map_err(|error| {
+            transcription_error(
+                VoiceTranscriptionErrorKind::ModelUnavailable,
+                format!("required local Silero VAD is unavailable: {error:#}"),
+            )
+        })
+    }
+
     fn load(
         &self,
         entry: &VoiceModelCatalogEntry,
@@ -570,6 +582,22 @@ impl VoiceInputSupervisor {
 
     pub(crate) async fn reconcile(self: &Arc<Self>, context: VoiceReconcileContext) {
         if context.is_cancelled() {
+            return;
+        }
+        let loader = self.engine_loader.clone();
+        let cancellation = context.cancellation_token();
+        // Resource staging, hashing, Session construction and the compatibility
+        // probe must not hold either supervisor mutex (including model_operation).
+        let prepared =
+            pioneer_observability::work::spawn_blocking(move || loader.prepare_vad(&cancellation))
+                .await
+                .context("voice VAD preparation task failed")
+                .and_then(|result| result.map_err(anyhow::Error::new));
+        if context.is_cancelled() {
+            return;
+        }
+        if let Err(error) = prepared {
+            self.publish_reconcile_failure(context.generation(), format!("{error:#}"));
             return;
         }
         let _model_operation = self.model_operation.lock().await;
@@ -1073,6 +1101,13 @@ mod tests {
     }
 
     impl VoiceEngineLoader for NoIoEngineLoader {
+        fn prepare_vad(
+            &self,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> std::result::Result<(), VoiceTranscriptionError> {
+            Ok(()) // Deterministic lifecycle fixture; no native model operations.
+        }
+
         fn load(
             &self,
             _entry: &VoiceModelCatalogEntry,
@@ -1381,6 +1416,13 @@ mod tests {
     }
 
     impl VoiceEngineLoader for FakeEngineLoader {
+        fn prepare_vad(
+            &self,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> std::result::Result<(), VoiceTranscriptionError> {
+            Ok(()) // Deterministic lifecycle fixture; no native model operations.
+        }
+
         fn load(
             &self,
             _entry: &VoiceModelCatalogEntry,
@@ -2184,6 +2226,143 @@ mod tests {
         assert!(!supervisor.has_loaded_engine());
         assert_eq!(install_calls.load(Ordering::SeqCst), 0);
         assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn replacement_can_become_ready_while_cancelled_vad_preparation_returns_late() {
+        struct BlockingPreparation {
+            calls: AtomicUsize,
+            loads: Arc<AtomicUsize>,
+            entered: tokio::sync::mpsc::UnboundedSender<()>,
+            released: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl VoiceEngineLoader for BlockingPreparation {
+            fn prepare_vad(&self, _: &CancellationToken) -> Result<(), VoiceTranscriptionError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.entered.send(()).unwrap();
+                    self.released.lock().unwrap().recv().unwrap();
+                }
+                Ok(())
+            }
+            fn load(
+                &self,
+                _: &VoiceModelCatalogEntry,
+                _: &VoiceModelInstallLayout,
+            ) -> Result<LoadedVoiceEngine, VoiceTranscriptionError> {
+                self.loads.fetch_add(1, Ordering::SeqCst);
+                Ok(LoadedVoiceEngine::test_stub())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let (mut supervisor, inspect, _, _) = reconcile_supervisor(
+            FakeInstallMode::Installed(fake_layout(temp.path(), "medium")),
+            false,
+        );
+        let loads = Arc::new(AtomicUsize::new(0));
+        let (entered, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let (release, released) = std::sync::mpsc::channel();
+        supervisor.engine_loader = Arc::new(BlockingPreparation {
+            calls: AtomicUsize::new(0),
+            loads: loads.clone(),
+            entered,
+            released: Mutex::new(released),
+        });
+        let supervisor = Arc::new(supervisor);
+        let old = supervisor
+            .apply_desired(selected("small"), false)
+            .unwrap()
+            .reconcile
+            .unwrap();
+        let worker_supervisor = supervisor.clone();
+        let worker = tokio::spawn(async move {
+            worker_supervisor.reconcile(old).await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), receive.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let replacement = supervisor
+            .apply_desired(selected("medium"), false)
+            .unwrap()
+            .reconcile
+            .unwrap();
+        // A cancelled synchronous probe does not own the operation gate. The
+        // new generation can load/publish while the old probe is still running.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            supervisor.reconcile(replacement),
+        )
+        .await
+        .unwrap();
+        assert_phase(
+            &supervisor,
+            GatewayVoiceInputRuntimePhase::Ready,
+            Some("medium"),
+        );
+        release.send(()).unwrap();
+        worker.await.unwrap();
+        assert_phase(
+            &supervisor,
+            GatewayVoiceInputRuntimePhase::Ready,
+            Some("medium"),
+        );
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert_eq!(inspect.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn required_vad_asset_failure_keeps_verified_asr_install_out_of_ready() {
+        struct InvalidVadLoader(PathBuf);
+        impl VoiceEngineLoader for InvalidVadLoader {
+            fn prepare_vad(&self, _: &CancellationToken) -> Result<(), VoiceTranscriptionError> {
+                // Real resource verification, with no native runtime entry for
+                // these invalid files. ASR itself is outside this regression.
+                super::super::silero::check_asset_failure_for_test(&self.0).map_err(|error| {
+                    transcription_error(
+                        VoiceTranscriptionErrorKind::ModelUnavailable,
+                        format!("required local Silero VAD is unavailable: {error:#}"),
+                    )
+                })
+            }
+            fn load(
+                &self,
+                _: &VoiceModelCatalogEntry,
+                _: &VoiceModelInstallLayout,
+            ) -> std::result::Result<LoadedVoiceEngine, VoiceTranscriptionError> {
+                panic!("invalid mandatory VAD must prevent ASR load")
+            }
+        }
+        for corrupt in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let asset = temp.path().join("silero_vad.onnx");
+            if corrupt {
+                std::fs::write(&asset, b"corrupt asset").unwrap();
+            }
+            let layout = fake_layout(temp.path(), "small");
+            let (mut supervisor, _, install_calls, _) =
+                reconcile_supervisor(FakeInstallMode::Installed(layout), false);
+            supervisor.engine_loader = Arc::new(InvalidVadLoader(asset));
+            let supervisor = Arc::new(supervisor);
+            let context = supervisor
+                .apply_desired(selected("small"), false)
+                .unwrap()
+                .reconcile
+                .unwrap();
+            supervisor.reconcile(context).await;
+            let snapshot = supervisor.runtime_snapshot();
+            assert_eq!(snapshot.phase, GatewayVoiceInputRuntimePhase::Failed);
+            assert!(!snapshot.effective_enabled);
+            let error = snapshot.error.unwrap();
+            assert!(error.contains("required local Silero VAD"));
+            assert!(error.contains(if corrupt {
+                "invalid size"
+            } else {
+                "unavailable"
+            }));
+            assert!(!supervisor.has_loaded_engine());
+            assert!(supervisor.try_session_generation().is_none());
+            assert_eq!(install_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]
