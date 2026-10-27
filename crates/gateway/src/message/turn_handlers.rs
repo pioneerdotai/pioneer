@@ -824,6 +824,7 @@ pub(super) enum TurnStartSuccessResponse {
         continuation_thread_id: String,
         context_thread_id: String,
         agent_author: pioneer_protocol::TurnAuthorSnapshot,
+        admitted_outcome: Option<Box<crate::thread::TurnStartOutcome>>,
         completion: std::sync::Arc<
             std::sync::Mutex<
                 Option<
@@ -3389,12 +3390,13 @@ impl MessageProcessor {
         params: &TurnStartParams,
         outcome: crate::thread::TurnStartOutcome,
         authority: &crate::authorization::ExecutionAuthorizationContext,
-    ) -> Result<PreparedApiProviderTurnStart, String> {
+    ) -> anyhow::Result<PreparedApiProviderTurnStart> {
+        use pioneer_crud::AgentActionOutboxFailure as Failure;
         if !matches!(
             &params.execution_backend,
             Some(pioneer_protocol::AgentExecutionBackend::ApiProvider { .. })
         ) {
-            return Err("committed API child has a non-API execution backend".to_owned());
+            return Err(Failure::InvalidStart.into());
         }
         let effective_reasoning_effort = self
             .resolve_turn_reasoning_effort(
@@ -3405,35 +3407,34 @@ impl MessageProcessor {
                 outcome.materialization.thread.model.as_str(),
                 requested_reasoning_effort(params).as_deref(),
             )
-            .await?;
+            .await
+            .map_err(|_| Failure::PreparationUnavailable)?;
         let skill_catalog = self
             .validate_turn_skill_capabilities(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.materialization.capabilities.as_slice(),
             )
             .await
-            .map_err(|error| error.diagnostic)?;
+            .map_err(|_| Failure::PreparationUnavailable)?;
         let execution_security_snapshot = self
             .crud_store
             .get_turn_execution_security_snapshot(outcome.started_notification.turn.id.as_str())
-            .await
-            .map_err(|error| format!("failed to load committed security snapshot: {error:#}"))?
-            .ok_or_else(|| "committed Agent Turn has no security snapshot".to_owned())?
+            .await?
+            .ok_or(Failure::InvalidStart)?
             .snapshot;
         if execution_security_snapshot.permission_profile
             != outcome.materialization.turn.permission_profile
         {
-            return Err(
-                "committed Agent Turn security snapshot differs from its permission profile"
-                    .to_owned(),
-            );
+            return Err(Failure::InvalidStart.into());
         }
         if authority.workspace_id() != outcome.started_notification.workspace_id {
-            return Err("committed Agent Turn authority differs from its workspace".to_owned());
+            return Err(Failure::InvalidStart.into());
         }
         self.register_execution_lease(outcome.started_notification.turn.id.as_str())
             .await
-            .map_err(|error| format!("failed to register execution lease: {error:#}"))?;
+            .map_err(|error| {
+                super::agent_action_tools::agent_start_proof_error(error, Failure::AuthorityDenied)
+            })?;
 
         self.ensure_hook_runtime_with_run_store().await;
         self.agent_manager
@@ -3441,11 +3442,9 @@ impl MessageProcessor {
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.workspace_id.as_str(),
             )
-            .await
-            .map_err(|error| format!("failed to prepare agent thread runtime: {error}"))?;
+            .await?;
         self.ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
-            .await
-            .map_err(|error| format!("failed to activate durable listener: {error:#}"))?;
+            .await?;
         let prepared_history = self
             .load_prepared_conversation_history_for_workspace(
                 outcome.started_notification.workspace_id.as_str(),
@@ -3453,15 +3452,12 @@ impl MessageProcessor {
                 outcome.started_notification.turn.id.as_str(),
             )
             .await
-            .map_err(|_| {
-                "Conversation history is unavailable; turn preparation paused".to_owned()
-            })?;
+            .context("committed Agent conversation history is unavailable")?;
         let history = prepared_history.messages.clone();
         let workspace_skill_policies = self
             .crud_store
             .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
-            .await
-            .map_err(|error| format!("failed to load workspace skill policies: {error:#}"))?
+            .await?
             .into_iter()
             .map(|record| {
                 (
@@ -3478,16 +3474,14 @@ impl MessageProcessor {
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.materialization.input.as_slice(),
             )
-            .await
-            .map_err(|error| format!("failed to resolve artifact input: {error:#}"))?;
+            .await?;
         let runtime_environment = self
             .create_artifact_output_environment(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
             )
-            .await
-            .map_err(|error| format!("failed to prepare artifact output: {error:#}"))?
+            .await?
             .into_iter()
             .collect::<HashMap<_, _>>();
         let mut agent_skill_overlay = Vec::new();
@@ -3509,11 +3503,10 @@ impl MessageProcessor {
             &mut agent_skill_overlay,
             Some(&prepared_history),
         )
-        .await
-        .map_err(|error| format!("failed to persist child runtime snapshot: {error:#}"))?;
+        .await?;
         let permission_profile = self
             .materialized_turn_permission_profile(&outcome.materialization.turn)
-            .map_err(|error| format!("failed to resolve permission profile: {error:#}"))?;
+            .map_err(|_| Failure::InvalidStart)?;
 
         Ok(PreparedApiProviderTurnStart {
             outcome,
@@ -3561,6 +3554,16 @@ impl MessageProcessor {
         failure: impl Into<TurnStartFailure>,
     ) {
         let failure = failure.into();
+        if matches!(
+            success_response,
+            TurnStartSuccessResponse::DurableAgent { .. }
+        ) && failure.task_failure.is_some()
+        {
+            // This completion is internal to the committed outbox. Preserve the
+            // typed infrastructure cause; public JSON is not an execution proof.
+            success_response.complete_task(Err(anyhow::Error::new(failure.task_failure.unwrap())));
+            return;
+        }
         let (public_error, task_failure) = if success_response.is_task() {
             let (public_error, task_failure) = failure.into_task_failure();
             (public_error, Some(task_failure))
@@ -3680,6 +3683,7 @@ impl MessageProcessor {
     pub(super) async fn prepare_committed_agent_cli_runtime_turn(
         &self,
         params: TurnStartParams,
+        admitted_outcome: crate::thread::TurnStartOutcome,
         runtime_id: String,
         runtime_kind: CLIAgentRuntimeKind,
         permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
@@ -3712,6 +3716,7 @@ impl MessageProcessor {
             continuation_thread_id,
             context_thread_id,
             agent_author,
+            admitted_outcome: Some(Box::new(admitted_outcome)),
             completion: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
         };
         self.turn_start_cli_runtime(
@@ -4007,6 +4012,7 @@ impl MessageProcessor {
         codex: &mut Option<crate::cli_runtime::codex_mcp::CodexMcpSessionLaunchProjection>,
         claude: &mut Option<crate::cli_runtime::claude_mcp::ClaudeMcpSessionLaunchProjection>,
         opencode: &mut Option<crate::cli_runtime::opencode_mcp::OpenCodeMcpSessionLaunchProjection>,
+        committed_agent: bool,
     ) -> anyhow::Result<()> {
         use crate::turn_mcp::native_tools::NativeToolFamily;
         // Reconcile the preliminary catalog against the exact admitted identity
@@ -4021,12 +4027,20 @@ impl MessageProcessor {
                 )
             })
         {
-            let permitted = crate::turn_mcp::native_tools::materialize_task_tools(
-                Arc::new(self.clone()),
-                context,
-            )
-            .await
-            .map_err(anyhow::Error::msg)?
+            let permitted = if committed_agent {
+                crate::turn_mcp::native_tools::materialize_task_tools_with_proof(
+                    Arc::new(self.clone()),
+                    context,
+                )
+                .await?
+            } else {
+                crate::turn_mcp::native_tools::materialize_task_tools(
+                    Arc::new(self.clone()),
+                    context,
+                )
+                .await
+                .map_err(anyhow::Error::msg)?
+            }
             .into_iter()
             .flat_map(|bundle| bundle.specs.into_iter().map(|spec| spec.spec.name))
             .collect::<std::collections::HashSet<_>>();
@@ -4583,13 +4597,6 @@ impl MessageProcessor {
                     crate::authorization::ExecutionAdmissionEntryPoint::AgentTurnStart
                 }
             };
-            let already_materialized = matches!(
-                &success_response,
-                TurnStartSuccessResponse::Task {
-                    admitted_outcome: Some(_),
-                    ..
-                }
-            );
             let response_turn_id = params.turn_id.clone();
             pioneer_observability::turn_startup::set_runtime(
                 &response_turn_id,
@@ -4615,6 +4622,26 @@ impl MessageProcessor {
                     .await;
                 }};
             }
+
+            if matches!(
+                &success_response,
+                TurnStartSuccessResponse::DurableAgent {
+                    admitted_outcome: None,
+                    ..
+                }
+            ) {
+                send_turn_start_failure!(TurnStartFailure::internal(
+                    "committed Agent CLI preparation requires its admitted outcome",
+                ));
+                return;
+            }
+            let already_materialized = matches!(
+                &success_response,
+                TurnStartSuccessResponse::Task {
+                    admitted_outcome: Some(_),
+                    ..
+                } | TurnStartSuccessResponse::DurableAgent { .. }
+            );
 
             let authority_matches_response = matches!(
                 (&success_response, &execution_authority),
@@ -5909,7 +5936,8 @@ impl MessageProcessor {
                 }
             };
             let admitted_outcome = match &mut success_response {
-                TurnStartSuccessResponse::Task { admitted_outcome, .. } => admitted_outcome.take(),
+                TurnStartSuccessResponse::Task { admitted_outcome, .. }
+                | TurnStartSuccessResponse::DurableAgent { admitted_outcome, .. } => admitted_outcome.take(),
                 _ => None,
             };
             let outcome_result = if let Some(outcome) = admitted_outcome {
@@ -6186,7 +6214,7 @@ impl MessageProcessor {
                 .as_ref()
                 .map(|prepared| prepared.graph.clone());
             let materialization_result = if already_materialized {
-                // The shared Task admission already committed input, authority,
+                // Canonical admission already committed input, authority,
                 // security and execution atomically before exposing the child.
                 Ok(Ok(None))
             } else {
@@ -6269,10 +6297,23 @@ impl MessageProcessor {
             }
             self.complete_runtime_draft_materialization(execution_authority.source())
                 .await;
+            #[cfg(test)]
+            if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. }) {
+                self.completed_history_preparation_barrier.wait_if_armed(
+                    "__cli_agent_before_lease_proof__", &tokio_util::sync::CancellationToken::new(),
+                ).await;
+            }
             if let Err(error) = self
                 .register_execution_lease(outcome.started_notification.turn.id.as_str())
                 .await
             {
+                if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. })
+                    && super::agent_action_tools::agent_start_has_storage_failure(&error) {
+                    send_turn_start_failure!(TurnStartFailure::internal_typed(
+                        pioneer_tasks::TaskStartStage::CliPreparation, error,
+                    ));
+                    return None;
+                }
                 let message = format!("failed to register execution lease: {error:#}");
                 self.mark_turn_blocked(
                     outcome.started_notification.thread_id.clone(),
@@ -6326,7 +6367,19 @@ impl MessageProcessor {
                     thread_id: outcome.started_notification.thread_id.clone(), turn_id: outcome.started_notification.turn.id.clone(),
                 }, runtime_kind, &mut combined_preflight, &mut codex_mcp_launch_projection,
                 &mut claude_mcp_launch_projection, &mut opencode_mcp_launch_projection,
+                matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. }),
             ).await {
+                #[cfg(test)]
+                self.completed_history_preparation_barrier.wait_if_armed(
+                    "__cli_agent_catalog_proof_failed__", &tokio_util::sync::CancellationToken::new(),
+                ).await;
+                if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. })
+                    && super::agent_action_tools::agent_start_has_storage_failure(&error) {
+                    send_turn_start_failure!(TurnStartFailure::internal_typed(
+                        pioneer_tasks::TaskStartStage::CliPreparation, error,
+                    ));
+                    return None;
+                }
                 let message = format!("failed to finalize native CLI tool projection: {error:#}");
                 self.mark_turn_blocked(outcome.started_notification.thread_id.clone(), outcome.started_notification.turn.id.clone(), message.clone()).await;
                 send_turn_start_failure!(TurnStartFailure::internal(message));
@@ -6789,6 +6842,12 @@ impl MessageProcessor {
                 ));
                 return;
             }
+            #[cfg(test)]
+            if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. }) {
+                self.completed_history_preparation_barrier.wait_if_armed(
+                    "__cli_agent_before_context_proof__", &tokio_util::sync::CancellationToken::new(),
+                ).await;
+            }
             let execution_authorization_context = match self
                 .load_turn_execution_authorization_context(
                     outcome.started_notification.turn.id.as_str(),
@@ -6797,6 +6856,14 @@ impl MessageProcessor {
             {
                 Ok(context) => context,
                 Err(error) => {
+                    if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. })
+                        && super::agent_action_tools::agent_start_has_storage_failure(&error) {
+                        send_turn_start_failure!(TurnStartFailure::internal_typed(
+                            pioneer_tasks::TaskStartStage::CliPreparation, error,
+                        ));
+                        return;
+                    }
+
                     self.mark_turn_blocked(
                         outcome.started_notification.thread_id.clone(),
                         outcome.started_notification.turn.id.clone(),

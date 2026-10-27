@@ -81,6 +81,7 @@ pub use repositories::administrative_audit::{
     NewAdministrativeAuditEvent, audit_action_to_db, audit_domain_to_db, audit_target_kind_to_db,
     insert_administrative_audit_event,
 };
+pub use repositories::agent_domain::AgentActionOutboxFailure;
 pub use repositories::agent_domain::{
     AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS, AGENT_ACTION_OUTBOX_MAX_ATTEMPTS, AgentActionInput,
     AgentActionLedgerCompactionSummary, AgentActionOutboxClaimBatch, AgentActionTimelineProjection,
@@ -13895,17 +13896,35 @@ impl CrudStore {
             .response
             .as_ref()
             .context("agent Turn transaction requires an exact response binding")?;
-        if execution_graph
-            .child_execution
-            .parent_execution_id
-            .as_deref()
-            != Some(input_execution_id.as_str())
-            || execution_graph.child_execution.parent_thread_id.as_deref()
-                != Some(thread_model.id.as_str())
+        let response_execution = &execution_graph.child_execution;
+        let independent_root = response_execution.parent_execution_id.is_none()
+            && response_execution.id == response_execution.work_graph_root_execution_id
+            && execution_graph
+                .root_execution
+                .as_ref()
+                .is_some_and(|root| root.id == response_execution.id)
+            && response_execution.home_root_thread_id == thread_model.id;
+        let grant: serde_json::Value = serde_json::from_str(&execution_graph.grant.grant_json)?;
+        let input_bound = if independent_root {
+            grant
+                .get("source_execution_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(input_execution_id.as_str())
+                && grant
+                    .get("source_action_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(agent_action.action.id.as_str())
+        } else {
+            response_execution.parent_execution_id.as_deref() == Some(input_execution_id.as_str())
+        };
+        if !input_bound
+            || agent_action.action.execution_id != input_execution_id.as_str()
+            || agent_action.action.action_kind != "start_agent"
+            || response_execution.parent_thread_id.as_deref() != Some(thread_model.id.as_str())
             || graph_response.turn_id != turn_model.id
-            || graph_response.execution_id != execution_graph.child_execution.id
+            || graph_response.execution_id != response_execution.id
         {
-            bail!("agent Turn input/response actors differ from its execution graph");
+            bail!("agent Turn input/response actors differ from its execution graph and action");
         }
         let authority_envelope_json = authority_envelope_json.trim();
         if authority_envelope_json.is_empty() {
@@ -14411,6 +14430,31 @@ impl CrudStore {
                 unix_to_datetime(lease_until_unix),
             )
             .await
+        })
+        .await
+    }
+
+    /// Fence duplicate outbox activations using the existing starting/running
+    /// receipt. This CAS precedes the native model request, while canonical
+    /// terminal acceptance shares the same serialized writer.
+    pub async fn claim_unactivated_agent_turn(
+        &self,
+        expected: &TurnExecutionRecord,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            if turn_event_projection_stream_state::has_accepted_terminal(&tx, &expected.turn_id)
+                .await?
+            {
+                return Ok(false);
+            }
+            // Writer admission (and a storage retry) may outlive the lease.
+            // Read the clock in this attempt, after acquiring the writer and
+            // immediately before evaluating the activation fence.
+            let claimed =
+                repositories::turn_execution::claim_unactivated(&tx, expected, utc_now()).await?;
+            tx.commit().await?;
+            Ok(claimed)
         })
         .await
     }
@@ -58230,6 +58274,75 @@ mod tests {
             permission_profile.effective_policy,
             ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
         );
+    }
+
+    #[tokio::test]
+    async fn agent_activation_claim_rechecks_lease_after_waiting_for_writer() {
+        use crate::{
+            NewTurnExecution, TurnExecutionStatus, TurnExecutorKind, repositories::turn_execution,
+            utc_now,
+        };
+
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_activation_lease",
+            "thr_activation_lease",
+            "turn_activation_lease",
+        )
+        .await;
+        let now = utc_now();
+        let owner = turn_execution::insert_immutable(
+            &store.connection,
+            NewTurnExecution {
+                turn_id: turn.id.clone(),
+                thread_id: thread.id,
+                workspace_id: thread.workspace_id,
+                executor_kind: TurnExecutorKind::ApiProvider,
+                executor_key: Some("openai".to_owned()),
+                status: TurnExecutionStatus::Starting,
+                owner_id: "activation-owner".to_owned(),
+                lease_until: now + chrono::Duration::seconds(2),
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        let writer = store.connection.begin().await.unwrap();
+        let mut claim = Box::pin(store.claim_unactivated_agent_turn(&owner));
+        // Use the existing queued-future synchronization pattern: first prove
+        // that activation is waiting for the occupied writer with a live lease.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(claim.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(utc_now() < owner.lease_until);
+        // Deliberately retain this fixture's writer across the lease boundary;
+        // the waiter must evaluate time only after that writer is released.
+        tokio::time::sleep(
+            (owner.lease_until - utc_now()).to_std().unwrap_or_default()
+                + std::time::Duration::from_millis(1),
+        )
+        .await;
+        writer.rollback().await.unwrap();
+        assert!(!claim.await.unwrap());
+        let unchanged = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.status, TurnExecutionStatus::Starting);
+        assert_eq!(unchanged.owner_generation, owner.owner_generation);
+        assert!(unchanged.started_at.is_none());
+
+        // An actually renewed lease can be claimed once; a duplicate claim
+        // still cannot reuse the starting receipt.
+        store
+            .heartbeat_turn_executions_owned_by("activation-owner", 2)
+            .await
+            .unwrap();
+        let renewed = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert!(store.claim_unactivated_agent_turn(&renewed).await.unwrap());
+        let activated = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert_eq!(activated.status, TurnExecutionStatus::Running);
+        assert!(activated.started_at.is_some());
+        assert_eq!(activated.owner_generation, renewed.owner_generation);
+        assert!(!store.claim_unactivated_agent_turn(&renewed).await.unwrap());
     }
 
     #[tokio::test]
