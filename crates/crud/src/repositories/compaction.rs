@@ -3201,102 +3201,78 @@ pub(crate) async fn compaction_reference_fragment(
     character_offset: u64,
 ) -> Result<Option<CanonicalFragment>> {
     if reference.scope.starts_with("task-basis:") {
-        let offset = i64::try_from(character_offset)?
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("source offset overflow"))?;
-        let row = task_run_conversation_snapshot::Entity::find()
+        use pioneer_entity::compaction_task_basis_revision as basis_revision;
+        use sea_orm::QueryTrait;
+        use task_run_conversation_snapshot::Column as Col;
+        if reference.scope != format!("task-basis:{}", reference.id) {
+            return Ok(None);
+        }
+        // Reproduce the Task branch's relational live-source fences directly.
+        // Joining the legacy live-source view here would evaluate ltrim(TEXT)
+        // and materialize the entire history before the native byte read.
+        let query = task_run_conversation_snapshot::Entity::find()
             .select_only()
             .join(
                 JoinType::InnerJoin,
-                compaction_live_sources::join(
+                task_run_conversation_snapshot::Entity::belongs_to(thread::Entity)
+                    .from(Col::ConversationThreadId)
+                    .to(thread::Column::Id)
+                    .into(),
+            )
+            .join(
+                JoinType::LeftJoin,
+                task_run_conversation_snapshot::Entity::belongs_to(basis_revision::Entity)
+                    .from(Col::RunId)
+                    .to(basis_revision::Column::RunId)
+                    .into(),
+            )
+            .filter(Col::RunId.eq(&reference.id))
+            .filter(Col::WorkspaceId.eq(workspace))
+            .filter(Col::ConversationThreadId.eq(thread))
+            .filter(
+                Expr::col((thread::Entity, thread::Column::WorkspaceId)).eq(Expr::col((
                     task_run_conversation_snapshot::Entity,
-                    task_run_conversation_snapshot::Column::RunId,
-                    compaction_live_sources::Column::SourceId,
-                )
-                .on_condition(|_, _| {
-                    sea_orm::Condition::all().add(
-                        Expr::col((
-                            compaction_live_sources::Column::Table,
-                            compaction_live_sources::Column::SourceScope,
-                        ))
-                        .eq(Expr::val("task-basis:").binary(
-                            BinOper::Custom("||"),
-                            Expr::col((
-                                task_run_conversation_snapshot::Entity,
-                                task_run_conversation_snapshot::Column::RunId,
-                            )),
-                        )),
-                    )
-                }),
-            )
-            .expr_as(
-                // A compressed source exposes only its small projection/ref to
-                // SQL. Indexed blocks are read and decoded after this query.
-                Expr::cust_with_values(
-                    "CASE WHEN (SELECT p.raw FROM portable_payload p WHERE p.id=task_run_conversation_snapshot.history_json_payload_id)=0 THEN '' ELSE substr(task_run_conversation_snapshot.history_json,?,16384) END",
-                    [offset],
-                ),
-                "fragment",
-            )
-            .expr_as(
-                Expr::cust("CASE WHEN task_run_conversation_snapshot.history_json_payload_id IS NULL THEN length(task_run_conversation_snapshot.history_json) ELSE (SELECT p.original_chars FROM portable_payload p WHERE p.id=task_run_conversation_snapshot.history_json_payload_id) END"),
-                "characters",
+                    Col::WorkspaceId,
+                ))),
             )
             .filter(
-                Expr::col((
-                    compaction_live_sources::Column::Table,
-                    compaction_live_sources::Column::WorkspaceId,
-                ))
-                .eq(Expr::Value(workspace.into()))
-                .and(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::ThreadId,
-                    ))
-                    .eq(Expr::Value(thread.into())),
+                Expr::cust(
+                    "'task-basis-revision:'||COALESCE(compaction_task_basis_revision.revision,1)",
                 )
-                .and(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::SourceScope,
-                    ))
-                    .eq(Expr::Value(reference.scope.clone().into())),
-                )
-                .and(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::SourceId,
-                    ))
-                    .eq(Expr::Value(reference.id.clone().into())),
-                )
-                .and(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::SourceVersion,
-                    ))
-                    .eq(Expr::Value(reference.version.clone().into())),
-                ),
-            )
-            .column(task_run_conversation_snapshot::Column::HistoryJsonPayloadId)
-            .into_tuple::<(String, i64, Option<String>)>()
-            .one(&store.connection)
-            .await?;
-        let Some((mut text, characters, payload_id)) = row else {
+                .eq(&reference.version),
+            );
+        let length = "CASE WHEN task_run_conversation_snapshot.history_json_payload_id IS NULL THEN octet_length(task_run_conversation_snapshot.history_json) ELSE (SELECT p.original_bytes FROM portable_payload p WHERE p.id=task_run_conversation_snapshot.history_json_payload_id) END";
+        let row = query.clone()
+            .expr_as(Expr::cust(length), "history_bytes")
+            .column(Col::HistoryJsonPayloadId).column(Col::PortableIdentity).column(Col::PortableRevision)
+            // Only a completed compressed value has a tiny base projection.
+            // The legacy branch never evaluates OP_Column on history_json.
+            .expr_as(Expr::cust("CASE WHEN (SELECT p.raw FROM portable_payload p WHERE p.id=task_run_conversation_snapshot.history_json_payload_id)=0 THEN task_run_conversation_snapshot.history_json ELSE NULL END"), "projection")
+            .limit(1).into_tuple::<(i64, Option<String>, String, i64, Option<String>)>()
+            .one(&store.connection).await?;
+        let Some((size, payload_id, identity, revision, projection)) = row else {
             return Ok(None);
         };
-        if let Some(id) = payload_id {
+        if let Some(id) = &payload_id {
             let meta = super::portable_payload::header(
                 &store.connection,
-                &id,
+                id,
                 super::portable_payload::Family::TaskHistory,
             )
             .await?;
             ensure!(
-                meta.original_chars == characters,
-                "Task basis character length changed"
+                meta.original_bytes == size,
+                "Task basis byte length changed"
             );
             if meta.raw == 0 {
-                text = String::from_utf8(
+                let projection =
+                    projection.ok_or_else(|| anyhow::anyhow!("Task basis projection missing"))?;
+                if !projection.trim_start_matches(' ').starts_with('[') {
+                    return Ok(None);
+                }
+                let characters = u64::try_from(meta.original_chars)?;
+                ensure!(character_offset <= characters, "source offset is past end");
+                let text = String::from_utf8(
                     super::portable_payload::read_range(
                         &store.connection,
                         &meta,
@@ -3306,15 +3282,41 @@ pub(crate) async fn compaction_reference_fragment(
                     )
                     .await?,
                 )?;
+                let end = character_offset + text.chars().count() as u64;
+                return Ok(Some(CanonicalFragment {
+                    reference: reference.clone(),
+                    text,
+                    next_character: (end < characters).then_some(end),
+                }));
             }
         }
-        let characters = u64::try_from(characters)?;
-        ensure!(character_offset <= characters, "source offset is past end");
-        let end = character_offset.saturating_add(text.chars().count() as u64);
-        return Ok(Some(CanonicalFragment {
+        let guard = query
+            .expr(Expr::cust("task_run_conversation_snapshot.rowid"))
+            .filter(Col::PortableIdentity.eq(&identity))
+            .filter(Col::PortableRevision.eq(revision))
+            .filter(Expr::cust(length).eq(size))
+            .filter(match &payload_id {
+                Some(id) => Col::HistoryJsonPayloadId.eq(id),
+                None => Col::HistoryJsonPayloadId.is_null(),
+            })
+            .limit(1)
+            .build(DbBackend::Sqlite);
+        let result = super::portable_payload_legacy_text::fragment(
+            store,
+            guard,
+            super::portable_payload_legacy_text::Key {
+                run: reference.id.clone(),
+                identity,
+                revision,
+            },
+            u64::try_from(size)?,
+            character_offset,
+        )
+        .await?;
+        return Ok(result.map(|(text, next_character)| CanonicalFragment {
             reference: reference.clone(),
             text,
-            next_character: (end < characters).then_some(end),
+            next_character,
         }));
     }
     if reference.scope.starts_with("checkpoint:") {

@@ -3123,6 +3123,8 @@ pub struct CrudStore {
     episodic_claim_discoveries: std::sync::Arc<std::sync::atomic::AtomicU64>,
     episodic_work: std::sync::Arc<tokio::sync::Notify>,
     frozen_readers: frozen_lifetime::ReaderCounts,
+    legacy_task_text_cursors:
+        std::sync::Arc<std::sync::Mutex<repositories::portable_payload_legacy_text::Cursors>>,
     connection: SqliteDatabase,
     projector: TurnProjector,
     task_projector: TaskProjector,
@@ -4716,6 +4718,7 @@ impl CrudStore {
             connection: connection.into(),
             episodic_work: std::sync::Arc::new(tokio::sync::Notify::new()),
             frozen_readers: Default::default(),
+            legacy_task_text_cursors: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             episodic_claim_fault: Default::default(),
             #[cfg(any(test, feature = "test-support"))]

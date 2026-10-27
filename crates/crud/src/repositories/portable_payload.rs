@@ -9,8 +9,8 @@ use pioneer_entity::{
 };
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, OnConflict};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, TransactionTrait,
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, QueryTrait, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -439,34 +439,37 @@ impl Preparation {
             let source_revision = self.revision;
             let source_identity = &self.identity;
             let source_stamp = &self.owner_stamp;
+            let (table, _, column) = family.spec();
+            // Select rowid only; the driver holds this exact guard's snapshot
+            // while reading a native TEXT/BLOB range on the same reader.
+            let guard = target!(family, |Target, Col, key, field, reference| {
+                Target::find()
+                    .select_only()
+                    .expr(Expr::col((Alias::new(table), Alias::new("rowid"))))
+                    .filter(key.eq(source_owner))
+                    .filter(Col::PortableRevision.eq(source_revision))
+                    .filter(reference.is_null())
+                    .filter(
+                        Expr::expr(Func::cust(Alias::new("octet_length")).arg(Expr::col(field)))
+                            .eq(source_size),
+                    )
+                    .filter(Col::PortableIdentity.eq(source_identity))
+                    .filter(Expr::cust(owner_stamp_sql(family)).eq(source_stamp))
+                    .limit(1)
+                    .build(DbBackend::Sqlite)
+            });
             let row = store
                 .run_background_database_quantum(|| async {
-                    target!(family, |Target, Col, key, field, reference| {
-                        Ok(Target::find()
-                            .select_only()
-                            .expr_as(
-                                Func::cust(Alias::new("substr")).args([
-                                    Expr::col(field).cast_as(Alias::new("BLOB")),
-                                    Expr::val(source_offset).into(),
-                                    Expr::val(i64::try_from(count)?).into(),
-                                ]),
-                                "fragment",
-                            )
-                            .filter(key.eq(source_owner))
-                            .filter(Col::PortableRevision.eq(source_revision))
-                            .filter(reference.is_null())
-                            .filter(
-                                Expr::expr(
-                                    Func::cust(Alias::new("octet_length")).arg(Expr::col(field)),
-                                )
-                                .eq(source_size),
-                            )
-                            .filter(Col::PortableIdentity.eq(source_identity))
-                            .filter(Expr::cust(owner_stamp_sql(family)).eq(source_stamp))
-                            .into_tuple::<Vec<u8>>()
-                            .one(&store.connection)
-                            .await?)
-                    })
+                    Ok(store
+                        .connection
+                        .read_blob_range(
+                            pioneer_sqlite::SqliteBlobSource { table, column },
+                            guard.clone(),
+                            u64::try_from(source_offset - 1)?,
+                            count,
+                            u64::try_from(source_size)?,
+                        )
+                        .await?)
                 })
                 .await?;
             let Some(fragment) = row else {

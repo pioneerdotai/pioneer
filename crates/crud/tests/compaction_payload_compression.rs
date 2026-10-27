@@ -955,6 +955,41 @@ async fn backfill_task_snapshot(store: &CrudStore) {
 
 #[tokio::test]
 async fn portable_task_snapshot_keeps_immutable_winner_and_basis_revision_after_restart() {
+    async fn assert_fragments(
+        store: &CrudStore,
+        reference: &pioneer_compaction::SourceRef,
+        history: &str,
+    ) {
+        let mut rebuilt = String::new();
+        let mut offset = 0;
+        loop {
+            let fragment = store
+                .compaction_reference_fragment("ws", "thread", &reference, offset)
+                .await
+                .unwrap()
+                .unwrap();
+            let characters = fragment.text.chars().count() as u64;
+            assert!(characters > 0 && characters <= 16_384);
+            assert_eq!(&fragment.reference, reference);
+            assert_eq!(
+                fragment.text,
+                history
+                    .chars()
+                    .skip(offset as usize)
+                    .take(16_384)
+                    .collect::<String>()
+            );
+            rebuilt.push_str(&fragment.text);
+            offset += characters;
+            if let Some(next) = fragment.next_character {
+                assert_eq!(next, offset);
+            } else {
+                break;
+            }
+        }
+        assert_eq!(rebuilt, history);
+        assert_eq!(offset, history.chars().count() as u64);
+    }
     let (file, store, writer) = fixture().await;
     // Preserve formatting, escaping, combining marks and multibyte scalars;
     // returning a parsed/reserialized value would violate this contract.
@@ -983,6 +1018,30 @@ async fn portable_task_snapshot_keeps_immutable_winner_and_basis_revision_after_
         .compaction_projection_version("ws", "thread")
         .await
         .unwrap();
+    // The same public reader must handle legacy TEXT before cutover. These
+    // sequential reads cross physical UTF-8/character boundaries, then seek
+    // backwards and to EOF with a populated continuation cache.
+    assert_fragments(&store, &reference, &history).await;
+    for offset in [16_383, 0, history.chars().count() as u64] {
+        let fragment = store
+            .compaction_reference_fragment("ws", "thread", &reference, offset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fragment.text,
+            history
+                .chars()
+                .skip(offset as usize)
+                .take(16_384)
+                .collect::<String>()
+        );
+        let end = offset + fragment.text.chars().count() as u64;
+        assert_eq!(
+            fragment.next_character,
+            (end < history.chars().count() as u64).then_some(end)
+        );
+    }
     backfill_task_snapshot(&store).await;
     assert_eq!(
         scalar(&store, "SELECT p.original_bytes n FROM portable_payload p JOIN task_run_conversation_snapshot s ON s.history_json_payload_id=p.id WHERE s.run_id='run'").await,
@@ -1039,35 +1098,7 @@ async fn portable_task_snapshot_keeps_immutable_winner_and_basis_revision_after_
         Some(history.as_str())
     );
 
-    let mut rebuilt = String::new();
-    let mut offset = 0;
-    loop {
-        let fragment = store
-            .compaction_reference_fragment("ws", "thread", &reference, offset)
-            .await
-            .unwrap()
-            .unwrap();
-        let characters = fragment.text.chars().count() as u64;
-        assert!(characters > 0 && characters <= 16_384);
-        assert_eq!(fragment.reference, reference);
-        assert_eq!(
-            fragment.text,
-            history
-                .chars()
-                .skip(offset as usize)
-                .take(16_384)
-                .collect::<String>()
-        );
-        rebuilt.push_str(&fragment.text);
-        offset += characters;
-        if let Some(next) = fragment.next_character {
-            assert_eq!(next, offset);
-        } else {
-            break;
-        }
-    }
-    assert_eq!(rebuilt, history);
-    assert_eq!(offset, history.chars().count() as u64);
+    assert_fragments(&store, &reference, &history).await;
     assert_eq!(
         scalar(
             &store,

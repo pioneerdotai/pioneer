@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use pioneer_entity::task_run_conversation_snapshot;
 use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QuerySelect, Set,
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, FromQueryResult, QueryFilter,
+    QuerySelect, QueryTrait, Set,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +48,9 @@ pub struct StoredTaskRunConversationSnapshot {
     pub conversation_thread_id: String,
     pub source_turn_id: Option<String>,
     pub created_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    // Preserve the SQLite spelling for the source fence (legacy defaults can
+    // use a space rather than SQLx's RFC3339 binding representation).
+    pub created_at_text: String,
     pub history_json_payload_id: Option<String>,
     pub portable_revision: i64,
     pub portable_identity: String,
@@ -132,6 +136,7 @@ pub async fn find_by_run<C: ConnectionTrait>(
             Col::PortableIdentity,
         ])
         .expr_as(Expr::cust(HISTORY_BYTES_SQL), "history_bytes")
+        .expr_as(Expr::cust("CAST(created_at AS TEXT)"), "created_at_text")
         .into_model::<StoredTaskRunConversationSnapshot>()
         .one(db)
         .await
@@ -199,14 +204,8 @@ pub(crate) async fn hydrate_record(
     }
     while bytes.len() < size {
         let count = BLOCK.min(size - bytes.len());
-        let (mut fragment, current_ref) = task_run_conversation_snapshot::Entity::find_by_id(&stored.run_id)
+        let query = task_run_conversation_snapshot::Entity::find_by_id(&stored.run_id)
             .select_only()
-            // Scalar header test + byte substr are outside Entity's column API.
-            .expr_as(Expr::cust_with_values(
-                "CASE WHEN (SELECT p.raw FROM portable_payload p WHERE p.id=task_run_conversation_snapshot.history_json_payload_id)=0 THEN X'' ELSE substr(CAST(history_json AS BLOB),?,?) END",
-                [i64::try_from(bytes.len() + 1)?, i64::try_from(count)?],
-            ), "fragment")
-            .column(Col::HistoryJsonPayloadId)
             .filter(Col::PortableIdentity.eq(&stored.portable_identity))
             .filter(Col::PortableRevision.eq(stored.portable_revision))
             .filter(Col::TaskId.eq(&stored.task_id))
@@ -216,34 +215,60 @@ pub(crate) async fn hydrate_record(
                 Some(source) => Col::SourceTurnId.eq(source),
                 None => Col::SourceTurnId.is_null(),
             })
-            .filter(Col::CreatedAt.eq(stored.created_at))
-            .filter(Expr::cust(HISTORY_BYTES_SQL).eq(stored.history_bytes))
-            .into_tuple::<(Vec<u8>, Option<String>)>()
-            .one(db).await?
+            .filter(Col::CreatedAt.eq(&stored.created_at_text))
+            .filter(Expr::cust(HISTORY_BYTES_SQL).eq(stored.history_bytes));
+        let current_ref = query
+            .clone()
+            .column(Col::HistoryJsonPayloadId)
+            .into_tuple::<Option<String>>()
+            .one(db)
+            .await?
             .ok_or(super::portable_payload::PreflightRace)?;
-        if let Some(id) = current_ref {
-            let meta = super::portable_payload::header(
-                db,
-                &id,
-                super::portable_payload::Family::TaskHistory,
-            )
-            .await?;
+        let meta = match &current_ref {
+            Some(id) => Some(
+                super::portable_payload::header(
+                    db,
+                    id,
+                    super::portable_payload::Family::TaskHistory,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        if let Some(meta) = &meta {
             anyhow::ensure!(
                 meta.original_bytes == stored.history_bytes,
                 "Task snapshot length changed"
             );
             original_digest = Some(meta.sha256.clone());
-            if meta.raw == 0 {
-                fragment = super::portable_payload::read_range(
-                    db,
-                    &meta,
-                    bytes.len() as i64,
-                    count,
-                    false,
-                )
-                .await?;
-            }
         }
+        let fragment = if let Some(meta) = meta.as_ref().filter(|meta| meta.raw == 0) {
+            super::portable_payload::read_range(db, meta, bytes.len() as i64, count, false).await?
+        } else {
+            // Legacy/raw bytes use a native range. Pin the captured reference
+            // as well as logical version: a concurrent physical cutover retries
+            // this read rather than interpreting the small SQL projection.
+            let guard = query
+                .expr(Expr::cust("task_run_conversation_snapshot.rowid"))
+                .filter(match &current_ref {
+                    Some(id) => Col::HistoryJsonPayloadId.eq(id),
+                    None => Col::HistoryJsonPayloadId.is_null(),
+                })
+                .limit(1)
+                .build(DbBackend::Sqlite);
+            db.read_blob_range(
+                pioneer_sqlite::SqliteBlobSource {
+                    table: "task_run_conversation_snapshot",
+                    column: "history_json",
+                },
+                guard,
+                u64::try_from(bytes.len())?,
+                count,
+                u64::try_from(size)?,
+            )
+            .await?
+            .ok_or(super::portable_payload::PreflightRace)?
+        };
         anyhow::ensure!(fragment.len() == count, "Task snapshot fragment incomplete");
         bytes.extend(fragment);
     }

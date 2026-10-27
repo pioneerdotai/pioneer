@@ -110,13 +110,33 @@ impl LocatorRead {
         // SQLite BLOB fragment, fixed actual-byte budget; sentinel/identity CAS
         // below stays typed and never compares source JSON in the writer.
         if self.offset < self.size {
-            let row = store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                format!("SELECT substr(CAST({field} AS BLOB),?3,?4) AS fragment FROM {table} WHERE {key}=?1 AND workspace_id=?2 AND frozen_manifest_id='' AND octet_length({field})=?5 LIMIT 1"),
-                [self.id.clone().into(),self.workspace.clone().into(),(self.offset+1).into(),FRAGMENT_BYTES.into(),self.size.into()])).await?;
-            let Some(row) = row else {
+            let guard = Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!(
+                    "SELECT rowid FROM {table} WHERE {key}=?1 AND workspace_id=?2 AND frozen_manifest_id='' AND octet_length({field})=?3 LIMIT 1"
+                ),
+                [
+                    self.id.clone().into(),
+                    self.workspace.clone().into(),
+                    self.size.into(),
+                ],
+            );
+            let bytes = store
+                .connection
+                .read_blob_range(
+                    pioneer_sqlite::SqliteBlobSource {
+                        table,
+                        column: field,
+                    },
+                    guard,
+                    u64::try_from(self.offset)?,
+                    usize::try_from(FRAGMENT_BYTES.min(self.size - self.offset))?,
+                    u64::try_from(self.size)?,
+                )
+                .await?;
+            let Some(bytes) = bytes else {
                 return Ok(true);
             };
-            let bytes: Vec<u8> = row.try_get("", "fragment")?;
             ensure!(
                 bytes.len() as i64 == FRAGMENT_BYTES.min(self.size - self.offset),
                 "legacy locator fragment missing"

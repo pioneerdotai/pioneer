@@ -11,7 +11,7 @@ use pioneer_entity::{
 };
 use pioneer_protocol::{TASK_COMPOSER_WORK_VERSION, TaskMetadata, UserInput};
 use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, Func, JoinType, Order, Query};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, DbBackend, EntityTrait, QueryFilter, QueryTrait};
 use sea_orm::{ConnectionTrait, FromQueryResult};
 
 #[derive(Clone, Debug, FromQueryResult)]
@@ -1274,7 +1274,7 @@ pub(crate) async fn compaction_task_basis_snapshot(
     bytes.try_reserve(history_bytes)?;
     while bytes.len() < history_bytes {
         let count = SOURCE_PAGE_BYTES.min(history_bytes - bytes.len());
-        let row = task_run_turn::Entity::find()
+        let query = task_run_turn::Entity::find()
             .select_only()
             .join(
                 JoinType::InnerJoin,
@@ -1330,15 +1330,6 @@ pub(crate) async fn compaction_task_basis_snapshot(
                     .into(),
                 Alias::new("parent"),
             )
-            .expr_as(
-                // A compressed row returns only its small reference here.
-                // Bind offsets; scalar subqueries are outside Entity's column API.
-                Expr::cust_with_values(
-                    "CASE WHEN (SELECT p.raw FROM portable_payload p WHERE p.id=task_run_conversation_snapshot.history_json_payload_id)=0 THEN X'' ELSE substr(CAST(task_run_conversation_snapshot.history_json AS BLOB),?,?) END",
-                    [i64::try_from(bytes.len() + 1)?, i64::try_from(count)?],
-                ),
-                "fragment",
-            )
             .filter(
                 Expr::col((task_run_turn::Entity, task_run_turn::Column::ThreadId))
                     .eq(Expr::Value(thread.into()))
@@ -1388,43 +1379,75 @@ pub(crate) async fn compaction_task_basis_snapshot(
                     )
                     .and(
                         Expr::cust(TASK_HISTORY_BYTES_SQL)
-                        .eq(Expr::Value(i64::try_from(history_bytes)?.into())),
+                            .eq(Expr::Value(i64::try_from(history_bytes)?.into())),
                     ),
             )
-            .filter(Expr::col((task_run_conversation_snapshot::Entity, task_run_conversation_snapshot::Column::PortableIdentity)).eq(identity.clone()))
-            .filter(Expr::col((task_run_conversation_snapshot::Entity, task_run_conversation_snapshot::Column::PortableRevision)).eq(revision))
-            .expr(Expr::col((task_run_conversation_snapshot::Entity, task_run_conversation_snapshot::Column::HistoryJsonPayloadId)))
-            .into_tuple::<(Vec<u8>, Option<String>)>()
+            .filter(
+                Expr::col((
+                    task_run_conversation_snapshot::Entity,
+                    task_run_conversation_snapshot::Column::PortableIdentity,
+                ))
+                .eq(identity.clone()),
+            )
+            .filter(
+                Expr::col((
+                    task_run_conversation_snapshot::Entity,
+                    task_run_conversation_snapshot::Column::PortableRevision,
+                ))
+                .eq(revision),
+            );
+        let payload_id = query
+            .clone()
+            .expr(Expr::col((
+                task_run_conversation_snapshot::Entity,
+                task_run_conversation_snapshot::Column::HistoryJsonPayloadId,
+            )))
+            .into_tuple::<Option<String>>()
             .one(db)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("accepted Task basis changed during read"))?;
-        // The query releases its reader before header validation/decompression.
-        // Physical cutover between fragments is allowed: identity/revision and
-        // logical length remain pinned, while each fragment captures its ref.
-        let (mut fragment, payload_id) = row;
-        if let Some(id) = payload_id {
-            let meta = super::portable_payload::header(
-                db,
-                &id,
-                super::portable_payload::Family::TaskHistory,
-            )
-            .await?;
+            .ok_or(super::portable_payload::PreflightRace)?;
+        let meta = match &payload_id {
+            Some(id) => Some(
+                super::portable_payload::header(
+                    db,
+                    id,
+                    super::portable_payload::Family::TaskHistory,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        if let Some(meta) = &meta {
             ensure!(
                 meta.original_bytes == history_bytes as i64,
                 "accepted Task basis length changed"
             );
             original_digest = Some(meta.sha256.clone());
-            if meta.raw == 0 {
-                fragment = super::portable_payload::read_range(
-                    db,
-                    &meta,
-                    bytes.len() as i64,
-                    count,
-                    false,
-                )
-                .await?;
-            }
         }
+        let fragment = if let Some(meta) = meta.as_ref().filter(|meta| meta.raw == 0) {
+            super::portable_payload::read_range(db, meta, bytes.len() as i64, count, false).await?
+        } else {
+            let guard = query
+                .expr(Expr::cust("task_run_conversation_snapshot.rowid"))
+                .filter(match &payload_id {
+                    Some(id) => task_run_conversation_snapshot::Column::HistoryJsonPayloadId.eq(id),
+                    None => task_run_conversation_snapshot::Column::HistoryJsonPayloadId.is_null(),
+                })
+                .limit(1)
+                .build(DbBackend::Sqlite);
+            db.read_blob_range(
+                pioneer_sqlite::SqliteBlobSource {
+                    table: "task_run_conversation_snapshot",
+                    column: "history_json",
+                },
+                guard,
+                u64::try_from(bytes.len())?,
+                count,
+                u64::try_from(history_bytes)?,
+            )
+            .await?
+            .ok_or(super::portable_payload::PreflightRace)?
+        };
         ensure!(
             fragment.len() == count,
             "accepted Task basis fragment is incomplete"
