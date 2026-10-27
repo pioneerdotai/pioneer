@@ -1,3 +1,5 @@
+mod codex_retry_notice;
+pub use codex_retry_notice::{CodexRetryNoticeTarget, codex_retry_notice_item_id};
 mod frozen_lifetime;
 pub use frozen_lifetime::FrozenReadHold;
 mod tool_output;
@@ -14448,7 +14450,6 @@ impl CrudStore {
     pub async fn claim_unactivated_agent_turn(
         &self,
         expected: &TurnExecutionRecord,
-        now: DateTimeWithTimeZone,
     ) -> Result<bool> {
         self.run_serialized_write(|| async {
             let tx = self.connection.begin().await?;
@@ -14457,8 +14458,11 @@ impl CrudStore {
             {
                 return Ok(false);
             }
+            // Writer admission (and a storage retry) may outlive the lease.
+            // Read the clock in this attempt, after acquiring the writer and
+            // immediately before evaluating the activation fence.
             let claimed =
-                repositories::turn_execution::claim_unactivated(&tx, expected, now).await?;
+                repositories::turn_execution::claim_unactivated(&tx, expected, utc_now()).await?;
             tx.commit().await?;
             Ok(claimed)
         })
@@ -20384,7 +20388,7 @@ impl CrudStore {
 
     pub async fn get_first_thread_user_text(&self, thread_id: &str) -> Result<Option<String>> {
         let Some(turn_model) =
-            turn::find_oldest_turn_for_thread(&self.connection, thread_id).await?
+            turn::find_oldest_user_conversation_turn(&self.connection, thread_id).await?
         else {
             return Ok(None);
         };
@@ -58534,6 +58538,75 @@ mod tests {
             permission_profile.effective_policy,
             ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
         );
+    }
+
+    #[tokio::test]
+    async fn agent_activation_claim_rechecks_lease_after_waiting_for_writer() {
+        use crate::{
+            NewTurnExecution, TurnExecutionStatus, TurnExecutorKind, repositories::turn_execution,
+            utc_now,
+        };
+
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_activation_lease",
+            "thr_activation_lease",
+            "turn_activation_lease",
+        )
+        .await;
+        let now = utc_now();
+        let owner = turn_execution::insert_immutable(
+            &store.connection,
+            NewTurnExecution {
+                turn_id: turn.id.clone(),
+                thread_id: thread.id,
+                workspace_id: thread.workspace_id,
+                executor_kind: TurnExecutorKind::ApiProvider,
+                executor_key: Some("openai".to_owned()),
+                status: TurnExecutionStatus::Starting,
+                owner_id: "activation-owner".to_owned(),
+                lease_until: now + chrono::Duration::seconds(2),
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        let writer = store.connection.begin().await.unwrap();
+        let mut claim = Box::pin(store.claim_unactivated_agent_turn(&owner));
+        // Use the existing queued-future synchronization pattern: first prove
+        // that activation is waiting for the occupied writer with a live lease.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(claim.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(utc_now() < owner.lease_until);
+        // Deliberately retain this fixture's writer across the lease boundary;
+        // the waiter must evaluate time only after that writer is released.
+        tokio::time::sleep(
+            (owner.lease_until - utc_now()).to_std().unwrap_or_default()
+                + std::time::Duration::from_millis(1),
+        )
+        .await;
+        writer.rollback().await.unwrap();
+        assert!(!claim.await.unwrap());
+        let unchanged = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.status, TurnExecutionStatus::Starting);
+        assert_eq!(unchanged.owner_generation, owner.owner_generation);
+        assert!(unchanged.started_at.is_none());
+
+        // An actually renewed lease can be claimed once; a duplicate claim
+        // still cannot reuse the starting receipt.
+        store
+            .heartbeat_turn_executions_owned_by("activation-owner", 2)
+            .await
+            .unwrap();
+        let renewed = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert!(store.claim_unactivated_agent_turn(&renewed).await.unwrap());
+        let activated = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert_eq!(activated.status, TurnExecutionStatus::Running);
+        assert!(activated.started_at.is_some());
+        assert_eq!(activated.owner_generation, renewed.owner_generation);
+        assert!(!store.claim_unactivated_agent_turn(&renewed).await.unwrap());
     }
 
     #[tokio::test]

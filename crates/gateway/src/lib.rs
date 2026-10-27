@@ -960,6 +960,7 @@ async fn run_gateway_until_shutdown_inner(
             post_startup = Some(post_startup::PostStartupSupervisor::start(
                 move |scope| async move {
                     let cancellation = scope.cancellation();
+                    post_message_processor.spawn_cli_runtime_idle_cleanup(&scope);
                     let catalog_directory = post_runtime_home.join("providers").join("models");
                     let catalog_cancellation = cancellation.clone();
                     scope.spawn(async move {

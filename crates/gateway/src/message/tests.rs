@@ -1,3 +1,7 @@
+#[cfg(unix)]
+#[path = "tests/title_recovery.rs"]
+mod title_recovery;
+
 #[path = "tests/root_conversation_compaction.rs"]
 mod root_conversation_compaction;
 
@@ -15,6 +19,8 @@ mod cli_task_tools;
 
 #[path = "tests/cli_runtime_active_bindings.rs"]
 mod cli_runtime_active_bindings;
+#[path = "tests/cli_runtime_idle_cleanup.rs"]
+mod cli_runtime_idle_cleanup;
 
 #[cfg(unix)]
 #[path = "tests/opencode_startup.rs"]
@@ -234,7 +240,7 @@ use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -804,6 +810,9 @@ struct RecordingCliRuntimeSession {
     fail_next_resume: TokioMutex<bool>,
     goal_clears: TokioMutex<Vec<String>>,
     closes: AtomicUsize,
+    close_pause: TokioMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    fail_next_close: AtomicBool,
+    interrupt_pause: TokioMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     factory_starts: AtomicUsize,
     event_log: TokioMutex<Option<Arc<TokioMutex<Vec<String>>>>>,
 }
@@ -915,6 +924,13 @@ impl RecordingCliRuntimeSession {
 impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
     async fn close(&self) -> anyhow::Result<()> {
         self.closes.fetch_add(1, Ordering::SeqCst);
+        if let Some((entered, release)) = self.close_pause.lock().await.take() {
+            entered.notify_one();
+            release.notified().await;
+        }
+        if self.fail_next_close.swap(false, Ordering::SeqCst) {
+            anyhow::bail!("injected close failure");
+        }
         Ok(())
     }
 
@@ -1124,6 +1140,10 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         native_thread_id: Option<&str>,
         native_turn_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        if let Some((entered, release)) = self.interrupt_pause.lock().await.take() {
+            entered.notify_one();
+            release.notified().await;
+        }
         self.interrupts.lock().await.push((
             native_thread_id.map(str::to_owned),
             native_turn_id.map(str::to_owned),
@@ -2529,15 +2549,15 @@ async fn capability_persistence_order_impl() {
             .await
             .expect("committed MCP capability event should arrive")
             .expect("committed lane should stay open");
-        // Thread actions/model options require explicit selection; this turn
-        // admits only the readers alongside the default HTML and task tools.
+        // This unrestricted turn admits the Threads catalog alongside the
+        // default HTML and task tools.
         let expected_mcp_bindings = 2
             + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
                 .definitions()
                 .len()
-            + super::thread_read_tools::thread_read_tool_specs().len()
-            + super::thread_search_tools::thread_search_tool_specs().len()
-            + super::thread_tool_results::thread_result_tool_specs().len();
+            + crate::turn_mcp::native_tools::NativeToolFamily::Threads
+                .definitions()
+                .len();
         assert!(matches!(
             committed_capabilities,
             AgentDurableEvent::TurnCapabilitiesResolved {
@@ -9872,6 +9892,7 @@ struct ProgressDeltaHarness {
     processor: MessageProcessor,
     crud_store: Arc<CrudStore>,
     rx: Option<mpsc::Receiver<Message>>,
+    connection_id: Option<ConnectionId>,
     workspace_id: String,
     thread_id: String,
     turn_id: String,
@@ -9903,7 +9924,7 @@ async fn setup_progress_delta_harness(
     let turn_id = generate_test_request_id("turn", case_id);
     let item_id = item.item_id().to_owned();
 
-    let rx = if subscribe {
+    let (connection_id, rx) = if subscribe {
         let (tx, rx) = mpsc::channel(16);
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -9930,9 +9951,9 @@ async fn setup_progress_delta_harness(
             )
             .await
             .expect("thread/start should seed subscribed thread");
-        Some(rx)
+        (Some(connection_id), Some(rx))
     } else {
-        None
+        (None, None)
     };
 
     let thread = pioneer_protocol::Thread {
@@ -9987,23 +10008,25 @@ async fn setup_progress_delta_harness(
         turn_id.as_str(),
     )
     .await;
-    crud_store
-        .materialize_item_started(
-            ItemStartedNotification {
-                workspace_id: workspace_id.clone(),
-                thread_id: thread_id.clone(),
-                turn_id: turn_id.clone(),
-                item,
-            },
-            2,
-        )
-        .await
-        .expect("item/started should materialize");
+    assert!(
+        processor
+            .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                notification: ItemStartedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item,
+                },
+            })
+            .await,
+        "item/started should commit through the Gateway lifecycle"
+    );
 
     ProgressDeltaHarness {
         processor,
         crud_store,
         rx,
+        connection_id,
         workspace_id,
         thread_id,
         turn_id,
@@ -10129,6 +10152,1059 @@ fn web_fetch_item(item_id: &str) -> TurnItem {
 }
 
 #[tokio::test]
+async fn service_items_cannot_gain_markdown_from_stream_or_payload() {
+    let mut harness =
+        setup_progress_delta_harness("markdown_denied", command_execution_item("denied"), true)
+            .await;
+    let mut items = vec![context_compaction_item("denied_system")];
+    // These are real protocol tool variants with their existing default fields.
+    for kind in [
+        "commandExecution",
+        "fileChange",
+        "webSearch",
+        "webFetch",
+        "download",
+        "dynamicToolCall",
+    ] {
+        let mut value = serde_json::to_value(command_execution_item(kind)).unwrap();
+        value["type"] = json!(kind);
+        items.push(serde_json::from_value::<TurnItem>(value).unwrap());
+    }
+    items.push(TurnItem::Task {
+        item: TaskTurnItem {
+            id: "denied_task".into(),
+            task_id: "task_denied".into(),
+            created_by_turn_id: None,
+            run_id: None,
+            parent_task_id: None,
+            root_task_id: None,
+            title: "**service**".into(),
+            status: TaskStatus::Running,
+            attachment: TaskAttachmentMode::Attached,
+            trigger_kind: TaskTriggerKind::Immediate,
+            executor_kind: TaskExecutorKind::Agent,
+            child_thread_id: None,
+            child_turn_id: None,
+            agent_role: None,
+            depth: 0,
+            max_depth: 3,
+            next_fire_at: None,
+            progress_preview: None,
+            result_preview: None,
+            error_preview: None,
+            started_at: None,
+            created_at: 1,
+            updated_at: 1,
+        },
+    });
+    for item in items {
+        let item_type = item.item_type();
+        harness.item_id = item.item_id().to_owned();
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                    notification: ItemStartedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: harness.thread_id.clone(),
+                        turn_id: harness.turn_id.clone(),
+                        item,
+                    },
+                })
+                .await
+        );
+        let streams = if item_type == TurnItemType::CommandExecution {
+            vec![
+                Some(ItemDeltaStream::Generic),
+                None,
+                Some(ItemDeltaStream::AgentMessage),
+            ]
+        } else {
+            vec![Some(ItemDeltaStream::Generic)]
+        };
+        for stream in streams {
+            let mut notification = progress_delta_notification(
+                &harness,
+                "# **not prose** 🦀",
+                ItemDeltaStream::Generic,
+            );
+            notification.stream = stream;
+            notification.payload =
+                Some(json!({"runtimeDeltaKind":"agent_message", "type":"agentMessage"}));
+            harness
+                .processor
+                .handle_progress_agent_event(AgentProgressEvent::ItemDelta { notification })
+                .await;
+            let live = recv_notification_by_method(
+                harness.rx.as_mut().unwrap(),
+                events::ITEM_AGENT_MESSAGE_DELTA,
+            )
+            .await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            assert_eq!(live.delta, "# **not prose** 🦀");
+            assert_eq!(live.stream, stream);
+            assert!(
+                live.markdown.is_none() && live.markdown_version.is_none(),
+                "{item_type:?}"
+            );
+            assert!(
+                harness
+                    .processor
+                    .agent_message_buffers
+                    .lock()
+                    .await
+                    .is_empty(),
+                "{item_type:?}"
+            );
+        }
+    }
+    assert_eq!(
+        harness
+            .processor
+            .markdown_delta_parse_count
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        harness
+            .processor
+            .progress_item_type_lookup_count
+            .load(Ordering::Relaxed),
+        0,
+        "started cache is reused, including for heartbeat; no fallback SQL on a cache hit"
+    );
+}
+
+#[tokio::test]
+async fn unknown_and_late_resolved_items_keep_raw_delta_until_a_full_snapshot() {
+    let mut harness =
+        setup_progress_delta_harness("markdown_late", command_execution_item("known_tool"), true)
+            .await;
+    harness.item_id = "late_message".into();
+    for stream in [Some(ItemDeltaStream::Generic), None] {
+        let mut notification = progress_delta_notification(
+            &harness,
+            "# missing prefix\n```\n",
+            ItemDeltaStream::Generic,
+        );
+        notification.stream = stream;
+        harness
+            .processor
+            .handle_progress_agent_event(AgentProgressEvent::ItemDelta { notification })
+            .await;
+        let live = recv_notification_by_method(
+            harness.rx.as_mut().unwrap(),
+            events::ITEM_AGENT_MESSAGE_DELTA,
+        )
+        .await;
+        let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+        assert_eq!(live.delta, "# missing prefix\n```\n");
+        assert!(live.markdown.is_none() && live.markdown_version.is_none());
+    }
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    // Existing bounded DB fallback can discover a type without a live prefix.
+    let snapshot = ItemStartedNotification {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item: TurnItem::AgentMessage {
+            id: harness.item_id.clone(),
+            text: "# recovered\n```\n".into(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+    };
+    harness
+        .crud_store
+        .materialize_item_started(snapshot.clone(), now_timestamp_secs())
+        .await
+        .unwrap();
+    let previous_lookups = harness
+        .processor
+        .progress_item_type_lookup_count
+        .load(Ordering::Relaxed);
+    harness
+        .processor
+        .progress_items
+        .lock()
+        .await
+        .forget_turn(&harness.turn_id);
+    harness
+        .processor
+        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+            notification: progress_delta_notification(
+                &harness,
+                "tail 🦀",
+                ItemDeltaStream::AgentMessage,
+            ),
+        })
+        .await;
+    let live = recv_notification_by_method(
+        harness.rx.as_mut().unwrap(),
+        events::ITEM_AGENT_MESSAGE_DELTA,
+    )
+    .await;
+    let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+    assert_eq!(live.delta, "tail 🦀");
+    assert!(live.markdown.is_none() && live.markdown_version.is_none());
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        harness
+            .processor
+            .markdown_delta_parse_count
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        harness
+            .processor
+            .progress_item_type_lookup_count
+            .load(Ordering::Relaxed),
+        previous_lookups + 1,
+        "one existing fallback resolves the late type without recovering a prefix"
+    );
+    assert!(
+        harness
+            .processor
+            .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                notification: snapshot
+            })
+            .await
+    );
+    harness
+        .processor
+        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+            notification: progress_delta_notification(
+                &harness,
+                "full tail 🦀\n```",
+                ItemDeltaStream::AgentMessage,
+            ),
+        })
+        .await;
+    let live = recv_notification_by_method(
+        harness.rx.as_mut().unwrap(),
+        events::ITEM_AGENT_MESSAGE_DELTA,
+    )
+    .await;
+    let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+    assert_eq!(
+        live.markdown,
+        Some(super::markdown::parse_markdown_document(
+            "# recovered\n```\nfull tail 🦀\n```"
+        ))
+    );
+}
+
+#[test]
+fn replay_markdown_requires_an_allowed_snapshot_and_preserves_its_full_source() {
+    let snapshot = |item: TurnItem, updated: bool| {
+        if updated {
+            TurnItemEventPayload::ItemUpdated {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item,
+            }
+        } else {
+            TurnItemEventPayload::ItemStarted {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item,
+            }
+        }
+    };
+    let message = |text: &str| TurnItem::AgentMessage {
+        id: "message".into(),
+        text: text.into(),
+        phase: Default::default(),
+        markdown: None,
+        markdown_version: None,
+    };
+    let delta =
+        |item_id: &str, text: &str, turn: &str, preview: bool| TurnItemEventPayload::ItemDelta {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: turn.into(),
+            item_id: item_id.into(),
+            delta: text.into(),
+            stream: None,
+            payload: preview.then(|| json!({"runtimeDeltaKind":"provider_message_preview"})),
+            markdown: None,
+            markdown_version: None,
+        };
+    let mut events = vec![
+        snapshot(command_execution_item("tool"), false),
+        delta("tool", "# **tool** 🦀", "turn", false),
+        delta("unknown", "# unknown", "turn", false),
+        delta("message", "lost prefix", "turn", false),
+        snapshot(message("# Начало\r\n```\r\n"), false),
+        delta("message", "stale preview", "turn", true),
+        delta("message", "краб ", "turn", false),
+        delta("message", "🦀\r\n```", "turn", false),
+        delta("message", "other execution", "other-turn", false),
+        snapshot(message("**snapshot"), true),
+        delta("message", " 🦀**", "turn", false),
+        TurnItemEventPayload::ItemCompleted {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: message("# Final authoritative"),
+        },
+        delta("message", "after completion", "turn", false),
+        snapshot(message("old source"), false),
+        snapshot(command_execution_item("message"), true),
+        delta("message", "denied replacement", "turn", false),
+        snapshot(
+            TurnItem::Reasoning {
+                id: "reasoning".into(),
+                summary: vec!["**мысль".into()],
+                content: vec![],
+            },
+            false,
+        ),
+        delta("reasoning", " 🦀**", "turn", false),
+        snapshot(
+            TurnItem::UserMessage {
+                id: "user".into(),
+                text: "# пользователь\r\n".into(),
+                attachments: vec![],
+            },
+            false,
+        ),
+        delta("user", "🦀", "turn", false),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, payload)| pioneer_protocol::TurnItemEvent {
+        sequence: index as i64,
+        created_at: 1,
+        payload,
+    })
+    .collect::<Vec<_>>();
+    MessageProcessor::enrich_turn_item_events_markdown(&mut events);
+    for index in [1, 2, 3, 5, 8, 12, 15] {
+        let TurnItemEventPayload::ItemDelta {
+            markdown,
+            markdown_version,
+            ..
+        } = &events[index].payload
+        else {
+            panic!("delta")
+        };
+        assert!(
+            markdown.is_none() && markdown_version.is_none(),
+            "event {index}"
+        );
+    }
+    for (index, source) in [
+        (6, "# Начало\r\n```\r\nкраб "),
+        (7, "# Начало\r\n```\r\nкраб 🦀\r\n```"),
+        (10, "**snapshot 🦀**"),
+        (17, "**мысль 🦀**"),
+        (19, "# пользователь\r\n🦀"),
+    ] {
+        let TurnItemEventPayload::ItemDelta {
+            markdown,
+            markdown_version,
+            ..
+        } = &events[index].payload
+        else {
+            panic!("delta")
+        };
+        assert_eq!(
+            markdown.as_ref(),
+            Some(&super::markdown::parse_markdown_document(source)),
+            "event {index}"
+        );
+        assert_eq!(
+            *markdown_version,
+            Some(pioneer_protocol::MARKDOWN_AST_VERSION)
+        );
+    }
+    let TurnItemEventPayload::ItemCompleted {
+        item: TurnItem::AgentMessage { markdown, .. },
+        ..
+    } = &events[11].payload
+    else {
+        panic!("final message")
+    };
+    assert_eq!(
+        markdown.as_ref(),
+        Some(&super::markdown::parse_markdown_document(
+            "# Final authoritative"
+        ))
+    );
+}
+
+#[tokio::test]
+async fn markdown_lifecycle_replaces_denied_items_and_isolates_turns_and_missing_prefixes() {
+    let harness = setup_progress_delta_harness(
+        "markdown_lifecycle",
+        TurnItem::AgentMessage {
+            id: "message".into(),
+            text: "old prefix".into(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+        false,
+    )
+    .await;
+    let mut delta = progress_delta_notification(&harness, "missing", ItemDeltaStream::Generic);
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, None)
+        .await;
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    delta.delta = "tail".into();
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
+        .await;
+    assert!(
+        delta.markdown.is_none(),
+        "lost classification invalidates the entire prefix"
+    );
+    let mut start = ItemStartedNotification {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item: TurnItem::AgentMessage {
+            id: harness.item_id.clone(),
+            text: "replacement".into(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+    };
+    harness
+        .processor
+        .enrich_item_started_markdown(&mut start)
+        .await;
+    start.item = command_execution_item(&harness.item_id);
+    harness
+        .processor
+        .enrich_item_started_markdown(&mut start)
+        .await;
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    start.turn_id = "another-turn".into();
+    start.item = TurnItem::AgentMessage {
+        id: harness.item_id.clone(),
+        text: "# new\r\n".into(),
+        phase: Default::default(),
+        markdown: None,
+        markdown_version: None,
+    };
+    harness
+        .processor
+        .enrich_item_started_markdown(&mut start)
+        .await;
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
+        .await;
+    assert!(
+        delta.markdown.is_none(),
+        "previous turn cannot append into the replacement"
+    );
+    let mut completed = ItemCompletedNotification {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item: start.item.clone(),
+    };
+    harness
+        .processor
+        .enrich_item_completed_markdown(&mut completed)
+        .await;
+    assert_eq!(
+        harness.processor.agent_message_buffers.lock().await.len(),
+        1,
+        "old completion cannot remove the replacement turn"
+    );
+    delta.turn_id = start.turn_id;
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
+        .await;
+    assert_eq!(
+        delta.markdown,
+        Some(super::markdown::parse_markdown_document("# new\r\ntail"))
+    );
+    harness
+        .processor
+        .teardown_agent_thread(&harness.thread_id)
+        .await;
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    delta.markdown = None;
+    delta.markdown_version = None;
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
+        .await;
+    assert!(
+        delta.markdown.is_none(),
+        "teardown cannot be followed by a tail-only buffer"
+    );
+}
+
+#[tokio::test]
+async fn gateway_missing_prefix_fallback_replaces_stale_client_markdown_and_recovers() {
+    use pioneer_client::core::{ClientCore, ClientScope};
+    use pioneer_client::timeline::item_presentation::TimelineItemPresentation;
+    use pioneer_client::timeline::semantic::TopLevelPageMergeMode;
+    use pioneer_protocol::{AgentMessagePhase, GatewayNotification};
+    use std::num::NonZeroUsize;
+
+    fn selected(
+        core: &Arc<ClientCore>,
+        thread: &str,
+        turn: &str,
+        id: &str,
+    ) -> (TimelineItemPresentation, TurnItem) {
+        core.set_thread_turn_work_expanded(thread, turn, true);
+        // Public shell subscription materializes the current presentation even
+        // without a background presentation worker in this fixture.
+        let _lease = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: thread.into(),
+            },
+            NonZeroUsize::new(8).unwrap(),
+        );
+        let snapshot = core
+            .thread_presentation_snapshot(thread)
+            .unwrap()
+            .timeline();
+        let row = snapshot
+            .rows()
+            .iter()
+            .find(|row| row.item().is_some_and(|item| item.id == id))
+            .expect("message row must be visible");
+        (
+            row.content().unwrap().clone(),
+            row.item().unwrap().item.clone(),
+        )
+    }
+    fn assert_reasoning_body(item: &TurnItem, expected: &str) {
+        if let TurnItem::Reasoning {
+            summary, content, ..
+        } = item
+        {
+            // Desktop builds its body from this actual row payload, not from
+            // TimelineItemPresentation.text (which prefers content alone).
+            assert_eq!(
+                pioneer_client::timeline::labels::reasoning_text(summary, content, ""),
+                expected,
+            );
+        }
+    }
+    fn projected(
+        core: &ClientCore,
+        thread: &str,
+        id: &str,
+    ) -> pioneer_client::conversation::ItemView {
+        core.thread_coordinator_snapshot(thread)
+            .unwrap()
+            .conversation
+            .projection()
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .unwrap()
+            .clone()
+    }
+    async fn send(harness: &mut ProgressDeltaHarness, text: &str) -> ItemDeltaNotification {
+        harness
+            .processor
+            .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                notification: progress_delta_notification(
+                    harness,
+                    text,
+                    ItemDeltaStream::AgentMessage,
+                ),
+            })
+            .await;
+        let live = recv_notification_by_method(
+            harness.rx.as_mut().unwrap(),
+            events::ITEM_AGENT_MESSAGE_DELTA,
+        )
+        .await;
+        serde_json::from_value(live.params.unwrap()).unwrap()
+    }
+
+    // Distinct storage/lifecycle risks: top-level final, work-item commentary,
+    // and Reasoning's existing AST-free semantic representation.
+    let cases: &[(
+        &str,
+        AgentMessagePhase,
+        Option<&[&str]>,
+        &[&str],
+        &str,
+        &str,
+    )] = &[
+        (
+            "fallback_final",
+            AgentMessagePhase::FinalAnswer,
+            None,
+            &[],
+            "**head**",
+            "**head**",
+        ),
+        (
+            "fallback_commentary",
+            AgentMessagePhase::Commentary,
+            None,
+            &[],
+            "**head**",
+            "**head**",
+        ),
+        (
+            "fallback_reasoning_content",
+            AgentMessagePhase::FinalAnswer,
+            Some(&[]),
+            &["**head**"],
+            "**head**",
+            "**head**",
+        ),
+        (
+            "fallback_reasoning_summary",
+            AgentMessagePhase::FinalAnswer,
+            Some(&["**head**", "prefix 🧠"]),
+            &[],
+            "**head**\nprefix 🧠",
+            "**head**\nprefix 🧠",
+        ),
+        (
+            "fallback_reasoning_both",
+            AgentMessagePhase::FinalAnswer,
+            Some(&["summary one", "summary two"]),
+            &["**head**", "independent 🧠"],
+            "**head**\nindependent 🧠",
+            "summary one\nsummary two\n\n**head**\nindependent 🧠",
+        ),
+    ];
+    for &(case, phase, summary, content, head, body) in cases {
+        let reasoning = summary.is_some();
+        let item = if let Some(summary) = summary {
+            TurnItem::Reasoning {
+                id: "message".into(),
+                summary: summary.iter().map(|part| (*part).into()).collect(),
+                content: content.iter().map(|part| (*part).into()).collect(),
+            }
+        } else {
+            TurnItem::AgentMessage {
+                id: "message".into(),
+                text: head.into(),
+                phase,
+                markdown: None,
+                markdown_version: None,
+            }
+        };
+        let mut harness = setup_progress_delta_harness(case, item, true).await;
+        let core = Arc::new(ClientCore::new());
+        let thread = harness
+            .processor
+            .thread_manager
+            .thread_get(&harness.thread_id)
+            .await
+            .unwrap();
+        core.upsert_thread(thread.clone());
+        let started = turn_item_payloads(&harness)
+            .await
+            .into_iter()
+            .find_map(|payload| match payload {
+                TurnItemEventPayload::ItemStarted { item, .. }
+                    if item.item_id() == harness.item_id =>
+                {
+                    Some(item)
+                }
+                _ => None,
+            })
+            .unwrap();
+        core.apply_thread_notification(GatewayNotification::ItemStarted(ItemStartedNotification {
+            workspace_id: harness.workspace_id.clone(),
+            thread_id: harness.thread_id.clone(),
+            turn_id: harness.turn_id.clone(),
+            item: started,
+        }));
+        let (started_content, started_item) = selected(
+            &core,
+            &harness.thread_id,
+            &harness.turn_id,
+            &harness.item_id,
+        );
+        assert_eq!(started_content.text, head);
+        assert_reasoning_body(&started_item, body);
+        if reasoning {
+            let initial = send(&mut harness, " warm").await;
+            assert!(initial.markdown.is_some());
+            core.apply_thread_notification(GatewayNotification::ItemDelta(initial));
+        }
+        let head = if reasoning {
+            format!("{head} warm")
+        } else {
+            head.into()
+        };
+        let body = if reasoning {
+            format!("{body} warm")
+        } else {
+            body.into()
+        };
+        let initial = projected(&core, &harness.thread_id, &harness.item_id);
+        assert!(
+            initial.partial_markdown.is_some(),
+            "the old AST must exist before fallback"
+        );
+        if let TurnItem::AgentMessage { markdown, .. } = &initial.item {
+            assert!(
+                markdown.is_some(),
+                "the payload fallback must also be populated"
+            );
+        }
+        let (before, before_item) = selected(
+            &core,
+            &harness.thread_id,
+            &harness.turn_id,
+            &harness.item_id,
+        );
+        assert_eq!(before.text, head);
+        assert_reasoning_body(&before_item, &body);
+        assert_eq!(before.markdown.is_some(), !reasoning);
+        assert_eq!(before.markdown_presentation.is_some(), !reasoning);
+
+        // Restore the final-answer row through the actual persisted history page
+        // producer and public client page boundary, without a new live ItemStarted.
+        let restored = if !reasoning && phase == AgentMessagePhase::FinalAnswer {
+            let request_id = generate_test_request_id("fallback", "history");
+            harness.processor.process_request_for_connection(harness.connection_id.unwrap(), &json!({
+                "jsonrpc":"2.0", "id":request_id, "method":"thread/timeline/page",
+                "params":{"threadId":harness.thread_id, "anchor":{"kind":"newest"}, "limit":10}
+            }).to_string()).await;
+            let response = recv_response_by_id(harness.rx.as_mut().unwrap(), &request_id).await;
+            let page: pioneer_protocol::ThreadTimelinePageResponse =
+                serde_json::from_value(response.result).unwrap();
+            let restored = Arc::new(ClientCore::new());
+            restored.upsert_thread(thread);
+            assert!(restored.apply_thread_timeline_page(page, TopLevelPageMergeMode::Reset));
+            let (old, _) = selected(
+                &restored,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            assert!(old.markdown.is_some() && old.markdown_presentation.is_some());
+            assert_eq!(old.text, head);
+            Some(restored)
+        } else {
+            None
+        };
+
+        let mut preview = progress_delta_notification(&harness, " draft", ItemDeltaStream::Generic);
+        preview.payload = Some(json!({"runtimeDeltaKind":"provider_message_preview"}));
+        harness
+            .processor
+            .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                notification: preview,
+            })
+            .await;
+        let preview = recv_notification_by_method(
+            harness.rx.as_mut().unwrap(),
+            events::ITEM_AGENT_MESSAGE_DELTA,
+        )
+        .await;
+        let preview: ItemDeltaNotification =
+            serde_json::from_value(preview.params.unwrap()).unwrap();
+        assert!(preview.markdown.is_none());
+        for consumer in std::iter::once(&core).chain(restored.iter()) {
+            let (before_preview, before_preview_item) = selected(
+                consumer,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            consumer.apply_thread_notification(GatewayNotification::ItemDelta(preview.clone()));
+            let (after_preview, after_preview_item) = selected(
+                consumer,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            assert_eq!(after_preview.text, before_preview.text);
+            assert_eq!(after_preview_item, before_preview_item);
+            assert_reasoning_body(&after_preview_item, &body);
+            assert_eq!(after_preview.markdown, before_preview.markdown);
+            assert_eq!(
+                after_preview.markdown_presentation,
+                before_preview.markdown_presentation
+            );
+        }
+        assert_eq!(
+            projected(&core, &harness.thread_id, &harness.item_id),
+            initial
+        );
+
+        // Real teardown removes the server's canonical prefix while its existing
+        // trusted type cache/turn guard can still deliver the next raw fragment.
+        harness
+            .processor
+            .teardown_agent_thread(&harness.thread_id)
+            .await;
+        let parse_count = harness
+            .processor
+            .markdown_delta_parse_count
+            .load(Ordering::Relaxed);
+        let fallback = send(&mut harness, " tail 🦀\r\n").await;
+        assert!(fallback.markdown.is_none() && fallback.markdown_version.is_none());
+        assert!(
+            harness
+                .processor
+                .agent_message_buffers
+                .lock()
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            harness
+                .processor
+                .markdown_delta_parse_count
+                .load(Ordering::Relaxed),
+            parse_count
+        );
+        let full = format!("{head} tail 🦀\r\n");
+        for consumer in std::iter::once(&core).chain(restored.iter()) {
+            consumer.apply_thread_notification(GatewayNotification::ItemDelta(fallback.clone()));
+            let (raw, raw_item) = selected(
+                consumer,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            assert_eq!(
+                raw.text, full,
+                "the received tail must be selected for display"
+            );
+            assert!(raw.markdown.is_none() && raw.markdown_presentation.is_none());
+            assert_reasoning_body(&raw_item, &format!("{body} tail 🦀\r\n"));
+        }
+        let raw = projected(&core, &harness.thread_id, &harness.item_id);
+        assert_eq!(raw.partial_text, full);
+        assert!(raw.partial_markdown.is_none() && raw.final_markdown.is_none());
+        if let TurnItem::AgentMessage {
+            markdown,
+            markdown_version,
+            ..
+        } = raw.item
+        {
+            assert!(
+                markdown.is_none() && markdown_version.is_none(),
+                "payload cannot resurrect the old AST"
+            );
+        }
+
+        // Only after proving the fallback, give Gateway a new full authoritative
+        // prefix. Do not send this started event to the existing clients.
+        let recovered = if reasoning {
+            TurnItem::Reasoning {
+                id: harness.item_id.clone(),
+                summary: vec![],
+                content: vec![full.clone()],
+            }
+        } else {
+            TurnItem::AgentMessage {
+                id: harness.item_id.clone(),
+                text: full.clone(),
+                phase,
+                markdown: None,
+                markdown_version: None,
+            }
+        };
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                    notification: ItemStartedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: harness.thread_id.clone(),
+                        turn_id: harness.turn_id.clone(),
+                        item: recovered,
+                    },
+                })
+                .await
+        );
+        let fresh = send(&mut harness, "**again**").await;
+        let recovered_text = format!("{full}**again**");
+        let recovered_ast = super::markdown::parse_markdown_document(&recovered_text);
+        assert_eq!(fresh.markdown, Some(recovered_ast.clone()));
+        for consumer in std::iter::once(&core).chain(restored.iter()) {
+            consumer.apply_thread_notification(GatewayNotification::ItemDelta(fresh.clone()));
+            let (content, content_item) = selected(
+                consumer,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            assert_eq!(content.text, recovered_text);
+            assert_reasoning_body(&content_item, &format!("{body} tail 🦀\r\n**again**"));
+            if !reasoning {
+                assert_eq!(content.markdown, Some(recovered_ast.clone()));
+                assert!(content.markdown_presentation.is_some());
+            }
+        }
+        assert_eq!(
+            projected(&core, &harness.thread_id, &harness.item_id).partial_markdown,
+            Some(recovered_ast)
+        );
+
+        let final_text = if reasoning {
+            recovered_text.as_str()
+        } else {
+            "# authoritative final"
+        };
+        let final_item = if reasoning {
+            TurnItem::Reasoning {
+                id: harness.item_id.clone(),
+                summary: vec!["authoritative summary".into(), "final detail".into()],
+                content: vec![final_text.into()],
+            }
+        } else {
+            TurnItem::AgentMessage {
+                id: harness.item_id.clone(),
+                text: final_text.into(),
+                phase,
+                markdown: None,
+                markdown_version: None,
+            }
+        };
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
+                    notification: ItemCompletedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: harness.thread_id.clone(),
+                        turn_id: harness.turn_id.clone(),
+                        item: final_item,
+                    },
+                })
+                .await
+        );
+        let completed = turn_item_payloads(&harness)
+            .await
+            .into_iter()
+            .find_map(|payload| match payload {
+                TurnItemEventPayload::ItemCompleted { item, .. }
+                    if item.item_id() == harness.item_id =>
+                {
+                    Some(item)
+                }
+                _ => None,
+            })
+            .unwrap();
+        for consumer in std::iter::once(&core).chain(restored.iter()) {
+            consumer.apply_thread_notification(GatewayNotification::ItemCompleted(
+                ItemCompletedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: harness.thread_id.clone(),
+                    turn_id: harness.turn_id.clone(),
+                    item: completed.clone(),
+                },
+            ));
+        }
+        let (terminal_content, terminal_item) = selected(
+            &core,
+            &harness.thread_id,
+            &harness.turn_id,
+            &harness.item_id,
+        );
+        assert_eq!(terminal_content.text, final_text);
+        assert!(!terminal_content.streaming);
+        if reasoning {
+            assert_eq!(
+                terminal_item, completed,
+                "terminal summary/content must be authoritative"
+            );
+        }
+        assert_reasoning_body(
+            &terminal_item,
+            &format!("authoritative summary\nfinal detail\n\n{final_text}"),
+        );
+        let terminal = projected(&core, &harness.thread_id, &harness.item_id);
+        let late = send(&mut harness, " late raw").await;
+        // A previously valid AST-bearing fragment may also arrive after completion.
+        for late in [late, fresh] {
+            for consumer in std::iter::once(&core).chain(restored.iter()) {
+                consumer.apply_thread_notification(GatewayNotification::ItemDelta(late.clone()));
+                let (content, content_item) = selected(
+                    consumer,
+                    &harness.thread_id,
+                    &harness.turn_id,
+                    &harness.item_id,
+                );
+                assert_eq!(content.text, final_text);
+                assert!(!content.streaming);
+                assert_eq!(
+                    content_item, terminal_item,
+                    "late delta cannot change terminal fields"
+                );
+                assert_reasoning_body(
+                    &content_item,
+                    &format!("authoritative summary\nfinal detail\n\n{final_text}"),
+                );
+                if !reasoning {
+                    assert_eq!(
+                        content.markdown,
+                        Some(super::markdown::parse_markdown_document(final_text))
+                    );
+                    assert!(content.markdown_presentation.is_some());
+                }
+            }
+            let after = projected(&core, &harness.thread_id, &harness.item_id);
+            assert_eq!(after.final_text, terminal.final_text);
+            assert_eq!(after.final_markdown, terminal.final_markdown);
+            assert_eq!(after.partial_markdown, terminal.partial_markdown);
+            assert_eq!(after.item, terminal.item);
+        }
+    }
+}
+
+#[tokio::test]
 async fn provider_preview_deltas_do_not_pollute_canonical_markdown_or_retain_a_draft_buffer() {
     let harness = setup_progress_delta_harness(
         "provider_preview",
@@ -10145,10 +11221,14 @@ async fn provider_preview_deltas_do_not_pollute_canonical_markdown_or_retain_a_d
     preview.payload = Some(json!({"runtimeDeltaKind":"provider_message_preview"}));
     harness
         .processor
-        .enrich_item_delta_markdown(&mut preview)
+        .enrich_item_delta_markdown(&mut preview, Some(TurnItemType::AgentMessage))
         .await;
     assert!(preview.markdown.is_none());
     assert!(preview.markdown_version.is_none());
+    assert_eq!(
+        harness.processor.agent_message_buffers.lock().await.len(),
+        1
+    );
     let mut resolved = ItemStartedNotification {
         workspace_id: harness.workspace_id.clone(),
         thread_id: harness.thread_id.clone(),
@@ -10168,14 +11248,14 @@ async fn provider_preview_deltas_do_not_pollute_canonical_markdown_or_retain_a_d
     preview.delta = "stale preview".into();
     harness
         .processor
-        .enrich_item_delta_markdown(&mut preview)
+        .enrich_item_delta_markdown(&mut preview, Some(TurnItemType::AgentMessage))
         .await;
     assert!(preview.markdown.is_none());
     let mut delta = progress_delta_notification(&harness, " more", ItemDeltaStream::AgentMessage);
     delta.item_id = "provider_preview".into();
     harness
         .processor
-        .enrich_item_delta_markdown(&mut delta)
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
         .await;
     assert_eq!(
         delta.markdown,
@@ -10183,74 +11263,136 @@ async fn provider_preview_deltas_do_not_pollute_canonical_markdown_or_retain_a_d
             "working more"
         ))
     );
+    assert_eq!(
+        harness.processor.agent_message_buffers.lock().await.len(),
+        2
+    );
+    let mut completed = ItemCompletedNotification {
+        workspace_id: resolved.workspace_id,
+        thread_id: resolved.thread_id,
+        turn_id: resolved.turn_id,
+        item: resolved.item,
+    };
+    harness
+        .processor
+        .enrich_item_completed_markdown(&mut completed)
+        .await;
+    harness
+        .processor
+        .teardown_agent_thread(&harness.thread_id)
+        .await;
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assistant_progress_delta_is_live_only_and_completed_item_is_durable() {
-    let mut harness = setup_progress_delta_harness(
-        "agent_msg",
-        TurnItem::AgentMessage {
-            id: "item_progress_agent_msg".to_owned(),
-            text: String::new(),
-            phase: Default::default(),
-            markdown: None,
-            markdown_version: None,
-        },
-        true,
-    )
-    .await;
-
-    harness
-        .processor
-        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
-            notification: progress_delta_notification(
-                &harness,
-                "hel",
-                ItemDeltaStream::AgentMessage,
-            ),
-        })
-        .await;
-
-    let live = recv_notification_by_method(
-        harness.rx.as_mut().expect("live receiver should exist"),
-        events::ITEM_AGENT_MESSAGE_DELTA,
-    )
-    .await;
-    let live_payload: ItemDeltaNotification =
-        serde_json::from_value(live.params.expect("delta params expected"))
-            .expect("live item delta payload should decode");
-    assert_eq!(live_payload.delta, "hel");
-
-    let payloads = turn_item_payloads(&harness).await;
-    assert_no_persisted_item_delta(payloads.as_slice());
-
-    harness
-        .processor
-        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
-            notification: ItemCompletedNotification {
-                workspace_id: harness.workspace_id.clone(),
-                thread_id: harness.thread_id.clone(),
-                turn_id: harness.turn_id.clone(),
-                item: TurnItem::AgentMessage {
-                    id: harness.item_id.clone(),
-                    text: "hello".to_owned(),
-                    phase: Default::default(),
-                    markdown: None,
-                    markdown_version: None,
-                },
+    for (case, phase) in [
+        (
+            "agent_final",
+            pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        ),
+        (
+            "agent_commentary",
+            pioneer_protocol::AgentMessagePhase::Commentary,
+        ),
+    ] {
+        let prefix = "# Привет\r\n\r\n```rust\r\n";
+        let mut harness = setup_progress_delta_harness(
+            case,
+            TurnItem::AgentMessage {
+                id: "item_progress_agent_msg".to_owned(),
+                text: prefix.to_owned(),
+                phase,
+                markdown: None,
+                markdown_version: None,
             },
-        })
+            true,
+        )
         .await;
-
-    let payloads = turn_item_payloads(&harness).await;
-    assert_no_persisted_item_delta(payloads.as_slice());
-    assert!(payloads.iter().any(|payload| matches!(
-        payload,
-        TurnItemEventPayload::ItemCompleted {
-            item: TurnItem::AgentMessage { id, text, .. },
-            ..
-        } if id == &harness.item_id && text == "hello"
-    )));
+        let mut full = prefix.to_owned();
+        for fragment in ["let краб = ", "\"🦀\";\r\n", "```\r\n\r\n**готово**"] {
+            full.push_str(fragment);
+            harness
+                .processor
+                .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                    notification: progress_delta_notification(
+                        &harness,
+                        fragment,
+                        ItemDeltaStream::AgentMessage,
+                    ),
+                })
+                .await;
+            let live = recv_notification_by_method(
+                harness.rx.as_mut().unwrap(),
+                events::ITEM_AGENT_MESSAGE_DELTA,
+            )
+            .await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            assert_eq!(live.delta, fragment);
+            assert_eq!(
+                live.markdown,
+                Some(super::markdown::parse_markdown_document(&full))
+            );
+            assert_eq!(
+                live.markdown_version,
+                Some(pioneer_protocol::MARKDOWN_AST_VERSION)
+            );
+        }
+        assert_eq!(
+            harness
+                .processor
+                .markdown_delta_parse_count
+                .load(Ordering::Relaxed),
+            3
+        );
+        let payloads = turn_item_payloads(&harness).await;
+        assert_no_persisted_item_delta(&payloads);
+        // The final snapshot deliberately differs from the streaming prefix.
+        let final_text = "# Итог\r\n\r\n[результат](https://example.com) 🦀";
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
+                    notification: ItemCompletedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: harness.thread_id.clone(),
+                        turn_id: harness.turn_id.clone(),
+                        item: TurnItem::AgentMessage {
+                            id: harness.item_id.clone(),
+                            text: final_text.to_owned(),
+                            phase,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                })
+                .await
+        );
+        let payloads = turn_item_payloads(&harness).await;
+        assert_no_persisted_item_delta(&payloads);
+        assert!(payloads.iter().any(|payload| matches!(payload,
+            TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::AgentMessage { id, text, phase: actual_phase, markdown: Some(document), markdown_version: Some(version) }, ..
+            } if id == &harness.item_id && text == final_text && *actual_phase == phase
+                && document == &super::markdown::parse_markdown_document(final_text)
+                && *version == pioneer_protocol::MARKDOWN_AST_VERSION
+        )));
+        assert!(
+            harness
+                .processor
+                .agent_message_buffers
+                .lock()
+                .await
+                .is_empty()
+        );
+    }
 }
 
 #[tokio::test]
@@ -10457,6 +11599,15 @@ async fn retiring_progress_state_drops_the_item_cache_and_execution_lease() {
         .await;
 
     assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+
+    assert!(
         !harness
             .processor
             .execution_leases
@@ -10476,90 +11627,228 @@ async fn retiring_progress_state_drops_the_item_cache_and_execution_lease() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reasoning_progress_delta_is_live_only_by_default() {
-    let harness = setup_progress_delta_harness(
-        "reasoning",
-        TurnItem::Reasoning {
-            id: "item_progress_reasoning".to_owned(),
-            summary: Vec::new(),
-            content: Vec::new(),
-        },
-        false,
-    )
-    .await;
-
-    harness
-        .processor
-        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
-            notification: progress_delta_notification(
-                &harness,
-                "thinking",
-                ItemDeltaStream::Generic,
-            ),
-        })
-        .await;
-
-    let payloads = turn_item_payloads(&harness).await;
-    assert_no_persisted_item_delta(payloads.as_slice());
+async fn reasoning_and_user_progress_preserve_existing_content_and_heartbeat() {
+    for (case, item, prefix) in [
+        (
+            "reasoning",
+            TurnItem::Reasoning {
+                id: "allowed".into(),
+                summary: vec!["unused summary".into()],
+                content: vec!["# Мысль".into(), "**открыто".into()],
+            },
+            "# Мысль\n**открыто",
+        ),
+        (
+            "user",
+            TurnItem::UserMessage {
+                id: "allowed".into(),
+                text: "# Пользователь\r\n**открыто".into(),
+                attachments: vec![],
+            },
+            "# Пользователь\r\n**открыто",
+        ),
+    ] {
+        let original = item.clone();
+        let mut harness = setup_progress_delta_harness(case, item, true).await;
+        // Make the existing delta heartbeat due without sleeping.
+        let key = super::ProgressItemKey {
+            turn_id: harness.turn_id.clone(),
+            item_id: harness.item_id.clone(),
+        };
+        harness
+            .processor
+            .progress_items
+            .lock()
+            .await
+            .items
+            .get_mut(&key)
+            .unwrap()
+            .last_persisted_heartbeat_at = None;
+        let mut full = prefix.to_owned();
+        for fragment in [" 🦀", "**\r\n"] {
+            full.push_str(fragment);
+            harness
+                .processor
+                .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                    notification: progress_delta_notification(
+                        &harness,
+                        fragment,
+                        ItemDeltaStream::Generic,
+                    ),
+                })
+                .await;
+            let live = recv_notification_by_method(
+                harness.rx.as_mut().unwrap(),
+                events::ITEM_AGENT_MESSAGE_DELTA,
+            )
+            .await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            assert_eq!(
+                live.markdown,
+                Some(super::markdown::parse_markdown_document(&full))
+            );
+        }
+        assert_eq!(
+            harness
+                .processor
+                .progress_item_type_lookup_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        {
+            let progress = harness.processor.progress_items.lock().await;
+            let state = progress.items.get(&key).unwrap();
+            assert!(state.last_persisted_heartbeat_at.is_some());
+            assert!(
+                state.pending_heartbeat_claim.is_none(),
+                "delta heartbeat completed successfully"
+            );
+        }
+        let attempts = harness
+            .crud_store
+            .list_running_turn_item_attempts_for_turn(&harness.turn_id)
+            .await
+            .unwrap();
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| attempt.item_id == harness.item_id
+                    && attempt.last_heartbeat_at_unix.is_some())
+        );
+        let payloads = turn_item_payloads(&harness).await;
+        assert_no_persisted_item_delta(&payloads);
+        assert!(
+            payloads.iter().any(|payload| matches!(payload,
+                TurnItemEventPayload::ItemStarted { item, .. } if item == &original
+            )),
+            "Reasoning/UserMessage snapshot representation stays unchanged"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn command_output_is_persisted_before_ack_and_survives_live_progress_cleanup() {
-    let harness = setup_progress_delta_harness(
+    let mut harness = setup_progress_delta_harness(
         "stdout",
         command_execution_item("item_progress_stdout"),
-        false,
+        true,
     )
     .await;
-    let notification = progress_delta_notification(&harness, "chunk\n", ItemDeltaStream::Stdout);
-    for _ in 0..2 {
-        assert!(
-            harness
-                .processor
-                .handle_durable_agent_event(AgentDurableEvent::ToolOutputRecorded {
-                    id: "test-output-1".into(),
-                    notification: notification.clone(),
-                })
+    let chunks = [
+        "# tool output\r\n```rust\r\n".repeat(700),
+        "**строка 🦀** | [file](https://example.com)\n".repeat(700),
+        "```\n- [x] finished\n".repeat(700),
+    ];
+    for (index, chunk) in chunks.iter().enumerate() {
+        let mut notification =
+            progress_delta_notification(&harness, chunk, ItemDeltaStream::Stdout);
+        notification.payload =
+            Some(json!({"runtimeDeltaKind":"command_output", "observation":{"eventSeq":index}}));
+        for _ in 0..2 {
+            assert!(
+                harness
+                    .processor
+                    .handle_durable_agent_event(AgentDurableEvent::ToolOutputRecorded {
+                        id: format!("test-output-{index}"),
+                        notification: notification.clone(),
+                    })
+                    .await,
+                "ACK only after raw output is saved"
+            );
+            let rows = harness
+                .crud_store
+                .tool_output_page(
+                    &harness.workspace_id,
+                    &harness.thread_id,
+                    &harness.turn_id,
+                    &harness.item_id,
+                    0,
+                )
                 .await
-        );
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                index + 1,
+                "replayed event IDs remain idempotent"
+            );
+            for (ordinal, (_, row)) in rows.iter().enumerate() {
+                assert_eq!(row.id, format!("test-output-{ordinal}"));
+                assert_eq!(row.text, chunks[ordinal]);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(row.metadata.as_ref().unwrap())
+                        .unwrap(),
+                    json!({"runtimeDeltaKind":"command_output", "observation":{"eventSeq":ordinal}})
+                );
+            }
+            assert!(rows.windows(2).all(|pair| pair[0].0 < pair[1].0));
+            let live = recv_notification_by_method(
+                harness.rx.as_mut().unwrap(),
+                events::ITEM_COMMAND_EXECUTION_OUTPUT_DELTA,
+            )
+            .await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            assert_eq!(live.delta, *chunk);
+            assert_eq!(live.stream, notification.stream);
+            assert_eq!(live.payload, notification.payload);
+            assert!(live.markdown.is_none() && live.markdown_version.is_none());
+            assert!(
+                harness
+                    .processor
+                    .agent_message_buffers
+                    .lock()
+                    .await
+                    .is_empty()
+            );
+            assert_eq!(
+                harness
+                    .processor
+                    .markdown_delta_parse_count
+                    .load(Ordering::Relaxed),
+                0
+            );
+        }
     }
     harness
         .processor
-        .retire_execution_progress_state(harness.turn_id.as_str())
+        .retire_execution_progress_state(&harness.turn_id)
         .await;
-    let rows = harness
-        .processor
-        .crud_store
-        .tool_output_page(
-            &notification.workspace_id,
-            &notification.thread_id,
-            &notification.turn_id,
-            &notification.item_id,
-            0,
-        )
-        .await
+    let mut params = pioneer_protocol::ThreadToolResultReadParams {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item_id: harness.item_id.clone(),
+        output_log: true,
+        cursor: None,
+        max_tokens: None,
+        max_bytes: Some(4096),
+    };
+    let mut raw = String::new();
+    let mut eof = false;
+    for _ in 0..256 {
+        let page = harness
+            .processor
+            .read_thread_tool_result(params.clone())
+            .await
+            .unwrap();
+        raw.push_str(&page.text);
+        if page.eof {
+            eof = true;
+            break;
+        }
+        params.cursor = page.next;
+        assert!(params.cursor.is_some());
+    }
+    assert!(eof);
+    let values = serde_json::Deserializer::from_str(&raw)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].1.text, "chunk\n");
-    let page = harness
-        .processor
-        .read_thread_tool_result(pioneer_protocol::ThreadToolResultReadParams {
-            workspace_id: notification.workspace_id.clone(),
-            thread_id: notification.thread_id.clone(),
-            turn_id: notification.turn_id.clone(),
-            item_id: notification.item_id.clone(),
-            output_log: true,
-            cursor: None,
-            max_tokens: None,
-            max_bytes: None,
-        })
-        .await
-        .unwrap();
-    let value: serde_json::Value = serde_json::from_str(&page.text).unwrap();
-    assert_eq!(value["text"], "chunk\n");
-    assert_eq!(value["stream"], "stdout");
-    assert!(page.eof);
-    let mut invalid = notification;
+    assert_eq!(values.len(), chunks.len());
+    for (value, chunk) in values.iter().zip(&chunks) {
+        assert_eq!(value["text"], *chunk);
+        assert_eq!(value["stream"], "stdout");
+    }
+    let mut invalid = progress_delta_notification(&harness, "rejected", ItemDeltaStream::Stdout);
     invalid.workspace_id = "wrong-workspace".into();
     assert!(
         !harness
@@ -10570,6 +11859,18 @@ async fn command_output_is_persisted_before_ack_and_survives_live_progress_clean
             })
             .await
     );
+    let rows = harness
+        .crud_store
+        .tool_output_page(
+            &harness.workspace_id,
+            &harness.thread_id,
+            &harness.turn_id,
+            &harness.item_id,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), chunks.len());
 }
 
 #[tokio::test]
@@ -11068,7 +12369,7 @@ async fn title_generation_retries_after_transient_failure() {
         preview_author: None,
         mode: pioneer_protocol::ThreadMode::Agent,
         model: "test-model".to_owned(),
-        model_provider: "openai".to_owned(),
+        model_provider: "cli_runtime:codex".to_owned(),
         reasoning_effort: None,
         created_at: 1,
         updated_at: 1,
@@ -36786,6 +38087,34 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         sleep(Duration::from_millis(25)).await;
     }
     if !child_dispatched {
+        let db = crud_store.database_connection();
+        let outbox_rows = pioneer_entity::agent_action_outbox::Entity::find()
+            .all(&db)
+            .await
+            .expect("direct Agent outbox diagnostics should load");
+        for row in &outbox_rows {
+            let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
+            if let Some(child_turn_id) = payload["dispatch"]["turn_id"].as_str() {
+                let owner = crud_store.get_turn_execution(child_turn_id).await;
+                let snapshot = crud_store.get_turn_runtime_snapshot(child_turn_id).await;
+                let authority = processor
+                    .load_turn_execution_authorization_context(child_turn_id)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}"));
+                let execution_id = payload["spawned_execution_id"].as_str().unwrap();
+                let resource =
+                    pioneer_crud::load_agent_execution_resource_state(&db, execution_id).await;
+                eprintln!(
+                    "direct Agent dispatch diagnostics: status={}, attempts={}, last_error={:?}, next_attempt_at={:?}, child_turn_id={child_turn_id}, owner={owner:?}, snapshot_present={:?}, authority={authority:?}, resource={resource:?}",
+                    row.status,
+                    row.attempts,
+                    row.last_error,
+                    row.next_attempt_at,
+                    snapshot.as_ref().map(|snapshot| snapshot.is_some()),
+                );
+            }
+        }
         let root_turn = crud_store
             .get_turn(thread_id, root_turn_id)
             .await
@@ -39146,6 +40475,75 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
     assert_eq!(
         anchor.child_turn_id.as_deref(),
         Some(lineage.child_turn_id.as_str())
+    );
+
+    // Exercise the real child lineage/resolver and parent subscription path.
+    wait_for_thread_manager_turn_status(
+        &processor.thread_manager,
+        &lineage.child_thread_id,
+        &lineage.child_turn_id,
+        TurnStatus::InProgress,
+    )
+    .await;
+    let reasoning_id = "task_child_reasoning";
+    assert!(
+        processor
+            .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                notification: ItemStartedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: lineage.child_thread_id.clone(),
+                    turn_id: lineage.child_turn_id.clone(),
+                    item: TurnItem::Reasoning {
+                        id: reasoning_id.into(),
+                        summary: vec!["**проверка".into()],
+                        content: vec![],
+                    },
+                },
+            })
+            .await
+    );
+    let previous_lookups = processor
+        .progress_item_type_lookup_count
+        .load(Ordering::Relaxed);
+    processor
+        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+            notification: ItemDeltaNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                item_id: reasoning_id.into(),
+                delta: " 🦀**".into(),
+                stream: Some(ItemDeltaStream::Generic),
+                payload: None,
+                markdown: None,
+                markdown_version: None,
+            },
+        })
+        .await;
+    let forwarded = timeout(Duration::from_secs(2), async {
+        loop {
+            let live = recv_notification_by_method(&mut rx, events::ITEM_AGENT_MESSAGE_DELTA).await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            if live.item_id == reasoning_id {
+                break live;
+            }
+        }
+    })
+    .await
+    .expect("child reasoning must reach the parent subscriber");
+    assert_eq!(forwarded.thread_id, thread_id);
+    assert_eq!(forwarded.turn_id, turn_id);
+    assert_eq!(forwarded.delta, " 🦀**");
+    assert_eq!(
+        forwarded.markdown,
+        Some(super::markdown::parse_markdown_document("**проверка 🦀**"))
+    );
+    assert_eq!(
+        processor
+            .progress_item_type_lookup_count
+            .load(Ordering::Relaxed),
+        previous_lookups,
+        "forwarding reuses the started item type cache"
     );
 
     processor
@@ -42489,6 +43887,14 @@ async fn setup_execution_window_terminal_turn(
     thread_id: &str,
     turn_id: &str,
 ) -> (MessageProcessor, Arc<CrudStore>, String) {
+    setup_execution_window_terminal_turn_with_input(thread_id, turn_id, &[]).await
+}
+
+async fn setup_execution_window_terminal_turn_with_input(
+    thread_id: &str,
+    turn_id: &str,
+    input: &[UserInput],
+) -> (MessageProcessor, Arc<CrudStore>, String) {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
@@ -42525,13 +43931,20 @@ async fn setup_execution_window_terminal_turn(
         )
         .await
         .expect("thread should start");
-    thread_manager
-        .system_turn_start_with_permission_profile(
+    let author = super::message_turn::resolve_turn_author_snapshot(
+        crud_store.as_ref(),
+        &pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let turn_start = thread_manager
+        .agent_turn_start_with_permission_profile(
             pioneer_protocol::TurnStartParams {
                 agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
-                input: Vec::new(),
+                input: input.to_vec(),
                 capabilities: Vec::new(),
                 model: None,
                 model_provider: None,
@@ -42548,6 +43961,7 @@ async fn setup_execution_window_terminal_turn(
             pioneer_protocol::system_turn_permission_profile_snapshot(
                 pioneer_protocol::TurnPermissionMode::FullAccess,
             ),
+            author,
         )
         .await
         .expect("turn should start in thread manager");
@@ -42555,22 +43969,8 @@ async fn setup_execution_window_terminal_turn(
         .materialize_turn_start(
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
-            &Turn {
-                id: turn_id.to_owned(),
-                status: TurnStatus::InProgress,
-                turn_kind: Default::default(),
-                origin: Default::default(),
-                mode: Default::default(),
-                author: None,
-                reply_to_turn_id: None,
-                mentions: Vec::new(),
-                message_revision: 0,
-                message_deleted: false,
-                error: None,
-                prompt_manifest: None,
-                permission_profile: default_test_permission_profile(),
-            },
-            &[],
+            &turn_start.materialization.turn,
+            input,
             pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
         )
         .await
@@ -49516,6 +50916,7 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
         .enqueue_codex_transport_session_recovery(
             handle.instance(),
             "oversized frame exceeded the finite spool budget",
+            None,
         )
         .await;
     cli_manager
@@ -51305,6 +52706,26 @@ async fn cli_runtime_terminal_attempt_fences_late_native_events() {
             }),
         )
         .await;
+
+    processor
+        .handle_cli_runtime_timeline_event(
+            &key,
+            RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+                native_thread_id: Some(native_thread_id.into()),
+                native_turn_id: Some(native_turn_id.into()),
+                message: "late retry".into(),
+                code: None,
+                native: None,
+            }),
+        )
+        .await;
+    assert!(
+        crud_store
+            .list_turn_items_by_type(turn_id, "system_event")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     assert!(
         crud_store
@@ -62557,6 +63978,762 @@ async fn semantic_timeline_rejects_excessive_limits_before_payload_growth() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_thread() {
+    use pioneer_client::{
+        core::ClientCore,
+        timeline::{
+            semantic::{TopLevelPageMergeMode, flatten_thread_semantic_timeline},
+            semantic_render::render_semantic_timeline_rows,
+        },
+    };
+    use sea_orm::ActiveModelTrait;
+
+    for (runtime_id, kind) in [
+        ("codex", CLIAgentRuntimeKind::Codex),
+        ("opencode", CLIAgentRuntimeKind::OpenCode),
+    ] {
+        // The harness thread is the visible parent. Never subscribe it to the child.
+        // Membership rows require a 21-character alphanumeric thread ID.
+        let mut harness = setup_live_semantic_timeline_harness_with_thread_id(
+            &format!("retry_{runtime_id}"),
+            generate_test_request_id("retrythread", runtime_id),
+        )
+        .await;
+        let cli = Arc::new(RecordingCliRuntimeSession::default());
+        cli.set_next_native_turn_id("retry_native_turn").await;
+        cli.enable_projected_mcp_metadata(harness.processor.crud_store.clone())
+            .await;
+        harness.processor = with_enabled_test_cli_runtime_catalog(
+            harness
+                .processor
+                .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli.clone()))
+                .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(kind)),
+        );
+        let processor = Arc::new(harness.processor.clone());
+        let store = processor.crud_store.clone();
+        sync_test_cli_runtime_identities(&processor).await.unwrap();
+        processor
+            .mark_cli_runtimes_ready_for_tests(&harness.workspace_id)
+            .await
+            .unwrap();
+        processor.bind_task_bridge().await;
+        processor.start_task_event_listener().await;
+        let mut parent: pioneer_entity::thread::ActiveModel = store
+            .get_thread_by_id(&harness.thread_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        parent.access_class = Set("private".into());
+        parent.update(&store.database_connection()).await.unwrap();
+        let params = detached_cli_task_create_params(
+            &harness.workspace_id,
+            &harness.thread_id,
+            &harness.turn_id,
+            runtime_id,
+            kind,
+            "gpt-5",
+            "retry notice presentation",
+        );
+        let (run, child) = drain_test_notifications_while(&mut harness.rx, async {
+            let response = create_task_for_test(&processor, params).await.unwrap();
+            let run = response.run.unwrap();
+            let child = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
+            assert_eq!(wait_for_cli_runtime_turn_starts(&cli, 1).await.len(), 1);
+            assert_eq!(
+                wait_for_run_status(store.clone(), &run.id, TaskRunStatus::Running).await,
+                TaskRunStatus::Running
+            );
+            (run, child)
+        })
+        .await;
+        assert!(
+            processor
+                .thread_manager
+                .subscribed_connections(&child.child_thread_id)
+                .await
+                .is_empty()
+        );
+        let source = store
+            .get_thread_by_id(&child.child_thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.access_class, "internal");
+        assert_eq!(source.sidebar_visibility, "hidden");
+        let binding = store
+            .get_cli_runtime_turn_binding(&child.child_turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let key = CLIAgentRuntimeSessionKey::new(
+            &harness.workspace_id,
+            runtime_id,
+            &binding.continuation_thread_id,
+        )
+        .unwrap();
+        let session = processor
+            .cli_runtime_manager
+            .as_ref()
+            .unwrap()
+            .existing_session(&key)
+            .await
+            .unwrap();
+        let instance = session.instance().clone();
+        let native_turn = binding.native_turn_id.clone().unwrap();
+        let retry = |message: &str| {
+            RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+                native_thread_id: Some(binding.native_thread_id.clone()),
+                native_turn_id: Some(native_turn.clone()),
+                message: message.into(),
+                code: None,
+                native: None,
+            })
+        };
+        // Finish startup fanout before observing the notice, so a delayed
+        // TaskRunStarted invalidation cannot satisfy the retry-delivery assertion.
+        timeout(
+            Duration::from_secs(10),
+            drain_test_notifications_while(&mut harness.rx, async {
+                loop {
+                    let fanout = processor.task_event_fanout_quantum().await.unwrap();
+                    assert_eq!(fanout.errors, 0);
+                    if fanout.pending != Some(true) {
+                        break;
+                    }
+                }
+                processor
+                    .process_due_native_turn_event_deliveries(now_timestamp_secs(), 128)
+                    .await
+                    .unwrap();
+                while processor
+                    .native_turn_event_delivery_kick_running
+                    .load(Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let initial = request_live_thread_timeline_page(&mut harness, "retry-before").await;
+        let core = ClientCore::new();
+        core.upsert_thread(
+            store
+                .get_thread_model(&harness.thread_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        core.activate_thread(Some(&harness.thread_id), Some(&harness.workspace_id));
+        core.apply_thread_timeline_page(initial, TopLevelPageMergeMode::Reset);
+
+        // A formerly admitted private-thread collaborator retains a stale local
+        // subscription, but membership revocation must fence both push and reload.
+        materialize_test_member_collaborator(
+            store.as_ref(),
+            &harness.workspace_id,
+            &harness.thread_id,
+        )
+        .await;
+        let (member_tx, mut member_rx) = mpsc::channel(64);
+        let member = processor
+            .session_manager
+            .register_connection(member_tx, authenticated_test_member_collaborator())
+            .await
+            .unwrap();
+        processor
+            .session_manager
+            .set_connection_workspace(member, Some(harness.workspace_id.clone()))
+            .await;
+        assert!(
+            processor
+                .thread_manager
+                .subscribe_connection(&harness.thread_id, member)
+                .await
+        );
+        let admitted_id = generate_test_request_id("retry", "member-before-revoke");
+        processor
+            .process_request_for_connection(
+                member,
+                &json!({
+                    "jsonrpc":"2.0", "id":admitted_id, "method":"thread/timeline/page",
+                    "params":{"threadId":harness.thread_id,"anchor":{"kind":"newest"}}
+                })
+                .to_string(),
+            )
+            .await;
+        let _admitted = recv_response_by_id(&mut member_rx, &admitted_id).await;
+        pioneer_entity::thread_membership::Entity::delete_many()
+            .filter(pioneer_entity::thread_membership::Column::ThreadId.eq(&harness.thread_id))
+            .filter(
+                pioneer_entity::thread_membership::Column::PrincipalId
+                    .eq(TEST_COLLABORATOR_PRINCIPAL_ID),
+            )
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+        while harness.rx.try_recv().is_ok() {}
+        for message in [
+            "Reconnecting... 1/5",
+            "different temporary failure",
+            "Reconnecting... 1/5",
+        ] {
+            processor
+                .handle_cli_runtime_timeline_event(&instance, retry(message))
+                .await;
+        }
+        let notices = store
+            .list_turn_items_by_type(&child.child_turn_id, "system_event")
+            .await
+            .unwrap();
+        let notices: Vec<_> = notices.into_iter().filter(|item| matches!(item, TurnItem::SystemEvent {code:Some(code),..} if code=="codex_request_retried")).collect();
+        if kind == CLIAgentRuntimeKind::OpenCode {
+            assert!(notices.is_empty());
+            continue;
+        }
+        assert_eq!(notices.len(), 1);
+        let notice_id = notices[0].item_id().to_owned();
+        let target = store
+            .codex_retry_notice_target(&child.child_thread_id, &child.child_turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // The card was read before a concurrent Task progress update. Mutable
+        // presentation fields must not invalidate its verified execution links.
+        let mut newer_task = target.task.clone();
+        newer_task.status = TaskStatus::Waiting;
+        newer_task.progress_preview = Some("newer progress".into());
+        newer_task.updated_at += 1;
+        store
+            .materialize_item_updated(
+                ItemUpdatedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: harness.thread_id.clone(),
+                    turn_id: target.turn_id.clone(),
+                    item: TurnItem::Task {
+                        item: newer_task.clone(),
+                    },
+                },
+                newer_task.updated_at,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .codex_retry_notices_for_task(
+                    &target.workspace_id,
+                    &target.thread_id,
+                    &target.turn_id,
+                    &target.task
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut wrong_link = target.task.clone();
+        wrong_link.run_id = Some("unrelated-run".into());
+        assert!(
+            store
+                .codex_retry_notices_for_task(
+                    &target.workspace_id,
+                    &target.thread_id,
+                    &target.turn_id,
+                    &wrong_link
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let block_id = pioneer_crud::detached_task_run_block_id(&target.turn_id, &target.task.id);
+        let changed = timeout(Duration::from_secs(10), async {
+            loop {
+                let packet = recv_notification_by_method(
+                    &mut harness.rx,
+                    events::THREAD_TIMELINE_BLOCKS_CHANGED,
+                )
+                .await;
+                let changed: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
+                    serde_json::from_value(packet.params.unwrap()).unwrap();
+                if changed.changed_block_ids.contains(&block_id) {
+                    break changed;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(changed.thread_id, harness.thread_id);
+        assert!(core.apply_thread_notification(
+            pioneer_protocol::GatewayNotification::ThreadTimelineBlocksChanged(changed)
+        ));
+        assert!(
+            core.thread_semantic_snapshot(&harness.thread_id)
+                .thread(&harness.thread_id)
+                .unwrap()
+                .top_level
+                .stale_block_ids()
+                .contains(&block_id.as_str())
+        );
+        assert!(
+            core.thread_semantic_snapshot(&child.child_thread_id)
+                .thread(&child.child_thread_id)
+                .is_none()
+        );
+        let page = request_live_thread_timeline_page(&mut harness, "retry-after").await;
+        core.apply_thread_timeline_page(page.clone(), TopLevelPageMergeMode::Merge);
+        let viewing_thread = harness.thread_id.clone();
+        let assert_visible = |client: &ClientCore| {
+            let state = client.thread_semantic_snapshot(&viewing_thread);
+            let rows = flatten_thread_semantic_timeline(state.thread(&viewing_thread).unwrap());
+            let rendered = render_semantic_timeline_rows(&rows.rows, Default::default());
+            let shown: Vec<_> = rendered.projection.items.iter().filter(|item| matches!(&item.item,TurnItem::SystemEvent{code:Some(code),..} if code=="codex_request_retried")).collect();
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].id, notice_id);
+            assert_eq!(shown[0].turn_id, child.child_turn_id);
+            assert_eq!(
+                shown[0]
+                    .timeline_origin
+                    .as_ref()
+                    .unwrap()
+                    .child_thread_id
+                    .as_deref(),
+                Some(child.child_thread_id.as_str())
+            );
+        };
+        assert_visible(&core);
+        // A fresh client opens only the main thread from durable history.
+        let restored = ClientCore::new();
+        restored.upsert_thread(
+            store
+                .get_thread_model(&harness.thread_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let reloaded = request_live_thread_timeline_page(&mut harness, "retry-reloaded").await;
+        restored.apply_thread_timeline_page(reloaded, TopLevelPageMergeMode::Reset);
+        assert_visible(&restored);
+        let canonical = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(&child.child_turn_id))
+            .filter(pioneer_entity::turn_event::Column::EventType.eq(events::ITEM_COMPLETED))
+            .all(&store.database_connection())
+            .await
+            .unwrap();
+        assert_eq!(
+            canonical
+                .iter()
+                .filter(|event| event.payload.contains("codex_request_retried"))
+                .count(),
+            1
+        );
+        assert!(store.list_turn_items_by_type(&run.id, "system_event").await.unwrap().iter().all(|item| !matches!(item,TurnItem::SystemEvent{code:Some(code),..} if code=="codex_request_retried")));
+        while let Ok(packet) = member_rx.try_recv() {
+            let Message::Text(packet) = packet else {
+                continue;
+            };
+            let packet: JsonValue = serde_json::from_str(packet.as_str()).unwrap();
+            assert_ne!(
+                packet.get("method").and_then(JsonValue::as_str),
+                Some(events::THREAD_TIMELINE_BLOCKS_CHANGED)
+            );
+        }
+        let id = generate_test_request_id("retry", "revoked");
+        processor.process_request_for_connection(member, &json!({"jsonrpc":"2.0","id":id,"method":"thread/timeline/page","params":{"threadId":harness.thread_id,"anchor":{"kind":"newest"}}}).to_string()).await;
+        let rejected = recv_jsonrpc_payload_by_id(&mut member_rx, &id).await;
+        let rejected: JsonValue = serde_json::from_str(&rejected).unwrap();
+        assert!(rejected.get("error").is_some());
+        assert!(!rejected.to_string().contains("codex_request_retried"));
+
+        // This reader can read the parent but its registered role specifically
+        // lacks ChildObserve. Unlike revoking the parent, this must return a
+        // successful Task card with an authorized empty notice list.
+        materialize_test_member_collaborator(
+            store.as_ref(),
+            &harness.workspace_id,
+            &harness.thread_id,
+        )
+        .await;
+        let mut restricted = (*authenticated_test_member_collaborator()).clone();
+        restricted.role_key = Some(RoleKey::new("synthetic_executor").unwrap());
+        let mut principal: pioneer_entity::gateway_principal::ActiveModel =
+            pioneer_entity::gateway_principal::Entity::find_by_id(TEST_COLLABORATOR_PRINCIPAL_ID)
+                .one(&store.database_connection())
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        principal.role_key = Set(Some("synthetic_executor".into()));
+        principal
+            .update(&store.database_connection())
+            .await
+            .unwrap();
+        let policy = crate::authorization::AuthorizationService::new();
+        use crate::authorization::ResourceAction;
+        assert!(
+            policy
+                .authorize_action(
+                    restricted.kind,
+                    restricted.role_key.as_ref(),
+                    ResourceAction::ThreadRead
+                )
+                .permits_resource_resolution()
+        );
+        assert!(
+            !policy
+                .authorize_action(
+                    restricted.kind,
+                    restricted.role_key.as_ref(),
+                    ResourceAction::ChildObserve
+                )
+                .permits_resource_resolution()
+        );
+        let (restricted_tx, mut restricted_rx) = mpsc::channel(64);
+        let restricted_connection = processor
+            .session_manager
+            .register_connection(restricted_tx, Arc::new(restricted))
+            .await
+            .unwrap();
+        processor
+            .session_manager
+            .set_connection_workspace(restricted_connection, Some(harness.workspace_id.clone()))
+            .await;
+        let id = generate_test_request_id("retry", "child-observe-denied");
+        processor
+            .process_request_for_connection(
+                restricted_connection,
+                &json!({"jsonrpc":"2.0","id":id,"method":"thread/timeline/page",
+                "params":{"threadId":harness.thread_id,"anchor":{"kind":"newest"}}})
+                .to_string(),
+            )
+            .await;
+        let response = recv_jsonrpc_payload_by_id(&mut restricted_rx, &id).await;
+        let response: JsonValue = serde_json::from_str(&response).unwrap();
+        assert!(
+            response.get("error").is_none(),
+            "parent ThreadRead must succeed: {response}"
+        );
+        let empty_page: pioneer_protocol::ThreadTimelinePageResponse =
+            serde_json::from_value(response["result"].clone()).unwrap();
+        assert!(empty_page.blocks.iter().any(|block| block.block_id == block_id
+            && matches!(&block.kind, pioneer_protocol::TimelineBlockKind::DetachedTaskRun { codex_retry_notices, .. } if codex_retry_notices.is_empty())));
+
+        // Feed the real Gateway result through the production request worker.
+        // A live Task update after its baseline was captured must retain fresh
+        // status/progress while still applying the ChildObserve denial.
+        struct AuthorizedPageTransport<'a> {
+            core: &'a ClientCore,
+            page: pioneer_protocol::ThreadTimelinePageResponse,
+            live: pioneer_protocol::ItemUpdatedNotification,
+            sent: std::cell::Cell<bool>,
+        }
+        impl pioneer_client::rpc::JsonRpcRequestTransport for AuthorizedPageTransport<'_> {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                _: String,
+                response: pioneer_client::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                if !self.sent.replace(true) {
+                    self.core.apply_thread_notification(
+                        pioneer_protocol::GatewayNotification::ItemUpdated(self.live.clone()),
+                    );
+                }
+                response
+                    .send(Ok(serde_json::to_value(&self.page).unwrap()))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        use pioneer_client::timeline::semantic::{
+            SemanticTimelineRequestAction, SemanticTimelineRequestKey,
+        };
+        let request = core
+            .begin_thread_semantic_request(SemanticTimelineRequestAction::ThreadTimelinePage {
+                key: SemanticTimelineRequestKey::ThreadNewest {
+                    thread_id: harness.thread_id.clone(),
+                },
+                params: pioneer_protocol::ThreadTimelinePageParams {
+                    thread_id: harness.thread_id.clone(),
+                    anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                    limit: Some(12),
+                },
+            })
+            .unwrap();
+        let mut fresh_task = newer_task.clone();
+        fresh_task.status = TaskStatus::Running;
+        fresh_task.progress_preview = Some("live progress during authorized read".into());
+        fresh_task.updated_at += 100;
+        let transport = AuthorizedPageTransport {
+            core: &core,
+            page: empty_page,
+            live: ItemUpdatedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: harness.thread_id.clone(),
+                turn_id: target.turn_id.clone(),
+                item: TurnItem::Task {
+                    item: fresh_task.clone(),
+                },
+            },
+            sent: std::cell::Cell::new(false),
+        };
+        core.execute_thread_semantic_request(&transport, request);
+        assert!(transport.sent.get());
+        let state = core.thread_semantic_snapshot(&harness.thread_id);
+        let timeline = &state.thread(&harness.thread_id).unwrap().top_level;
+        assert_eq!(
+            timeline.request_status,
+            pioneer_client::timeline::semantic::TimelineRequestStatus::Ready
+        );
+        let card = timeline.block(&block_id).unwrap();
+        assert!(
+            matches!(&card.kind, pioneer_protocol::TimelineBlockKind::DetachedTaskRun { task, codex_retry_notices, .. }
+            if task == &fresh_task && codex_retry_notices.is_empty())
+        );
+
+        // Cross the identity batch boundary without loading unrelated technical
+        // history. The current active attempt stays the latest durable attempt.
+        let attempt = pioneer_entity::turn_cli_runtime_attempt::Entity::find()
+            .filter(
+                pioneer_entity::turn_cli_runtime_attempt::Column::TurnId.eq(&child.child_turn_id),
+            )
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active: pioneer_entity::turn_cli_runtime_attempt::ActiveModel =
+            attempt.clone().into();
+        active.attempt_index = Set(65);
+        active.update(&store.database_connection()).await.unwrap();
+        for index in 1..=64 {
+            let mut historical: pioneer_entity::turn_cli_runtime_attempt::ActiveModel =
+                attempt.clone().into();
+            historical.id = Set(format!("retry-history-{index}"));
+            historical.attempt_index = Set(index);
+            historical.native_turn_id = Set(Some(format!("retry-history-native-{index}")));
+            historical.status = Set("completed".into());
+            historical
+                .insert(&store.database_connection())
+                .await
+                .unwrap();
+        }
+        let history_id =
+            pioneer_crud::codex_retry_notice_item_id(&child.child_turn_id, "retry-history-1");
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: child.child_thread_id.clone(),
+                    turn_id: child.child_turn_id.clone(),
+                    item: TurnItem::SystemEvent {
+                        id: history_id.clone(),
+                        level: pioneer_protocol::SystemEventLevel::Warning,
+                        message: "Codex reported a request retry after a temporary failure.".into(),
+                        code: Some("codex_request_retried".into()),
+                        details: None,
+                    },
+                },
+                now_timestamp_secs(),
+            )
+            .await
+            .unwrap();
+        let notice_row = pioneer_entity::turn_item::Entity::find()
+            .filter(pioneer_entity::turn_item::Column::TurnId.eq(&child.child_turn_id))
+            .filter(pioneer_entity::turn_item::Column::ItemId.eq(&notice_id))
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut unrelated: pioneer_entity::turn_item::ActiveModel = notice_row.clone().into();
+        unrelated.id = Set("unrelated-corrupt-system-event".into());
+        unrelated.item_id = Set("unrelated-corrupt-system-event".into());
+        unrelated.payload = Set("{corrupt unrelated technical event".into());
+        unrelated
+            .insert(&store.database_connection())
+            .await
+            .unwrap();
+        let read = store
+            .codex_retry_notices_for_task(
+                &target.workspace_id,
+                &target.thread_id,
+                &target.turn_id,
+                &target.task,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.len(), 2);
+        assert!(read.iter().any(|notice| notice.item_id == notice_id));
+        assert!(read.iter().any(|notice| notice.item_id == history_id));
+        let original_payload = notice_row.payload.clone();
+        let mut corrupt: pioneer_entity::turn_item::ActiveModel = notice_row.clone().into();
+        corrupt.payload = Set("{corrupt requested retry notice".into());
+        corrupt.update(&store.database_connection()).await.unwrap();
+        assert!(
+            store
+                .codex_retry_notices_for_task(
+                    &target.workspace_id,
+                    &target.thread_id,
+                    &target.turn_id,
+                    &target.task
+                )
+                .await
+                .is_err()
+        );
+        let mut restore: pioneer_entity::turn_item::ActiveModel = notice_row.into();
+        restore.payload = Set(original_payload);
+        restore.update(&store.database_connection()).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_retry_notice_storage_failure_preserves_native_execution_and_rejects_commit() {
+    use crate::cli_runtime::session_instance::CliSessionInstanceOrigin;
+    let harness = setup_live_semantic_timeline_harness("retry_storage_failure").await;
+    let processor = &harness.processor;
+    let store = processor.crud_store.clone();
+    let now = chrono::Utc::now().fixed_offset();
+    seed_running_cli_runtime_binding(
+        store.as_ref(),
+        NewCliRuntimeTurnBinding {
+            turn_id: harness.turn_id.clone(),
+            thread_id: harness.thread_id.clone(),
+            continuation_thread_id: harness.thread_id.clone(),
+            workspace_id: harness.workspace_id.clone(),
+            runtime_id: "codex".into(),
+            runtime_kind: "codex".into(),
+            native_thread_id: "retry_storage_thread".into(),
+            native_turn_id: Some("retry_storage_turn".into()),
+            request_id: None,
+            status: "running".into(),
+            model: None,
+            cwd: None,
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".into(),
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await;
+    let attempt = store
+        .latest_cli_runtime_turn_attempt(&harness.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let key =
+        CLIAgentRuntimeSessionKey::new(&harness.workspace_id, "codex", &harness.thread_id).unwrap();
+    store.database_connection().execute_unprepared(
+        "CREATE TRIGGER reject_codex_retry_notice BEFORE INSERT ON turn_event \
+         WHEN NEW.event_type='item/completed' AND json_extract(NEW.payload,'$.payload.item.code')='codex_request_retried' \
+         BEGIN SELECT RAISE(ABORT,'injected retry notice storage failure'); END;"
+    ).await.unwrap();
+    processor
+        .handle_cli_runtime_timeline_event(
+            &key,
+            RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+                native_thread_id: Some("retry_storage_thread".into()),
+                native_turn_id: Some("retry_storage_turn".into()),
+                message: "temporary failure".into(),
+                code: None,
+                native: None,
+            }),
+        )
+        .await;
+    let transition = processor.cli_runtime_session_transition_mutex(&key).await;
+    let released = timeout(Duration::from_secs(1), transition.lock_owned())
+        .await
+        .expect("failed notice must release native transition");
+    drop(released);
+    let projection = crate::cli_runtime::projector::project_cli_runtime_event(
+        &crate::cli_runtime::projector::CLIRuntimeProjectorContext {
+            workspace_id: harness.workspace_id.clone(),
+            thread_id: harness.thread_id.clone(),
+            turn_id: harness.turn_id.clone(),
+            recovery: None,
+            codex_retry_attempt_id: Some(attempt.id.clone()),
+        },
+        &RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+            native_thread_id: Some("retry_storage_thread".into()),
+            native_turn_id: Some("retry_storage_turn".into()),
+            message: "same retry".into(),
+            code: None,
+            native: None,
+        }),
+    );
+    let event = projection.durable.into_iter().next().unwrap();
+    let result = processor
+        .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), event.clone())
+        .await;
+    match result {
+        Err(pioneer_runtime_events::ExecutionEventHubError::CommitRejected(rejection)) => {
+            assert_eq!(rejection.code(), "projection_failed");
+        }
+        other => panic!("expected storage projection rejection, got {other:?}"),
+    }
+    assert!(
+        store
+            .list_turn_items_by_type(&harness.turn_id, "system_event")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_turn(&harness.thread_id, &harness.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding(&harness.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_attempt(&attempt.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        attempt.status
+    );
+    assert!(attempt.status.is_active());
+    assert!(
+        pioneer_entity::recovery_job::Entity::find()
+            .filter(pioneer_entity::recovery_job::Column::TurnId.eq(&harness.turn_id))
+            .all(&store.database_connection())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER reject_codex_retry_notice")
+        .await
+        .unwrap();
+    processor
+        .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), event)
+        .await
+        .expect("same valid attempt must ACK after removing the INSERT fault");
+    let saved = store
+        .list_turn_items_by_type(&harness.turn_id, "system_event")
+        .await
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert!(
+        matches!(&saved[0], TurnItem::SystemEvent { code: Some(code), .. } if code == "codex_request_retried")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_semantic_timeline_projects_running_item_without_backfill() {
     let mut harness = setup_live_semantic_timeline_harness("running").await;
     let item_id = "semantic_live_running_cmd";
@@ -63565,6 +65742,17 @@ async fn setup_semantic_timeline_query_harness_inner(
 }
 
 async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTimelineHarness {
+    setup_live_semantic_timeline_harness_with_thread_id(
+        case_id,
+        format!("thr_semantic_live_{case_id}"),
+    )
+    .await
+}
+
+async fn setup_live_semantic_timeline_harness_with_thread_id(
+    case_id: &str,
+    thread_id: String,
+) -> LiveSemanticTimelineHarness {
     let (tx, rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -63573,7 +65761,6 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
-    let thread_id = format!("thr_semantic_live_{case_id}");
     let turn_id = format!("turn_semantic_live_{case_id}");
 
     let thread_start = thread_manager

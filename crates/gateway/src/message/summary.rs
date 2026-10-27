@@ -199,15 +199,27 @@ async fn generate_cli_title(
             *scope = serde_json::json!("isolated_cli_title_result");
         }
     }
-    call.record(
-        if result.is_ok() {
-            "completed"
-        } else {
-            "failed"
-        },
-        &usage,
-    )
-    .await?;
+    let recorded = call
+        .record(
+            if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+            &usage,
+        )
+        .await;
+    if let Err(error) = recorded {
+        return Err(
+            if result.as_ref().is_err_and(|failure| {
+                failure.is::<pioneer_cli_agent_runtime::service::CodexServiceDeadline>()
+            }) {
+                error.context(pioneer_cli_agent_runtime::service::CodexServiceDeadline)
+            } else {
+                error
+            },
+        );
+    }
     result.map(|(text, _)| text)
 }
 

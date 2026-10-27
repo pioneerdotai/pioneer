@@ -13,7 +13,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 // xctrace's --time-limit covers recording, not stack analysis and trace saving.
@@ -25,6 +28,7 @@ pub(super) const XCTRACE_FINISH_ALLOWANCE_SECONDS: u64 = 120;
 #[serde(rename_all = "snake_case")]
 pub enum CaptureMode {
     Cpu,
+    SqlCpu,
     Allocations,
     AllocationHistory,
     LiveAllocations,
@@ -74,6 +78,7 @@ pub struct CaptureManifest {
 fn is_profile_file(mode: CaptureMode, file: &ArtifactFile) -> bool {
     file.bytes > 0
         && match mode {
+            CaptureMode::SqlCpu => false,
             CaptureMode::Cpu | CaptureMode::Allocations => {
                 file.filename.starts_with("profile.trace/") || file.filename == "perf.data"
             }
@@ -192,6 +197,10 @@ fn plan(config: &CaptureRequest, pid: u32, path: &Path, stack_logging: &str) -> 
         (19..=199).contains(&config.frequency_hz),
         "frequency must be 19..199 Hz"
     );
+    ensure!(
+        config.mode != CaptureMode::SqlCpu,
+        "SQL CPU has no native plan"
+    );
     let pid = pid.to_string();
     #[cfg(target_os = "macos")]
     {
@@ -245,6 +254,7 @@ fn plan(config: &CaptureRequest, pid: u32, path: &Path, stack_logging: &str) -> 
                     graceful_stop: false,
                 }
             }
+            CaptureMode::SqlCpu => unreachable!("SQL CPU bypasses native adapters"),
             CaptureMode::Vm => ToolPlan {
                 program: "/usr/bin/vmmap".into(),
                 args: vec!["-summary".into(), pid],
@@ -317,6 +327,43 @@ fn identity_result(start: &str, observed: std::io::Result<String>) -> Result<(),
 fn verify_identity(pid: u32, start: &str) -> Result<()> {
     identity_result(start, crate::resources::process_start_identity(pid))
         .map_err(anyhow::Error::msg)
+}
+// One capture-local, first-failure latch. Only classified identity results
+// enter here, never arbitrary native tool errors. Successful reads cannot clear it.
+#[derive(Default)]
+struct NativeIdentityFailure(Mutex<Option<&'static str>>);
+impl NativeIdentityFailure {
+    fn record(&self, reason: &'static str) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(reason);
+    }
+    fn get(&self) -> Option<&'static str> {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+fn verify_native_identity(
+    pid: u32,
+    start: &str,
+    failure: Option<&NativeIdentityFailure>,
+    #[cfg(test)] boundary: tests::NativeIdentityBoundary,
+) -> Result<()> {
+    #[cfg(test)]
+    let observed = tests::NATIVE_IDENTITY
+        .with(|slot| slot.borrow_mut().as_mut().and_then(|read| read(boundary)))
+        .unwrap_or_else(|| crate::resources::process_start_identity(pid));
+    #[cfg(not(test))]
+    let observed = crate::resources::process_start_identity(pid);
+    let result = identity_result(start, observed);
+    if let (Some(failure), Err(reason)) = (failure, result) {
+        // Publish before the caller starts bounded stop/reap/finalization.
+        failure.record(reason);
+    }
+    result.map_err(anyhow::Error::msg)
 }
 fn allowed(epoch: u64, stop: &AtomicBool, cancel: &AtomicBool) -> bool {
     !stop.load(Ordering::Acquire)
@@ -466,6 +513,15 @@ pub(super) fn capture(
         !cancel.load(Ordering::Acquire),
         "operator_cancelled_before_attach"
     );
+    ensure!(
+        (1..=60).contains(&config.seconds),
+        "capture duration must be 1..60 seconds"
+    );
+    ensure!(
+        config.mode != CaptureMode::SqlCpu
+            || sql_cpu_eligible(&target.service, &config, target.run.pid),
+        "unsupported_target: SQL CPU requires the owner parent Gateway without --child"
+    );
     let (pid, start_identity) = resolve_target(target, &config)?;
     verify_identity(pid, &start_identity)?;
     if config.child_generation.is_none() {
@@ -478,27 +534,78 @@ pub(super) fn capture(
     let capture_id = nanoid::nanoid!(24);
     let path = storage::capture_dir(root, &capture_id)?;
     let _capture_lease = storage::CaptureLease::new(&path);
-    let mut attempt = None;
-    let mut sql_cpu = SqlCpuCapture::default();
-    let outcome = capture_inner(
-        &path,
-        &capture_id,
-        target,
-        config.clone(),
-        pid,
-        &start_identity,
+    let _consent_cleanup = CaptureConsentCleanup {
+        path: &path,
+        epoch,
         stop,
-        cancel,
-        &mut attempt,
-        &mut sql_cpu,
-    );
-    // Seal even on native spawn/wait/inventory failure; deadline is owned by
-    // Session and never extended by native-tool finalization.
-    sql_cpu.seal();
-    let sql_cpu = sql_cpu.snapshot;
+    };
+    // Admission and the full SQL/manifest reserve precede all native preparation.
+    if reserve_sql_cpu {
+        native_size(&path, true)?;
+    }
+    let mut sql_cpu = SqlCpuCapture::default();
+    if reserve_sql_cpu {
+        sql_cpu.start(config.seconds, epoch);
+    }
+    let native_identity_failure = NativeIdentityFailure::default();
+    let mut attempt = None;
+    #[cfg(test)]
+    let native_fixture = tests::NATIVE_PLAN.with(|slot| slot.borrow_mut().take());
+    let outcome = if config.mode == CaptureMode::SqlCpu {
+        sql_cpu.wait(epoch, pid, &start_identity, stop, cancel);
+        Ok(sql_only_manifest(
+            &capture_id,
+            target,
+            &config,
+            &start_identity,
+            &sql_cpu,
+        ))
+    } else {
+        sql_cpu.run_native(
+            epoch,
+            pid,
+            &start_identity,
+            stop,
+            cancel,
+            &native_identity_failure,
+            |native_stop| {
+                #[cfg(test)]
+                let native_done = native_fixture.as_ref().map(|f| f.done.clone());
+                let outcome = capture_inner(
+                    &path,
+                    &capture_id,
+                    target,
+                    config.clone(),
+                    pid,
+                    &start_identity,
+                    native_stop,
+                    cancel,
+                    &mut attempt,
+                    reserve_sql_cpu.then_some(&native_identity_failure),
+                    #[cfg(test)]
+                    native_fixture.map(|f| f.plan),
+                );
+                #[cfg(test)]
+                if let Some(done) = native_done {
+                    done.store(true, Ordering::Release);
+                }
+                // Record the native cleanup boundary now, not after waiting for SQL.
+                if let Some(attempt) = &mut attempt {
+                    attempt
+                        .ended
+                        .get_or_insert_with(|| (unix_ms(), monotonic_ms()));
+                }
+                outcome
+            },
+        )
+    };
     if !crate::telemetry_sample_allowed(Some(epoch)) || stop.load(Ordering::Acquire) {
         storage::remove_owned(&path);
         bail!("capture_shutdown_or_consent_revoked");
+    }
+    if let Some(reason) = sql_cpu.identity_failure {
+        storage::remove_owned(&path);
+        bail!("{reason}");
     }
     let mut manifest = match outcome {
         Ok(manifest) => manifest,
@@ -515,20 +622,79 @@ pub(super) fn capture(
             reserve_sql_cpu,
         )?,
     };
-    if let Some(snapshot) = sql_cpu {
+    if reserve_sql_cpu {
+        if let Err(error) = verify_identity(pid, &start_identity) {
+            storage::remove_owned(&path);
+            return Err(error);
+        }
+    }
+    if config.mode == CaptureMode::SqlCpu {
+        manifest.files = capture_inventory(&path, true)?;
+    }
+    if let Some(snapshot) = &sql_cpu.snapshot {
         if !crate::telemetry_sample_allowed(Some(epoch)) || stop.load(Ordering::Acquire) {
             storage::remove_owned(&path);
             bail!("capture_shutdown_or_consent_revoked");
         }
-        store_sql_cpu(&path, target, &mut manifest, &snapshot);
+        store_sql_cpu(&path, target, &mut manifest, snapshot);
     }
     if manifest.sql_cpu.is_none() && sql_cpu_eligible(&target.service, &config, pid) {
-        manifest.sql_cpu = Some(
-            serde_json::json!({"status":"unavailable", "reason":"native_prerequisite_failed_or_session_unavailable"}),
-        );
+        manifest.sql_cpu = Some(serde_json::json!({
+            "status":"unavailable", "reason":"sql_cpu_session_unavailable",
+            "native_profile_status": if config.mode == CaptureMode::SqlCpu { "not_requested" } else { &manifest.status },
+            "native_profile_interval": native_profile_interval(&manifest),
+        }));
+        if !manifest
+            .incomplete_reasons
+            .iter()
+            .any(|r| r == "sql_cpu_session_unavailable")
+        {
+            manifest
+                .incomplete_reasons
+                .push("sql_cpu_session_unavailable".into());
+        }
+        if manifest.status == "completed" {
+            manifest.status = if config.mode == CaptureMode::SqlCpu {
+                "failed"
+            } else {
+                "partial"
+            }
+            .into();
+        }
     }
+    if let Some(reason) = sql_cpu.closed_reason.filter(|r| *r != "deadline") {
+        if !manifest.incomplete_reasons.iter().any(|r| r == reason) {
+            manifest.incomplete_reasons.push(reason.into());
+        }
+        if manifest.status == "completed" {
+            manifest.status = "partial".into();
+        }
+    }
+    // Identity loss cannot authorize storage of a result for a different target.
+    if reserve_sql_cpu {
+        if let Err(error) = verify_identity(pid, &start_identity) {
+            storage::remove_owned(&path);
+            return Err(error);
+        }
+    }
+    if !crate::telemetry_sample_allowed(Some(epoch)) || stop.load(Ordering::Acquire) {
+        storage::remove_owned(&path);
+        bail!("consent_revoked_before_capture_commit");
+    }
+    #[cfg(test)]
+    tests::BEFORE_COMMIT.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(&path);
+        }
+    });
     storage::write_new_json(&path.join("manifest.json"), &manifest)?;
-    if !crate::telemetry_sample_allowed(Some(epoch)) {
+    if reserve_sql_cpu {
+        if let Err(error) = verify_identity(pid, &start_identity) {
+            storage::remove_owned(&path);
+            return Err(error);
+        }
+    }
+    if !crate::telemetry_sample_allowed(Some(epoch)) || stop.load(Ordering::Acquire) {
         storage::remove_owned(&path);
         bail!("consent_revoked_before_capture_commit");
     }
@@ -624,12 +790,12 @@ fn store_sql_cpu(
             kind: "pioneer.gateway.sql_cpu",
             run: &target.run,
             consent_generation: target.consent_generation,
-            native_profile_status: &manifest.status,
-            native_profile_interval: serde_json::json!({
-                "started_monotonic_ms": manifest.started_monotonic_ms,
-                "ended_monotonic_ms": manifest.ended_monotonic_ms,
-                "clock_scope": manifest.clock_scope,
-            }),
+            native_profile_status: if manifest.mode == CaptureMode::SqlCpu {
+                "not_requested"
+            } else {
+                &manifest.status
+            },
+            native_profile_interval: native_profile_interval(manifest),
             sql_cpu: snapshot,
         };
         let bytes = storage::write_new_sql_cpu_json(&path.join("sql-cpu.json"), &sidecar)?;
@@ -642,6 +808,14 @@ fn store_sql_cpu(
         "coverage": snapshot.coverage,
         "measured_unknown": snapshot.measured_unknown,
         "group_overflow": snapshot.group_overflow,
+        "native_profile_status": if manifest.mode == CaptureMode::SqlCpu { "not_requested" } else { &manifest.status },
+        "native_profile_interval": native_profile_interval(manifest),
+        "started_unix_ms": snapshot.started_unix_ms,
+        "elapsed_ns": snapshot.elapsed_ns,
+        "requested_seconds": snapshot.requested_seconds,
+        "closed_reason": snapshot.closed_reason,
+        "window_complete": snapshot.closed_reason == "deadline",
+        "limitations": snapshot.limitations,
         "started_monotonic_ms": snapshot.started_monotonic_ms,
         "ended_monotonic_ms": snapshot.ended_monotonic_ms,
         "scope": "Observed SQLx command CPU only; aggregation completeness is independent of unknown identities, measurement gaps and native profile status. measured_unknown overlaps groups/residual; never add it to accounted.",
@@ -665,7 +839,12 @@ fn store_sql_cpu(
                 .incomplete_reasons
                 .push("sql_cpu_sidecar_unavailable".into());
             if manifest.status == "completed" {
-                manifest.status = "partial".into();
+                manifest.status = if manifest.mode == CaptureMode::SqlCpu {
+                    "failed"
+                } else {
+                    "partial"
+                }
+                .into();
             }
         }
     }
@@ -687,23 +866,227 @@ fn native_size(path: &Path, sql_cpu: bool) -> Result<u64> {
     let (bytes, files) = native_storage_limits(sql_cpu);
     storage::size_with_file_limit(path, bytes, files)
 }
+// Keep revoke/shutdown deletion authoritative on storage/recovery `?` exits as
+// well. Declared before SQL ownership, so Session and joined native work finish
+// before this guard can remove the admitted directory.
+struct CaptureConsentCleanup<'a> {
+    path: &'a Path,
+    epoch: u64,
+    stop: &'a AtomicBool,
+}
+impl Drop for CaptureConsentCleanup<'_> {
+    fn drop(&mut self) {
+        if self.stop.load(Ordering::Acquire) || !crate::telemetry_sample_allowed(Some(self.epoch)) {
+            storage::remove_owned(self.path);
+        }
+    }
+}
+
+fn native_profile_interval(manifest: &CaptureManifest) -> serde_json::Value {
+    if manifest.mode == CaptureMode::SqlCpu || manifest.tool == "not_started_or_prerequisite_failed"
+    {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!({
+            "started_monotonic_ms": manifest.started_monotonic_ms,
+            "ended_monotonic_ms": manifest.ended_monotonic_ms,
+            "clock_scope": manifest.clock_scope,
+        })
+    }
+}
+
 #[derive(Default)]
 struct SqlCpuCapture {
     session: Option<crate::query_cpu::Session>,
     snapshot: Option<crate::query_cpu::Snapshot>,
+    deadline: Option<Instant>,
+    closed_reason: Option<&'static str>,
+    identity_failure: Option<&'static str>,
 }
 impl SqlCpuCapture {
-    fn seal(&mut self) {
-        if let Some(session) = self.session.take() {
-            self.snapshot = Some(session.finish());
+    fn start(&mut self, seconds: u64, epoch: u64) {
+        self.session = crate::query_cpu::Session::start(seconds, epoch);
+        self.deadline = self
+            .session
+            .as_ref()
+            .map(crate::query_cpu::Session::deadline);
+    }
+    fn poll(&mut self, signal: Option<&'static str>) {
+        // An observed loss remains terminal even if a later identity read
+        // recovers, including after SQL deadline during native finalization.
+        if let Some(reason) = signal.filter(|r| r.starts_with("target_")) {
+            self.identity_failure.get_or_insert(reason);
         }
+        if self.session.is_some()
+            && (signal.is_some() || self.deadline.is_some_and(|d| Instant::now() >= d))
+        {
+            let mut snapshot = self.session.take().unwrap().finish();
+            // The collector's original deadline determines whether SQL ran its
+            // full window. A cancel processed later cannot make that partial.
+            if snapshot.closed_reason != "deadline" {
+                if let Some(reason) = signal {
+                    snapshot.closed_reason = reason;
+                }
+            }
+            self.closed_reason = Some(snapshot.closed_reason);
+            self.snapshot = Some(snapshot);
+        }
+    }
+    fn pause(&self) {
+        let slice = Duration::from_millis(50);
+        let remaining = if self.session.is_some() {
+            self.deadline
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+                .min(slice)
+        } else {
+            slice
+        };
+        // No collector mutex, SQL scope or SQLite capacity is held while waiting.
+        std::thread::sleep(remaining);
+    }
+    fn wait(&mut self, epoch: u64, pid: u32, start: &str, stop: &AtomicBool, cancel: &AtomicBool) {
+        while self.session.is_some() {
+            self.poll(sql_window_signal(epoch, pid, start, stop, cancel));
+            if self.session.is_some() {
+                self.pause();
+            }
+        }
+    }
+    fn run_native(
+        &mut self,
+        epoch: u64,
+        pid: u32,
+        start: &str,
+        stop: &AtomicBool,
+        cancel: &AtomicBool,
+        identity_failure: &NativeIdentityFailure,
+        native: impl FnOnce(&AtomicBool) -> Result<CaptureManifest> + Send,
+    ) -> Result<CaptureManifest> {
+        if self.session.is_none() {
+            let result = native(stop);
+            self.poll(identity_failure.get());
+            return result;
+        }
+        let native_stop = AtomicBool::new(false);
+        // The existing capture owner keeps the SQL Session. Native work is
+        // joined before recovery/storage/lease release; it can never detach.
+        std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .name("pioneer-native-capture".into())
+                .spawn_scoped(scope, || native(&native_stop));
+            match worker {
+                Ok(worker) => {
+                    loop {
+                        let owner_signal = sql_window_signal(epoch, pid, start, stop, cancel);
+                        let signal = identity_failure.get().or(owner_signal);
+                        if signal.is_some() {
+                            native_stop.store(true, Ordering::Release);
+                        }
+                        self.poll(signal);
+                        if self.session.is_none() {
+                            #[cfg(test)]
+                            tests::BEFORE_NATIVE_FINISHED_CHECK.with(|slot| {
+                                if let Some(hook) = slot.borrow_mut().take() {
+                                    hook(&|| worker.is_finished());
+                                }
+                            });
+                            if worker.is_finished() {
+                                break;
+                            }
+                        }
+                        self.pause();
+                    }
+                    let result = worker.join();
+                    // A worker can publish between the last latch read and
+                    // is_finished. Join first, then drain even on worker error.
+                    self.poll(identity_failure.get());
+                    result.map_err(|_| anyhow::anyhow!("native_capture_worker_panicked"))?
+                }
+                Err(error) => {
+                    // Thread admission is a native failure too, not SQL cancel.
+                    self.wait(epoch, pid, start, stop, cancel);
+                    Err(error.into())
+                }
+            }
+        })
+    }
+}
+fn sql_window_signal(
+    epoch: u64,
+    pid: u32,
+    start: &str,
+    stop: &AtomicBool,
+    cancel: &AtomicBool,
+) -> Option<&'static str> {
+    if !crate::telemetry_sample_allowed(Some(epoch)) {
+        Some("consent_epoch_changed")
+    } else if stop.load(Ordering::Acquire) {
+        Some("capture_shutdown")
+    } else if cancel.load(Ordering::Acquire) {
+        Some("operator_cancelled")
+    } else {
+        identity_result(start, crate::resources::process_start_identity(pid)).err()
     }
 }
 fn sql_cpu_eligible(service: &str, config: &CaptureRequest, pid: u32) -> bool {
     service == "gateway"
-        && config.mode == CaptureMode::Cpu
+        && matches!(config.mode, CaptureMode::Cpu | CaptureMode::SqlCpu)
         && config.child_generation.is_none()
         && pid == std::process::id()
+}
+fn sql_only_manifest(
+    id: &str,
+    target: &TargetSnapshot,
+    config: &CaptureRequest,
+    start: &str,
+    sql: &SqlCpuCapture,
+) -> CaptureManifest {
+    let mut manifest = failed_manifest(
+        id,
+        target,
+        config,
+        target.run.pid,
+        start,
+        "sql_cpu_session_unavailable".into(),
+        Vec::new(),
+    );
+    manifest.target_build_scope =
+        "owner Gateway run/build; native module identity not requested".into();
+    manifest.correlation_scope = "observed SQL window linked by exact Gateway run/build/PID-start; no native profile or arbitrary async stack attribution".into();
+    manifest.tool = "pioneer.query_cpu".into();
+    manifest.tool_version = "sql_cpu_schema_v2".into();
+    manifest.configuration = vec![format!("requested_duration_seconds={}", config.seconds)];
+    manifest.actual_format =
+        "pioneer.gateway.sql_cpu JSON schema v2; native profile not requested".into();
+    manifest.module = None;
+    manifest.module_coverage =
+        "not_applicable; native profile not requested; exact run/build retained".into();
+    manifest.symbol_status = "not_applicable; native profile not requested".into();
+    manifest.coverage = "observed instrumented SQL command CPU only; see sql_cpu coverage/limitations; native profile not requested".into();
+    manifest.clock_scope =
+        "SQL Session target monotonic window; ended_unix_ms projects started_unix_ms + elapsed_ms; native profile not requested".into();
+    if let Some(snapshot) = &sql.snapshot {
+        manifest.started_unix_ms = snapshot.started_unix_ms;
+        manifest.ended_unix_ms = snapshot.started_unix_ms + snapshot.elapsed_ns / 1_000_000;
+        manifest.started_monotonic_ms = snapshot.started_monotonic_ms;
+        manifest.ended_monotonic_ms = snapshot.ended_monotonic_ms;
+        manifest.status = if snapshot.closed_reason == "deadline" {
+            "completed"
+        } else {
+            "partial"
+        }
+        .into();
+        manifest.incomplete_reasons = sql
+            .closed_reason
+            .filter(|r| *r != "deadline")
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+    } else {
+        manifest.clock_scope = "SQL Session unavailable; no SQL or native interval recorded".into();
+    }
+    manifest
 }
 fn capture_inner(
     path: &Path,
@@ -715,18 +1098,41 @@ fn capture_inner(
     stop: &AtomicBool,
     cancel: &AtomicBool,
     attempt: &mut Option<AttemptProvenance>,
-    sql_cpu: &mut SqlCpuCapture,
+    identity_failure: Option<&NativeIdentityFailure>,
+    #[cfg(test)] native_fixture: Option<tests::NativePlan>,
 ) -> Result<CaptureManifest> {
     let epoch = target.consent_generation;
     let reserve_sql_cpu = sql_cpu_eligible(&target.service, &config, pid);
+    #[cfg(test)]
+    let fixture = native_fixture.is_some();
+    #[cfg(not(test))]
     let plan = plan(&config, pid, path, &target.stack_logging)?;
+    #[cfg(test)]
+    let plan = match native_fixture {
+        Some(plan) => plan(path).map_err(anyhow::Error::msg),
+        None => plan(&config, pid, path, &target.stack_logging),
+    }?;
     let module = if config.child_generation.is_none() {
-        Some(child_module(pid, epoch, stop, cancel)?)
+        #[cfg(test)]
+        let module = if fixture {
+            None
+        } else {
+            Some(child_module(pid, epoch, stop, cancel)?)
+        };
+        #[cfg(not(test))]
+        let module = Some(child_module(pid, epoch, stop, cancel)?);
+        module
     } else {
         child_module(pid, epoch, stop, cancel).ok()
     };
     let tool_version = version(&plan, path, epoch, stop, cancel)?;
-    verify_identity(pid, start_identity)?;
+    verify_native_identity(
+        pid,
+        start_identity,
+        identity_failure,
+        #[cfg(test)]
+        tests::NativeIdentityBoundary::BeforeAttach,
+    )?;
     ensure!(
         allowed(epoch, stop, cancel),
         "capture_cancelled_before_attach"
@@ -738,9 +1144,6 @@ fn capture_inner(
     }
     let started_unix_ms = unix_ms();
     let started_monotonic_ms = monotonic_ms();
-    if sql_cpu_eligible(&target.service, &config, pid) {
-        sql_cpu.session = crate::query_cpu::Session::start(config.seconds, epoch);
-    }
     let mut child = OwnedTool(
         Command::new(&plan.program)
             .args(&plan.args)
@@ -784,12 +1187,10 @@ fn capture_inner(
         let exited = match child.try_wait() {
             Ok(exited) => exited,
             Err(error) => {
-                sql_cpu.seal();
                 return Err(error.into());
             }
         };
         if let Some(exit) = exited {
-            sql_cpu.seal();
             registration.exited(exit.success());
             if !exit.success() {
                 status = "failed";
@@ -800,26 +1201,28 @@ fn capture_inner(
         if cancel.load(Ordering::Acquire) {
             reasons.push("operator_cancelled".into());
             status = "partial";
-            sql_cpu.seal();
             stop_tool(&mut child, plan.graceful_stop, &mut registration);
             break;
         }
         if !crate::telemetry_sample_allowed(Some(epoch)) || stop.load(Ordering::Acquire) {
-            sql_cpu.seal();
             stop_tool(&mut child, plan.graceful_stop, &mut registration);
             bail!("consent_revoked_or_shutdown");
         }
-        if let Err(error) = verify_identity(pid, start_identity) {
+        if let Err(error) = verify_native_identity(
+            pid,
+            start_identity,
+            identity_failure,
+            #[cfg(test)]
+            tests::NativeIdentityBoundary::Recording,
+        ) {
             reasons.push(error.to_string());
             status = "partial";
-            sql_cpu.seal();
             stop_tool(&mut child, plan.graceful_stop, &mut registration);
             break;
         }
         if native_size(path, reserve_sql_cpu).is_err() {
             reasons.push("output_overflow".into());
             status = "partial";
-            sql_cpu.seal();
             stop_tool(&mut child, plan.graceful_stop, &mut registration);
             trim_overflow(path, reserve_sql_cpu)?;
             break;
@@ -828,7 +1231,6 @@ fn capture_inner(
         if config.mode == CaptureMode::Cpu
             && started.elapsed() >= Duration::from_secs(config.seconds)
         {
-            sql_cpu.seal();
             if !stop_tool(&mut child, true, &mut registration) {
                 status = "partial";
                 reasons.push("profiler_forced_termination_after_grace".into());
@@ -838,19 +1240,23 @@ fn capture_inner(
         if started.elapsed() >= timeout {
             reasons.push("tool_timeout".into());
             status = "partial";
-            sql_cpu.seal();
             stop_tool(&mut child, plan.graceful_stop, &mut registration);
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    sql_cpu.seal();
     let ended_unix_ms = unix_ms();
     let ended_monotonic_ms = monotonic_ms();
     if let Some(attempt) = attempt {
         attempt.ended = Some((ended_unix_ms, ended_monotonic_ms));
     }
-    if let Err(error) = verify_identity(pid, start_identity) {
+    if let Err(error) = verify_native_identity(
+        pid,
+        start_identity,
+        identity_failure,
+        #[cfg(test)]
+        tests::NativeIdentityBoundary::AfterStop,
+    ) {
         status = "partial";
         let reason = error.to_string();
         if !reasons.contains(&reason) {
@@ -1028,6 +1434,920 @@ fn record_reference(manifest: &CaptureManifest) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum NativeIdentityBoundary {
+        BeforeAttach,
+        Recording,
+        AfterStop,
+    }
+    type NativeIdentityRead =
+        Box<dyn FnMut(NativeIdentityBoundary) -> Option<std::io::Result<String>>>;
+    type NativeFinishedCheck = Box<dyn FnOnce(&dyn Fn() -> bool)>;
+    pub(super) type NativePlan = Box<dyn FnOnce(&Path) -> Result<ToolPlan, &'static str> + Send>;
+    pub(super) struct NativeFixture {
+        pub(super) plan: NativePlan,
+        pub(super) done: std::sync::Arc<AtomicBool>,
+    }
+    std::thread_local! {
+        pub(super) static NATIVE_PLAN: std::cell::RefCell<Option<NativeFixture>> = const { std::cell::RefCell::new(None) };
+        pub(super) static NATIVE_IDENTITY: std::cell::RefCell<Option<NativeIdentityRead>> = const { std::cell::RefCell::new(None) };
+        pub(super) static BEFORE_NATIVE_FINISHED_CHECK: std::cell::RefCell<Option<NativeFinishedCheck>> = const { std::cell::RefCell::new(None) };
+        pub(super) static BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> = const { std::cell::RefCell::new(None) };
+    }
+    // These regressions use the production capture boundary, including its
+    // admitted directory/lease, Session, native error recovery and SQL writer.
+    struct ConsentFixture {
+        old: bool,
+        _telemetry: std::sync::MutexGuard<'static, ()>,
+        _session: std::sync::MutexGuard<'static, ()>,
+    }
+    impl ConsentFixture {
+        fn new() -> Self {
+            let telemetry = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
+            let session = crate::query_cpu::tests::SERIAL.lock().unwrap();
+            let old = crate::telemetry_enabled();
+            crate::set_telemetry_enabled(true);
+            Self {
+                old,
+                _telemetry: telemetry,
+                _session: session,
+            }
+        }
+    }
+    impl Drop for ConsentFixture {
+        fn drop(&mut self) {
+            NATIVE_PLAN.with(|slot| {
+                slot.borrow_mut().take();
+            });
+            NATIVE_IDENTITY.with(|slot| {
+                slot.borrow_mut().take();
+            });
+            BEFORE_NATIVE_FINISHED_CHECK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+            BEFORE_COMMIT.with(|slot| {
+                slot.borrow_mut().take();
+            });
+            crate::set_telemetry_enabled(self.old);
+        }
+    }
+    fn local_target() -> (TargetSnapshot, TargetDescriptor) {
+        let target = crate::diagnostics::tests::target(crate::telemetry_consent_snapshot().1);
+        let descriptor = TargetDescriptor {
+            schema_version: 1,
+            service: target.service.clone(),
+            run: target.run.clone(),
+            start_identity: crate::resources::process_start_identity(target.run.pid).unwrap(),
+            endpoint: "127.0.0.1:1".parse().unwrap(),
+            token: "fixture".into(),
+        };
+        (target, descriptor)
+    }
+    fn read_sql(root: &Path, manifest: &CaptureManifest) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        let directory = root
+            .join(&manifest.local_reference)
+            .parent()
+            .unwrap()
+            .to_owned();
+        let bytes =
+            storage::read_bounded(&directory.join("sql-cpu.json"), storage::SQL_CPU_BYTES).unwrap();
+        let file = manifest
+            .files
+            .iter()
+            .find(|f| f.filename == "sql-cpu.json")
+            .unwrap();
+        assert_eq!(file.bytes, bytes.len() as u64);
+        assert_eq!(file.sha256, hex::encode(Sha256::digest(&bytes)));
+        assert_eq!(manifest.sql_cpu.as_ref().unwrap()["bytes"], file.bytes);
+        storage::validate_private_file(&directory.join("sql-cpu.json")).unwrap();
+        assert!(!directory.join("active.json").exists());
+        let saved: CaptureManifest =
+            serde_json::from_slice(&fs::read(directory.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(saved.sql_cpu, manifest.sql_cpu);
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    fn sql_config() -> CaptureRequest {
+        CaptureRequest {
+            seconds: 1,
+            frequency_hz: 0,
+            ..config(CaptureMode::SqlCpu)
+        }
+    }
+    fn native_fixture(plan: Result<ToolPlan, &'static str>) -> std::sync::Arc<AtomicBool> {
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let make_plan: NativePlan = Box::new(move |path| {
+            plan.map(|mut plan| {
+                if plan.program == Path::new("/bin/sh") {
+                    plan.args
+                        .push(path.join("perf.data").to_string_lossy().into_owned());
+                }
+                plan
+            })
+        });
+        NATIVE_PLAN.with(|slot| {
+            *slot.borrow_mut() = Some(NativeFixture {
+                plan: make_plan,
+                done: done.clone(),
+            })
+        });
+        done
+    }
+    fn wait_native(done: &AtomicBool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !done.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "native fixture did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    #[test]
+    fn sql_only_real_callbacks_reach_full_sidecar_without_native_prerequisites() {
+        let _consent = ConsentFixture::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = storage::private_root(&temp.path().join("diagnostics")).unwrap();
+        let (target, descriptor) = local_target();
+        let stop = AtomicBool::new(false);
+        let cancel = AtomicBool::new(false);
+        let native = native_fixture(Err("native_must_not_be_called"));
+        let manifest = std::thread::scope(|scope| {
+            let callbacks = scope.spawn(|| {
+                crate::query_cpu::tests::wait_for_capture();
+                crate::query_cpu::tests::capture_command(17, true);
+                crate::query_cpu::tests::capture_command(23, false);
+                crate::query_cpu::tests::capture_control();
+            });
+            let manifest =
+                capture(&root, &target, &descriptor, sql_config(), &stop, &cancel).unwrap();
+            callbacks.join().unwrap();
+            manifest
+        });
+        assert!(!native.load(Ordering::Acquire));
+        assert_eq!(manifest.status, "completed");
+        assert_eq!(manifest.mode, CaptureMode::SqlCpu);
+        assert_eq!(manifest.tool, "pioneer.query_cpu");
+        assert!(manifest.module.is_none());
+        assert!(
+            manifest
+                .configuration
+                .iter()
+                .all(|v| !v.contains("frequency"))
+        );
+        assert!(!manifest.profile_data_present());
+        let sql = read_sql(&root, &manifest);
+        assert_eq!(sql["native_profile_status"], "not_requested");
+        assert!(sql["native_profile_interval"].is_null());
+        assert_eq!(sql["run"], serde_json::to_value(&target.run).unwrap());
+        assert_eq!(sql["consent_generation"], target.consent_generation);
+        assert_eq!(sql["sql_cpu"]["requested_seconds"], 1);
+        assert_eq!(sql["sql_cpu"]["elapsed_ns"], 1_000_000_000_u64);
+        let groups = sql["sql_cpu"]["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 3);
+        let measured = groups
+            .iter()
+            .find(|g| g["fingerprint"] == "0000000000000011")
+            .unwrap();
+        assert_eq!(measured["workload"], "timeline.page");
+        assert_eq!(measured["site"], "timeline_page");
+        assert!(measured["control"].is_null());
+        let control = groups.iter().find(|g| g["control"] == "begin").unwrap();
+        assert!(control["fingerprint"].is_null());
+        assert_eq!(control["workload"], "timeline.page");
+        assert_eq!(control["site"], "timeline_page");
+        assert_eq!(measured["completed_calls"], 1);
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        assert!(measured["cpu_ns"].is_u64());
+        let unknown = groups
+            .iter()
+            .find(|g| g["fingerprint"] == "0000000000000017")
+            .unwrap();
+        assert!(unknown["cpu_ns"].is_null());
+        assert_eq!(manifest.sql_cpu.as_ref().unwrap()["window_complete"], true);
+        assert!(
+            !manifest
+                .files
+                .iter()
+                .any(|f| f.filename.starts_with("tool-") || f.filename == "perf.data")
+        );
+    }
+    #[test]
+    fn sql_only_server_rejects_unsupported_targets_and_duration_before_admission() {
+        let _consent = ConsentFixture::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = storage::private_root(&temp.path().join("diagnostics")).unwrap();
+        let (target, descriptor) = local_target();
+        for case in ["desktop", "child", "foreign_pid", "zero", "too_long"] {
+            let mut target = target.clone();
+            let mut request = sql_config();
+            match case {
+                "desktop" => target.service = "desktop".into(),
+                "child" => request.child_generation = Some(1),
+                "foreign_pid" => target.run.pid = target.run.pid.wrapping_add(1),
+                "zero" => request.seconds = 0,
+                "too_long" => request.seconds = 61,
+                _ => unreachable!(),
+            }
+            let error = capture(
+                &root,
+                &target,
+                &descriptor,
+                request,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(if matches!(case, "zero" | "too_long") {
+                    "duration"
+                } else {
+                    "unsupported_target"
+                }),
+                "{case}: {error}"
+            );
+        }
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+    }
+    #[cfg(unix)]
+    fn shell_plan(exit: i32, version: &str) -> ToolPlan {
+        ToolPlan {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("printf fixture > \"$1\"; exit {exit}"),
+                "fixture".into(),
+            ],
+            format: "fixture.native",
+            version_args: vec!["-c".into(), version.into()],
+            graceful_stop: false,
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn native_plan_version_spawn_and_early_exit_all_leave_sql_until_original_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let _consent = ConsentFixture::new();
+        for case in ["plan", "version", "spawn", "exit_failure", "exit_success"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = storage::private_root(&temp.path().join("diagnostics")).unwrap();
+            let (target, descriptor) = local_target();
+            let native_plan = match case {
+                "plan" => Err("fixture_plan_failed"),
+                "version" => Ok(shell_plan(0, "exit 7")),
+                "spawn" => {
+                    // The actual bounded version succeeds, then the actual
+                    // recording spawn fails because that fixture removed itself.
+                    let script = temp.path().join("one-version-only");
+                    fs::write(
+                        &script,
+                        b"#!/bin/sh\nrm -- \"$0\"\nprintf fixture-version\n",
+                    )
+                    .unwrap();
+                    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+                    Ok(ToolPlan {
+                        program: script,
+                        args: vec![],
+                        format: "fixture.native",
+                        version_args: vec!["--version".into()],
+                        graceful_stop: false,
+                    })
+                }
+                "exit_failure" => Ok(shell_plan(7, "printf fixture-version")),
+                "exit_success" => Ok(shell_plan(0, "printf fixture-version")),
+                _ => unreachable!(),
+            };
+            let done = native_fixture(native_plan);
+            let stop = AtomicBool::new(false);
+            let cancel = AtomicBool::new(false);
+            let manifest = std::thread::scope(|scope| {
+                let callbacks = scope.spawn(|| {
+                    let deadline = crate::query_cpu::tests::wait_for_capture();
+                    wait_native(&done);
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture failure must precede SQL callback"
+                    );
+                    crate::query_cpu::tests::capture_command(17, true);
+                });
+                let manifest = capture(
+                    &root,
+                    &target,
+                    &descriptor,
+                    CaptureRequest {
+                        seconds: 2,
+                        ..config(CaptureMode::Cpu)
+                    },
+                    &stop,
+                    &cancel,
+                )
+                .unwrap();
+                callbacks.join().unwrap();
+                manifest
+            });
+            let sql = read_sql(&root, &manifest);
+            assert_eq!(sql["sql_cpu"]["elapsed_ns"], 2_000_000_000_u64, "{case}");
+            assert_eq!(
+                sql["sql_cpu"]["groups"][0]["fingerprint"], "0000000000000011",
+                "{case}"
+            );
+            assert_eq!(sql["sql_cpu"]["groups"][0]["completed_calls"], 1);
+            assert_eq!(manifest.sql_cpu.as_ref().unwrap()["status"], "recorded");
+            assert_eq!(
+                manifest.status,
+                if case == "exit_success" {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                "{case}"
+            );
+            if matches!(case, "plan" | "version" | "spawn") {
+                assert!(sql["native_profile_interval"].is_null());
+                assert_eq!(manifest.tool, "not_started_or_prerequisite_failed");
+            } else {
+                assert!(!sql["native_profile_interval"].is_null());
+                assert!(
+                    manifest.ended_monotonic_ms
+                        < sql["sql_cpu"]["ended_monotonic_ms"].as_u64().unwrap()
+                );
+            }
+            assert!(crate::query_cpu::Session::start(1, target.consent_generation).is_some());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn sql_deadline_excludes_late_callbacks_while_native_version_is_still_running() {
+        let _consent = ConsentFixture::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = storage::private_root(&temp.path().join("diagnostics")).unwrap();
+        let (target, descriptor) = local_target();
+        let done = native_fixture(Ok(shell_plan(7, "exec /bin/sleep 2")));
+        let manifest = std::thread::scope(|scope| {
+            let callbacks = scope.spawn(|| {
+                let deadline = crate::query_cpu::tests::wait_for_capture();
+                crate::query_cpu::tests::capture_command(17, true);
+                std::thread::sleep(
+                    (deadline + Duration::from_millis(100))
+                        .saturating_duration_since(Instant::now()),
+                );
+                assert!(!done.load(Ordering::Acquire));
+                crate::query_cpu::tests::capture_command(99, true);
+            });
+            let manifest = capture(
+                &root,
+                &target,
+                &descriptor,
+                CaptureRequest {
+                    seconds: 1,
+                    ..config(CaptureMode::Cpu)
+                },
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            callbacks.join().unwrap();
+            manifest
+        });
+        let sql = read_sql(&root, &manifest);
+        assert_eq!(sql["sql_cpu"]["elapsed_ns"], 1_000_000_000_u64);
+        assert_eq!(sql["sql_cpu"]["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            sql["sql_cpu"]["groups"][0]["fingerprint"],
+            "0000000000000011"
+        );
+        assert_eq!(manifest.status, "failed");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn combined_controls_close_sql_and_join_the_owned_version_child_promptly() {
+        let _consent = ConsentFixture::new();
+        for signal in ["cancel", "late_cancel", "shutdown", "revoke"] {
+            crate::set_telemetry_enabled(true);
+            let temp = tempfile::tempdir().unwrap();
+            let root = storage::private_root(&temp.path().join("diagnostics")).unwrap();
+            let (target, descriptor) = local_target();
+            let done = native_fixture(Ok(shell_plan(0, "printf started; exec /bin/sleep 30")));
+            let stop = AtomicBool::new(false);
+            let cancel = AtomicBool::new(false);
+            let result = std::thread::scope(|scope| {
+                let actor = scope.spawn(|| {
+                    let deadline = crate::query_cpu::tests::wait_for_capture();
+                    let timeout = Instant::now() + Duration::from_secs(3);
+                    loop {
+                        let running = fs::read_dir(root.join("captures"))
+                            .unwrap()
+                            .map(|e| e.unwrap().path())
+                            .any(|p| {
+                                fs::metadata(p.join("tool-version.txt")).is_ok_and(|m| m.len() > 0)
+                            });
+                        if running {
+                            break;
+                        }
+                        assert!(Instant::now() < timeout, "version fixture did not start");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    crate::query_cpu::tests::capture_command(17, true);
+                    if signal == "late_cancel" {
+                        std::thread::sleep(
+                            (deadline + Duration::from_millis(100))
+                                .saturating_duration_since(Instant::now()),
+                        );
+                    }
+                    match signal {
+                        "cancel" | "late_cancel" => cancel.store(true, Ordering::Release),
+                        "shutdown" => stop.store(true, Ordering::Release),
+                        "revoke" => crate::set_telemetry_enabled(false),
+                        _ => unreachable!(),
+                    }
+                });
+                let started = Instant::now();
+                let result = capture(
+                    &root,
+                    &target,
+                    &descriptor,
+                    CaptureRequest {
+                        seconds: if signal == "late_cancel" { 1 } else { 60 },
+                        ..config(CaptureMode::Cpu)
+                    },
+                    &stop,
+                    &cancel,
+                );
+                // Existing stop_tool(false) allows 3 s grace before kill;
+                // include startup/polling slack, while refusing a 60 s SQL wait.
+                assert!(started.elapsed() < Duration::from_secs(8));
+                actor.join().unwrap();
+                result
+            });
+            assert!(
+                done.load(Ordering::Acquire),
+                "capture returns only after native is joined/reaped"
+            );
+            if matches!(signal, "cancel" | "late_cancel") {
+                let manifest = result.unwrap();
+                assert_eq!(manifest.status, "failed"); // native version did not complete
+                let sql = read_sql(&root, &manifest);
+                assert_eq!(
+                    sql["sql_cpu"]["closed_reason"],
+                    if signal == "late_cancel" {
+                        "deadline"
+                    } else {
+                        "operator_cancelled"
+                    }
+                );
+                assert_eq!(
+                    manifest.sql_cpu.as_ref().unwrap()["window_complete"],
+                    signal == "late_cancel"
+                );
+                if signal == "late_cancel" {
+                    assert_eq!(sql["sql_cpu"]["elapsed_ns"], 1_000_000_000_u64);
+                }
+                assert!(sql["sql_cpu"]["elapsed_ns"].as_u64().unwrap() < 60_000_000_000);
+                assert_eq!(
+                    sql["sql_cpu"]["groups"][0]["fingerprint"],
+                    "0000000000000011"
+                );
+            } else {
+                assert!(result.is_err());
+                assert!(
+                    fs::read_dir(root.join("captures"))
+                        .unwrap()
+                        .next()
+                        .is_none()
+                );
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn worker_only_identity_failure_is_terminal_before_deadline_and_after_final_join() {
+        use std::{
+            io::{Error, ErrorKind},
+            sync::Arc,
+        };
+        let _consent = ConsentFixture::new();
+        for (boundary, error_kind, reason, join_race) in [
+            (
+                NativeIdentityBoundary::BeforeAttach,
+                Some(ErrorKind::Other),
+                "target_identity_unavailable",
+                false,
+            ),
+            (
+                NativeIdentityBoundary::Recording,
+                Some(ErrorKind::PermissionDenied),
+                "target_identity_permission_denied",
+                false,
+            ),
+            (
+                NativeIdentityBoundary::AfterStop,
+                Some(ErrorKind::NotFound),
+                "target_exited",
+                false,
+            ),
+            (
+                NativeIdentityBoundary::AfterStop,
+                None,
+                "target_pid_reused",
+                true,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = storage::private_root(&temp.path().join("diagnostics")).unwrap();
+            let (target, descriptor) = local_target();
+            verify_identity(target.run.pid, &descriptor.start_identity).unwrap();
+            let stop = AtomicBool::new(false);
+            let cancel = AtomicBool::new(false);
+            let ready = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(AtomicBool::new(false));
+            let done = Arc::new(AtomicBool::new(false));
+            let deadline = Arc::new(Mutex::new(None));
+            let closed_early = Arc::new(AtomicBool::new(false));
+            let closed_before_native_exit = Arc::new(AtomicBool::new(false));
+            let native_ready = ready.clone();
+            let native_release = release.clone();
+            NATIVE_PLAN.with(|slot| {
+                *slot.borrow_mut() = Some(NativeFixture {
+                    done: done.clone(),
+                    plan: Box::new(move |path| {
+                        let mut injected = false;
+                        // This override is read only by the real native verifier.
+                        // Owner/common/pre/post-commit reads remain real and healthy.
+                        NATIVE_IDENTITY.with(|slot| {
+                            *slot.borrow_mut() = Some(Box::new(move |at| {
+                                if at != boundary || injected {
+                                    return None;
+                                }
+                                wait_native(&native_ready);
+                                if join_race {
+                                    wait_native(&native_release);
+                                }
+                                injected = true;
+                                Some(match error_kind {
+                                    Some(kind) => Err(Error::from(kind)),
+                                    None => Ok("fixture-different-process-start".into()),
+                                })
+                            }))
+                        });
+                        let mut plan = shell_plan(0, "printf fixture-version");
+                        if boundary == NativeIdentityBoundary::Recording {
+                            plan.args = vec!["-c".into(), "exec /bin/sleep 30".into()];
+                        } else {
+                            plan.args
+                                .push(path.join("perf.data").to_string_lossy().into_owned());
+                        }
+                        Ok(plan)
+                    }),
+                })
+            });
+            let owner_deadline = deadline.clone();
+            let owner_closed_early = closed_early.clone();
+            let owner_closed_before_exit = closed_before_native_exit.clone();
+            BEFORE_NATIVE_FINISHED_CHECK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |finished| {
+                    let sql_deadline = owner_deadline.lock().unwrap().unwrap();
+                    owner_closed_early.store(Instant::now() < sql_deadline, Ordering::Release);
+                    owner_closed_before_exit.store(!finished(), Ordering::Release);
+                    if join_race {
+                        assert!(Instant::now() >= sql_deadline);
+                        // Owner has already polled an empty latch and closed SQL.
+                        // Publish the native failure now, then make is_finished true
+                        // before owner can check it. Only the post-join drain sees it.
+                        release.store(true, Ordering::Release);
+                        let timeout = Instant::now() + Duration::from_secs(3);
+                        while !finished() {
+                            assert!(
+                                Instant::now() < timeout,
+                                "native join-race fixture did not finish"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }))
+            });
+            let error = std::thread::scope(|scope| {
+                let callbacks = scope.spawn(|| {
+                    let end = crate::query_cpu::tests::wait_for_capture();
+                    *deadline.lock().unwrap() = Some(end);
+                    crate::query_cpu::tests::capture_command(17, true);
+                    ready.store(true, Ordering::Release);
+                });
+                let result = capture(
+                    &root,
+                    &target,
+                    &descriptor,
+                    CaptureRequest {
+                        seconds: if join_race { 1 } else { 5 },
+                        ..config(CaptureMode::Cpu)
+                    },
+                    &stop,
+                    &cancel,
+                );
+                callbacks.join().unwrap();
+                result.unwrap_err()
+            });
+            assert_eq!(error.to_string(), reason);
+            assert!(
+                done.load(Ordering::Acquire),
+                "native is joined before capture removal"
+            );
+            assert_eq!(closed_early.load(Ordering::Acquire), !join_race);
+            if boundary == NativeIdentityBoundary::Recording {
+                assert!(
+                    closed_before_native_exit.load(Ordering::Acquire),
+                    "SQL must close before the 3 s native stop grace ends"
+                );
+            }
+            assert!(!stop.load(Ordering::Acquire));
+            assert!(!cancel.load(Ordering::Acquire));
+            assert!(crate::telemetry_sample_allowed(Some(
+                target.consent_generation
+            )));
+            verify_identity(target.run.pid, &descriptor.start_identity).unwrap();
+            assert!(
+                fs::read_dir(root.join("captures"))
+                    .unwrap()
+                    .next()
+                    .is_none(),
+                "no SQL/native result may be retained after {reason}"
+            );
+        }
+    }
+    #[test]
+    fn sql_poll_preserves_real_deadline_for_late_cancel_and_shortens_only_early_cancel() {
+        let _consent = ConsentFixture::new();
+        for late in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = storage::private_root(&temp.path().join("diagnostics")).unwrap();
+            let id = "abcdefghijklmnopqrstuvwx";
+            let path = storage::capture_dir(&root, id).unwrap();
+            let lease = storage::CaptureLease::new(&path);
+            let (target, descriptor) = local_target();
+            let config = CaptureRequest {
+                seconds: if late { 1 } else { 60 },
+                ..sql_config()
+            };
+            let mut sql = SqlCpuCapture::default();
+            sql.start(config.seconds, target.consent_generation);
+            crate::query_cpu::tests::capture_command(17, true);
+            if late {
+                std::thread::sleep(
+                    (sql.deadline.unwrap() + Duration::from_millis(10))
+                        .saturating_duration_since(Instant::now()),
+                );
+            }
+            // Exercise production poll with the control signal after the real
+            // collector deadline, without fabricating a completed Snapshot.
+            sql.poll(Some("operator_cancelled"));
+            let reason = if late {
+                "deadline"
+            } else {
+                "operator_cancelled"
+            };
+            assert_eq!(sql.closed_reason, Some(reason));
+            let snapshot = sql.snapshot.as_ref().unwrap();
+            assert_eq!(snapshot.closed_reason, reason);
+            if late {
+                assert_eq!(snapshot.elapsed_ns, 1_000_000_000);
+            } else {
+                assert!(snapshot.elapsed_ns < 60_000_000_000);
+            }
+            let mut manifest =
+                sql_only_manifest(id, &target, &config, &descriptor.start_identity, &sql);
+            store_sql_cpu(&path, &target, &mut manifest, snapshot);
+            storage::write_new_json(&path.join("manifest.json"), &manifest).unwrap();
+            drop(lease);
+            let saved = read_sql(&root, &manifest);
+            assert_eq!(manifest.status, if late { "completed" } else { "partial" });
+            let summary = manifest.sql_cpu.as_ref().unwrap();
+            assert_eq!(summary["status"], "recorded");
+            assert_eq!(summary["window_complete"], late);
+            assert_eq!(summary["closed_reason"], reason);
+            assert_eq!(saved["sql_cpu"]["closed_reason"], reason);
+            assert_eq!(saved["sql_cpu"]["requested_seconds"], config.seconds);
+            assert_eq!(
+                saved["sql_cpu"]["groups"][0]["fingerprint"],
+                "0000000000000011"
+            );
+            assert_eq!(saved["native_profile_status"], "not_requested");
+            assert!(saved["native_profile_interval"].is_null());
+        }
+    }
+    #[test]
+    fn sql_only_empty_busy_storage_failure_and_cancel_have_distinct_results() {
+        let _consent = ConsentFixture::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = storage::private_root(&temp.path().join("diagnostics")).unwrap();
+        let (target, descriptor) = local_target();
+        let stop = AtomicBool::new(false);
+        let cancel = AtomicBool::new(false);
+        let empty = capture(&root, &target, &descriptor, sql_config(), &stop, &cancel).unwrap();
+        assert_eq!(empty.status, "completed");
+        let empty_sql = read_sql(&root, &empty);
+        assert!(
+            empty_sql["sql_cpu"]["groups"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(empty_sql["sql_cpu"]["aggregation"]["accounted"]["cpu_ns"].is_null());
+        let busy_session = crate::query_cpu::Session::start(60, target.consent_generation).unwrap();
+        let busy = capture(&root, &target, &descriptor, sql_config(), &stop, &cancel).unwrap();
+        assert_eq!(busy.status, "failed");
+        assert_eq!(
+            busy.sql_cpu.as_ref().unwrap()["reason"],
+            "sql_cpu_session_unavailable"
+        );
+        assert!(!busy.files.iter().any(|f| f.filename == "sql-cpu.json"));
+        crate::query_cpu::tests::capture_command(23, false);
+        assert_eq!(
+            busy_session.finish().groups.len(),
+            1,
+            "foreign window stays with its owner"
+        );
+        for storage_failure in [false, true] {
+            cancel.store(false, Ordering::Release);
+            let manifest = std::thread::scope(|scope| {
+                let actor = scope.spawn(|| {
+                    crate::query_cpu::tests::wait_for_capture();
+                    crate::query_cpu::tests::capture_command(17, true);
+                    if storage_failure {
+                        let captures = root.join("captures");
+                        let active = fs::read_dir(captures)
+                            .unwrap()
+                            .map(|e| e.unwrap().path())
+                            .find(|p| p.join("active.json").exists())
+                            .unwrap();
+                        fs::write(active.join("sql-cpu.json"), b"foreign-collision").unwrap();
+                    }
+                    if !storage_failure {
+                        cancel.store(true, Ordering::Release);
+                    }
+                });
+                let started = Instant::now();
+                let manifest = capture(
+                    &root,
+                    &target,
+                    &descriptor,
+                    CaptureRequest {
+                        seconds: if storage_failure { 1 } else { 60 },
+                        ..sql_config()
+                    },
+                    &stop,
+                    &cancel,
+                )
+                .unwrap();
+                assert!(started.elapsed() < Duration::from_secs(3));
+                actor.join().unwrap();
+                manifest
+            });
+            assert_ne!(manifest.status, "completed");
+            let summary = manifest.sql_cpu.as_ref().unwrap();
+            assert_eq!(
+                summary["closed_reason"],
+                if storage_failure {
+                    "deadline"
+                } else {
+                    "operator_cancelled"
+                }
+            );
+            assert_eq!(summary["window_complete"], storage_failure);
+            assert!(summary["elapsed_ns"].as_u64().unwrap() < 60_000_000_000);
+            assert_eq!(
+                summary["status"],
+                if storage_failure {
+                    "unavailable"
+                } else {
+                    "recorded"
+                }
+            );
+            if storage_failure {
+                assert_eq!(manifest.status, "failed");
+                let directory = root
+                    .join(&manifest.local_reference)
+                    .parent()
+                    .unwrap()
+                    .to_owned();
+                assert_eq!(
+                    fs::read(directory.join("sql-cpu.json")).unwrap(),
+                    b"foreign-collision"
+                );
+            } else {
+                assert_eq!(manifest.status, "partial");
+                read_sql(&root, &manifest);
+            }
+        }
+    }
+    #[test]
+    fn sql_commit_error_after_revoke_or_shutdown_removes_the_admitted_sidecar() {
+        let _consent = ConsentFixture::new();
+        for shutdown in [false, true] {
+            crate::set_telemetry_enabled(true);
+            let temp = tempfile::tempdir().unwrap();
+            let root = storage::private_root(&temp.path().join("diagnostics")).unwrap();
+            let (target, descriptor) = local_target();
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let stop_at_commit = stop.clone();
+            // The narrow hook is after the final consent check, at the real
+            // create_new manifest write. No successful manifest is fabricated.
+            BEFORE_COMMIT.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |path| {
+                    let sql: serde_json::Value =
+                        serde_json::from_slice(&fs::read(path.join("sql-cpu.json")).unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        sql["sql_cpu"]["groups"][0]["fingerprint"],
+                        "0000000000000011"
+                    );
+                    fs::write(path.join("manifest.json"), b"commit-collision").unwrap();
+                    if shutdown {
+                        stop_at_commit.store(true, Ordering::Release);
+                    } else {
+                        crate::set_telemetry_enabled(false);
+                    }
+                }))
+            });
+            std::thread::scope(|scope| {
+                let callbacks = scope.spawn(|| {
+                    crate::query_cpu::tests::wait_for_capture();
+                    crate::query_cpu::tests::capture_command(17, true);
+                });
+                let error = capture(
+                    &root,
+                    &target,
+                    &descriptor,
+                    sql_config(),
+                    &stop,
+                    &AtomicBool::new(false),
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                    std::io::ErrorKind::AlreadyExists
+                );
+                callbacks.join().unwrap();
+            });
+            assert!(
+                fs::read_dir(root.join("captures"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }
+    }
+    #[test]
+    fn sql_owner_stops_and_removes_capture_on_shutdown_revoke_or_epoch_change() {
+        let _consent = ConsentFixture::new();
+        for signal in ["shutdown", "revoke", "epoch"] {
+            crate::set_telemetry_enabled(true);
+            let temp = tempfile::tempdir().unwrap();
+            let root = storage::private_root(&temp.path().join("diagnostics")).unwrap();
+            let (target, descriptor) = local_target();
+            let stop = AtomicBool::new(false);
+            let cancel = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let actor = scope.spawn(|| {
+                    crate::query_cpu::tests::wait_for_capture();
+                    crate::query_cpu::tests::capture_command(17, true);
+                    if signal == "shutdown" {
+                        stop.store(true, Ordering::Release);
+                    } else {
+                        crate::set_telemetry_enabled(false);
+                        if signal == "epoch" {
+                            crate::set_telemetry_enabled(true);
+                        }
+                    }
+                });
+                let started = Instant::now();
+                assert!(
+                    capture(
+                        &root,
+                        &target,
+                        &descriptor,
+                        CaptureRequest {
+                            seconds: 60,
+                            ..sql_config()
+                        },
+                        &stop,
+                        &cancel
+                    )
+                    .is_err()
+                );
+                assert!(started.elapsed() < Duration::from_secs(3));
+                actor.join().unwrap();
+            });
+            assert!(
+                fs::read_dir(root.join("captures"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            crate::set_telemetry_enabled(true);
+            assert!(
+                crate::query_cpu::Session::start(1, crate::telemetry_consent_snapshot().1)
+                    .is_some()
+            );
+        }
+    }
+
     fn config(mode: CaptureMode) -> CaptureRequest {
         CaptureRequest {
             mode,
@@ -1522,6 +2842,11 @@ mod tests {
         assert!(m.profile_data_present());
         m.status = "completed".into();
         assert!(m.profile_data_present());
+        m.mode = CaptureMode::SqlCpu;
+        assert!(
+            !m.profile_data_present(),
+            "SQL-only never supplies native coverage even with native-named files"
+        );
         m.mode = CaptureMode::Vm;
         m.files.push(ArtifactFile {
             filename: "tool-stderr.txt".into(),
@@ -1535,6 +2860,33 @@ mod tests {
             sha256: "fixture".into(),
         });
         assert!(m.profile_data_present());
+    }
+    #[test]
+    fn legacy_modes_and_manifests_without_sql_summary_still_decode() {
+        let target = crate::diagnostics::tests::target(7);
+        for (mode, wire) in [
+            (CaptureMode::Cpu, "cpu"),
+            (CaptureMode::Allocations, "allocations"),
+            (CaptureMode::AllocationHistory, "allocation_history"),
+            (CaptureMode::LiveAllocations, "live_allocations"),
+            (CaptureMode::Vm, "vm"),
+        ] {
+            let manifest = failed_manifest(
+                "fixture",
+                &target,
+                &config(mode),
+                42,
+                "start",
+                "fixture".into(),
+                Vec::new(),
+            );
+            let mut value = serde_json::to_value(manifest).unwrap();
+            value.as_object_mut().unwrap().remove("sql_cpu");
+            assert_eq!(value["mode"], wire);
+            let legacy: CaptureManifest = serde_json::from_value(value).unwrap();
+            assert_eq!(legacy.mode, mode);
+            assert!(legacy.sql_cpu.is_none());
+        }
     }
     #[test]
     fn limits_and_preparation_contract() {

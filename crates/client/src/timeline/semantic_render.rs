@@ -339,7 +339,12 @@ fn push_detached_task_run(
     block: &TimelineBlock,
     author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) {
-    let TimelineBlockKind::DetachedTaskRun { task, .. } = &block.kind else {
+    let TimelineBlockKind::DetachedTaskRun {
+        task,
+        codex_retry_notices,
+        ..
+    } = &block.kind
+    else {
         return;
     };
     let turn_id = block.turn_id.as_deref().unwrap_or(block.block_id.as_str());
@@ -378,6 +383,51 @@ fn push_detached_task_run(
             })),
         },
     );
+    for notice in codex_retry_notices {
+        let item = TurnItem::SystemEvent {
+            id: notice.item_id.clone(),
+            level: SystemEventLevel::Warning,
+            message: notice.message.clone(),
+            code: Some("codex_request_retried".into()),
+            details: None,
+        };
+        let item_index = projection.items.len();
+        push_item_row(
+            projection,
+            rows,
+            ItemRowInput {
+                html_publications: Vec::new(),
+                entry_id: format!("{}:retry:{}", block.block_id, notice.item_id),
+                item_id: notice.item_id.clone(),
+                turn_id: notice.source_turn_id.clone(),
+                item_type: "system_event".into(),
+                status: TimelineEntryStatus::Completed,
+                started_at_unix_ms: Some(notice.occurred_at_unix_ms),
+                updated_at_unix_ms: Some(notice.occurred_at_unix_ms),
+                completed_at_unix_ms: Some(notice.occurred_at_unix_ms),
+                partial_text: notice.message.clone(),
+                final_text: Some(notice.message.clone()),
+                partial_markdown: None,
+                final_markdown: None,
+                item,
+                author: None,
+                route: None,
+                opaque_meta: None,
+            },
+        );
+        projection.items[item_index].timeline_origin = Some(pioneer_protocol::TimelineOrigin {
+            kind: pioneer_protocol::TimelineOriginKind::ChildTurn,
+            task_id: Some(task.task_id.clone()),
+            run_id: task.run_id.clone(),
+            child_thread_id: Some(notice.source_thread_id.clone()),
+            child_turn_id: Some(notice.source_turn_id.clone()),
+            origin_event_id: None,
+            origin_turn_item_id: Some(notice.item_id.clone()),
+            origin_sequence: 0,
+            occurred_at: notice.occurred_at_unix_ms / 1_000,
+            lane: pioneer_protocol::TimelineLane::ChildTool,
+        });
+    }
 }
 
 fn push_turn_state(
@@ -1188,6 +1238,7 @@ mod tests {
             started_at_unix_ms: Some(2),
             updated_at_unix_ms: Some(3),
             kind: TimelineBlockKind::DetachedTaskRun {
+                codex_retry_notices: Vec::new(),
                 task: TaskTurnItem {
                     id: "task_anchor_a".to_owned(),
                     task_id: "task_a".to_owned(),

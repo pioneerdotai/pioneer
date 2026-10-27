@@ -486,6 +486,35 @@
         "other"
       ]
     },
+    "CodexRetryNotice": {
+      "description": "Read-only presentation of a canonical Codex retry notice owned by a Task's\nhidden execution. This never becomes a canonical event in the viewing thread.",
+      "type": "object",
+      "properties": {
+        "itemId": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "occurredAtUnixMs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "sourceThreadId": {
+          "type": "string"
+        },
+        "sourceTurnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sourceThreadId",
+        "sourceTurnId",
+        "itemId",
+        "message",
+        "occurredAtUnixMs"
+      ]
+    },
     "CrossThreadSourceVisibility": {
       "type": "string",
       "enum": [
@@ -1270,6 +1299,12 @@
                   "type": "null"
                 }
               ]
+            },
+            "codexRetryNotices": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CodexRetryNotice"
+              }
             },
             "kind": {
               "type": "string",

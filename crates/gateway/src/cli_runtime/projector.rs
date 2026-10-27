@@ -25,6 +25,8 @@ pub(crate) struct CLIRuntimeProjectorContext {
     pub thread_id: String,
     pub turn_id: String,
     pub recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+    /// Set only for Codex after current durable attempt ownership is validated.
+    pub codex_retry_attempt_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -102,7 +104,28 @@ pub(crate) fn project_cli_runtime_event(
                 cancellation_owner: None,
             })
         }
-        RuntimeEvent::TurnRetrying(_) => CLIRuntimeProjectedEvents::ignored("turn_retrying"),
+        RuntimeEvent::TurnRetrying(_) => {
+            let Some(attempt_id) = context.codex_retry_attempt_id.as_deref() else {
+                return CLIRuntimeProjectedEvents::ignored("turn_retrying");
+            };
+            // One immutable historical fact per native attempt. Neither retry
+            // diagnostics nor recovery confirmation may change this payload.
+            CLIRuntimeProjectedEvents::durable(AgentDurableEvent::ItemCompleted {
+                notification: ItemCompletedNotification {
+                    workspace_id: context.workspace_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    turn_id: context.turn_id.clone(),
+                    item: TurnItem::SystemEvent {
+                        id: pioneer_crud::codex_retry_notice_item_id(&context.turn_id, attempt_id),
+                        level: SystemEventLevel::Warning,
+                        message: "Codex reported a request retry after a temporary failure."
+                            .to_owned(),
+                        code: Some("codex_request_retried".to_owned()),
+                        details: None,
+                    },
+                },
+            })
+        }
         RuntimeEvent::Error(error) => project_runtime_error(context, error),
         RuntimeEvent::ReviewModeChanged(review) => project_review_mode_changed(context, review),
         RuntimeEvent::ItemStarted(started) => project_item_started(context, started),
@@ -1525,6 +1548,7 @@ mod tests {
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             recovery: None,
+            codex_retry_attempt_id: Some("attempt_1".to_owned()),
         }
     }
 
@@ -3282,23 +3306,74 @@ mod tests {
     }
 
     #[test]
-    fn codex_retrying_turn_does_not_project_terminal_or_timeline_events() {
-        let retrying = project_codex_notification(
-            "error",
-            json!({
-                "threadId": "native_thread_1",
-                "turnId": "native_turn_1",
-                "error": {
-                    "message": "Reconnecting... 2/5",
-                    "code": "stream_disconnected"
-                },
-                "willRetry": true
-            }),
+    fn codex_retrying_turn_projects_one_immutable_historical_warning() {
+        let retry = |message: &str| {
+            project_codex_notification(
+                "error",
+                json!({
+                    "threadId": "native_thread_1",
+                    "turnId": "native_turn_1",
+                    "error": {"message": message, "code": message},
+                    "willRetry": true
+                }),
+            )
+        };
+        let first = retry("Reconnecting... 2/5");
+        assert!(first.progress.is_empty());
+        assert!(first.snapshot.is_empty());
+        assert!(first.ignored.is_empty());
+        let [AgentDurableEvent::ItemCompleted { notification }] = first.durable.as_slice() else {
+            panic!("retry must emit only a completed historical item");
+        };
+        assert!(matches!(&notification.item, TurnItem::SystemEvent {
+            level: SystemEventLevel::Warning, code: Some(code), details: None, ..
+        } if code == "codex_request_retried"));
+        let payload = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification.clone());
+        for message in [
+            "Reconnecting... 3/5",
+            "different temporary failure",
+            "Reconnecting... 2/5",
+        ] {
+            let projected = retry(message);
+            assert_eq!(projected.durable, first.durable);
+            let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
+                unreachable!();
+            };
+            let replay =
+                pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification.clone());
+            assert_eq!(
+                replay.idempotency_key().unwrap(),
+                payload.idempotency_key().unwrap()
+            );
+        }
+        assert!(
+            pioneer_observability::turn_startup::notification_output(
+                "item/completed",
+                &serde_json::to_value(notification).unwrap()
+            )
+            .is_none()
         );
 
-        assert!(retrying.progress.is_empty());
-        assert!(retrying.durable.is_empty());
-        assert_eq!(retrying.ignored, vec!["turn_retrying"]);
+        let event =
+            RuntimeEvent::TurnRetrying(pioneer_cli_agent_runtime::event::RuntimeTurnRetrying {
+                native_thread_id: Some("native_thread_1".into()),
+                native_turn_id: Some("native_turn_1".into()),
+                message: "temporary failure".into(),
+                code: None,
+                native: None,
+            });
+        let mut next_attempt = context();
+        next_attempt.codex_retry_attempt_id = Some("attempt_2".into());
+        let next = project_cli_runtime_event(&next_attempt, &event);
+        let [AgentDurableEvent::ItemCompleted { notification: next }] = next.durable.as_slice()
+        else {
+            panic!("next attempt must own its own notice");
+        };
+        assert_ne!(next.item.item_id(), notification.item.item_id());
+        next_attempt.codex_retry_attempt_id = None;
+        let unowned = project_cli_runtime_event(&next_attempt, &event);
+        assert!(unowned.durable.is_empty());
+        assert!(unowned.progress.is_empty());
     }
 
     #[test]

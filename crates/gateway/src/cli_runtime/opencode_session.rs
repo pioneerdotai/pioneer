@@ -5957,6 +5957,7 @@ mod tests {
             thread_id: "thread".into(),
             turn_id: "turn".into(),
             recovery: None,
+            codex_retry_attempt_id: None,
         };
         let shell = observation
             .reconciliation_events

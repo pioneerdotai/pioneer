@@ -42,7 +42,7 @@ fn technical_system_event(item: &TurnItem, service_filter: bool) -> bool {
         return false;
     };
     match code.as_deref() {
-        Some("agent_thread_status_changed") => true,
+        Some("agent_thread_status_changed" | "codex_request_retried") => true,
         Some(
             "agent_runtime_item_updated"
             | "cli_runtime_turn_steer"
@@ -244,6 +244,42 @@ mod tests {
             phase: Default::default(),
             markdown: None,
             markdown_version: None,
+        }
+    }
+
+    #[test]
+    fn codex_retry_notice_is_technical_in_every_model_history_projection() {
+        let item = TurnItem::SystemEvent {
+            id: "retry-attempt-1".into(),
+            level: SystemEventLevel::Warning,
+            message: "Codex reported a request retry after a temporary failure.".into(),
+            code: Some("codex_request_retried".into()),
+            details: None,
+        };
+        assert!(canonical_item_model_projection(&item).is_omitted());
+        for event in [
+            CanonicalTurnEventPayload::ItemStarted(pioneer_protocol::ItemStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: item.clone(),
+            }),
+            completed(item.clone()),
+            CanonicalTurnEventPayload::ItemUpdated(ItemUpdatedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item,
+            }),
+        ] {
+            assert!(canonical_event_model_projection(&event).is_omitted());
+            assert!(canonical_event_model_projection_before_service_filter(&event).is_omitted());
+            if !matches!(event, CanonicalTurnEventPayload::ItemStarted(_)) {
+                assert_eq!(
+                    crate::compaction::event_projection_metadata(&event).1,
+                    "technical"
+                );
+            }
         }
     }
 

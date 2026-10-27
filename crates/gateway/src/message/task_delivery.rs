@@ -560,6 +560,7 @@ impl MessageProcessor {
         http_status: Option<u16>,
         response_fingerprint: Option<String>,
     ) -> Result<pioneer_crud::TaskDeliveryTransitionOutcome<()>> {
+        let title_recovery = self.composer_title_recovery_target(&delivery).await;
         let outcome = self
             .task_runtime
             .background_control_service()
@@ -576,12 +577,50 @@ impl MessageProcessor {
             .map_err(|error| anyhow!("{error:#}"))?;
         Ok(match outcome {
             pioneer_crud::TaskDeliveryTransitionOutcome::Applied(_) => {
+                if let Some(thread_id) = title_recovery {
+                    self.recover_thread_title(thread_id).await;
+                }
                 pioneer_crud::TaskDeliveryTransitionOutcome::Applied(())
             }
             pioneer_crud::TaskDeliveryTransitionOutcome::Superseded => {
                 pioneer_crud::TaskDeliveryTransitionOutcome::Superseded
             }
         })
+    }
+
+    async fn composer_title_recovery_target(&self, delivery: &TaskDelivery) -> Option<String> {
+        if delivery.mode != TaskDeliveryMode::Thread || delivery.error_snapshot.is_some() {
+            return None;
+        }
+        let target = delivery.target_thread_id.as_deref()?;
+        if !matches!(
+            self.title_job_runtime.lock().await.get(target),
+            Some(ThreadTitleJobState::AwaitingSuccessfulTurn(_))
+        ) {
+            return None;
+        }
+        let background = self.crud_store.with_maintenance_access();
+        let task = background.get_task(&delivery.task_id).await.ok()??;
+        if !task.runs.iter().any(|run| {
+            run.id == delivery.run_id && run.status == pioneer_protocol::TaskRunStatus::Succeeded
+        }) {
+            return None;
+        }
+        let work = task.task.metadata.as_ref()?.composer_work.as_ref()?;
+        // Only the saved Composer launch identifies the user conversation.
+        // Arbitrary task lineage and the hidden execution thread do not.
+        let launch = &work.launch;
+        if target != launch.thread_id {
+            return None;
+        }
+        let (_, turn) = background
+            .get_turn(&launch.thread_id, &launch.turn_id)
+            .await
+            .ok()??;
+        (turn.status == TurnStatus::Completed
+            && turn.origin == pioneer_protocol::TurnOrigin::User
+            && turn.turn_kind == pioneer_protocol::TurnKind::Conversation)
+            .then(|| launch.thread_id.clone())
     }
 
     async fn prepare_task_delivery_agent_action(
