@@ -7215,6 +7215,9 @@ impl MessageProcessor {
                     return;
                 }
             };
+            #[cfg(test)]
+            self.completed_history_preparation_barrier.wait_if_armed(
+                "__cli_before_initial_binding__", &tokio_util::sync::CancellationToken::new()).await;
             if let Err(error) = self
                 .persist_cli_runtime_input_mapping_if_thread_bound(
                     runtime_id.as_str(),
@@ -7238,6 +7241,9 @@ impl MessageProcessor {
                 ));
                 return;
             }
+            #[cfg(test)]
+            self.completed_history_preparation_barrier.wait_if_armed(
+                "__cli_after_initial_binding__", &tokio_util::sync::CancellationToken::new()).await;
             // Sent mapping is now the durable root; provider awaits need no temporary pin.
             drop(cli_basis_hold);
             let native_turn_input = match serde_json::to_value(&input_mapping.input) {
@@ -11015,6 +11021,22 @@ impl MessageProcessor {
             return;
         }
 
+        let cancel_owner = match self.crud_store.get_turn_execution(&turn_id).await {
+            Ok(owner) => owner,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    public_turn_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
+                        format!("failed to read cancellation ownership: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         let cancel_intent_key = (thread_id.clone(), turn_id.clone());
         let reason = self
             .user_turn_cancel_intents
@@ -11107,10 +11129,14 @@ impl MessageProcessor {
                 .await
             {
                 if let Some((workspace_id, turn)) = self
-                    .thread_manager
-                    .turn_get(thread_id.as_str(), turn_id.as_str())
+                    .projected_terminal_cancel_outcome(
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        cancel_owner.as_ref(),
+                    )
                     .await
-                    .filter(|(_, turn)| turn.status != TurnStatus::InProgress)
+                    .ok()
+                    .flatten()
                 {
                     self.release_user_turn_cancel_intent(&cancel_intent_key)
                         .await;
@@ -11188,15 +11214,18 @@ impl MessageProcessor {
             self.release_user_turn_cancel_intent(&cancel_intent_key)
                 .await;
             // Cancellation races with fail-closed admission/runtime paths.
-            // If that path already committed a terminal state, cancellation
-            // has reached its intended durable outcome and is idempotently
-            // successful. Only an absent or still-running Turn is a
-            // persistence failure.
+            // A competing projected terminal outcome can settle this request.
+            // Interrupted still requires the cancellation completion checks;
+            // its provisional memory state alone cannot acknowledge Stop.
             if let Some((workspace_id, turn)) = self
-                .thread_manager
-                .turn_get(thread_id.as_str(), turn_id.as_str())
+                .projected_terminal_cancel_outcome(
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    cancel_owner.as_ref(),
+                )
                 .await
-                .filter(|(_, turn)| turn.status != TurnStatus::InProgress)
+                .ok()
+                .flatten()
             {
                 self.send_turn_cancel_response(
                     connection_id,

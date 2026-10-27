@@ -2572,6 +2572,7 @@ async fn capability_persistence_order_impl() {
                 && mcp_bindings.len() == expected_mcp_bindings
                 && mcp_bindings.iter().all(|binding| crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id).is_some())
                 && mcp_bindings.iter().any(|binding| binding.raw_tool_name == "task_wait")
+                && thread_actions.iter().all(|name| mcp_bindings.iter().any(|binding| binding.raw_tool_name == *name))
         ));
         let committed_skills = timeout(Duration::from_secs(1), committed_rx.recv())
             .await
@@ -5920,37 +5921,46 @@ impl DirectAgentSandboxProvider {
     }
 }
 
-fn find_current_agent_target_option(value: &JsonValue) -> Option<String> {
+fn find_agent_option(value: &JsonValue, field: &str, label: Option<&str>) -> Option<String> {
     match value {
         JsonValue::Object(object) => {
-            if let Some(options) = object
-                .get("targetOptions")
-                .or_else(|| object.get("target_options"))
-                .and_then(JsonValue::as_array)
+            if let Some(options) = object.get(field).and_then(JsonValue::as_array)
                 && let Some(id) = options.iter().find_map(|option| {
-                    let label = option.get("label").and_then(JsonValue::as_str)?;
-                    (label == "Current thread")
+                    let actual = option.get("label").and_then(JsonValue::as_str)?;
+                    let selected = label.map_or(
+                        actual != "Current thread" && actual != "Current collaboration",
+                        |label| actual == label,
+                    );
+                    selected
                         .then(|| option.get("id").and_then(JsonValue::as_str))
                         .flatten()
                 })
             {
                 return Some(id.to_owned());
             }
-            object.values().find_map(find_current_agent_target_option)
+            object
+                .values()
+                .find_map(|value| find_agent_option(value, field, label))
         }
-        JsonValue::Array(values) => values.iter().find_map(find_current_agent_target_option),
+        JsonValue::Array(values) => values
+            .iter()
+            .find_map(|value| find_agent_option(value, field, label)),
         JsonValue::String(encoded) => serde_json::from_str::<JsonValue>(encoded)
             .ok()
             .as_ref()
-            .and_then(find_current_agent_target_option),
+            .and_then(|value| find_agent_option(value, field, label)),
         _ => None,
     }
 }
 
-fn current_agent_target_option_from_request(request: &ChatRequest) -> Option<String> {
+fn agent_option_from_request(
+    request: &ChatRequest,
+    field: &str,
+    label: Option<&str>,
+) -> Option<String> {
     for message in request.messages.iter().rev() {
         if let Ok(value) = serde_json::from_str::<JsonValue>(message.content.as_str())
-            && let Some(id) = find_current_agent_target_option(&value)
+            && let Some(id) = find_agent_option(&value, field, label)
         {
             return Some(id);
         }
@@ -5958,7 +5968,7 @@ fn current_agent_target_option_from_request(request: &ChatRequest) -> Option<Str
             let mut values = serde_json::Deserializer::from_str(&message.content[index..])
                 .into_iter::<JsonValue>();
             if let Some(Ok(value)) = values.next()
-                && let Some(id) = find_current_agent_target_option(&value)
+                && let Some(id) = find_agent_option(&value, field, label)
             {
                 return Some(id);
             }
@@ -7024,6 +7034,7 @@ impl Provider for DirectAgentSandboxProvider {
             } else {
                 test_turn_preflight_response_with_visible_tools(&[
                     "threads_start_options",
+                    "thread_create",
                     "threads_turn_start",
                 ])
             });
@@ -7069,13 +7080,34 @@ impl Provider for DirectAgentSandboxProvider {
                 }],
             },
             1 => {
-                let target_option_id = current_agent_target_option_from_request(&request)
+                let option = agent_option_from_request(
+                    &request,
+                    "threadCreationOptions",
+                    Some("Current collaboration"),
+                )
+                .expect("parent options must allow an internal child thread");
+                ChatResponse {
+                    messages: Vec::new(),
+                    text: String::new(),
+                    usage: None,
+                    reasoning_content: None,
+                    provider_replay_state: None,
+                    termination: pioneer_provider::ProviderTermination::ToolCalls,
+                    tool_calls: vec![ProviderToolCall {
+                        id: "call_direct_agent_create".to_owned(),
+                        name: "thread_create".to_owned(),
+                        arguments: json!({"optionId":option}).to_string(),
+                    }],
+                }
+            }
+            2 => {
+                let target_option_id = agent_option_from_request(&request, "targetOptions", None)
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "threads_start_options output did not contain a current-thread target: {:#?}",
-                            request.messages
-                        )
-                    })?;
+                    anyhow::anyhow!(
+                        "thread_create output did not contain a child-thread target: {:#?}",
+                        request.messages
+                    )
+                })?;
                 ChatResponse {
                     messages: Vec::new(),
                     text: String::new(),
@@ -24905,6 +24937,7 @@ fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_co
         "recovered hidden Task preflight ordering",
         recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
             TaskAttachmentMode::Detached,
+            false,
         ),
     );
 }
@@ -24915,12 +24948,25 @@ fn compaction_attached_task_restores_its_frozen_basis_without_changing_hook_scop
         "attached Task frozen basis and recovery",
         recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
             TaskAttachmentMode::Attached,
+            false,
+        ),
+    );
+}
+
+#[test]
+fn recovered_task_public_stop_preserves_prompt_manifest_and_canonical_identity() {
+    run_standard_stack_message_test(
+        "recovered Task Stop before prompt compilation",
+        recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+            TaskAttachmentMode::Detached,
+            true,
         ),
     );
 }
 
 async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
     attachment: TaskAttachmentMode,
+    stop_before_prompt: bool,
 ) {
     let initial_provider = Arc::new(HangingChildProvider::new());
     let initial_provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
@@ -25060,6 +25106,15 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         initial_provider.child_main_call_count() > 0,
         "initial child task provider should be hanging in the main child request"
     );
+    let saved_manifest = crud_store
+        .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .prompt_manifest
+        .expect("the first model call must persist a prompt manifest");
+    assert!(!saved_manifest.section_ids.is_empty());
     let child_snapshot = crud_store
         .get_turn_runtime_snapshot(&lineage.child_turn_id)
         .await
@@ -25300,11 +25355,151 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         test_tool_loop_config(),
     ));
     recovery_processor.bind_task_bridge().await;
+    if stop_before_prompt {
+        recovery_processor
+            .arm_completed_history_preparation_barrier("__native_recovery_before_control_ack__");
+    }
     recovery_processor
         .task_runtime
         .start()
         .await
         .expect("startup recovery should run");
+
+    if stop_before_prompt {
+        timeout(
+            Duration::from_secs(10),
+            recovery_processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .unwrap();
+        let restored = recovery_processor
+            .thread_manager
+            .turn_get(&lineage.child_thread_id, &lineage.child_turn_id)
+            .await
+            .unwrap()
+            .1;
+        assert_eq!(restored.status, TurnStatus::InProgress);
+        assert!(
+            restored.prompt_manifest.is_none(),
+            "the production thread snapshot intentionally omits the manifest"
+        );
+        assert_eq!(
+            crud_store
+                .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .prompt_manifest
+                .as_ref(),
+            Some(&saved_manifest),
+        );
+        assert!(recovery_provider.snapshot_requests().is_empty());
+        let (tx, mut rx) = mpsc::channel(256);
+        let connection =
+            register_authenticated_test_connection(recovery_processor.session_manager.as_ref(), tx)
+                .await;
+        assert!(
+            recovery_processor
+                .thread_manager
+                .subscribe_connection(&lineage.child_thread_id, connection)
+                .await
+        );
+        let mut terminal_events = None;
+        for delivery in ["first", "repeat"] {
+            let id = generate_test_request_id("taskstop", delivery);
+            recovery_processor
+                .process_request_for_connection(
+                    connection,
+                    &json!({"jsonrpc":"2.0", "id":id, "method":"turn/cancel",
+                    "params":{"thread_id":lineage.child_thread_id,
+                        "turn_id":lineage.child_turn_id}})
+                    .to_string(),
+                )
+                .await;
+            let reply = recv_response_by_id(&mut rx, &id).await;
+            let reply: TurnCancelResponse = serde_json::from_value(reply.result).unwrap();
+            assert_eq!(reply.turn.status, TurnStatus::Interrupted);
+            let persisted = crud_store
+                .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1;
+            assert_eq!(persisted.prompt_manifest.as_ref(), Some(&saved_manifest));
+            assert_eq!(
+                recovery_processor
+                    .thread_manager
+                    .turn_get(&lineage.child_thread_id, &lineage.child_turn_id)
+                    .await
+                    .unwrap()
+                    .1,
+                persisted
+            );
+            let accepted = crud_store
+                .native_cancellation_accepted_notification_owned(
+                    &lineage.child_turn_id,
+                    recovery_processor.turn_execution_owner_id.as_ref(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                accepted.turn.prompt_manifest.is_none(),
+                "hydration must not rewrite the original canonical payload"
+            );
+            let events = pioneer_entity::turn_event::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event::Column::TurnId.eq(lineage.child_turn_id.clone()),
+                )
+                .filter(pioneer_entity::turn_event::Column::EventType.eq(events::TURN_FAILED))
+                .all(&crud_store.database_connection())
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            if let Some(first) = terminal_events.as_ref() {
+                assert_eq!(
+                    &events, first,
+                    "repeat Stop must retain the exact canonical ID, payload and idempotency key"
+                );
+            } else {
+                terminal_events = Some(events);
+            }
+        }
+        recovery_processor.release_completed_history_preparation_barrier();
+        wait_for_cancelled_native_actor_cleanup(
+            &recovery_processor.agent_manager,
+            &lineage.child_thread_id,
+        )
+        .await;
+        assert_eq!(
+            crud_store
+                .get_task_run(&run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskRunStatus::Cancelled
+        );
+        assert!(
+            recovery_provider.snapshot_requests().is_empty(),
+            "recovery Stop must not compile another model request"
+        );
+        assert_eq!(initial_provider.child_main_call_count(), 1);
+        assert_eq!(
+            pioneer_entity::turn_event::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event::Column::TurnId.eq(lineage.child_turn_id.clone())
+                )
+                .filter(pioneer_entity::turn_event::Column::EventType.eq(events::TURN_FAILED))
+                .all(&crud_store.database_connection())
+                .await
+                .unwrap(),
+            terminal_events.unwrap(),
+            "actor cleanup must retain the same accepted terminal event"
+        );
+        return;
+    }
 
     let mut recovered_task_status = crud_store
         .get_task(response.task.id.as_str())
@@ -38136,12 +38331,19 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         .expect("direct Agent child permission request should be present");
     assert_eq!(opened_request["tool_name"], json!("exec_command"));
     assert_eq!(opened_request["action"], json!("shell_command"));
-    assert_eq!(opened_request["thread_id"], json!(thread_id));
+    let child_thread_id = opened_request["thread_id"].as_str().unwrap().to_owned();
+    assert_ne!(child_thread_id, thread_id);
+    let lineage = crud_store
+        .get_task_thread_lineage(&child_thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lineage.root_thread_id, thread_id);
     let child_turn_id = opened_request["turn_id"]
         .as_str()
         .expect("direct Agent child turn id should be present")
         .to_owned();
-    assert_admitted_turn_owner(&processor, thread_id, &child_turn_id).await;
+    assert_admitted_turn_owner(&processor, &child_thread_id, &child_turn_id).await;
     assert_ne!(child_turn_id, root_turn_id);
     let permission_request_id = opened_request["request_id"]
         .as_str()
@@ -38209,7 +38411,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
     let expected_artifact_root = pioneer_artifacts::artifact_output_dir_path(
         processor.artifact_runtime_home.join("artifacts").as_path(),
         workspace_id.as_str(),
-        thread_id,
+        child_thread_id.as_str(),
         child_turn_id.as_str(),
     )
     .expect("direct Agent child artifact root should resolve");
@@ -38244,7 +38446,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
     assert!(permission_records[0].status.is_terminal());
 
     let child_events = crud_store
-        .get_turn_item_events(thread_id, child_turn_id.as_str())
+        .get_turn_item_events(&child_thread_id, child_turn_id.as_str())
         .await
         .expect("direct Agent child event stream should load")
         .expect("direct Agent child event stream should exist");
@@ -60456,8 +60658,15 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
     // Cancellation is the control-plane operation under test. Seed an admitted,
     // durable in-progress Turn directly so the assertion does not depend on the
     // separate launch-admission surface (which has its own exhaustive tests).
+    let actor = pioneer_protocol::PersistedActorRef::Principal(
+        authenticated_test_superuser().principal_id.clone(),
+    );
+    let author =
+        super::message_turn::resolve_turn_author_snapshot(crud_store_for_assert.as_ref(), &actor)
+            .await
+            .unwrap();
     let turn_outcome = thread_manager_for_assert
-        .turn_start(
+        .turn_start_with_user_metadata(
             connection_id,
             pioneer_protocol::TurnStartParams {
                 agent_delegation_routes: Vec::new(),
@@ -60482,6 +60691,8 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 permission_profile: None,
                 cli_runtime_options: None,
             },
+            author,
+            Vec::new(),
         )
         .await
         .expect("turn cancellation fixture should seed an in-progress Turn");
@@ -60871,10 +61082,11 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
         .expect("interrupted turn should be persisted");
     assert_eq!(persisted_turn.status, TurnStatus::Interrupted);
     assert_eq!(persisted_turn.error.as_deref(), Some("user clicked stop"));
-    // Aggregate reads synthesize the legacy author from the persisted initiator.
-    // The accepted canonical notification must still deliver its exact Turn.
-    assert!(persisted_turn.author.is_some());
-    assert!(failed.turn.author.is_none());
+    // Admission stored an explicit author. Cancellation must retain that exact
+    // author in both its canonical notification and the persisted projection.
+    assert_eq!(failed.turn.author, turn_outcome.materialization.turn.author);
+    assert!(failed.turn.author.is_some());
+    assert_eq!(persisted_turn, failed.turn);
     assert_eq!(
         thread_manager_for_assert
             .turn_get("thr_000000000000000022", "turn_000000000000000022")
@@ -87156,8 +87368,17 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
             // Cancellation is the control-plane operation under test. Seed an admitted,
             // durable in-progress Turn directly so the assertion does not depend on the
             // separate launch-admission surface (which has its own exhaustive tests).
+            let actor = pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            );
+            let author = super::message_turn::resolve_turn_author_snapshot(
+                crud_store_for_assert.as_ref(),
+                &actor,
+            )
+            .await
+            .unwrap();
             let turn_outcome = thread_manager_for_assert
-                .turn_start(
+                .turn_start_with_user_metadata(
                     connection_id,
                     pioneer_protocol::TurnStartParams {
                         agent_delegation_routes: Vec::new(),
@@ -87182,6 +87403,8 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
                         permission_profile: None,
                         cli_runtime_options: None,
                     },
+                    author,
+                    Vec::new(),
                 )
                 .await
                 .expect("turn cancellation fixture should seed an in-progress Turn");

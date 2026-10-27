@@ -615,7 +615,7 @@ fn gateway_reported_admission_does_not_hide_child_persistence_error() {
 #[test]
 fn real_internal_completion_keeps_type_ownership_and_durable_agent_contract() {
     use super::super::turn_handlers::{TurnStartFailure, TurnStartSuccessResponse};
-    let ((task_saved, durable_error), events) = capture_task_start(async {
+    let ((task_saved, durable_saved), events) = capture_task_start(async {
         let harness =
             setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
         let security =
@@ -706,8 +706,7 @@ fn real_internal_completion_keeps_type_ownership_and_durable_agent_contract() {
             admitted_outcome: None,
             completion: Arc::new(std::sync::Mutex::new(Some(sender))),
         };
-        // Committed outbox completion retains the typed validation cause for
-        // its caller, which owns classification and reporting.
+        // The committed outbox owns typed failures and their eventual reporting.
         harness
             .processor
             .send_turn_start_failure_for_test(
@@ -720,7 +719,9 @@ fn real_internal_completion_keeps_type_ownership_and_durable_agent_contract() {
             )
             .await;
         let error = receiver.await.unwrap().err().unwrap();
-        let failure = error.downcast_ref::<TaskStartFailure>().unwrap();
+        let failure = error
+            .downcast_ref::<TaskStartFailure>()
+            .expect("the committed outbox must retain the typed admission cause");
         assert_eq!(failure.descriptor().stage, TaskStartStage::CliAdmission);
         assert_eq!(failure.descriptor().cause, TaskStartCause::Validation);
         assert_eq!(failure.reporting(), TaskStartReporting::Unreported);
@@ -734,8 +735,13 @@ fn real_internal_completion_keeps_type_ownership_and_durable_agent_contract() {
             .unwrap()
             .contains("PIONEER9_")
     );
-    assert_eq!(durable_error.class, TaskErrorClass::Validation);
-    assert_eq!(durable_error.code, "task_cli_admission_validation_failed");
+    assert_eq!(durable_saved.class, TaskErrorClass::Validation);
+    assert_eq!(durable_saved.code, "task_cli_admission_validation_failed");
+    assert!(
+        !serde_json::to_string(&durable_saved)
+            .unwrap()
+            .contains("invalid request")
+    );
 }
 
 #[test]

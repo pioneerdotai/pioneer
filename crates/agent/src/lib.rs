@@ -3858,9 +3858,9 @@ impl AgentManager {
         self.finish_control_dispatch(thread_id, result).await
     }
 
-    /// Called only after the controller confirmed canonical cancellation and its
-    /// obligations. Bind that observation to the exact actor generation and run;
-    /// a cancellation token alone is never a durable receipt.
+    /// Called after canonical acceptance with durable cancellation obligations.
+    /// Projection and cleanup still own completion. Bind this observation to the
+    /// exact actor generation and run; a token alone is never a durable receipt.
     pub async fn observe_durable_cancellation(
         &self,
         receipt: pioneer_protocol::NativeDurableCancellationReceipt,
@@ -3989,7 +3989,9 @@ impl AgentManager {
         let command = AgentCommand::CancelTurn {
             turn_id: turn_id.to_owned(),
             reason: reason.to_owned(),
-            expected_run_id: expected_generation.map(|(_, run_id)| run_id),
+            expected_run_id: expected_generation
+                .map(|(_, run_id)| run_id)
+                .or_else(|| control.as_ref().map(|control| control.run_id)),
             completion_ack: completion_tx,
             cancellation_owner,
             ack: AgentControlAck {

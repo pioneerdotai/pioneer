@@ -2985,7 +2985,7 @@ async fn unactivated_fixture(
             executor_key: Some("openai".into()),
             status: crate::TurnExecutionStatus::Starting,
             owner_id: OWNER.into(),
-            lease_until: unix_to_datetime(NOW + 100),
+            lease_until: crate::utc_now() + chrono::Duration::seconds(100),
             created_at: unix_to_datetime(NOW),
         },
     )
@@ -3008,13 +3008,16 @@ async fn accepted_unactivated_stop_and_activation_share_a_durable_writer_fence()
         if claim_before_stop {
             assert!(
                 store
-                    .claim_unactivated_agent_turn(&expected, unix_to_datetime(NOW))
+                    .claim_unactivated_agent_turn(&expected)
                     .await
                     .unwrap()
             );
+            let claimed = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+            assert_eq!(claimed.status, crate::TurnExecutionStatus::Starting);
+            assert!(claimed.started_at.is_some());
             assert!(
                 !store
-                    .claim_unactivated_agent_turn(&expected, unix_to_datetime(NOW))
+                    .claim_unactivated_agent_turn(&expected)
                     .await
                     .unwrap()
             );
@@ -3064,7 +3067,7 @@ async fn accepted_unactivated_stop_and_activation_share_a_durable_writer_fence()
         );
         assert!(
             !store
-                .claim_unactivated_agent_turn(&expected, unix_to_datetime(NOW + 2))
+                .claim_unactivated_agent_turn(&expected)
                 .await
                 .unwrap()
         );
@@ -3259,7 +3262,10 @@ async fn unactivated_refusal_and_stop_preserve_activation_terminal_results_and_r
     // recovery which has already claimed the durable execution.
     let (store, turn, plan, expected) = unactivated_fixture("new_owner").await;
     let replacement = store
-        .claim_expired_turn_execution(&expected, "replacement-owner", NOW + 101, NOW + 201)
+        .claim_expired_turn_execution(
+            &expected, "replacement-owner", expected.lease_until.timestamp() + 1,
+            expected.lease_until.timestamp() + 101,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -3309,7 +3315,10 @@ async fn unactivated_refusal_and_stop_preserve_activation_terminal_results_and_r
         .unwrap()
         .unwrap();
     let replacement = store
-        .claim_expired_turn_execution(&expected, OWNER, NOW + 101, NOW + 201)
+        .claim_expired_turn_execution(
+            &expected, OWNER, expected.lease_until.timestamp() + 1,
+            expected.lease_until.timestamp() + 101,
+        )
         .await
         .unwrap()
         .unwrap();

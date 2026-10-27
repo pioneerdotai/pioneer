@@ -208,11 +208,7 @@ async fn fixture_with_principal_probe(
     });
     let mut context = TurnToolContext {
         workspace_id: workspace.clone(),
-        thread_id: if member {
-            "T0000000000000000000C".into()
-        } else {
-            "choices-root".into()
-        },
+        thread_id: "C00000000000000000001".into(),
         turn_id: "choices-parent".into(),
     };
     ensure_test_superuser_execution_turn(
@@ -444,6 +440,19 @@ async fn fixture_with_principal_probe(
         .await
         .unwrap();
     }
+    // These scenarios start from an active foreground source, not only its
+    // persisted authorization/snapshot. Restore the actual source Turn too.
+    let source = processor
+        .crud_store
+        .get_thread_model(&context.thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(source, Some(SandboxMode::FullAccess))
+        .await
+        .unwrap();
     let tools = processor
         .materialize_agent_action_tools(context.clone())
         .await
@@ -758,34 +767,24 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         grant,
         "replay preserves the independent root's immutable provenance"
     );
-    // A concurrent child can change composer settings while the queued root
-    // remains runnable. Stop the root only after checking its pinned launch.
-    let mut concurrent = start.clone();
-    concurrent.turn_id = "composer-change-child".into();
-    concurrent.model = Some("gpt-5.4-catalog-other".into());
-    concurrent.reasoning = Some(pioneer_protocol::TurnReasoningSelection {
-        effort: "low".into(),
-    });
-    let root_turn = processor
+    // Restore the still-runnable Turn with newer composer settings, as after
+    // reconnecting before the committed outbox prepares its pinned launch.
+    let rehydration_manager = ThreadManager::new("composer-model", "openai");
+    let mut restored_thread = processor
         .thread_manager
-        .turn_get(thread_id, &start.turn_id)
+        .thread_get(thread_id)
         .await
-        .unwrap()
-        .1;
-    let composer_change = processor
-        .thread_manager
-        .concurrent_agent_turn_start_with_permission_profile(
-            concurrent,
-            root_turn.permission_profile.clone(),
-            root_turn.author.clone().unwrap(),
-        )
+        .unwrap();
+    restored_thread.model = "gpt-5.4-catalog-other".into();
+    restored_thread.reasoning_effort = Some("low".into());
+    rehydration_manager
+        .system_thread_restore_persisted(restored_thread, Some(SandboxMode::FullAccess))
         .await
         .unwrap();
     // Dispatch of the earlier queued Turn must keep its pinned launch even
     // after the same destination acquires different composer settings.
     assert_eq!(
-        processor
-            .thread_manager
+        rehydration_manager
             .thread_get(thread_id)
             .await
             .unwrap()
@@ -797,8 +796,7 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         .get_turn_inputs(&start.turn_id)
         .await
         .unwrap();
-    let rehydrated = processor
-        .thread_manager
+    let rehydrated = rehydration_manager
         .rehydrate_committed_agent_turn(&start, input)
         .await
         .unwrap();
@@ -813,8 +811,7 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         Some("high")
     );
     assert_eq!(
-        processor
-            .thread_manager
+        rehydration_manager
             .thread_get(thread_id)
             .await
             .unwrap()
@@ -823,16 +820,12 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         "rehydration must not overwrite current composer settings"
     );
 
-    processor
-        .thread_manager
-        .rollback_turn_start(composer_change.rollback_context)
-        .await;
     assert!(
         processor
             .mark_turn_interrupted(
                 start.thread_id.clone(),
                 start.turn_id.clone(),
-                "Finish the first accepted launch before the explicit launch".into()
+                "Finish the first accepted launch before the explicit launch".into(),
             )
             .await
     );
@@ -999,11 +992,32 @@ async fn source_at_max_depth_can_start_only_an_independent_root() {
             .await
             .unwrap();
         let facts = binding.adapter.lock().await.persistence_facts();
-        let current = binding
+        // Keep each active ancestor in its own hidden destination. Starting
+        // another foreground Turn in the visible source is correctly refused.
+        let creation = binding
             .options
-            .target_options
+            .thread_creation_options
             .iter()
-            .find(|o| o.label == "Current thread")
+            .find(|option| option.label == "Current collaboration")
+            .unwrap();
+        let created = call(
+            &tools,
+            "thread_create",
+            &format!("depth-thread-{depth}"),
+            json!({"optionId":creation.id}),
+        )
+        .await;
+        let targets: Vec<pioneer_protocol::AgentToolTargetOption> =
+            serde_json::from_value(created["targetOptions"].clone()).unwrap();
+        let current = targets
+            .iter()
+            .find(|option| {
+                !binding
+                    .options
+                    .target_options
+                    .iter()
+                    .any(|old| old.id == option.id)
+            })
             .unwrap();
         let call_id = format!("depth-source-{depth}");
         call(
@@ -1060,6 +1074,10 @@ async fn source_at_max_depth_can_start_only_an_independent_root() {
             )
             .await
             .unwrap();
+        context.thread_id = payload["dispatch"]["thread_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         context.turn_id = payload["dispatch"]["turn_id"].as_str().unwrap().to_owned();
         if depth == max_depth {
             // Canonical admission alone has no runtime snapshot. Prepare the
@@ -1082,6 +1100,42 @@ async fn source_at_max_depth_can_start_only_an_independent_root() {
                 .unwrap();
             processor
                 .prepare_committed_agent_api_turn(&params, outcome, &authority)
+                .await
+                .unwrap();
+        } else {
+            // This admission-depth fixture has no provider dispatch. Seed the
+            // child's runtime input just as fixture() seeds the first source;
+            // thread_create requires a source snapshot matching its pinned profile.
+            let child_params: TurnStartParams =
+                serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+            let now = pioneer_crud::utc_now();
+            processor
+                .crud_store
+                .upsert_turn_runtime_snapshot(pioneer_crud::NewTurnRuntimeSnapshot {
+                    turn_id: context.turn_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    workspace_id: context.workspace_id.clone(),
+                    mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
+                    model: child_params.model.clone().unwrap(),
+                    provider_name: child_params.model_provider.clone().unwrap(),
+                    reasoning_effort: child_params
+                        .reasoning
+                        .as_ref()
+                        .map(|value| value.effort.clone()),
+                    agent_skill_versions_json: None,
+                    hook_runtime_context_json: serde_json::to_string(
+                        &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                    )
+                    .unwrap(),
+                    workspace_skill_policies_json: "[]".into(),
+                    input_json: serde_json::to_string(&child_params.input).unwrap(),
+                    capabilities_json: serde_json::to_string(&child_params.capabilities).unwrap(),
+                    resolved_artifacts_json: "[]".into(),
+                    runtime_environment_json: "{}".into(),
+                    history_json: "[]".into(),
+                    created_at: now,
+                    updated_at: now,
+                })
                 .await
                 .unwrap();
         }
@@ -2568,6 +2622,7 @@ async fn finish_choice_source_foreground(
 
 #[tokio::test]
 async fn delegated_root_foreground_admission_rejects_competing_start_without_persisting_it() {
+    use sea_orm::PaginatorTrait;
     for target_label in [
         "New delegated root",
         "Current thread",
@@ -2663,19 +2718,15 @@ async fn delegated_root_foreground_admission_rejects_competing_start_without_per
         let payload: serde_json::Value = serde_json::from_str(&accepted[0].payload_json).unwrap();
         let params: TurnStartParams =
             serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
-        let thread = processor
-            .crud_store
-            .get_thread_model(&params.thread_id)
-            .await
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            thread
-                .turns
-                .iter()
-                .filter(|turn| turn.status == TurnStatus::InProgress)
-                .count(),
-            1
+            pioneer_entity::turn::Entity::find()
+                .filter(pioneer_entity::turn::Column::ThreadId.eq(params.thread_id.clone()))
+                .filter(pioneer_entity::turn::Column::Status.eq("in_progress"))
+                .count(&db)
+                .await
+                .unwrap(),
+            1,
+            "the full saved timeline must have exactly one foreground owner"
         );
         let source = binding.adapter.lock().await.persistence_facts();
         let (_, accepted_turn) = processor
@@ -4939,22 +4990,23 @@ fn restart_choice_processor(processor: &Arc<MessageProcessor>) -> Arc<MessagePro
 
 #[tokio::test]
 async fn recovery_terminalization_cannot_apply_blocked_over_a_resumed_generation() {
-    let probe = Arc::new(ChoiceRuntimeProbe::default());
-    let (processor, context, tools) = fixture_with_probe(
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        false,
-        probe.clone(),
-    )
-    .await;
-    processor.bind_agent_tool_bridges().await;
-    let binding = processor
-        .agent_action_binding(&context.turn_id)
-        .await
-        .unwrap();
-    let target = delegated_launch_target(&tools, &binding.options).await;
-    call(
+    for resume_first in [true, false] {
+        let probe = Arc::new(ChoiceRuntimeProbe::default());
+        let (processor, context, tools) = fixture_with_probe(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            false,
+            probe.clone(),
+        )
+        .await;
+        processor.bind_agent_tool_bridges().await;
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let target = delegated_launch_target(&tools, &binding.options).await;
+        call(
         &tools,
         "threads_turn_start",
         "recovery-sync-start",
@@ -4963,159 +5015,181 @@ async fn recovery_terminalization_cannot_apply_blocked_over_a_resumed_generation
         }),
     )
     .await;
-    let db = processor.crud_store.database_connection();
-    let row = pioneer_crud::load_agent_action_outbox(
-        &db,
-        crate::authorization::action_id_for_call("recovery-sync-start").as_str(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
-    let params: TurnStartParams =
-        serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
-    // Keep the real prepared snapshot and activation fence, before actor/model
-    // admission. The recovery worker owns the ensuing terminal transition.
-    processor.arm_completed_history_preparation_barrier("__agent_start_after_activation_claim__");
-    let dispatch = tokio::spawn({
-        let processor = processor.clone();
-        async move {
-            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
-                .await
-                .unwrap()
-        }
-    });
-    timeout(
-        Duration::from_secs(5),
-        processor.wait_for_completed_history_preparation_barrier(),
-    )
-    .await
-    .unwrap();
-    dispatch.abort();
-    let _ = dispatch.await;
-    processor.release_completed_history_preparation_barrier();
-    let before = processor
-        .crud_store
-        .get_turn_execution(&params.turn_id)
+        let db = processor.crud_store.database_connection();
+        let row = pioneer_crud::load_agent_action_outbox(
+            &db,
+            crate::authorization::action_id_for_call("recovery-sync-start").as_str(),
+        )
         .await
         .unwrap()
         .unwrap();
-    let now = now_timestamp_secs();
-    let job = processor
-        .crud_store
-        .enqueue_recovery_job(
-            params.turn_id.clone(),
-            "recovery-sync-reasoning".into(),
-            pioneer_protocol::TurnItemType::Reasoning,
-            None,
-            pioneer_protocol::RecoveryTrigger::Timeout,
-            pioneer_protocol::RecoveryAction::BlockResumable,
-            None,
-            None,
-            None,
-            None,
-            0,
-            0,
-            json!({}),
-            json!({"base_backoff_secs":0,"max_wall_clock_secs":60}),
-            now,
+        let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
+        let params: TurnStartParams =
+            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        // Keep the real prepared snapshot and activation fence, before actor/model
+        // admission. The recovery worker owns the ensuing terminal transition.
+        processor
+            .arm_completed_history_preparation_barrier("__agent_start_after_activation_claim__");
+        let dispatch = tokio::spawn({
+            let processor = processor.clone();
+            async move {
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap()
+            }
+        });
+        timeout(
+            Duration::from_secs(5),
+            processor.wait_for_completed_history_preparation_barrier(),
         )
         .await
         .unwrap();
-    assert!(
-        processor
+        dispatch.abort();
+        let _ = dispatch.await;
+        processor.release_completed_history_preparation_barrier();
+        let before = processor
             .crud_store
-            .mark_recovery_job_terminal(
-                &job.id,
-                pioneer_protocol::RecoveryJobStatus::Blocked,
+            .get_turn_execution(&params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = now_timestamp_secs();
+        let job = processor
+            .crud_store
+            .enqueue_recovery_job(
+                params.turn_id.clone(),
+                "recovery-sync-reasoning".into(),
+                pioneer_protocol::TurnItemType::Reasoning,
                 None,
+                pioneer_protocol::RecoveryTrigger::Timeout,
+                pioneer_protocol::RecoveryAction::BlockResumable,
+                None,
+                None,
+                None,
+                None,
+                0,
+                0,
+                json!({}),
+                json!({"base_backoff_secs":0,"max_wall_clock_secs":60}),
                 now,
             )
             .await
-            .unwrap()
-    );
-    processor.arm_completed_history_preparation_barrier("__agent_terminal_before_memory_sync__");
-    let recovery = tokio::spawn({
-        let processor = processor.clone();
-        async move {
+            .unwrap();
+        assert!(
             processor
-                .process_due_recovery_terminalizations(now, 64)
+                .crud_store
+                .mark_recovery_job_terminal(
+                    &job.id,
+                    pioneer_protocol::RecoveryJobStatus::Blocked,
+                    None,
+                    now,
+                )
                 .await
                 .unwrap()
-        }
-    });
-    timeout(
-        Duration::from_secs(5),
-        processor.wait_for_completed_history_preparation_barrier(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
+        );
         processor
+            .arm_completed_history_preparation_barrier("__agent_terminal_before_memory_sync__");
+        let recovery = tokio::spawn({
+            let processor = processor.clone();
+            async move {
+                processor
+                    .process_due_recovery_terminalizations(now, 64)
+                    .await
+                    .unwrap()
+            }
+        });
+        timeout(
+            Duration::from_secs(5),
+            processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            processor
+                .crud_store
+                .get_turn(&params.thread_id, &params.turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::Blocked
+        );
+        let recovery = if resume_first {
+            Some(recovery)
+        } else {
+            processor.release_completed_history_preparation_barrier();
+            assert_eq!(recovery.await.unwrap(), 1);
+            assert_eq!(
+                processor
+                    .thread_manager
+                    .turn_get(&params.thread_id, &params.turn_id)
+                    .await
+                    .unwrap()
+                    .1
+                    .status,
+                TurnStatus::Blocked
+            );
+            None
+        };
+        assert!(
+            processor
+                .resume_blocked_turn_control(
+                    &context.workspace_id,
+                    &params.thread_id,
+                    &params.turn_id,
+                    Some(&job.id),
+                    now,
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let resumed = processor
+            .crud_store
+            .get_turn_execution(&params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.owner_id, before.owner_id);
+        assert_eq!(resumed.owner_generation, before.owner_generation + 1);
+        if let Some(recovery) = recovery {
+            processor.release_completed_history_preparation_barrier();
+            assert_eq!(recovery.await.unwrap(), 1);
+        }
+        let canonical = processor
             .crud_store
             .get_turn(&params.thread_id, &params.turn_id)
             .await
             .unwrap()
             .unwrap()
-            .1
-            .status,
-        TurnStatus::Blocked
-    );
-    assert!(
-        processor
-            .resume_blocked_turn_control(
-                &context.workspace_id,
-                &params.thread_id,
-                &params.turn_id,
-                Some(&job.id),
-                now,
+            .1;
+        assert_eq!(canonical.status, TurnStatus::InProgress);
+        assert_eq!(
+            processor
+                .thread_manager
+                .turn_get(&params.thread_id, &params.turn_id)
+                .await
+                .unwrap()
+                .1,
+            canonical
+        );
+        let mut competing = params.clone();
+        competing.turn_id = "competing-with-recovery-resume".into();
+        let conflict = processor
+            .thread_manager
+            .agent_turn_start_with_permission_profile(
+                competing,
+                canonical.permission_profile.clone(),
+                canonical.author.clone().unwrap(),
             )
             .await
-            .unwrap()
-            .is_some()
-    );
-    let resumed = processor
-        .crud_store
-        .get_turn_execution(&params.turn_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(resumed.owner_id, before.owner_id);
-    assert_eq!(resumed.owner_generation, before.owner_generation + 1);
-    processor.release_completed_history_preparation_barrier();
-    assert_eq!(recovery.await.unwrap(), 1);
-    let canonical = processor
-        .crud_store
-        .get_turn(&params.thread_id, &params.turn_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .1;
-    assert_eq!(canonical.status, TurnStatus::InProgress);
-    assert_eq!(
-        processor
-            .thread_manager
-            .turn_get(&params.thread_id, &params.turn_id)
-            .await
-            .unwrap()
-            .1,
-        canonical
-    );
-    let mut competing = params.clone();
-    competing.turn_id = "competing-with-recovery-resume".into();
-    let conflict = processor
-        .thread_manager
-        .agent_turn_start_with_permission_profile(
-            competing,
-            canonical.permission_profile.clone(),
-            canonical.author.clone().unwrap(),
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        conflict
-            .downcast_ref::<crate::thread::ForegroundTurnConflict>()
-            .is_some()
-    );
-    assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
+            .unwrap_err();
+        assert!(
+            conflict
+                .downcast_ref::<crate::thread::ForegroundTurnConflict>()
+                .is_some()
+        );
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
+    }
 }
