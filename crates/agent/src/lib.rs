@@ -4531,6 +4531,9 @@ impl AgentManager {
                         captured_run: Some(control.run_id),
                         turn_id: turn_id.to_owned(),
                         reason: reason.to_owned(),
+                        expected_run_id: Some(control.run_id),
+                        completion_ack: None,
+                        cancellation_owner: None,
                         ack: AgentControlAck {
                             sender,
                             operation_id: AgentControlOperationId::CancelTurn {
