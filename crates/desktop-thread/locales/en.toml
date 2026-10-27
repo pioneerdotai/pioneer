@@ -219,6 +219,7 @@
 "timeline.system.capability_kind_skill" = "Skill"
 "timeline.system.checkpoint_label" = "Checkpoint"
 "timeline.system.code" = "Code:"
+"timeline.system.codex_request_retried" = "Codex reported a request retry after a temporary failure."
 "timeline.system.continued_label" = "Continued"
 "timeline.system.detail_agent_rounds" = "Agent rounds"
 "timeline.system.detail_checkpoint" = "Checkpoint"

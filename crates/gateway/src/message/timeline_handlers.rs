@@ -552,6 +552,22 @@ impl MessageProcessor {
                 return;
             }
         };
+        if let Err(error) = self
+            .enrich_codex_retry_notices(request_context, &mut blocks)
+            .await
+        {
+            self.send_error(
+                connection_id,
+                timeline_public_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("failed to load Codex retry notices: {error:#}"),
+                ),
+            )
+            .await;
+            trace.finish_failure();
+            return;
+        }
         trace.record_items(
             pioneer_observability::GatewayOperationItemKind::ThreadTimelineMaterializedBlocks,
             u64::try_from(blocks.len()).unwrap_or(u64::MAX),
@@ -2242,6 +2258,76 @@ impl MessageProcessor {
         })
     }
 
+    async fn enrich_codex_retry_notices(
+        &self,
+        request_context: &RequestContext,
+        blocks: &mut [TimelineBlock],
+    ) -> Result<()> {
+        use crate::authorization::{
+            AuthorizationResolver, AuthorizationService, ProofResolution, ResourceAction,
+        };
+        let principal = request_context.principal();
+        // The resolver authorizes this read through the root and separately
+        // requires ChildObserve for the internal execution child.
+        let action = ResourceAction::ThreadRead;
+        let gate = AuthorizationService::new().authorize_action(
+            principal.kind,
+            principal.role_key.as_ref(),
+            action,
+        );
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        for block in blocks {
+            let TimelineBlockKind::DetachedTaskRun {
+                task,
+                codex_retry_notices,
+                ..
+            } = &mut block.kind
+            else {
+                continue;
+            };
+            let (Some(child), Some(turn_id)) =
+                (task.child_thread_id.as_deref(), block.turn_id.as_deref())
+            else {
+                continue;
+            };
+            let Some(child_turn) = task.child_turn_id.as_deref() else {
+                continue;
+            };
+            if !self
+                .crud_store
+                .get_cli_runtime_turn_binding(child_turn)
+                .await?
+                .is_some_and(|binding| {
+                    binding.runtime_kind == "codex"
+                        && binding.thread_id == child
+                        && binding.workspace_id == block.workspace_id
+                })
+            {
+                continue;
+            }
+            // Reading the presentation thread alone is not a child-observation grant.
+            if !matches!(
+                resolver
+                    .authorize_internal_thread_via_root(
+                        principal,
+                        &gate,
+                        action,
+                        child,
+                        Some(&block.workspace_id)
+                    )
+                    .await?,
+                ProofResolution::Authorized(_)
+            ) {
+                continue;
+            }
+            *codex_retry_notices = self
+                .crud_store
+                .codex_retry_notices_for_task(&block.workspace_id, &block.thread_id, turn_id, task)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn detached_task_run_timeline_block_kind(
         &self,
         row: &thread_timeline_block::Model,
@@ -2266,7 +2352,11 @@ impl MessageProcessor {
                 row.block_id
             ));
         };
-        Ok(TimelineBlockKind::DetachedTaskRun { task, author })
+        Ok(TimelineBlockKind::DetachedTaskRun {
+            task,
+            author,
+            codex_retry_notices: Vec::new(),
+        })
     }
 
     async fn turn_work_items_from_rows(

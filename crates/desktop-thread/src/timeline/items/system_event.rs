@@ -48,6 +48,9 @@ fn system_event_message_text(message: &SystemEventMessage) -> String {
         SystemEventMessage::RecoveryAttached => t!("timeline.system.recovery_attached").to_string(),
         SystemEventMessage::RetryScheduled => t!("timeline.system.retry_scheduled").to_string(),
         SystemEventMessage::RetryStarted => t!("timeline.system.retry_started").to_string(),
+        SystemEventMessage::CodexRequestRetried => {
+            t!("timeline.system.codex_request_retried").to_string()
+        }
         SystemEventMessage::RecoverySucceeded => {
             t!("timeline.system.recovery_succeeded").to_string()
         }

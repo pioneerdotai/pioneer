@@ -221,6 +221,7 @@
 "timeline.system.capability_kind_skill" = "スキル"
 "timeline.system.checkpoint_label" = "チェックポイント"
 "timeline.system.code" = "コード:"
+"timeline.system.codex_request_retried" = "Codex が一時的な障害後にリクエストを再試行したことを報告しました。"
 "timeline.system.continued_label" = "続行"
 "timeline.system.detail_agent_rounds" = "エージェントラウンド"
 "timeline.system.detail_checkpoint" = "チェックポイント"

@@ -52678,6 +52678,26 @@ async fn cli_runtime_terminal_attempt_fences_late_native_events() {
         )
         .await;
 
+    processor
+        .handle_cli_runtime_timeline_event(
+            &key,
+            RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+                native_thread_id: Some(native_thread_id.into()),
+                native_turn_id: Some(native_turn_id.into()),
+                message: "late retry".into(),
+                code: None,
+                native: None,
+            }),
+        )
+        .await;
+    assert!(
+        crud_store
+            .list_turn_items_by_type(turn_id, "system_event")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
     assert!(
         crud_store
             .get_turn_item(turn_id, "late_terminal_attempt_item")
@@ -63929,6 +63949,762 @@ async fn semantic_timeline_rejects_excessive_limits_before_payload_growth() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_thread() {
+    use pioneer_client::{
+        core::ClientCore,
+        timeline::{
+            semantic::{TopLevelPageMergeMode, flatten_thread_semantic_timeline},
+            semantic_render::render_semantic_timeline_rows,
+        },
+    };
+    use sea_orm::ActiveModelTrait;
+
+    for (runtime_id, kind) in [
+        ("codex", CLIAgentRuntimeKind::Codex),
+        ("opencode", CLIAgentRuntimeKind::OpenCode),
+    ] {
+        // The harness thread is the visible parent. Never subscribe it to the child.
+        // Membership rows require a 21-character alphanumeric thread ID.
+        let mut harness = setup_live_semantic_timeline_harness_with_thread_id(
+            &format!("retry_{runtime_id}"),
+            generate_test_request_id("retrythread", runtime_id),
+        )
+        .await;
+        let cli = Arc::new(RecordingCliRuntimeSession::default());
+        cli.set_next_native_turn_id("retry_native_turn").await;
+        cli.enable_projected_mcp_metadata(harness.processor.crud_store.clone())
+            .await;
+        harness.processor = with_enabled_test_cli_runtime_catalog(
+            harness
+                .processor
+                .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli.clone()))
+                .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(kind)),
+        );
+        let processor = Arc::new(harness.processor.clone());
+        let store = processor.crud_store.clone();
+        sync_test_cli_runtime_identities(&processor).await.unwrap();
+        processor
+            .mark_cli_runtimes_ready_for_tests(&harness.workspace_id)
+            .await
+            .unwrap();
+        processor.bind_task_bridge().await;
+        processor.start_task_event_listener().await;
+        let mut parent: pioneer_entity::thread::ActiveModel = store
+            .get_thread_by_id(&harness.thread_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        parent.access_class = Set("private".into());
+        parent.update(&store.database_connection()).await.unwrap();
+        let params = detached_cli_task_create_params(
+            &harness.workspace_id,
+            &harness.thread_id,
+            &harness.turn_id,
+            runtime_id,
+            kind,
+            "gpt-5",
+            "retry notice presentation",
+        );
+        let (run, child) = drain_test_notifications_while(&mut harness.rx, async {
+            let response = create_task_for_test(&processor, params).await.unwrap();
+            let run = response.run.unwrap();
+            let child = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
+            assert_eq!(wait_for_cli_runtime_turn_starts(&cli, 1).await.len(), 1);
+            assert_eq!(
+                wait_for_run_status(store.clone(), &run.id, TaskRunStatus::Running).await,
+                TaskRunStatus::Running
+            );
+            (run, child)
+        })
+        .await;
+        assert!(
+            processor
+                .thread_manager
+                .subscribed_connections(&child.child_thread_id)
+                .await
+                .is_empty()
+        );
+        let source = store
+            .get_thread_by_id(&child.child_thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.access_class, "internal");
+        assert_eq!(source.sidebar_visibility, "hidden");
+        let binding = store
+            .get_cli_runtime_turn_binding(&child.child_turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let key = CLIAgentRuntimeSessionKey::new(
+            &harness.workspace_id,
+            runtime_id,
+            &binding.continuation_thread_id,
+        )
+        .unwrap();
+        let session = processor
+            .cli_runtime_manager
+            .as_ref()
+            .unwrap()
+            .existing_session(&key)
+            .await
+            .unwrap();
+        let instance = session.instance().clone();
+        let native_turn = binding.native_turn_id.clone().unwrap();
+        let retry = |message: &str| {
+            RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+                native_thread_id: Some(binding.native_thread_id.clone()),
+                native_turn_id: Some(native_turn.clone()),
+                message: message.into(),
+                code: None,
+                native: None,
+            })
+        };
+        // Finish startup fanout before observing the notice, so a delayed
+        // TaskRunStarted invalidation cannot satisfy the retry-delivery assertion.
+        timeout(
+            Duration::from_secs(10),
+            drain_test_notifications_while(&mut harness.rx, async {
+                loop {
+                    let fanout = processor.task_event_fanout_quantum().await.unwrap();
+                    assert_eq!(fanout.errors, 0);
+                    if fanout.pending != Some(true) {
+                        break;
+                    }
+                }
+                processor
+                    .process_due_native_turn_event_deliveries(now_timestamp_secs(), 128)
+                    .await
+                    .unwrap();
+                while processor
+                    .native_turn_event_delivery_kick_running
+                    .load(Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let initial = request_live_thread_timeline_page(&mut harness, "retry-before").await;
+        let core = ClientCore::new();
+        core.upsert_thread(
+            store
+                .get_thread_model(&harness.thread_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        core.activate_thread(Some(&harness.thread_id), Some(&harness.workspace_id));
+        core.apply_thread_timeline_page(initial, TopLevelPageMergeMode::Reset);
+
+        // A formerly admitted private-thread collaborator retains a stale local
+        // subscription, but membership revocation must fence both push and reload.
+        materialize_test_member_collaborator(
+            store.as_ref(),
+            &harness.workspace_id,
+            &harness.thread_id,
+        )
+        .await;
+        let (member_tx, mut member_rx) = mpsc::channel(64);
+        let member = processor
+            .session_manager
+            .register_connection(member_tx, authenticated_test_member_collaborator())
+            .await
+            .unwrap();
+        processor
+            .session_manager
+            .set_connection_workspace(member, Some(harness.workspace_id.clone()))
+            .await;
+        assert!(
+            processor
+                .thread_manager
+                .subscribe_connection(&harness.thread_id, member)
+                .await
+        );
+        let admitted_id = generate_test_request_id("retry", "member-before-revoke");
+        processor
+            .process_request_for_connection(
+                member,
+                &json!({
+                    "jsonrpc":"2.0", "id":admitted_id, "method":"thread/timeline/page",
+                    "params":{"threadId":harness.thread_id,"anchor":{"kind":"newest"}}
+                })
+                .to_string(),
+            )
+            .await;
+        let _admitted = recv_response_by_id(&mut member_rx, &admitted_id).await;
+        pioneer_entity::thread_membership::Entity::delete_many()
+            .filter(pioneer_entity::thread_membership::Column::ThreadId.eq(&harness.thread_id))
+            .filter(
+                pioneer_entity::thread_membership::Column::PrincipalId
+                    .eq(TEST_COLLABORATOR_PRINCIPAL_ID),
+            )
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+        while harness.rx.try_recv().is_ok() {}
+        for message in [
+            "Reconnecting... 1/5",
+            "different temporary failure",
+            "Reconnecting... 1/5",
+        ] {
+            processor
+                .handle_cli_runtime_timeline_event(&instance, retry(message))
+                .await;
+        }
+        let notices = store
+            .list_turn_items_by_type(&child.child_turn_id, "system_event")
+            .await
+            .unwrap();
+        let notices: Vec<_> = notices.into_iter().filter(|item| matches!(item, TurnItem::SystemEvent {code:Some(code),..} if code=="codex_request_retried")).collect();
+        if kind == CLIAgentRuntimeKind::OpenCode {
+            assert!(notices.is_empty());
+            continue;
+        }
+        assert_eq!(notices.len(), 1);
+        let notice_id = notices[0].item_id().to_owned();
+        let target = store
+            .codex_retry_notice_target(&child.child_thread_id, &child.child_turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // The card was read before a concurrent Task progress update. Mutable
+        // presentation fields must not invalidate its verified execution links.
+        let mut newer_task = target.task.clone();
+        newer_task.status = TaskStatus::Waiting;
+        newer_task.progress_preview = Some("newer progress".into());
+        newer_task.updated_at += 1;
+        store
+            .materialize_item_updated(
+                ItemUpdatedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: harness.thread_id.clone(),
+                    turn_id: target.turn_id.clone(),
+                    item: TurnItem::Task {
+                        item: newer_task.clone(),
+                    },
+                },
+                newer_task.updated_at,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .codex_retry_notices_for_task(
+                    &target.workspace_id,
+                    &target.thread_id,
+                    &target.turn_id,
+                    &target.task
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut wrong_link = target.task.clone();
+        wrong_link.run_id = Some("unrelated-run".into());
+        assert!(
+            store
+                .codex_retry_notices_for_task(
+                    &target.workspace_id,
+                    &target.thread_id,
+                    &target.turn_id,
+                    &wrong_link
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let block_id = pioneer_crud::detached_task_run_block_id(&target.turn_id, &target.task.id);
+        let changed = timeout(Duration::from_secs(10), async {
+            loop {
+                let packet = recv_notification_by_method(
+                    &mut harness.rx,
+                    events::THREAD_TIMELINE_BLOCKS_CHANGED,
+                )
+                .await;
+                let changed: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
+                    serde_json::from_value(packet.params.unwrap()).unwrap();
+                if changed.changed_block_ids.contains(&block_id) {
+                    break changed;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(changed.thread_id, harness.thread_id);
+        assert!(core.apply_thread_notification(
+            pioneer_protocol::GatewayNotification::ThreadTimelineBlocksChanged(changed)
+        ));
+        assert!(
+            core.thread_semantic_snapshot(&harness.thread_id)
+                .thread(&harness.thread_id)
+                .unwrap()
+                .top_level
+                .stale_block_ids()
+                .contains(&block_id.as_str())
+        );
+        assert!(
+            core.thread_semantic_snapshot(&child.child_thread_id)
+                .thread(&child.child_thread_id)
+                .is_none()
+        );
+        let page = request_live_thread_timeline_page(&mut harness, "retry-after").await;
+        core.apply_thread_timeline_page(page.clone(), TopLevelPageMergeMode::Merge);
+        let viewing_thread = harness.thread_id.clone();
+        let assert_visible = |client: &ClientCore| {
+            let state = client.thread_semantic_snapshot(&viewing_thread);
+            let rows = flatten_thread_semantic_timeline(state.thread(&viewing_thread).unwrap());
+            let rendered = render_semantic_timeline_rows(&rows.rows, Default::default());
+            let shown: Vec<_> = rendered.projection.items.iter().filter(|item| matches!(&item.item,TurnItem::SystemEvent{code:Some(code),..} if code=="codex_request_retried")).collect();
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].id, notice_id);
+            assert_eq!(shown[0].turn_id, child.child_turn_id);
+            assert_eq!(
+                shown[0]
+                    .timeline_origin
+                    .as_ref()
+                    .unwrap()
+                    .child_thread_id
+                    .as_deref(),
+                Some(child.child_thread_id.as_str())
+            );
+        };
+        assert_visible(&core);
+        // A fresh client opens only the main thread from durable history.
+        let restored = ClientCore::new();
+        restored.upsert_thread(
+            store
+                .get_thread_model(&harness.thread_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let reloaded = request_live_thread_timeline_page(&mut harness, "retry-reloaded").await;
+        restored.apply_thread_timeline_page(reloaded, TopLevelPageMergeMode::Reset);
+        assert_visible(&restored);
+        let canonical = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(&child.child_turn_id))
+            .filter(pioneer_entity::turn_event::Column::EventType.eq(events::ITEM_COMPLETED))
+            .all(&store.database_connection())
+            .await
+            .unwrap();
+        assert_eq!(
+            canonical
+                .iter()
+                .filter(|event| event.payload.contains("codex_request_retried"))
+                .count(),
+            1
+        );
+        assert!(store.list_turn_items_by_type(&run.id, "system_event").await.unwrap().iter().all(|item| !matches!(item,TurnItem::SystemEvent{code:Some(code),..} if code=="codex_request_retried")));
+        while let Ok(packet) = member_rx.try_recv() {
+            let Message::Text(packet) = packet else {
+                continue;
+            };
+            let packet: JsonValue = serde_json::from_str(packet.as_str()).unwrap();
+            assert_ne!(
+                packet.get("method").and_then(JsonValue::as_str),
+                Some(events::THREAD_TIMELINE_BLOCKS_CHANGED)
+            );
+        }
+        let id = generate_test_request_id("retry", "revoked");
+        processor.process_request_for_connection(member, &json!({"jsonrpc":"2.0","id":id,"method":"thread/timeline/page","params":{"threadId":harness.thread_id,"anchor":{"kind":"newest"}}}).to_string()).await;
+        let rejected = recv_jsonrpc_payload_by_id(&mut member_rx, &id).await;
+        let rejected: JsonValue = serde_json::from_str(&rejected).unwrap();
+        assert!(rejected.get("error").is_some());
+        assert!(!rejected.to_string().contains("codex_request_retried"));
+
+        // This reader can read the parent but its registered role specifically
+        // lacks ChildObserve. Unlike revoking the parent, this must return a
+        // successful Task card with an authorized empty notice list.
+        materialize_test_member_collaborator(
+            store.as_ref(),
+            &harness.workspace_id,
+            &harness.thread_id,
+        )
+        .await;
+        let mut restricted = (*authenticated_test_member_collaborator()).clone();
+        restricted.role_key = Some(RoleKey::new("synthetic_executor").unwrap());
+        let mut principal: pioneer_entity::gateway_principal::ActiveModel =
+            pioneer_entity::gateway_principal::Entity::find_by_id(TEST_COLLABORATOR_PRINCIPAL_ID)
+                .one(&store.database_connection())
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        principal.role_key = Set(Some("synthetic_executor".into()));
+        principal
+            .update(&store.database_connection())
+            .await
+            .unwrap();
+        let policy = crate::authorization::AuthorizationService::new();
+        use crate::authorization::ResourceAction;
+        assert!(
+            policy
+                .authorize_action(
+                    restricted.kind,
+                    restricted.role_key.as_ref(),
+                    ResourceAction::ThreadRead
+                )
+                .permits_resource_resolution()
+        );
+        assert!(
+            !policy
+                .authorize_action(
+                    restricted.kind,
+                    restricted.role_key.as_ref(),
+                    ResourceAction::ChildObserve
+                )
+                .permits_resource_resolution()
+        );
+        let (restricted_tx, mut restricted_rx) = mpsc::channel(64);
+        let restricted_connection = processor
+            .session_manager
+            .register_connection(restricted_tx, Arc::new(restricted))
+            .await
+            .unwrap();
+        processor
+            .session_manager
+            .set_connection_workspace(restricted_connection, Some(harness.workspace_id.clone()))
+            .await;
+        let id = generate_test_request_id("retry", "child-observe-denied");
+        processor
+            .process_request_for_connection(
+                restricted_connection,
+                &json!({"jsonrpc":"2.0","id":id,"method":"thread/timeline/page",
+                "params":{"threadId":harness.thread_id,"anchor":{"kind":"newest"}}})
+                .to_string(),
+            )
+            .await;
+        let response = recv_jsonrpc_payload_by_id(&mut restricted_rx, &id).await;
+        let response: JsonValue = serde_json::from_str(&response).unwrap();
+        assert!(
+            response.get("error").is_none(),
+            "parent ThreadRead must succeed: {response}"
+        );
+        let empty_page: pioneer_protocol::ThreadTimelinePageResponse =
+            serde_json::from_value(response["result"].clone()).unwrap();
+        assert!(empty_page.blocks.iter().any(|block| block.block_id == block_id
+            && matches!(&block.kind, pioneer_protocol::TimelineBlockKind::DetachedTaskRun { codex_retry_notices, .. } if codex_retry_notices.is_empty())));
+
+        // Feed the real Gateway result through the production request worker.
+        // A live Task update after its baseline was captured must retain fresh
+        // status/progress while still applying the ChildObserve denial.
+        struct AuthorizedPageTransport<'a> {
+            core: &'a ClientCore,
+            page: pioneer_protocol::ThreadTimelinePageResponse,
+            live: pioneer_protocol::ItemUpdatedNotification,
+            sent: std::cell::Cell<bool>,
+        }
+        impl pioneer_client::rpc::JsonRpcRequestTransport for AuthorizedPageTransport<'_> {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                _: String,
+                response: pioneer_client::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                if !self.sent.replace(true) {
+                    self.core.apply_thread_notification(
+                        pioneer_protocol::GatewayNotification::ItemUpdated(self.live.clone()),
+                    );
+                }
+                response
+                    .send(Ok(serde_json::to_value(&self.page).unwrap()))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        use pioneer_client::timeline::semantic::{
+            SemanticTimelineRequestAction, SemanticTimelineRequestKey,
+        };
+        let request = core
+            .begin_thread_semantic_request(SemanticTimelineRequestAction::ThreadTimelinePage {
+                key: SemanticTimelineRequestKey::ThreadNewest {
+                    thread_id: harness.thread_id.clone(),
+                },
+                params: pioneer_protocol::ThreadTimelinePageParams {
+                    thread_id: harness.thread_id.clone(),
+                    anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                    limit: Some(12),
+                },
+            })
+            .unwrap();
+        let mut fresh_task = newer_task.clone();
+        fresh_task.status = TaskStatus::Running;
+        fresh_task.progress_preview = Some("live progress during authorized read".into());
+        fresh_task.updated_at += 100;
+        let transport = AuthorizedPageTransport {
+            core: &core,
+            page: empty_page,
+            live: ItemUpdatedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: harness.thread_id.clone(),
+                turn_id: target.turn_id.clone(),
+                item: TurnItem::Task {
+                    item: fresh_task.clone(),
+                },
+            },
+            sent: std::cell::Cell::new(false),
+        };
+        core.execute_thread_semantic_request(&transport, request);
+        assert!(transport.sent.get());
+        let state = core.thread_semantic_snapshot(&harness.thread_id);
+        let timeline = &state.thread(&harness.thread_id).unwrap().top_level;
+        assert_eq!(
+            timeline.request_status,
+            pioneer_client::timeline::semantic::TimelineRequestStatus::Ready
+        );
+        let card = timeline.block(&block_id).unwrap();
+        assert!(
+            matches!(&card.kind, pioneer_protocol::TimelineBlockKind::DetachedTaskRun { task, codex_retry_notices, .. }
+            if task == &fresh_task && codex_retry_notices.is_empty())
+        );
+
+        // Cross the identity batch boundary without loading unrelated technical
+        // history. The current active attempt stays the latest durable attempt.
+        let attempt = pioneer_entity::turn_cli_runtime_attempt::Entity::find()
+            .filter(
+                pioneer_entity::turn_cli_runtime_attempt::Column::TurnId.eq(&child.child_turn_id),
+            )
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active: pioneer_entity::turn_cli_runtime_attempt::ActiveModel =
+            attempt.clone().into();
+        active.attempt_index = Set(65);
+        active.update(&store.database_connection()).await.unwrap();
+        for index in 1..=64 {
+            let mut historical: pioneer_entity::turn_cli_runtime_attempt::ActiveModel =
+                attempt.clone().into();
+            historical.id = Set(format!("retry-history-{index}"));
+            historical.attempt_index = Set(index);
+            historical.native_turn_id = Set(Some(format!("retry-history-native-{index}")));
+            historical.status = Set("completed".into());
+            historical
+                .insert(&store.database_connection())
+                .await
+                .unwrap();
+        }
+        let history_id =
+            pioneer_crud::codex_retry_notice_item_id(&child.child_turn_id, "retry-history-1");
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: child.child_thread_id.clone(),
+                    turn_id: child.child_turn_id.clone(),
+                    item: TurnItem::SystemEvent {
+                        id: history_id.clone(),
+                        level: pioneer_protocol::SystemEventLevel::Warning,
+                        message: "Codex reported a request retry after a temporary failure.".into(),
+                        code: Some("codex_request_retried".into()),
+                        details: None,
+                    },
+                },
+                now_timestamp_secs(),
+            )
+            .await
+            .unwrap();
+        let notice_row = pioneer_entity::turn_item::Entity::find()
+            .filter(pioneer_entity::turn_item::Column::TurnId.eq(&child.child_turn_id))
+            .filter(pioneer_entity::turn_item::Column::ItemId.eq(&notice_id))
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut unrelated: pioneer_entity::turn_item::ActiveModel = notice_row.clone().into();
+        unrelated.id = Set("unrelated-corrupt-system-event".into());
+        unrelated.item_id = Set("unrelated-corrupt-system-event".into());
+        unrelated.payload = Set("{corrupt unrelated technical event".into());
+        unrelated
+            .insert(&store.database_connection())
+            .await
+            .unwrap();
+        let read = store
+            .codex_retry_notices_for_task(
+                &target.workspace_id,
+                &target.thread_id,
+                &target.turn_id,
+                &target.task,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.len(), 2);
+        assert!(read.iter().any(|notice| notice.item_id == notice_id));
+        assert!(read.iter().any(|notice| notice.item_id == history_id));
+        let original_payload = notice_row.payload.clone();
+        let mut corrupt: pioneer_entity::turn_item::ActiveModel = notice_row.clone().into();
+        corrupt.payload = Set("{corrupt requested retry notice".into());
+        corrupt.update(&store.database_connection()).await.unwrap();
+        assert!(
+            store
+                .codex_retry_notices_for_task(
+                    &target.workspace_id,
+                    &target.thread_id,
+                    &target.turn_id,
+                    &target.task
+                )
+                .await
+                .is_err()
+        );
+        let mut restore: pioneer_entity::turn_item::ActiveModel = notice_row.into();
+        restore.payload = Set(original_payload);
+        restore.update(&store.database_connection()).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_retry_notice_storage_failure_preserves_native_execution_and_rejects_commit() {
+    use crate::cli_runtime::session_instance::CliSessionInstanceOrigin;
+    let harness = setup_live_semantic_timeline_harness("retry_storage_failure").await;
+    let processor = &harness.processor;
+    let store = processor.crud_store.clone();
+    let now = chrono::Utc::now().fixed_offset();
+    seed_running_cli_runtime_binding(
+        store.as_ref(),
+        NewCliRuntimeTurnBinding {
+            turn_id: harness.turn_id.clone(),
+            thread_id: harness.thread_id.clone(),
+            continuation_thread_id: harness.thread_id.clone(),
+            workspace_id: harness.workspace_id.clone(),
+            runtime_id: "codex".into(),
+            runtime_kind: "codex".into(),
+            native_thread_id: "retry_storage_thread".into(),
+            native_turn_id: Some("retry_storage_turn".into()),
+            request_id: None,
+            status: "running".into(),
+            model: None,
+            cwd: None,
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".into(),
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await;
+    let attempt = store
+        .latest_cli_runtime_turn_attempt(&harness.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let key =
+        CLIAgentRuntimeSessionKey::new(&harness.workspace_id, "codex", &harness.thread_id).unwrap();
+    store.database_connection().execute_unprepared(
+        "CREATE TRIGGER reject_codex_retry_notice BEFORE INSERT ON turn_event \
+         WHEN NEW.event_type='item/completed' AND json_extract(NEW.payload,'$.payload.item.code')='codex_request_retried' \
+         BEGIN SELECT RAISE(ABORT,'injected retry notice storage failure'); END;"
+    ).await.unwrap();
+    processor
+        .handle_cli_runtime_timeline_event(
+            &key,
+            RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+                native_thread_id: Some("retry_storage_thread".into()),
+                native_turn_id: Some("retry_storage_turn".into()),
+                message: "temporary failure".into(),
+                code: None,
+                native: None,
+            }),
+        )
+        .await;
+    let transition = processor.cli_runtime_session_transition_mutex(&key).await;
+    let released = timeout(Duration::from_secs(1), transition.lock_owned())
+        .await
+        .expect("failed notice must release native transition");
+    drop(released);
+    let projection = crate::cli_runtime::projector::project_cli_runtime_event(
+        &crate::cli_runtime::projector::CLIRuntimeProjectorContext {
+            workspace_id: harness.workspace_id.clone(),
+            thread_id: harness.thread_id.clone(),
+            turn_id: harness.turn_id.clone(),
+            recovery: None,
+            codex_retry_attempt_id: Some(attempt.id.clone()),
+        },
+        &RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+            native_thread_id: Some("retry_storage_thread".into()),
+            native_turn_id: Some("retry_storage_turn".into()),
+            message: "same retry".into(),
+            code: None,
+            native: None,
+        }),
+    );
+    let event = projection.durable.into_iter().next().unwrap();
+    let result = processor
+        .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), event.clone())
+        .await;
+    match result {
+        Err(pioneer_runtime_events::ExecutionEventHubError::CommitRejected(rejection)) => {
+            assert_eq!(rejection.code(), "projection_failed");
+        }
+        other => panic!("expected storage projection rejection, got {other:?}"),
+    }
+    assert!(
+        store
+            .list_turn_items_by_type(&harness.turn_id, "system_event")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_turn(&harness.thread_id, &harness.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding(&harness.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_attempt(&attempt.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        attempt.status
+    );
+    assert!(attempt.status.is_active());
+    assert!(
+        pioneer_entity::recovery_job::Entity::find()
+            .filter(pioneer_entity::recovery_job::Column::TurnId.eq(&harness.turn_id))
+            .all(&store.database_connection())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER reject_codex_retry_notice")
+        .await
+        .unwrap();
+    processor
+        .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), event)
+        .await
+        .expect("same valid attempt must ACK after removing the INSERT fault");
+    let saved = store
+        .list_turn_items_by_type(&harness.turn_id, "system_event")
+        .await
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert!(
+        matches!(&saved[0], TurnItem::SystemEvent { code: Some(code), .. } if code == "codex_request_retried")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_semantic_timeline_projects_running_item_without_backfill() {
     let mut harness = setup_live_semantic_timeline_harness("running").await;
     let item_id = "semantic_live_running_cmd";
@@ -64937,6 +65713,17 @@ async fn setup_semantic_timeline_query_harness_inner(
 }
 
 async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTimelineHarness {
+    setup_live_semantic_timeline_harness_with_thread_id(
+        case_id,
+        format!("thr_semantic_live_{case_id}"),
+    )
+    .await
+}
+
+async fn setup_live_semantic_timeline_harness_with_thread_id(
+    case_id: &str,
+    thread_id: String,
+) -> LiveSemanticTimelineHarness {
     let (tx, rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -64945,7 +65732,6 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
-    let thread_id = format!("thr_semantic_live_{case_id}");
     let turn_id = format!("turn_semantic_live_{case_id}");
 
     let thread_start = thread_manager
