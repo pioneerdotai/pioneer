@@ -980,70 +980,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_calls_run_in_parallel() {
-        let max_active = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(SleepHandler {
-            sleep_ms: 120,
-            active: Arc::new(AtomicUsize::new(0)),
-            max_active: max_active.clone(),
-        });
-        let runtime = build_runtime("shared_tool", ExecutionClass::Shared, handler);
-
-        let runtime_left = runtime.clone();
-        let runtime_right = runtime.clone();
-        let left = runtime_left.execute_tool_call(function_call(
-            "shared_tool",
-            "call_left",
-            ExecutionClass::Shared,
-        ));
-        let right = runtime_right.execute_tool_call(function_call(
-            "shared_tool",
-            "call_right",
-            ExecutionClass::Shared,
-        ));
-
-        let (left, right) = tokio::join!(left, right);
-        assert!(left.is_ok());
-        assert!(right.is_ok());
-        assert!(
-            max_active.load(Ordering::SeqCst) >= 2,
-            "shared execution should overlap"
-        );
-    }
-
-    #[tokio::test]
-    async fn mutation_scoped_calls_reach_target_locking_in_parallel() {
-        let max_active = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(SleepHandler {
-            sleep_ms: 120,
-            active: Arc::new(AtomicUsize::new(0)),
-            max_active: max_active.clone(),
-        });
-        let runtime = build_runtime("mutation_tool", ExecutionClass::MutationScoped, handler);
-
-        let runtime_left = runtime.clone();
-        let runtime_right = runtime.clone();
-        let left = runtime_left.execute_tool_call(function_call(
-            "mutation_tool",
-            "call_left",
-            ExecutionClass::MutationScoped,
-        ));
-        let right = runtime_right.execute_tool_call(function_call(
-            "mutation_tool",
-            "call_right",
-            ExecutionClass::MutationScoped,
-        ));
-
-        let (left, right) = tokio::join!(left, right);
-        assert!(left.is_ok());
-        assert!(right.is_ok());
-        assert!(
-            max_active.load(Ordering::SeqCst) >= 2,
-            "runtime must not globally serialize mutation-scoped calls"
-        );
-    }
-
-    #[tokio::test]
     async fn runtime_rejects_tool_execution_without_security_snapshot() {
         let active = Arc::new(AtomicUsize::new(0));
         let handler = Arc::new(SleepHandler {
@@ -1073,39 +1009,6 @@ mod tests {
             "unexpected error: {error}"
         );
         assert_eq!(active.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn exclusive_calls_are_serialized() {
-        let max_active = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(SleepHandler {
-            sleep_ms: 120,
-            active: Arc::new(AtomicUsize::new(0)),
-            max_active: max_active.clone(),
-        });
-        let runtime = build_runtime("exclusive_tool", ExecutionClass::Exclusive, handler);
-
-        let runtime_left = runtime.clone();
-        let runtime_right = runtime.clone();
-        let left = runtime_left.execute_tool_call(function_call(
-            "exclusive_tool",
-            "call_left",
-            ExecutionClass::Exclusive,
-        ));
-        let right = runtime_right.execute_tool_call(function_call(
-            "exclusive_tool",
-            "call_right",
-            ExecutionClass::Exclusive,
-        ));
-
-        let (left, right) = tokio::join!(left, right);
-        assert!(left.is_ok());
-        assert!(right.is_ok());
-        assert_eq!(
-            max_active.load(Ordering::SeqCst),
-            1,
-            "exclusive execution must be serialized"
-        );
     }
 
     #[tokio::test]
@@ -1496,6 +1399,68 @@ mod tests {
                 assert_eq!(started, terminal, "all started CUA calls must terminate");
             }
             *handler.runtime.lock().unwrap() = None;
+        }
+    }
+
+    #[test]
+    fn execution_class_inputs_preserve_parallel_and_exclusive_dispatch() {
+        let cases = [
+            (
+                "shared_tool",
+                ExecutionClass::Shared,
+                2..=usize::MAX,
+                "shared execution should overlap",
+            ),
+            (
+                "mutation_tool",
+                ExecutionClass::MutationScoped,
+                2..=usize::MAX,
+                "runtime must not globally serialize mutation-scoped calls",
+            ),
+            (
+                "exclusive_tool",
+                ExecutionClass::Exclusive,
+                1..=1,
+                "exclusive execution must be serialized",
+            ),
+        ];
+        for (tool_name, execution_class, allowed_max, message) in cases {
+            let body = async {
+                let max_active = Arc::new(AtomicUsize::new(0));
+                let handler = Arc::new(SleepHandler {
+                    sleep_ms: 120,
+                    active: Arc::new(AtomicUsize::new(0)),
+                    max_active: max_active.clone(),
+                });
+                let runtime = build_runtime(tool_name, execution_class, handler);
+                let runtime_left = runtime.clone();
+                let runtime_right = runtime.clone();
+                let left = runtime_left.execute_tool_call(function_call(
+                    tool_name,
+                    "call_left",
+                    execution_class,
+                ));
+                let right = runtime_right.execute_tool_call(function_call(
+                    tool_name,
+                    "call_right",
+                    execution_class,
+                ));
+                let (left, right) = tokio::join!(left, right);
+                assert!(left.is_ok());
+                assert!(right.is_ok());
+                let observed = max_active.load(Ordering::SeqCst);
+                assert!(
+                    allowed_max.contains(&observed),
+                    "{message}: observed {observed}, allowed {allowed_max:?}"
+                );
+            };
+            tokio::pin!(body);
+            let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+            let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("case runtime should build");
+            tokio_runtime.block_on(body);
         }
     }
 }
