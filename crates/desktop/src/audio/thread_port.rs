@@ -263,8 +263,6 @@ fn capture_error(error: DesktopVoiceCaptureError) -> ThreadAudioError {
         Native::GatewaySession => Port::GatewaySession,
         Native::GatewayChunk => Port::GatewayChunk,
         Native::GatewayFinalize => Port::GatewayFinalize,
-        #[cfg(test)]
-        Native::NotCapturing => Port::GatewaySession,
     };
     ThreadAudioError::new(kind, error.message)
 }
