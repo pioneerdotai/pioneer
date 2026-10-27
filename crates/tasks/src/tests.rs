@@ -8826,3 +8826,6 @@ async fn cancelled_terminal_commit_uses_saved_stop_actor_and_rolls_back_receipt_
 
 #[path = "tests_webhook.rs"]
 mod webhook;
+
+#[path = "tests/agent_spec_snapshots.rs"]
+mod agent_spec_snapshots;

@@ -579,11 +579,19 @@ impl TaskScheduler {
             });
             events.push(TaskEventPayload::RunCreated {
                 run: run.clone(),
-                agent_spec: task_response.agent_specs.last().cloned().map(|mut spec| {
-                    spec.run_id = Some(run.id.clone());
-                    spec.updated_at = now;
-                    spec
-                }),
+                agent_spec: task_response
+                    .agent_specs
+                    .iter()
+                    .rev()
+                    .find(|spec| spec.run_id.is_none())
+                    .or_else(|| task_response.agent_specs.last())
+                    .cloned()
+                    .map(|mut spec| {
+                        spec.id = generate_id(ID_LEN);
+                        spec.run_id = Some(run.id.clone());
+                        spec.updated_at = now;
+                        spec
+                    }),
             });
             parent_run_id = Some(run.id.clone());
             next_run_number = next_run_number
@@ -755,11 +763,19 @@ impl TaskScheduler {
             },
             TaskEventPayload::RunCreated {
                 run: run.clone(),
-                agent_spec: task_response.agent_specs.last().cloned().map(|mut spec| {
-                    spec.run_id = Some(run.id.clone());
-                    spec.updated_at = now;
-                    spec
-                }),
+                agent_spec: task_response
+                    .agent_specs
+                    .iter()
+                    .rev()
+                    .find(|spec| spec.run_id.is_none())
+                    .or_else(|| task_response.agent_specs.last())
+                    .cloned()
+                    .map(|mut spec| {
+                        spec.id = generate_id(ID_LEN);
+                        spec.run_id = Some(run.id.clone());
+                        spec.updated_at = now;
+                        spec
+                    }),
             },
             TaskEventPayload::TaskRescheduled {
                 task_id: task_response.task.id.clone(),

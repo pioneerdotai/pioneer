@@ -368,7 +368,7 @@ impl MessageProcessor {
         ancestor_thread_ids
     }
 
-    async fn notify_semantic_timeline_blocks_changed(
+    pub(super) async fn notify_semantic_timeline_blocks_changed(
         &self,
         workspace_id: &str,
         thread_id: &str,

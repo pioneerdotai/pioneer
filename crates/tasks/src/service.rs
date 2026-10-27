@@ -2161,6 +2161,7 @@ impl TaskService {
             events.push(TaskEventPayload::RunCreated {
                 run: run.clone(),
                 agent_spec: agent_spec.clone().map(|mut spec| {
+                    spec.id = generate_id(ID_LEN);
                     spec.run_id = Some(run.id.clone());
                     spec.updated_at = now;
                     spec

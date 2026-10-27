@@ -6,7 +6,7 @@ use crate::event::{
     RuntimeEventMappingOptions, classify_runtime_provider_failure, map_codex_notification_event,
 };
 use crate::process::{CLIAgentProcess, SensitiveEnvironment};
-use crate::service::{ServiceFailure, ServiceStage};
+use crate::service::{CodexServiceDeadline, ServiceFailure, ServiceStage};
 use anyhow::{Context, Result, bail, ensure};
 use pioneer_protocol::ProviderFailureClass;
 use tokio::{
@@ -107,9 +107,18 @@ impl CodexService {
         };
         let result = match tokio::time::timeout_at(deadline, run).await {
             Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("Codex service deadline exceeded")),
+            Err(_) => Err(CodexServiceDeadline.into()),
         };
-        self.cleanup().await?;
+        self.cleanup().await.map_err(|error| {
+            if result
+                .as_ref()
+                .is_err_and(|failure| failure.is::<CodexServiceDeadline>())
+            {
+                error.context(CodexServiceDeadline)
+            } else {
+                error
+            }
+        })?;
         result
     }
     async fn invoke(
@@ -121,7 +130,9 @@ impl CodexService {
         let result = {
             let mut owner = self.attempt.lock().await;
             ensure!(owner.is_none(), "previous service attempt needs cleanup");
-            ensure!(Instant::now() < deadline, "Codex service deadline exceeded");
+            if Instant::now() >= deadline {
+                return Err(CodexServiceDeadline.into());
+            }
             let directory = tempfile::tempdir().context(ServiceStage("cli_directory"))?;
             // Instructions and transcript never go into process arguments.
             // The private file is removed together with the owned attempt.
@@ -698,12 +709,12 @@ if (home/'bad-exit').exists(): sys.exit(1)
         );
         std::fs::remove_file(home.join("bad-exit")).unwrap();
         std::fs::write(home.join("hang"), "").unwrap();
-        assert!(
-            service
-                .summarize(request(), Duration::from_secs(1))
-                .await
-                .is_err()
-        );
+        let error = service
+            .summarize(request(), Duration::from_secs(1))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.downcast_ref::<CodexServiceDeadline>().is_some());
         assert!(service.attempt.lock().await.is_none());
         std::fs::remove_file(home.join("started")).unwrap();
         let work = tokio::spawn({

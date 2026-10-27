@@ -1,8 +1,9 @@
-# Bounded native captures
+# Bounded native and SQL CPU captures
 
 Read after initial snapshots show that function-level evidence is needed. No
 capture command restarts the target. The diagnostic client asks the live target
-to start an owned profiler child; cancellation controls that profiler only.
+to collect SQL CPU or start an owned profiler child. Cancellation controls that
+capture; it never signals the target application.
 Native attach can perturb a process, so choose a short capture suited to the
 question, keep disk/RAM headroom and respect the user's operational constraints.
 Do not attach a debugger that suspends the hosting process as a substitute.
@@ -11,6 +12,7 @@ Do not attach a debugger that suspends the hosting process as a substitute.
 
 | Action | macOS | Linux | Windows |
 | --- | --- | --- | --- |
+| `sql-cpu` | Parent Gateway SQL command CPU | Parent Gateway SQL command CPU | Parent Gateway SQL command CPU |
 | `cpu` | xctrace Time Profiler `.trace` | perf `cpu-clock`, DWARF stack `perf.data` | Native adapter unavailable |
 | `allocations` | xctrace Allocations, from attach onward | Unavailable | Unavailable |
 | `allocation-history` | malloc_history `-allEvents`, prepared launch required | Unavailable | Unavailable |
@@ -29,6 +31,8 @@ to force attach. Report a permission/tool blocker precisely.
 Use the private case directory, verified CLI path and exact run ID from discovery:
 
 ```bash
+"$diag_cli" diagnostics sql-cpu --target "$diag_run" --seconds 20 \
+  > "$diag_case/sql-cpu-receipt.json"
 "$diag_cli" diagnostics cpu --target "$diag_run" --seconds 20 --frequency 99 \
   > "$diag_case/cpu-receipt.json"
 "$diag_cli" diagnostics vm --target "$diag_run" --seconds 10 \
@@ -51,8 +55,17 @@ allows that finalization. Do not wrap it in an outer timeout of `seconds + 10`.
 A command still finalizing has not necessarily hung. Follow tool/process activity
 and its bounded manifest result.
 
-`--frequency` accepts 19..199, default 99. Linux uses strict requested sampling
-frequency; the macOS template controls frequency, so the number is not proof of
+`sql-cpu` supports only the owner parent Gateway: selector `gateway` or exactly
+one live run ID, without `--child`. Desktop/child targets are rejected by the
+server. It creates a local SQL Session inside that Gateway using existing SQLite
+instrumentation; it requires no native profiler, version probe, attach permission,
+module hashing or symbols. No native output is created. Explicit `--frequency`
+is rejected for this action: SQL command CPU is not sampled at a requested Hz.
+Its client reply budget is 120 seconds (at most 60 seconds collection plus
+bounded storage/inventory/reply); no native timeout is increased.
+
+`--frequency` accepts 19..199, default 99, for native captures. Linux uses strict
+requested sampling frequency; the macOS template controls frequency, so the number is not proof of
 the actual sample rate. Native sample loss can be unknown. The recording does not
 reconstruct work before attach.
 
@@ -92,7 +105,19 @@ makes the CLI fail after emitting a receipt. Resolve `local_reference` under
 - `module`, symbol status/coverage, native coverage, nullable `lost_samples`.
 - `status`, `incomplete_reasons`, file names/bytes/SHA256.
 
-`completed` describes the native collection result, not proof of useful symbols,
+For `sql-cpu`, `completed` means the SQL window reached its deadline and the
+full retained table was saved, including a valid empty window. Inspect
+`sql_cpu.window_complete`, `closed_reason`, coverage and aggregation separately.
+No Session/start failure or missing sidecar is a complete successful SQL action.
+Cancellation can retain a partial window and reason; revoke/epoch change/shutdown
+or identity loss stop collection and prevent retention/commit. Native status is
+`not_requested` and native interval is null in the SQL sidecar/summary. Module,
+symbol and native coverage are not applicable. The manifest interval is the SQL
+window; the manifest tool/format describe the SQL collector. SQL artifacts never
+count as native profiles in capture references or bundle completeness.
+
+For native actions, `completed` describes the native collection result, not
+proof of useful symbols,
 a minimum sample count, complete allocation ownership or a solved incident.
 `partial` may have useful data, but could also contain only logs and no readable
 profile. Open the native artifact and confirm records/stacks for the selected
@@ -104,6 +129,71 @@ VM and malloc_history produce `tool-output.txt`. `tool-stderr.txt` and tool-vers
 metadata explain adapter failures. A native `.trace` is a directory; preserve the
 whole directory. The bundle is a separate snapshot with references to captures.
 A manifest's `files` inventory is the authority for what was retained.
+
+SQL-only and eligible Gateway parent CPU captures retain `sql-cpu.json` when
+the local SQL collector is available. One Session starts after common identity,
+consent and storage admission checks, before any native plan/module/version
+preparation. Its original monotonic deadline is independent of native recording.
+Early native failure/exit (including plan/version/spawn), timeout, overflow or
+finalization never shorten or restart SQL. The owned capture worker waits out the
+remaining SQL window in sleep slices of at most 50 ms, checking controls/identity
+each iteration, and joins all native work before commit. The collector independently refuses callbacks at/after
+its deadline, including during long native preparation/finalization. Open segments
+at closure retain unknown endpoint CPU. Cancel can close early; shutdown/revoke
+and identity loss have priority. Only one capture/Session is owned; busy/start
+failure never borrows another window. A disconnected client does not create a
+retry or detach work; the admitted owner still has its bounded lifecycle.
+
+SQL schema v2 contains the full retained `groups` table,
+ranked after aggregation by measured CPU (measured zero precedes null), rather
+than the first 64 groups. Read `sql_cpu.status` **and**
+`sql_cpu.aggregation.complete` in the manifest: `recorded` alone only confirms
+storage. A complete aggregation means all observed groups fit independent
+first-admission reservations: up to 20,000 measured keys (including measured
+zero), plus 8320 initially unmeasured keys (8192 sequential completions and
+128 active/incomplete scopes of headroom). The extra allowance is finite;
+segment/simultaneous-scope limits do not bound all unmeasured completions.
+The full fingerprint/workload/site/control key is preserved. Text allowances
+are cumulative per class: 2,560,000 measured / 1,064,960 unmeasured UTF-8 bytes,
+not a truncation of individual keys. Current fixed labels fit <=95 bytes/key.
+An admitted key keeps its original charge if later measured, and all its updates
+continue accumulating without admission. Early unmeasured keys cannot spend the
+measured reservation.
+
+Completeness does not assert full SQL instrumentation or all process CPU
+coverage. An incomplete table names its first exhausted class/count/text budget
+in `incomplete_reason`; `coverage.group_overflow_scopes` counts rejected scopes,
+not an estimated number of distinct lost keys.
+
+`aggregation.accounted` equals the sum of retained groups plus disjoint
+`group_overflow`, for each counter and measured CPU. `measured_unknown` overlaps
+null-fingerprint groups and possibly overflow; never add it again. CPU null means
+unmeasured, while zero is a successfully measured zero. Error/cancellation
+counters can overlap completed/incomplete and are not extra calls. Scope/segment
+losses, unknown fingerprint/workload, clock failures and unfinished segments
+remain separate coverage facts; unobserved CPU is unknown, never residual zero.
+Native status/window remain independent: a stored SQL table does not repair a
+failed native profile. A storage failure reports `status=unavailable` and retains
+summary counters, without claiming that the table was saved.
+
+SQL-only and eligible Gateway parent CPU captures reserve a maximum
+44,703,744-byte compact SQL sidecar, derived from all 28,320 admitted keys, cumulative text with JSON
+escaping, maximum-width counters and metadata. The full table is only in this
+local sidecar; read it with its SQL byte bound, not the generic 8 MiB JSON limit.
+Manifest/API/CLI carry a short summary and file reference. Their existing 8 MiB
+JSON/read limits remain; the full manifest allowance is reserved before native
+spawn, including build provenance which may use the library fallback.
+
+Inside the unchanged 128 MiB capture budget, native artifacts plus owner/active
+markers are limited to 81,125,376 bytes, 1022 files and 2046 directory entries.
+SQL JSON and manifest each have a reserved file/entry while the active lease is
+still held. Inventory before manifest has a 120 MiB allowance; the manifest can
+use up to its existing 8 MiB limit. Checks run before spawn, periodically and
+after native exit/stop, including final flush. Overshoot can trim/discard owned
+native output with a partial/failed status; the sealed SQL table survives native
+failure recovery and is then saved independently. Disk/permissions/checksum
+errors can still make SQL storage unavailable; consent revocation retains its
+existing priority over retention. Other capture modes keep their limits.
 
 Artifacts are private local data. Retained captures are bounded to 128 MiB each,
 16 entries / 512 MiB total and 7 days. Native output is checked periodically and

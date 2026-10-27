@@ -31,8 +31,6 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&module)?);
         return Ok(());
     }
-    let config = pioneer_config::AppConfig::load()?;
-    let home = config.runtime_home_dir()?;
     let mut target = None;
     let mut seconds = 10;
     let mut frequency_hz = 99;
@@ -47,6 +45,10 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
             }
             "--seconds" => seconds = args.next().context("--seconds requires number")?.parse()?,
             "--frequency" => {
+                ensure!(
+                    action != "sql-cpu",
+                    "--frequency is native-only and does not apply to sql-cpu"
+                );
                 frequency_hz = args
                     .next()
                     .context("--frequency requires number")?
@@ -62,6 +64,8 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
             _ => bail!("unknown diagnostics argument: {arg}"),
         }
     }
+    let config = pioneer_config::AppConfig::load()?;
+    let home = config.runtime_home_dir()?;
     let scan = diagnostics::targets(&home)?;
     if scan.skipped_descriptors > 0 {
         eprintln!(
@@ -91,16 +95,7 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         "bundle" => diagnostics::bundle_target(target)?,
         "cancel" => diagnostics::cancel_target(target)?,
         mode => {
-            let mode = match mode {
-                "cpu" => CaptureMode::Cpu,
-                "allocations" => CaptureMode::Allocations,
-                "allocation-history" => CaptureMode::AllocationHistory,
-                "live-allocations" => CaptureMode::LiveAllocations,
-                "vm" => CaptureMode::Vm,
-                _ => bail!(
-                    "expected list|snapshot|cpu|allocations|allocation-history|live-allocations|vm|bundle|launch-memory|validate-symbols"
-                ),
-            };
+            let mode = capture_mode(mode)?;
             serde_json::to_value(diagnostics::capture_target(
                 target,
                 CaptureRequest {
@@ -115,11 +110,22 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&result)?);
     if let Some(sql_cpu) = result.get("sql_cpu") {
         eprintln!(
-            "local SQL CPU: {}; coverage and independent capture window are in the manifest and sql-cpu.json",
+            "local SQL CPU: {}; observed-group aggregation: {}; coverage and independent capture window are in the manifest and sql-cpu.json",
             sql_cpu
                 .get("status")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
+                .unwrap_or("unknown"),
+            match sql_cpu.get("status").and_then(|v| v.as_str()) {
+                Some("recorded") => match sql_cpu
+                    .pointer("/aggregation/complete")
+                    .and_then(|v| v.as_bool())
+                {
+                    Some(true) => "complete",
+                    Some(false) => "INCOMPLETE (inspect aggregation reason and group_overflow)",
+                    None => "unknown (legacy schema)",
+                },
+                _ => "unavailable (table not retained)",
+            }
         );
     }
     ensure!(
@@ -128,6 +134,20 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     );
     Ok(())
 }
+fn capture_mode(action: &str) -> Result<CaptureMode> {
+    Ok(match action {
+        "cpu" => CaptureMode::Cpu,
+        "sql-cpu" => CaptureMode::SqlCpu,
+        "allocations" => CaptureMode::Allocations,
+        "allocation-history" => CaptureMode::AllocationHistory,
+        "live-allocations" => CaptureMode::LiveAllocations,
+        "vm" => CaptureMode::Vm,
+        _ => bail!(
+            "expected list|snapshot|cpu|sql-cpu|allocations|allocation-history|live-allocations|vm|bundle|launch-memory|validate-symbols"
+        ),
+    })
+}
+
 fn launch_memory(mut args: impl Iterator<Item = String>) -> Result<()> {
     ensure!(
         cfg!(target_os = "macos"),
@@ -719,5 +739,32 @@ mod preparation_tests {
             .unwrap(),
             Some(42)
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_dispatch_tests {
+    use super::*;
+    #[test]
+    fn sql_cpu_action_has_distinct_wire_mode_and_rejects_native_frequency() {
+        assert_eq!(capture_mode("sql-cpu").unwrap(), CaptureMode::SqlCpu);
+        assert_eq!(
+            serde_json::to_value(capture_mode("sql-cpu").unwrap()).unwrap(),
+            "sql_cpu"
+        );
+        let error = run(["sql-cpu", "--frequency", "99"]
+            .into_iter()
+            .map(str::to_owned))
+        .unwrap_err();
+        assert!(error.to_string().contains("--frequency is native-only"));
+        for (action, mode) in [
+            ("cpu", CaptureMode::Cpu),
+            ("allocations", CaptureMode::Allocations),
+            ("allocation-history", CaptureMode::AllocationHistory),
+            ("live-allocations", CaptureMode::LiveAllocations),
+            ("vm", CaptureMode::Vm),
+        ] {
+            assert_eq!(capture_mode(action).unwrap(), mode);
+        }
     }
 }

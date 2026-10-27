@@ -1267,6 +1267,7 @@ fn prepare_retry(
         })
         .cloned()
         .map(|mut spec| {
+            spec.id = generate_id(ID_LEN);
             spec.run_id = Some(retry_run.id.clone());
             spec.updated_at = completed_at;
             spec

@@ -8,6 +8,22 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 pub(super) const CAPTURE_BYTES: u64 = 128 * 1024 * 1024;
+// Existing generic JSON/readers/API retain their 8 MiB bound. Reserve its
+// full amount for SQL manifest: 1024 worst-case filenames (512 UTF-8 bytes,
+// <=6x escaping), hashes/u64/pretty punctuation use <3.4 MiB; the remainder
+// also admits existing build metadata, including the unconfigured fallback.
+pub(super) const JSON_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const SQL_MANIFEST_BYTES: u64 = JSON_BYTES;
+// Shared run/native provenance is a subset of the <=8 MiB manifest. SQL-only
+// coverage/limits/limitations/counters/envelope need <64 KiB. This does not
+// assume every build went through configure_build's smaller 16 KiB cap.
+const SQL_METADATA_BYTES: u64 = SQL_MANIFEST_BYTES + 64 * 1024;
+// Full collector contract: max-width counters and <=6x key-text escaping.
+pub(super) const SQL_CPU_BYTES: u64 = (crate::query_cpu::MAX_GROUPS * 512
+    + crate::query_cpu::MAX_GROUP_KEY_BYTES * 6) as u64
+    + SQL_METADATA_BYTES;
+pub(super) const SQL_INVENTORY_BYTES: u64 = CAPTURE_BYTES - SQL_MANIFEST_BYTES;
+pub(super) const INVENTORY_BYTES: u64 = CAPTURE_BYTES - 1024 * 1024;
 pub(super) const MAX_FILES: usize = 1024;
 pub(super) const STORE_BYTES: u64 = 512 * 1024 * 1024;
 pub(super) const STORE_COUNT: usize = 16;
@@ -79,7 +95,31 @@ pub(super) fn validate_private_file(path: &Path) -> Result<()> {
 }
 pub(super) fn write_new_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
-    ensure!(bytes.len() <= 8 * 1024 * 1024, "manifest overflow");
+    ensure!(bytes.len() as u64 <= JSON_BYTES, "manifest overflow");
+    write_new_bytes(path, &bytes)
+}
+// Serialize directly from the typed sidecar, without a Value copy of every row.
+// A capped writer bounds the temporary buffer even if a future schema grows.
+pub(super) fn write_new_sql_cpu_json(path: &Path, value: &impl Serialize) -> Result<u64> {
+    struct Bounded(Vec<u8>);
+    impl Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > SQL_CPU_BYTES as usize - self.0.len() {
+                return Err(std::io::Error::other("SQL CPU JSON overflow"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Bounded(Vec::with_capacity(SQL_CPU_BYTES as usize));
+    serde_json::to_writer(&mut buffer, value)?;
+    write_new_bytes(path, &buffer.0)?;
+    Ok(buffer.0.len() as u64)
+}
+fn write_new_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -88,7 +128,7 @@ pub(super) fn write_new_json(path: &Path, value: &impl Serialize) -> Result<()> 
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    if let Err(error) = file.write_all(&bytes) {
+    if let Err(error) = file.write_all(bytes) {
         drop(file);
         let _ = fs::remove_file(path); // create_new proved this file belongs to this write
         return Err(error.into());
@@ -229,6 +269,7 @@ fn walk(
     limit: u64,
     entries: &mut usize,
     deadline: Instant,
+    max_files: usize,
 ) -> Result<()> {
     ensure!(Instant::now() < deadline, "artifact directory deadline");
     ensure!(depth <= 12, "artifact depth overflow");
@@ -237,7 +278,8 @@ fn walk(
         let entry = entry?;
         *entries += 1;
         ensure!(
-            *entries <= MAX_FILES * 2,
+            // Reserve the sidecar directory entry as well as its file slot.
+            *entries <= MAX_FILES + max_files,
             "artifact directory entry overflow"
         );
         let meta = fs::symlink_metadata(entry.path())?;
@@ -252,11 +294,12 @@ fn walk(
                 limit,
                 entries,
                 deadline,
+                max_files,
             )?;
         } else if meta.is_file() {
             *bytes = bytes.saturating_add(meta.len());
             ensure!(*bytes <= limit, "artifact byte overflow");
-            ensure!(out.len() < MAX_FILES, "artifact count overflow");
+            ensure!(out.len() < max_files, "artifact count overflow");
             let relative = entry.path().strip_prefix(root)?.to_owned();
             ensure!(
                 relative.to_string_lossy().len() <= 512,
@@ -270,6 +313,9 @@ fn walk(
     Ok(())
 }
 pub(super) fn size(root: &Path, limit: u64) -> Result<u64> {
+    size_with_file_limit(root, limit, MAX_FILES)
+}
+pub(super) fn size_with_file_limit(root: &Path, limit: u64, max_files: usize) -> Result<u64> {
     let mut out = Vec::new();
     let mut bytes = 0;
     walk(
@@ -281,22 +327,23 @@ pub(super) fn size(root: &Path, limit: u64) -> Result<u64> {
         limit,
         &mut 0,
         Instant::now() + Duration::from_secs(2),
+        max_files,
     )?;
     Ok(bytes)
 }
 pub(super) fn inventory(root: &Path) -> Result<Vec<ArtifactFile>> {
+    inventory_with_limits(root, INVENTORY_BYTES, MAX_FILES)
+}
+pub(super) fn inventory_with_limits(
+    root: &Path,
+    limit: u64,
+    max_files: usize,
+) -> Result<Vec<ArtifactFile>> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut files = Vec::new();
     let mut bytes = 0;
     walk(
-        root,
-        root,
-        0,
-        &mut files,
-        &mut bytes,
-        CAPTURE_BYTES - 1024 * 1024,
-        &mut 0,
-        deadline,
+        root, root, 0, &mut files, &mut bytes, limit, &mut 0, deadline, max_files,
     )?;
     let mut result = Vec::with_capacity(files.len());
     for (relative, len) in files {
@@ -388,6 +435,34 @@ pub(super) fn cleanup(root: &Path, reserve: u64) -> Result<()> {
     );
     Ok(())
 }
+// The caller already owns an admitted capture and its live CaptureLease, and
+// has stopped/reaped the native tool. Keep the root and markers continuously
+// visible to concurrent store admission; this is cleanup, never re-admission.
+pub(super) fn clear_owned_capture_output(path: &Path) -> Result<()> {
+    validate_private(path)?;
+    validate_private_file(&path.join("owner.json"))?;
+    validate_private_file(&path.join("active.json"))?;
+    ensure!(
+        is_owned(path) && active_owner(path),
+        "expected active owned capture"
+    );
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "owner.json" || name == "active.json" {
+            continue;
+        }
+        let child = entry.path();
+        // Inspect the entry itself: unlink symlinks, never their targets.
+        // remove_dir_all also does not follow symlinks inside a native subtree.
+        if fs::symlink_metadata(&child)?.is_dir() {
+            fs::remove_dir_all(child)?;
+        } else {
+            fs::remove_file(child)?;
+        }
+    }
+    Ok(())
+}
 pub(super) fn remove_owned(path: &Path) {
     if is_owned(path) {
         let _ = fs::remove_dir_all(path);
@@ -409,6 +484,7 @@ mod tests {
             64,
             &mut 0,
             Instant::now() - Duration::from_millis(1),
+            MAX_FILES,
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "artifact directory deadline");
@@ -458,11 +534,18 @@ mod tests {
         assert_eq!(fs::read(file).unwrap(), b"foreign-original");
     }
     #[test]
-    fn oversized_manifest_rejected() {
+    fn oversized_json_and_reads_are_rejected_before_replacing_files() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("large");
         fs::write(&file, [0u8; 64]).unwrap();
         assert!(read_bounded(&file, 32).is_err());
+        let oversized = "x".repeat(SQL_CPU_BYTES as usize);
+        let sidecar = temp.path().join("sql-cpu.json");
+        assert!(write_new_sql_cpu_json(&sidecar, &oversized).is_err());
+        assert!(!sidecar.exists());
+        fs::write(&sidecar, b"foreign").unwrap();
+        assert!(write_new_sql_cpu_json(&sidecar, &serde_json::json!({})).is_err());
+        assert_eq!(fs::read(&sidecar).unwrap(), b"foreign");
     }
 }
 

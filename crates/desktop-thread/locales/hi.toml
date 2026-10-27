@@ -221,6 +221,7 @@
 "timeline.system.capability_kind_skill" = "स्किल"
 "timeline.system.checkpoint_label" = "चेकपॉइंट"
 "timeline.system.code" = "कोड:"
+"timeline.system.codex_request_retried" = "Codex ने अस्थायी विफलता के बाद अनुरोध दोबारा भेजने की सूचना दी।"
 "timeline.system.continued_label" = "जारी"
 "timeline.system.detail_agent_rounds" = "एजेंट राउंड"
 "timeline.system.detail_checkpoint" = "चेकपॉइंट"

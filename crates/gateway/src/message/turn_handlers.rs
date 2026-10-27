@@ -2553,8 +2553,15 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+            // This only acknowledges Composer admission. Recovery belongs to
+            // successful delivery from its hidden execution thread.
             if !self
-                .complete_turn(thread.id.clone(), launch.turn_id.clone(), None)
+                .complete_turn_with_title_recovery(
+                    thread.id.clone(),
+                    launch.turn_id.clone(),
+                    None,
+                    false,
+                )
                 .await
             {
                 self.mark_turn_blocked(
@@ -4928,6 +4935,10 @@ impl MessageProcessor {
                     }
                 }
             }
+            #[cfg(test)]
+            self.completed_history_preparation_barrier.wait_if_armed(
+                "__cli_before_transition__", &self.cli_history_shutdown,
+            ).await;
             let transition_mutex = self.cli_runtime_session_transition_mutex(&session_key).await;
             let _transition = scope_current_stage(Stage::CliTransitionWait, transition_mutex.lock()).await;
             // Session ownership serializes both provider use and continuity
@@ -7371,6 +7382,7 @@ impl MessageProcessor {
             self.retain_cli_runtime_session_turn_lease(
                 pioneer_turn_id.as_str(),
                 session_turn_lease,
+                session_handle,
             )
             .await;
             if matches!(
@@ -9311,6 +9323,147 @@ impl MessageProcessor {
         mutexes.entry(key.clone()).or_default().lease.clone()
     }
 
+    pub(crate) fn spawn_cli_runtime_idle_cleanup(
+        &self,
+        scope: &crate::post_startup::PostStartupScope,
+    ) {
+        if self.cli_runtime_manager.is_none() {
+            return;
+        }
+        let processor = self.clone();
+        let cancellation = scope.cancellation();
+        scope.spawn(async move {
+            let period = std::time::Duration::from_secs(60);
+            let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return,
+                    _ = ticks.tick() => {}
+                }
+                // Deliberately outside select: shutdown joins a close already
+                // in progress, including its bridge/generation cleanup.
+                processor
+                    .close_idle_cli_runtime_sessions(&cancellation)
+                    .await;
+            }
+        });
+    }
+
+    pub(super) async fn close_idle_cli_runtime_sessions(
+        &self,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> usize {
+        let Some(manager) = self.cli_runtime_manager.as_ref() else {
+            return 0;
+        };
+        let store = self.crud_store.with_maintenance_access();
+        let mut closed = 0;
+        let mut activity_lookup_failures = 0;
+        let mut close_failures = 0;
+        for instance in manager.idle_codex_sessions().await {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let key = instance.key();
+            // Admission takes this gate before selecting/using a process and
+            // holds it through preparation/start; recovery/terminal effects
+            // share it. Do not take the Turn lease here: ordinary admission
+            // uses try_lock and would mistake cleanup for an active Turn.
+            // Its retained handle plus the durable check protect silent Turns
+            // between transitions. A new admission waits at this gate and then
+            // resolves its continuation through the normal acquisition path.
+            let transition = self.cli_runtime_session_transition_mutex(key).await;
+            let Ok(_transition) = transition.try_lock() else {
+                continue;
+            };
+            // A recovered execution may have no in-memory retained lease.
+            // Starting/running is conservatively busy even if its last event
+            // is old or its native turn ID has not been assigned yet. This is
+            // a bounded read; no DB capacity survives into process I/O.
+            let activity = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => break,
+                result = store.list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+                    workspace_id: Some(key.workspace_id.clone()),
+                    runtime_id: Some(key.runtime_id.clone()),
+                    continuation_thread_id: Some(key.thread_id.clone()),
+                    statuses: vec![
+                        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+                            .to_owned(),
+                        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+                            .to_owned(),
+                    ],
+                    limit: Some(1),
+                    ..Default::default()
+                }) => result,
+            };
+            match activity {
+                Ok(active) if active.is_empty() => {}
+                Ok(_) => continue,
+                Err(_) => {
+                    activity_lookup_failures += 1;
+                    continue;
+                }
+            }
+            // Unbound native activity and outstanding response lanes are also
+            // uncertainty, never evidence of idle. Match the continuation key,
+            // not a hidden execution thread or a native turn ID.
+            let pending_key_matches = |pending: &super::CLIRuntimePendingTurnEventKey| {
+                pending.workspace_id == key.workspace_id
+                    && pending.runtime_id == key.runtime_id
+                    && pending.thread_id == key.thread_id
+            };
+            let pending_events = self
+                .cli_runtime_pending_turn_events
+                .lock()
+                .await
+                .keys()
+                .any(pending_key_matches);
+            if pending_events {
+                continue;
+            }
+            let pending_requests = self
+                .cli_runtime_pending_turn_server_requests
+                .lock()
+                .await
+                .keys()
+                .any(pending_key_matches);
+            if pending_requests {
+                continue;
+            }
+            let response_lanes = self
+                .cli_runtime_machine_requests
+                .lock()
+                .await
+                .by_lane
+                .keys()
+                .any(|lane| lane.instance.key() == key);
+            if response_lanes {
+                continue;
+            }
+            if cancellation.is_cancelled() {
+                break;
+            }
+            match manager.close_idle_codex_session(&instance).await {
+                Ok(true) => closed += 1,
+                Ok(false) => {}
+                Err(_) => close_failures += 1,
+            }
+        }
+        if activity_lookup_failures > 0 {
+            warn!(
+                activity_lookup_failures,
+                "Codex idle cleanup skipped candidates with unknown activity"
+            );
+        }
+        if close_failures > 0 {
+            warn!(close_failures, "failed to close idle Codex sessions");
+        }
+        closed
+    }
+
     // Unlike the retained Turn lease, this gate covers one transition, including
     // its external terminal effects. Recovery of the same Turn uses it too.
     pub(super) async fn cli_runtime_session_transition_mutex(
@@ -9387,11 +9540,12 @@ impl MessageProcessor {
         &self,
         turn_id: &str,
         lease: tokio::sync::OwnedMutexGuard<()>,
+        session: crate::cli_runtime::manager::CLIAgentRuntimeSessionHandle,
     ) {
         self.cli_runtime_session_turn_leases
             .lock()
             .await
-            .insert(turn_id.to_owned(), lease);
+            .insert(turn_id.to_owned(), (lease, session));
     }
 
     pub(crate) async fn release_cli_runtime_session_turn_lease(&self, turn_id: &str) {

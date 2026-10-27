@@ -219,6 +219,7 @@
 "timeline.system.capability_kind_skill" = "Скилл"
 "timeline.system.checkpoint_label" = "Чекпоинт"
 "timeline.system.code" = "Код:"
+"timeline.system.codex_request_retried" = "Codex сообщил о повторе запроса после временного сбоя."
 "timeline.system.continued_label" = "Продолжено"
 "timeline.system.detail_agent_rounds" = "Раунды агента"
 "timeline.system.detail_checkpoint" = "Чекпоинт"

@@ -1,3 +1,5 @@
+mod codex_retry_notice;
+pub use codex_retry_notice::{CodexRetryNoticeTarget, codex_retry_notice_item_id};
 mod frozen_lifetime;
 pub use frozen_lifetime::FrozenReadHold;
 mod tool_output;
@@ -20386,7 +20388,7 @@ impl CrudStore {
 
     pub async fn get_first_thread_user_text(&self, thread_id: &str) -> Result<Option<String>> {
         let Some(turn_model) =
-            turn::find_oldest_turn_for_thread(&self.connection, thread_id).await?
+            turn::find_oldest_user_conversation_turn(&self.connection, thread_id).await?
         else {
             return Ok(None);
         };

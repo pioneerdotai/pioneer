@@ -2959,6 +2959,70 @@ async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_
         .into_iter()
         .enumerate()
     {
+        // Model an older admission with exactly one creation grant. Current
+        // Member rights and the Agent envelope still allow both variants.
+        let excluded_action = if index == 0 {
+            crate::authorization::ResourceAction::ThreadCreateWorkspace
+        } else {
+            crate::authorization::ResourceAction::ThreadCreatePrivate
+        };
+        let mut limited: serde_json::Value =
+            serde_json::from_str(&authority.to_persisted_json().unwrap()).unwrap();
+        limited["grant_manifest"]["actions"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|action| action.as_str() != Some(excluded_action.safe_name()));
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(&context.turn_id, &limited.to_string())
+            .await
+            .unwrap();
+        // Restore the lease from the modeled admission too; its immutable
+        // action set must agree with the persisted context in each case.
+        processor
+            .register_execution_lease(&context.turn_id)
+            .await
+            .unwrap();
+        let options = call(
+            &tools,
+            "threads_start_options",
+            &format!("member-options-{index}"),
+            json!({}),
+        )
+        .await;
+        let creation_options = options["threadCreationOptions"].as_array().unwrap();
+        assert_eq!(creation_options.len(), 1);
+        assert_eq!(creation_options[0]["label"], label);
+        let excluded_option = binding
+            .options
+            .thread_creation_options
+            .iter()
+            .find(|option| option.label != label)
+            .unwrap();
+        let denied_call = format!("member-excluded-create-{index}");
+        let denied = invoke_with_mutation(
+            &tools,
+            "thread_create",
+            &denied_call,
+            json!({"optionId":excluded_option.id}),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            denied,
+            pioneer_tools::ToolError::InvalidArguments(ref reason)
+                if reason == "agent_action_not_allowed"
+        ));
+        assert!(
+            pioneer_crud::load_agent_action_outbox(
+                &processor.crud_store.database_connection(),
+                crate::authorization::action_id_for_call(&denied_call).as_str(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
         let option = binding
             .options
             .thread_creation_options
@@ -2973,7 +3037,40 @@ async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_
         )
         .await;
         assert_eq!(result["status"], "accepted");
+        let database = processor.crud_store.database_connection();
+        let action_id = crate::authorization::action_id_for_call(&format!("member-create-{index}"));
+        let receipt = pioneer_crud::load_agent_action_receipt(&database, action_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        let outbox = pioneer_crud::load_agent_action_outbox(&database, action_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["receiptId"], receipt.id);
+        assert_eq!(result["outboxId"], outbox.id);
+        let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json).unwrap();
+        assert!(
+            processor
+                .crud_store
+                .get_thread_model(payload["created_thread_id"].as_str().unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
+    processor
+        .crud_store
+        .set_turn_execution_authorization_context(
+            &context.turn_id,
+            &authority.to_persisted_json().unwrap(),
+        )
+        .await
+        .unwrap();
+    processor
+        .register_execution_lease(&context.turn_id)
+        .await
+        .unwrap();
     assert!(
         invoke_with_mutation(
             &tools,

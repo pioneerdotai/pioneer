@@ -5415,12 +5415,29 @@ fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() 
             assert!(
                 original.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
             );
+            // The running binding is persisted before startup releases its
+            // session gate. Wait for that handoff and hold the gate while blocking.
+            let transition = timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(transition) = processor
+                        .try_cli_runtime_turn_transition(&child)
+                        .await
+                        .unwrap()
+                    {
+                        break transition;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Task child must release its startup transition");
             assert!(
                 processor
-                    .mark_turn_blocked(
+                    .mark_turn_blocked_with_transition(
                         child.thread_id.clone(),
                         child.turn_id.clone(),
-                        "resumable Task".into()
+                        "resumable Task".into(),
+                        Some(transition),
                     )
                     .await
             );
@@ -5439,9 +5456,10 @@ fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() 
                     .status,
                 pioneer_protocol::TaskStatus::Blocked
             );
-            // Admit a different controller under an older, narrower source
-            // ceiling. Editing an already-admitted child's authority would
-            // break its immutable execution fingerprint before task_resume.
+            // A different, still-running execution in the same capsule may
+            // manage A without lending its own create rights to a new admission.
+            // Model the restricted source on the principal-authored root fixture
+            // before task_create derives the sibling admission and execution graph.
             let source = processor
                 .load_turn_execution_authorization_context(&turn)
                 .await
@@ -5477,6 +5495,8 @@ fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() 
             let caller =
                 wait_for_task_cli_child(&processor, sibling["runId"].as_str().unwrap(), None).await;
             assert_ne!(caller.turn_id, turn);
+            // The normal loader checks the child's graph fingerprint and lineage.
+            // Never rewrite an already-pinned Task child's authority envelope.
             let caller_authority = processor
                 .load_turn_execution_authorization_context(&caller.turn_id)
                 .await
@@ -5489,6 +5509,7 @@ fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() 
                 !caller_authority
                     .grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
             );
+            assert_eq!(caller_authority.root_thread_id(), saved.root_thread_id);
             if !persisted {
                 // Model the supported legacy case with no immutable admission;
                 // source ceiling applies when the real readmission path creates it.
@@ -5497,7 +5518,6 @@ fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() 
                     .await
                     .unwrap();
             }
-            assert_eq!(source.root_thread_id(), saved.root_thread_id);
             let caller_facade =
                 ThreadsFacade::new(&processor, &caller.turn_id, CLIAgentRuntimeKind::Codex).await;
             let resumed = caller_facade
