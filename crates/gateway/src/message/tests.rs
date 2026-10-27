@@ -17714,10 +17714,18 @@ fn owned_voice_ingress_case(
     })
 }
 
-fn ready_gateway_voice_supervisor(
-    transcript: &str,
-) -> Arc<crate::voice::supervisor::VoiceInputSupervisor> {
-    ready_gateway_voice_supervisor_for_model(transcript, "parakeet-tdt-0.6b-v3")
+impl MessageProcessor {
+    fn with_test_voice_transcript(mut self, transcript: &str) -> Self {
+        self = self.with_voice_input_supervisor(ready_gateway_voice_supervisor_for_model(
+            transcript,
+            "parakeet-tdt-0.6b-v3",
+        ));
+        // Message lifecycle fixtures use constant PCM, not a speech recording.
+        // The existing fake boundary also selects deterministic VAD for them.
+        let transcript = transcript.to_owned();
+        self.voice_test_transcriber = Some(Arc::new(move |_| Ok(transcript.clone())));
+        self
+    }
 }
 
 fn ready_gateway_voice_supervisor_for_model(
@@ -17855,7 +17863,7 @@ async fn first_voice_turn_materializes_runtime_draft() {
             test_summary_config(),
             test_tool_loop_config(),
         )
-        .with_voice_input_supervisor(ready_gateway_voice_supervisor("first voice message")),
+        .with_test_voice_transcript("first voice message"),
     );
     let thread_id = "thr_first_voice_runtime_draft";
     let turn_id = "turn_first_voice_runtime_draft";
@@ -17949,7 +17957,7 @@ async fn voice_turn_start_replay_does_not_dispatch_provider_again_impl() {
             test_summary_config(),
             test_tool_loop_config(),
         )
-        .with_voice_input_supervisor(ready_gateway_voice_supervisor("same durable voice request")),
+        .with_test_voice_transcript("same durable voice request"),
     );
     let thread_id = "thr_voice_admission_replay";
     let turn_id = "turn_voice_admission_replay";
@@ -18060,9 +18068,7 @@ async fn collaborative_voice_composer_admits_detached_task() {
             test_summary_config(),
             test_tool_loop_config(),
         )
-        .with_voice_input_supervisor(ready_gateway_voice_supervisor(
-            "run this voice command asynchronously",
-        )),
+        .with_test_voice_transcript("run this voice command asynchronously"),
     );
     let parent_thread_id = "thr_voice_collaborative";
     let started = thread_manager
@@ -18169,7 +18175,7 @@ async fn task_run_voice_composer_stays_foreground() {
             test_summary_config(),
             test_tool_loop_config(),
         )
-        .with_voice_input_supervisor(ready_gateway_voice_supervisor("continue inside this child")),
+        .with_test_voice_transcript("continue inside this child"),
     );
     let root_thread_id = "thr_voice_task_root";
     let root_turn_id = "turn_voice_task_root";
@@ -18356,9 +18362,7 @@ async fn voice_session_transcript_starts_turn_and_preserves_authorized_context_a
         test_summary_config(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     )
-    .with_voice_input_supervisor(ready_gateway_voice_supervisor(
-        "voice transcript with context",
-    ));
+    .with_test_voice_transcript("voice transcript with context");
     let thread = start_thread_for_artifact_test(
         &processor,
         connection_id,
@@ -18596,7 +18600,7 @@ async fn voice_session_cancel_drops_session_without_creating_turn() {
         test_summary_config(),
         test_tool_loop_config(),
     )
-    .with_voice_input_supervisor(ready_gateway_voice_supervisor("ignored"));
+    .with_test_voice_transcript("ignored");
     let thread = start_thread_for_artifact_test(
         &processor,
         connection_id,
@@ -18662,7 +18666,7 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
         test_summary_config(),
         test_tool_loop_config(),
     )
-    .with_voice_input_supervisor(ready_gateway_voice_supervisor("should not run"));
+    .with_test_voice_transcript("should not run");
     let thread = start_thread_for_artifact_test(
         &processor,
         connection_id,
@@ -19571,7 +19575,7 @@ async fn voice_settings_two_client_race_serializes_to_one_consistent_outcome() {
             test_tool_loop_config(),
         )
         .with_runtime_home_for_tests(runtime_home.clone())
-        .with_voice_input_supervisor(ready_gateway_voice_supervisor("race transcript")),
+        .with_test_voice_transcript("race transcript"),
     );
     let thread = start_thread_for_artifact_test(
         processor.as_ref(),
