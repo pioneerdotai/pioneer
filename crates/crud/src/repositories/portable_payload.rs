@@ -1178,7 +1178,7 @@ async fn read_range_inner(
         meta.original_bytes
     };
     ensure!(start <= total, "portable range starts past end");
-    let count = (count as i64).min(total - start);
+    let count = std::cmp::min(count as i64, total - start);
     if count == 0 {
         return Ok(Vec::new());
     }
@@ -1336,7 +1336,7 @@ async fn read_range_inner(
             "portable block character count mismatch"
         );
         let local = usize::try_from(position - offset)?;
-        let take = usize::try_from((end - position).min(length - local as i64))?;
+        let take = usize::try_from(std::cmp::min(end - position, length - local as i64))?;
         if characters {
             output.extend(
                 text.chars()
@@ -1470,7 +1470,9 @@ async fn publish(
             .filter(reference.is_null())
             .filter(Expr::cust(owner_guard.trim_start_matches(" AND ")));
         if !root_guard.is_empty() {
-            update = update.filter(Expr::cust(root_guard.trim_start_matches(" AND ")));
+            update = update.filter(Expr::cust(
+                root_guard.trim_start_matches(" AND ").to_owned(),
+            ));
         }
         if let Some(projection) = &prepared.projection {
             update = update.col_expr(field, Expr::value(projection.clone()));

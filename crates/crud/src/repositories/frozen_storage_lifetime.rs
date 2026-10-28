@@ -143,7 +143,7 @@ impl LocatorRead {
                     },
                     guard,
                     u64::try_from(self.offset)?,
-                    usize::try_from(FRAGMENT_BYTES.min(self.size - self.offset))?,
+                    usize::try_from(std::cmp::min(FRAGMENT_BYTES, self.size - self.offset))?,
                     u64::try_from(self.size)?,
                 )
                 .await?;
@@ -159,7 +159,7 @@ impl LocatorRead {
             }
             let _verify = portable.then(|| observe::stage(observe::Stage::VerifyAssemble));
             ensure!(
-                bytes.len() as i64 == FRAGMENT_BYTES.min(self.size - self.offset),
+                bytes.len() as i64 == std::cmp::min(FRAGMENT_BYTES, self.size - self.offset),
                 "legacy locator fragment missing"
             );
             // The query has released database capacity before decoding. Only
