@@ -1499,10 +1499,7 @@ async fn utf8_metadata_bytecode_does_not_fetch_overflow_payload_before_admission
         assert_eq!(header.retired, 0);
         assert_eq!(header.original_bytes, original.len() as i64);
         assert_eq!(header.original_chars, original.chars().count() as i64);
-        assert_eq!(
-            header.sha256,
-            hex::encode(Sha256::digest(original.as_bytes()))
-        );
+        assert_eq!(header.sha256, Sha256::digest(original.as_bytes()).to_vec());
         if index == 0 {
             assert_eq!(
                 header.raw, 1,
