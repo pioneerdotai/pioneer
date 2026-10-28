@@ -1976,11 +1976,13 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let error = header(&store.connection, &reserved, Family::ToolText)
+        let late_hold = PayloadReadHold::capture(&reserved, Family::ToolText).unwrap();
+        let error = header_with_hold(&store.connection, &reserved, Family::ToolText, &late_hold)
             .await
             .err()
             .unwrap();
         assert!(error.downcast_ref::<PreflightRace>().is_some());
+        drop(late_hold);
         for _ in 0..4 {
             store
                 .run_background_database_quantum(|| cleanup(&store, None))
