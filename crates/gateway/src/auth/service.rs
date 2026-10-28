@@ -4,18 +4,19 @@ use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Utc};
 use pioneer_config::GatewayAuthConfig;
 use pioneer_crud::{
-    DeviceActivationFailureOutcome, GatewayPrincipalRecord, NewActiveDeviceSessionRow,
-    NewPendingDeviceSessionRow, NewRefreshCredentialRow, PendingSessionIssuer,
-    activate_pending_auth_session, activate_pending_device, advance_auth_session_refresh,
-    auth_session_status_to_db, delete_refresh_for_session, expire_pending_auth_session,
-    expire_session_refresh_family, expire_stale_auth_sessions, expire_stale_pending_sessions,
-    insert_active_device_session, insert_pending_device_session, insert_refresh_credential,
-    list_pending_activation_locator_hashes, list_sessions_for_principal,
+    AuthSessionLeaseRow, DeviceActivationFailureOutcome, GatewayPrincipalRecord,
+    NewActiveDeviceSessionRow, NewPendingDeviceSessionRow, NewRefreshCredentialRow,
+    PendingSessionIssuer, activate_pending_auth_session, activate_pending_device,
+    advance_auth_session_refresh, auth_session_status_to_db, delete_refresh_for_session,
+    expire_pending_auth_session, expire_session_refresh_family, expire_stale_auth_sessions,
+    expire_stale_pending_sessions, insert_active_device_session, insert_pending_device_session,
+    insert_refresh_credential, list_pending_activation_locator_hashes, list_sessions_for_principal,
     load_active_device_by_installation, load_active_session_by_device, load_current_refresh,
     load_device, load_gateway_singleton, load_pending_local_session,
     load_pending_session_by_activation_locator_hash, load_pending_session_for_creator,
-    load_principal_avatar, load_principal_by_id, load_session, load_session_by_activation_hash,
-    mark_device_revoked, mark_session_revoked, record_failed_device_activation,
+    load_principal_avatar, load_principal_by_id, load_principal_profile, load_session,
+    load_session_by_activation_hash, load_session_lease, mark_device_revoked, mark_session_revoked,
+    principal_kind_from_db, principal_status_from_db, record_failed_device_activation,
     replace_current_refresh, revoke_session_family_for_refresh_reuse, touch_active_auth_session,
     touch_active_device,
 };
@@ -651,7 +652,7 @@ impl GatewayAuthService {
             return Err(AuthError::new(AuthErrorCode::TemporarilyUnavailable));
         }
         let lease = self.validate_session_lease(&next).await?;
-        if lease.me.session.refresh_generation != params.refresh_generation {
+        if lease.session.refresh_generation != params.refresh_generation {
             return Err(AuthError::new(AuthErrorCode::TemporarilyUnavailable));
         }
         Ok(next)
@@ -798,7 +799,7 @@ impl GatewayAuthService {
     pub(crate) async fn validate_session_lease(
         &self,
         principal: &AuthenticatedSessionPrincipal,
-    ) -> Result<SessionLeaseSnapshot, AuthError> {
+    ) -> Result<SessionLeaseFacts, AuthError> {
         self.validate_session_lease_with_trace(principal, None)
             .await
     }
@@ -807,7 +808,7 @@ impl GatewayAuthService {
         &self,
         principal: &AuthenticatedSessionPrincipal,
         trace: Option<&pioneer_observability::GatewayOperationTrace>,
-    ) -> Result<SessionLeaseSnapshot, AuthError> {
+    ) -> Result<SessionLeaseFacts, AuthError> {
         self.validate_session_lease_in_scope(principal, trace, &self.database)
             .await
     }
@@ -815,7 +816,7 @@ impl GatewayAuthService {
         &self,
         principal: &AuthenticatedSessionPrincipal,
         database: &SqliteDatabase,
-    ) -> Result<SessionLeaseSnapshot, AuthError> {
+    ) -> Result<SessionLeaseFacts, AuthError> {
         self.validate_session_lease_in_scope(principal, None, database)
             .await
     }
@@ -824,7 +825,7 @@ impl GatewayAuthService {
         principal: &AuthenticatedSessionPrincipal,
         trace: Option<&pioneer_observability::GatewayOperationTrace>,
         database: &SqliteDatabase,
-    ) -> Result<SessionLeaseSnapshot, AuthError> {
+    ) -> Result<SessionLeaseFacts, AuthError> {
         let now_unix =
             unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         if now_unix >= principal.access_expires_at_unix {
@@ -833,105 +834,14 @@ impl GatewayAuthService {
         if principal.gateway_id != self.identity.gateway.id {
             return Err(AuthError::new(AuthErrorCode::GatewayIdentityMismatch));
         }
-        let session = trace_auth_me_database_read(
+        let row = trace_auth_me_database_read(
             trace,
-            pioneer_observability::GatewayOperationStage::AuthMeSessionLoad,
-            load_session(database, &principal.session_id),
+            pioneer_observability::GatewayOperationStage::AuthMeLeaseFactsLoad,
+            load_session_lease(database, &principal.session_id),
         )
         .await?
         .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-        let device = trace_auth_me_database_read(
-            trace,
-            pioneer_observability::GatewayOperationStage::AuthMeDeviceLoad,
-            load_device(database, &principal.device_id),
-        )
-        .await?
-        .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-        let owner = trace_auth_me_database_read(
-            trace,
-            pioneer_observability::GatewayOperationStage::AuthMePrincipalLoad,
-            load_principal_by_id(database, &principal.principal_id),
-        )
-        .await?
-        .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-
-        if session.gateway_id != principal.gateway_id.as_str()
-            || session.principal_id != principal.principal_id.as_str()
-            || session.device_id != principal.device_id.as_str()
-            || device.gateway_id != principal.gateway_id.as_str()
-            || device.principal_id != principal.principal_id.as_str()
-            || owner.gateway_id != principal.gateway_id
-        {
-            return Err(AuthError::new(AuthErrorCode::InvalidCredential));
-        }
-        let role_key =
-            validate_authenticated_principal(owner.kind, owner.status, owner.role_key.as_deref())?;
-        if session.status == "expired" {
-            return Err(AuthError::new(AuthErrorCode::SessionExpired));
-        }
-        if session.status != "active" {
-            return Err(AuthError::new(AuthErrorCode::SessionRevoked));
-        }
-        let now = datetime(now_unix)?;
-        let refresh_expires_at = session
-            .refresh_expires_at
-            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-        if now >= refresh_expires_at {
-            return Err(AuthError::new(AuthErrorCode::SessionExpired));
-        }
-        if device.status != "active" {
-            return Err(AuthError::new(AuthErrorCode::SessionRevoked));
-        }
-        let avatar_revision = trace_auth_me_database_read(
-            trace,
-            pioneer_observability::GatewayOperationStage::AuthMeAvatarLoad,
-            load_principal_avatar(database, &principal.principal_id),
-        )
-        .await?
-        .map(|avatar| hex::encode(avatar.content_hash));
-        Ok(SessionLeaseSnapshot {
-            kind: owner.kind,
-            role_key: role_key.clone(),
-            me: AuthMeResponse {
-                gateway: AuthGatewaySnapshot {
-                    id: principal.gateway_id.clone(),
-                },
-                principal: AuthPrincipalSnapshot {
-                    id: principal.principal_id.clone(),
-                    kind: owner.kind,
-                    display_name: owner.display_name,
-                    nickname: owner.nickname,
-                    avatar_revision,
-                },
-                device: AuthDeviceSnapshot {
-                    id: principal.device_id.clone(),
-                    installation_id: device
-                        .installation_id
-                        .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?,
-                    display_name: device
-                        .display_name
-                        .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?,
-                    client_kind: client_kind_from_db(
-                        device
-                            .client_kind
-                            .as_deref()
-                            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?,
-                    )?,
-                    status: DeviceStatus::Active,
-                },
-                session: AuthSessionSnapshot {
-                    id: principal.session_id.clone(),
-                    device_id: principal.device_id.clone(),
-                    token_family_id: TokenFamilyId::new(session.token_family_id)
-                        .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?,
-                    status: AuthSessionStatus::Active,
-                    refresh_generation: u64::try_from(session.refresh_generation)
-                        .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?,
-                    refresh_expires_at_unix: timestamp(refresh_expires_at)?,
-                },
-                role_key,
-            },
-        })
+        validate_session_lease_facts(row, principal, now_unix)
     }
 
     pub(crate) async fn resolve_active_view_grant_principal(
@@ -1005,10 +915,35 @@ impl GatewayAuthService {
         let trace = pioneer_observability::GatewayOperationTrace::start(
             pioneer_observability::GatewayOperation::AuthMe,
         );
-        let result = self
-            .validate_session_lease_with_trace(principal, Some(&trace))
-            .await
-            .map(|snapshot| snapshot.me);
+        let result = async {
+            let facts = self
+                .validate_session_lease_with_trace(principal, Some(&trace))
+                .await?;
+            let profile = trace_auth_me_database_read(
+                Some(&trace),
+                pioneer_observability::GatewayOperationStage::AuthMeProfileLoad,
+                load_principal_profile(&self.database, &principal.principal_id),
+            )
+            .await?
+            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+            let avatar_revision = profile.avatar_hash.map(hex::encode);
+            Ok(AuthMeResponse {
+                gateway: AuthGatewaySnapshot {
+                    id: principal.gateway_id.clone(),
+                },
+                principal: AuthPrincipalSnapshot {
+                    id: principal.principal_id.clone(),
+                    kind: facts.kind,
+                    display_name: profile.display_name,
+                    nickname: profile.nickname,
+                    avatar_revision,
+                },
+                device: facts.device,
+                session: facts.session,
+                role_key: facts.role_key,
+            })
+        }
+        .await;
         match result {
             Ok(me) => {
                 trace.finish_success();
@@ -2440,10 +2375,86 @@ impl GatewayAuthService {
 }
 
 #[derive(Debug)]
-pub(crate) struct SessionLeaseSnapshot {
+pub(crate) struct SessionLeaseFacts {
     kind: PrincipalKind,
     role_key: Option<RoleKey>,
-    me: AuthMeResponse,
+    device: AuthDeviceSnapshot,
+    session: AuthSessionSnapshot,
+}
+
+fn validate_session_lease_facts(
+    row: AuthSessionLeaseRow,
+    principal: &AuthenticatedSessionPrincipal,
+    now_unix: u64,
+) -> Result<SessionLeaseFacts, AuthError> {
+    // Preserve the principal conversions that load_principal_by_id performed
+    // before the old ownership/status checks.
+    let owner_id = pioneer_protocol::PrincipalId::new(row.principal_id.clone())
+        .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+    let owner_gateway_id = pioneer_protocol::GatewayId::new(row.principal_gateway_id.clone())
+        .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+    let kind = principal_kind_from_db(&row.principal_kind).map_err(storage_error)?;
+    let status = principal_status_from_db(&row.principal_status).map_err(storage_error)?;
+    if row.session_gateway_id != principal.gateway_id.as_str()
+        || row.session_principal_id != principal.principal_id.as_str()
+        || row.session_device_id != principal.device_id.as_str()
+        || row.device_gateway_id != principal.gateway_id.as_str()
+        || row.device_principal_id != principal.principal_id.as_str()
+        || row.device_id != principal.device_id.as_str()
+        || owner_id != principal.principal_id
+        || owner_gateway_id != principal.gateway_id
+    {
+        return Err(AuthError::new(AuthErrorCode::InvalidCredential));
+    }
+    let role_key = validate_authenticated_principal(kind, status, row.role_key.as_deref())?;
+    if row.session_status == "expired" {
+        return Err(AuthError::new(AuthErrorCode::SessionExpired));
+    }
+    if row.session_status != "active" {
+        return Err(AuthError::new(AuthErrorCode::SessionRevoked));
+    }
+    let now = datetime(now_unix)?;
+    let refresh_expires_at = row
+        .refresh_expires_at
+        .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+    if now >= refresh_expires_at {
+        return Err(AuthError::new(AuthErrorCode::SessionExpired));
+    }
+    if row.device_status != "active" {
+        return Err(AuthError::new(AuthErrorCode::SessionRevoked));
+    }
+    // These persisted device/session conversions are part of validity even
+    // for callers that only consume success/failure. Keep them off the
+    // presentation path so malformed active rows still fail closed.
+    Ok(SessionLeaseFacts {
+        kind,
+        role_key,
+        device: AuthDeviceSnapshot {
+            id: principal.device_id.clone(),
+            installation_id: row
+                .installation_id
+                .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?,
+            display_name: row
+                .display_name
+                .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?,
+            client_kind: client_kind_from_db(
+                row.client_kind
+                    .as_deref()
+                    .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?,
+            )?,
+            status: DeviceStatus::Active,
+        },
+        session: AuthSessionSnapshot {
+            id: principal.session_id.clone(),
+            device_id: principal.device_id.clone(),
+            token_family_id: TokenFamilyId::new(row.token_family_id)
+                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?,
+            status: AuthSessionStatus::Active,
+            refresh_generation: u64::try_from(row.refresh_generation)
+                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?,
+            refresh_expires_at_unix: timestamp(refresh_expires_at)?,
+        },
+    })
 }
 
 fn validate_authenticated_principal(
@@ -2842,7 +2853,12 @@ mod tests {
     }
 
     async fn fixture() -> (GatewayAuthService, Arc<IdentityBootstrapSnapshot>) {
-        let database = Database::connect("sqlite::memory:").await.unwrap();
+        fixture_with_connection(Database::connect("sqlite::memory:").await.unwrap()).await
+    }
+
+    async fn fixture_with_connection(
+        database: sea_orm::DatabaseConnection,
+    ) -> (GatewayAuthService, Arc<IdentityBootstrapSnapshot>) {
         Migrator::up(&database, None).await.unwrap();
         bootstrap_workspace(&database).await.unwrap();
         let identity = Arc::new(bootstrap_identity(&database).await.unwrap().snapshot);
@@ -2884,10 +2900,10 @@ mod tests {
                     'Member A','member-a','member-a',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
                  );\
                  UPDATE device SET principal_id='P0000000000000000000A'\
-                    WHERE id='D00000000000000000001';\
+                    WHERE id='{}';\
                  UPDATE auth_session SET principal_id='P0000000000000000000A'\
-                    WHERE id='S00000000000000000001';",
-                    service.identity.gateway.id
+                    WHERE id='{}';",
+                    service.identity.gateway.id, grant.device.id, grant.session.id,
                 )
                 .as_str(),
             )
@@ -3813,6 +3829,18 @@ mod tests {
             responses.try_recv().is_err(),
             "no close or lost request on renewal"
         );
+        let wrong_generation = pioneer_protocol::AuthAccessRenewParams {
+            refresh_generation: params.refresh_generation + 1,
+            ..params.clone()
+        };
+        assert_eq!(
+            service
+                .renew_connection_access(context.principal(), &wrong_generation)
+                .await
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::TemporarilyUnavailable
+        );
         // Replay and a forged token cannot roll back or extend admission.
         let stale = pioneer_protocol::AuthAccessRenewParams {
             access_token: AuthSecretString::new(old_token),
@@ -3965,6 +3993,380 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lease_rejects_missing_cross_linked_and_invalid_active_rows_with_fk_off() {
+        use AuthErrorCode::{InvalidCredential, SessionExpired, SessionRevoked};
+        let cases = [
+            ("DELETE FROM auth_session", InvalidCredential),
+            ("DELETE FROM device", InvalidCredential),
+            ("DELETE FROM gateway_principal", InvalidCredential),
+            (
+                "UPDATE auth_session SET gateway_id='G00000000000000000099'",
+                InvalidCredential,
+            ),
+            (
+                "UPDATE device SET gateway_id='G00000000000000000099'",
+                InvalidCredential,
+            ),
+            (
+                "UPDATE gateway_principal SET gateway_id='G00000000000000000099'",
+                InvalidCredential,
+            ),
+            (
+                "UPDATE device SET principal_id='P00000000000000000099'",
+                InvalidCredential,
+            ),
+            (
+                "UPDATE auth_session SET principal_id='P00000000000000000099'",
+                InvalidCredential,
+            ),
+            (
+                "UPDATE auth_session SET device_id='D00000000000000000099'",
+                InvalidCredential,
+            ),
+            ("UPDATE auth_session SET status='expired'", SessionExpired),
+            ("UPDATE auth_session SET status='revoked'", SessionRevoked),
+            ("UPDATE auth_session SET status='pending'", SessionRevoked),
+            (
+                "UPDATE auth_session SET refresh_expires_at=NULL",
+                InvalidCredential,
+            ),
+            ("UPDATE device SET status='revoked'", SessionRevoked),
+            (
+                "UPDATE gateway_principal SET status='suspended'",
+                SessionRevoked,
+            ),
+            (
+                "UPDATE gateway_principal SET role_key='member'",
+                SessionRevoked,
+            ),
+            (
+                "UPDATE gateway_principal SET kind='unknown'",
+                InvalidCredential,
+            ),
+            (
+                "UPDATE gateway_principal SET status='unknown'",
+                InvalidCredential,
+            ),
+            (
+                "UPDATE gateway_principal SET kind='user',role_key=NULL",
+                SessionRevoked,
+            ),
+            (
+                "UPDATE gateway_principal SET kind='user',role_key='unknown'",
+                SessionRevoked,
+            ),
+            ("UPDATE device SET installation_id=NULL", InvalidCredential),
+            ("UPDATE device SET display_name=NULL", InvalidCredential),
+            ("UPDATE device SET client_kind=NULL", InvalidCredential),
+            ("UPDATE device SET client_kind='unknown'", InvalidCredential),
+            (
+                "UPDATE auth_session SET token_family_id='invalid'",
+                InvalidCredential,
+            ),
+            (
+                "UPDATE auth_session SET refresh_generation=-1",
+                InvalidCredential,
+            ),
+            // Missing rows and ownership errors precede terminal state checks.
+            (
+                "UPDATE auth_session SET status='expired'; DELETE FROM device",
+                InvalidCredential,
+            ),
+            (
+                "UPDATE auth_session SET status='expired'; UPDATE device SET principal_id='P00000000000000000099'",
+                InvalidCredential,
+            ),
+            (
+                "UPDATE auth_session SET status='expired'; UPDATE gateway_principal SET status='suspended'",
+                SessionRevoked,
+            ),
+        ];
+        for (mutation, expected) in cases {
+            let (service, _) = fixture().await;
+            let grant = service
+                .create_initial_session_with_ids(
+                    params("lease-matrix", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let principal = authenticate_grant(&service, &grant).await;
+            service
+                .database
+                .execute_unprepared("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON")
+                .await
+                .unwrap();
+            assert_eq!(
+                scalar_i64(
+                    &service.database,
+                    "SELECT foreign_keys AS value FROM pragma_foreign_keys"
+                )
+                .await,
+                0
+            );
+            service.database.execute_unprepared(mutation).await.unwrap();
+            assert_eq!(
+                service
+                    .validate_session_lease(&principal)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                expected,
+                "{mutation}"
+            );
+        }
+
+        // Existing, valid related rows must not substitute for the expected
+        // authenticated device/principal. This differs from a dangling FK.
+        let (service, _) = fixture().await;
+        service
+            .database
+            .execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
+        let first = service
+            .create_initial_session_with_ids(params("lease-first", ClientKind::Desktop), ids(1))
+            .await
+            .unwrap();
+        let principal = authenticate_grant(&service, &first).await;
+        let second = service
+            .create_initial_session_with_ids(params("lease-second", ClientKind::Mobile), ids(2))
+            .await
+            .unwrap();
+        let (member_id, member_credential) = member_access_credential(&service, &second).await;
+        service.validate_session_lease(&principal).await.unwrap();
+        let captured_superuser = AuthenticatedSessionPrincipal {
+            principal_id: member_id.clone(),
+            device_id: second.device.id.clone(),
+            session_id: second.session.id.clone(),
+            ..principal.as_ref().clone()
+        };
+        let current = service
+            .validate_session_lease(&captured_superuser)
+            .await
+            .unwrap();
+        assert_eq!(current.kind, PrincipalKind::User);
+        assert_eq!(
+            current.role_key.as_ref().map(RoleKey::as_str),
+            Some("member")
+        );
+        let transaction = service.database.begin().await.unwrap();
+        let guarded = service
+            .validate_active_actor_in_transaction(
+                &transaction,
+                &captured_superuser,
+                datetime(unix_timestamp_secs().unwrap()).unwrap(),
+            )
+            .await;
+        transaction.rollback().await.unwrap();
+        assert_eq!(guarded.unwrap_err().code(), SessionRevoked);
+
+        let substituted = AuthenticatedSessionPrincipal {
+            session_id: second.session.id,
+            ..principal.as_ref().clone()
+        };
+        assert_eq!(
+            service
+                .validate_session_lease(&substituted)
+                .await
+                .unwrap_err()
+                .code(),
+            InvalidCredential
+        );
+        let substituted = AuthenticatedSessionPrincipal {
+            device_id: member_credential.subject.device_id,
+            ..principal.as_ref().clone()
+        };
+        assert_eq!(
+            service
+                .validate_session_lease(&substituted)
+                .await
+                .unwrap_err()
+                .code(),
+            InvalidCredential
+        );
+        let substituted = AuthenticatedSessionPrincipal {
+            principal_id: member_id,
+            ..principal.as_ref().clone()
+        };
+        assert_eq!(
+            service
+                .validate_session_lease(&substituted)
+                .await
+                .unwrap_err()
+                .code(),
+            InvalidCredential
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_refresh_expiry_boundary_uses_current_projection_and_generation() {
+        let (service, _) = fixture().await;
+        let grant = service
+            .create_initial_session_with_ids(params("lease-boundary", ClientKind::Desktop), ids(1))
+            .await
+            .unwrap();
+        let principal = authenticate_grant(&service, &grant).await;
+        let rotated = service
+            .exchange_refresh(
+                refresh_admission(grant.refresh_token.expose_secret()),
+                refresh_params(1),
+            )
+            .await
+            .unwrap();
+        let row = load_session_lease(&service.database, &principal.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let expiry = timestamp(row.refresh_expires_at.unwrap()).unwrap();
+        let facts = validate_session_lease_facts(row, &principal, expiry - 1).unwrap();
+        assert_eq!(facts.session.refresh_generation, 1);
+        assert_eq!(facts.session.refresh_generation, rotated.refresh_generation);
+        for now in [expiry, expiry + 1] {
+            let row = load_session_lease(&service.database, &principal.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                validate_session_lease_facts(row, &principal, now)
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionExpired
+            );
+        }
+        let wrong_gateway = AuthenticatedSessionPrincipal {
+            gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000099").unwrap(),
+            ..principal.as_ref().clone()
+        };
+        assert_eq!(
+            service
+                .validate_session_lease(&wrong_gateway)
+                .await
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::GatewayIdentityMismatch
+        );
+        let expired = AuthenticatedSessionPrincipal {
+            access_expires_at_unix: unix_timestamp_secs().unwrap(),
+            ..wrong_gateway
+        };
+        assert_eq!(
+            service
+                .validate_session_lease(&expired)
+                .await
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::CredentialExpired
+        );
+    }
+
+    #[derive(Default)]
+    struct LeaseReadObserver(Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>);
+
+    impl pioneer_sqlite::SqliteReadObserver for LeaseReadObserver {
+        fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_reads_one_statement_on_the_callers_scoped_query_only_reader() {
+        use pioneer_sqlite::{
+            SqliteReadClass, SqliteReadEvent, SqliteReadOutcome, SqliteWriteExecutor,
+        };
+        use sea_orm::ConnectOptions;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lease.sqlite");
+        let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+        options
+            .max_connections(1)
+            .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
+        let writer = Database::connect(options).await.unwrap();
+        pioneer_sqlite::apply_sqlite_pragmas(&writer).await.unwrap();
+        let (mut service, _) = fixture_with_connection(writer.clone()).await;
+        let grant = service
+            .create_initial_session_with_ids(params("lease-routing", ClientKind::Desktop), ids(1))
+            .await
+            .unwrap();
+        let principal = authenticate_grant(&service, &grant).await;
+        let mut options =
+            ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+        options.max_connections(1).map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+                .pragma("foreign_keys", "OFF")
+        });
+        let reader = Database::connect(options).await.unwrap();
+        let observer = Arc::new(LeaseReadObserver::default());
+        service.database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            SqliteWriteExecutor::new(writer),
+            observer.clone(),
+        )
+        .with_critical_writes();
+        service.database.validate_reader().await.unwrap();
+        for scope in [
+            service.database.clone(),
+            CrudStore::new(service.database.clone())
+                .with_maintenance_access()
+                .database_connection(),
+        ] {
+            let writer_transaction = service.database.begin().await.unwrap();
+            observer.0.lock().unwrap().clear();
+            let facts = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                service.validate_session_lease_with_database(&principal, &scope),
+            )
+            .await
+            .expect("lease must not wait on the held writer")
+            .unwrap();
+            assert_eq!(facts.session.id, grant.session.id);
+            let events = observer.0.lock().unwrap().clone();
+            let operations: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    SqliteReadEvent::OperationFinished { class, outcome, .. } => {
+                        Some((*class, *outcome))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                operations,
+                vec![(scope.read_class(), SqliteReadOutcome::Ok)]
+            );
+            if scope.read_class() == SqliteReadClass::Maintenance {
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    SqliteReadEvent::AdmissionReleased {
+                        class: SqliteReadClass::Maintenance,
+                        active: 0,
+                        ..
+                    }
+                )));
+            }
+            writer_transaction.rollback().await.unwrap();
+        }
+        observer.0.lock().unwrap().clear();
+        assert_eq!(
+            service.auth_me(&principal).await.unwrap().device.id,
+            grant.device.id
+        );
+        assert_eq!(
+            observer
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, SqliteReadEvent::OperationFinished { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn authenticated_principal_can_atomically_update_and_remove_own_profile() {
         let (service, identity) = fixture().await;
         let grant = service
@@ -4073,6 +4475,42 @@ mod tests {
         assert!(removed.changed);
         assert_eq!(removed.principal.avatar_revision, None);
         assert_eq!(count(&service.database, "principal_avatar").await, 0);
+        assert_eq!(
+            service
+                .auth_me(&principal)
+                .await
+                .unwrap()
+                .principal
+                .avatar_revision,
+            None
+        );
+        // Immutable revisions survive removal. A foreign current pointer must
+        // fail auth/me, while the same valid lease remains independent of it.
+        service
+            .database
+            .execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
+        service.database.execute_unprepared(
+            "UPDATE principal_avatar_revision SET principal_id='P0000000000000000000B';
+             INSERT INTO principal_avatar(principal_id,revision_id,updated_at)
+             SELECT (SELECT principal_id FROM auth_session LIMIT 1),id,CURRENT_TIMESTAMP FROM principal_avatar_revision LIMIT 1",
+        ).await.unwrap();
+        service.validate_session_lease(&principal).await.unwrap();
+        assert_eq!(
+            service.auth_me(&principal).await.unwrap_err().code(),
+            AuthErrorCode::InvalidCredential
+        );
+        service
+            .database
+            .execute_unprepared("DELETE FROM principal_avatar_revision")
+            .await
+            .unwrap();
+        service.validate_session_lease(&principal).await.unwrap();
+        assert_eq!(
+            service.auth_me(&principal).await.unwrap_err().code(),
+            AuthErrorCode::InvalidCredential
+        );
     }
 
     #[tokio::test]
