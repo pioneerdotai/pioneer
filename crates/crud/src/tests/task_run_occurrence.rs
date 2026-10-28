@@ -13,8 +13,8 @@ use sea_orm::sea_query::{ExprTrait, Query};
 const NOW: i64 = 4_000_000_000;
 const MIGRATION: &str = "m20261002_000001_task_run_occurrence_reconcile";
 
-// Event-driven fixture creation needs the cancellation marker columns. Use
-// that production schema prefix, without later irreversible migrations.
+// Keep rollback aimed at the tracker through the cancellation schema prefix;
+// current projector metadata is added separately by the legacy fixture helper.
 struct TrackerFixtureMigrator;
 
 impl MigratorTrait for TrackerFixtureMigrator {

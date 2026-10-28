@@ -13,6 +13,8 @@ fn independent_direct_and_ffi_onboarding_replay_preserves_scope_and_single_submi
         let direct = Arc::new(ClientCore::new());
         let wire = Arc::new(ClientCore::new());
         let runtime = ClientFfiRuntime {
+            native_oauth: Arc::new(plugin_shell::NativeOAuthShell::new(&wire)),
+            plugin_uploads: Default::default(),
             core: wire.clone(),
             config: Default::default(),
             client_subscriptions: Default::default(),

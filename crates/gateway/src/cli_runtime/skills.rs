@@ -30,6 +30,8 @@ pub(crate) struct CliRuntimeSelectedSkill {
     pub install_name: String,
     pub installed_path: PathBuf,
     pub source_folder_hash: String,
+    pub plugin_id: Option<String>,
+    pub skill_relative_path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,17 +182,110 @@ pub(crate) fn cli_runtime_native_skills_root(
     normalized_destination(&expanded.join("skills"))
 }
 
+#[cfg(test)]
 pub(crate) fn build_cli_runtime_skill_install_plans(
     runtime: &pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig,
     runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
     resolved: &[pioneer_skills::ResolvedSkill],
     receipt_path: &Path,
 ) -> Result<Vec<CliRuntimeSkillInstallPlan>> {
+    build_cli_runtime_skill_install_plans_with_contexts(
+        runtime,
+        runtime_kind,
+        resolved,
+        receipt_path,
+        &HashMap::new(),
+    )
+}
+
+pub(crate) fn plugin_skill_alias(plugin: &str, skill: &SkillId) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update((plugin.len() as u64).to_le_bytes());
+    hash.update(plugin.as_bytes());
+    hash.update(skill.as_str().as_bytes());
+    format!("pioneer-plugin-{}", &hex::encode(hash.finalize())[..48])
+}
+
+/// Same materializer and receipts, with source context selected from genuine
+/// native ownership. A native source override never falls back to package files.
+pub(crate) async fn build_cli_runtime_owned_skill_install_plans(
+    store: &pioneer_crud::CrudStore,
+    workspace: &str,
+    runtime: &pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
+    resolved: &[pioneer_skills::ResolvedSkill],
+    receipt_path: &Path,
+) -> Result<Vec<CliRuntimeSkillInstallPlan>> {
+    let mut contexts = HashMap::new();
+    for skill in resolved {
+        let Some(owner) = store.find_skill_plugin_owner(&skill.skill_id).await? else {
+            continue;
+        };
+        let parent = store
+            .find_plugin_installation(&owner.plugin_id)
+            .await?
+            .filter(|p| {
+                p.workspace_id == workspace
+                    && p.enabled
+                    && p.state == "installed"
+                    && p.pending_json.is_none()
+            })
+            .context("plugin skill source unavailable")?;
+        let overrides: std::collections::BTreeSet<String> =
+            serde_json::from_str(&owner.override_fields_json)?;
+        let native_source = PathBuf::from(&skill.definition.identity.skill_dir);
+        let (source, relative) = if overrides.contains("skill_source") {
+            (native_source, None)
+        } else {
+            let relative = format!("skills/{}", owner.member_key);
+            anyhow::ensure!(
+                owner.member_path.as_deref() == Some(relative.as_str()),
+                "plugin skill member changed"
+            );
+            let root = PathBuf::from(&parent.package_path);
+            let member =
+                pioneer_plugins::containment::resolve_contained(&root, &root.join(&relative))?;
+            anyhow::ensure!(
+                member == fs::canonicalize(&native_source)?,
+                "plugin skill context changed"
+            );
+            (root, Some(relative))
+        };
+        contexts.insert(skill.skill_id.clone(), (parent.id, source, relative));
+    }
+    build_cli_runtime_skill_install_plans_with_contexts(
+        runtime,
+        runtime_kind,
+        resolved,
+        receipt_path,
+        &contexts,
+    )
+}
+
+fn plugin_contexts_root(native_skills_root: &Path) -> Result<PathBuf> {
+    // Outside provider auto-discovered skills. Only selected native Skill items
+    // or the controlled Claude manifest expose these materialized contexts.
+    Ok(native_skills_root
+        .parent()
+        .context("native skills root has no parent")?
+        .join(".pioneer-selected-contexts"))
+}
+
+fn build_cli_runtime_skill_install_plans_with_contexts(
+    runtime: &pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
+    resolved: &[pioneer_skills::ResolvedSkill],
+    receipt_path: &Path,
+    contexts: &HashMap<SkillId, (String, PathBuf, Option<String>)>,
+) -> Result<Vec<CliRuntimeSkillInstallPlan>> {
     let native_skills_root = cli_runtime_native_skills_root(runtime, runtime_kind)?;
     let mut destinations = std::collections::BTreeMap::<PathBuf, String>::new();
+    let mut owned_names = std::collections::BTreeMap::new();
     let mut plans = Vec::with_capacity(resolved.len());
     for skill in resolved {
-        let install_name = cli_system_skill_export_name(
+        let context = contexts.get(&skill.skill_id);
+        let standalone_name = cli_system_skill_export_name(
             skill.definition.identity.source_kind.as_db_value(),
             skill.definition.identity.owner.as_deref(),
             &skill.definition.identity.slug,
@@ -200,9 +295,24 @@ pub(crate) fn build_cli_runtime_skill_install_plans(
             skill.definition.identity.source_kind.as_db_value(),
             skill.definition.identity.owner.as_deref(),
             &skill.definition.identity.slug,
-            &install_name,
+            &standalone_name,
         )?;
-        let destination = normalized_destination(&native_skills_root.join(&install_name))?;
+        let install_name = context
+            .map(|c| plugin_skill_alias(&c.0, &skill.skill_id))
+            .unwrap_or(standalone_name);
+        if let Some(was_owned) = owned_names.insert(install_name.clone(), context.is_some())
+            && (was_owned || context.is_some())
+        {
+            anyhow::bail!(
+                "cli_runtime.skill_alias_collision: `{install_name}` is already selected"
+            );
+        }
+        let root = if context.is_some() {
+            plugin_contexts_root(&native_skills_root)?
+        } else {
+            native_skills_root.clone()
+        };
+        let destination = normalized_destination(&root.join(&install_name))?;
         if let Some(first_slug) = destinations.insert(destination.clone(), skill.slug.clone()) {
             anyhow::bail!(
                 "cli_runtime.skill_destination_collision: skills `{first_slug}` and `{}` both target `{}`",
@@ -214,9 +324,13 @@ pub(crate) fn build_cli_runtime_skill_install_plans(
             skill_id: skill.skill_id.clone(),
             owner: skill.definition.identity.owner.clone(),
             slug: skill.definition.identity.slug.clone(),
-            source: PathBuf::from(&skill.definition.identity.skill_dir),
+            source: context
+                .map(|c| c.1.clone())
+                .unwrap_or_else(|| PathBuf::from(&skill.definition.identity.skill_dir)),
+            plugin_id: context.map(|c| c.0.clone()),
+            skill_relative_path: context.and_then(|c| c.2.clone()),
             destination,
-            native_skills_root: native_skills_root.clone(),
+            native_skills_root: root,
             receipt_path: receipt_path.to_path_buf(),
             runtime_id: runtime.id.clone(),
             runtime_kind: match runtime_kind {
@@ -259,6 +373,7 @@ pub(crate) fn restore_cli_runtime_selected_skills(
     runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
     bindings: &[TurnSkillBinding],
     receipt_path: &Path,
+    plugin_selection: Option<&pioneer_protocol::PluginSelectionSnapshot>,
 ) -> Result<Vec<CliRuntimeSelectedSkill>> {
     if bindings.is_empty() {
         return Ok(Vec::new());
@@ -293,6 +408,18 @@ pub(crate) fn restore_cli_runtime_selected_skills(
                 binding.skill_id
             );
         };
+        let expected_parent = plugin_selection
+            .and_then(|snapshot| {
+                snapshot
+                    .children
+                    .iter()
+                    .find(|child| child.kind == "skill" && child.id == binding.skill_id.as_str())
+            })
+            .map(|child| child.parent_id.as_str());
+        anyhow::ensure!(
+            entry.plugin_id.as_deref() == expected_parent,
+            "CLI skill receipt ownership differs from the ready selection"
+        );
         verify_system_skill_export_alias(
             &binding.source_kind,
             binding.skill_owner.as_deref(),
@@ -315,17 +442,23 @@ pub(crate) fn restore_cli_runtime_selected_skills(
             );
         }
         let receipt_root = normalized_destination(Path::new(entry.native_skills_root.as_str()))?;
-        if receipt_root != native_skills_root {
+        let expected_root = if let Some(parent) = &entry.plugin_id {
+            anyhow::ensure!(
+                entry.install_name == plugin_skill_alias(parent, &binding.skill_id),
+                "plugin skill alias changed"
+            );
+            plugin_contexts_root(&native_skills_root)?
+        } else {
+            native_skills_root.clone()
+        };
+        if receipt_root != expected_root {
             anyhow::bail!(
                 "CLI runtime skill `{}` receipt names a different native skill root",
                 binding.skill_id
             );
         }
-        let expected_path = normalized_destination(
-            native_skills_root
-                .join(entry.install_name.as_str())
-                .as_path(),
-        )?;
+        let expected_path =
+            normalized_destination(expected_root.join(entry.install_name.as_str()).as_path())?;
         let installed_path = normalized_destination(Path::new(entry.install_path.as_str()))?;
         if installed_path != expected_path {
             anyhow::bail!(
@@ -357,6 +490,8 @@ pub(crate) fn restore_cli_runtime_selected_skills(
             );
         }
         selected.push(CliRuntimeSelectedSkill {
+            plugin_id: entry.plugin_id.clone(),
+            skill_relative_path: entry.skill_relative_path.clone(),
             install_name: entry.install_name.clone(),
             installed_path,
             source_folder_hash: entry.source_folder_hash.clone(),
@@ -444,6 +579,9 @@ pub(crate) fn partition_cli_runtime_capabilities(
     let mut partition = CliRuntimeCapabilityPartition::default();
     for capability in capabilities {
         match &capability.kind {
+            pioneer_protocol::TurnCapabilityKind::Plugin { .. } => {
+                return Err("plugin parent must be expanded before CLI projection".into());
+            }
             TurnCapabilityKind::Skill {
                 skill_id,
                 pack_id: None,
@@ -532,6 +670,8 @@ pub(crate) async fn acquire_cli_runtime_skill_destination_lock(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CliRuntimeSkillInstallPlan {
+    pub plugin_id: Option<String>,
+    pub skill_relative_path: Option<String>,
     pub skill_id: SkillId,
     pub owner: Option<String>,
     pub slug: String,
@@ -555,6 +695,8 @@ pub(crate) enum CliRuntimeSkillInstallStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CliRuntimeSkillInstallResult {
+    pub plugin_id: Option<String>,
+    pub skill_relative_path: Option<String>,
     pub status: CliRuntimeSkillInstallStatus,
     pub install_name: String,
     pub source_folder_hash: String,
@@ -565,6 +707,8 @@ pub(crate) struct CliRuntimeSkillInstallResult {
 impl From<&CliRuntimeSkillInstallResult> for CliRuntimeSelectedSkill {
     fn from(value: &CliRuntimeSkillInstallResult) -> Self {
         Self {
+            plugin_id: value.plugin_id.clone(),
+            skill_relative_path: value.skill_relative_path.clone(),
             install_name: value.install_name.clone(),
             installed_path: value.installed_path.clone(),
             source_folder_hash: value.source_folder_hash.clone(),
@@ -586,6 +730,8 @@ fn planned_receipt_entry(
     updated_at_unix_ms: u64,
 ) -> ExternalRuntimeSkillReceiptEntry {
     ExternalRuntimeSkillReceiptEntry {
+        plugin_id: plan.plugin_id.clone(),
+        skill_relative_path: plan.skill_relative_path.clone(),
         skill_id: plan.skill_id.clone(),
         owner: plan.owner.clone(),
         slug: plan.slug.clone(),
@@ -754,11 +900,12 @@ pub(crate) async fn install_one_cli_runtime_skill(
     };
     if let Some(entry) = previous.as_ref()
         && external_runtime_skill_is_current(&receipt, &expected, &plan.destination)?
-        // Another Pioneer environment may have updated the shared export while
-        // this environment's receipt still describes its previous contents.
-        && (managed.is_none() || compute_skill_folder_hash(&plan.destination)? == source_folder_hash)
+        && ((plan.plugin_id.is_none() && managed.is_none())
+            || compute_skill_folder_hash(&plan.destination)? == source_folder_hash)
     {
         return Ok(CliRuntimeSkillInstallResult {
+            plugin_id: plan.plugin_id.clone(),
+            skill_relative_path: plan.skill_relative_path.clone(),
             status: CliRuntimeSkillInstallStatus::Current,
             install_name: plan.install_name.clone(),
             source_folder_hash,
@@ -783,7 +930,12 @@ pub(crate) async fn install_one_cli_runtime_skill(
     }
 
     replace_external_runtime_skill(source, &plan.destination)?;
-    fs::read(plan.destination.join("SKILL.md")).with_context(|| {
+    fs::read(
+        plan.destination
+            .join(plan.skill_relative_path.as_deref().unwrap_or(""))
+            .join("SKILL.md"),
+    )
+    .with_context(|| {
         format!(
             "installed external runtime skill has no readable SKILL.md at `{}`",
             plan.destination.display()
@@ -811,6 +963,8 @@ pub(crate) async fn install_one_cli_runtime_skill(
     }
 
     Ok(CliRuntimeSkillInstallResult {
+        plugin_id: plan.plugin_id.clone(),
+        skill_relative_path: plan.skill_relative_path.clone(),
         status: if previous.is_some() {
             CliRuntimeSkillInstallStatus::Updated
         } else {
@@ -821,6 +975,23 @@ pub(crate) async fn install_one_cli_runtime_skill(
         installed_path: plan.destination.clone(),
         receipt_updated_at_unix_ms: updated_at_unix_ms,
     })
+}
+
+/// Probe the same receipt/materializer contract before touching a projection
+/// used by another native process. Parent admission serializes owned plans;
+/// the installer still rechecks under its existing destination lock.
+pub(crate) fn owned_skill_projection_is_current(
+    plan: &CliRuntimeSkillInstallPlan,
+    candidates: &[ExternalRuntimeReceiptConversionCandidate],
+) -> Result<bool> {
+    anyhow::ensure!(plan.plugin_id.is_some(), "projection is not plugin-owned");
+    let receipt = ensure_external_runtime_receipt_v2(&plan.receipt_path, candidates)?;
+    let hash = compute_skill_folder_hash(&plan.source)?;
+    let expected = planned_receipt_entry(plan, hash.clone(), 0, 0);
+    Ok(
+        external_runtime_skill_is_current(&receipt, &expected, &plan.destination)?
+            && compute_skill_folder_hash(&plan.destination)? == hash,
+    )
 }
 
 pub(crate) fn prepend_installed_skill_items(
@@ -836,6 +1007,7 @@ pub(crate) fn prepend_installed_skill_items(
             name: skill.install_name.clone(),
             path: skill
                 .installed_path
+                .join(skill.skill_relative_path.as_deref().unwrap_or(""))
                 .join("SKILL.md")
                 .to_string_lossy()
                 .into_owned(),
@@ -881,6 +1053,8 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("SKILL.md"), format!("# {name}\n")).unwrap();
         CliRuntimeSkillInstallPlan {
+            plugin_id: None,
+            skill_relative_path: None,
             skill_id: test_skill_id(name, SkillSourceKind::Registry),
             owner: Some("registry".to_owned()),
             slug: name.to_owned(),
@@ -981,6 +1155,8 @@ mod tests {
 
     fn installed_skill(name: &str, path: &str) -> CliRuntimeSkillInstallResult {
         CliRuntimeSkillInstallResult {
+            plugin_id: None,
+            skill_relative_path: None,
             status: CliRuntimeSkillInstallStatus::Current,
             install_name: name.to_owned(),
             source_folder_hash: "source-hash-not-prompt-content".to_owned(),
@@ -1239,6 +1415,7 @@ mod tests {
                 kind,
                 &cli_runtime_turn_skill_bindings(&resolved),
                 &receipt_path,
+                None,
             )
             .unwrap();
             assert_eq!(restored.len(), 4);
@@ -1286,7 +1463,8 @@ mod tests {
                     &runtime,
                     kind,
                     &cli_runtime_turn_skill_bindings(&resolved),
-                    &receipt_path
+                    &receipt_path,
+                    None,
                 )
                 .unwrap(),
                 restored
@@ -1373,6 +1551,7 @@ mod tests {
             pioneer_protocol::CLIAgentRuntimeKind::Claude,
             &cli_runtime_turn_skill_bindings(&resolved),
             &receipt_path,
+            None,
         )
         .unwrap();
         assert_eq!(initial, restored);
@@ -1473,6 +1652,7 @@ mod tests {
                 pioneer_protocol::CLIAgentRuntimeKind::Codex,
                 &cli_runtime_turn_skill_bindings(&[selected]),
                 &plan.receipt_path,
+                None,
             )
             .unwrap_err();
             assert!(
@@ -1634,6 +1814,7 @@ mod tests {
                     pioneer_protocol::CLIAgentRuntimeKind::Claude,
                     &cli_runtime_turn_skill_bindings(&resolved[skill_index..skill_index + 1]),
                     &plan.receipt_path,
+                    None,
                 )
                 .unwrap();
                 assert_eq!(restored, vec![CliRuntimeSelectedSkill::from(&updated)]);
@@ -1756,6 +1937,7 @@ mod tests {
                     pioneer_protocol::CLIAgentRuntimeKind::Codex,
                     &cli_runtime_turn_skill_bindings(&[prod_skill]),
                     &prod_plan.receipt_path,
+                    None,
                 )
                 .unwrap(),
                 vec![CliRuntimeSelectedSkill::from(&refreshed)]
@@ -2277,6 +2459,8 @@ mod tests {
         )
         .unwrap();
         let installed = CliRuntimeSkillInstallResult {
+            plugin_id: None,
+            skill_relative_path: None,
             status: CliRuntimeSkillInstallStatus::Installed,
             install_name: "proposal-51-sentinel".to_owned(),
             source_folder_hash: "fixture-hash".to_owned(),
@@ -2530,11 +2714,14 @@ mod tests {
             CLIAgentRuntimeKind::Claude,
             std::slice::from_ref(&binding),
             plan.receipt_path.as_path(),
+            None,
         )
         .unwrap();
         assert_eq!(
             selected,
             vec![CliRuntimeSelectedSkill {
+                plugin_id: None,
+                skill_relative_path: None,
                 install_name: installed.install_name,
                 installed_path: installed.installed_path.clone(),
                 source_folder_hash: installed.source_folder_hash,
@@ -2547,6 +2734,7 @@ mod tests {
             CLIAgentRuntimeKind::Claude,
             std::slice::from_ref(&binding),
             plan.receipt_path.as_path(),
+            None,
         )
         .unwrap_err();
         assert!(format!("{drift:#}").contains("installed content differs"));
@@ -2559,6 +2747,7 @@ mod tests {
             CLIAgentRuntimeKind::Claude,
             std::slice::from_ref(&binding),
             plan.receipt_path.as_path(),
+            None,
         )
         .unwrap_err();
         assert!(format!("{escaped:#}").contains("non-canonical install name"));
@@ -2597,5 +2786,243 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(retried.status, CliRuntimeSkillInstallStatus::Installed);
+    }
+
+    // C2 source regressions: NOT_RUN / NOT_COMPILED. No native processes.
+    #[test]
+    fn owned_aliases_distinguish_authored_names_and_standalone_destinations() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime_instance(
+            pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex,
+            temp.path().join("home").to_string_lossy().into_owned(),
+            None,
+        );
+        let mut first = resolved_skill("first", SkillSourceKind::User);
+        let mut second = resolved_skill("second", SkillSourceKind::Registry);
+        let mut standalone = resolved_skill("third", SkillSourceKind::User);
+        for skill in [&mut first, &mut second, &mut standalone] {
+            skill.definition.identity.name = "same-name".into();
+        }
+        let contexts = HashMap::from([
+            (
+                first.skill_id.clone(),
+                (
+                    "parent-one".into(),
+                    temp.path().join("one"),
+                    Some("skills/first".into()),
+                ),
+            ),
+            (
+                second.skill_id.clone(),
+                (
+                    "parent-two".into(),
+                    temp.path().join("two"),
+                    Some("skills/second".into()),
+                ),
+            ),
+        ]);
+        let selected = [first, second, standalone];
+        let plans = build_cli_runtime_skill_install_plans_with_contexts(
+            &runtime,
+            pioneer_protocol::CLIAgentRuntimeKind::Codex,
+            &selected,
+            &temp.path().join("receipt.json"),
+            &contexts,
+        )
+        .unwrap();
+        assert_ne!(plans[0].install_name, plans[1].install_name);
+        assert_eq!(plans[2].install_name, "same-name");
+        assert!(
+            plans[2]
+                .destination
+                .starts_with(temp.path().join("home/skills"))
+        );
+        assert!(
+            !plans[0]
+                .destination
+                .starts_with(temp.path().join("home/skills"))
+        );
+        let reversed = build_cli_runtime_skill_install_plans_with_contexts(
+            &runtime,
+            pioneer_protocol::CLIAgentRuntimeKind::Codex,
+            &[selected[1].clone(), selected[0].clone()],
+            &temp.path().join("receipt.json"),
+            &contexts,
+        )
+        .unwrap();
+        assert_eq!(plans[0].install_name, reversed[1].install_name);
+        assert_ne!(
+            plugin_skill_alias("parent-one", &selected[0].skill_id),
+            plugin_skill_alias("parent-two", &selected[0].skill_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_context_receipts_cover_package_siblings_native_override_and_assets_only_updates()
+    {
+        for kind in [
+            pioneer_protocol::CLIAgentRuntimeKind::Codex,
+            pioneer_protocol::CLIAgentRuntimeKind::Claude,
+        ] {
+            for native_override in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut plan = install_plan(temp.path(), "owned");
+                let body = fs::read(plan.source.join("SKILL.md")).unwrap();
+                let relative = (!native_override).then(|| "skills/member".to_owned());
+                if let Some(relative) = &relative {
+                    fs::remove_file(plan.source.join("SKILL.md")).unwrap();
+                    fs::create_dir_all(plan.source.join(relative)).unwrap();
+                    fs::write(plan.source.join(relative).join("SKILL.md"), &body).unwrap();
+                }
+                fs::create_dir_all(plan.source.join("scripts")).unwrap();
+                fs::create_dir_all(plan.source.join("references")).unwrap();
+                fs::write(plan.source.join("scripts/run.sh"), b"sibling script v1").unwrap();
+                fs::write(plan.source.join("references/guide.txt"), b"whole context").unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(
+                        plan.source.join("scripts/run.sh"),
+                        fs::Permissions::from_mode(0o755),
+                    )
+                    .unwrap();
+                }
+                plan.plugin_id = Some("parent".into());
+                plan.skill_relative_path = relative.clone();
+                plan.install_name = plugin_skill_alias("parent", &plan.skill_id);
+                plan.native_skills_root = plugin_contexts_root(&plan.native_skills_root).unwrap();
+                plan.destination = plan.native_skills_root.join(&plan.install_name);
+                plan.runtime_kind = if kind == pioneer_protocol::CLIAgentRuntimeKind::Claude {
+                    "claude"
+                } else {
+                    "codex"
+                }
+                .into();
+                let locks = Arc::new(Mutex::new(HashMap::new()));
+                let receipt_lock = Arc::new(Mutex::new(()));
+                let candidates = [receipt_candidate(&plan)];
+                assert!(!owned_skill_projection_is_current(&plan, &candidates).unwrap());
+                let first =
+                    install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
+                        .await
+                        .unwrap();
+                assert!(owned_skill_projection_is_current(&plan, &candidates).unwrap());
+                let runtime = runtime_instance(
+                    if kind == pioneer_protocol::CLIAgentRuntimeKind::Claude {
+                        pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude
+                    } else {
+                        pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex
+                    },
+                    temp.path().join("runtime").to_string_lossy().into_owned(),
+                    None,
+                );
+                let binding = TurnSkillBinding {
+                    skill_id: plan.skill_id.clone(),
+                    skill_owner: plan.owner.clone(),
+                    skill_slug: plan.slug.clone(),
+                    skill_version: None,
+                    fingerprint: "definition".into(),
+                    source_kind: plan.source_kind.clone(),
+                    resolved_reason: "explicit_capability".into(),
+                };
+                let mut selection = pioneer_protocol::PluginSelectionSnapshot {
+                    phase: "ready".into(),
+                    parents: vec![pioneer_protocol::PluginSelectedParent {
+                        id: "parent".into(),
+                        revision: 1,
+                    }],
+                    children: vec![pioneer_protocol::PluginSelectedChild {
+                        kind: "skill".into(),
+                        id: plan.skill_id.to_string(),
+                        parent_id: "parent".into(),
+                    }],
+                };
+                assert!(
+                    restore_cli_runtime_selected_skills(
+                        &runtime,
+                        kind,
+                        std::slice::from_ref(&binding),
+                        &plan.receipt_path,
+                        Some(&selection)
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    restore_cli_runtime_selected_skills(
+                        &runtime,
+                        kind,
+                        std::slice::from_ref(&binding),
+                        &plan.receipt_path,
+                        None
+                    )
+                    .is_err(),
+                    "owned receipt cannot become standalone on recovery"
+                );
+                selection.children[0].parent_id = "other-parent".into();
+                assert!(
+                    restore_cli_runtime_selected_skills(
+                        &runtime,
+                        kind,
+                        std::slice::from_ref(&binding),
+                        &plan.receipt_path,
+                        Some(&selection)
+                    )
+                    .is_err(),
+                    "receipt must match the exact ready parent identity"
+                );
+                assert_eq!(
+                    fs::read(
+                        plan.destination
+                            .join(relative.as_deref().unwrap_or(""))
+                            .join("SKILL.md")
+                    )
+                    .unwrap(),
+                    body
+                );
+                assert_eq!(
+                    fs::read(plan.destination.join("references/guide.txt")).unwrap(),
+                    b"whole context"
+                );
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        fs::metadata(plan.destination.join("scripts/run.sh"))
+                            .unwrap()
+                            .permissions()
+                            .mode()
+                            & 0o777,
+                        0o755
+                    );
+                }
+                fs::write(plan.source.join("scripts/run.sh"), b"assets only v2").unwrap();
+                assert!(!owned_skill_projection_is_current(&plan, &candidates).unwrap());
+                let updated =
+                    install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
+                        .await
+                        .unwrap();
+                assert_eq!(updated.status, CliRuntimeSkillInstallStatus::Updated);
+                assert_eq!(first.install_name, updated.install_name);
+                assert_ne!(first.source_folder_hash, updated.source_folder_hash);
+                let mut mapping = pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping {
+                    input: Vec::new(),
+                    diagnostics: Vec::new(),
+                };
+                prepend_installed_skill_items(&[updated], &mut mapping);
+                assert!(
+                    matches!(&mapping.input[0], pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Skill { name, path }
+                    if name == &plan.install_name && path == &plan.destination.join(relative.as_deref().unwrap_or("")).join("SKILL.md").to_string_lossy())
+                );
+                fs::write(plan.destination.join("references/guide.txt"), b"tampered").unwrap();
+                assert!(!owned_skill_projection_is_current(&plan, &candidates).unwrap());
+                install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fs::read(plan.destination.join("references/guide.txt")).unwrap(),
+                    b"whole context"
+                );
+            }
+        }
     }
 }

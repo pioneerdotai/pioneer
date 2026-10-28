@@ -83,6 +83,13 @@ constructor = "SkillsCatalogView::new"
 public_modules = []
 edges = ["pioneer-client", "pioneer-desktop-foundation"]
 [[features]]
+package = "pioneer-desktop-plugins"
+path = "desktop-plugins"
+root = "PluginsView"
+constructor = "PluginsView::new"
+public_modules = []
+edges = ["pioneer-client", "pioneer-desktop-foundation"]
+[[features]]
 package = "pioneer-desktop-settings"
 path = "desktop-settings"
 root = "SettingsView"
@@ -154,6 +161,7 @@ edges = ["pioneer-client", "pioneer-desktop-foundation"]
 "TUI-45" = { kind = "RenderOnce", owner = "OnboardingView", symbol = "OnboardingSurface", file = "desktop-onboarding/src/lib.rs" }
 "TUI-46" = { kind = "RenderOnce", owner = "owning feature", symbol = "AvatarSurface", file = "desktop-foundation/src/avatar.rs" }
 "TUI-47" = { kind = "Behavior", owner = "OnboardingView", symbol = "Popover", file = "desktop-onboarding/src/switcher.rs" }
+"TUI-48" = { kind = "Entity", owner = "PluginsView", symbol = "PluginsView", file = "desktop-plugins/src/lib.rs" }
 
 [caches]
 avatar_bytes = { owner = "Client AvatarStore", source = "client/src/avatars.rs", max_files = 2048, max_age_days = 30 }

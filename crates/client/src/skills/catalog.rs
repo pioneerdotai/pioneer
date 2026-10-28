@@ -99,6 +99,9 @@ pub fn skill_key(skill_id: &SkillId) -> SkillId {
 /// Tasks, and Subagents are always active and therefore do not belong in
 /// user-managed catalog or composer-selection surfaces.
 pub fn skill_is_user_selectable(skill: &SkillListItem) -> bool {
+    if skill.plugin_owner.is_some() {
+        return false;
+    }
     skill.policy.allow_implicit_invocation_editable
 }
 
@@ -140,7 +143,8 @@ pub fn filter_skills_by_search<'a>(
 }
 
 pub fn derive_skills_catalog_and_installed(mut catalog: Vec<SkillListItem>) -> SkillsCatalogSplit {
-    catalog.retain(skill_is_user_selectable);
+    // Keep owned native records in the shared catalog; surface selectors hide them.
+    catalog.retain(|skill| skill.plugin_owner.is_some() || skill_is_user_selectable(skill));
     catalog.sort_by(|left, right| {
         left.source_kind
             .cmp(&right.source_kind)
@@ -194,7 +198,7 @@ pub fn project_skill_management(
 ) -> SkillManagementProjection {
     let mut standalone = installed
         .iter()
-        .filter(|skill| skill.pack.is_none())
+        .filter(|skill| skill.pack.is_none() && skill.plugin_owner.is_none())
         .cloned()
         .collect::<Vec<_>>();
     standalone.sort_by(skill_management_order);
@@ -373,6 +377,21 @@ mod tests {
     };
     use std::cell::RefCell;
 
+    #[test]
+    fn owned_records_survive_common_catalog_but_are_hidden_by_surface_selectors() {
+        let standalone = skill("standalone", "user", true);
+        let mut owned = skill("bundled", "user", true);
+        owned.plugin_owner = Some(pioneer_protocol::PluginOwner {
+            plugin_id: "P".repeat(21),
+            member_key: "bundled".into(),
+        });
+        let snapshot = project_skills_snapshot(vec![owned.clone(), standalone], vec![]);
+        assert_eq!(snapshot.catalog.len(), 2);
+        assert_eq!(snapshot.installed.len(), 2);
+        assert_eq!(snapshot.management.standalone.len(), 1);
+        assert!(!skill_is_user_selectable(&owned));
+    }
+
     fn skill_id(slug: &str, source_kind: &str) -> SkillId {
         let seed = format!("{slug}{source_kind}")
             .chars()
@@ -383,6 +402,7 @@ mod tests {
 
     fn skill(slug: &str, source_kind: &str, installed: bool) -> SkillListItem {
         SkillListItem {
+            plugin_owner: None,
             skill_id: skill_id(slug, source_kind),
             pack: None,
             owner: None,

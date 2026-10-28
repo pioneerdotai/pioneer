@@ -45,8 +45,30 @@ async fn policy_upgrade_preserves_execution_intents_and_root_publication_survive
         db.execute_unprepared(sql).await.unwrap();
     }
     // Historical input and ready response must never populate the new table.
-    answer_item(&store, "old-human", "old-ready", READY + 10).await;
-    complete(&store, "root", "old-human", READY + 10).await;
+    // Seed the historical schema directly: current CRUD models include columns
+    // introduced after the upgrade boundary under test.
+    let historical_answer = serde_json::to_string(&TurnItem::AgentMessage {
+        id: "old-ready".into(),
+        text: "fixture original publication".into(),
+        phase: Default::default(),
+        markdown: None,
+        markdown_version: None,
+    })
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES('old-ready-row','old-human','old-ready','agent_message','completed',?,datetime(?,'unixepoch'),datetime(?,'unixepoch'))",
+        [historical_answer.into(), (READY + 10).into(), (READY + 10).into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE turn SET status='completed',updated_at=datetime(?,'unixepoch') WHERE id='old-human'",
+        [(READY + 10).into()],
+    ))
+    .await
+    .unwrap();
     writer
         .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
         .await

@@ -361,12 +361,19 @@ impl ComposerView {
         cx: &mut Context<Self>,
     ) -> Option<Entity<CapabilityPickerState>> {
         let capabilities = self.principal_presentation_capabilities();
-        if !self.can_start_active_thread_agent_presentation()
-            || !match kind {
-                ComposerPickerKind::Skills => capabilities.can_use_skills,
-                ComposerPickerKind::Mcp => capabilities.can_use_mcp,
-            }
-        {
+        let (allowed, placeholder) = match kind {
+            ComposerPickerKind::Skills => (
+                capabilities.can_use_skills,
+                t!("chat.composer.capability_picker.search_skills").to_string(),
+            ),
+            ComposerPickerKind::Mcp => (
+                capabilities.can_use_mcp,
+                t!("chat.composer.capability_picker.search_mcp").to_string(),
+            ),
+            // Plugins use their own parent-only picker in open_composer_plugins_picker.
+            ComposerPickerKind::Plugins => return None,
+        };
+        if !self.can_start_active_thread_agent_presentation() || !allowed {
             return None;
         }
         if let Some(old) = self.capability_picker.take() {
@@ -392,12 +399,6 @@ impl ComposerView {
             .as_ref()?
             .identity
             .clone();
-        let placeholder = match kind {
-            ComposerPickerKind::Skills => {
-                t!("chat.composer.capability_picker.search_skills").to_string()
-            }
-            ComposerPickerKind::Mcp => t!("chat.composer.capability_picker.search_mcp").to_string(),
-        };
         let registrar = self.thread_bindings.registrar();
         let picker = cx.new(|cx| {
             CapabilityPickerState::new(client, registrar, identity, window, cx, placeholder)
@@ -1611,5 +1612,66 @@ mod lifecycle_tests {
         assert!(weak.upgrade().is_none());
         assert!(search.upgrade().is_none());
         cx.update(|window, cx| assert_eq!(window.focused(cx), Some(trigger)));
+    }
+}
+
+impl ComposerView {
+    pub(super) fn open_composer_plugins_picker(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let permissions = self.principal_presentation_capabilities();
+        if !self.can_start_active_thread_agent_presentation()
+            || !permissions.can_use_skills
+            || !permissions.can_use_mcp
+        {
+            return;
+        }
+        let Some(input) = &self.composer_input else {
+            return;
+        };
+        let thread = input.thread_id().to_owned();
+        let draft = input.draft_id();
+        let Some(workspace) = self
+            .client
+            .navigation_snapshot()
+            .workspace_id()
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let generation = self.client.authorization_connection_generation();
+        let selected = self
+            .composer_domain()
+            .capabilities
+            .iter()
+            .filter_map(|capability| match &capability.kind {
+                pioneer_client::composer::capabilities::ComposerCapabilityKind::Plugin {
+                    plugin_id,
+                    ..
+                } => Some(plugin_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let view = cx.entity().downgrade();
+        super::plugin_picker::open_plugin_picker(
+            self.client.clone(),
+            workspace,
+            selected,
+            window,
+            cx,
+            move |result, window, cx| {
+                let _ = view.update(cx, |view, cx| {
+                if view.client.authorization_connection_generation() != generation || view.composer_input.as_ref().is_none_or(|input| input.thread_id() != thread || input.draft_id() != draft) { return; }
+                if let Some(selected) = result {
+                    let mut capabilities: Vec<_> = view.composer_domain().capabilities.iter().filter(|c| !matches!(c.kind, pioneer_client::composer::capabilities::ComposerCapabilityKind::Plugin { .. })).cloned().collect();
+                    capabilities.extend(selected);
+                    view.composer_domain_intent(pioneer_client::composer::state_machine::ComposerDomainAction::SetCapabilities { capabilities });
+                }
+                view.focus(window, cx); cx.notify();
+            });
+            },
+        );
     }
 }

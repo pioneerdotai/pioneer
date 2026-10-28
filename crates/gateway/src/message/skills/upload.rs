@@ -22,7 +22,7 @@ const UPLOAD_STATUS_CONSUMED: &str = "consumed";
 const UPLOAD_STATUS_ABORTED: &str = "aborted";
 const UPLOAD_STATUS_EXPIRED: &str = "expired";
 
-pub(super) struct MaterializedSkillSource {
+pub(crate) struct MaterializedSkillSource {
     pub source_dir: PathBuf,
     pub cleanup_root: PathBuf,
     pub upload: SkillUploadSessionRecord,
@@ -197,6 +197,7 @@ impl MessageProcessor {
         }
 
         let record = SkillUploadSessionRecord {
+            purpose: params.purpose.as_str().to_owned(),
             upload_id: upload_id.clone(),
             workspace_id: workspace_id.clone(),
             connection_id,
@@ -763,6 +764,13 @@ impl MessageProcessor {
                 request_id,
             )
             .await?;
+        if materialized.upload.purpose != "skill" {
+            let _ = fs::remove_dir_all(&materialized.cleanup_root);
+            return Err(invalid_materialized_archive_error(
+                request_id,
+                anyhow!("upload purpose mismatch"),
+            ));
+        }
         match validate_single_skill_root(materialized.source_dir.clone()).and_then(|source_dir| {
             normalize_materialized_skill_frontmatter(source_dir.as_path())?;
             Ok(source_dir)
@@ -795,6 +803,13 @@ impl MessageProcessor {
                 request_id,
             )
             .await?;
+        if materialized.upload.purpose != "skill" {
+            let _ = fs::remove_dir_all(&materialized.cleanup_root);
+            return Err(invalid_materialized_archive_error(
+                request_id,
+                anyhow!("upload purpose mismatch"),
+            ));
+        }
         match validate_skill_pack_root(materialized.source_dir.clone()).and_then(|validated| {
             for member in &validated.members {
                 normalize_materialized_skill_frontmatter(member.source_dir.as_path())?;
@@ -809,7 +824,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn materialize_uploaded_archive_source(
+    pub(crate) async fn materialize_uploaded_archive_source(
         &self,
         connection_id: ConnectionId,
         workspace_id: &str,
@@ -856,13 +871,27 @@ impl MessageProcessor {
             )
         })?;
 
-        let source_dir = match extract_archive_secure(
-            PathBuf::from(upload.payload_path.as_str()).as_path(),
-            cleanup_root.as_path(),
-            context.max_upload_uncompressed_bytes,
-            context.max_upload_archive_entries,
-            context.security_policy.max_install_file_bytes,
-        ) {
+        let archive = PathBuf::from(upload.payload_path.as_str());
+        let extracted = if upload.purpose == "plugin" {
+            extract_archive_with_purpose(
+                &archive,
+                &cleanup_root,
+                context.max_upload_uncompressed_bytes,
+                context.max_upload_archive_entries,
+                context.security_policy.max_install_file_bytes,
+                true,
+            )
+        } else {
+            // Keep standalone extraction on its original security branch.
+            extract_archive_secure(
+                &archive,
+                &cleanup_root,
+                context.max_upload_uncompressed_bytes,
+                context.max_upload_archive_entries,
+                context.security_policy.max_install_file_bytes,
+            )
+        };
+        let source_dir = match extracted {
             Ok(source_dir) => source_dir,
             Err(error) => {
                 let materialized = MaterializedSkillSource {
@@ -985,7 +1014,7 @@ impl MessageProcessor {
         Ok(())
     }
 
-    pub(super) fn cleanup_upload_artifacts(
+    pub(crate) fn cleanup_upload_artifacts(
         &self,
         upload: &SkillUploadSessionRecord,
         materialized_cleanup_root: &std::path::Path,
@@ -1530,6 +1559,26 @@ pub(super) fn extract_archive_secure(
     max_entries: usize,
     max_file_bytes: usize,
 ) -> Result<PathBuf> {
+    extract_archive_with_purpose(
+        archive_path,
+        cleanup_root,
+        max_uncompressed_bytes,
+        max_entries,
+        max_file_bytes,
+        false,
+    )
+}
+
+fn extract_archive_with_purpose(
+    archive_path: &Path,
+    cleanup_root: &Path,
+    max_uncompressed_bytes: usize,
+    max_entries: usize,
+    max_file_bytes: usize,
+    plugin: bool,
+) -> Result<PathBuf> {
+    let mut links = Vec::new();
+    let mut directory_modes = Vec::new();
     let file = fs::File::open(archive_path)
         .with_context(|| format!("failed to open skill archive `{}`", archive_path.display()))?;
     let decoder = GzDecoder::new(file);
@@ -1580,6 +1629,12 @@ pub(super) fn extract_archive_secure(
         }
 
         if entry_type.is_dir() {
+            if plugin {
+                directory_modes.push((
+                    target_path.clone(),
+                    entry.header().mode().unwrap_or(0o755) & 0o777,
+                ));
+            }
             fs::create_dir_all(target_path.as_path()).with_context(|| {
                 format!(
                     "failed to create archive directory `{}`",
@@ -1590,6 +1645,14 @@ pub(super) fn extract_archive_secure(
             continue;
         }
 
+        if plugin && entry_type.is_symlink() {
+            let target = entry
+                .link_name()?
+                .ok_or_else(|| anyhow!("missing link target"))?
+                .into_owned();
+            links.push((target_path, target));
+            continue;
+        }
         if !entry_type.is_file() {
             bail!(
                 "archive contains unsupported entry `{}`",
@@ -1623,7 +1686,13 @@ pub(super) fn extract_archive_secure(
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = entry.header().mode().unwrap_or(0o644);
-            let permissions = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
+            let permissions = if plugin {
+                mode & 0o777
+            } else if mode & 0o111 != 0 {
+                0o755
+            } else {
+                0o644
+            };
             let _ = fs::set_permissions(
                 target_path.as_path(),
                 fs::Permissions::from_mode(permissions),
@@ -1632,6 +1701,43 @@ pub(super) fn extract_archive_secure(
         ensure_materialized_path_contained(cleanup_root.as_path(), target_path.as_path())?;
     }
 
+    // Reject the entire link topology before the first link write. Deferring
+    // links protects regular writes, but a link must not become an ancestor
+    // of a later link (or of an implicit parent directory).
+    let link_paths: HashSet<_> = links.iter().map(|(path, _)| path.as_path()).collect();
+    for relative in &seen_paths {
+        let path = cleanup_root.join(relative);
+        for ancestor in path.ancestors().skip(1) {
+            if link_paths.contains(ancestor) {
+                bail!("archive symlink overlaps descendant entry");
+            }
+        }
+    }
+    // Snapshot capture follows only contained links and normalizes them into
+    // regular files for the genuine native installer. External leaf links are
+    // retained as denied assets; they are never traversed during extraction.
+    for (path, target) in links {
+        if fs::symlink_metadata(&path).is_ok() {
+            bail!("link overlaps materialized entry");
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &path)?;
+        #[cfg(not(unix))]
+        {
+            let _ = (path, target);
+            bail!("plugin archive links unsupported on this host");
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for (path, mode) in directory_modes.into_iter().rev() {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
+    }
     let root = root_name.ok_or_else(|| anyhow!("archive is empty"))?;
     let source_dir = cleanup_root.join(root);
     ensure_materialized_path_contained(cleanup_root.as_path(), source_dir.as_path())?;
@@ -1794,6 +1900,109 @@ mod tests {
 
         assert!(gap.contains("does not match chunk offset"));
         assert_eq!(contents, b"hellworld");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_archive_normalizes_contained_links_without_weakening_legacy_extraction() {
+        let case = TempCase::new("plugin-links");
+        let archive = case.path.join("plugin.tar.gz");
+        write_archive(
+            &archive,
+            &[
+                TestEntry::dir("plugin"),
+                TestEntry::file("plugin/plugin.json", br#"{"name":"mixed"}"#),
+                TestEntry::file("plugin/bin/helper", b"data"),
+                TestEntry::symlink("plugin/bin/contained", "helper"),
+                TestEntry::symlink("plugin/outside", "../../outside"),
+            ],
+        );
+        let root = extract_archive_with_purpose(&archive, &case.materialized, 4096, 16, 1024, true)
+            .unwrap();
+        let snapshot =
+            pioneer_plugins::Snapshot::capture(&root, Default::default(), || false).unwrap();
+        assert_eq!(snapshot.file("bin/contained"), Some(b"data".as_slice()));
+        assert!(matches!(
+            snapshot.entries().get("outside"),
+            Some(pioneer_plugins::Entry::Denied)
+        ));
+        let legacy = TempCase::new("legacy-links");
+        assert!(extract_archive_secure(&archive, &legacy.materialized, 4096, 16, 1024).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_symlink_cannot_redirect_later_archive_writes() {
+        let case = TempCase::new("plugin-link-write");
+        let archive = case.path.join("plugin.tar.gz");
+        write_archive(
+            &archive,
+            &[
+                TestEntry::dir("plugin"),
+                TestEntry::symlink("plugin/assets", "../../escape"),
+                TestEntry::file("plugin/assets/body", b"contained"),
+            ],
+        );
+        assert!(
+            extract_archive_with_purpose(&archive, &case.materialized, 4096, 16, 1024, true)
+                .is_err()
+        );
+        assert!(!case.path.join("escape/body").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_nested_links_never_write_through_an_external_ancestor() {
+        for nested in ["plugin/a/new-link", "plugin/a/new-dir/link"] {
+            for ancestor_first in [true, false] {
+                let case = TempCase::new("plugin-nested-link-write");
+                let external = case.path.join("external");
+                fs::create_dir(&external).unwrap();
+                fs::write(external.join("sentinel"), b"unchanged").unwrap();
+                let archive = case.path.join("plugin.tar.gz");
+                let external_target = external.to_str().unwrap();
+                let (first, second) = if ancestor_first {
+                    (
+                        TestEntry::symlink("plugin/a", external_target),
+                        TestEntry::symlink(nested, "missing-target"),
+                    )
+                } else {
+                    (
+                        TestEntry::symlink(nested, "missing-target"),
+                        TestEntry::symlink("plugin/a", external_target),
+                    )
+                };
+                write_archive(
+                    &archive,
+                    &[
+                        TestEntry::file("plugin/plugin.json", br#"{"name":"mixed"}"#),
+                        first,
+                        second,
+                    ],
+                );
+                assert!(
+                    extract_archive_with_purpose(
+                        &archive,
+                        &case.materialized,
+                        4096,
+                        16,
+                        1024,
+                        true
+                    )
+                    .is_err()
+                );
+                assert_eq!(fs::read(external.join("sentinel")).unwrap(), b"unchanged");
+                assert_eq!(
+                    fs::read_dir(&external).unwrap().count(),
+                    1,
+                    "no external directory or dangling link may be created"
+                );
+                assert!(
+                    fs::symlink_metadata(case.materialized.join("plugin/a")).is_err(),
+                    "reject the topology before creating even its first link"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2292,7 +2501,7 @@ mod tests {
     enum TestEntryKind {
         Dir,
         File(&'static [u8]),
-        Symlink(&'static str),
+        Symlink(String),
         Hardlink(&'static str),
         Special,
     }
@@ -2312,10 +2521,10 @@ mod tests {
             }
         }
 
-        fn symlink(path: &'static str, target: &'static str) -> Self {
+        fn symlink(path: &'static str, target: &str) -> Self {
             Self {
                 path,
-                kind: TestEntryKind::Symlink(target),
+                kind: TestEntryKind::Symlink(target.to_owned()),
             }
         }
 
@@ -2407,11 +2616,18 @@ mod tests {
             TestEntryKind::Symlink(target) => {
                 header.set_entry_type(EntryType::Symlink);
                 header.set_size(0);
-                header.set_link_name(target).expect("set symlink target");
-                header.set_cksum();
-                builder
-                    .append(&header, Cursor::new(Vec::<u8>::new()))
-                    .expect("append symlink");
+                if header.set_link_name(target).is_err() {
+                    // macOS temporary roots can exceed GNU's fixed link field.
+                    // Let the builder encode the long-link extension for them.
+                    builder
+                        .append_link(&mut header, entry.path, target)
+                        .expect("append long symlink");
+                } else {
+                    header.set_cksum();
+                    builder
+                        .append(&header, Cursor::new(Vec::<u8>::new()))
+                        .expect("append symlink");
+                }
             }
             TestEntryKind::Hardlink(target) => {
                 header.set_entry_type(EntryType::Link);

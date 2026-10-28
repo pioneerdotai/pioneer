@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PluginsRetryParams",
+  "type": "object",
+  "properties": {
+    "components": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/PluginComponentKey"
+      }
+    },
+    "expected_revision": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "plugin_id": {
+      "type": "string"
+    },
+    "restore_removed": {
+      "type": "boolean",
+      "default": false
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspace_id",
+    "plugin_id",
+    "expected_revision"
+  ],
+  "$defs": {
+    "PluginComponentKey": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "member_key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "member_key"
+      ]
+    }
+  }
+}

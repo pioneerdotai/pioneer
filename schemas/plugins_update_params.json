@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PluginsUpdateParams",
+  "type": "object",
+  "properties": {
+    "confirm_changes": {
+      "type": "boolean"
+    },
+    "expected_fingerprint": {
+      "type": "string"
+    },
+    "expected_revision": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "plugin_id": {
+      "type": "string"
+    },
+    "upload_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspace_id",
+    "plugin_id",
+    "expected_revision",
+    "upload_id",
+    "expected_fingerprint",
+    "confirm_changes"
+  ]
+}

@@ -105,6 +105,16 @@
         "name": {
           "type": "string"
         },
+        "plugin_owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginOwner"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "policy": {
           "$ref": "#/$defs/McpPolicyState"
         },
@@ -252,6 +262,21 @@
         "code",
         "level",
         "message"
+      ]
+    },
+    "PluginOwner": {
+      "type": "object",
+      "properties": {
+        "member_key": {
+          "type": "string"
+        },
+        "plugin_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "member_key"
       ]
     }
   }

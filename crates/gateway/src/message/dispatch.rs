@@ -918,7 +918,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn authorize_normal_request(
+    pub(super) async fn authorize_normal_request(
         &self,
         context: &crate::request_context::RequestContext,
         request: &JsonRpcRequest,
@@ -1573,6 +1573,8 @@ impl MessageProcessor {
                         | methods::ARTIFACT_CAPABILITIES
                         | methods::ARTIFACT_LIST
                         | methods::SKILLS_LIST
+                        | methods::PLUGINS_LIST
+                        | methods::PLUGINS_DETAILS
                         | methods::CLI_RUNTIME_LIST
                         | methods::CLI_RUNTIME_GET
                         | methods::CLI_RUNTIME_STATUS
@@ -1613,6 +1615,11 @@ impl MessageProcessor {
                             .map_err(|_| invalid_params())?
                             .workspace_id
                     }
+                    methods::PLUGINS_LIST | methods::PLUGINS_DETAILS => params
+                        .get("workspace_id")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(invalid_params)?
+                        .to_owned(),
                     methods::SKILLS_LIST => {
                         serde_json::from_value::<SkillListParams>(params)
                             .map_err(|_| invalid_params())?
@@ -6132,6 +6139,7 @@ impl MessageProcessor {
                         }
                     }
                 }
+                methods::PLUGINS_LIST | methods::PLUGINS_DETAILS | methods::PLUGINS_PREVIEW | methods::PLUGINS_INSTALL | methods::PLUGINS_SET_ENABLED | methods::PLUGINS_UPDATE | methods::PLUGINS_REMOVE | methods::PLUGINS_RETRY | methods::PLUGINS_CONTINUE => { self.plugins_request(&context, request).await; }
                 methods::SKILLS_INSTALL => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsInstallParams>(params_value) {

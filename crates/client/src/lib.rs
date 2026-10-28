@@ -85,6 +85,7 @@ pub mod mcp;
 pub mod navigation;
 pub mod notifications;
 pub mod platform;
+pub mod plugins;
 pub mod providers;
 pub mod request_state;
 pub mod rpc;

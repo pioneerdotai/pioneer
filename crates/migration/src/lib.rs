@@ -12,6 +12,8 @@ mod m20261026_000002_frozen_proof_discovery_index;
 mod m20261026_000001_agent_start_reconciliation_index;
 mod m20261026_000002_agent_action_immediate_terminal_index;
 
+mod m20261005_000001_plugin_ownership;
+
 pub struct Migrator;
 
 pub mod stable_skill_id;
@@ -217,6 +219,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261026_000002_frozen_proof_discovery_index::Migration),
             Box::new(m20261026_000001_agent_start_reconciliation_index::Migration),
             Box::new(m20261026_000002_agent_action_immediate_terminal_index::Migration),
+            Box::new(m20261005_000001_plugin_ownership::Migration),
         ]
     }
 }

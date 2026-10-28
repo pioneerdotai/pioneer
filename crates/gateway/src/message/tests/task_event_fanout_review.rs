@@ -1,4 +1,4 @@
-//! Review regressions. Compile only until orchestrator acceptance.
+//! Task event fanout scheduling and cutover regressions.
 use super::*;
 use crate::message::TaskEventFanoutSummary;
 use pioneer_crud::{TASK_EVENT_FANOUT_BYTE_BUDGET as BYTES, TaskEventFanoutOutcome};

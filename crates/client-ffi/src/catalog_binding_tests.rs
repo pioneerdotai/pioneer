@@ -6,6 +6,8 @@ use pioneer_client::{
 };
 fn runtime(core: Arc<ClientCore>) -> ClientFfiRuntime {
     ClientFfiRuntime {
+        native_oauth: Arc::new(plugin_shell::NativeOAuthShell::new(&core)),
+        plugin_uploads: Default::default(),
         core,
         config: Default::default(),
         client_subscriptions: Default::default(),

@@ -35,8 +35,26 @@ impl SkillArchiveFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillUploadPurpose {
+    #[default]
+    Skill,
+    Plugin,
+}
+impl SkillUploadPurpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Skill => "skill",
+            Self::Plugin => "plugin",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillsUploadStartParams {
+    #[serde(default)]
+    pub purpose: SkillUploadPurpose,
     pub workspace_id: String,
     pub file_name: String,
     pub archive_format: SkillArchiveFormat,
@@ -137,6 +155,8 @@ pub struct SkillPackMembership {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillListItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_owner: Option<crate::PluginOwner>,
     pub skill_id: SkillId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack: Option<SkillPackMembership>,
@@ -497,6 +517,7 @@ mod tests {
 
     fn list_item(character: char, pack: Option<SkillPackMembership>) -> SkillListItem {
         SkillListItem {
+            plugin_owner: None,
             skill_id: skill_id(character),
             pack,
             owner: None,
@@ -941,6 +962,7 @@ mod tests {
     #[test]
     fn management_results_and_notifications_carry_id_and_presentation() {
         let list_item = SkillListItem {
+            plugin_owner: None,
             skill_id: skill_id('E'),
             pack: None,
             owner: Some("owner".to_owned()),
@@ -1123,6 +1145,7 @@ mod tests {
     #[test]
     fn upload_control_params_round_trip() {
         let start = SkillsUploadStartParams {
+            purpose: Default::default(),
             workspace_id: "ws_000000000000000001".to_owned(),
             file_name: "skill.tar.gz".to_owned(),
             archive_format: SkillArchiveFormat::TarGz,

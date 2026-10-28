@@ -24,6 +24,7 @@ config_json = "JSON конфиг"
 secret_store_hint = "Секретные значения из env, headers, tokens и authorization сохраняются в хранилище секретов шлюза."
 
 [mcp.dialog.error]
+owned_server_body = "Введите конфигурацию одного сервера с command или URL."
 config_required = "Нужно указать JSON конфиг MCP"
 config_invalid = "JSON конфиг MCP некорректен: %{error}"
 servers_required = "JSON конфиг MCP должен содержать объект mcpServers"
@@ -68,6 +69,7 @@ restart = "Перезапустить"
 uninstall = "Удалить"
 
 [mcp.details]
+configure = "Настроить"
 not_selected = "MCP сервер не выбран"
 enabled = "Включён"
 implicit = "Неявный"

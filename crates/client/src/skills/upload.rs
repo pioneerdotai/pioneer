@@ -62,6 +62,7 @@ pub fn skills_upload_start_params(
     archive: &SkillUploadArchive,
 ) -> Result<SkillsUploadStartParams> {
     Ok(SkillsUploadStartParams {
+        purpose: Default::default(),
         workspace_id: workspace_id.into(),
         file_name: archive.file_name.clone(),
         archive_format: SkillArchiveFormat::TarGz,

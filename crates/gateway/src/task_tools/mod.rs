@@ -902,6 +902,13 @@ impl TaskToolAuthorizationScope {
             None,
         )
         .map_err(|_| task_tool_authorization_error())?;
+        if let Some(launch) = params.launch.as_ref() {
+            request.capabilities = processor
+                .normalize_task_launch_capabilities(workspace_id.as_str(), &launch.execution)
+                .await
+                .map_err(|_| task_tool_authorization_error())?
+                .execution;
+        }
         if let Some(profile) = profile {
             request.provider = profile.provider_id.clone();
             request.model = profile.model_id.clone();
@@ -1369,7 +1376,13 @@ impl TaskToolHandler {
     async fn merged_immediate_task_capabilities(
         &self,
         agent_launch: &pioneer_protocol::AgentLaunchSelection,
-    ) -> Result<Vec<pioneer_protocol::TurnCapability>, ToolError> {
+    ) -> Result<
+        (
+            Vec<pioneer_protocol::TurnCapability>,
+            Vec<pioneer_protocol::TurnCapability>,
+        ),
+        ToolError,
+    > {
         let snapshot = self
             .processor
             .crud_store
@@ -1402,7 +1415,24 @@ impl TaskToolHandler {
             ))
         })?;
         capabilities = merge_task_capabilities(capabilities, requested);
-        if capabilities.len() > pioneer_protocol::TURN_EXECUTION_CAPABILITY_MAX_COUNT {
+        let ceiling = capabilities
+            .iter()
+            .map(|cap| cap.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let presentation = self
+            .processor
+            .inherited_plugin_presentation(
+                self.context.workspace_id.as_str(),
+                self.context.turn_id.as_str(),
+                &capabilities,
+            )
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "parent plugin selection unavailable: {error:#}"
+                ))
+            })?;
+        if presentation.len() > pioneer_protocol::TURN_EXECUTION_CAPABILITY_MAX_COUNT {
             return Err(ToolError::invalid_arguments(
                 "immediate Task capabilities exceed the Turn limit",
             ));
@@ -1410,10 +1440,13 @@ impl TaskToolHandler {
         self.processor
             .normalize_turn_skill_capabilities(
                 self.context.workspace_id.as_str(),
-                capabilities.as_slice(),
+                presentation.as_slice(),
             )
             .await
-            .map(|normalized| normalized.execution)
+            .map(|mut normalized| {
+                normalized.execution.retain(|cap| ceiling.contains(&cap.id));
+                (normalized.execution, normalized.presentation)
+            })
             .map_err(|error| {
                 ToolError::invalid_arguments(format!(
                     "immediate Task capabilities are unavailable: {error}"
@@ -2080,13 +2113,21 @@ impl TaskToolHandler {
                 .await?;
             crate::message::agent_action_tools::pin_immediate_task_capabilities(
                 &mut persisted_launch,
-                &capabilities,
+                &capabilities.0,
             )
             .map_err(|error| {
                 ToolError::invalid_arguments(format!(
                     "invalid immediate Task capabilities: {error:#}"
                 ))
             })?;
+            if capabilities.1.iter().any(|cap| {
+                matches!(
+                    cap.kind,
+                    pioneer_protocol::TurnCapabilityKind::Plugin { .. }
+                )
+            }) {
+                persisted_launch.execution.selected_capabilities = capabilities.1;
+            }
         }
         params.launch = Some(persisted_launch.clone());
         create_context.launch_selection = Some(persisted_launch);

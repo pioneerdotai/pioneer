@@ -55,11 +55,11 @@ pub use installer::{
     MaterializedSkillFacts, MaterializedSkillPreparation, PrepareMaterializedSkillRequest,
     PreparedMaterializedSkill, PreviousSkillInstallation, ReversibleSkillRemoval,
     ReversibleSkillRemovalBatch, ReversibleSkillRemovalTarget, SkillInstallerPolicy,
-    StageReversibleSkillRemovalsRequest, UninstallSkillRequest, UninstallSkillResult,
-    UpdateSkillRequest, canonical_skill_install_path, commit_prepared_skill,
+    StageReversibleSkillRemovalsRequest, StagedSkillFolder, UninstallSkillRequest,
+    UninstallSkillResult, UpdateSkillRequest, canonical_skill_install_path, commit_prepared_skill,
     finalize_prepared_skill_commit, finalize_reversible_skill_removals, install_skill,
     prepare_materialized_skill, rollback_prepared_skill_commit, rollback_reversible_skill_removals,
-    stage_reversible_skill_removals, uninstall_skill, update_skill,
+    stage_reversible_skill_removals, stage_skill_folder, uninstall_skill, update_skill,
 };
 pub use pioneer_protocol::SkillId;
 pub use policy::{

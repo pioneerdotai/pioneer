@@ -24,6 +24,7 @@ config_json = "Config JSON"
 secret_store_hint = "Secret values from env, headers, tokens and authorization fields are stored through the gateway secret store."
 
 [mcp.dialog.error]
+owned_server_body = "Enter one server configuration object with command or URL."
 config_required = "MCP config JSON is required"
 config_invalid = "MCP config JSON is invalid: %{error}"
 servers_required = "MCP config JSON must contain an mcpServers object"
@@ -68,6 +69,7 @@ restart = "Restart"
 uninstall = "Uninstall"
 
 [mcp.details]
+configure = "Configure"
 not_selected = "MCP server is not selected"
 enabled = "Enabled"
 implicit = "Implicit"

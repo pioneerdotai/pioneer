@@ -84,6 +84,21 @@ async fn idle_cleanup_preserves_real_admission_silent_turn_terminal_effects_and_
     })
     .await
     .expect("real admission must persist its running binding");
+    // The running binding precedes the execution-window commit. Wait for the
+    // admission transition to finish before advancing the runtime clock, or
+    // the jump can expire an in-flight SQLite authorization query.
+    let key = CLIAgentRuntimeSessionKey::new(
+        &harness.workspace_id,
+        "codex",
+        &binding.continuation_thread_id,
+    )
+    .unwrap();
+    let transition = processor.cli_runtime_session_transition_mutex(&key).await;
+    drop(
+        timeout(Duration::from_secs(10), transition.lock())
+            .await
+            .expect("real admission must finish before the idle clock advances"),
+    );
     // No event, token, approval response or activity heartbeat is required to
     // keep this real admitted Turn alive through a wait longer than its TTL.
     elapse(Duration::from_secs(601)).await;
@@ -314,15 +329,26 @@ async fn idle_worker_continues_after_close_error_and_shutdown_joins_inflight_lif
         1
     );
     assert_eq!(session.closes.load(Ordering::SeqCst), 2);
-    {
+    let failed_instance = {
         let events = lifecycle.events.lock().await;
-        assert_eq!(events.len(), 4);
-        for pair in events.chunks_exact(2) {
-            assert_eq!(pair[0].0, pair[1].0);
-            assert_eq!((pair[0].1, pair[1].1), ("before", "after"));
-            assert_eq!(pair[1].2, pair[0].2 + 1);
-        }
-    }
+        assert_eq!(events.len(), 3);
+        assert_eq!((events[0].1, events[0].2), ("before", 0));
+        assert_ne!(events[0].0, events[1].0);
+        assert_eq!(events[1].0, events[2].0);
+        assert_eq!((events[1].1, events[1].2), ("before", 1));
+        assert_eq!((events[2].1, events[2].2), ("after", 2));
+        // Failed native cleanup retains ownership and must not run the
+        // successful-stop callback that releases its resources.
+        events[0].0.clone()
+    };
+    assert!(
+        manager
+            .close_session_instance(&failed_instance)
+            .await
+            .unwrap()
+    );
+    assert_eq!(session.closes.load(Ordering::SeqCst), 3);
+    assert_eq!(lifecycle.events.lock().await.len(), 5);
     let key =
         CLIAgentRuntimeSessionKey::new(&workspace, "custom-codex-id", "worker-owned").unwrap();
     manager.get_or_start(key.clone()).await.unwrap();
@@ -341,13 +367,15 @@ async fn idle_worker_continues_after_close_error_and_shutdown_joins_inflight_lif
     assert!(manager.existing_session(&key).await.is_none());
     let mut shutdown = Box::pin(supervisor.shutdown());
     assert!(futures_util::poll!(&mut shutdown).is_pending());
-    assert_eq!(lifecycle.events.lock().await.len(), 5);
+    assert_eq!(lifecycle.events.lock().await.len(), 6);
     release.notify_one();
     shutdown.await;
-    assert_eq!(lifecycle.events.lock().await.len(), 6);
+    assert_eq!(lifecycle.events.lock().await.len(), 7);
     elapse(Duration::from_secs(120)).await;
-    assert_eq!(session.closes.load(Ordering::SeqCst), 3);
+    assert_eq!(session.closes.load(Ordering::SeqCst), 4);
     manager.close_all().await.unwrap();
+    assert_eq!(session.closes.load(Ordering::SeqCst), 4);
+    assert_eq!(lifecycle.events.lock().await.len(), 7);
 }
 
 #[tokio::test]

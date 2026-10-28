@@ -118,6 +118,7 @@ pub struct SkillsCatalogView {
     pub(crate) input: Arc<CatalogInput>,
     pub(crate) binding: Arc<CatalogBinding>,
     sidebar: Entity<CatalogSidebar>,
+    plugin_component: Option<(String, String, SkillId)>,
     demand: Option<SkillsDemand>,
     demand_key: Option<(String, Option<SkillId>)>,
     pub(crate) sidebar_width: Pixels,
@@ -144,6 +145,23 @@ impl SkillsCatalogView {
         self.input.is_skill_pending(id)
     }
 
+    /// Embed the genuine native details/controller under one plugin parent.
+    /// The native catalog's authoritative owner is rechecked on every publication.
+    pub fn new_plugin_details(
+        config: SkillsCatalogConfig,
+        workspace: String,
+        parent: String,
+        child: SkillId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let view = Self::new(config, window, cx);
+        view.update(cx, |view, cx| {
+            view.plugin_component = Some((workspace, parent, child));
+            view.sync_publications(window, cx);
+        });
+        view
+    }
     pub fn new(config: SkillsCatalogConfig, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let mount = NEXT_MOUNT.fetch_add(1, Ordering::Relaxed);
         cx.new(|cx| {
@@ -209,6 +227,7 @@ impl SkillsCatalogView {
                 binding,
                 sidebar,
                 demand: None,
+                plugin_component: None,
                 demand_key: None,
                 sidebar_width: px(320.),
                 mount,
@@ -278,6 +297,15 @@ impl SkillsCatalogView {
     }
     fn sync_publications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut next = CatalogInput::empty(&self.client);
+        if let Some((workspace, _, child)) = &self.plugin_component {
+            if next.navigation_input.workspace_id() == Some(workspace.as_str()) {
+                next.navigation_input = Arc::new(next.navigation_input.with_details_destination(
+                    SemanticDestination::Skills {
+                        skill_id: Some(child.clone()),
+                    },
+                ));
+            }
+        }
         let session = self.client.gateway_session();
         next.gateway.connection_state = session
             .status
@@ -305,8 +333,38 @@ impl SkillsCatalogView {
                 workspace_id: Some(workspace.clone()),
             });
             if let Some(catalog) = self.client.skills_catalog_snapshot(&workspace) {
-                next.skills_catalog = catalog.catalog.iter().map(|s| (**s).clone()).collect();
-                next.installed_skills = catalog.installed.iter().map(|s| (**s).clone()).collect();
+                next.skills_catalog = catalog
+                    .catalog
+                    .iter()
+                    .filter(|skill| match &self.plugin_component {
+                        Some((expected_workspace, parent, child)) => {
+                            expected_workspace == &workspace
+                                && &skill.skill_id == child
+                                && skill
+                                    .plugin_owner
+                                    .as_ref()
+                                    .is_some_and(|owner| &owner.plugin_id == parent)
+                        }
+                        None => pioneer_client::skills::catalog::skill_is_user_selectable(skill),
+                    })
+                    .map(|s| (**s).clone())
+                    .collect();
+                next.installed_skills = catalog
+                    .installed
+                    .iter()
+                    .filter(|skill| match &self.plugin_component {
+                        Some((expected_workspace, parent, child)) => {
+                            expected_workspace == &workspace
+                                && &skill.skill_id == child
+                                && skill
+                                    .plugin_owner
+                                    .as_ref()
+                                    .is_some_and(|owner| &owner.plugin_id == parent)
+                        }
+                        None => true,
+                    })
+                    .map(|s| (**s).clone())
+                    .collect();
                 next.skills_management = (*catalog.management).clone();
                 next.skills_loading = catalog.request == SkillsLoadState::Loading;
                 next.skills_error = (catalog.request == SkillsLoadState::Failed)
@@ -633,6 +691,9 @@ mod tests {
         let upload = view.read_with(cx, |view, _| view.upload.clone());
         let publication = |revision, sent_bytes, state| {
             Some(Arc::new(SkillUploadPublication {
+                plugin_preview: None,
+                plugin_result: None,
+                plugin_update_preview: None,
                 operation_id: 7,
                 generation: 7,
                 revision,

@@ -275,6 +275,7 @@ pub struct CLIAgentProcess {
     stdout: Option<ChildStdout>,
     stderr: StderrRing,
     stderr_reader: Option<JoinHandle<()>>,
+    stderr_failure: Option<String>,
 }
 
 impl CLIAgentProcess {
@@ -419,9 +420,18 @@ impl CLIAgentProcess {
     }
 
     async fn wait_for_stderr(&mut self) -> Result<()> {
+        if let Some(error) = &self.stderr_failure {
+            bail!("{error}");
+        }
         if let Some(reader) = self.stderr_reader.as_mut() {
-            reader.await.context("failed to drain CLI process stderr")?;
+            let result = reader.await;
             self.stderr_reader.take();
+            if result.is_err() {
+                self.stderr_failure = Some("failed to drain CLI process stderr".to_owned());
+            }
+        }
+        if let Some(error) = &self.stderr_failure {
+            bail!("{error}");
         }
         Ok(())
     }
@@ -605,6 +615,7 @@ pub fn spawn_prepared_cli_agent_process(
         stdout,
         stderr,
         stderr_reader,
+        stderr_failure: None,
     })
 }
 

@@ -26,6 +26,7 @@ pub enum SettingsRoute {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticDestination {
+    Plugins,
     Threads,
     AgentsDocument,
     Providers {
@@ -109,6 +110,13 @@ impl ClientNavigationState {
     }
     pub fn workspace_id(&self) -> Option<&str> {
         self.workspace_id.as_deref()
+    }
+    /// Local presenter projection for a capability's embedded details. Does not
+    /// publish global navigation or change the active workspace/thread.
+    pub fn with_details_destination(&self, destination: SemanticDestination) -> Self {
+        let mut projected = self.clone();
+        projected.apply(NavigationIntent::Navigate { destination });
+        projected
     }
     pub fn destination(&self) -> &SemanticDestination {
         &self.destination

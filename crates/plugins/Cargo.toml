@@ -1,0 +1,20 @@
+[package]
+name = "pioneer-plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+hex.workspace = true
+http.workspace = true
+url.workspace = true
+pioneer-skills.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

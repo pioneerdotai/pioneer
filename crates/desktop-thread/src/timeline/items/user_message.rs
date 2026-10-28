@@ -441,7 +441,9 @@ impl RowPresentation {
     ) -> AnyElement {
         if matches!(
             kind,
-            ParsedUserAttachmentKind::Skill | ParsedUserAttachmentKind::Mcp
+            ParsedUserAttachmentKind::Plugin
+                | ParsedUserAttachmentKind::Skill
+                | ParsedUserAttachmentKind::Mcp
         ) {
             return attachment_capability_icon(kind, cx).into_any_element();
         }
@@ -489,6 +491,7 @@ fn attachment_file_icon(flex_none: bool) -> gpui_kit::Div {
 
 fn attachment_capability_icon(kind: ParsedUserAttachmentKind, cx: &mut App) -> gpui_kit::Div {
     let icon = match kind {
+        ParsedUserAttachmentKind::Plugin => PioneerIconName::Mcp,
         ParsedUserAttachmentKind::Skill => PioneerIconName::Zap,
         ParsedUserAttachmentKind::Mcp => PioneerIconName::Mcp,
         ParsedUserAttachmentKind::File => PioneerIconName::Paperclip,

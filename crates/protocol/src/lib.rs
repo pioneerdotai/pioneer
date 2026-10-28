@@ -46,6 +46,7 @@ pub use recovery_diagnostic::{
     ProviderErrorReason, ProviderRequestId, RecoveryDiagnostic, RecoveryProviderFailure,
     RecoveryStopReason,
 };
+mod plugins;
 mod schema;
 mod scoped_push;
 pub use scoped_push::{
@@ -53,6 +54,7 @@ pub use scoped_push::{
     WorkspacePushParams, WorkspacePushResponse,
 };
 mod settings;
+pub use plugins::*;
 mod skills;
 mod system_assets;
 mod task;
@@ -354,7 +356,7 @@ pub use skills::{
     SkillLifecycleAuditSummary, SkillLifecycleRemovedSkill, SkillLifecycleResultSkill,
     SkillLifecycleSource, SkillListItem, SkillListParams, SkillListResponse, SkillPackChangedItem,
     SkillPackInstallationItem, SkillPackMembership, SkillPolicyState, SkillSecurityFinding,
-    SkillTrustGateStatus, SkillValidationDiagnostic, SkillWorkspacePolicy,
+    SkillTrustGateStatus, SkillUploadPurpose, SkillValidationDiagnostic, SkillWorkspacePolicy,
     SkillsChangedNotification, SkillsHealthParams, SkillsHealthResponse, SkillsInstallParams,
     SkillsInstallResponse, SkillsPackInstallParams, SkillsPackInstallResponse,
     SkillsPackUninstallParams, SkillsPackUninstallResponse, SkillsPackUpdateParams,
@@ -540,9 +542,9 @@ pub use turn::{
     TurnPermissionProfileCap, TurnPermissionProfileSelection, TurnPermissionProfileSnapshot,
     TurnPermissionProfileSource, TurnPermissionRequestOpenedNotification,
     TurnPermissionRequestResolvedNotification, TurnPermissionRequestRespondParams,
-    TurnPermissionRequestRespondResponse, TurnProcessPolicySnapshot, TurnProcessTimeoutPolicy,
-    TurnReasoningSelection, TurnResumeParams, TurnResumeResponse, TurnSandboxMode,
-    TurnSandboxSnapshot, TurnSecurityBackendSnapshot, TurnSecurityCapabilityKind,
+    TurnPermissionRequestRespondResponse, TurnPluginCapabilitySummary, TurnProcessPolicySnapshot,
+    TurnProcessTimeoutPolicy, TurnReasoningSelection, TurnResumeParams, TurnResumeResponse,
+    TurnSandboxMode, TurnSandboxSnapshot, TurnSecurityBackendSnapshot, TurnSecurityCapabilityKind,
     TurnSecurityDegradation, TurnSecurityEnforcementStatus, TurnSecurityExecutionBackendKind,
     TurnSecurityParentCapSnapshot, TurnSecurityRuleProvenance, TurnSecuritySnapshotSource,
     TurnShellPolicy, TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary,
@@ -553,7 +555,7 @@ pub use turn::{
     build_execution_checkpoint_payload, build_execution_checkpoint_provider_budget_summary,
     build_execution_checkpoint_tool_summary, collect_execution_checkpoint_strict_obligations,
     context_compaction_status, mcp_server_capability_key, mcp_tool_capability_key,
-    normalize_metadata_reasoning_effort, reasoning_effort_comparison_key,
+    normalize_metadata_reasoning_effort, plugin_capability_key, reasoning_effort_comparison_key,
     resolve_turn_permission_profile, skill_capability_key, skill_pack_capability_key,
     validate_turn_execution_envelope, validate_turn_message_content,
 };

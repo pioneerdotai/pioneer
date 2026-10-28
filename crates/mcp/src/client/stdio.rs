@@ -9,10 +9,12 @@ use rmcp::RoleClient;
 use rmcp::transport::async_rw::AsyncRwTransport;
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::process::Command;
 use tokio::process::{ChildStdin, ChildStdout};
+use tokio::sync::Mutex;
 
 pub(crate) const MCP_MAX_STDIO_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
@@ -75,9 +77,8 @@ pub(crate) type BoundedStdioTransport =
     AsyncRwTransport<RoleClient, BoundedLineReader<ManagedChildStdout>, ChildStdin>;
 
 pub(crate) struct ManagedChildStdout {
-    child: Option<Box<dyn ChildWrapper>>,
+    child: Arc<StdioChildOwner>,
     stdout: ChildStdout,
-    observation: Option<pioneer_observability::resources::ChildRegistration>,
 }
 
 impl AsyncRead for ManagedChildStdout {
@@ -90,29 +91,58 @@ impl AsyncRead for ManagedChildStdout {
     }
 }
 
+// The session retains the real process-group wrapper after transport close.
+// Drop can signal termination, but only this native helper acknowledges wait.
+pub(crate) struct StdioChildOwner {
+    state: Mutex<StdioChildState>,
+}
+struct StdioChildState {
+    child: Box<dyn ChildWrapper>,
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
+    process_stopped: bool,
+    observation: pioneer_observability::resources::ChildRegistration,
+    reader_error: Option<String>,
+}
+impl StdioChildOwner {
+    pub(crate) async fn stop_and_wait(&self) -> std::io::Result<()> {
+        let mut state = self.state.lock().await;
+        if !state.process_stopped {
+            // Same ProcessGroup/JobObject policy; kill includes child.wait.
+            Box::into_pin(state.child.kill()).await?;
+            state.process_stopped = true;
+            if let Some(status) = state.child.try_wait()? {
+                state.observation.exited(status.success());
+            }
+        }
+        if let Some(reader) = state.stderr_reader.as_mut() {
+            reader.abort();
+            let result = (&mut *reader).await;
+            state.stderr_reader = None;
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                state.reader_error = Some("MCP stderr reader join failed".into());
+            }
+        }
+        if let Some(error) = &state.reader_error {
+            return Err(std::io::Error::other(error.clone()));
+        }
+        Ok(())
+    }
+}
 impl Drop for ManagedChildStdout {
     fn drop(&mut self) {
-        if let Some(child) = self.child.take() {
-            let observation = self.observation.take();
-            tokio::spawn(pioneer_observability::work::inherit(
-                pioneer_observability::work::Boundary::Child,
-                pioneer_observability::work::WorkKind::Child,
-                pioneer_observability::work::ExecutorRole::Child,
-                async move {
-                    let _observation = observation;
-                    let mut child = child;
-                    if let Err(error) = Box::into_pin(child.kill()).await {
-                        tracing::warn!(%error, "failed to terminate MCP stdio child process");
-                    }
-                },
-            ));
+        if let Ok(mut state) = self.child.state.try_lock()
+            && !state.process_stopped
+        {
+            let _ = state.child.start_kill();
         }
     }
 }
 
 pub(crate) fn build_stdio_transport(
     transport: &MaterializedStdioTransport,
-) -> Result<(BoundedStdioTransport, StderrTail)> {
+) -> Result<(BoundedStdioTransport, StderrTail, Arc<StdioChildOwner>)> {
     let stderr_tail = StderrTail::new(16 * 1024, transport.secrets.clone());
     let mut command = Command::new(transport.command.as_str());
     command.args(transport.args.iter().map(String::as_str));
@@ -153,17 +183,26 @@ pub(crate) fn build_stdio_transport(
         .take()
         .ok_or_else(|| std::io::Error::other("MCP stdio child stdout was not piped"))?;
     let stderr = child.inner_mut().stderr().take();
-    if let Some(stderr) = stderr {
-        stderr_tail.spawn_reader(stderr);
-    }
-
+    let stderr_reader = stderr.map(|stderr| stderr_tail.spawn_reader(stderr));
+    let owner = Arc::new(StdioChildOwner {
+        state: Mutex::new(StdioChildState {
+            child,
+            stderr_reader,
+            process_stopped: false,
+            observation,
+            reader_error: None,
+        }),
+    });
     let reader = BoundedLineReader::new(
         ManagedChildStdout {
-            child: Some(child),
+            child: owner.clone(),
             stdout,
-            observation: Some(observation),
         },
         MCP_MAX_STDIO_FRAME_BYTES,
     );
-    Ok((AsyncRwTransport::new_client(reader, stdin), stderr_tail))
+    Ok((
+        AsyncRwTransport::new_client(reader, stdin),
+        stderr_tail,
+        owner,
+    ))
 }

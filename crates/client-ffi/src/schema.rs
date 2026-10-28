@@ -23,6 +23,14 @@ macro_rules! schema_doc {
 pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
         schema_doc!(
+            "plugin_shell_request.json",
+            crate::plugin_shell::PluginShellRequest
+        ),
+        schema_doc!(
+            "plugin_shell_response.json",
+            crate::plugin_shell::PluginShellResponse
+        ),
+        schema_doc!(
             "client_scope_lease_request_dto.json",
             crate::client_binding::ClientScopeLeaseRequestDto
         ),

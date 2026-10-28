@@ -15,6 +15,7 @@ use std::sync::Arc;
 pub(crate) struct McpConfigForm {
     input: Entity<TextareaState>,
     workspace: String,
+    owned_name: Option<String>,
     operation: Option<u64>,
     publication: Option<Arc<McpActionPublication>>,
     error: Option<String>,
@@ -92,10 +93,29 @@ impl McpCatalogView {
         else {
             return;
         };
+        let owned_name = if let Some((expected_workspace, parent, child)) = &self.plugin_component {
+            let Some(server) = self.input.mcp_servers.iter().find(|server| {
+                expected_workspace == &workspace
+                    && &server.id == child
+                    && server
+                        .plugin_owner
+                        .as_ref()
+                        .is_some_and(|owner| &owner.plugin_id == parent)
+            }) else {
+                return;
+            };
+            Some(server.name.clone())
+        } else {
+            None
+        };
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(5, 14)
-                .placeholder(r#"{ "mcpServers": { ... } }"#)
+                .placeholder(if owned_name.is_some() {
+                    r#"{ "url": "https://…", "headers": {} }"#
+                } else {
+                    r#"{ "mcpServers": { ... } }"#
+                })
         });
         if let Some(value) = initial_config {
             input.update(cx, |input, cx| input.set_value(value, window, cx));
@@ -113,6 +133,7 @@ impl McpCatalogView {
         let form = cx.new(|_| McpConfigForm {
             input,
             workspace,
+            owned_name,
             operation: None,
             publication: None,
             error: None,
@@ -229,6 +250,17 @@ impl McpCatalogView {
                 return;
             }
             let config = form.input.read(cx).value().to_string();
+            let config = if let Some(name) = &form.owned_name {
+                let Some(config) = mcp_actions::owned_server_config_for_submit(&config, name)
+                else {
+                    form.error = Some(t!("mcp.dialog.error.owned_server_body").to_string());
+                    cx.notify();
+                    return;
+                };
+                config
+            } else {
+                config
+            };
             if let Err(error) = mcp_actions::validate_mcp_config_for_submit(&config) {
                 form.error = Some(mcp_config_validation_error_message(error));
                 cx.notify();
