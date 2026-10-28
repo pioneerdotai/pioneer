@@ -1,0 +1,58 @@
+name: Import release signing identity
+description: Import the existing macOS release certificate into a temporary keychain.
+runs:
+  using: composite
+  steps:
+    - name: setup-macos-signing-keychain
+      shell: bash
+      run: |
+        set -euo pipefail
+        [[ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ]] || { echo "missing MACOS_CERTIFICATE_P12_BASE64 secret" >&2; exit 1; }
+        [[ -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]] || { echo "missing MACOS_CERTIFICATE_PASSWORD secret" >&2; exit 1; }
+        [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]] || { echo "missing MACOS_DESKTOP_SIGN_IDENTITY secret" >&2; exit 1; }
+
+        keychain_path="${RUNNER_TEMP}/pioneer-signing.keychain-db"
+        cert_path="${RUNNER_TEMP}/pioneer-signing-cert.p12"
+        trap 'rm -f "$cert_path"' EXIT
+
+        python3 - <<'PY'
+        import base64
+        import os
+        from pathlib import Path
+
+        raw = os.environ["MACOS_CERTIFICATE_P12_BASE64"]
+        normalized = "".join(raw.split()).rstrip("%")
+        if not normalized:
+            raise SystemExit("MACOS_CERTIFICATE_P12_BASE64 is empty after normalization")
+        try:
+            decoded = base64.b64decode(normalized, validate=True)
+        except Exception as exc:
+            raise SystemExit(f"invalid MACOS_CERTIFICATE_P12_BASE64: {exc}")
+
+        Path(os.environ["RUNNER_TEMP"], "pioneer-signing-cert.p12").write_bytes(decoded)
+        PY
+
+        security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$keychain_path"
+        security set-keychain-settings -lut 21600 "$keychain_path"
+        security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$keychain_path"
+        security list-keychains -d user -s "$keychain_path" login.keychain-db
+        security default-keychain -d user -s "$keychain_path"
+
+        security import "$cert_path" \
+          -k "$keychain_path" \
+          -P "$MACOS_CERTIFICATE_PASSWORD" \
+          -T /usr/bin/codesign \
+          -T /usr/bin/security
+
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CERTIFICATE_PASSWORD" "$keychain_path"
+
+        identities="$(security find-identity -v -p codesigning "$keychain_path")"
+        printf '%s\n' "$identities"
+        for identity_name in MACOS_DESKTOP_SIGN_IDENTITY MACOS_DMG_SIGN_IDENTITY; do
+          identity="${!identity_name:-}"
+          [[ -z "$identity" ]] && continue
+          grep -Fqi -- "$identity" <<<"$identities" || {
+            echo "configured ${identity_name} was not found in the imported keychain" >&2
+            exit 1
+          }
+        done

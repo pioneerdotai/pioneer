@@ -4,9 +4,9 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  check-package-contents.sh macos-app-zip <Pioneer-arch.app.zip>
-  check-package-contents.sh linux-appdir <Pioneer.AppDir>
-  check-package-contents.sh windows-stage <stage-dir>
+  check-package-contents.sh macos-app-zip <Pioneer-arch.app.zip> <rust-target>
+  check-package-contents.sh linux-appdir <Pioneer.AppDir> <rust-target>
+  check-package-contents.sh windows-stage <stage-dir> <rust-target>
 USAGE
 }
 
@@ -45,7 +45,8 @@ require_zip_entry() {
 
 mode="${1:-}"
 target="${2:-}"
-if [[ -z "$mode" || -z "$target" ]]; then
+rust_target="${3:-}"
+if [[ -z "$mode" || -z "$target" || -z "$rust_target" ]]; then
   usage
   exit 1
 fi
@@ -82,6 +83,7 @@ case "$mode" in
     done
     ;;
   windows-stage)
+    if command -v cygpath >/dev/null 2>&1; then target="$(cygpath -u "$target")"; fi
     require_path "$target/pioneer-app.exe"
     require_path "$target/pioneer-app-updater.exe"
     require_path "$target/gateway/pioneer-bootstrap.exe"
@@ -99,5 +101,18 @@ case "$mode" in
   *)
     usage
     exit 1
+    ;;
+esac
+
+# Presence checks above and approved producer identity are separate contracts.
+case "$mode" in
+  macos-app-zip)
+    python3 scripts/packaging/desktop-inputs.py macos-app-zip --target "$rust_target" --destination "$target"
+    ;;
+  linux-appdir)
+    python3 scripts/packaging/desktop-inputs.py verify --target "$rust_target" --destination "$target/usr/bin/gateway"
+    ;;
+  windows-stage)
+    python scripts/packaging/desktop-inputs.py verify --target "$rust_target" --destination "$target/gateway"
     ;;
 esac

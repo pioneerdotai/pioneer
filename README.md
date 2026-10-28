@@ -110,8 +110,7 @@ Install Rust with [rustup](https://rustup.rs). See [rust-toolchain.toml](./rust-
 ```bash
 git clone https://github.com/pioneerdotai/pioneer.git
 cd pioneer
-cargo update -p cua-driver-sdk
-cargo build --workspace
+cargo build --locked --workspace
 ```
 
 Gateway releases provide a default server build and an opt-in computer-use build
@@ -122,26 +121,54 @@ variable `PIONEER_INSTALL_COMPUTER_USE=1` also selects computer use; an explicit
 switch overrides it. Source builds enable it with `--features computer-use` on
 `pioneer-cli` or `pioneer-gateway`; on macOS set `MACOSX_DEPLOYMENT_TARGET=13.0`
 for those CU builds. Desktop bundles the computer-use variant.
-Release packaging refreshes the SDK and fetches the current upstream driver
-before building. Cargo.lock records the dependencies selected for that build.
+The CUA SDK is pinned to `cua-driver-rs-v0.38.0`, with the same release declared
+in `scripts/packaging/cua-release.json`. Packaging uses verified official prebuilt
+daemon archives for all six targets. It does not compile the CUA daemon or refresh
+the SDK to upstream HEAD. Cargo.lock records the pinned SDK and its dependencies.
+
+Release compilation and packaging are separate entrypoints. `build-gateway.py`
+and `build-desktop.py` retain compact runtime inputs and separate original link
+inputs. `cua-driver.py prepare` obtains the verified prebuilt runtime;
+`package-gateway.py` signs and creates the final Gateway asset from ready inputs.
+Desktop packagers consume that same full ZIP, bootstrap and checksums through
+`release-inputs.py` and `PIONEER_GATEWAY_RUNTIME_DIR`. They require prepared inputs
+in every mode; `--skip-build` remains accepted and never triggers a nested build.
+The release workflow supplies the shared model catalog and run/commit/target
+provenance. Missing or mismatched inputs fail without a compilation fallback.
 
 The server assets retain their existing names and formats: gzip for Linux and
 macOS aarch64, ZIP for Windows and macOS x86_64. Computer-use assets are named
-`pioneer-gateway-{os}-{arch}-computer-use-package.zip` and contain the CUA driver built from the current upstream default branch
-package. Install the complete CU archive; copying only `pioneer` cannot install
+`pioneer-gateway-{os}-{arch}-computer-use-package.zip` and contain the verified
+CUA 0.38.0 runtime. Install the complete CU archive; copying only `pioneer` cannot install
 the driver. The installer keeps the executable and `bin/cua` together and retains
 recovery files when schema compatibility is unknown.
 
-Existing computer-use installations use their normal `pioneer update` or
-`pioneer self-update` command. The old `-computer-use.gz` / `-computer-use.zip`
-assets contain a compatibility executable with the complete new package embedded.
-Its candidate version probe prepares a verified private package generation;
-the existing updater retains schema admission, replacement and restart. The
-bridge then runs the actual packaged Gateway, including its signed macOS app.
-It requires no Desktop, manual script bootstrap or intermediate release. New
-installers and subsequent updates select the complete `-computer-use-package.zip`
-asset directly. Server asset names and formats remain unchanged. Use the existing
-bootstrap with `--headless` / `-Headless` for an explicit switch back to server.
+**Computer-use installations below 0.66.0 require a manual upgrade, including
+installations managed only through Desktop.** Fully quit Desktop first. Upgrade
+the Gateway on its host with the appropriate command:
+
+macOS / Linux:
+
+```bash
+curl -fsSL https://getpioneer.dev/install.sh | bash -s -- --computer-use
+```
+
+Windows PowerShell:
+
+```powershell
+$env:PIONEER_INSTALL_COMPUTER_USE="1"; iwr -useb https://getpioneer.dev/install.ps1 | iex
+```
+
+Then update Desktop separately from [GitHub Releases](https://github.com/pioneerdotai/pioneer/releases):
+on macOS open the appropriate DMG and replace the application; on Windows install
+the matching MSI; on Linux replace the matching AppImage and give it executable
+permission. Keep existing data and settings; no deletion or reset is required.
+Subsequent Gateway updates use the complete `-computer-use-package.zip` asset
+through `pioneer update` or `pioneer self-update`.
+
+Server/default installations retain their normal update procedure and do not
+need computer use or Desktop. Use `--headless` / `-Headless` for an explicit
+switch back to server.
 OS permission requests still belong to the Gateway machine; existing OS grants
 are not promised to transfer automatically to the new responsible application.
 
@@ -152,7 +179,9 @@ Desktop permissions do not authorize a remote Gateway. The server build does
 not require the CUA app or its Swift build inputs. Its deployment policy follows
 the existing server dependencies and toolchain, without a CUA-specific minimum.
 Linux computer use needs a compatible graphical user session and capture/input
-dependencies. Windows retains the current-user logon task with Limited
+dependencies. The official prebuilt Linux daemon omits the additional
+`portal-capture` feature; other supported capture and input paths remain available
+when their session requirements are met. Windows retains the current-user logon task with Limited
 privileges; Linux retains the systemd user service. Actual binary dependencies,
 minimum OS versions and computer-use readiness still require platform qualification.
 

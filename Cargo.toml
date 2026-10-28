@@ -101,7 +101,7 @@ same-file = "=1.0.6"
 async-stream = "0.3"
 
 # Computer use
-cua-driver-sdk = { git = "https://github.com/trycua/cua" }
+cua-driver-sdk = { git = "https://github.com/trycua/cua", tag = "cua-driver-rs-v0.38.0" }
 
 # Error handling
 anyhow = "1"

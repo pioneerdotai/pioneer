@@ -60,63 +60,6 @@ require_cmd() {
   }
 }
 
-configure_macos_x86_64_onnxruntime() {
-  [[ "$TARGET" == "x86_64-apple-darwin" ]] || return 0
-
-  if [[ -z "${ORT_LIB_LOCATION:-}" ]] && command -v brew >/dev/null 2>&1; then
-    local brew_ort_prefix
-    brew_ort_prefix="$(brew --prefix onnxruntime 2>/dev/null || true)"
-    if [[ -n "$brew_ort_prefix" && -d "$brew_ort_prefix/lib" ]]; then
-      export ORT_LIB_LOCATION="$brew_ort_prefix/lib"
-    fi
-  fi
-
-  if [[ -z "${ORT_LIB_LOCATION:-}" ]]; then
-    echo "ORT_LIB_LOCATION is required for x86_64-apple-darwin ONNX Runtime linking" >&2
-    echo "Install ONNX Runtime and rerun with ORT_LIB_LOCATION=/path/to/onnxruntime/lib ORT_PREFER_DYNAMIC_LINK=1" >&2
-    exit 1
-  fi
-
-  export ORT_PREFER_DYNAMIC_LINK="${ORT_PREFER_DYNAMIC_LINK:-1}"
-  export PIONEER_ONNXRUNTIME_DYLIB_DIR="${PIONEER_ONNXRUNTIME_DYLIB_DIR:-$ORT_LIB_LOCATION}"
-
-  local rpath_flag="-C link-arg=-Wl,-rpath,@executable_path"
-  if [[ " ${RUSTFLAGS:-} " != *" $rpath_flag "* ]]; then
-    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$rpath_flag"
-  fi
-}
-
-copy_macos_x86_64_onnxruntime_dylibs() {
-  local destination="$1"
-  [[ "$TARGET" == "x86_64-apple-darwin" ]] || return 0
-
-  local dylib_dir="${PIONEER_ONNXRUNTIME_DYLIB_DIR:-${ORT_LIB_LOCATION:-}}"
-  if [[ -z "$dylib_dir" || ! -d "$dylib_dir" ]]; then
-    echo "ONNX Runtime dylib directory is missing: ${dylib_dir:-<unset>}" >&2
-    exit 1
-  fi
-
-  shopt -s nullglob
-  local dylibs=("$dylib_dir"/libonnxruntime*.dylib)
-  shopt -u nullglob
-  if [[ ${#dylibs[@]} -eq 0 ]]; then
-    echo "no libonnxruntime dylibs found in $dylib_dir" >&2
-    exit 1
-  fi
-
-  local dylib copied
-  for dylib in "${dylibs[@]}"; do
-    copied="$destination/$(basename "$dylib")"
-    cp -L "$dylib" "$copied"
-    chmod 0644 "$copied"
-    if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
-      require_cmd codesign
-      codesign --force --timestamp --options runtime --sign "$MACOS_DESKTOP_SIGN_IDENTITY" "$copied"
-      codesign --verify --strict "$copied"
-    fi
-  done
-}
-
 apply_applications_link_icon() {
   local alias_path="$1"
   local work_dir="$2"
@@ -223,15 +166,6 @@ detach_dmg() {
   hdiutil detach -force "$mount_dir"
 }
 
-sha256_file() {
-  local path="$1"
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$path" | awk '{print $1}'
-  else
-    sha256sum "$path" | awk '{print $1}'
-  fi
-}
-
 ensure_macos_signing_prerequisites() {
   if bool_is_true "${MACOS_SIGNING_REQUIRED:-false}"; then
     [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]] || {
@@ -251,39 +185,6 @@ ensure_macos_signing_prerequisites() {
       exit 1
     fi
   fi
-}
-
-write_notarization_key() {
-  local destination="$1"
-
-  if [[ -n "${APPLE_NOTARIZATION_KEY_BASE64:-}" ]]; then
-    python3 - <<'PY' "$destination"
-import base64
-import os
-import sys
-
-destination = sys.argv[1]
-raw = os.environ.get("APPLE_NOTARIZATION_KEY_BASE64", "")
-normalized = "".join(raw.split()).rstrip("%")
-if not normalized:
-    raise SystemExit("APPLE_NOTARIZATION_KEY_BASE64 is empty after normalization")
-try:
-    decoded = base64.b64decode(normalized, validate=True)
-except Exception as exc:
-    raise SystemExit(f"APPLE_NOTARIZATION_KEY_BASE64 is invalid base64: {exc}")
-
-with open(destination, "wb") as handle:
-    handle.write(decoded)
-PY
-    return 0
-  fi
-
-  if [[ -n "${APPLE_NOTARIZATION_KEY:-}" ]]; then
-    printf '%s' "$APPLE_NOTARIZATION_KEY" > "$destination"
-    return 0
-  fi
-
-  return 1
 }
 
 usage() {
@@ -362,36 +263,26 @@ case "$PIONEER_APP_URL_SCHEME" in
 esac
 export PIONEER_APP_URL_SCHEME
 
-if [[ "$SKIP_BUILD" != true ]]; then require_cmd cargo; fi
 require_cmd hdiutil
-require_cmd gzip
 require_cmd ditto
 ensure_macos_signing_prerequisites
-configure_macos_x86_64_onnxruntime
+python3 scripts/packaging/desktop-inputs.py preflight --target "$TARGET"
 
 if [[ -z "$OUT_DIR" ]]; then
   OUT_DIR="$REPO_ROOT/dist"
 fi
 mkdir -p "$OUT_DIR"
 
-if [[ "$SKIP_BUILD" != true ]]; then
-  cargo update -p cua-driver-sdk
-  cargo build --locked --release -p pioneer-desktop --target "$TARGET"
-  cargo build --locked --release -p pioneer-app-updater --target "$TARGET"
-  MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --locked --release -p pioneer-cli --features computer-use --target "$TARGET"
-  if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
-    python3 scripts/packaging/symbol-inputs.py export --target "$TARGET" "$PIONEER_SYMBOL_INPUTS_DIR" \
-      "target/$TARGET/release/pioneer-app" "target/$TARGET/release/pioneer" "target/$TARGET/release/pioneer-app-updater"
-  fi
-fi
-
-WORK_DIR="$(mktemp -d)"
+# Signed app/DMG and submission state survive a failed stapler/job attempt.
+# Runtime provenance is checked before this checkpoint can be reused.
+NOTARY_LOG_DIR="${PIONEER_NOTARY_LOG_DIR:-$OUT_DIR/notary-logs}"
+WORK_DIR="$NOTARY_LOG_DIR/desktop-work"
+mkdir -p "$WORK_DIR"
 DMG_MOUNT_DIR=""
 cleanup_work_dir() {
   if [[ -n "${DMG_MOUNT_DIR:-}" ]]; then
     hdiutil detach "$DMG_MOUNT_DIR" >/dev/null 2>&1 || true
   fi
-  rm -rf "$WORK_DIR"
 }
 trap cleanup_work_dir EXIT
 
@@ -408,6 +299,10 @@ MACOS_ICON_SOURCE="$REPO_ROOT/crates/desktop/assets/app-icon.icns"
 DMG_BACKGROUND_SOURCE="$REPO_ROOT/assets/dmg-backgrond@2x.png"
 DMG_BACKGROUND_NAME="background@2x.png"
 MACOS_DMG_SIGN_IDENTITY="${MACOS_DMG_SIGN_IDENTITY:-${MACOS_DESKTOP_SIGN_IDENTITY:-}}"
+GATEWAY_BUNDLE_DIR="$RESOURCES_DIR/gateway"
+APP_ZIP_PATH="$OUT_DIR/Pioneer-${ARCH}.app.zip"
+DMG_PATH="$OUT_DIR/Pioneer-${ARCH}.dmg"
+assemble_desktop() {
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 if [[ ! -f "$MACOS_ICON_SOURCE" ]]; then
@@ -434,32 +329,7 @@ fi
 
 GATEWAY_BUNDLE_DIR="$RESOURCES_DIR/gateway"
 mkdir -p "$GATEWAY_BUNDLE_DIR"
-copy_macos_x86_64_onnxruntime_dylibs "$GATEWAY_BUNDLE_DIR"
-
-GATEWAY_ASSET_NAME="pioneer-gateway-macos-${ARCH}-computer-use-package.zip"
-GATEWAY_ASSET_PATH="$GATEWAY_BUNDLE_DIR/$GATEWAY_ASSET_NAME"
-GATEWAY_BINARY_RAW="$WORK_DIR/pioneer-gateway-${ARCH}"
-cp "target/$TARGET/release/pioneer" "$GATEWAY_BINARY_RAW"
-strip -S "$GATEWAY_BINARY_RAW"
-chmod 0755 "$GATEWAY_BINARY_RAW"
-
-if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
-  require_cmd codesign
-  codesign --force --timestamp --options runtime --sign "$MACOS_DESKTOP_SIGN_IDENTITY" "$GATEWAY_BINARY_RAW"
-  codesign --verify --strict "$GATEWAY_BINARY_RAW"
-fi
-
-# The archive and the bootstrap may later receive different signing envelopes.
-if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
-  python3 scripts/packaging/symbol-inputs.py record "$GATEWAY_BINARY_RAW" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
-fi
-cp "$GATEWAY_BINARY_RAW" "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
-chmod 0755 "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
-
-python3 scripts/packaging/cua-driver.py --target "$TARGET" --binary "$GATEWAY_BINARY_RAW" --archive "$GATEWAY_ASSET_PATH"
-
-GATEWAY_SHA256="$(sha256_file "$GATEWAY_ASSET_PATH")"
-printf 'sha256:%s %s\n' "$GATEWAY_SHA256" "$GATEWAY_ASSET_NAME" > "$GATEWAY_BUNDLE_DIR/SHA256SUMS"
+python3 scripts/packaging/desktop-inputs.py embed --target "$TARGET" --destination "$GATEWAY_BUNDLE_DIR"
 
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -518,26 +388,13 @@ if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
   require_cmd codesign
   codesign --force --timestamp --options runtime --sign "$MACOS_DESKTOP_SIGN_IDENTITY" "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}"
   codesign --verify --strict "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}"
-  codesign --deep --force --timestamp --options runtime --entitlements "$APP_ENTITLEMENTS_PATH" --sign "$MACOS_DESKTOP_SIGN_IDENTITY" "$APP_DIR"
+  codesign --force --timestamp --options runtime --entitlements "$APP_ENTITLEMENTS_PATH" --sign "$MACOS_DESKTOP_SIGN_IDENTITY" "$APP_DIR"
   codesign --verify --deep --strict "$APP_DIR"
   if ! codesign -d --entitlements :- "$APP_DIR" 2>/dev/null | grep -q "com.apple.security.device.audio-input"; then
     echo "signed app is missing com.apple.security.device.audio-input entitlement" >&2
     exit 1
   fi
 fi
-
-APP_ZIP_NAME="Pioneer-${ARCH}.app.zip"
-if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
-  python3 scripts/packaging/symbol-inputs.py record "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
-  python3 scripts/packaging/symbol-inputs.py record "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
-fi
-if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
-  python3 scripts/packaging/symbol-inputs.py record "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
-fi
-APP_ZIP_PATH="$OUT_DIR/$APP_ZIP_NAME"
-rm -f "$APP_ZIP_PATH"
-ditto -c -k --keepParent "$APP_DIR" "$APP_ZIP_PATH"
-scripts/packaging/desktop/check-package-contents.sh macos-app-zip "$APP_ZIP_PATH"
 
 DMG_NAME="Pioneer-${ARCH}.dmg"
 DMG_PATH="$OUT_DIR/$DMG_NAME"
@@ -583,47 +440,52 @@ if [[ -n "$MACOS_DMG_SIGN_IDENTITY" ]]; then
   codesign --verify --strict "$DMG_PATH"
 fi
 
-if [[ -n "${APPLE_NOTARIZATION_KEY_ID:-}" ]] && [[ -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
-  require_cmd xcrun
-  NOTARY_KEY_FILE="$WORK_DIR/notary-api-key.p8"
-  if ! write_notarization_key "$NOTARY_KEY_FILE"; then
-    echo "notarization key is missing, skipping notarization"
-  else
-    NOTARY_SUBMIT_JSON="$WORK_DIR/notary-submit.json"
-    xcrun notarytool submit "$DMG_PATH" \
-      --key "$NOTARY_KEY_FILE" \
-      --key-id "$APPLE_NOTARIZATION_KEY_ID" \
-      --issuer "$APPLE_NOTARIZATION_ISSUER_ID" \
-      --wait \
-      --output-format json > "$NOTARY_SUBMIT_JSON"
+cp "$DMG_PATH" "$WORK_DIR/signed.dmg"
+python3 scripts/packaging/desktop-checkpoint.py record --target "$TARGET" --work "$WORK_DIR"
+}
 
-    read -r NOTARY_SUBMISSION_ID NOTARY_STATUS < <(
-      python3 - <<'PY' "$NOTARY_SUBMIT_JSON"
-import json
-import sys
-
-payload = json.load(open(sys.argv[1], "r", encoding="utf-8"))
-submission_id = (payload.get("id") or "").strip()
-status = (payload.get("status") or "").strip()
-print(f"{submission_id} {status}")
-PY
-    )
-
-    if [[ "$NOTARY_STATUS" != "Accepted" ]]; then
-      echo "notarization failed with status: ${NOTARY_STATUS:-unknown}" >&2
-      if [[ -n "${NOTARY_SUBMISSION_ID:-}" ]]; then
-        echo "notary submission id: $NOTARY_SUBMISSION_ID" >&2
-        xcrun notarytool log "$NOTARY_SUBMISSION_ID" \
-          --key "$NOTARY_KEY_FILE" \
-          --key-id "$APPLE_NOTARIZATION_KEY_ID" \
-          --issuer "$APPLE_NOTARIZATION_ISSUER_ID" || true
-      fi
-      exit 1
-    fi
-
-    xcrun stapler staple "$DMG_PATH"
-  fi
+if [[ -f "$WORK_DIR/checkpoint.json" ]]; then
+  python3 scripts/packaging/desktop-checkpoint.py verify --target "$TARGET" --work "$WORK_DIR"
+  cp "$WORK_DIR/signed.dmg" "$DMG_PATH"
+else
+  python3 scripts/packaging/desktop-checkpoint.py prepare --target "$TARGET" --work "$WORK_DIR"
+  assemble_desktop
 fi
+
+if [[ -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
+  python3 scripts/packaging/macos-notary.py --submit "$DMG_PATH" \
+    --staple "$DMG_PATH" --staple "$APP_DIR" \
+    --log-dir "$NOTARY_LOG_DIR/desktop"
+fi
+
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+  python3 scripts/packaging/symbol-inputs.py record "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
+
+# Apple's DMG submission also issues a ticket for the signed contained app.
+# Staple that same source app before creating the auto-update ZIP.
+python3 scripts/packaging/desktop-inputs.py verify --target "$TARGET" --destination "$GATEWAY_BUNDLE_DIR"
+rm -f "$APP_ZIP_PATH"
+ditto -c -k --keepParent "$APP_DIR" "$APP_ZIP_PATH"
+scripts/packaging/desktop/check-package-contents.sh macos-app-zip "$APP_ZIP_PATH" "$TARGET"
+
+# Inspect the delivered disk image independently of the source app/ZIP stage.
+DMG_MOUNT_DIR="$WORK_DIR/dmg-final"
+mkdir -p "$DMG_MOUNT_DIR"
+hdiutil attach -readonly -noautoopen -mountpoint "$DMG_MOUNT_DIR" "$DMG_PATH"
+if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
+  codesign --verify --deep --strict "$DMG_MOUNT_DIR/${APP_NAME}.app"
+fi
+cmp "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}" "$DMG_MOUNT_DIR/${APP_NAME}.app/Contents/MacOS/${DESKTOP_EXECUTABLE_NAME}"
+cmp "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}" "$DMG_MOUNT_DIR/${APP_NAME}.app/Contents/MacOS/${DESKTOP_UPDATER_EXECUTABLE_NAME}"
+python3 scripts/packaging/desktop-inputs.py verify --target "$TARGET" \
+  --destination "$DMG_MOUNT_DIR/${APP_NAME}.app/Contents/Resources/gateway"
+detach_dmg "$DMG_MOUNT_DIR"
+DMG_MOUNT_DIR=""
 
 echo "Created: $APP_ZIP_PATH"
 echo "Created: $DMG_PATH"
