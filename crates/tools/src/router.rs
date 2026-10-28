@@ -1337,32 +1337,30 @@ mod tests {
     }
 
     #[test]
-    fn function_tool_scope_keys_preserve_session_and_destination() {
-        for (tool_name, arguments, expected) in [
-            (
-                "computer_use",
-                r#"{"action":"status","session_id":12}"#,
-                "computer_use:12",
-            ),
-            (
-                "download_url",
-                r#"{"url":"https://example.com/a","destination":"/tmp/a.txt"}"#,
-                "download:/tmp/a.txt",
-            ),
-        ] {
-            let router = router_with_specs(vec![configured_spec(
-                tool_name,
-                PayloadKind::Function,
-                ExecutionClass::SessionScoped,
-            )]);
-            let call = router
-                .build_tool_call(RawToolCall {
-                    call_id: "call_1".to_owned(),
-                    tool_name: tool_name.to_owned(),
-                    arguments: arguments.to_owned(),
-                })
-                .expect("tool call should parse");
-            assert_eq!(call.session_scope_key(), Some(expected.to_owned()));
-        }
+    fn function_tools_reject_legacy_computer_use_and_preserve_download_destination() {
+        // CUA owns its sessions in the Gateway; the retired tool must not be
+        // resurrected by a synthetic spec carrying a caller-chosen session_id.
+        let router = router_with_specs(crate::builtin_tool_specs());
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_legacy_computer_use".to_owned(),
+                tool_name: "computer_use".to_owned(),
+                arguments: r#"{"action":"status","session_id":12}"#.to_owned(),
+            })
+            .expect_err("legacy computer_use must be rejected before dispatch");
+        assert!(matches!(error, ToolError::NotFound(name) if name == "computer_use"));
+
+        let call = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_download".to_owned(),
+                tool_name: "download_url".to_owned(),
+                arguments: r#"{"url":"https://example.com/a","destination":"/tmp/a.txt"}"#
+                    .to_owned(),
+            })
+            .expect("download tool call should parse");
+        assert_eq!(
+            call.session_scope_key(),
+            Some("download:/tmp/a.txt".to_owned())
+        );
     }
 }
