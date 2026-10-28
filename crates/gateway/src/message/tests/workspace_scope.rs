@@ -140,7 +140,7 @@ async fn explicit_resource_reads_preserve_selection_including_empty_tombstone_an
     )
     .await;
     assert!(tombstone.get("error").is_none(), "{tombstone}");
-    assert!(tombstone["result"]["work"].is_null());
+    assert_eq!(tombstone["result"]["work"], JsonValue::Null);
     assert_eq!(tombstone["result"]["items"], json!([]));
     assert_preserved(&harness, &workspace_b, &catalog_before).await;
     for (method, params) in [

@@ -77586,7 +77586,7 @@ async fn memory_search_respects_connection_workspace() {
             .to_string(),
         )
         .await;
-    let selected = recv_response_by_id(&mut harness.rx, &select_id).await;
+    let selected = recv_response_by_id(&mut harness.rx, select_id.as_str()).await;
     assert_eq!(selected.result["workspace"]["id"], workspace_b.id);
 
     let empty_scope_search_id = memory_request_id("isoempty");
