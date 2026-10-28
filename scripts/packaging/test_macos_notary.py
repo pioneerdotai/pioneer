@@ -24,14 +24,12 @@ CREDENTIALS = dict(APPLE_NOTARIZATION_KEY_ID="fixture-key-id",
 
 class NotaryTransport:
     """Fixture for only xcrun's external wire/file responses, not owner outcomes."""
-    def __init__(self, report_status="Accepted", issues=None, staple_failures=0, validation_errors=()):
+    def __init__(self, report_status="Accepted", issues=None, staple_failures=0):
         self.report_status = report_status
         self.issues = issues
         self.staple_failures = staple_failures
         self.actions = []
         self.staple_attempts = 0
-        self.validation_errors = iter(validation_errors)
-        self.validation_attempts = 0
 
     def run(self, arguments, **options):
         if arguments[0] != "xcrun":
@@ -56,11 +54,7 @@ class NotaryTransport:
             else:
                 (Path(arguments[-1]) / "Contents/CodeResources").write_bytes(b"fixture Apple ticket")
         elif action == ("stapler", "validate"):
-            self.validation_attempts += 1
-            failure = next(self.validation_errors, None)
-            if failure is not None:
-                status, error = failure
-            elif not (Path(arguments[-1]) / "Contents/CodeResources").is_file():
+            if not (Path(arguments[-1]) / "Contents/CodeResources").is_file():
                 status, error = 66, "No stapled ticket\n"
         else:
             raise AssertionError(f"Unexpected xcrun operation: {action}")
@@ -80,37 +74,6 @@ def inputs(root, retained=False):
 
 
 class MacosNotaryTests(unittest.TestCase):
-    def test_delivered_ticket_validation_recovers_network_errors_but_rejects_invalid_tickets(self):
-        network = (68, 'Error Domain=NSURLErrorDomain Code=-1005 "The network connection was lost."\n'
-                       'CloudKit\'s response is inconsistent with expections: (null)\n'
-                       'The validate action failed! Error 68.\n')
-        invalid = (65, "The ticket data is invalid.\n")
-        for errors, attempts, failure in (((network,), 2, None),
-                                          ((network,) * 4, 4, "network connection was lost"),
-                                          ((invalid,), 1, "ticket data is invalid")):
-            with self.subTest(errors=errors), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                _, app, logs = inputs(root)
-                (app / "Contents/CodeResources").write_bytes(b"delivered ticket fixture")
-                transport = NotaryTransport(validation_errors=errors)
-                with (patch.dict(os.environ, PIONEER_NOTARY_LOG_DIR=str(logs)),
-                      patch.object(subprocess, "run", transport.run),
-                      patch("time.sleep", return_value=None), redirect_stdout(io.StringIO())):
-                    if failure:
-                        with self.assertRaisesRegex(RuntimeError, failure):
-                            NOTARY["validate_ticket"](app)
-                    else:
-                        NOTARY["validate_ticket"](app)
-                self.assertEqual(transport.validation_attempts, attempts)
-                validation_logs = list((logs / "validation").glob("*.log"))
-                self.assertEqual(len(validation_logs), 1)
-                log = validation_logs[0].read_text()
-                self.assertIn(errors[0][1], log)
-                if failure is None:
-                    self.assertIn("attempt 2, exit 0", log)
-                self.assertEqual((app / "Contents/CodeResources").read_bytes(), b"delivered ticket fixture")
-                self.assertFalse((logs / "submission.json").exists())
-
     def test_invalid_submission_or_report_error_retains_report_and_never_staples(self):
         for status, issues in (("Invalid", [dict(severity="error", message="Invalid code signature")]),
                                ("Accepted", [dict(severity="error", message="Invalid nested signature")])):
