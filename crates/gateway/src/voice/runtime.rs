@@ -31,7 +31,7 @@ pub(crate) enum LoadedVoiceEngine {
     Canary(CanaryModel),
     Cohere(CohereModel),
     #[cfg(test)]
-    TestStub(String),
+    TestStub(super::transcription::TestVoiceSpeechTranscriber),
     #[cfg(test)]
     TestHypothesis(VoiceSpeechHypothesis),
 }
@@ -101,7 +101,9 @@ impl LoadedVoiceEngine {
             Self::Canary(model) => transcribe_canary(model, &input),
             Self::Cohere(model) => transcribe_cohere(model, &input),
             #[cfg(test)]
-            Self::TestStub(text) => Ok(VoiceSpeechHypothesis::text_only(text.clone())),
+            Self::TestStub(transcriber) => {
+                transcriber(buffer).map(VoiceSpeechHypothesis::text_only)
+            }
             #[cfg(test)]
             Self::TestHypothesis(hypothesis) => Ok(hypothesis.clone()),
         }
@@ -115,7 +117,8 @@ impl LoadedVoiceEngine {
 
     #[cfg(test)]
     pub(crate) fn test_stub_with_transcript(text: impl Into<String>) -> Self {
-        Self::TestStub(text.into())
+        let text = text.into();
+        Self::TestStub(std::sync::Arc::new(move |_| Ok(text.clone())))
     }
 }
 

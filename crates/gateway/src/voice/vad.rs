@@ -116,6 +116,9 @@ pub(crate) struct SmoothedVoiceVad<D> {
     hangover_counter: usize,
     onset_counter: usize,
     in_speech: bool,
+    // Source time since the last positive detector frame, including hangover.
+    // This is independent of how much PCM smoothing emits or retains as prefill.
+    quiet_samples: usize,
 }
 
 impl<D> SmoothedVoiceVad<D>
@@ -130,6 +133,7 @@ where
             hangover_counter: 0,
             onset_counter: 0,
             in_speech: false,
+            quiet_samples: 0,
         })
     }
 
@@ -207,6 +211,10 @@ where
         Ok(result)
     }
 
+    pub(super) fn quiet_samples(&self) -> usize {
+        self.quiet_samples
+    }
+
     pub(super) fn finish_incremental_tail(&mut self, tail: &[f32]) -> Result<Vec<f32>> {
         if tail.len() >= self.config.frame_samples {
             bail!("voice VAD tail must be shorter than a frame");
@@ -240,6 +248,11 @@ where
 
         let probability = self.detector.speech_probability(frame)?;
         let is_voice = probability > self.config.speech_threshold;
+        self.quiet_samples = if is_voice {
+            0
+        } else {
+            self.quiet_samples.saturating_add(self.config.frame_samples)
+        };
         match (self.in_speech, is_voice) {
             (false, true) => {
                 self.onset_counter += 1;
