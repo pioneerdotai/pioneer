@@ -1,3 +1,6 @@
+#[path = "tests/workspace_scope.rs"]
+mod workspace_scope;
+
 #[cfg(unix)]
 #[path = "tests/title_recovery.rs"]
 mod title_recovery;
@@ -77571,27 +77574,35 @@ async fn memory_search_respects_connection_workspace() {
         .create_workspace("phase06_workspace_b", Some("Phase 06 Workspace B"))
         .await
         .expect("create workspace B");
+    let select_id = memory_request_id("isoselect");
     harness
         .processor
-        .session_manager
-        .set_connection_workspace(harness.connection_id, Some(workspace_b.id.clone()))
+        .process_request_for_connection(
+            harness.connection_id,
+            &json!({
+                "jsonrpc":"2.0", "id":select_id, "method":"workspace/select",
+                "params":{"workspace_id":workspace_b.id,"make_current":false}
+            })
+            .to_string(),
+        )
         .await;
+    let selected = recv_response_by_id(&mut harness.rx, &select_id).await;
+    assert_eq!(selected.result["workspace"]["id"], workspace_b.id);
 
     let empty_scope_search_id = memory_request_id("isoempty");
     harness
         .processor
-        .memory_search(
-            &request_context,
-            empty_scope_search_id.clone(),
-            MemorySearchParams {
-                query: "phase06 isolation phrase".to_owned(),
-                scopes: Vec::new(),
-                categories: Vec::new(),
-                statuses: Vec::new(),
-                limit: Some(10),
-                cursor: None,
-                include_provenance: false,
-            },
+        .process_request_for_connection(
+            harness.connection_id,
+            &json!({
+                "jsonrpc":"2.0", "id":empty_scope_search_id, "method":"memory/search",
+                "params":MemorySearchParams {
+                    query: "phase06 isolation phrase".to_owned(),
+                    scopes: Vec::new(), categories: Vec::new(), statuses: Vec::new(),
+                    limit: Some(10), cursor: None, include_provenance: false,
+                }
+            })
+            .to_string(),
         )
         .await;
     let empty_scope_response =

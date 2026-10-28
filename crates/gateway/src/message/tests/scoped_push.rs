@@ -37,9 +37,19 @@ async fn scoped_push_delivers_committed_answer_and_read_without_tree_hint() {
     let _ = recv_response_by_id(&mut source_rx, &start).await;
     let _ = recv_notification_by_method(&mut source_rx, events::THREAD_STARTED).await;
     send_epic6_test_message(&processor, source, &mut source_rx, THREAD, TURN, "question").await;
-    sessions
-        .set_connection_workspace(observer, Some(workspace.clone()))
+    let select = generate_test_request_id("pushtest", "select");
+    processor
+        .process_request_for_connection(
+            observer,
+            &json!({
+                "jsonrpc":"2.0", "id":select, "method":"workspace/select",
+                "params":{"workspace_id":workspace,"make_current":false}
+            })
+            .to_string(),
+        )
         .await;
+    let selected = recv_response_by_id(&mut observer_rx, &select).await;
+    assert_eq!(selected.result["workspace"]["id"], workspace);
     let register = generate_test_request_id("pushtest", "register");
     processor.process_request_for_connection(observer, &json!({
         "jsonrpc":"2.0", "id":register, "method":"workspace/push",
@@ -54,6 +64,30 @@ async fn scoped_push_delivers_committed_answer_and_read_without_tree_hint() {
     assert!(initial.snapshot && !initial.resync_required);
     assert_eq!(initial.revision, 1);
     assert_eq!(initial.indicators[0].unread_count, Some(0));
+
+    // A sidebar prefetch for another workspace must not retire this publisher.
+    let other = processor
+        .workspace_manager
+        .create_workspace("push_background_a", Some("Background A"))
+        .await
+        .unwrap();
+    let tree_id = generate_test_request_id("pushtest", "background");
+    processor
+        .process_request_for_connection(
+            observer,
+            &json!({
+                "jsonrpc":"2.0", "id":tree_id, "method":"thread/tree",
+                "params":{"workspace_id":other.id}
+            })
+            .to_string(),
+        )
+        .await;
+    let tree = recv_response_by_id(&mut observer_rx, &tree_id).await;
+    assert_eq!(tree.result["threads"], json!([]));
+    assert_eq!(
+        sessions.connection_workspace_id(observer).await.as_deref(),
+        Some(workspace.as_str())
+    );
 
     let answer = pioneer_protocol::TurnItem::AgentMessage {
         id: pioneer_protocol::task_delivery_result_item_id("push-completion"),
