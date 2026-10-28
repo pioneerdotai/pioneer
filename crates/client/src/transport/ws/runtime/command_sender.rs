@@ -218,22 +218,25 @@ impl GatewayWsCommandSender {
             "connection renewal retired"
         );
         let access = http_access_from_spec(&spec, connection_id);
+        let deadline = std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT;
         let (response_tx, response_rx) = mpsc::channel();
+        let response_tx = crate::rpc::JsonRpcResponseSender::new(response_tx, deadline);
+        let _request_guard = response_tx.retire_on_drop();
         self.command_tx
             .send(GatewayWsCommand::RenewAccess {
                 connection_id,
                 spec,
                 refresh_generation,
-                deadline: tokio::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+                deadline: deadline.into(),
                 response_tx,
             })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
         let _wait = pioneer_observability::live::WaitGuard::with_timeout(
             pioneer_observability::live::WaitKind::Reply,
-            crate::rpc::RPC_REQUEST_TIMEOUT + Duration::from_secs(1),
+            deadline.saturating_duration_since(std::time::Instant::now()),
         );
         response_rx
-            .recv_timeout(crate::rpc::RPC_REQUEST_TIMEOUT + Duration::from_secs(1))
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
             .map_err(|_| anyhow!("connection renewal unavailable"))?
             .map_err(anyhow::Error::new)?;
         let generations = self
