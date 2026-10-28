@@ -104,10 +104,8 @@ mod tests {
         let set: ThemeSet = serde_json::from_str(super::BUNDLED_THEME).unwrap();
         assert_eq!(set.themes.len(), 2);
         for config in set.themes {
-            let mut theme = Theme {
-                mode: config.mode,
-                ..Theme::default()
-            };
+            let mut theme = Theme::default();
+            theme.mode = config.mode;
             theme.apply_config(&std::rc::Rc::new(config));
             assert_eq!(theme.list_active_border.a, 0.0);
             assert!(theme.sidebar_accent.a > 0.0);
