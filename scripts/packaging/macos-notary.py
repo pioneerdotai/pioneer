@@ -54,10 +54,21 @@ def command(arguments, log, retry=False, terminal_json=False):
             except (ValueError, AttributeError):
                 pass
         if not retry or attempt == 4 or not transient(result):
-            raise RuntimeError(f"{arguments[1:3]} failed; see {log}")
+            details = (result.stdout + result.stderr).strip()
+            raise RuntimeError(f"{arguments[1:3]} failed; see {log}\n{details}")
         delay = attempt * 5
         print(f"Transient Apple error; attempt {attempt}/4, retry in {delay}s", flush=True)
         time.sleep(delay)
+
+
+def validate_ticket(path, log=None):
+    """Validate delivered tickets with the same bounded network retries as stapling."""
+    if log is None:
+        identity = hashlib.sha256(str(Path(path).resolve()).encode()).hexdigest()[:16]
+        log = Path(os.environ.get("PIONEER_NOTARY_LOG_DIR", "notary-logs")) / "validation" / f"{identity}.log"
+    log = Path(log)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    command(["xcrun", "stapler", "validate", str(path)], log, retry=True)
 
 
 def notarize(submit, staples, log_dir):
@@ -118,7 +129,7 @@ def notarize(submit, staples, log_dir):
         command(["xcrun", "stapler", "staple", str(path)], log_dir / f"staple-{index}.log", retry=True)
         state["final_sha256"] = digest(submit)
         write_json(state_path, state)
-        command(["xcrun", "stapler", "validate", str(path)], log_dir / f"validate-{index}.log", retry=True)
+        validate_ticket(path, log_dir / f"validate-{index}.log")
     state["final_sha256"] = digest(submit)
     write_json(state_path, state)
     return state

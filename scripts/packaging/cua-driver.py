@@ -323,7 +323,8 @@ def validate_tree(target, root, verify_signatures=False):
                     raise ValueError("Root/app ONNX copies differ")
         if verify_signatures:
             verify_macos(root)
-            subprocess.run(["xcrun", "stapler", "validate", str(root / "cua/Pioneer Gateway.app")], check=True)
+            notary = runpy.run_path(str(Path(__file__).with_name("macos-notary.py")))
+            notary["validate_ticket"](root / "cua/Pioneer Gateway.app")
     elif verify_signatures:
         raise ValueError("Signature verification mode requires a macOS target")
     return manifest

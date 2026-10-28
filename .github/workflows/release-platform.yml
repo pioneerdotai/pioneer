@@ -395,6 +395,9 @@ jobs:
         with:
           role: gateway-runtime-${{ fromJSON(inputs.platform).target }}
           path: gateway-runtime
+      # Input restoration validates Gateway tickets too; configure TCP first.
+      - uses: ./.github/actions/macos-signing
+        if: runner.os == 'macOS'
       - name: restore-exact-runtime-inputs
         run: >-
           python scripts/packaging/release-inputs.py --target "${{ fromJSON(inputs.platform).target }}"
@@ -423,8 +426,6 @@ jobs:
                       if source.read(4) in magic:
                           path.chmod(0o755)
           PYMODES
-      - uses: ./.github/actions/macos-signing
-        if: runner.os == 'macOS'
       - name: install-linux-packaging-dependencies
         if: runner.os == 'Linux'
         run: |

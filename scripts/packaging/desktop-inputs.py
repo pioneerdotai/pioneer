@@ -132,7 +132,8 @@ def main():
                                     str(app / "Contents/MacOS" / name)], check=True)
                 subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
             if os.environ.get("APPLE_NOTARIZATION_KEY_ID"):
-                subprocess.run(["xcrun", "stapler", "validate", str(app)], check=True)
+                notary = runpy.run_path(str(Path(__file__).with_name("macos-notary.py")))
+                notary["validate_ticket"](app)
 
 
 if __name__ == "__main__":

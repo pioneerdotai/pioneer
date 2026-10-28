@@ -1,8 +1,17 @@
-name: Import release signing identity
-description: Import the existing macOS release certificate into a temporary keychain.
+name: Prepare macOS release signing
+description: Use TCP for Apple ticket requests and import the release certificate into a temporary keychain.
 runs:
   using: composite
   steps:
+    - name: use-TCP-for-Apple-ticket-service
+      shell: bash
+      run: |
+        set -euo pipefail
+        # GitHub-hosted macOS runners can lose CloudKit HTTP/3 connections.
+        # Use TCP on both Intel and Apple Silicon for this ephemeral job.
+        # https://github.com/actions/runner-images/issues/14924
+        printf '%s\n' 'block return out quick proto udp from any to any port 443' | sudo pfctl -f -
+        sudo pfctl -E
     - name: setup-macos-signing-keychain
       shell: bash
       run: |
