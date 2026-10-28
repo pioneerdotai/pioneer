@@ -15,8 +15,40 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  prepare-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - name: keep-release-hidden-until-all-assets-are-ready
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          prerelease_flag=""
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft ${prerelease_flag}
+          else
+            if ! gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" --draft ${prerelease_flag}; then
+              gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                --draft ${prerelease_flag}
+            fi
+          fi
+
+          [[ "$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq '.isDraft')" == true ]] || {
+            echo 'release preparation did not leave the current tag in draft' >&2
+            exit 1
+          }
+
   preflight:
     if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: prepare-release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -472,14 +504,11 @@ jobs:
             prerelease_flag="--prerelease"
           fi
 
-          if gh release view "${GITHUB_REF_NAME}" --json isDraft >/dev/null 2>&1; then
-            [[ "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')" == true ]] || {
-              echo 'refusing to mutate an already published release' >&2; exit 1;
-            }
-          else
-            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --draft ${prerelease_flag} \
-              --notes-file .github/release-notes/0.66.0-computer-use-migration.md
-          fi
+          # prepare-release hides the current tag before any builds start.
+          # Keep it hidden throughout asset upload and verification.
+          [[ "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')" == true ]] || {
+            echo 'the prepared release must remain draft until all assets are ready' >&2; exit 1;
+          }
 
           # Keep human-authored draft notes and append the migration notice once.
           # It also applies to users arriving from older CU installs in later releases.
@@ -490,7 +519,7 @@ jobs:
 
           draft = json.loads(Path('release-draft.json').read_text())
           if draft.get('isDraft') is not True:
-              raise ValueError('refusing to mutate an already published release')
+              raise ValueError('the prepared release must remain draft until all assets are ready')
           body = draft['body']
           notice = Path('.github/release-notes/0.66.0-computer-use-migration.md').read_text()
           marker = '<!-- pioneer-computer-use-migration-0.66.0 -->'

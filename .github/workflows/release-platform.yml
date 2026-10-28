@@ -74,6 +74,8 @@ jobs:
           shared-key: release-gateway-${{ fromJSON(inputs.platform).target }}-default-v2
           cache-workspace-crates: false
       - name: compile-gateway
+        # Git Bash rewrites CL=/EHsc as a path when launching native Python.
+        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
         run: >-
           python scripts/packaging/build-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant "default"
@@ -122,6 +124,7 @@ jobs:
           shared-key: release-gateway-${{ fromJSON(inputs.platform).target }}-computer-use-v2
           cache-workspace-crates: false
       - name: compile-gateway
+        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
         run: >-
           python scripts/packaging/build-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant "computer-use"
@@ -171,6 +174,7 @@ jobs:
           shared-key: release-desktop-${{ fromJSON(inputs.platform).target }}-v2
           cache-workspace-crates: false
       - name: compile-desktop-and-updater
+        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
         run: python scripts/packaging/build-desktop.py --target "${{ fromJSON(inputs.platform).target }}" --out release-desktop
       - uses: actions/upload-artifact@v6
         with:
