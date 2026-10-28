@@ -5,7 +5,11 @@ use serde_json::{Value, json};
 use std::{
     io,
     pin::Pin,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -61,9 +65,26 @@ impl WriteGate {
     }
 }
 
+/// An inexhaustible source of valid, unmasked server Pong frames. While active,
+/// every AsyncRead poll has bytes available: passing the progress regression
+/// cannot depend on a producer task yielding or leaving the reader empty.
+struct ReadyInbound {
+    active: AtomicBool,
+    read: AtomicBool,
+}
+
+struct StopInbound(Arc<ReadyInbound>);
+impl Drop for StopInbound {
+    fn drop(&mut self) {
+        self.0.active.store(false, Ordering::Release);
+    }
+}
+
 struct GatedSocket {
     inner: DuplexStream,
     gate: Arc<WriteGate>,
+    ready_inbound: Option<Arc<ReadyInbound>>,
+    inbound_offset: usize,
 }
 
 impl AsyncRead for GatedSocket {
@@ -72,6 +93,16 @@ impl AsyncRead for GatedSocket {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if let Some(inbound) = self.ready_inbound.as_ref()
+            && inbound.active.load(Ordering::Acquire)
+        {
+            inbound.read.store(true, Ordering::Release);
+            let pong = [0x8a, 0x00]; // FIN | Pong, zero payload, server is unmasked.
+            let count = buf.remaining().min(pong.len() - self.inbound_offset);
+            buf.put_slice(&pong[self.inbound_offset..self.inbound_offset + count]);
+            self.inbound_offset = (self.inbound_offset + count) % pong.len();
+            return Poll::Ready(Ok(()));
+        }
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
@@ -127,12 +158,22 @@ struct Fixture {
 
 impl Fixture {
     async fn start() -> Self {
+        let (fixture, start) = Self::paused(None).await;
+        start.send(()).unwrap();
+        fixture
+    }
+
+    async fn paused(
+        ready_inbound: Option<Arc<ReadyInbound>>,
+    ) -> (Self, tokio::sync::oneshot::Sender<()>) {
         let (client, server) = tokio::io::duplex(4096);
         let gate = Arc::new(WriteGate::default());
         let stream = WebSocketStream::from_raw_socket(
             GatedSocket {
                 inner: client,
                 gate: gate.clone(),
+                ready_inbound,
+                inbound_offset: 0,
             },
             Role::Client,
             None,
@@ -155,16 +196,21 @@ impl Fixture {
         let events = GatewayWsEventSender::from(events);
         let (commands, command_rx) = work_channel(Boundary::ClientRpc);
         let mut command_rx = ConnectionCommandReceiver(command_rx);
+        let (start, started) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
+            started.await.expect("start monitor fixture");
             monitor_connection(stream, &mut active_spec, 7, &events, &mut command_rx.0).await
         });
-        Self {
-            peer,
-            commands,
-            gate,
-            task,
-            spec,
-        }
+        (
+            Self {
+                peer,
+                commands,
+                gate,
+                task,
+                spec,
+            },
+            start,
+        )
     }
 
     async fn next_data(&mut self) -> Message {
@@ -252,6 +298,36 @@ impl JsonRpcRequestTransport for QueueTransport {
         self.admitted.send(id).unwrap();
         Ok(())
     }
+}
+
+// A permanently ready reader can monopolize one worker on the old ordering.
+// A second worker lets the peer/fuse stop that source even on regression failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ready_inbound_does_not_starve_outgoing_request_admission() {
+    let inbound = Arc::new(ReadyInbound {
+        active: AtomicBool::new(true),
+        read: AtomicBool::new(false),
+    });
+    let stop = StopInbound(inbound.clone());
+    let (mut fixture, start) = Fixture::paused(Some(inbound.clone())).await;
+    // Admission and incoming bytes are both ready before the monitor starts.
+    let live = request(&fixture.commands, "synthetic/inbound-progress");
+    start.send(()).unwrap();
+    let observed = timeout(Duration::from_secs(5), fixture.next_request()).await;
+    let still_active = inbound.active.load(Ordering::Acquire);
+    let read = inbound.read.load(Ordering::Acquire);
+    // Stop only after observing the outgoing request (or the deadlock fuse),
+    // before asserting, so the old busy reader can always leave its poll loop.
+    drop(stop);
+    fixture.task.abort();
+    let _ = fixture.task.await;
+    let observed = observed.expect("outgoing RPC must arrive while inbound stays ready");
+    assert!(
+        read,
+        "actual WebSocket reader must have consumed ready inbound"
+    );
+    assert!(still_active, "source must not stop to admit the command");
+    assert_eq!(observed["id"], live.id);
 }
 
 #[tokio::test]

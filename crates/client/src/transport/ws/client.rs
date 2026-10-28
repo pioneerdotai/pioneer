@@ -17,7 +17,7 @@ use super::{
 };
 use crate::rpc::{JsonRpcResponseSender, PendingJsonRpcRequests};
 use anyhow::{Context as _, Result};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, future::Either};
 use pioneer_protocol::{
     ArtifactUploadChunkAckNotification, AuthSecretString, GatewayNotification,
     SkillsUploadChunkAckNotification,
@@ -836,14 +836,15 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
         ..Default::default()
     };
 
+    let mut prefer_commands = false;
     let disconnect_reason = loop {
         let renewal_deadline = waiters.renewal.as_ref().map_or_else(
             || Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
             |pending| pending.deadline,
         );
         tokio::select! {
-            // Drain a ready writer before admitting another frame; reader/control
-            // remain ahead of ordinary backlog when the socket write is blocked.
+            // Poll the writer before admission to avoid an artificial Full.
+            // Alternate ready reads/commands below so neither can starve the other.
             biased;
             reason = &mut writer => { break reason; }
             _ = tokio::time::sleep_until(renewal_deadline), if waiters.renewal.is_some() => {
@@ -858,7 +859,23 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                     break "websocket control writer handoff full or closed".to_owned();
                 }
             }
-            payload = reader.next() => {
+            input = async {
+                if prefer_commands {
+                    tokio::select! {
+                        biased;
+                        item = rpc_rx.recv() => Either::Left(item),
+                        payload = reader.next() => Either::Right(payload),
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        payload = reader.next() => Either::Right(payload),
+                        item = rpc_rx.recv() => Either::Left(item),
+                    }
+                }
+            } => match input {
+            Either::Right(payload) => {
+                prefer_commands = true;
                 let carrier=pioneer_observability::work::WorkCarrier::independent(Boundary::EventLane,WorkKind::Event,pioneer_observability::work::Trigger::Event,ExecutorRole::ClientWs);
                 let failure=carrier.scope(async {
                 match payload {
@@ -950,7 +967,8 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                 }).await;
                 if let Some(reason)=failure { break reason; }
             }
-            item = rpc_rx.recv() => {
+            Either::Left(item) => {
+                prefer_commands = false;
                 let Some(item)=item else {break WEBSOCKET_COMMAND_CHANNEL_CLOSED_MESSAGE.to_owned();};
                 let mut queue=item.queue.as_ref().map(|(queue,_)|queue.processing());
                 let (command,carrier)=item.received(Boundary::ClientRpc,WorkKind::ClientRpc,ExecutorRole::ClientWs);
@@ -1018,6 +1036,7 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                 }).await;
                 if let Some(queue)=queue.as_mut(){queue.processed();}
                 if let Some(failure)=failure {break failure;}
+            }
             }
         }
     };
