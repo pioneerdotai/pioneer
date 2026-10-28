@@ -4491,10 +4491,13 @@ mod tests {
             .execute_unprepared("PRAGMA foreign_keys=OFF")
             .await
             .unwrap();
+        // Bypass the revision ID CHECK only while seeding the corrupt owner.
         service.database.execute_unprepared(
-            "UPDATE principal_avatar_revision SET principal_id='P0000000000000000000B';
+            "PRAGMA ignore_check_constraints=ON;
+             UPDATE principal_avatar_revision SET principal_id='P0000000000000000000B';
              INSERT INTO principal_avatar(principal_id,revision_id,updated_at)
-             SELECT (SELECT principal_id FROM auth_session LIMIT 1),id,CURRENT_TIMESTAMP FROM principal_avatar_revision LIMIT 1",
+             SELECT (SELECT principal_id FROM auth_session LIMIT 1),id,CURRENT_TIMESTAMP FROM principal_avatar_revision LIMIT 1;
+             PRAGMA ignore_check_constraints=OFF",
         ).await.unwrap();
         service.validate_session_lease(&principal).await.unwrap();
         assert_eq!(
