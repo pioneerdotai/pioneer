@@ -48,6 +48,11 @@ jobs:
 
   build-gateway-default:
     runs-on: ${{ fromJSON(inputs.platform).os }}
+    defaults:
+      run:
+        # Select the shell from workflow inputs before a runner is allocated.
+        # Native PowerShell avoids Git Bash converting CL=/EHsc to a path.
+        shell: ${{ contains(fromJSON(inputs.platform).target, 'windows') && 'pwsh' || 'bash' }}
     env:
       PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
     steps:
@@ -74,8 +79,6 @@ jobs:
           shared-key: release-gateway-${{ fromJSON(inputs.platform).target }}-default-v2
           cache-workspace-crates: false
       - name: compile-gateway
-        # Git Bash rewrites CL=/EHsc as a path when launching native Python.
-        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
         run: >-
           python scripts/packaging/build-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant "default"
@@ -98,6 +101,11 @@ jobs:
 
   build-gateway-computer-use:
     runs-on: ${{ fromJSON(inputs.platform).os }}
+    defaults:
+      run:
+        # Select the shell from workflow inputs before a runner is allocated.
+        # Native PowerShell avoids Git Bash converting CL=/EHsc to a path.
+        shell: ${{ contains(fromJSON(inputs.platform).target, 'windows') && 'pwsh' || 'bash' }}
     env:
       PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
     steps:
@@ -124,7 +132,6 @@ jobs:
           shared-key: release-gateway-${{ fromJSON(inputs.platform).target }}-computer-use-v2
           cache-workspace-crates: false
       - name: compile-gateway
-        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
         run: >-
           python scripts/packaging/build-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant "computer-use"
@@ -147,6 +154,11 @@ jobs:
 
   build-desktop:
     runs-on: ${{ fromJSON(inputs.platform).os }}
+    defaults:
+      run:
+        # Select the shell from workflow inputs before a runner is allocated.
+        # Native PowerShell avoids Git Bash converting CL=/EHsc to a path.
+        shell: ${{ contains(fromJSON(inputs.platform).target, 'windows') && 'pwsh' || 'bash' }}
     env:
       PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
       PIONEER_DESKTOP_SENTRY_DSN: ${{ secrets.PIONEER_DESKTOP_SENTRY_DSN }}
@@ -174,7 +186,6 @@ jobs:
           shared-key: release-desktop-${{ fromJSON(inputs.platform).target }}-v2
           cache-workspace-crates: false
       - name: compile-desktop-and-updater
-        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
         run: python scripts/packaging/build-desktop.py --target "${{ fromJSON(inputs.platform).target }}" --out release-desktop
       - uses: actions/upload-artifact@v6
         with:
