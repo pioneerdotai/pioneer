@@ -786,7 +786,6 @@ async fn connection_writer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
     }
 }
 
-#[derive(Default)]
 struct ConnectionWaiters {
     connection_id: u64,
     requests: PendingJsonRpcRequests,
@@ -833,7 +832,10 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     let mut last_pong = Instant::now();
     let mut waiters = ConnectionWaiters {
         connection_id,
-        ..Default::default()
+        requests: PendingJsonRpcRequests::default(),
+        renewal: None,
+        uploads: HashMap::new(),
+        artifact_uploads: HashMap::new(),
     };
 
     let mut prefer_commands = false;
