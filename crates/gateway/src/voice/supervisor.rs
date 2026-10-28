@@ -24,6 +24,7 @@ use pioneer_protocol::{
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::watch;
@@ -221,6 +222,9 @@ impl VoiceEngineLoader for EagerVoiceEngineLoader {
 
 pub(crate) struct VoiceInputSupervisor {
     inner: Mutex<VoiceInputSupervisorInner>,
+    // Published by the serialized generation transition, independently of the
+    // engine mutex so a cached completion never waits for another native call.
+    current_generation: AtomicU64,
     pub(crate) installer: Arc<dyn VoiceModelInstaller>,
     pub(crate) engine_loader: Arc<dyn VoiceEngineLoader>,
     settings_tx: watch::Sender<GatewayVoiceInputSettings>,
@@ -281,6 +285,7 @@ impl VoiceInputSupervisor {
         let initial_state = VoiceInputSupervisorState::default();
         let (settings_tx, _) = watch::channel(initial_state.settings_snapshot());
         Self {
+            current_generation: AtomicU64::new(initial_state.generation),
             inner: Mutex::new(VoiceInputSupervisorInner {
                 state: initial_state,
                 current_reconcile: None,
@@ -299,9 +304,9 @@ impl VoiceInputSupervisor {
         self.lock_inner().state.desired.clone()
     }
 
-    #[cfg(test)]
+    // Read-only fence for completed session candidates, including no-speech.
     pub(crate) fn generation(&self) -> u64 {
-        self.lock_inner().state.generation
+        self.current_generation.load(Ordering::Acquire)
     }
 
     pub(crate) fn runtime_snapshot(&self) -> GatewayVoiceInputRuntimeSnapshot {
@@ -388,6 +393,7 @@ impl VoiceInputSupervisor {
         }
         inner.loaded_engine = None;
         let generation = inner.state.apply_desired(desired, retry_install)?;
+        self.current_generation.store(generation, Ordering::Release);
         let reconcile =
             inner
                 .state

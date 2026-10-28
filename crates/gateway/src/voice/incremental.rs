@@ -1,6 +1,6 @@
 //! Session-owned contextual ASR over the existing one-shot engines.
 //! Replay is bounded to the unresolved span and a short confirmed left context.
-//! Packet boundaries never confirm text. VAD/Commit or a bounded window
+//! Packet boundaries never confirm text. Long pauses/Commit or a bounded window
 //! projection advances the confirmed prefix; projection is an ASR heuristic.
 #[cfg(test)]
 use super::transcription::{VoiceTranscriptionErrorKind, transcription_error};
@@ -36,6 +36,15 @@ const LEFT_CONTEXT_SAMPLES: usize = REFRESH_SAMPLES / 2;
 const MAX_ALIGNMENT_UNITS: usize = 2048;
 const MAX_CONTEXT_ANCHOR_BYTES: usize = 256;
 const MAX_SPEECH_WINDOW_SAMPLES: usize = 6 * REFRESH_SAMPLES;
+// Pause policy: retain 3 s unresolved + 1.5 s real confirmed left context,
+// within the existing 18 s window. 1.2 s quiet includes VAD's 450 ms hangover.
+// A carried span gets at most two continuations and 6 s of input-time lifetime.
+// Oversized text is sealed instead of retaining an unbounded linguistic history.
+const PAUSE_WINDOW_SAMPLES: usize = REFRESH_SAMPLES + LEFT_CONTEXT_SAMPLES;
+const PAUSE_SEAL_SAMPLES: usize = 40 * VOICE_VAD_FRAME_SAMPLES;
+const PAUSE_LIFETIME_SAMPLES: usize = 2 * REFRESH_SAMPLES;
+const MAX_PAUSE_CONTINUATIONS: usize = 2;
+const MAX_PAUSE_TEXT_BYTES: usize = 512;
 // transcribe-rs 0.3.12 onnx/moonshine/model.rs::generate rejects audio shorter
 // than 0.1 s at 16 kHz. This applies to Pioneer's moonshine-base adapter only;
 // other engines keep their existing input and inference parameters.
@@ -165,7 +174,7 @@ fn start_with_detector<D: VoiceActivityDetector + Send + 'static>(
                 let detector = make_detector(&cancellation)
                     .map_err(|_| worker_error("failed to initialize required Silero VAD"))?;
                 ensure_active(&cancellation)?;
-                if transcribe_while_recording {
+                let result = if transcribe_while_recording {
                     process(
                         &store,
                         &session_id,
@@ -183,7 +192,14 @@ fn start_with_detector<D: VoiceActivityDetector + Send + 'static>(
                         transcriber.is_moonshine_base,
                         detector,
                     )
+                };
+                // Cached candidates must also respect replacement generations,
+                // even when Commit needs no additional native invocation.
+                ensure_active(&cancellation)?;
+                if transcriber.supervisor.generation() != transcriber.generation {
+                    return Err(worker_error("voice session model is no longer available"));
                 }
+                result
             }))
             .unwrap_or_else(|_| Err(worker_error("voice processing worker panicked")));
             store.processing_finished(&session_id);
@@ -346,16 +362,20 @@ fn process<D: VoiceActivityDetector>(
                 .map_err(|_| worker_error("failed to segment voice audio"))?;
                 ensure_active(cancellation)?;
                 state.pending.clear();
+                state.source_samples += VOICE_VAD_FRAME_SAMPLES;
                 match classified {
-                    SmoothedVadFrame::Speech(samples) => state.accept_speech(
-                        &samples,
-                        store,
-                        session_id,
-                        cancellation,
-                        transcriber,
-                    )?,
+                    SmoothedVadFrame::Speech(samples) => {
+                        state.resume(store, session_id, cancellation, transcriber)?;
+                        state.accept_speech(
+                            &samples,
+                            store,
+                            session_id,
+                            cancellation,
+                            transcriber,
+                        )?;
+                    }
                     SmoothedVadFrame::Noise => {
-                        state.flush(store, session_id, cancellation, transcriber)?
+                        state.pause(store, session_id, cancellation, transcriber)?
                     }
                 }
             }
@@ -369,6 +389,11 @@ fn process<D: VoiceActivityDetector>(
         {
             state.refresh(store, session_id, cancellation, transcriber)?;
         }
+        if matches!(state.pause, PauseState::Holding(_))
+            && !store.processing_skip_preview(session_id)
+        {
+            state.prepare_pause(store, session_id, cancellation, transcriber)?;
+        }
     }
     ensure_active(cancellation)?;
     let key = store.processing_startup_key(session_id);
@@ -380,7 +405,11 @@ fn process<D: VoiceActivityDetector>(
     })
     .map_err(|_| worker_error("failed to segment final voice audio"))?;
     ensure_active(cancellation)?;
-    state.accept_speech(&tail, store, session_id, cancellation, transcriber)?;
+    state.source_samples += state.pending.len();
+    if !tail.is_empty() {
+        state.resume(store, session_id, cancellation, transcriber)?;
+        state.accept_speech(&tail, store, session_id, cancellation, transcriber)?;
+    }
     state.flush(store, session_id, cancellation, transcriber)?;
     let signal_stats = state.signal.finish();
     if state.text.is_empty() {
@@ -411,6 +440,23 @@ fn process<D: VoiceActivityDetector>(
     })
 }
 
+// The existing session owner also owns pause transitions. Holding is quiet;
+// Resumed keeps the same deadline/replay budget across short repeated pauses.
+// A first unconfirmed onset with no owned speech never creates a held context.
+#[derive(Clone, Copy)]
+struct PauseContext {
+    started_at: usize,
+    continuations: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+enum PauseState {
+    #[default]
+    Speech,
+    Holding(PauseContext),
+    Resumed(PauseContext),
+}
+
 struct IncrementalSpeech<D> {
     is_moonshine_base: bool,
     vad: SmoothedVoiceVad<D>,
@@ -426,9 +472,14 @@ struct IncrementalSpeech<D> {
     owned_text_start: usize,
     context_samples: usize, // already confirmed PCM at the start of speech
     context_text: String,
+    // Preview cadence counts new source separately from candidate validity:
+    // projection carries a stride origin, but changes PCM/ownership boundaries.
     decoded_samples: usize,
+    candidate_current: bool,
     next_refresh_samples: usize,
     signal: SignalAccumulator,
+    source_samples: usize, // processed input, including discarded silence
+    pause: PauseState,
 }
 impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
     fn new(is_moonshine_base: bool, detector: D) -> Result<Self, VoiceError> {
@@ -448,9 +499,93 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
             context_samples: 0,
             context_text: String::new(),
             decoded_samples: 0,
+            candidate_current: false,
             next_refresh_samples: REFRESH_SAMPLES,
             signal: SignalAccumulator::default(),
+            source_samples: 0,
+            pause: PauseState::Speech,
         })
+    }
+
+    fn pause(
+        &mut self,
+        store: &GatewayVoiceSessionBufferStore,
+        id: &str,
+        cancellation: &CancellationToken,
+        transcriber: &impl VoiceSpeechTranscriber,
+    ) -> Result<(), VoiceError> {
+        if self.speech.len() == self.context_samples {
+            return Ok(());
+        }
+        let entering = !matches!(self.pause, PauseState::Holding(_));
+        let context = match self.pause {
+            PauseState::Speech => PauseContext {
+                started_at: self.source_samples.saturating_sub(self.vad.quiet_samples()),
+                continuations: 0,
+            },
+            PauseState::Holding(context) | PauseState::Resumed(context) => context,
+        };
+        self.pause = PauseState::Holding(context);
+        if self.vad.quiet_samples() >= PAUSE_SEAL_SAMPLES
+            || self.source_samples.saturating_sub(context.started_at) >= PAUSE_LIFETIME_SAMPLES
+        {
+            return self.flush(store, id, cancellation, transcriber);
+        }
+        if entering {
+            self.prepare_pause(store, id, cancellation, transcriber)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_pause(
+        &mut self,
+        store: &GatewayVoiceSessionBufferStore,
+        id: &str,
+        cancellation: &CancellationToken,
+        transcriber: &impl VoiceSpeechTranscriber,
+    ) -> Result<(), VoiceError> {
+        if self.speech.len() > PAUSE_WINDOW_SAMPLES {
+            // The same ownership projection as a full window, with a fixed
+            // source fence. At most whole + two partition probes + left probe;
+            // never retry to force textual agreement.
+            let cut = self.speech.len() - REFRESH_SAMPLES;
+            self.project_window(cut, cut, cut, store, id, cancellation, transcriber)?;
+            self.next_refresh_samples = self.speech.len() + REFRESH_SAMPLES;
+        }
+        if !store.processing_skip_preview(id) {
+            self.refresh(store, id, cancellation, transcriber)?;
+        }
+        if self.full_hypothesis.text.len() > MAX_PAUSE_TEXT_BYTES
+            || self.context_text.len() > MAX_PAUSE_TEXT_BYTES
+        {
+            self.flush(store, id, cancellation, transcriber)?;
+        }
+        Ok(())
+    }
+
+    fn resume(
+        &mut self,
+        store: &GatewayVoiceSessionBufferStore,
+        id: &str,
+        cancellation: &CancellationToken,
+        transcriber: &impl VoiceSpeechTranscriber,
+    ) -> Result<(), VoiceError> {
+        let (context, entering) = match self.pause {
+            PauseState::Speech => return Ok(()),
+            PauseState::Holding(context) => (context, true),
+            PauseState::Resumed(context) => (context, false),
+        };
+        if self.source_samples.saturating_sub(context.started_at) >= PAUSE_LIFETIME_SAMPLES
+            || (entering && context.continuations == MAX_PAUSE_CONTINUATIONS)
+        {
+            self.flush(store, id, cancellation, transcriber)?;
+        } else {
+            self.pause = PauseState::Resumed(PauseContext {
+                continuations: context.continuations + usize::from(entering),
+                ..context
+            });
+        }
+        Ok(())
     }
 
     fn accept_speech(
@@ -473,6 +608,7 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
             let until_refresh = self.next_refresh_samples - self.speech.len();
             let take = samples.len().min(room).min(until_refresh);
             self.speech.extend_from_slice(&samples[..take]);
+            self.candidate_current = false;
             self.speech_samples += take;
             samples = &samples[take..];
             if self.speech.len() == self.next_refresh_samples {
@@ -499,7 +635,7 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         cancellation: &CancellationToken,
         transcriber: &impl VoiceSpeechTranscriber,
     ) -> Result<(), VoiceError> {
-        if self.decoded_samples != self.speech.len() {
+        if !self.candidate_current || self.decoded_samples != self.speech.len() {
             let full = self.decode(&self.speech, store, id, cancellation, transcriber)?;
             let start = if self.context_samples == 0 {
                 0
@@ -515,6 +651,7 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
             self.owned_text_start = start;
             self.full_hypothesis = full;
             self.decoded_samples = self.speech.len();
+            self.candidate_current = true;
         }
         Ok(())
     }
@@ -526,10 +663,31 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         cancellation: &CancellationToken,
         transcriber: &impl VoiceSpeechTranscriber,
     ) -> Result<(), VoiceError> {
-        self.refresh(store, id, cancellation, transcriber)?;
         let preferred_cut = partition_boundary(&self.speech, self.context_samples);
         let earliest = self.context_samples + MIN_ADVANCE_SAMPLES;
         let latest = self.speech.len() - REFRESH_SAMPLES;
+        self.project_window(
+            preferred_cut,
+            earliest,
+            latest,
+            store,
+            id,
+            cancellation,
+            transcriber,
+        )
+    }
+
+    fn project_window(
+        &mut self,
+        preferred_cut: usize,
+        earliest: usize,
+        latest: usize,
+        store: &GatewayVoiceSessionBufferStore,
+        id: &str,
+        cancellation: &CancellationToken,
+        transcriber: &impl VoiceSpeechTranscriber,
+    ) -> Result<(), VoiceError> {
+        self.refresh(store, id, cancellation, transcriber)?;
         let timing = timed_boundaries(&self.full_hypothesis, self.speech.len());
         let timed_cut = timing.as_ref().and_then(|boundaries| {
             boundaries
@@ -621,14 +779,16 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         self.window_start_sample += context_start;
         self.context_samples = LEFT_CONTEXT_SAMPLES;
         self.context_text = context_text;
-        // The tail was decoded with at least as much context and the identical
-        // source end. Reuse it if Commit adds no source; no fabricated timings.
+        // Carry the projected ownership reference, but it is not a final
+        // candidate for the changed PCM/ownership boundaries. Refresh once
+        // before Commit can reuse it, even if no new source arrived.
         let mut carried = self.context_text.clone();
         append_text(&mut carried, &tail, true);
         self.owned_text_start = self.context_text.len();
         self.full_hypothesis = VoiceSpeechHypothesis::text_only(carried);
         self.hypothesis = tail.trim().to_owned();
         self.decoded_samples = self.speech.len();
+        self.candidate_current = false;
         Ok(())
     }
 
@@ -659,7 +819,9 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         self.context_samples = 0;
         self.context_text.clear();
         self.decoded_samples = 0;
+        self.candidate_current = false;
         self.next_refresh_samples = REFRESH_SAMPLES;
+        self.pause = PauseState::Speech;
         Ok(())
     }
 
@@ -1132,6 +1294,42 @@ mod tests {
 
     fn test_detector() -> super::super::vad::EnergyVoiceActivityDetector {
         super::super::vad::EnergyVoiceActivityDetector::new(0.02).unwrap()
+    }
+
+    // Entering frame N proves that all handling of frame N-1, including its
+    // successful decode and candidate acceptance, has returned to the owner.
+    // Notifications inside fake ASR itself cannot establish that ordering.
+    struct CheckpointDetector {
+        inner: super::super::vad::EnergyVoiceActivityDetector,
+        frames: usize,
+        checkpoints: Vec<usize>,
+        reached: std::sync::mpsc::Sender<usize>,
+    }
+
+    impl CheckpointDetector {
+        fn new(checkpoints: Vec<usize>) -> (Self, std::sync::mpsc::Receiver<usize>) {
+            let (reached, receive) = std::sync::mpsc::channel();
+            (
+                Self {
+                    inner: test_detector(),
+                    frames: 0,
+                    checkpoints,
+                    reached,
+                },
+                receive,
+            )
+        }
+    }
+
+    impl VoiceActivityDetector for CheckpointDetector {
+        fn speech_probability(&mut self, frame: &[f32]) -> anyhow::Result<f32> {
+            let probability = self.inner.speech_probability(frame)?;
+            self.frames += 1;
+            if self.checkpoints.contains(&self.frames) {
+                let _ = self.reached.send(self.frames);
+            }
+            Ok(probability)
+        }
     }
 
     fn process(
@@ -2350,7 +2548,7 @@ mod tests {
                     });
                 }
                 168000 => "начало да",
-                120000 => "конец",
+                120000 | 144000 => "конец",
                 LEFT_CONTEXT_SAMPLES => "",
                 176007 => match (*samples.last().unwrap() * 32768.0) as i16 {
                     12000 => "конец да дальше",
@@ -2531,12 +2729,17 @@ mod tests {
         );
         assert_eq!(signal_stats.total_samples, audio.len());
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 5);
-        let cut = calls[1].len();
-        let mut final_source =
-            vec![12000.0 / 32768.0; MAX_SPEECH_WINDOW_SAMPLES - cut + LEFT_CONTEXT_SAMPLES];
-        final_source.extend(vec![0.0; 15 * VOICE_VAD_FRAME_SAMPLES]);
-        assert_eq!(calls[4], final_source);
+        // One ordinary cap projection, then one smaller pause projection.
+        // The final candidate must use the newly bounded PCM, including hangover.
+        assert_eq!(calls.len(), 9);
+        let mut final_source = vec![12000.0 / 32768.0; 72000 - 15 * 480];
+        final_source.extend(vec![0.0; 15 * 480]);
+        assert_eq!(calls.last().unwrap(), &final_source);
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.len() <= MAX_SPEECH_WINDOW_SAMPLES)
+        );
     }
 
     #[test]
@@ -2790,17 +2993,18 @@ mod tests {
     }
 
     #[test]
-    fn vad_pause_seals_contextual_span_and_preserves_short_moonshine_tail() {
-        let mut audio = vec![12000; 4 * REFRESH_SAMPLES];
+    fn vad_short_pause_keeps_context_and_preserves_seven_sample_moonshine_tail() {
+        let mut audio = vec![12000; 960];
         audio.extend(vec![0; 16 * VOICE_VAD_FRAME_SAMPLES]);
         audio.extend([6000; 7]);
         let fake = TestSpeechTranscriber(Arc::new(|buffer| {
             assert!(buffer.speech_samples() >= MIN_MOONSHINE_BASE_INPUT_SAMPLES);
             let samples = buffer.flattened_samples();
-            Ok(if samples.iter().any(|sample| *sample > 0.3) {
-                "да, да; ещё раз, ещё раз"
+            assert_eq!(&samples[samples.len() - 7..], &[6000.0 / 32768.0; 7]);
+            Ok(if samples.contains(&(6000.0 / 32768.0)) {
+                "да, да; ещё раз, ещё раз короткий хвост"
             } else {
-                "короткий хвост"
+                "да, да; ещё раз, ещё раз"
             }
             .to_owned())
         }));
@@ -2816,9 +3020,356 @@ mod tests {
             assert_eq!(transcript.text, "да, да; ещё раз, ещё раз короткий хвост");
             assert_eq!(transcript.diagnostics.total_samples, audio.len());
             assert_eq!(transcript.diagnostics.speech_samples, audio.len());
-            assert_eq!(transcript.diagnostics.segment_count, 2);
+            assert_eq!(transcript.diagnostics.segment_count, 1);
             assert_eq!(signal_stats.total_samples, audio.len());
-            assert_eq!(signal_stats.non_zero_samples, 4 * REFRESH_SAMPLES + 7);
+            assert_eq!(signal_stats.non_zero_samples, 960 + 7);
+        }
+    }
+
+    #[test]
+    fn short_pause_revises_only_owned_tail_with_packet_independent_source() {
+        for resume in [false, true] {
+            let mut audio = vec![12000; 96000];
+            audio.extend(vec![0; 480 * 16]);
+            if resume {
+                audio.extend(vec![6000; 967]);
+            }
+            for packet in [137, 480, 1600] {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let capture = calls.clone();
+                let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
+                    let samples = buffer.flattened_samples();
+                    let text = if samples.contains(&(6000.0 / 32768.0)) {
+                        "prefix corrected tail"
+                    } else {
+                        match samples.len() {
+                            103200 => "immutable prefix wrong tail",
+                            55200 => "immutable prefix",
+                            48000 => "wrong tail",
+                            24000 => "prefix",
+                            72000 => "prefix wrong tail",
+                            count => panic!("unexpected source span {count}"),
+                        }
+                    };
+                    capture.lock().unwrap().push(samples);
+                    Ok(text.to_owned())
+                }));
+                let result = closed_input(&audio, packet, false, &fake).unwrap();
+                let GatewayVoiceSessionPipelineOutcome::Transcript {
+                    transcript,
+                    signal_stats,
+                } = result
+                else {
+                    panic!("contextual transcript expected");
+                };
+                assert_eq!(
+                    transcript.text,
+                    if resume {
+                        "immutable prefix corrected tail"
+                    } else {
+                        "immutable prefix wrong tail"
+                    }
+                );
+                let normalized: Vec<_> = audio.iter().map(|s| f32::from(*s) / 32768.0).collect();
+                let calls = calls.lock().unwrap();
+                // A real final decode of the retained span, after the ownership
+                // fence changed. The dropped silence is recovered once as prefill
+                // only when continuation is present; old hangover is not reissued.
+                let source_end = if resume { audio.len() } else { 103200 };
+                assert_eq!(calls.last().unwrap(), &normalized[31200..source_end]);
+                assert!(calls.iter().all(|call| call.len() <= 288000));
+                assert_eq!(transcript.diagnostics.speech_samples, source_end);
+                assert_eq!(transcript.diagnostics.total_samples, audio.len());
+                assert_eq!(signal_stats.total_samples, audio.len());
+            }
+        }
+    }
+
+    #[test]
+    fn long_silence_seals_once_without_decoding_or_retaining_each_noise_frame() {
+        for quiet_frames in [40, 1000] {
+            let mut audio = vec![12000; 960];
+            audio.extend(vec![0; quiet_frames * 480]);
+            audio.extend(vec![6000; 967]);
+            for packet in [137, 1600] {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let capture = calls.clone();
+                let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
+                    let samples = buffer.flattened_samples();
+                    let text = if samples.contains(&(12000.0 / 32768.0)) {
+                        "first"
+                    } else {
+                        "second"
+                    };
+                    capture.lock().unwrap().push(samples);
+                    Ok(text.to_owned())
+                }));
+                let result = closed_input(&audio, packet, false, &fake).unwrap();
+                let GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. } = result
+                else {
+                    panic!("both spans expected");
+                };
+                assert_eq!(transcript.text, "first second");
+                let calls = calls.lock().unwrap();
+                let mut first = vec![12000.0 / 32768.0; 960];
+                first.extend(vec![0.0; 15 * 480]);
+                let mut second = vec![0.0; 14 * 480];
+                second.extend(vec![6000.0 / 32768.0; 967]);
+                assert_eq!(*calls, vec![first, second]);
+                assert_eq!(transcript.diagnostics.speech_samples, 960 + 29 * 480 + 967);
+                assert_eq!(transcript.diagnostics.total_samples, audio.len());
+            }
+        }
+    }
+
+    #[test]
+    fn real_repetition_across_short_pause_is_not_text_deduplicated() {
+        let mut audio = vec![12000; 960];
+        audio.extend(vec![0; 16 * 480]);
+        audio.extend(vec![12000; 960]);
+        let fake = TestSpeechTranscriber(Arc::new(|buffer| {
+            Ok(frame_transcript(&buffer.flattened_samples()))
+        }));
+        let result = closed_input(&audio, 137, false, &fake).unwrap();
+        let GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. } = result else {
+            panic!("repeated phrase expected");
+        };
+        assert_eq!(transcript.text, "да, да, да, да,");
+        assert_eq!(transcript.diagnostics.speech_samples, audio.len());
+    }
+
+    #[test]
+    fn pause_candidate_commit_resume_error_and_cancel_use_current_source() {
+        for action in [
+            "commit",
+            "resume",
+            "error",
+            "cancel",
+            "cancel_paused",
+            "oversized",
+            "empty",
+            "seal",
+        ] {
+            let store = GatewayVoiceSessionBufferStore::default();
+            let token = CancellationToken::new();
+            let (_sender, receiver) = oneshot::channel();
+            store
+                .start_processing(
+                    "session".to_owned(),
+                    VoiceAudioFormat::pioneer_streaming_target(),
+                    token.clone(),
+                    receiver,
+                )
+                .unwrap();
+            let cancel = token.clone();
+            let (entered, receive) = std::sync::mpsc::channel();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let capture = calls.clone();
+            let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
+                let samples = buffer.flattened_samples();
+                let resumed = samples.contains(&(6000.0 / 32768.0));
+                capture.lock().unwrap().push(samples);
+                if !resumed {
+                    entered.send(()).unwrap();
+                    return Ok(if action == "oversized" {
+                        "я".repeat(300)
+                    } else {
+                        "early mistake".to_owned()
+                    });
+                }
+                if action == "error" {
+                    return Err(transcription_error(
+                        VoiceTranscriptionErrorKind::RuntimeFailure,
+                        "late decode failed",
+                    ));
+                }
+                if action == "cancel" {
+                    cancel.cancel();
+                }
+                if action == "empty" {
+                    return Ok(String::new());
+                }
+                Ok("corrected continuation".to_owned())
+            }));
+            let mut audio = vec![12000; 960];
+            audio.extend(vec![0; 16 * 480]);
+            append_test_packet(&store, "session", 0, &audio);
+            let (detector, checkpoints) = CheckpointDetector::new(vec![19, 29, 43]);
+            std::thread::scope(|scope| {
+                let worker = scope
+                    .spawn(|| super::process(&store, "session", &token, &fake, false, detector));
+                let before_commit = receive.recv_timeout(std::time::Duration::from_secs(5));
+                // The first pause decode is frame 18 (2 speech + 16 quiet).
+                // Frame 19 can only enter after the candidate was accepted.
+                append_test_packet(&store, "session", 1, &[0; 480]);
+                audio.extend([0; 480]);
+                let accepted = checkpoints.recv_timeout(std::time::Duration::from_secs(5));
+                let mut quiet_progress = Vec::new();
+                if action == "seal" {
+                    // Remain open: frame 29 proves ten additional quiet frames
+                    // have completed after acceptance, with no changed ASR PCM.
+                    append_test_packet(&store, "session", 2, &[0; 10 * 480]);
+                    audio.extend([0; 10 * 480]);
+                    quiet_progress.push((
+                        checkpoints.recv_timeout(std::time::Duration::from_secs(5)),
+                        calls.lock().unwrap().len(),
+                    ));
+                    // Seal is frame 42 (2 speech + 40 quiet); entering frame 43
+                    // proves seal has run before Commit, not because of close.
+                    append_test_packet(&store, "session", 3, &[0; 14 * 480]);
+                    audio.extend([0; 14 * 480]);
+                    quiet_progress.push((
+                        checkpoints.recv_timeout(std::time::Duration::from_secs(5)),
+                        calls.lock().unwrap().len(),
+                    ));
+                }
+                if action == "cancel_paused" {
+                    token.cancel();
+                } else if !matches!(action, "commit" | "seal") {
+                    append_test_packet(&store, "session", 2, &[6000; 967]);
+                }
+                let _completion = store.finish_processing("session").unwrap();
+                assert!(store.finish_processing("session").is_err());
+                let result = worker.join().unwrap();
+                // Always close/join before asserting a missing preview, so a
+                // regression cannot strand the scoped worker on its inbox.
+                before_commit.unwrap();
+                assert_eq!(accepted.unwrap(), 19);
+                for ((progress, count), expected_frame) in quiet_progress.into_iter().zip([29, 43])
+                {
+                    assert_eq!(progress.unwrap(), expected_frame);
+                    assert_eq!(
+                        count, 1,
+                        "open-inbox quiet frames must reuse the accepted candidate"
+                    );
+                }
+                let mut first_source = vec![12000.0 / 32768.0; 960];
+                first_source.extend([0.0; 7200]);
+                assert_eq!(calls.lock().unwrap()[0], first_source);
+                match action {
+                    "empty" => {
+                        let GatewayVoiceSessionPipelineOutcome::NoSpeech { no_speech, .. } =
+                            result.unwrap()
+                        else {
+                            panic!("empty current decode must replace the candidate");
+                        };
+                        assert_eq!(
+                            no_speech.reason,
+                            VoiceTranscriptionNoSpeechReason::EmptyTranscript
+                        );
+                        assert_eq!(no_speech.total_samples, audio.len() + 967);
+                    }
+                    "error" | "cancel" | "cancel_paused" => {
+                        let Err(error) = result else {
+                            panic!("earlier candidate must not become a successful recording");
+                        };
+                        assert_eq!(
+                            error.kind,
+                            if action != "error" {
+                                VoiceErrorKind::Cancelled
+                            } else {
+                                VoiceErrorKind::TranscriptionFailed
+                            }
+                        );
+                    }
+                    _ => {
+                        let GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. } =
+                            result.unwrap()
+                        else {
+                            panic!("current transcript expected");
+                        };
+                        assert_eq!(
+                            transcript.text,
+                            match action {
+                                "commit" | "seal" => "early mistake".to_owned(),
+                                "oversized" =>
+                                    format!("{} corrected continuation", "я".repeat(300)),
+                                _ => "corrected continuation".to_owned(),
+                            }
+                        );
+                        assert_eq!(
+                            transcript.diagnostics.speech_samples,
+                            if matches!(action, "commit" | "seal") {
+                                8160
+                            } else {
+                                audio.len() + 967
+                            }
+                        );
+                        assert_eq!(
+                            transcript.diagnostics.total_samples,
+                            audio.len()
+                                + if matches!(action, "commit" | "seal") {
+                                    0
+                                } else {
+                                    967
+                                }
+                        );
+                        assert_eq!(
+                            transcript.diagnostics.segment_count,
+                            if action == "oversized" { 2 } else { 1 }
+                        );
+                    }
+                }
+            });
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                if matches!(action, "commit" | "cancel_paused" | "seal") {
+                    1
+                } else {
+                    2
+                }
+            );
+            if !matches!(action, "commit" | "cancel_paused" | "seal") {
+                let mut expected: Vec<_> = if action == "oversized" {
+                    vec![0.0; 960]
+                } else {
+                    audio.iter().map(|s| f32::from(*s) / 32768.0).collect()
+                };
+                expected.extend([6000.0 / 32768.0; 967]);
+                assert_eq!(calls.lock().unwrap()[1], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn pause_context_expires_after_two_continuations_or_source_lifetime() {
+        for lifetime in [false, true] {
+            let mut audio = vec![12000; 960];
+            audio.extend(vec![0; 16 * 480]);
+            if lifetime {
+                audio.extend(vec![6000; 6 * 16000]);
+            } else {
+                for amplitude in [10000, 8000, 6000] {
+                    audio.extend(vec![amplitude; 960]);
+                    if amplitude != 6000 {
+                        audio.extend(vec![0; 16 * 480]);
+                    }
+                }
+            }
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let capture = calls.clone();
+            let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
+                let samples = buffer.flattened_samples();
+                let text = if samples.contains(&(12000.0 / 32768.0)) {
+                    "held"
+                } else {
+                    "fresh"
+                };
+                capture.lock().unwrap().push(samples);
+                Ok(text.to_owned())
+            }));
+            let result = closed_input(&audio, 137, false, &fake).unwrap();
+            let GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. } = result else {
+                panic!("finite context expected");
+            };
+            assert_eq!(transcript.text, "held fresh");
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            // Holding survives the first continuation, but cannot survive all
+            // source time / the third continuation until Commit.
+            assert!(calls[0].contains(&(if lifetime { 6000.0 } else { 10000.0 } / 32768.0)));
+            assert!(!calls[1].contains(&(12000.0 / 32768.0)));
+            assert_eq!(transcript.diagnostics.speech_samples, audio.len());
         }
     }
 
@@ -3140,7 +3691,7 @@ mod tests {
                     let outcome =
                         closed_input_mode(&audio, packet, false, &fake, buffered).unwrap();
                     let calls = calls.lock().unwrap();
-                    assert_eq!(calls.len(), if buffered { 1 } else { 2 });
+                    assert_eq!(calls.len(), 1);
                     assert_eq!(calls.concat(), expected);
                     let GatewayVoiceSessionPipelineOutcome::Transcript {
                         transcript,
@@ -3155,6 +3706,234 @@ mod tests {
                     assert_eq!(signal_stats.non_zero_samples, 1440 + remainder);
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_completion_does_not_wait_for_peer_native_and_rejects_stale_generation() {
+        use super::super::{
+            runtime::LoadedVoiceEngine,
+            supervisor::{
+                EagerVoiceEngineLoader, FilesystemVoiceModelInstaller, VoiceInputDesiredState,
+                VoiceModelIdentity,
+            },
+        };
+        use pioneer_protocol::GatewayVoiceInputProvider;
+
+        // Release even on an assertion/timeout failure; the simulated native
+        // call must never strand the runtime's blocking-worker shutdown.
+        struct NativeRelease(Option<std::sync::mpsc::Sender<()>>);
+        impl NativeRelease {
+            fn release(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        impl Drop for NativeRelease {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        for mode in ["cached", "no_speech", "stale"] {
+            let store = GatewayVoiceSessionBufferStore::default();
+            let workers = VoiceFinalizations::default();
+            let supervisor = Arc::new(VoiceInputSupervisor::new(
+                Arc::new(FilesystemVoiceModelInstaller::new(
+                    crate::isolated_test_app_config().unwrap(),
+                    std::path::PathBuf::new(),
+                )),
+                Arc::new(EagerVoiceEngineLoader),
+            ));
+            let identity = VoiceModelIdentity {
+                provider: GatewayVoiceInputProvider::Local,
+                model: "small".to_owned(),
+            };
+            let generation = supervisor
+                .apply_desired(
+                    VoiceInputDesiredState {
+                        enabled: true,
+                        provider: Some(identity.provider),
+                        model: Some(identity.model.clone()),
+                    },
+                    false,
+                )
+                .unwrap()
+                .generation;
+            supervisor.mark_loading(generation).unwrap();
+            let (entered_a, receive_a) = std::sync::mpsc::channel();
+            let (entered_b, receive_b) = std::sync::mpsc::channel();
+            let (release_b, released_b) = std::sync::mpsc::channel();
+            let mut native_release = NativeRelease(Some(release_b));
+            let released_b = Mutex::new(released_b);
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let captured = calls.clone();
+            assert!(
+                supervisor
+                    .mark_ready(
+                        generation,
+                        identity,
+                        LoadedVoiceEngine::TestStub(Arc::new(move |buffer| {
+                            let samples = buffer.flattened_samples();
+                            let is_a = samples.contains(&(12000.0 / 32768.0));
+                            captured.lock().unwrap().push(samples);
+                            if is_a {
+                                entered_a.send(()).unwrap();
+                                Ok("accepted pause candidate".to_owned())
+                            } else {
+                                // This callback runs through transcribe_for_session and
+                                // transcribe_inner, while the real engine mutex is held.
+                                entered_b.send(()).unwrap();
+                                released_b.lock().unwrap().recv().unwrap();
+                                Ok("peer result".to_owned())
+                            }
+                        }))
+                    )
+                    .unwrap()
+            );
+            let (detector_a, checkpoint_a) = CheckpointDetector::new(vec![19]);
+            let (detector_b, _) = CheckpointDetector::new(Vec::new());
+            let peer_cancellation = CancellationToken::new();
+            for (id, connection, detector, cancellation) in [
+                ("candidate", 1, detector_a, CancellationToken::new()),
+                ("peer", 2, detector_b, peer_cancellation.clone()),
+            ] {
+                start_with_detector(
+                    store.clone(),
+                    id.to_owned(),
+                    VoiceAudioFormat::pioneer_streaming_target(),
+                    &workers,
+                    workers.reserve(connection).unwrap(),
+                    SessionSpeechTranscriber {
+                        supervisor: supervisor.clone(),
+                        generation,
+                        is_moonshine_base: false,
+                        cancellation,
+                        fake: None,
+                    },
+                    true,
+                    move |_| Ok(detector),
+                )
+                .unwrap();
+            }
+            let mut audio = vec![if mode == "no_speech" { 0 } else { 12000 }; 960];
+            audio.extend([0; 16 * 480]);
+            append_test_packet(&store, "candidate", 0, &audio);
+            if mode != "no_speech" {
+                receive_a
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            append_test_packet(&store, "candidate", 1, &[0; 480]);
+            assert_eq!(
+                checkpoint_a
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap(),
+                19
+            );
+            if mode == "stale" {
+                // A's successful candidate is already owned; no changed PCM
+                // can force another decode to discover the generation change.
+                supervisor
+                    .apply_desired(VoiceInputDesiredState::default(), false)
+                    .unwrap();
+            }
+            append_test_packet(&store, "peer", 0, &[6000; 960]);
+            let peer_completion = store.finish_processing("peer").unwrap();
+            if mode != "stale" {
+                receive_b
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            let candidate_completion = store.finish_processing("candidate").unwrap();
+            // Wait before releasing B; release B even on timeout, before
+            // asserting it. The old mutex getter cannot finish this await.
+            let before_peer_return =
+                tokio::time::timeout(std::time::Duration::from_secs(5), candidate_completion).await;
+            let peer_kept_lease = workers.reserve(2).is_none();
+            if mode != "stale" {
+                peer_cancellation.cancel();
+            }
+            let cancelled_peer_kept_lease = workers.reserve(2).is_none();
+            native_release.release();
+            let peer = tokio::time::timeout(std::time::Duration::from_secs(5), peer_completion)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                peer.outcome
+                    .as_ref()
+                    .err()
+                    .expect("peer must be fenced")
+                    .kind,
+                if mode == "stale" {
+                    VoiceErrorKind::TranscriptionFailed
+                } else {
+                    VoiceErrorKind::Cancelled
+                }
+            );
+            drop(peer);
+            let candidate = before_peer_return
+                .expect("completion must arrive before B's native return")
+                .unwrap();
+            match mode {
+                "stale" => {
+                    let Err(error) = candidate.outcome else {
+                        panic!("a cached old-generation result must fail");
+                    };
+                    assert_eq!(error.kind, VoiceErrorKind::TranscriptionFailed);
+                    assert!(
+                        receive_b.try_recv().is_err(),
+                        "old-generation B must also be fenced before native entry"
+                    );
+                }
+                "no_speech" => {
+                    let GatewayVoiceSessionPipelineOutcome::NoSpeech { no_speech, .. } =
+                        candidate.outcome.unwrap()
+                    else {
+                        panic!("silence expected");
+                    };
+                    assert_eq!(
+                        no_speech.reason,
+                        VoiceTranscriptionNoSpeechReason::NoSpeechDetected
+                    );
+                    assert_eq!(no_speech.total_samples, 19 * 480);
+                }
+                _ => {
+                    let GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. } =
+                        candidate.outcome.unwrap()
+                    else {
+                        panic!("cached transcript expected");
+                    };
+                    assert_eq!(transcript.text, "accepted pause candidate");
+                    assert_eq!(transcript.diagnostics.total_samples, 19 * 480);
+                    assert_eq!(transcript.diagnostics.speech_samples, 8160);
+                    assert_eq!(transcript.diagnostics.segment_count, 1);
+                }
+            }
+            if mode != "stale" {
+                assert!(
+                    peer_kept_lease && cancelled_peer_kept_lease,
+                    "B must retain its lease until actual native return"
+                );
+            }
+            drop(candidate.lease);
+            workers.tasks.close();
+            tokio::time::timeout(std::time::Duration::from_secs(5), workers.tasks.wait())
+                .await
+                .unwrap();
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), if mode == "cached" { 2 } else { 1 });
+            if mode != "no_speech" {
+                let mut expected = vec![12000.0 / 32768.0; 960];
+                expected.extend([0.0; 7200]);
+                assert_eq!(calls[0], expected);
+            }
+            if mode != "stale" {
+                assert_eq!(calls.last().unwrap(), &vec![6000.0 / 32768.0; 960]);
+            }
+            assert!(!workers.has_active_work());
         }
     }
 
