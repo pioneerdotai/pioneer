@@ -11,9 +11,10 @@
 - Base после `git fetch origin main`: `afe798675a082425b25898bf31d72f9f60d1973d`.
 - Commit реализации: `723d924da449eecb07899a113448c2d23512729c` —
   `Refactor releases around verified prebuilt CUA payloads`.
-- Следующий commit содержит только этот handoff — `Document prebuilt CUA release review handoff`.
-  Его полный SHA (финальный HEAD) передан в финальном ответе; ссылка HEAD ref выше
-  обозначает именно его. Файл не содержит SHA собственного будущего commit.
+- Первичный handoff: `bd586b32714c1b5c83d891c23483e06240b1d664` —
+  `Document prebuilt CUA release review handoff`.
+  Последующее исправление release notes описано в дополнении ниже. Полный SHA
+  текущего HEAD передаётся в финальном ответе; HEAD ref выше включает исправление.
 - Точный диапазон кода: `afe798675a082425b25898bf31d72f9f60d1973d..723d924da449eecb07899a113448c2d23512729c`.
   Полный диапазон, включая отчёт: `afe798675a082425b25898bf31d72f9f60d1973d..fix/release-prebuilt-cua`.
 - Main и чужие worktree не редактировались. Старый stapler-набросок не использован.
@@ -193,3 +194,39 @@ readiness подтвердятся. Статически просмотрены 
 Linux x86_64 и Windows ARM64; остальные fail-closed guards написаны, но сами assets
 не квалифицированы исполнением. Lost submit response требует восстановления ID
 из сохранённого лога и не повторяется вслепую. Ускорение не измерялось и не обещается.
+
+## Дополнение: инструкция миграции в GitHub Release notes
+
+Замечание координатора исправлено поверх проверенного
+`bd586b32714c1b5c83d891c23483e06240b1d664`; branch/status/HEAD перед правками
+проверены, worktree был чистым. Локальный commit:
+`Include CU manual migration warning in release notes`.
+Дополнительный диапазон: `bd586b32714c1b5c83d891c23483e06240b1d664..fix/release-prebuilt-cua`;
+точный конечный SHA передан координатору в финальном ответе.
+
+Добавлен `.github/release-notes/0.66.0-computer-use-migration.md`: CU ниже 0.66.0,
+включая Desktop-only пользователей, требует полного выхода из Desktop, ручного
+обновления Gateway на его компьютере обеими согласованными командами, затем
+отдельного обновления Desktop через DMG/MSI/AppImage. Данные/настройки сохраняются;
+server/default не требует включения CU. Автоматическая миграция не обещается.
+Инструкция также применима к пользователям старых CU установок в последующих релизах.
+
+Статически прослежены четыре пути в существующем `publish-github-release`:
+
+- Новый draft получает notice через `gh release create --notes-file`.
+- Существующий draft сохраняет полный текущий body: новый текст только дописывается,
+  без trim/замены человеческого текста. Перед этим повторно проверяется `isDraft`.
+- Повтор job видит уникальный HTML marker, не дописывает notice и не вызывает
+  notes edit; устаревший временный notes-файл удаляется перед решением.
+- Уже опубликованный release по-прежнему отклоняется прежним guard до изменений;
+  повторное чтение body содержит дополнительный guard перед notes edit.
+
+Полный дополнительный diff перечитан. Изменены только workflow release notes,
+текст notice и handoff. `dist`, manifests/checksums, signing, platform DAG и
+финальная точка публикации после полного upload/remote verification не изменены.
+`git diff --check` и staged diff check: exit 0. Cargo fmt не запускался в этом
+дополнении: Rust не менялся. Тесты не добавлялись. Hooks отключены только на commit.
+
+**ТЕСТЫ, СБОРКИ, CARGO CHECK, РЕЛИЗНЫЕ СКРИПТЫ И WORKFLOW НЕ ЗАПУСКАЛИСЬ.**
+GitHub notes create/edit/upload/publish также не вызывались; это статическая
+передача для повторной внешней приёмки, а не подтверждение исполнения GitHub API.
