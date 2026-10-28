@@ -2559,8 +2559,16 @@ mod tests {
             let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
             let (client_read, client_write) = split(client_stream);
             let (server_read, server_write) = split(server_stream);
-            let (rpc, rpc_owner) =
-                CodexJsonlRpcClient::new_owned(BufReader::new(client_read), client_write);
+            // Match the persistent Gateway transport, including spool recovery
+            // for oversized thread history responses.
+            let (rpc, rpc_owner) = CodexJsonlRpcClient::new_owned_with_channel_capacity_and_budget(
+                BufReader::new(client_read),
+                client_write,
+                256,
+                256,
+                64,
+                pioneer_cli_agent_runtime::codex::codex_native_event_budget(),
+            );
             Self {
                 client: CodexAppServerClient::new(rpc),
                 rpc_owner: Some(rpc_owner),
