@@ -1,93 +1,51 @@
 #!/usr/bin/env python3
-"""Restore completed Desktop/Gateway inputs from this release run; never poll or build."""
+"""Restore compact Desktop inputs and validate final Gateway; never consume objects."""
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
 import runpy
-import subprocess
-import tarfile
+import shutil
 
-SYMBOLS = runpy.run_path(str(Path(__file__).with_name("symbol-inputs.py")))
+RUNTIME = runpy.run_path(str(Path(__file__).with_name("runtime-inputs.py")))
+DESKTOP = runpy.run_path(str(Path(__file__).with_name("desktop-inputs.py")))
 
 
-def restore(inputs, names, target, commit, catalog, variant=None):
-    metadata = json.loads((inputs / "inputs.json").read_text())
-    if ((variant is not None and metadata.get("variant") != variant)
-            or metadata["commit"] != commit or str(metadata["run_id"]) != os.environ["GITHUB_RUN_ID"]
-            or metadata["target"] != target
-            or metadata.get("catalog_sha256") != SYMBOLS["digest"](catalog)
-            or {row["filename"] for row in metadata["binaries"]} != set(names)
-            or len(metadata["binaries"]) != len(names)):
-        raise ValueError("Release inputs must match this run, commit, target, catalog and binary inventory")
-    binaries = {"binaries/" + row["filename"]: row for row in metadata["binaries"]}
-    records = {row["path"]: row for row in metadata["files"]}
+def restore(inputs, target):
+    suffix = ".exe" if "windows" in target else ""
+    names = [name + suffix for name in ("pioneer-app", "pioneer-app-updater")]
+    metadata = RUNTIME["read"](inputs, target, "desktop", names)
     output = Path("target") / target / "release"
     output.mkdir(parents=True, exist_ok=True)
+    if any((output / name).exists() for name in [*names, "desktop-inputs.json"]):
+        raise ValueError("Desktop runtime destination already contains inputs")
     created = []
-    seen = set()
     try:
-        with tarfile.open(inputs / "inputs.tar.gz", "r|gz") as archive:
-            for member in archive:
-                if member.name not in binaries:
-                    continue
-                entry = binaries[member.name]
-                row = records[member.name]
-                if (member.name in seen or not member.isfile() or member.size != row["bytes"]
-                        or row["sha256"] != entry["sha256"]):
-                    raise ValueError("Invalid release executable member")
-                binary = output / entry["filename"]
-                digest = hashlib.sha256()
-                with binary.open("xb") as destination:
-                    created.append(binary)
-                    with archive.extractfile(member) as source:
-                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                            destination.write(chunk)
-                            digest.update(chunk)
-                if binary.stat().st_size != member.size or digest.hexdigest() != entry["sha256"]:
-                    raise ValueError("Release executable checksum mismatch")
-                data = binary.read_bytes()
-                if SYMBOLS["native"]["identity"](data) != (entry["format"], entry["module_id"]):
-                    raise ValueError("Release executable module mismatch")
-                if entry["filename"] in ("pioneer", "pioneer.exe"):
-                    build = SYMBOLS["native"]["build_manifest"](data)
-                    if (build["revision"] != commit or build["target"] != target
-                            or (variant is not None and
-                                ("COMPUTER_USE" in build["features"]) != (variant == "computer-use"))):
-                        raise ValueError("Desktop requires this release's Gateway")
-                binary.chmod(0o755)
-                seen.add(member.name)
-                # Binaries sort before objects; do not decompress multi-GiB symbol objects.
-                if seen == set(binaries):
-                    break
-        if seen != set(binaries):
-            raise ValueError("Release executable missing from input archive")
+        for name in names:
+            destination = output / name
+            with (inputs / name).open("rb") as source, destination.open("xb") as handle:
+                created.append(destination)
+                shutil.copyfileobj(source, handle)
+            destination.chmod(0o755)
+        receipt = output / "desktop-inputs.json"
+        receipt.write_text(json.dumps(metadata, indent=2) + "\n")
+        created.append(receipt)
+        DESKTOP["own_binaries"](target)
+        symbols = Path(os.environ["PIONEER_SYMBOL_INPUTS_DIR"])
+        symbols.mkdir(parents=True, exist_ok=False)
+        shutil.copy2(inputs / "inputs.json", symbols / "inputs.json")
     except BaseException:
-        for binary in created:
-            binary.unlink(missing_ok=True)
+        for path in created:
+            path.unlink(missing_ok=True)
         raise
     return metadata
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", required=True)
-    parser.add_argument("--inputs", type=Path, required=True)
-    args = parser.parse_args()
-    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    catalog = Path(os.environ["PIONEER_BUNDLED_MODEL_CATALOG"])
-    suffix = ".exe" if args.target.endswith("windows-msvc") else ""
-    restore(args.inputs, [name + suffix for name in ("pioneer-app", "pioneer-app-updater")],
-            args.target, commit, catalog)
-    gateway = args.inputs / "gateway"
-    metadata = restore(gateway, ["pioneer" + suffix], args.target, commit, catalog, "computer-use")
-    entry = metadata["binaries"][0]
-    (gateway / "reuse.json").write_text(json.dumps(dict(schema_version=1,
-        run_id=str(metadata["run_id"]), commit=commit, target=args.target, variant="computer-use",
-        module_id=entry["module_id"], binary_sha256=entry["sha256"]),
-        indent=2) + "\n")
-
-
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target", required=True, choices=sorted(RUNTIME["PLATFORMS"]))
+    parser.add_argument("--inputs", type=Path, required=True)
+    parser.add_argument("--gateway", type=Path, required=True)
+    args = parser.parse_args()
+    DESKTOP["gateway"](args.gateway, args.target)
+    restore(args.inputs, args.target)

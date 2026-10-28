@@ -1,0 +1,52 @@
+name: Download release input
+description: Select one exact role from this run, including successful inputs retained before a job retry.
+inputs:
+  role:
+    required: true
+    description: Exact artifact role (including target and variant).
+  path:
+    required: true
+    description: Empty destination directory.
+  optional:
+    default: 'false'
+    description: Allow an absent role only for first-attempt notarization recovery.
+outputs:
+  artifact-id:
+    description: Selected immutable artifact ID.
+    value: ${{ steps.select.outputs.artifact_id }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/github-script@v8
+      id: select
+      env:
+        INPUT_ROLE: ${{ inputs.role }}
+        INPUT_OPTIONAL: ${{ inputs.optional }}
+      with:
+        script: |
+          const prefix = `${process.env.INPUT_ROLE}-run-${context.runId}-attempt-`;
+          const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts,
+            {owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId, per_page: 100});
+          const candidates = artifacts.filter(row => row.name.startsWith(prefix)).map(row => {
+            const suffix = row.name.slice(prefix.length);
+            if (!/^[1-9][0-9]*$/.test(suffix)) throw new Error('Malformed release artifact attempt');
+            return {...row, attempt: Number(suffix)};
+          }).filter(row => row.attempt <= Number(process.env.GITHUB_RUN_ATTEMPT));
+          candidates.sort((a, b) => b.attempt - a.attempt);
+          if (!candidates.length && process.env.INPUT_OPTIONAL === 'true') {
+            core.info(`No retained recovery state for ${process.env.INPUT_ROLE}`);
+            core.setOutput('artifact_id', '');
+            return;
+          }
+          if (!candidates.length || candidates[0].expired ||
+              candidates.filter(row => row.attempt === candidates[0].attempt).length !== 1) {
+            throw new Error(`Missing, expired or ambiguous release input: ${process.env.INPUT_ROLE}`);
+          }
+          core.info(`Using ${candidates[0].name} (ID ${candidates[0].id})`);
+          core.setOutput('artifact_id', String(candidates[0].id));
+    - uses: actions/download-artifact@v7
+      if: steps.select.outputs.artifact_id != ''
+      with:
+        artifact-ids: ${{ steps.select.outputs.artifact_id }}
+        path: ${{ inputs.path }}
+        merge-multiple: true

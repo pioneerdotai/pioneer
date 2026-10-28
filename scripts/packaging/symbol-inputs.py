@@ -91,7 +91,8 @@ def export(args):
             archive.add(path, arcname=name, recursive=False)
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     metadata = dict(schema_version=1, commit=commit,
-                    run_id=os.environ["GITHUB_RUN_ID"], target=args.target,
+                    run_id=os.environ["GITHUB_RUN_ID"],
+                    run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT", "1"), target=args.target,
                     catalog_sha256=(digest(Path(os.environ["PIONEER_BUNDLED_MODEL_CATALOG"]))
                                     if os.environ.get("PIONEER_BUNDLED_MODEL_CATALOG") else None),
                     binaries=binaries, files=records)
@@ -198,17 +199,6 @@ def process(args, expected_run_id=None, packaged_override=None, inventory_name="
         child = argparse.Namespace(inputs=gateway, work=args.work / "gateway", out=args.out)
         process(child, str(receipt["run_id"]), packaged, "gateway-release-inputs.json")
         metadata["reused_gateway"] = receipt
-    compatibility = args.inputs / "compatibility"
-    if expected_run_id is None and compatibility.exists():
-        bridge = json.loads((compatibility / "inputs.json").read_text())
-        if (metadata.get("variant") != "computer-use" or bridge.get("variant") != "computer-use"
-                or any(bridge.get(key) != metadata.get(key)
-                       for key in ("commit", "run_id", "target", "catalog_sha256"))
-                or [row["filename"] for row in bridge["binaries"]] not in
-                   (["pioneer-cu-update"], ["pioneer-cu-update.exe"])):
-            raise ValueError("compatibility bridge provenance mismatch")
-        child = argparse.Namespace(inputs=compatibility, work=args.work / "compatibility", out=args.out)
-        process(child, str(metadata["run_id"]), inventory_name="compatibility-release-inputs.json")
     (args.out / inventory_name).write_text(json.dumps(metadata, indent=2) + "\n")
 
 

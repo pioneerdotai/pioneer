@@ -101,141 +101,7 @@ function Resolve-ProductVersion {
     throw "failed to resolve release version from PIONEER_DESKTOP_VERSION/GITHUB_REF_NAME/Cargo.toml"
 }
 
-function Resolve-SignToolPath {
-    $cmd = Get-Command signtool.exe -ErrorAction SilentlyContinue
-    if ($null -ne $cmd) {
-        return $cmd.Source
-    }
-
-    $sdkBinRoot = "C:\Program Files (x86)\Windows Kits\10\bin"
-    if (Test-Path -Path $sdkBinRoot) {
-        $candidate = Get-ChildItem -Path $sdkBinRoot -Directory -ErrorAction SilentlyContinue |
-            Sort-Object -Property Name -Descending |
-            ForEach-Object { Join-Path $_.FullName "x64\signtool.exe" } |
-            Where-Object { Test-Path -Path $_ } |
-            Select-Object -First 1
-
-        if ($candidate) {
-            return $candidate
-        }
-    }
-
-    throw "signtool.exe is not available"
-}
-
-function New-SigningContext {
-    param(
-        [bool]$SigningRequired,
-        [string]$WorkDir
-    )
-
-    $context = @{
-        Enabled = $false
-        Mode = ""
-        CertPath = ""
-        CertPassword = ""
-        Subject = ""
-        TempCertPath = $null
-        SignToolPath = ""
-        TimestampUrl = if ($env:WINDOWS_SIGNING_TIMESTAMP_URL) { $env:WINDOWS_SIGNING_TIMESTAMP_URL } else { "http://timestamp.digicert.com" }
-        FileDigest = if ($env:WINDOWS_SIGNING_FILE_DIGEST) { $env:WINDOWS_SIGNING_FILE_DIGEST } else { "SHA256" }
-        TimestampDigest = if ($env:WINDOWS_SIGNING_TIMESTAMP_DIGEST) { $env:WINDOWS_SIGNING_TIMESTAMP_DIGEST } else { "SHA256" }
-    }
-
-    $certBase64 = $env:WINDOWS_SIGNING_CERT_BASE64
-    $certPath = $env:WINDOWS_SIGNING_CERT_PATH
-    $subject = $env:WINDOWS_SIGNING_SUBJECT_NAME
-
-    if (-not [string]::IsNullOrWhiteSpace($certBase64)) {
-        if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERT_PASSWORD)) {
-            throw "WINDOWS_SIGNING_CERT_PASSWORD is required when WINDOWS_SIGNING_CERT_BASE64 is set"
-        }
-
-        $tempCertPath = Join-Path $WorkDir "windows-signing-cert.pfx"
-        try {
-            [System.IO.File]::WriteAllBytes($tempCertPath, [Convert]::FromBase64String($certBase64))
-        }
-        catch {
-            throw "WINDOWS_SIGNING_CERT_BASE64 is not valid base64"
-        }
-
-        $context.Enabled = $true
-        $context.Mode = "pfx"
-        $context.CertPath = $tempCertPath
-        $context.CertPassword = $env:WINDOWS_SIGNING_CERT_PASSWORD
-        $context.TempCertPath = $tempCertPath
-    }
-    elseif (-not [string]::IsNullOrWhiteSpace($certPath)) {
-        if (-not (Test-Path -Path $certPath)) {
-            throw "WINDOWS_SIGNING_CERT_PATH does not exist: $certPath"
-        }
-
-        if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERT_PASSWORD)) {
-            throw "WINDOWS_SIGNING_CERT_PASSWORD is required when WINDOWS_SIGNING_CERT_PATH is set"
-        }
-
-        $context.Enabled = $true
-        $context.Mode = "pfx"
-        $context.CertPath = $certPath
-        $context.CertPassword = $env:WINDOWS_SIGNING_CERT_PASSWORD
-    }
-    elseif (-not [string]::IsNullOrWhiteSpace($subject)) {
-        $context.Enabled = $true
-        $context.Mode = "subject"
-        $context.Subject = $subject
-    }
-
-    if ($SigningRequired -and -not $context.Enabled) {
-        throw "Windows signing is required but no signing certificate configuration is provided"
-    }
-
-    if ($context.Enabled) {
-        $context.SignToolPath = Resolve-SignToolPath
-    }
-
-    return $context
-}
-
-function Sign-Artifact {
-    param(
-        [string]$Path,
-        [hashtable]$SigningContext
-    )
-
-    if (-not $SigningContext.Enabled) {
-        return
-    }
-
-    if (-not (Test-Path -Path $Path)) {
-        throw "cannot sign missing file: $Path"
-    }
-
-    $args = @(
-        "sign",
-        "/fd", $SigningContext.FileDigest,
-        "/td", $SigningContext.TimestampDigest,
-        "/tr", $SigningContext.TimestampUrl
-    )
-
-    switch ($SigningContext.Mode) {
-        "pfx" {
-            $args += @("/f", $SigningContext.CertPath, "/p", $SigningContext.CertPassword)
-        }
-        "subject" {
-            $args += @("/n", $SigningContext.Subject)
-        }
-        default {
-            throw "unsupported signing mode: $($SigningContext.Mode)"
-        }
-    }
-
-    $args += $Path
-
-    & $SigningContext.SignToolPath @args
-    if ($LASTEXITCODE -ne 0) {
-        throw "signtool failed with exit code $LASTEXITCODE for $Path"
-    }
-}
+. (Join-Path $PSScriptRoot "../windows-signing.ps1")
 
 switch ($Target) {
     "x86_64-pc-windows-msvc" {
@@ -259,6 +125,7 @@ if ([string]::IsNullOrWhiteSpace($OutDir)) {
 }
 
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+$OutDir = (Resolve-Path $OutDir).Path
 
 if ([string]::IsNullOrWhiteSpace($WixPath)) {
     $wixCmd = Get-Command wix -ErrorAction SilentlyContinue
@@ -288,33 +155,9 @@ if (-not (Test-Path -Path $appIconPath)) {
     throw "missing Windows app icon: $appIconPath"
 }
 
-$env:BINDGEN_EXTRA_CLANG_ARGS = "--target=$Target"
-
-if ($Target -eq "aarch64-pc-windows-msvc") {
-    # ggml's ARM backend requires clang. Ninja lets CMake honor the compiler
-    # selection instead of forcing the Visual Studio MSVC toolset.
-    $env:CMAKE_GENERATOR = "Ninja"
-    $env:CMAKE_C_COMPILER = "clang-cl"
-    $env:CMAKE_CXX_COMPILER = "clang-cl"
-    $env:CMAKE_C_COMPILER_TARGET = $Target
-    $env:CMAKE_CXX_COMPILER_TARGET = $Target
-    $env:CL = "/EHsc"
-    # ccache exited successfully without producing clang-cl ARM64 object files
-    # in release builds, so invoke the compiler directly.
-    $env:GGML_CCACHE = "OFF"
-}
-
-if (-not $SkipBuild) {
-    cargo update -p cua-driver-sdk
-    if ($LASTEXITCODE -ne 0) { throw "CUA SDK refresh failed" }
-    cargo build --locked --release -p pioneer-desktop --target $Target
-    cargo build --locked --release -p pioneer-app-updater --target $Target
-    cargo build --locked --release -p pioneer-cli --features computer-use --target $Target
-    if ($env:PIONEER_SYMBOL_INPUTS_DIR) {
-        python scripts/packaging/symbol-inputs.py export --target $Target "$env:PIONEER_SYMBOL_INPUTS_DIR" "target/$Target/release/pioneer-app.exe" "target/$Target/release/pioneer.exe" "target/$Target/release/pioneer-app-updater.exe"
-        if ($LASTEXITCODE -ne 0) { throw "Symbol input preservation failed" }
-    }
-}
+# Always use prepared inputs; SkipBuild is retained for existing callers.
+python scripts/packaging/desktop-inputs.py preflight --target $Target
+if ($LASTEXITCODE -ne 0) { throw "Prepared Desktop/Gateway inputs are required" }
 
 $workDir = Join-Path $env:TEMP ("pioneer-msi-" + [Guid]::NewGuid().ToString("N"))
 $stageDir = Join-Path $workDir "stage"
@@ -337,14 +180,13 @@ try {
     New-Item -ItemType Directory -Path $gatewayStageDir -Force | Out-Null
 
     $gatewayAssetName = "pioneer-gateway-windows-$archLabel-computer-use-package.zip"
-    $gatewayAssetPath = Join-Path $gatewayStageDir $gatewayAssetName
-    python scripts/packaging/cua-driver.py --target $Target --binary "target/$Target/release/pioneer.exe" --archive $gatewayAssetPath
-    if ($LASTEXITCODE -ne 0) { throw "Gateway CUA packaging failed" }
+    python scripts/packaging/desktop-inputs.py embed --target $Target --destination $gatewayStageDir
+    if ($LASTEXITCODE -ne 0) { throw "Approved Gateway payload embedding failed" }
+    Sign-Artifact -Path (Join-Path $stageDir "pioneer-app.exe") -SigningContext $signingContext
 
-    $gatewaySha256 = (Get-FileHash -Path $gatewayAssetPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    "sha256:$gatewaySha256 $gatewayAssetName" | Set-Content -Path (Join-Path $gatewayStageDir "SHA256SUMS") -NoNewline
-
-    Copy-Item -Path "target/$Target/release/pioneer.exe" -Destination (Join-Path $gatewayStageDir "pioneer-bootstrap.exe") -Force
+    # windows-stage must be called, including full ZIP identity/hash validation.
+    bash scripts/packaging/desktop/check-package-contents.sh windows-stage $stageDir $Target
+    if ($LASTEXITCODE -ne 0) { throw "Windows staging validation failed" }
     if ($env:PIONEER_SYMBOL_INPUTS_DIR) {
         $ledger = Join-Path $env:PIONEER_SYMBOL_INPUTS_DIR "packaged.json"
         foreach ($binary in @((Join-Path $stageDir "pioneer-app.exe"), (Join-Path $gatewayStageDir "pioneer-bootstrap.exe"), $helperStagePath)) {
@@ -390,6 +232,9 @@ try {
           <Component Id="GatewayChecksumsComponent" Guid="*">
             <File Id="GatewayChecksumsFile" Source="`$(var.StageDir)\\gateway\\SHA256SUMS" KeyPath="yes" />
           </Component>
+          <Component Id="GatewayProvenanceComponent" Guid="*">
+            <File Id="GatewayProvenanceFile" Source="`$(var.StageDir)\\gateway\\provenance.json" KeyPath="yes" />
+          </Component>
         </Directory>
       </Directory>
     </StandardDirectory>
@@ -400,6 +245,7 @@ try {
       <ComponentRef Id="GatewayBootstrapComponent" />
       <ComponentRef Id="GatewayAssetComponent" />
       <ComponentRef Id="GatewayChecksumsComponent" />
+      <ComponentRef Id="GatewayProvenanceComponent" />
     </Feature>
   </Package>
 </Wix>
@@ -412,6 +258,8 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "wix build failed with exit code $LASTEXITCODE"
     }
+
+    Sign-Artifact -Path $msiPath -SigningContext $signingContext
 
     $bundleWxsPath = Join-Path $workDir "PioneerBundle.wxs"
     @"
@@ -435,8 +283,22 @@ try {
         throw "wix bundle build failed with exit code $LASTEXITCODE"
     }
 
-    Sign-Artifact -Path $msiPath -SigningContext $signingContext
     Sign-Artifact -Path $exePath -SigningContext $signingContext
+
+    # Administrative extraction validates actual MSI payload without installing it.
+    $extractDir = Join-Path $workDir "extracted"
+    $extract = Start-Process msiexec.exe -ArgumentList @("/a", "`"$msiPath`"", "/qn", "TARGETDIR=`"$extractDir`"") -Wait -PassThru
+    if ($extract.ExitCode -ne 0) { throw "MSI payload extraction failed: $($extract.ExitCode)" }
+    $installedApp = @(Get-ChildItem -Path $extractDir -Filter "pioneer-app.exe" -Recurse)
+    if ($installedApp.Count -ne 1) { throw "MSI does not contain exactly one Desktop executable" }
+    $installedStage = $installedApp[0].Directory.FullName
+    bash scripts/packaging/desktop/check-package-contents.sh windows-stage $installedStage $Target
+    if ($LASTEXITCODE -ne 0) { throw "Built MSI payload validation failed" }
+    foreach ($name in @("pioneer-app.exe", "pioneer-app-updater.exe")) {
+        $expected = (Get-FileHash (Join-Path $stageDir $name) -Algorithm SHA256).Hash
+        $actual = (Get-FileHash (Join-Path $installedStage $name) -Algorithm SHA256).Hash
+        if ($expected -ne $actual) { throw "MSI executable identity mismatch: $name" }
+    }
 
     Write-Host "Created: $msiPath"
     Write-Host "Created: $exePath"

@@ -53,7 +53,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo update -p cua-driver-sdk
           cargo check --locked --workspace
           if [[ "${{ runner.os }}" == "macOS" ]]; then
             export MACOSX_DEPLOYMENT_TARGET=13.0
@@ -149,7 +148,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo update -p cua-driver-sdk
           cargo check --locked -p pioneer-cli
 
       # A separate Cargo invocation keeps CU features out of these server owners.
