@@ -73,7 +73,7 @@ pub(super) async fn down(m: &SchemaManager<'_>, table: &str, fields: &[&str]) ->
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
     if m.get_connection()
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             format!("SELECT 1 FROM ({refs}) referenced LEFT JOIN portable_payload p ON p.id=referenced.id WHERE referenced.id IS NOT NULL AND (p.id IS NULL OR p.raw<>1) LIMIT 1"),
         ))

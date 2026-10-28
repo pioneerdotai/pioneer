@@ -103,7 +103,7 @@ impl MigrationTrait for Migration {
         // Never silently discard the only surviving copy of a logical value.
         // Rollback requires an explicit reverse-data migration after review.
         if m.get_connection()
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT 1 FROM portable_payload WHERE retired=0 AND raw=0 LIMIT 1".to_owned(),
             ))
