@@ -328,81 +328,6 @@ fn active_recall_planner_parses_new_episodic_modes_and_validates_capabilities() 
 }
 
 #[tokio::test]
-async fn current_thread_recall_uses_native_provider_and_separate_prompt_context() {
-    let durable_provider = Arc::new(TestRecallMemoryProvider::with_recall(
-        MemoryRecallSnapshot::empty(),
-    ));
-    let mut episodic =
-        FakeEpisodicRecallProvider::with_capabilities(MemoryEpisodicRecallCapabilities {
-            current_thread_search: true,
-            ..MemoryEpisodicRecallCapabilities::default()
-        });
-    episodic.current_thread = MemoryEpisodicRecallResponse {
-        items: vec![episodic_item(
-            "thread:turn_1/item_1/chunk_0",
-            MemoryEpisodicRecallSourceKind::CurrentThread,
-            "Earlier in this thread, the user rejected phrase-list memory policy.",
-        )],
-        ..MemoryEpisodicRecallResponse::default()
-    };
-    let episodic = Arc::new(episodic);
-    let hook = ActiveMemoryRecallHook {
-        memory_provider: durable_provider.clone(),
-        episodic_provider: Some(episodic.clone()),
-        config: MemoryActiveRecallConfig::default(),
-    };
-    let plan = parse_active_memory_decision_json(
-        r#"{"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},"episodic":{"status":"run","reasonCode":"provider_run","confidence":0.9,"queries":[{"mode":"current_thread","query":"continue what we discussed earlier","targets":[]}]}}"#,
-    )
-    .expect("provider-owned preflight plan parses");
-    let input = TurnPostPreflightPromptContextHookInput::from_parts(
-        "continue what we discussed earlier",
-        Some("test-model"),
-        Some("test-provider"),
-    )
-    .with_active_memory_recall_preflight_plan(
-        serde_json::to_value(plan).expect("active recall plan serializes"),
-    );
-    let mut request = test_active_prompt_context_hook_request(
-        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-        HookPromptContextSet::default(),
-        "continue what we discussed earlier",
-    );
-    request.input = HookInput::turn_post_preflight_prompt_context(input);
-
-    let response = hook
-        .execute(request)
-        .await
-        .expect("active recall hook executes");
-
-    assert_eq!(durable_provider.recall_call_count(), 0);
-    assert_eq!(episodic.calls(), vec!["current_thread"]);
-    let contributions = prompt_context_contributions(&response);
-    assert_eq!(contributions.len(), 1);
-    assert_eq!(
-        contributions[0].contribution_id.as_str(),
-        MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID
-    );
-    assert_eq!(contributions[0].domain.as_str(), "current_thread_context");
-    assert!(
-        contributions[0]
-            .content
-            .as_str()
-            .contains("Earlier in this thread, the user rejected phrase-list memory policy.")
-    );
-    assert!(
-        contributions[0]
-            .content
-            .as_str()
-            .contains("thread:turn_1/item_1/chunk_0")
-    );
-    assert_eq!(
-        contributions[0].source_refs[0].kind.as_str(),
-        "current_thread_context"
-    );
-}
-
-#[tokio::test]
 async fn current_thread_recall_uses_envelope_planned_query_instead_of_raw_turn_text() {
     let durable_provider = Arc::new(TestRecallMemoryProvider::with_recall(
         MemoryRecallSnapshot::empty(),
@@ -476,7 +401,29 @@ async fn current_thread_recall_uses_envelope_planned_query_instead_of_raw_turn_t
     assert_eq!(durable_provider.recall_call_count(), 0);
     assert_eq!(episodic.calls(), vec!["current_thread"]);
     assert_eq!(episodic.queries(), vec!["прогноз погоды в Москве завтра"]);
-    assert!(!prompt_context_contributions(&response).is_empty());
+    let contributions = prompt_context_contributions(&response);
+    assert_eq!(contributions.len(), 1);
+    assert_eq!(
+        contributions[0].contribution_id.as_str(),
+        MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID
+    );
+    assert_eq!(contributions[0].domain.as_str(), "current_thread_context");
+    assert!(
+        contributions[0]
+            .content
+            .as_str()
+            .contains("Earlier in this thread, the user asked for tomorrow weather in Moscow.")
+    );
+    assert!(
+        contributions[0]
+            .content
+            .as_str()
+            .contains("thread:turn_1/item_1/chunk_0")
+    );
+    assert_eq!(
+        contributions[0].source_refs[0].kind.as_str(),
+        "current_thread_context"
+    );
 }
 
 #[tokio::test]

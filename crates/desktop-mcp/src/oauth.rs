@@ -341,33 +341,7 @@ mod tests {
         assert!(cleanup.clear);
         assert!(!cleanup.sign_in && !cleanup.cancel);
     }
-    #[test]
-    fn current_details_cleanup_overrides_stale_denied_copy_and_actions() {
-        let state = pioneer_client::mcp::oauth::effective_oauth_management_state(
-            Some(McpOAuthState::Denied),
-            Some(McpOAuthState::CleanupRequired),
-            false,
-        );
-        assert_eq!(state, Some(McpOAuthState::CleanupRequired));
-        let actions = oauth_management_actions(state, McpServerStatus::AuthRequired, false, None);
-        assert!(actions.clear);
-        assert!(!actions.sign_in && !actions.cancel);
-        for pending in [
-            McpOAuthState::Preparing,
-            McpOAuthState::AwaitingCallback,
-            McpOAuthState::Exchanging,
-            McpOAuthState::Resolving,
-        ] {
-            assert_eq!(
-                pioneer_client::mcp::oauth::effective_oauth_management_state(
-                    Some(pending),
-                    Some(McpOAuthState::CleanupRequired),
-                    false
-                ),
-                Some(pending)
-            );
-        }
-    }
+
     #[test]
     fn failed_clear_remains_actionable_without_restarting_or_signing_in() {
         for status in [

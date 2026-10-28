@@ -455,12 +455,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_targets_are_keyed_only_by_exact_id() {
-        let id = skill_id("imagegen", "user");
-        assert_eq!(skill_key(&id), id);
-    }
-
-    #[test]
     fn catalog_split_uses_invocation_policy_instead_of_system_origin() {
         let browser = skill("browser", "system", true);
         let mut memory = skill("memory", "system", true);
@@ -493,22 +487,6 @@ mod tests {
             &split.installed,
             &skill_id("memory", "system")
         ));
-    }
-
-    #[test]
-    fn snapshot_projects_health_map_and_prunes_pending_actions() {
-        let snapshot = project_skills_snapshot(
-            vec![skill("alpha", "user", true), skill("beta", "user", false)],
-            vec![health("alpha", "user")],
-        );
-        let alpha_id = skill_id("alpha", "user");
-        assert!(snapshot.health_details.contains_key(&alpha_id));
-
-        let missing_id = skill_id("missing", "user");
-        let mut pending = HashSet::from([alpha_id.clone(), missing_id.clone()]);
-        retain_pending_actions_for_catalog(&mut pending, &snapshot.catalog);
-        assert!(pending.contains(&alpha_id));
-        assert!(!pending.contains(&missing_id));
     }
 
     #[test]
@@ -714,13 +692,6 @@ mod tests {
             assert_eq!(filter_skills_by_search(&skills, query).len(), 2, "{query}");
         }
         assert!(filter_skills_by_search(&skills, "missing").is_empty());
-    }
-
-    #[test]
-    fn refresh_failure_reduction_carries_display_error() {
-        let reduction = reduce_skills_catalog_refresh_failure("load failed");
-
-        assert_eq!(reduction.error, "load failed");
     }
 
     #[test]

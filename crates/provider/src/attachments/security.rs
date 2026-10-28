@@ -436,26 +436,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_public_peer_that_does_not_match_the_pinned_dns_address() {
-        let mut policy = AttachmentSecurityPolicy::default();
-        policy.allow_private_network = true;
-        let pinned = [SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
-            443,
-        )];
-        let different_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 443);
-
-        let error = validate_connected_peer("test", different_peer, &pinned, &policy)
-            .expect_err("a connected peer must match the pinned DNS result");
-
-        assert!(
-            error
-                .to_string()
-                .contains("connected peer does not match the pinned DNS decision")
-        );
-    }
-
-    #[test]
     fn controlled_dns_mixed_public_private_answer_fails_closed() {
         let policy = AttachmentSecurityPolicy::default();
         let result = resolve_and_validate_host_addresses_with(
@@ -494,7 +474,13 @@ mod tests {
         )
         .unwrap();
         let rebound = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
-        assert!(validate_connected_peer("test", rebound, &pinned, &policy).is_err());
+        let error = validate_connected_peer("test", rebound, &pinned, &policy)
+            .expect_err("a connected peer must match the pinned DNS result");
+        assert!(
+            error
+                .to_string()
+                .contains("connected peer does not match the pinned DNS decision")
+        );
     }
 
     #[test]

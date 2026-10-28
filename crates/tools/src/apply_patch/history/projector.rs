@@ -631,239 +631,6 @@ mod tests {
     }
 
     #[test]
-    fn unified_renderer_emits_hunk_headers_and_no_final_newline_markers() {
-        let before = snapshot(b"old\n");
-        let after = snapshot(b"new");
-        let aggregate = TurnAggregate {
-            thread_id: "thread".to_owned(),
-            turn_id: "turn".to_owned(),
-            changes: vec![AggregateFileChange {
-                environment_id: "env".to_owned(),
-                kind: ChangeKind::Update,
-                source_path: "file.txt".to_owned(),
-                destination_path: None,
-                before: Some(before.clone()),
-                after: Some(after.clone()),
-                overwritten_destination: None,
-            }],
-            exact: true,
-            coverage: PatchHistoryCoverage::EngineVerifiedSteps,
-            applied_through: Some(CommitOrdinal(0)),
-            record_count: 1,
-        };
-        let rendered = aggregate
-            .render_unified_diff(|reference| {
-                if reference == &before {
-                    Ok(b"old\n".to_vec())
-                } else if reference == &after {
-                    Ok(b"new".to_vec())
-                } else {
-                    Err(AggregateProjectionError::Snapshot(
-                        "unexpected snapshot".to_owned(),
-                    ))
-                }
-            })
-            .unwrap();
-        assert_eq!(
-            rendered,
-            "--- a/file.txt\n+++ b/file.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n\\ No newline at end of file\n"
-        );
-    }
-
-    #[test]
-    fn unified_renderer_keeps_pure_rename_without_a_text_hunk() {
-        let snapshot_ref = snapshot(b"same\n");
-        let aggregate = TurnAggregate {
-            thread_id: "thread".to_owned(),
-            turn_id: "turn".to_owned(),
-            changes: vec![AggregateFileChange {
-                environment_id: "env".to_owned(),
-                kind: ChangeKind::Move,
-                source_path: "old.txt".to_owned(),
-                destination_path: Some("new.txt".to_owned()),
-                before: Some(snapshot_ref.clone()),
-                after: Some(snapshot_ref.clone()),
-                overwritten_destination: None,
-            }],
-            exact: true,
-            coverage: PatchHistoryCoverage::EngineVerifiedSteps,
-            applied_through: Some(CommitOrdinal(0)),
-            record_count: 1,
-        };
-        let rendered = aggregate
-            .render_unified_diff(|_| Ok(b"same\n".to_vec()))
-            .unwrap();
-        assert_eq!(rendered, "--- a/old.txt\n+++ b/new.txt\n");
-    }
-
-    #[test]
-    fn repeated_edits_fold_to_first_before_and_last_after() {
-        let records = vec![
-            stored(
-                0,
-                "one",
-                ChangeKind::Update,
-                "a.txt",
-                Some(b"a"),
-                Some(b"b"),
-                None,
-            ),
-            stored(
-                1,
-                "two",
-                ChangeKind::Update,
-                "a.txt",
-                Some(b"b"),
-                Some(b"c"),
-                None,
-            ),
-        ];
-        let aggregate = project_turn_records("thread", "turn", &records).unwrap();
-        assert_eq!(aggregate.changes.len(), 1);
-        assert_eq!(aggregate.changes[0].before, Some(snapshot(b"a")));
-        assert_eq!(aggregate.changes[0].after, Some(snapshot(b"c")));
-    }
-
-    #[test]
-    fn add_then_update_remains_one_add_with_final_bytes() {
-        let records = vec![
-            stored(0, "add", ChangeKind::Add, "a.txt", None, Some(b"a"), None),
-            stored(
-                1,
-                "update",
-                ChangeKind::Update,
-                "a.txt",
-                Some(b"a"),
-                Some(b"b"),
-                None,
-            ),
-        ];
-
-        let aggregate = project_turn_records("thread", "turn", &records).unwrap();
-
-        assert_eq!(aggregate.changes.len(), 1);
-        assert_eq!(aggregate.changes[0].kind, ChangeKind::Add);
-        assert_eq!(aggregate.changes[0].source_path, "a.txt");
-        assert_eq!(aggregate.changes[0].before, None);
-        assert_eq!(aggregate.changes[0].after, Some(snapshot(b"b")));
-    }
-
-    #[test]
-    fn add_then_delete_is_net_zero() {
-        let records = vec![
-            stored(0, "add", ChangeKind::Add, "a.txt", None, Some(b"a"), None),
-            stored(
-                1,
-                "delete",
-                ChangeKind::Delete,
-                "a.txt",
-                Some(b"a"),
-                None,
-                None,
-            ),
-        ];
-
-        let aggregate = project_turn_records("thread", "turn", &records).unwrap();
-
-        assert!(aggregate.changes.is_empty());
-        assert_eq!(aggregate.record_count, 2);
-    }
-
-    #[test]
-    fn add_then_move_is_an_add_at_the_final_path() {
-        let records = vec![
-            stored(0, "add", ChangeKind::Add, "a.txt", None, Some(b"a"), None),
-            stored(
-                1,
-                "move",
-                ChangeKind::Move,
-                "a.txt",
-                Some(b"a"),
-                Some(b"a"),
-                Some("b.txt"),
-            ),
-        ];
-
-        let aggregate = project_turn_records("thread", "turn", &records).unwrap();
-
-        assert_eq!(aggregate.changes.len(), 1);
-        assert_eq!(aggregate.changes[0].kind, ChangeKind::Add);
-        assert_eq!(aggregate.changes[0].source_path, "b.txt");
-        assert_eq!(aggregate.changes[0].destination_path, None);
-        assert_eq!(aggregate.changes[0].before, None);
-        assert_eq!(aggregate.changes[0].after, Some(snapshot(b"a")));
-    }
-
-    #[test]
-    fn incremental_projector_matches_replay_of_page_concatenation() {
-        let records = vec![
-            stored(
-                0,
-                "one",
-                ChangeKind::Update,
-                "a.txt",
-                Some(b"a"),
-                Some(b"b"),
-                None,
-            ),
-            stored(
-                1,
-                "two",
-                ChangeKind::Move,
-                "a.txt",
-                Some(b"b"),
-                Some(b"b"),
-                Some("b.txt"),
-            ),
-            stored(
-                2,
-                "three",
-                ChangeKind::Update,
-                "b.txt",
-                Some(b"b"),
-                Some(b"c"),
-                None,
-            ),
-        ];
-        let expected = project_turn_records("thread", "turn", &records).unwrap();
-        let mut projector =
-            TurnRecordProjector::new("thread", "turn", &BTreeSet::new(), &BTreeSet::new());
-        for page in records.chunks(1) {
-            for record in page {
-                projector.push(record).unwrap();
-            }
-        }
-        assert_eq!(projector.finish().unwrap(), expected);
-    }
-
-    #[test]
-    fn edit_revert_is_net_zero_but_records_remain_counted() {
-        let records = vec![
-            stored(
-                0,
-                "one",
-                ChangeKind::Update,
-                "a.txt",
-                Some(b"a"),
-                Some(b"b"),
-                None,
-            ),
-            stored(
-                1,
-                "two",
-                ChangeKind::Update,
-                "a.txt",
-                Some(b"b"),
-                Some(b"a"),
-                None,
-            ),
-        ];
-        let aggregate = project_turn_records("thread", "turn", &records).unwrap();
-        assert!(aggregate.changes.is_empty());
-        assert_eq!(aggregate.record_count, 2);
-    }
-
-    #[test]
     fn exact_partial_record_keeps_engine_verified_aggregate_coverage() {
         let mut partial = stored(
             0,
@@ -913,88 +680,6 @@ mod tests {
             PatchHistoryCoverage::Incomplete { .. }
         ));
         assert_eq!(aggregate.record_count, 1);
-    }
-
-    #[test]
-    fn rename_chain_preserves_original_path_and_destination() {
-        let records = vec![stored(
-            0,
-            "one",
-            ChangeKind::Move,
-            "a.txt",
-            Some(b"a"),
-            Some(b"a"),
-            Some("b.txt"),
-        )];
-        let aggregate = project_turn_records("thread", "turn", &records).unwrap();
-        assert_eq!(aggregate.changes[0].source_path, "a.txt");
-        assert_eq!(
-            aggregate.changes[0].destination_path.as_deref(),
-            Some("b.txt")
-        );
-    }
-
-    #[test]
-    fn move_overwrite_preserves_destination_turn_baseline_after_prior_edit() {
-        let records = vec![
-            stored(
-                0,
-                "destination-edit",
-                ChangeKind::Update,
-                "b.txt",
-                Some(b"b0"),
-                Some(b"b1"),
-                None,
-            ),
-            stored(
-                1,
-                "move",
-                ChangeKind::Move,
-                "a.txt",
-                Some(b"a"),
-                Some(b"a"),
-                Some("b.txt"),
-            ),
-        ];
-        let aggregate = project_turn_records("thread", "turn", &records).unwrap();
-        assert_eq!(aggregate.changes.len(), 1);
-        let change = &aggregate.changes[0];
-        assert_eq!(change.source_path, "a.txt");
-        assert_eq!(change.destination_path.as_deref(), Some("b.txt"));
-        assert_eq!(change.overwritten_destination, Some(snapshot(b"b0")));
-        assert_eq!(change.before, Some(snapshot(b"a")));
-        assert_eq!(change.after, Some(snapshot(b"a")));
-    }
-
-    #[test]
-    fn move_overwrite_of_destination_added_in_turn_keeps_absent_baseline() {
-        let records = vec![
-            stored(
-                0,
-                "destination-add",
-                ChangeKind::Add,
-                "b.txt",
-                None,
-                Some(b"b1"),
-                None,
-            ),
-            stored(
-                1,
-                "move",
-                ChangeKind::Move,
-                "a.txt",
-                Some(b"a"),
-                Some(b"a"),
-                Some("b.txt"),
-            ),
-        ];
-        let aggregate = project_turn_records("thread", "turn", &records).unwrap();
-        assert_eq!(aggregate.changes.len(), 1);
-        assert_eq!(
-            aggregate.changes[0].destination_path.as_deref(),
-            Some("b.txt")
-        );
-        assert_eq!(aggregate.changes[0].overwritten_destination, None);
     }
 
     #[test]
@@ -1124,5 +809,310 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["env-a", "env-b"])
         );
+    }
+
+    #[test]
+    fn patch_lineage_folding_keeps_the_original_and_final_file_state() {
+        for (case, records, expected) in [
+            (
+                "repeated_edits_fold_to_first_before_and_last_after",
+                {
+                    let records = vec![
+                        stored(
+                            0,
+                            "one",
+                            ChangeKind::Update,
+                            "a.txt",
+                            Some(b"a"),
+                            Some(b"b"),
+                            None,
+                        ),
+                        stored(
+                            1,
+                            "two",
+                            ChangeKind::Update,
+                            "a.txt",
+                            Some(b"b"),
+                            Some(b"c"),
+                            None,
+                        ),
+                    ];
+                    records
+                },
+                (
+                    ChangeKind::Update,
+                    "a.txt",
+                    None,
+                    Some(snapshot(b"a")),
+                    Some(snapshot(b"c")),
+                    None,
+                ),
+            ),
+            (
+                "add_then_update_remains_one_add_with_final_bytes",
+                {
+                    let records = vec![
+                        stored(0, "add", ChangeKind::Add, "a.txt", None, Some(b"a"), None),
+                        stored(
+                            1,
+                            "update",
+                            ChangeKind::Update,
+                            "a.txt",
+                            Some(b"a"),
+                            Some(b"b"),
+                            None,
+                        ),
+                    ];
+                    records
+                },
+                (
+                    ChangeKind::Add,
+                    "a.txt",
+                    None,
+                    None,
+                    Some(snapshot(b"b")),
+                    None,
+                ),
+            ),
+            (
+                "add_then_move_is_an_add_at_the_final_path",
+                {
+                    let records = vec![
+                        stored(0, "add", ChangeKind::Add, "a.txt", None, Some(b"a"), None),
+                        stored(
+                            1,
+                            "move",
+                            ChangeKind::Move,
+                            "a.txt",
+                            Some(b"a"),
+                            Some(b"a"),
+                            Some("b.txt"),
+                        ),
+                    ];
+                    records
+                },
+                (
+                    ChangeKind::Add,
+                    "b.txt",
+                    None,
+                    None,
+                    Some(snapshot(b"a")),
+                    None,
+                ),
+            ),
+            (
+                "rename_chain_preserves_original_path_and_destination",
+                {
+                    let records = vec![stored(
+                        0,
+                        "one",
+                        ChangeKind::Move,
+                        "a.txt",
+                        Some(b"a"),
+                        Some(b"a"),
+                        Some("b.txt"),
+                    )];
+                    records
+                },
+                (
+                    ChangeKind::Move,
+                    "a.txt",
+                    Some("b.txt"),
+                    Some(snapshot(b"a")),
+                    Some(snapshot(b"a")),
+                    None,
+                ),
+            ),
+            (
+                "move_overwrite_preserves_destination_turn_baseline_after_prior_edit",
+                {
+                    let records = vec![
+                        stored(
+                            0,
+                            "destination-edit",
+                            ChangeKind::Update,
+                            "b.txt",
+                            Some(b"b0"),
+                            Some(b"b1"),
+                            None,
+                        ),
+                        stored(
+                            1,
+                            "move",
+                            ChangeKind::Move,
+                            "a.txt",
+                            Some(b"a"),
+                            Some(b"a"),
+                            Some("b.txt"),
+                        ),
+                    ];
+                    records
+                },
+                (
+                    ChangeKind::Move,
+                    "a.txt",
+                    Some("b.txt"),
+                    Some(snapshot(b"a")),
+                    Some(snapshot(b"a")),
+                    Some(snapshot(b"b0")),
+                ),
+            ),
+            (
+                "move_overwrite_of_destination_added_in_turn_keeps_absent_baseline",
+                {
+                    let records = vec![
+                        stored(
+                            0,
+                            "destination-add",
+                            ChangeKind::Add,
+                            "b.txt",
+                            None,
+                            Some(b"b1"),
+                            None,
+                        ),
+                        stored(
+                            1,
+                            "move",
+                            ChangeKind::Move,
+                            "a.txt",
+                            Some(b"a"),
+                            Some(b"a"),
+                            Some("b.txt"),
+                        ),
+                    ];
+                    records
+                },
+                (
+                    ChangeKind::Move,
+                    "a.txt",
+                    Some("b.txt"),
+                    Some(snapshot(b"a")),
+                    Some(snapshot(b"a")),
+                    None,
+                ),
+            ),
+        ] {
+            let aggregate = project_turn_records("thread", "turn", &records).expect(case);
+            assert_eq!(aggregate.changes.len(), 1, "{case}");
+            let change = &aggregate.changes[0];
+            assert_eq!(
+                (
+                    change.kind,
+                    change.source_path.as_str(),
+                    change.destination_path.as_deref(),
+                    change.before.clone(),
+                    change.after.clone(),
+                    change.overwritten_destination.clone()
+                ),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_lineage_net_zero_keeps_both_committed_records() {
+        for (case, records) in [
+            ("add_then_delete_is_net_zero", {
+                let records = vec![
+                    stored(0, "add", ChangeKind::Add, "a.txt", None, Some(b"a"), None),
+                    stored(
+                        1,
+                        "delete",
+                        ChangeKind::Delete,
+                        "a.txt",
+                        Some(b"a"),
+                        None,
+                        None,
+                    ),
+                ];
+                records
+            }),
+            ("edit_revert_is_net_zero_but_records_remain_counted", {
+                let records = vec![
+                    stored(
+                        0,
+                        "one",
+                        ChangeKind::Update,
+                        "a.txt",
+                        Some(b"a"),
+                        Some(b"b"),
+                        None,
+                    ),
+                    stored(
+                        1,
+                        "two",
+                        ChangeKind::Update,
+                        "a.txt",
+                        Some(b"b"),
+                        Some(b"a"),
+                        None,
+                    ),
+                ];
+                records
+            }),
+        ] {
+            let aggregate = project_turn_records("thread", "turn", &records).expect(case);
+            assert!(aggregate.changes.is_empty(), "{case}");
+            assert_eq!(aggregate.record_count, 2, "{case}");
+        }
+    }
+
+    #[test]
+    fn unified_patch_rendering_keeps_exact_hunks_and_pure_rename_headers() {
+        for (case, kind, source, destination, before_bytes, after_bytes, expected) in [
+            (
+                "text hunk without final newline",
+                ChangeKind::Update,
+                "file.txt",
+                None,
+                &b"old\n"[..],
+                &b"new"[..],
+                "--- a/file.txt\n+++ b/file.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n\\ No newline at end of file\n",
+            ),
+            (
+                "pure rename",
+                ChangeKind::Move,
+                "old.txt",
+                Some("new.txt"),
+                &b"same\n"[..],
+                &b"same\n"[..],
+                "--- a/old.txt\n+++ b/new.txt\n",
+            ),
+        ] {
+            let before = snapshot(before_bytes);
+            let after = snapshot(after_bytes);
+            let aggregate = TurnAggregate {
+                thread_id: "thread".to_owned(),
+                turn_id: "turn".to_owned(),
+                changes: vec![AggregateFileChange {
+                    environment_id: "env".to_owned(),
+                    kind,
+                    source_path: source.to_owned(),
+                    destination_path: destination.map(str::to_owned),
+                    before: Some(before.clone()),
+                    after: Some(after.clone()),
+                    overwritten_destination: None,
+                }],
+                exact: true,
+                coverage: PatchHistoryCoverage::EngineVerifiedSteps,
+                applied_through: Some(CommitOrdinal(0)),
+                record_count: 1,
+            };
+            let rendered = aggregate
+                .render_unified_diff(|reference| {
+                    if reference == &before {
+                        Ok(before_bytes.to_vec())
+                    } else if reference == &after {
+                        Ok(after_bytes.to_vec())
+                    } else {
+                        Err(AggregateProjectionError::Snapshot(
+                            "unexpected snapshot".to_owned(),
+                        ))
+                    }
+                })
+                .expect(case);
+            assert_eq!(rendered, expected, "{case}");
+        }
     }
 }

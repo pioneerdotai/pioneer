@@ -249,47 +249,24 @@ mod tests {
     }
 
     #[test]
-    fn policy_set_merges_single_contribution() {
-        let set = HookPolicySet::merge_contributions([policy(
-            "test",
-            "mode",
-            HookValue::Text("strict".to_owned()),
-            10,
-        )]);
-
-        let entry = set
-            .get(&domain("test"), &key("mode"))
-            .expect("policy entry exists");
-        assert_eq!(entry.value, HookValue::Text("strict".to_owned()));
-        assert_eq!(entry.priority, 10);
-    }
-
-    #[test]
     fn higher_priority_policy_contribution_wins() {
-        let set = HookPolicySet::merge_contributions([
-            policy("test", "mode", HookValue::Text("weak".to_owned()), 0),
-            policy("test", "mode", HookValue::Text("strong".to_owned()), 10),
-        ]);
-
-        let entry = set
-            .get(&domain("test"), &key("mode"))
-            .expect("policy entry exists");
-        assert_eq!(entry.value, HookValue::Text("strong".to_owned()));
-        assert_eq!(entry.priority, 10);
-    }
-
-    #[test]
-    fn lower_priority_policy_contribution_does_not_override() {
-        let set = HookPolicySet::merge_contributions([
-            policy("test", "mode", HookValue::Text("strong".to_owned()), 10),
-            policy("test", "mode", HookValue::Text("weak".to_owned()), 0),
-        ]);
-
-        let entry = set
-            .get(&domain("test"), &key("mode"))
-            .expect("policy entry exists");
-        assert_eq!(entry.value, HookValue::Text("strong".to_owned()));
-        assert_eq!(entry.priority, 10);
+        for contributions in [
+            [
+                policy("test", "mode", HookValue::Text("weak".to_owned()), 0),
+                policy("test", "mode", HookValue::Text("strong".to_owned()), 10),
+            ],
+            [
+                policy("test", "mode", HookValue::Text("strong".to_owned()), 10),
+                policy("test", "mode", HookValue::Text("weak".to_owned()), 0),
+            ],
+        ] {
+            let set = HookPolicySet::merge_contributions(contributions);
+            let entry = set
+                .get(&domain("test"), &key("mode"))
+                .expect("policy entry exists");
+            assert_eq!(entry.value, HookValue::Text("strong".to_owned()));
+            assert_eq!(entry.priority, 10);
+        }
     }
 
     #[test]

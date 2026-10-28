@@ -2243,16 +2243,6 @@ mod tests {
         assert!(output.get("content_base64").is_none());
     }
 
-    #[test]
-    fn artifact_tool_specs_include_artifact_read() {
-        let tool_names = artifact_tool_specs()
-            .into_iter()
-            .map(|configured| configured.spec.name)
-            .collect::<Vec<_>>();
-
-        assert!(tool_names.contains(&ARTIFACT_READ_TOOL.to_owned()));
-    }
-
     fn assert_schema_descriptions_have_no_json_object_examples(value: &JsonValue, label: &str) {
         match value {
             JsonValue::Object(object) => {

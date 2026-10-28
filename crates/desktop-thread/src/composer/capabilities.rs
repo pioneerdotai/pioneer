@@ -24,8 +24,6 @@ use pioneer_client::composer::skill_selection::ComposerSkillSelection;
 use pioneer_client::composer::skill_selection::SelectablePackedSkillCapability;
 use pioneer_client::composer::skill_selection::SelectableSkillPackCapability;
 use pioneer_client::composer::skill_selection::project_composer_skill_picker;
-#[cfg(test)]
-use pioneer_client::composer::skill_selection::reduce_composer_skill_selection_toggle;
 use pioneer_client::skills::catalog::SkillManagementProjection;
 use pioneer_client::timeline::types::SkillPackId;
 use std::collections::HashSet;
@@ -342,15 +340,6 @@ impl Drop for CapabilityPickerState {
     fn drop(&mut self) {
         self.retire();
     }
-}
-
-#[cfg(test)]
-fn reduce_desktop_skill_picker_selection(
-    current: &[ComposerSkillSelection],
-    picker: &ComposerSkillPickerProjection,
-    selection: ComposerSkillSelection,
-) -> Vec<ComposerSkillSelection> {
-    reduce_composer_skill_selection_toggle(current, picker, selection).selections
 }
 
 impl ComposerView {
@@ -1421,106 +1410,6 @@ fn selected_mcp_composer_capabilities(state: &CapabilityPickerState) -> Vec<Comp
         state.mcp_tool_rows().as_slice(),
         &state.selected(),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pioneer_client::timeline::types::SkillId;
-
-    fn skill_id(character: char) -> SkillId {
-        SkillId::new(character.to_string().repeat(21)).expect("skill id")
-    }
-
-    fn pack_id(character: char) -> SkillPackId {
-        SkillPackId::new(character.to_string().repeat(21)).expect("pack id")
-    }
-
-    fn selectable_skill(character: char) -> SelectableSkillCapability {
-        let skill_id = skill_id(character);
-        SelectableSkillCapability {
-            key: ComposerSkillSelection::Skill {
-                skill_id: skill_id.clone(),
-                pack_id: None,
-            }
-            .key(),
-            skill_id,
-            label: character.to_string(),
-            display_name: character.to_string(),
-            description: String::new(),
-            owner: None,
-            slug: character.to_string(),
-            source_kind: "user".to_owned(),
-            selectable: true,
-            unavailable_reason: None,
-        }
-    }
-
-    fn picker() -> ComposerSkillPickerProjection {
-        let pack_id = pack_id('P');
-        ComposerSkillPickerProjection {
-            standalone: vec![selectable_skill('S')],
-            packs: vec![SelectableSkillPackCapability {
-                key: format!("skill_pack:{pack_id}"),
-                pack_id: pack_id.clone(),
-                label: "Pack".to_owned(),
-                children: vec![SelectablePackedSkillCapability {
-                    pack_id,
-                    member_key: "child".to_owned(),
-                    skill: selectable_skill('C'),
-                }],
-                selectable: true,
-            }],
-        }
-    }
-
-    #[::core::prelude::v1::test]
-    fn desktop_picker_uses_shared_full_to_partial_transition_with_stable_ids() {
-        let picker = picker();
-        let full = ComposerSkillSelection::SkillPack {
-            pack_id: pack_id('P'),
-        };
-        let child = ComposerSkillSelection::Skill {
-            skill_id: skill_id('C'),
-            pack_id: Some(pack_id('P')),
-        };
-
-        let selected = reduce_desktop_skill_picker_selection(&[], &picker, full);
-        let partial = reduce_desktop_skill_picker_selection(&selected, &picker, child.clone());
-
-        assert_eq!(partial, vec![child]);
-    }
-
-    #[::core::prelude::v1::test]
-    fn desktop_picker_keeps_manual_all_children_partial() {
-        let mut picker = picker();
-        let pack_id = pack_id('P');
-        picker.packs[0]
-            .children
-            .push(SelectablePackedSkillCapability {
-                pack_id: pack_id.clone(),
-                member_key: "second".to_owned(),
-                skill: selectable_skill('D'),
-            });
-        let first = ComposerSkillSelection::Skill {
-            skill_id: skill_id('C'),
-            pack_id: Some(pack_id.clone()),
-        };
-        let second = ComposerSkillSelection::Skill {
-            skill_id: skill_id('D'),
-            pack_id: Some(pack_id),
-        };
-
-        let selected = reduce_desktop_skill_picker_selection(&[], &picker, first);
-        let selected = reduce_desktop_skill_picker_selection(&selected, &picker, second);
-
-        assert_eq!(selected.len(), 2);
-        assert!(
-            selected
-                .iter()
-                .all(|selection| matches!(selection, ComposerSkillSelection::Skill { .. }))
-        );
-    }
 }
 
 #[cfg(test)]

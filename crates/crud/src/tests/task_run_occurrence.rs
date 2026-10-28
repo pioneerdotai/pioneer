@@ -857,16 +857,6 @@ async fn due_plan_empty_deferred_and_due_backlog_use_covering_index_without_sort
     }
 }
 
-#[test]
-fn backoff_is_exponential_bounded_and_attempt_counter_has_finite_policy() {
-    assert_eq!(
-        (1..=8).map(queue::retry_delay).collect::<Vec<_>>(),
-        vec![5, 10, 20, 40, 80, 160, 300, 300]
-    );
-    assert_eq!(queue::retry_delay(16), 300);
-    assert_eq!(queue::retry_delay(i64::MAX), 300);
-}
-
 #[tokio::test]
 async fn every_terminal_mapping_commits_through_common_turn_event_projector() {
     for (status, target) in [
@@ -1711,9 +1701,12 @@ async fn attempt_count_saturates_but_poison_row_stays_retryable_forever() {
             .unwrap()
             .unwrap();
         assert_eq!(claim.attempt_count, std::cmp::min(attempt, 16));
-        assert_eq!(claim.next_attempt_at, now + queue::retry_delay(attempt));
+        let expected_delay = [5, 10, 20, 40, 80, 160, 300][(attempt as usize - 1).min(6)];
+        assert_eq!(claim.next_attempt_at, now + expected_delay);
+        let stored = row(&store, &run.id).await.unwrap();
+        assert_eq!(stored.next_attempt_at, now + expected_delay);
         assert_eq!(
-            row(&store, &run.id).await.unwrap().claim_token.as_deref(),
+            stored.claim_token.as_deref(),
             Some(claim.claim_token.as_str())
         );
         now = claim.next_attempt_at;

@@ -356,28 +356,14 @@ mod tests {
     }
 
     #[test]
-    fn turn_preflight_prompt_is_schema_free_and_has_no_markdown_block() {
-        let prompt = sample_prompt_with_active_recall();
-
-        assert!(!prompt.contains("```"));
-        assert!(!prompt.contains("\"parameters\""));
-        assert!(!prompt.contains("\"properties\""));
-        assert!(!prompt.contains("\"additionalProperties\""));
-        assert!(!prompt.contains("\"required\""));
-        assert!(!prompt.contains("\"jsonSchema\""));
-        assert!(!prompt.contains("\"type\""));
-        assert!(!prompt.contains("active_recall_json_object_described_below"));
-        assert!(!prompt.contains("optional string"));
-        assert!(!prompt.contains("\"skip\" |"));
-        assert!(!prompt.contains("\"tool_name_from_tools_candidateTools\""));
-    }
-
-    #[test]
     fn turn_preflight_prompt_renders_memory_contract_only_when_provider_planning_is_needed() {
         let without_memory = sample_prompt();
 
         assert!(!without_memory.contains("Active recall output contract"));
         assert!(!without_memory.contains(r#""activeRecall""#));
+
+        assert!(!without_memory.contains("`memory.activeRecall` is required"));
+        assert!(!without_memory.contains(r#""factClass": "user_identity""#));
 
         let with_memory = sample_prompt_with_active_recall();
 
@@ -409,61 +395,6 @@ mod tests {
     }
 
     #[test]
-    fn turn_preflight_prompt_memory_contract_keeps_identity_name_guidance_language_neutral() {
-        let prompt = sample_prompt_with_active_recall();
-
-        assert!(prompt.contains("`factClass`: `user_identity`"));
-        assert!(prompt.contains("`subject`: `current_user`"));
-        assert!(prompt.contains("`attribute`: `name`"));
-        assert!(prompt.contains(r#""factClass": "user_identity""#));
-        assert!(prompt.contains(r#""subject": "current_user""#));
-        assert!(prompt.contains(r#""attribute": "name""#));
-        assert!(prompt.contains("Do not use category names such as `identity` as `factClass`"));
-        assert!(prompt.contains("Make decisions by semantic need and structured fields"));
-        assert!(prompt.contains(r#""inputTextPreview":"как меня зовут?""#));
-        assert!(!prompt.contains("запомни"));
-        assert!(!prompt.contains("remember that"));
-    }
-
-    #[test]
-    fn turn_preflight_prompt_omits_memory_contract_when_local_decision_is_final() {
-        for (label, structured_input_json) in [
-            (
-                "policy_disabled",
-                r#"{"memory":{"activeRecall":{"providerPlanningNeeded":false,"localDecision":{"reasonCode":"policy_disabled","status":"skip","confidence":1.0}}}}"#,
-            ),
-            (
-                "config_disabled",
-                r#"{"memory":{"activeRecall":{"providerPlanningNeeded":false,"localDecision":{"reasonCode":"config_disabled","status":"skip","confidence":1.0}}}}"#,
-            ),
-            (
-                "deterministic_only",
-                r#"{"memory":{"activeRecall":{"providerPlanningNeeded":false,"localDecision":{"reasonCode":"deterministic_only","status":"skip","confidence":1.0}}}}"#,
-            ),
-            (
-                "strict_debug",
-                r#"{"memory":{"activeRecall":{"providerPlanningNeeded":false,"localDecision":{"reasonCode":"strict_debug","status":"run","confidence":1.0}}}}"#,
-            ),
-        ] {
-            let prompt = render_turn_preflight_prompt(&TurnPreflightPromptInput {
-                structured_input_json: structured_input_json.to_owned(),
-                memory_active_recall: TurnPreflightMemoryActiveRecallPromptInput::disabled(),
-                max_output_chars: 1_200,
-            });
-
-            assert!(!prompt.contains("Active recall output contract"), "{label}");
-            assert!(
-                !prompt.contains("`memory.activeRecall` is required"),
-                "{label}"
-            );
-            assert!(
-                !prompt.contains(r#""factClass": "user_identity""#),
-                "{label}"
-            );
-        }
-    }
-
-    #[test]
     fn turn_preflight_prompt_uses_one_valid_final_output_example() {
         serde_json::from_str::<serde_json::Value>(render_turn_preflight_output_example(
             false,
@@ -490,20 +421,43 @@ mod tests {
     }
 
     #[test]
-    fn turn_preflight_prompt_keeps_diagnostics_shapes_distinct() {
-        let prompt = sample_prompt_with_active_recall();
-
-        assert!(prompt.contains("top-level array of objects with `code`"));
-        assert!(prompt.contains("`memory.activeRecall.diagnostics` is an array of short strings"));
-        assert!(prompt.contains(r#""diagnostics": ["identity_lookup"]"#));
-        assert!(prompt.contains(r#"{ "code": "memory_identity_lookup" }"#));
-    }
-
-    #[test]
     fn turn_preflight_prompt_is_deterministic() {
         let first = sample_prompt_with_active_recall();
         let second = sample_prompt_with_active_recall();
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn turn_preflight_active_recall_prompt_preserves_text_contract() {
+        let prompt = sample_prompt_with_active_recall();
+        assert!(!prompt.contains("```"));
+        assert!(!prompt.contains("\"parameters\""));
+        assert!(!prompt.contains("\"properties\""));
+        assert!(!prompt.contains("\"additionalProperties\""));
+        assert!(!prompt.contains("\"required\""));
+        assert!(!prompt.contains("\"jsonSchema\""));
+        assert!(!prompt.contains("\"type\""));
+        assert!(!prompt.contains("active_recall_json_object_described_below"));
+        assert!(!prompt.contains("optional string"));
+        assert!(!prompt.contains("\"skip\" |"));
+        assert!(!prompt.contains("\"tool_name_from_tools_candidateTools\""));
+
+        assert!(prompt.contains("`factClass`: `user_identity`"));
+        assert!(prompt.contains("`subject`: `current_user`"));
+        assert!(prompt.contains("`attribute`: `name`"));
+        assert!(prompt.contains(r#""factClass": "user_identity""#));
+        assert!(prompt.contains(r#""subject": "current_user""#));
+        assert!(prompt.contains(r#""attribute": "name""#));
+        assert!(prompt.contains("Do not use category names such as `identity` as `factClass`"));
+        assert!(prompt.contains("Make decisions by semantic need and structured fields"));
+        assert!(prompt.contains(r#""inputTextPreview":"как меня зовут?""#));
+        assert!(!prompt.contains("запомни"));
+        assert!(!prompt.contains("remember that"));
+
+        assert!(prompt.contains("top-level array of objects with `code`"));
+        assert!(prompt.contains("`memory.activeRecall.diagnostics` is an array of short strings"));
+        assert!(prompt.contains(r#""diagnostics": ["identity_lookup"]"#));
+        assert!(prompt.contains(r#"{ "code": "memory_identity_lookup" }"#));
     }
 }

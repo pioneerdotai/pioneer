@@ -1560,23 +1560,32 @@ mod tests {
     }
 
     #[test]
-    fn response_planner_rejects_cli_runtime_session_scope() {
-        let pending = PendingRequest::from_cli_runtime_opened_notification(request_opened(
-            "req",
-            "ws",
-            "codex",
-            Some("thread"),
-            Some("turn"),
-            "pwd",
-        ));
-
-        let error =
-            plan_pending_request_response(&pending, PendingRequestResolution::AllowForSession)
-                .expect_err("CLI session scope exceeds the canonical approval contract");
-        assert_eq!(
-            error,
-            PendingRequestResponsePlanError::UnsupportedResolutionForOrigin
-        );
+    fn cli_response_planner_rejects_unsupported_scopes() {
+        for (case, resolution) in [
+            (
+                "response_planner_rejects_cli_runtime_session_scope",
+                PendingRequestResolution::AllowForSession,
+            ),
+            (
+                "response_planner_rejects_turn_resolution_for_cli_runtime_request",
+                PendingRequestResolution::AllowForTurn,
+            ),
+        ] {
+            let pending = PendingRequest::from_cli_runtime_opened_notification(request_opened(
+                "req",
+                "ws",
+                "codex",
+                Some("thread"),
+                Some("turn"),
+                "pwd",
+            ));
+            let error = plan_pending_request_response(&pending, resolution).expect_err(case);
+            assert_eq!(
+                error,
+                PendingRequestResponsePlanError::UnsupportedResolutionForOrigin,
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -1665,57 +1674,29 @@ mod tests {
     }
 
     #[test]
-    fn response_planner_rejects_turn_resolution_for_cli_runtime_request() {
-        let pending = PendingRequest::from_cli_runtime_opened_notification(request_opened(
-            "req",
-            "ws",
-            "codex",
-            Some("thread"),
-            Some("turn"),
-            "pwd",
-        ));
-
-        let error = plan_pending_request_response(&pending, PendingRequestResolution::AllowForTurn)
-            .expect_err("CLI runtime approvals do not use native turn scope");
-
-        assert_eq!(
-            error,
-            PendingRequestResponsePlanError::UnsupportedResolutionForOrigin
-        );
-    }
-
-    #[test]
-    fn response_planner_rejects_session_resolution_for_native_permission_request() {
-        let pending =
-            PendingRequest::from_native_permission_request(native_permission_request("req_native"));
-
-        let error =
-            plan_pending_request_response(&pending, PendingRequestResolution::AllowForSession)
-                .expect_err("native permission approvals are scoped to the turn");
-
-        assert_eq!(
-            error,
-            PendingRequestResponsePlanError::UnsupportedResolutionForOrigin
-        );
-    }
-
-    #[test]
-    fn response_planner_rejects_answered_resolution_for_native_permission_request() {
-        let pending =
-            PendingRequest::from_native_permission_request(native_permission_request("req_native"));
-
-        let error = plan_pending_request_response(
-            &pending,
-            PendingRequestResolution::Answered {
-                response: Some(serde_json::json!({ "text": "hello" })),
-            },
-        )
-        .expect_err("native permission requests are not user-input answers");
-
-        assert_eq!(
-            error,
-            PendingRequestResponsePlanError::UnsupportedResolutionForOrigin
-        );
+    fn native_response_planner_rejects_unsupported_decisions() {
+        for (case, resolution) in [
+            (
+                "response_planner_rejects_session_resolution_for_native_permission_request",
+                PendingRequestResolution::AllowForSession,
+            ),
+            (
+                "response_planner_rejects_answered_resolution_for_native_permission_request",
+                PendingRequestResolution::Answered {
+                    response: Some(serde_json::json!({ "text": "hello" })),
+                },
+            ),
+        ] {
+            let pending = PendingRequest::from_native_permission_request(
+                native_permission_request("req_native"),
+            );
+            let error = plan_pending_request_response(&pending, resolution).expect_err(case);
+            assert_eq!(
+                error,
+                PendingRequestResponsePlanError::UnsupportedResolutionForOrigin,
+                "{case}"
+            );
+        }
     }
 
     #[test]

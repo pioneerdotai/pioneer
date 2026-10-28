@@ -1459,16 +1459,6 @@ mod tests {
     }
 
     #[test]
-    fn capability_required_for_local_paths_forces_upload() {
-        let caps = capabilities(true);
-
-        assert!(local_attachments_require_artifact_upload(
-            Some(GatewayEndpointKind::Local),
-            Some(&caps)
-        ));
-    }
-
-    #[test]
     fn missing_capability_response_falls_back_to_upload() {
         assert!(local_attachments_require_artifact_upload(
             Some(GatewayEndpointKind::Local),

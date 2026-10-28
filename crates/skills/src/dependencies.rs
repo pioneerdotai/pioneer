@@ -320,6 +320,24 @@ mod tests {
         );
 
         assert!(result.has_failures());
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|item| (item.kind, item.name.as_str(), item.status))
+                .collect::<Vec<_>>(),
+            vec![
+                (DependencyKind::Env, "HOME", DependencyStatus::Blocked),
+                (DependencyKind::Bin, "cargo", DependencyStatus::Blocked),
+                (DependencyKind::Command, "cargo", DependencyStatus::Blocked),
+                (DependencyKind::Mcp, "server-a", DependencyStatus::Blocked),
+                (
+                    DependencyKind::ApiKey,
+                    "OPENAI_API_KEY",
+                    DependencyStatus::Blocked
+                ),
+            ]
+        );
         assert!(
             result
                 .diagnostics

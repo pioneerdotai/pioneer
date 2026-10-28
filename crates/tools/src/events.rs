@@ -774,7 +774,7 @@ fn monotonic_now_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_policy::{ToolOutputProjectionKind, ToolResultView};
+    use crate::output_policy::ToolOutputProjectionKind;
     use crate::output_projection::{ToolProjectionInput, project_tool_result};
     use tokio::time::{Duration, timeout};
 
@@ -807,37 +807,13 @@ mod tests {
         let send = tokio::spawn(async move { trace.emit_delta(1, "must persist".into()).await });
         let envelope = receiver.recv().await.unwrap();
         assert_eq!(envelope.event.kind(), ToolEventKind::OutputDelta);
+        assert_eq!(
+            envelope.event.payload.event_class(),
+            ProtocolEventClass::Durable
+        );
         assert!(!send.is_finished());
         envelope.acknowledge(Err("storage unavailable".into()));
         assert!(send.await.unwrap().is_err());
-    }
-
-    #[test]
-    fn output_delta_events_are_durable() {
-        let event = ToolEventPayload::OutputDelta(ToolOutputDeltaEvent {
-            delta: ToolDeltaPayload::OutputChunk {
-                stream: ItemDeltaStream::Stdout,
-                text: "chunk".to_owned(),
-                truncated: false,
-            },
-        });
-
-        assert_eq!(event.event_class(), ProtocolEventClass::Durable);
-    }
-
-    #[test]
-    fn completed_calls_are_durable() {
-        let event = ToolEventPayload::CallCompleted(ToolCallCompletedEvent {
-            success: true,
-            outcome: ToolOutcome::ok(),
-            llm_view: ToolResultView::Empty,
-            display: ToolDisplayPayload::default(),
-            storage: ToolStoragePayload::default(),
-            recovery: None,
-            output_policy: ToolOutputPolicySnapshot::for_tool_name("test_tool"),
-        });
-
-        assert_eq!(event.event_class(), ProtocolEventClass::Durable);
     }
 
     #[tokio::test]
@@ -912,6 +888,10 @@ mod tests {
         assert_eq!(
             completed_envelope.event.kind(),
             ToolEventKind::CallCompleted
+        );
+        assert_eq!(
+            completed_envelope.event.payload.event_class(),
+            ProtocolEventClass::Durable
         );
         completed_envelope.acknowledge(Ok(()));
         completion

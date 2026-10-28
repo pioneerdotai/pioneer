@@ -816,31 +816,6 @@ mod tests {
     }
 
     #[test]
-    fn assistant_none_keeps_only_identity() {
-        let root = temp_workspace("none");
-        let compiled = compile_prompt(PromptCompileInput {
-            workspace_root: root,
-            profile: PromptProfile::AssistantNone,
-            skills_prompt: Some("[Skills]\n- skill-a".to_owned()),
-            retry_instruction: Some("retry".to_owned()),
-            include_tool_recovery_policy: true,
-            include_task_orchestration_policy: false,
-            include_threads_policy: false,
-            include_html_policy: false,
-            continue_generation_hint: true,
-            runtime_sections: Vec::new(),
-            dynamic_sections: Vec::new(),
-            dynamic_context: Some("dynamic".to_owned()),
-            extra_system: Some("extra".to_owned()),
-            limits: PromptLimits::default(),
-        })
-        .expect("compile");
-
-        assert!(compiled.stable_system_text.contains("personal assistant"));
-        assert!(compiled.dynamic_system_text.is_empty());
-    }
-
-    #[test]
     fn runtime_section_order_is_deterministic() {
         let root = temp_workspace("runtime_order");
         std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
@@ -1030,6 +1005,20 @@ mod tests {
         );
         assert!(!compiled.dynamic_system_text.contains("task_create"));
         assert!(!compiled.dynamic_system_text.contains("task_accept"));
+
+        assert!(subagents_section.content.contains("read_skill"));
+        assert!(subagents_section.content.contains("attached subagents"));
+        assert!(
+            subagents_section
+                .content
+                .contains("parent agent owns the user outcome")
+        );
+        assert!(tasks_section.content.contains("read_skill"));
+        assert!(
+            tasks_section
+                .content
+                .contains("future, recurring, background")
+        );
     }
 
     #[test]
@@ -1098,6 +1087,21 @@ mod tests {
         assert!(!compiled.stable_system_text.contains("write_file"));
         assert!(!compiled.stable_system_text.contains("edit_file"));
         assert!(!compiled.stable_system_text.contains("partial edits"));
+
+        assert!(tool_usage_section.content.contains("`read_file`"));
+        assert!(!tool_usage_section.content.contains("AppliedPatchLog"));
+        assert!(
+            !tool_usage_section
+                .content
+                .to_ascii_lowercase()
+                .contains("codex")
+        );
+        assert!(
+            !tool_usage_section
+                .content
+                .to_ascii_lowercase()
+                .contains("proposal")
+        );
     }
 
     #[test]
@@ -1333,52 +1337,6 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_prompt_section_appears_in_compiled_prompt() {
-        let root = temp_workspace("dynamic_prompt_section");
-        std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
-        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
-
-        let compiled = compile_prompt(PromptCompileInput {
-            workspace_root: root,
-            profile: PromptProfile::AssistantFull,
-            skills_prompt: None,
-            retry_instruction: None,
-            include_tool_recovery_policy: true,
-            include_task_orchestration_policy: false,
-            include_threads_policy: false,
-            include_html_policy: false,
-            continue_generation_hint: false,
-            runtime_sections: Vec::new(),
-            dynamic_sections: vec![dynamic_section(
-                "test.phase10.alpha",
-                Some("Alpha Hook Section"),
-                "alpha hook section content",
-            )],
-            dynamic_context: None,
-            extra_system: None,
-            limits: PromptLimits::default(),
-        })
-        .expect("compile");
-
-        assert!(
-            compiled
-                .dynamic_system_text
-                .contains("## Alpha Hook Section")
-        );
-        assert!(
-            compiled
-                .dynamic_system_text
-                .contains("alpha hook section content")
-        );
-        assert!(
-            compiled
-                .sections
-                .iter()
-                .any(|section| { section.id.manifest_id() == "test.phase10.alpha" })
-        );
-    }
-
-    #[test]
     fn dynamic_prompt_sections_preserve_input_order_and_slot() {
         let root = temp_workspace("dynamic_prompt_section_order");
         std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
@@ -1430,6 +1388,9 @@ mod tests {
         assert!(memory_index < first_index);
         assert!(first_index < second_index);
         assert!(second_index < recovery_index);
+
+        assert!(compiled.dynamic_system_text.contains("## First Hook"));
+        assert!(compiled.dynamic_system_text.contains("first content"));
     }
 
     #[test]
@@ -1796,6 +1757,14 @@ mod tests {
             source_manifest[2].status,
             crate::bundle::PromptSourceStatus::Missing
         );
+
+        assert!(compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == PromptDiagnosticCode::MissingFile
+                && diagnostic
+                    .file
+                    .as_deref()
+                    .is_some_and(|file| file.ends_with("SOUL.md"))
+        }));
     }
 
     #[test]

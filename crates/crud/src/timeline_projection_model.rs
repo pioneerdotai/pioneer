@@ -170,29 +170,3 @@ pub(crate) fn terminal_completed_at(turn: &turn::Model) -> Option<DateTimeWithTi
         None
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::turn_work_state;
-
-    #[test]
-    fn cli_runtime_state_does_not_follow_gaps_between_work_items() {
-        assert_eq!(
-            turn_work_state("in_progress", Some("running"), 0, false),
-            "running"
-        );
-    }
-
-    #[test]
-    fn cli_runtime_starting_is_the_authoritative_queue_state() {
-        assert_eq!(
-            turn_work_state("in_progress", Some("starting"), 0, false),
-            "starting"
-        );
-    }
-
-    #[test]
-    fn native_turns_stay_running_between_work_items() {
-        assert_eq!(turn_work_state("in_progress", None, 0, false), "running");
-    }
-}

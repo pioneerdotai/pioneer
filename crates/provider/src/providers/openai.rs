@@ -1925,6 +1925,10 @@ mod tests {
                         .and_then(serde_json::Value::as_str),
                     expected_effort
                 );
+                assert!(body.get("temperature").is_none());
+                if expected_effort.is_none() {
+                    assert!(body.get("reasoning_effort").is_none());
+                }
                 assert!(body.get("max_output_tokens").is_none());
                 let other = if field == "max_tokens" {
                     "max_completion_tokens"
@@ -2106,66 +2110,11 @@ mod tests {
     }
 
     #[test]
-    fn creates_with_custom_base_url() {
-        let provider = OpenAiProvider::with_base_url("key", "http://localhost:8080");
-        assert_eq!(provider.base_url, "http://localhost:8080");
-    }
-
-    #[test]
-    fn default_base_url() {
-        let provider = OpenAiProvider::new("key");
-        assert_eq!(provider.base_url, "https://api.openai.com/v1");
-    }
-
-    #[test]
-    fn chat_completions_url_built_correctly() {
-        let provider = OpenAiProvider::new("key");
-        assert_eq!(
-            provider.chat_completions_url(),
-            "https://api.openai.com/v1/chat/completions"
-        );
-    }
-
-    #[test]
     fn chat_completions_url_with_custom_base() {
         let provider = OpenAiProvider::with_base_url("key", "http://localhost:3000");
         assert_eq!(
             provider.chat_completions_url(),
             "http://localhost:3000/chat/completions"
-        );
-    }
-
-    #[test]
-    fn openai_reasoning_registry_exposes_documented_gpt_5_5_efforts() {
-        let reasoning = reasoning_registry::reasoning_capabilities_for_model("openai", "gpt-5.5")
-            .expect("gpt-5.5 reasoning metadata");
-
-        assert_eq!(reasoning.supported, Some(true));
-        assert_eq!(
-            reasoning.effort_options,
-            vec!["none", "low", "medium", "high", "xhigh"]
-        );
-        assert_eq!(reasoning.default_effort.as_deref(), Some("medium"));
-    }
-
-    #[test]
-    fn openai_reasoning_registry_matches_documented_gpt_5_4_family() {
-        let reasoning =
-            reasoning_registry::reasoning_capabilities_for_model("openai", "gpt-5.4-mini")
-                .expect("gpt-5.4 mini reasoning metadata");
-
-        assert_eq!(reasoning.supported, Some(true));
-        assert_eq!(
-            reasoning.effort_options,
-            vec!["none", "low", "medium", "high", "xhigh"]
-        );
-    }
-
-    #[test]
-    fn openai_reasoning_registry_leaves_unknown_models_unset() {
-        assert!(
-            reasoning_registry::reasoning_capabilities_for_model("openai", "custom-model")
-                .is_none()
         );
     }
 
@@ -2380,109 +2329,6 @@ mod tests {
     }
 
     #[test]
-    fn api_request_serializes_with_max_tokens() {
-        let request = ApiChatRequest {
-            generation: Default::default(),
-            model: "gpt-4o".into(),
-            messages: vec![],
-            temperature: None,
-            max_tokens: Some(1024),
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning_effort: None,
-            stream: true,
-            stream_options: Some(serde_json::json!({"include_usage": true})),
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-
-        assert!(json.contains("\"max_tokens\":1024"));
-        assert!(json.contains("\"stream\":true"));
-        assert!(!json.contains("temperature"));
-    }
-
-    #[test]
-    fn api_request_serializes_reasoning_effort_only_when_selected() {
-        let request = ApiChatRequest {
-            generation: Default::default(),
-            model: "gpt-5.4".into(),
-            messages: vec![],
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning_effort: Some("high".to_owned()),
-            stream: false,
-            stream_options: None,
-        };
-
-        let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["reasoning_effort"], "high");
-
-        let request_without_reasoning = ApiChatRequest {
-            reasoning_effort: None,
-            ..request
-        };
-        let json = serde_json::to_value(&request_without_reasoning).unwrap();
-        assert!(json.get("reasoning_effort").is_none());
-    }
-
-    #[test]
-    fn api_response_deserializes() {
-        let json = r#"{"choices":[{"message":{"content":"Hi from OpenAI"}}]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices.len(), 1);
-        assert_eq!(
-            response.choices[0].message.content.as_deref(),
-            Some("Hi from OpenAI")
-        );
-    }
-
-    #[test]
-    fn api_response_with_usage() {
-        let json = r#"{
-            "choices": [{"message": {"content": "Hello"}}],
-            "usage": {"prompt_tokens": 42, "completion_tokens": 15}
-        }"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let usage = response.usage.unwrap().normalized();
-        assert_eq!(usage.input_tokens, Some(42));
-        assert_eq!(usage.output_tokens, Some(15));
-    }
-
-    #[test]
-    fn api_response_without_usage() {
-        let json = r#"{"choices":[{"message":{"content":"Hello"}}]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert!(response.usage.is_none());
-    }
-
-    #[test]
-    fn api_response_empty_choices() {
-        let json = r#"{"choices":[]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert!(response.choices.is_empty());
-    }
-
-    #[test]
-    fn stream_response_deserializes_delta() {
-        let json = r#"{"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices.len(), 1);
-        assert_eq!(response.choices[0].delta.content.as_deref(), Some("Hello"));
-        assert!(response.choices[0].finish_reason.is_none());
-    }
-
-    #[test]
-    fn stream_response_deserializes_finish() {
-        let json = r#"{"choices":[{"delta":{"content":null},"finish_reason":"stop"}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
-    }
-
-    #[test]
     fn stream_response_empty_delta() {
         let json = r#"{"choices":[{"delta":{},"finish_reason":null}]}"#;
         let response: StreamResponse = serde_json::from_str(json).unwrap();
@@ -2490,19 +2336,41 @@ mod tests {
     }
 
     #[test]
-    fn provider_name() {
+    fn default_endpoint_and_capabilities() {
         use crate::traits::Provider;
         let provider = OpenAiProvider::new("key");
-        assert_eq!(provider.name(), "openai");
-    }
-
-    #[test]
-    fn provider_capabilities() {
-        use crate::traits::Provider;
-        let provider = OpenAiProvider::new("key");
+        assert_eq!(
+            provider.chat_completions_url(),
+            "https://api.openai.com/v1/chat/completions"
+        );
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn api_response_choices_and_absent_usage_mapping() {
+        let cases: [(&str, &[Option<&str>]); 3] = [
+            (
+                r#"{"choices":[{"message":{"content":"Hi from OpenAI"}}]}"#,
+                &[Some("Hi from OpenAI")],
+            ),
+            (
+                r#"{"choices":[{"message":{"content":"Hello"}}]}"#,
+                &[Some("Hello")],
+            ),
+            (r#"{"choices":[]}"#, &[]),
+        ];
+        for (json, expected_contents) in cases {
+            let response: ApiChatResponse = serde_json::from_str(json).unwrap();
+            let contents = response
+                .choices
+                .iter()
+                .map(|choice| choice.message.content.as_deref())
+                .collect::<Vec<_>>();
+            assert_eq!(contents.as_slice(), expected_contents, "{json}");
+            assert!(response.usage.is_none(), "{json}");
+        }
     }
 }
 

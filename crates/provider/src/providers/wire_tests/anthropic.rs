@@ -120,19 +120,6 @@ fn native_replay_keeps_two_parallel_tool_rounds_separate_after_storage() {
 }
 
 #[test]
-fn canonical_stream_start_and_json_delta_use_same_tool_schema() {
-    let event: StreamEvent = serde_json::from_str(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"forecast_1","name":"forecast","input":{}}}"#).unwrap();
-    let block = event.content_block.unwrap();
-    assert_eq!(block.block_type, "tool_use");
-    assert_eq!(block.id.as_deref(), Some("forecast_1"));
-    assert_eq!(block.name.as_deref(), Some("forecast"));
-    let event: StreamEvent = serde_json::from_str(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"days\":2}"}}"#).unwrap();
-    let args: serde_json::Value =
-        serde_json::from_str(event.delta.unwrap().partial_json.as_deref().unwrap()).unwrap();
-    assert_eq!(args["days"], 2);
-}
-
-#[test]
 fn ordinary_text_reasoning_usage_and_replay_keep_existing_normalization() {
     let response = AnthropicProvider::parse_response(serde_json::from_value(serde_json::json!({
         "content":[

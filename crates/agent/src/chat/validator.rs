@@ -250,91 +250,71 @@ mod tests {
     use super::{looks_like_raw_tool_call_markup, looks_like_tool_schema_dump};
 
     #[test]
-    fn raw_tool_call_markup_detector_matches_provider_protocol_leaks() {
-        assert!(looks_like_raw_tool_call_markup(
+    fn raw_tool_call_markup_recognition_preserves_leaks_and_explanations() {
+        let recognized = [
             "][transport][<tool_call>\n\
              ][transport][<invoke name=\"exec_command\">][transport][<command>]\
              <item>bash && -lc && grep -nP '[\\xe2\\x80\\x94]' file.md</item>\
              </command></invoke>\n\
-             </tool_call>"
-        ));
-        assert!(looks_like_raw_tool_call_markup(
-            "<tool_call>\n<invoke name=\"read_file\"><arguments>{\"path\":\"/tmp/a.md\"}</arguments></invoke>\n</tool_call>"
-        ));
-        assert!(looks_like_raw_tool_call_markup(
+             </tool_call>",
+            "<tool_call>\n<invoke name=\"read_file\"><arguments>{\"path\":\"/tmp/a.md\"}</arguments></invoke>\n</tool_call>",
             "< | | DSML | | tool_calls>\n\
              < | | DSML | | invoke name=\"exec_command\">\n\
              < | | DSML | | parameter name=\"command\" string=\"false\">[\"brew\",\"install\",\"mole\"]</| | DSML | | parameter>\n\
              < | | DSML | | parameter name=\"timeout_ms\" string=\"false\">120000</| | DSML | | parameter>\n\
              </| | DSML | | invoke>\n\
-             </| | DSML | | tool_calls>"
-        ));
-        assert!(looks_like_raw_tool_call_markup(
+             </| | DSML | | tool_calls>",
             "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls>\n\
              <\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}invoke name=\"web_search\">\n\
              <\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter name=\"q\" string=\"true\">Austrian GP 2026 F1 schedule</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter>\n\
              <\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter name=\"region\" string=\"true\">ru-ru</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter>\n\
              </\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}invoke>\n\
-             </\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls>"
-        ));
+             </\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls>",
+        ];
+        let ordinary = [
+            "The provider leaked this text: <tool_call><invoke name=\"exec_command\"></invoke></tool_call>",
+            "Use XML tags like <tool_call> only in this documentation example.",
+            "<tool_call> is the literal string I found in the logs.",
+            "<arguments>{\"path\":\"/tmp/a.md\"}</arguments>",
+            "Example:<toolcall><invoke name=\"exec_command\"></invoke></toolcall>",
+            "How LLM tool calls work:\n<toolcall><invoke name=\"exec_command\"></invoke></toolcall>",
+            "Use DSML tags like < | | DSML | | tool_calls> only in documentation examples.",
+        ];
+        for (inputs, expected) in [(recognized.as_slice(), true), (ordinary.as_slice(), false)] {
+            for &input in inputs {
+                assert_eq!(
+                    looks_like_raw_tool_call_markup(input),
+                    expected,
+                    "input {input:?}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn raw_tool_call_markup_detector_ignores_explanatory_text() {
-        assert!(!looks_like_raw_tool_call_markup(
-            "The provider leaked this text: <tool_call><invoke name=\"exec_command\"></invoke></tool_call>"
-        ));
-        assert!(!looks_like_raw_tool_call_markup(
-            "Use XML tags like <tool_call> only in this documentation example."
-        ));
-        assert!(!looks_like_raw_tool_call_markup(
-            "<tool_call> is the literal string I found in the logs."
-        ));
-        assert!(!looks_like_raw_tool_call_markup(
-            "<arguments>{\"path\":\"/tmp/a.md\"}</arguments>"
-        ));
-        assert!(!looks_like_raw_tool_call_markup(
-            "Example:<toolcall><invoke name=\"exec_command\"></invoke></toolcall>"
-        ));
-        assert!(!looks_like_raw_tool_call_markup(
-            "How LLM tool calls work:\n<toolcall><invoke name=\"exec_command\"></invoke></toolcall>"
-        ));
-        assert!(!looks_like_raw_tool_call_markup(
-            "Use DSML tags like < | | DSML | | tool_calls> only in documentation examples."
-        ));
-    }
-
-    #[test]
-    fn tool_schema_dump_detector_matches_common_schema_shapes() {
-        assert!(looks_like_tool_schema_dump(
-            r#"{"name":"apply_patch","description":"Apply a patch","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"],"additionalProperties":false}}"#
-        ));
-        assert!(looks_like_tool_schema_dump(
-            r#"[{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}]"#
-        ));
-        assert!(looks_like_tool_schema_dump(
-            r#"{"tools":[{"type":"function","function":{"name":"apply_patch","description":"Apply a patch","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}]}"#
-        ));
-        assert!(looks_like_tool_schema_dump(
+    fn tool_schema_dump_recognition_preserves_definitions_and_regular_answers() {
+        let recognized = [
+            r#"{"name":"apply_patch","description":"Apply a patch","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"],"additionalProperties":false}}"#,
+            r#"[{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}]"#,
+            r#"{"tools":[{"type":"function","function":{"name":"apply_patch","description":"Apply a patch","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}]}"#,
             r#"```json
 {"name":"web_fetch","description":"Fetch a URL","input_schema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}
-```"#
-        ));
-    }
-
-    #[test]
-    fn tool_schema_dump_detector_ignores_regular_json_answers() {
-        assert!(!looks_like_tool_schema_dump(
-            r#"{"status":"ok","path":"/tmp/report.json","summary":"created"}"#
-        ));
-        assert!(!looks_like_tool_schema_dump(
-            r#"{"path":"/tmp/report.md","content":"hello"}"#
-        ));
-        assert!(!looks_like_tool_schema_dump(
-            r#"{"name":"report","description":"weather report","parameters":{"city":"Moscow"}}"#
-        ));
-        assert!(!looks_like_tool_schema_dump(
-            "Here is the JSON:\n{\"name\":\"apply_patch\",\"description\":\"Apply\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}"
-        ));
+```"#,
+        ];
+        let ordinary = [
+            r#"{"status":"ok","path":"/tmp/report.json","summary":"created"}"#,
+            r#"{"path":"/tmp/report.md","content":"hello"}"#,
+            r#"{"name":"report","description":"weather report","parameters":{"city":"Moscow"}}"#,
+            "Here is the JSON:\n{\"name\":\"apply_patch\",\"description\":\"Apply\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}",
+        ];
+        for (inputs, expected) in [(recognized.as_slice(), true), (ordinary.as_slice(), false)] {
+            for &input in inputs {
+                assert_eq!(
+                    looks_like_tool_schema_dump(input),
+                    expected,
+                    "input {input:?}"
+                );
+            }
+        }
     }
 }

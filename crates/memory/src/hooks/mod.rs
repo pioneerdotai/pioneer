@@ -40,8 +40,6 @@ use pioneer_hooks::{
     TurnPostTurnStatus, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
     TurnPrePromptContextHookInput,
 };
-#[cfg(test)]
-use pioneer_promt::MemoryRecallPromptItem;
 use pioneer_promt::{
     MemoryPostTurnExtractorPromptInput, MemoryRecallPromptContextBlock, MemoryRecallPromptInput,
     MemoryRecallPromptPolicy, render_memory_post_turn_extractor_prompt,

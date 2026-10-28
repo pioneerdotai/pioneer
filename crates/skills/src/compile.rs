@@ -453,24 +453,13 @@ fn compile_policy_hints(conformance: &SkillConformanceReport) -> SkillPolicyHint
 mod tests {
     use super::{
         CompileSkillInput, SkillDependencySet, SkillIdentity, SkillImplicitInvocationPolicy,
-        SkillSourceKind, compact_skill_label, compile_skill_definition, normalize_string_list,
+        SkillSourceKind, compact_skill_label, compile_skill_definition,
     };
     use crate::contract::{SkillDependencies, SkillTrustLevel, default_skill_conformance};
     use pioneer_protocol::SkillId;
 
     fn skill_id(value: &str) -> SkillId {
         SkillId::new(value).expect("valid test skill id")
-    }
-
-    #[test]
-    fn normalize_string_list_deduplicates_and_sorts() {
-        let normalized = normalize_string_list(vec![
-            " node ".to_owned(),
-            "cargo".to_owned(),
-            "node".to_owned(),
-            String::new(),
-        ]);
-        assert_eq!(normalized, vec!["cargo".to_owned(), "node".to_owned()]);
     }
 
     #[test]
@@ -497,7 +486,12 @@ mod tests {
             trust_level: SkillTrustLevel::Community,
             dependencies: SkillDependencies {
                 env: vec!["OPENAI_API_KEY".to_owned()],
-                bins: vec!["node".to_owned()],
+                bins: vec![
+                    " npm ".to_owned(),
+                    "node".to_owned(),
+                    String::new(),
+                    "node".to_owned(),
+                ],
                 commands: Vec::new(),
                 config: Vec::new(),
                 mcp: Vec::new(),

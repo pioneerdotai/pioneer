@@ -335,20 +335,26 @@ async fn effective_mime_actual_bytes_aliases_and_strict_policy_reach_admission()
     let mut config = super::default_attachment_pipeline_config();
     config.normalization.strict_mime_match = true;
     strict.pipeline_config = Some(config);
-    assert!(
-        scoped(
-            Arc::new(strict),
-            super::input_estimate::prepare(
-                "groq",
-                &caps,
-                request(
-                    "vision",
-                    vec![part(InputContentType::Image, "image/png", &jpeg)]
-                )
-            )
-        )
-        .await
-        .is_err()
+    let error = scoped(
+        Arc::new(strict),
+        super::input_estimate::prepare(
+            "groq",
+            &caps,
+            request(
+                "vision",
+                vec![part(InputContentType::Image, "image/png", &jpeg)],
+            ),
+        ),
+    )
+    .await
+    .err()
+    .expect("strict MIME mismatch must fail");
+    assert_eq!(
+        error
+            .downcast_ref::<super::errors::AttachmentPipelineError>()
+            .expect("strict admission must fail at the MIME guard")
+            .code(),
+        "MIME_MISMATCH"
     );
     for mime in ["audio/wav", " AUDIO/X-WAV "] {
         let s = Arc::new(state("openrouter", "media", json!({})));

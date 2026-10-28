@@ -374,33 +374,26 @@ mod tests {
     }
 
     #[test]
-    fn nested_path_allow_lists_intersect_to_the_narrower_component_scope() {
-        let mut left = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
-        left.allowed_paths_restricted = true;
-        left.allowed_paths = vec!["/workspace/src".to_owned()];
-        let mut right = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
-        right.allowed_paths_restricted = true;
-        right.allowed_paths = vec!["/workspace/src/./generated/../lib".to_owned()];
+    fn restricted_path_allow_lists_intersect_to_exact_scopes() {
+        for (right_path, expected_paths) in [
+            (
+                "/workspace/src/./generated/../lib",
+                vec!["/workspace/src/lib".to_owned()],
+            ),
+            ("/workspace/tests", vec![]),
+        ] {
+            let mut left = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
+            left.allowed_paths_restricted = true;
+            left.allowed_paths = vec!["/workspace/src".to_owned()];
+            let mut right = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
+            right.allowed_paths_restricted = true;
+            right.allowed_paths = vec![right_path.to_owned()];
 
-        let intersection = intersect_tool_permission_policies(&left, &right);
+            let intersection = intersect_tool_permission_policies(&left, &right);
 
-        assert!(intersection.allowed_paths_restricted);
-        assert_eq!(intersection.allowed_paths, vec!["/workspace/src/lib"]);
-    }
-
-    #[test]
-    fn disjoint_path_allow_lists_intersect_to_explicit_deny_all() {
-        let mut left = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
-        left.allowed_paths_restricted = true;
-        left.allowed_paths = vec!["/workspace/src".to_owned()];
-        let mut right = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
-        right.allowed_paths_restricted = true;
-        right.allowed_paths = vec!["/workspace/tests".to_owned()];
-
-        let intersection = intersect_tool_permission_policies(&left, &right);
-
-        assert!(intersection.allowed_paths_restricted);
-        assert!(intersection.allowed_paths.is_empty());
+            assert!(intersection.allowed_paths_restricted, "{right_path}");
+            assert_eq!(intersection.allowed_paths, expected_paths, "{right_path}");
+        }
     }
 
     #[test]

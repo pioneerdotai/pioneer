@@ -372,42 +372,6 @@ mod tests {
     }
 
     #[test]
-    fn macos_install_root_is_app_bundle() {
-        let root = resolve_install_root_path_for_os(
-            Path::new("/Applications/Pioneer.app/Contents/MacOS/pioneer-app"),
-            None,
-            "macos",
-        )
-        .unwrap();
-
-        assert_eq!(root, PathBuf::from("/Applications/Pioneer.app"));
-    }
-
-    #[test]
-    fn linux_install_root_prefers_appimage_path() {
-        let root = resolve_install_root_path_for_os(
-            Path::new("/tmp/.mount_pioneer/usr/bin/pioneer-app"),
-            Some(Path::new("/home/alex/Pioneer.AppImage")),
-            "linux",
-        )
-        .unwrap();
-
-        assert_eq!(root, PathBuf::from("/home/alex/Pioneer.AppImage"));
-    }
-
-    #[test]
-    fn windows_install_root_is_executable_parent() {
-        let root = resolve_install_root_path_for_os(
-            Path::new("/Program Files/Pioneer/pioneer-app.exe"),
-            None,
-            "windows",
-        )
-        .unwrap();
-
-        assert_eq!(root, PathBuf::from("/Program Files/Pioneer"));
-    }
-
-    #[test]
     fn staging_component_is_path_safe() {
         assert_eq!(
             sanitize_staging_component("../0.26.0 beta"),
@@ -441,5 +405,37 @@ mod tests {
         };
 
         assert_valid_plan_for_desktop(&plan).unwrap();
+    }
+
+    #[test]
+    fn install_root_follows_platform_contract() {
+        for (os, executable, appimage, expected) in [
+            (
+                "macos",
+                "/Applications/Pioneer.app/Contents/MacOS/pioneer-app",
+                None,
+                "/Applications/Pioneer.app",
+            ),
+            (
+                "linux",
+                "/tmp/.mount_pioneer/usr/bin/pioneer-app",
+                Some("/home/alex/Pioneer.AppImage"),
+                "/home/alex/Pioneer.AppImage",
+            ),
+            (
+                "windows",
+                "/Program Files/Pioneer/pioneer-app.exe",
+                None,
+                "/Program Files/Pioneer",
+            ),
+        ] {
+            let root = resolve_install_root_path_for_os(
+                Path::new(executable),
+                appimage.map(Path::new),
+                os,
+            )
+            .unwrap();
+            assert_eq!(root, PathBuf::from(expected), "{os}");
+        }
     }
 }

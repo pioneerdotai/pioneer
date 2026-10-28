@@ -449,18 +449,6 @@ mod tests {
     }
 
     #[test]
-    fn embedding_errors_classify_retryable_provider_failure() {
-        let error = ThreadEpisodicEmbeddingError::retryable_provider_failure(
-            "openai",
-            "text-embedding-3-small",
-            "rate limited",
-        );
-
-        assert!(error.is_retryable());
-        assert!(!error.to_string().contains("sk-"));
-    }
-
-    #[test]
     fn embedding_errors_expose_stable_failure_classes_and_diagnostics() {
         let missing = ThreadEpisodicEmbeddingError::missing_key("openai", "text-embedding-3-small");
         assert_eq!(

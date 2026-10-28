@@ -884,14 +884,76 @@ mod tests {
     }
 
     #[test]
-    fn demotes_expected_rmcp_streamable_http_initialize_response_failure() {
-        assert!(should_demote_rmcp_transport_worker_failure(
-            &tracing::Level::ERROR,
-            "rmcp::transport::worker",
-            Some(
-                "worker quit with fatal: unexpected server response: expect initialized, accepted, when process initialize response",
+    fn rmcp_transport_worker_failure_classification_preserves_matching_and_neighboring_events() {
+        for (case, level, target, message, expected) in [
+            (
+                "demotes_expected_rmcp_streamable_http_initialize_response_failure",
+                &tracing::Level::ERROR,
+                "rmcp::transport::worker",
+                Some(
+                    "worker quit with fatal: unexpected server response: expect initialized, accepted, when process initialize response",
+                ),
+                true,
             ),
-        ));
+            (
+                "demotes_expected_rmcp_streamable_http_auth_rejection",
+                &tracing::Level::ERROR,
+                "rmcp::transport::worker",
+                Some(
+                    "worker quit with fatal: Transport channel closed, when UnexpectedServerResponse(\"HTTP 403 Forbidden: forbidden: access denied\\n\")",
+                ),
+                true,
+            ),
+            (
+                "demotes_expected_rmcp_streamable_http_transport_connect_failure",
+                &tracing::Level::ERROR,
+                "rmcp::transport::worker",
+                Some(
+                    "worker quit with fatal: Transport channel closed, when Client(reqwest::Error { kind: Request, url: \"https://mcp.posthog.com/mcp\", source: hyper_util::client::legacy::Error(Connect, Error { code: -9806, message: \"connection closed via error\" }) })",
+                ),
+                true,
+            ),
+            (
+                "demotes_expected_rmcp_streamable_http_initialized_notification_send_failure",
+                &tracing::Level::ERROR,
+                "rmcp::transport::worker",
+                Some(
+                    "worker quit with fatal: Client error: error sending request for url (https://mcp.posthog.com/mcp), when send initialized notification",
+                ),
+                true,
+            ),
+            (
+                "keeps_rmcp_client_errors_from_other_stages_as_events",
+                &tracing::Level::ERROR,
+                "rmcp::transport::worker",
+                Some(
+                    "worker quit with fatal: Client error: error sending request for url (https://mcp.posthog.com/mcp), when call tools/list",
+                ),
+                false,
+            ),
+            (
+                "keeps_other_rmcp_worker_errors_as_events",
+                &tracing::Level::ERROR,
+                "rmcp::transport::worker",
+                Some("worker quit with fatal: transport channel closed"),
+                false,
+            ),
+            (
+                "keeps_same_message_from_other_targets_as_events",
+                &tracing::Level::ERROR,
+                "pioneer_gateway",
+                Some(
+                    "worker quit with fatal: unexpected server response: expect initialized, accepted, when process initialize response",
+                ),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                should_demote_rmcp_transport_worker_failure(level, target, message),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     const COMMON_STREAM_TARGET: &str = "rmcp::transport::streamable_http_client";
@@ -1030,333 +1092,305 @@ mod tests {
     }
 
     #[test]
-    fn demotes_expected_rmcp_streamable_http_auth_rejection() {
-        assert!(should_demote_rmcp_transport_worker_failure(
-            &tracing::Level::ERROR,
-            "rmcp::transport::worker",
-            Some(
-                "worker quit with fatal: Transport channel closed, when UnexpectedServerResponse(\"HTTP 403 Forbidden: forbidden: access denied\\n\")",
+    fn tantivy_reader_commit_reload_not_found_classification_preserves_matching_and_neighboring_events()
+     {
+        for (case, level, target, log_target, message, expected) in [
+            (
+                "demotes_tantivy_reader_commit_reload_lock_not_found_from_log_target",
+                &tracing::Level::ERROR,
+                "log",
+                Some("tantivy::reader"),
+                Some(
+                    "Error while loading searcher after commit was detected. LockFailure(IoError(Os { code: 2, kind: NotFound, message: \"No such file or directory\" }), None)",
+                ),
+                true,
             ),
-        ));
+            (
+                "demotes_tantivy_reader_commit_reload_meta_json_missing_from_log_target",
+                &tracing::Level::ERROR,
+                "log",
+                Some("tantivy::reader"),
+                Some(
+                    "Error while loading searcher after commit was detected. OpenReadError(FileDoesNotExist(\"meta.json\"))",
+                ),
+                true,
+            ),
+            (
+                "keeps_other_tantivy_reader_commit_reload_errors_as_events",
+                &tracing::Level::ERROR,
+                "log",
+                Some("tantivy::reader"),
+                Some(
+                    "Error while loading searcher after commit was detected. LockFailure(IoError(Os { code: 13, kind: PermissionDenied, message: \"Permission denied\" }), None)",
+                ),
+                false,
+            ),
+            (
+                "keeps_other_tantivy_reader_missing_files_as_events",
+                &tracing::Level::ERROR,
+                "log",
+                Some("tantivy::reader"),
+                Some(
+                    "Error while loading searcher after commit was detected. OpenReadError(FileDoesNotExist(\"segment_1.store\"))",
+                ),
+                false,
+            ),
+            (
+                "keeps_tantivy_lock_not_found_message_from_other_targets_as_events",
+                &tracing::Level::ERROR,
+                "pioneer_memory",
+                None,
+                Some(
+                    "Error while loading searcher after commit was detected. LockFailure(IoError(Os { code: 2, kind: NotFound, message: \"No such file or directory\" }), None)",
+                ),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                should_demote_tantivy_reader_commit_reload_not_found(
+                    level, target, log_target, message
+                ),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]
-    fn demotes_expected_rmcp_streamable_http_transport_connect_failure() {
-        assert!(should_demote_rmcp_transport_worker_failure(
-            &tracing::Level::ERROR,
-            "rmcp::transport::worker",
-            Some(
-                "worker quit with fatal: Transport channel closed, when Client(reqwest::Error { kind: Request, url: \"https://mcp.posthog.com/mcp\", source: hyper_util::client::legacy::Error(Connect, Error { code: -9806, message: \"connection closed via error\" }) })",
+    fn gpui_asset_cache_http_not_found_classification_preserves_matching_and_neighboring_events() {
+        for (case, level, target, log_target, message, expected) in [
+            (
+                "demotes_gpui_asset_cache_http_not_found_from_log_target",
+                &tracing::Level::ERROR,
+                "log",
+                Some("gpui::asset_cache"),
+                Some(
+                    "Failed to load asset: unexpected http status for https://icons.duckduckgo.com/ip3/api.github.com.ico: 404 Not Found, body: PNG",
+                ),
+                true,
             ),
-        ));
+            (
+                "demotes_gpui_asset_cache_generic_http_not_found",
+                &tracing::Level::ERROR,
+                "gpui::asset_cache",
+                None,
+                Some(
+                    "Failed to load asset: unexpected http status for https://example.com/missing.png: 404 Not Found, body: not found",
+                ),
+                true,
+            ),
+            (
+                "keeps_gpui_asset_cache_http_server_error_as_event",
+                &tracing::Level::ERROR,
+                "log",
+                Some("gpui::asset_cache"),
+                Some(
+                    "Failed to load asset: unexpected http status for https://example.com/favicon.ico: 500 Internal Server Error, body: error",
+                ),
+                false,
+            ),
+            (
+                "keeps_gpui_asset_cache_not_found_from_other_targets_as_event",
+                &tracing::Level::ERROR,
+                "pioneer_desktop",
+                None,
+                Some(
+                    "Failed to load asset: unexpected http status for https://example.com/favicon.ico: 404 Not Found, body: not found",
+                ),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                should_demote_gpui_asset_cache_http_not_found(level, target, log_target, message),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]
-    fn demotes_expected_rmcp_streamable_http_initialized_notification_send_failure() {
-        assert!(should_demote_rmcp_transport_worker_failure(
-            &tracing::Level::ERROR,
-            "rmcp::transport::worker",
-            Some(
-                "worker quit with fatal: Client error: error sending request for url (https://mcp.posthog.com/mcp), when send initialized notification",
+    fn gpui_closed_window_activation_event_classification_preserves_matching_and_neighboring_events()
+     {
+        for (case, level, target, log_target, log_file, log_line, message, expected) in [
+            (
+                "demotes_gpui_closed_window_activation_event_on_windows",
+                &tracing::Level::ERROR,
+                "log",
+                Some(""),
+                Some(
+                    r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-0.3.5\src\window.rs",
+                ),
+                Some(1899),
+                Some("window not found"),
+                true,
             ),
-        ));
+            (
+                "keeps_gpui_window_not_found_from_other_callbacks_as_event",
+                &tracing::Level::ERROR,
+                "log",
+                Some(""),
+                Some(
+                    r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-0.3.5\src\window.rs",
+                ),
+                Some(1900),
+                Some("window not found"),
+                false,
+            ),
+            (
+                "keeps_window_not_found_from_application_code_as_event",
+                &tracing::Level::ERROR,
+                "pioneer_desktop",
+                None,
+                Some("crates/desktop/src/window.rs"),
+                Some(1899),
+                Some("window not found"),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                should_demote_gpui_closed_window_activation_event(
+                    level, target, log_target, log_file, log_line, message
+                ),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]
-    fn keeps_rmcp_client_errors_from_other_stages_as_events() {
-        assert!(!should_demote_rmcp_transport_worker_failure(
-            &tracing::Level::ERROR,
-            "rmcp::transport::worker",
-            Some(
-                "worker quit with fatal: Client error: error sending request for url (https://mcp.posthog.com/mcp), when call tools/list",
+    fn gpui_closed_window_teardown_error_classification_preserves_matching_and_neighboring_events()
+    {
+        for (case, level, target, log_target, log_file, log_line, message, expected) in [
+            (
+                "demotes_gpui_closed_window_drag_drop_teardown_error",
+                &tracing::Level::ERROR,
+                "log",
+                Some("gpui_windows::window"),
+                Some(
+                    r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.5\src\window.rs",
+                ),
+                Some(618),
+                Some("Invalid window handle (0x80040102)"),
+                true,
             ),
-        ));
+            (
+                "demotes_gpui_closed_window_destroy_teardown_error",
+                &tracing::Level::ERROR,
+                "log",
+                Some("gpui_windows::window"),
+                Some(
+                    r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.5\src\window.rs",
+                ),
+                Some(619),
+                Some("Invalid window handle. (0x80070578)"),
+                true,
+            ),
+            (
+                "keeps_gpui_invalid_window_handle_from_other_calls_as_event",
+                &tracing::Level::ERROR,
+                "log",
+                Some("gpui_windows::window"),
+                Some(
+                    r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.5\src\window.rs",
+                ),
+                Some(620),
+                Some("Invalid window handle (0x80040102)"),
+                false,
+            ),
+            (
+                "keeps_gpui_invalid_window_handle_from_other_versions_as_event",
+                &tracing::Level::ERROR,
+                "log",
+                Some("gpui_windows::window"),
+                Some(
+                    r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.6\src\window.rs",
+                ),
+                Some(618),
+                Some("Invalid window handle (0x80040102)"),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                should_demote_gpui_closed_window_teardown_error(
+                    level, target, log_target, log_file, log_line, message
+                ),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]
-    fn keeps_other_rmcp_worker_errors_as_events() {
-        assert!(!should_demote_rmcp_transport_worker_failure(
-            &tracing::Level::ERROR,
-            "rmcp::transport::worker",
-            Some("worker quit with fatal: transport channel closed"),
-        ));
-    }
-
-    #[test]
-    fn keeps_same_message_from_other_targets_as_events() {
-        assert!(!should_demote_rmcp_transport_worker_failure(
-            &tracing::Level::ERROR,
-            "pioneer_gateway",
-            Some(
-                "worker quit with fatal: unexpected server response: expect initialized, accepted, when process initialize response",
+    fn rathole_client_control_channel_retry_classification_preserves_matching_and_neighboring_events()
+     {
+        for (case, level, target, log_target, message, expected) in [
+            (
+                "demotes_rathole_client_control_channel_network_retry",
+                &tracing::Level::ERROR,
+                "rathole::client",
+                None,
+                Some(
+                    "Failed to run the control channel: Failed to read cmd: Connection reset by peer (os error 54). Retry in 507.880488ms...",
+                ),
+                true,
             ),
-        ));
-    }
-
-    #[test]
-    fn demotes_tantivy_reader_commit_reload_lock_not_found_from_log_target() {
-        assert!(should_demote_tantivy_reader_commit_reload_not_found(
-            &tracing::Level::ERROR,
-            "log",
-            Some("tantivy::reader"),
-            Some(
-                "Error while loading searcher after commit was detected. LockFailure(IoError(Os { code: 2, kind: NotFound, message: \"No such file or directory\" }), None)",
+            (
+                "demotes_rathole_client_control_channel_network_retry",
+                &tracing::Level::ERROR,
+                "rathole::client",
+                None,
+                Some(
+                    "Failed to run the control channel: Failed to read cmd: early eof. Retry in 470.57167ms...",
+                ),
+                true,
             ),
-        ));
-    }
-
-    #[test]
-    fn demotes_tantivy_reader_commit_reload_meta_json_missing_from_log_target() {
-        assert!(should_demote_tantivy_reader_commit_reload_not_found(
-            &tracing::Level::ERROR,
-            "log",
-            Some("tantivy::reader"),
-            Some(
-                "Error while loading searcher after commit was detected. OpenReadError(FileDoesNotExist(\"meta.json\"))",
+            (
+                "demotes_rathole_client_control_channel_network_retry",
+                &tracing::Level::ERROR,
+                "rathole::client",
+                None,
+                Some(
+                    "Failed to run the control channel: Heartbeat timed out. Retry in 539.863684ms...",
+                ),
+                true,
             ),
-        ));
-    }
-
-    #[test]
-    fn keeps_other_tantivy_reader_commit_reload_errors_as_events() {
-        assert!(!should_demote_tantivy_reader_commit_reload_not_found(
-            &tracing::Level::ERROR,
-            "log",
-            Some("tantivy::reader"),
-            Some(
-                "Error while loading searcher after commit was detected. LockFailure(IoError(Os { code: 13, kind: PermissionDenied, message: \"Permission denied\" }), None)",
+            (
+                "keeps_rathole_client_control_channel_auth_failure_as_event",
+                &tracing::Level::ERROR,
+                "rathole::client",
+                None,
+                Some(
+                    "Failed to run the control channel: Authentication failed: pioneer_gateway: Incorrect token. Retry in 1s...",
+                ),
+                false,
             ),
-        ));
-    }
-
-    #[test]
-    fn keeps_other_tantivy_reader_missing_files_as_events() {
-        assert!(!should_demote_tantivy_reader_commit_reload_not_found(
-            &tracing::Level::ERROR,
-            "log",
-            Some("tantivy::reader"),
-            Some(
-                "Error while loading searcher after commit was detected. OpenReadError(FileDoesNotExist(\"segment_1.store\"))",
+            (
+                "keeps_single_typed_rathole_rejection_as_event",
+                &tracing::Level::ERROR,
+                "rathole::client",
+                None,
+                Some("Remote access control channel rejected"),
+                false,
             ),
-        ));
-    }
-
-    #[test]
-    fn keeps_tantivy_lock_not_found_message_from_other_targets_as_events() {
-        assert!(!should_demote_tantivy_reader_commit_reload_not_found(
-            &tracing::Level::ERROR,
-            "pioneer_memory",
-            None,
-            Some(
-                "Error while loading searcher after commit was detected. LockFailure(IoError(Os { code: 2, kind: NotFound, message: \"No such file or directory\" }), None)",
+            (
+                "keeps_rathole_client_control_channel_retry_from_other_targets_as_event",
+                &tracing::Level::ERROR,
+                "pioneer_gateway",
+                None,
+                Some(
+                    "Failed to run the control channel: Failed to read cmd: Connection reset by peer (os error 54). Retry in 507.880488ms...",
+                ),
+                false,
             ),
-        ));
-    }
-
-    #[test]
-    fn demotes_gpui_asset_cache_http_not_found_from_log_target() {
-        assert!(should_demote_gpui_asset_cache_http_not_found(
-            &tracing::Level::ERROR,
-            "log",
-            Some("gpui::asset_cache"),
-            Some(
-                "Failed to load asset: unexpected http status for https://icons.duckduckgo.com/ip3/api.github.com.ico: 404 Not Found, body: PNG",
-            ),
-        ));
-    }
-
-    #[test]
-    fn demotes_gpui_asset_cache_generic_http_not_found() {
-        assert!(should_demote_gpui_asset_cache_http_not_found(
-            &tracing::Level::ERROR,
-            "gpui::asset_cache",
-            None,
-            Some(
-                "Failed to load asset: unexpected http status for https://example.com/missing.png: 404 Not Found, body: not found",
-            ),
-        ));
-    }
-
-    #[test]
-    fn keeps_gpui_asset_cache_http_server_error_as_event() {
-        assert!(!should_demote_gpui_asset_cache_http_not_found(
-            &tracing::Level::ERROR,
-            "log",
-            Some("gpui::asset_cache"),
-            Some(
-                "Failed to load asset: unexpected http status for https://example.com/favicon.ico: 500 Internal Server Error, body: error",
-            ),
-        ));
-    }
-
-    #[test]
-    fn keeps_gpui_asset_cache_not_found_from_other_targets_as_event() {
-        assert!(!should_demote_gpui_asset_cache_http_not_found(
-            &tracing::Level::ERROR,
-            "pioneer_desktop",
-            None,
-            Some(
-                "Failed to load asset: unexpected http status for https://example.com/favicon.ico: 404 Not Found, body: not found",
-            ),
-        ));
-    }
-
-    #[test]
-    fn demotes_gpui_closed_window_activation_event_on_windows() {
-        assert!(should_demote_gpui_closed_window_activation_event(
-            &tracing::Level::ERROR,
-            "log",
-            Some(""),
-            Some(
-                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-0.3.5\src\window.rs",
-            ),
-            Some(1899),
-            Some("window not found"),
-        ));
-    }
-
-    #[test]
-    fn keeps_gpui_window_not_found_from_other_callbacks_as_event() {
-        assert!(!should_demote_gpui_closed_window_activation_event(
-            &tracing::Level::ERROR,
-            "log",
-            Some(""),
-            Some(
-                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-0.3.5\src\window.rs",
-            ),
-            Some(1900),
-            Some("window not found"),
-        ));
-    }
-
-    #[test]
-    fn keeps_window_not_found_from_application_code_as_event() {
-        assert!(!should_demote_gpui_closed_window_activation_event(
-            &tracing::Level::ERROR,
-            "pioneer_desktop",
-            None,
-            Some("crates/desktop/src/window.rs"),
-            Some(1899),
-            Some("window not found"),
-        ));
-    }
-
-    #[test]
-    fn demotes_gpui_closed_window_drag_drop_teardown_error() {
-        assert!(should_demote_gpui_closed_window_teardown_error(
-            &tracing::Level::ERROR,
-            "log",
-            Some("gpui_windows::window"),
-            Some(
-                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.5\src\window.rs",
-            ),
-            Some(618),
-            Some("Invalid window handle (0x80040102)"),
-        ));
-    }
-
-    #[test]
-    fn demotes_gpui_closed_window_destroy_teardown_error() {
-        assert!(should_demote_gpui_closed_window_teardown_error(
-            &tracing::Level::ERROR,
-            "log",
-            Some("gpui_windows::window"),
-            Some(
-                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.5\src\window.rs",
-            ),
-            Some(619),
-            Some("Invalid window handle. (0x80070578)"),
-        ));
-    }
-
-    #[test]
-    fn keeps_gpui_invalid_window_handle_from_other_calls_as_event() {
-        assert!(!should_demote_gpui_closed_window_teardown_error(
-            &tracing::Level::ERROR,
-            "log",
-            Some("gpui_windows::window"),
-            Some(
-                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.5\src\window.rs",
-            ),
-            Some(620),
-            Some("Invalid window handle (0x80040102)"),
-        ));
-    }
-
-    #[test]
-    fn keeps_gpui_invalid_window_handle_from_other_versions_as_event() {
-        assert!(!should_demote_gpui_closed_window_teardown_error(
-            &tracing::Level::ERROR,
-            "log",
-            Some("gpui_windows::window"),
-            Some(
-                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.6\src\window.rs",
-            ),
-            Some(618),
-            Some("Invalid window handle (0x80040102)"),
-        ));
-    }
-
-    #[test]
-    fn demotes_rathole_client_control_channel_network_retry() {
-        assert!(should_demote_rathole_client_control_channel_retry(
-            &tracing::Level::ERROR,
-            "rathole::client",
-            None,
-            Some(
-                "Failed to run the control channel: Failed to read cmd: Connection reset by peer (os error 54). Retry in 507.880488ms...",
-            ),
-        ));
-        assert!(should_demote_rathole_client_control_channel_retry(
-            &tracing::Level::ERROR,
-            "rathole::client",
-            None,
-            Some(
-                "Failed to run the control channel: Failed to read cmd: early eof. Retry in 470.57167ms...",
-            ),
-        ));
-        assert!(should_demote_rathole_client_control_channel_retry(
-            &tracing::Level::ERROR,
-            "rathole::client",
-            None,
-            Some(
-                "Failed to run the control channel: Heartbeat timed out. Retry in 539.863684ms...",
-            ),
-        ));
-    }
-
-    #[test]
-    fn keeps_rathole_client_control_channel_auth_failure_as_event() {
-        assert!(!should_demote_rathole_client_control_channel_retry(
-            &tracing::Level::ERROR,
-            "rathole::client",
-            None,
-            Some(
-                "Failed to run the control channel: Authentication failed: pioneer_gateway: Incorrect token. Retry in 1s...",
-            ),
-        ));
-    }
-
-    #[test]
-    fn keeps_single_typed_rathole_rejection_as_event() {
-        assert!(!should_demote_rathole_client_control_channel_retry(
-            &tracing::Level::ERROR,
-            "rathole::client",
-            None,
-            Some("Remote access control channel rejected"),
-        ));
-    }
-
-    #[test]
-    fn keeps_rathole_client_control_channel_retry_from_other_targets_as_event() {
-        assert!(!should_demote_rathole_client_control_channel_retry(
-            &tracing::Level::ERROR,
-            "pioneer_gateway",
-            None,
-            Some(
-                "Failed to run the control channel: Failed to read cmd: Connection reset by peer (os error 54). Retry in 507.880488ms...",
-            ),
-        ));
+        ] {
+            assert_eq!(
+                should_demote_rathole_client_control_channel_retry(
+                    level, target, log_target, message
+                ),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]

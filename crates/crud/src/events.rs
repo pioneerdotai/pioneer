@@ -242,15 +242,13 @@ pub struct AppendedTurnEvent {
 #[cfg(test)]
 mod tests {
     use pioneer_protocol::{
-        PersistedActorRef, PrincipalId, SandboxMode, Thread, ThreadMode, ThreadOriginKind,
+        PersistedActorRef, SandboxMode, Thread, ThreadMode, ThreadOriginKind,
         ThreadSidebarVisibility, ThreadStatus, Turn, TurnKind, TurnOrigin, TurnPermissionMode,
         TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus, UserInput,
     };
     use serde_json::json;
 
     use super::{CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload};
-
-    const PRINCIPAL_ID: &str = "P00000000000000000001";
 
     fn started_payload(actor: Option<PersistedActorRef>) -> CanonicalTurnStartedEventPayload {
         CanonicalTurnStartedEventPayload {
@@ -322,27 +320,6 @@ mod tests {
             panic!("expected turn_started event");
         };
         assert_eq!(decoded.actor, None);
-    }
-
-    #[test]
-    fn turn_started_actor_round_trips_through_the_canonical_event_envelope() {
-        for actor in [
-            PersistedActorRef::Principal(
-                PrincipalId::new(PRINCIPAL_ID).expect("valid principal id"),
-            ),
-            PersistedActorRef::System,
-        ] {
-            let canonical =
-                CanonicalTurnEventPayload::TurnStarted(started_payload(Some(actor.clone())));
-            let encoded = serde_json::to_value(&canonical).expect("event should serialize");
-            let decoded: CanonicalTurnEventPayload =
-                serde_json::from_value(encoded).expect("event should deserialize");
-
-            let CanonicalTurnEventPayload::TurnStarted(decoded) = decoded else {
-                panic!("expected turn_started event");
-            };
-            assert_eq!(decoded.actor, Some(actor));
-        }
     }
 
     #[test]

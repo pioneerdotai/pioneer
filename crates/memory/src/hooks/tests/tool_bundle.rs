@@ -128,12 +128,31 @@ async fn memory_tool_bundle_hook_applies_policy_visibility_matrix() {
             "policy {:?}",
             policy.reason_code
         );
+        let actual_tools = response
+            .contributions
+            .iter()
+            .flat_map(|contribution| match contribution {
+                HookContribution::ToolBundle(bundle) => {
+                    hook_tool_names_to_strings(&bundle.tool_names)
+                }
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            response_tool_names(&response),
-            expected_tools,
+            actual_tools, expected_tools,
             "policy {:?}",
             policy.reason_code
         );
+        if policy.explicit_forget {
+            assert!(
+                response.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.message.as_str().contains(MEMORY_REMEMBER_TOOL)
+                })
+            );
+        }
+        if policy.source == MemoryPolicySource::DefaultFallback {
+            assert!(response.diagnostics.is_empty());
+        }
     }
 }
 
@@ -267,111 +286,4 @@ async fn memory_tool_bundle_hook_materialization_error_is_safe_best_effort() {
             && diagnostic.safe_for_user
             && !diagnostic.message.as_str().contains("raw provider error")
     }));
-}
-
-#[test]
-fn memory_tool_filtering_applies_turn_policy() {
-    let materialization = MemoryToolMaterialization {
-        bundles: vec![pioneer_tools::ToolExtensionBundle {
-            specs: [
-                MEMORY_SEARCH_TOOL,
-                MEMORY_LIST_TOOL,
-                MEMORY_GET_TOOL,
-                MEMORY_REMEMBER_TOOL,
-                MEMORY_FORGET_TOOL,
-            ]
-            .into_iter()
-            .map(test_tool_spec)
-            .collect(),
-            handlers: [
-                MEMORY_SEARCH_TOOL,
-                MEMORY_LIST_TOOL,
-                MEMORY_GET_TOOL,
-                MEMORY_REMEMBER_TOOL,
-                MEMORY_FORGET_TOOL,
-            ]
-            .into_iter()
-            .map(|name| {
-                (
-                    name.to_owned(),
-                    Arc::new(TestToolHandler) as Arc<dyn pioneer_tools::ToolHandler>,
-                )
-            })
-            .collect(),
-        }],
-        diagnostics: Vec::new(),
-    };
-
-    let filtered = filter_memory_tool_materialization(
-        materialization,
-        &MemoryTurnPolicy::explicit_forget(None),
-    );
-    assert_eq!(
-        memory_tool_names(&filtered),
-        vec![
-            MEMORY_SEARCH_TOOL,
-            MEMORY_LIST_TOOL,
-            MEMORY_GET_TOOL,
-            MEMORY_FORGET_TOOL,
-        ]
-    );
-    assert!(
-        filtered
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.contains(MEMORY_REMEMBER_TOOL))
-    );
-}
-
-#[test]
-fn permissive_classifier_fallback_filter_keeps_all_explicit_memory_tools() {
-    let materialization = MemoryToolMaterialization {
-        bundles: vec![pioneer_tools::ToolExtensionBundle {
-            specs: [
-                MEMORY_SEARCH_TOOL,
-                MEMORY_LIST_TOOL,
-                MEMORY_GET_TOOL,
-                MEMORY_REMEMBER_TOOL,
-                MEMORY_FORGET_TOOL,
-            ]
-            .into_iter()
-            .map(test_tool_spec)
-            .collect(),
-            handlers: [
-                MEMORY_SEARCH_TOOL,
-                MEMORY_LIST_TOOL,
-                MEMORY_GET_TOOL,
-                MEMORY_REMEMBER_TOOL,
-                MEMORY_FORGET_TOOL,
-            ]
-            .into_iter()
-            .map(|name| {
-                (
-                    name.to_owned(),
-                    Arc::new(TestToolHandler) as Arc<dyn pioneer_tools::ToolHandler>,
-                )
-            })
-            .collect(),
-        }],
-        diagnostics: Vec::new(),
-    };
-
-    let policy = MemoryTurnPolicy::permissive_classifier_fallback(
-        MemoryPolicyReasonCode::ClassifierUnavailable,
-    );
-    assert_eq!(policy.post_turn_extraction, MemoryExtractionPolicy::Allow);
-
-    let filtered = filter_memory_tool_materialization(materialization, &policy);
-
-    assert_eq!(
-        memory_tool_names(&filtered),
-        vec![
-            MEMORY_SEARCH_TOOL,
-            MEMORY_LIST_TOOL,
-            MEMORY_GET_TOOL,
-            MEMORY_REMEMBER_TOOL,
-            MEMORY_FORGET_TOOL,
-        ]
-    );
-    assert!(filtered.diagnostics.is_empty());
 }

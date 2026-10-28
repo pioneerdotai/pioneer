@@ -284,14 +284,6 @@ fn release_matches_channel(release: &GithubRelease, channel: DesktopReleaseChann
     }
 }
 
-#[cfg(test)]
-pub(crate) fn release_by_tag_api_url(config: &DesktopUpdateConfig, tag: &str) -> String {
-    format!(
-        "{}/tags/{tag}",
-        config.release_api_base.trim_end_matches('/')
-    )
-}
-
 pub(crate) fn release_manifest_download_url(config: &DesktopUpdateConfig, tag: &str) -> String {
     release_asset_download_url(config, tag, DESKTOP_UPDATE_MANIFEST_FILE)
 }
@@ -312,36 +304,11 @@ pub(crate) fn release_list_url(api_base: &str) -> String {
 }
 
 #[cfg(test)]
-fn select_channel_tag<'a>(
-    channel: DesktopReleaseChannel,
-    tags: impl IntoIterator<Item = &'a str>,
-) -> Result<String, DesktopReleaseError> {
-    let Some(suffix) = channel.tag_suffix() else {
-        return Err(DesktopReleaseError::new(
-            DesktopReleaseErrorCode::UnsupportedChannel,
-            "stable release channel must use latest release metadata",
-        ));
-    };
-
-    tags.into_iter()
-        .map(str::trim)
-        .find(|tag| !tag.is_empty() && tag.contains(suffix))
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            DesktopReleaseError::new(
-                DesktopReleaseErrorCode::ChannelTagNotFound,
-                format!("failed to find desktop release tag for channel `{suffix}`"),
-            )
-        })
-}
-
-#[cfg(test)]
 mod tests {
     use super::{
         DESKTOP_UPDATE_MANIFEST_FILE, DesktopReleaseChannel, DesktopReleaseErrorCode,
-        GithubRelease, GithubReleaseAsset, release_asset_download_url, release_by_tag_api_url,
-        release_list_url, release_manifest_download_url, release_may_have_manifest_asset,
-        select_channel_release_tag, select_channel_tag,
+        GithubRelease, GithubReleaseAsset, release_asset_download_url, release_list_url,
+        release_manifest_download_url, release_may_have_manifest_asset, select_channel_release_tag,
     };
     use crate::updater::state::DesktopUpdateConfig;
 
@@ -361,10 +328,6 @@ mod tests {
             "http://localhost:1111/releases?per_page=100"
         );
         assert_eq!(
-            release_by_tag_api_url(&config, "v1.2.3"),
-            "http://localhost:1111/releases/tags/v1.2.3"
-        );
-        assert_eq!(
             release_manifest_download_url(&config, "v1.2.3"),
             "http://localhost:2222/download/v1.2.3/desktop-update-manifest.json"
         );
@@ -372,137 +335,6 @@ mod tests {
             release_asset_download_url(&config, "v1.2.3", "Pioneer-aarch64.app.zip"),
             "http://localhost:2222/download/v1.2.3/Pioneer-aarch64.app.zip"
         );
-    }
-
-    #[test]
-    fn selects_first_beta_tag_from_release_list_order() {
-        let tags = [
-            "v1.0.0",
-            "v1.1.0-canary.1",
-            "v1.1.0-beta.2",
-            "v1.0.1-beta.1",
-        ];
-
-        let selected = select_channel_tag(DesktopReleaseChannel::Beta, tags).unwrap();
-
-        assert_eq!(selected, "v1.1.0-beta.2");
-    }
-
-    #[test]
-    fn selects_first_canary_tag_from_release_list_order() {
-        let tags = ["v1.0.0", " v1.2.0-canary.3 ", "v1.1.0-canary.1"];
-
-        let selected = select_channel_tag(DesktopReleaseChannel::Canary, tags).unwrap();
-
-        assert_eq!(selected, "v1.2.0-canary.3");
-    }
-
-    #[test]
-    fn returns_typed_error_when_channel_tag_is_missing() {
-        let error = select_channel_tag(DesktopReleaseChannel::Beta, ["v1.0.0", "v1.1.0-canary.1"])
-            .unwrap_err();
-
-        assert_eq!(error.code(), DesktopReleaseErrorCode::ChannelTagNotFound);
-    }
-
-    #[test]
-    fn release_without_assets_field_is_allowed_for_local_fixtures() {
-        let release = release("v1.2.3", None);
-
-        assert!(release_may_have_manifest_asset(&release));
-        assert_eq!(
-            select_channel_release_tag(DesktopReleaseChannel::Stable, [&release]).unwrap(),
-            "v1.2.3"
-        );
-    }
-
-    #[test]
-    fn release_with_assets_requires_manifest_asset() {
-        let release = release("v1.2.3", Some(vec!["Pioneer-aarch64.app.zip"]));
-
-        let error =
-            select_channel_release_tag(DesktopReleaseChannel::Stable, [&release]).unwrap_err();
-
-        assert_eq!(error.code(), DesktopReleaseErrorCode::ManifestNotPublished);
-    }
-
-    #[test]
-    fn release_with_manifest_asset_is_ready() {
-        let release = release(
-            "v1.2.3",
-            Some(vec![
-                "Pioneer-aarch64.app.zip",
-                DESKTOP_UPDATE_MANIFEST_FILE,
-            ]),
-        );
-
-        assert!(release_may_have_manifest_asset(&release));
-    }
-
-    #[test]
-    fn channel_release_without_manifest_is_retryable() {
-        let releases = vec![release(
-            "v1.2.3-beta.1",
-            Some(vec!["Pioneer-aarch64.app.zip"]),
-        )];
-
-        let error =
-            select_channel_release_tag(DesktopReleaseChannel::Beta, releases.iter()).unwrap_err();
-
-        assert_eq!(error.code(), DesktopReleaseErrorCode::ManifestNotPublished);
-    }
-
-    #[test]
-    fn channel_release_selects_first_ready_channel_release() {
-        let releases = vec![
-            release("v1.2.3-beta.2", Some(vec!["Pioneer-aarch64.app.zip"])),
-            release(
-                "v1.2.3-beta.1",
-                Some(vec![
-                    "Pioneer-aarch64.app.zip",
-                    DESKTOP_UPDATE_MANIFEST_FILE,
-                ]),
-            ),
-        ];
-
-        let selected =
-            select_channel_release_tag(DesktopReleaseChannel::Beta, releases.iter()).unwrap();
-
-        assert_eq!(selected, "v1.2.3-beta.1");
-    }
-
-    #[test]
-    fn stable_release_selects_previous_release_while_latest_manifest_is_missing() {
-        let releases = vec![
-            release("v1.2.3", Some(vec!["Pioneer-aarch64.app.zip"])),
-            release(
-                "v1.2.2",
-                Some(vec![
-                    "Pioneer-aarch64.app.zip",
-                    DESKTOP_UPDATE_MANIFEST_FILE,
-                ]),
-            ),
-        ];
-
-        let selected =
-            select_channel_release_tag(DesktopReleaseChannel::Stable, releases.iter()).unwrap();
-
-        assert_eq!(selected, "v1.2.2");
-    }
-
-    #[test]
-    fn stable_release_ignores_ready_prerelease() {
-        let mut prerelease = release("v1.3.0-beta.1", Some(vec![DESKTOP_UPDATE_MANIFEST_FILE]));
-        prerelease.prerelease = true;
-        let releases = vec![
-            prerelease,
-            release("v1.2.2", Some(vec![DESKTOP_UPDATE_MANIFEST_FILE])),
-        ];
-
-        let selected =
-            select_channel_release_tag(DesktopReleaseChannel::Stable, releases.iter()).unwrap();
-
-        assert_eq!(selected, "v1.2.2");
     }
 
     fn release(tag_name: &str, assets: Option<Vec<&str>>) -> GithubRelease {
@@ -518,6 +350,137 @@ mod tests {
                     })
                     .collect()
             }),
+        }
+    }
+
+    #[test]
+    fn channel_release_selection_preserves_readiness_order_and_stable_filtering() {
+        for (case, channel, releases, expected) in [
+            (
+                "selects_first_canary_tag_from_release_list_order",
+                DesktopReleaseChannel::Canary,
+                {
+                    let tags = ["v1.0.0", " v1.2.0-canary.3 ", "v1.1.0-canary.1"];
+
+                    let releases = tags
+                        .into_iter()
+                        .map(|tag| release(tag, None))
+                        .collect::<Vec<_>>();
+                    releases
+                },
+                "v1.2.0-canary.3",
+            ),
+            (
+                "channel_release_selects_first_ready_channel_release",
+                DesktopReleaseChannel::Beta,
+                {
+                    let releases = vec![
+                        release("v1.2.3-beta.2", Some(vec!["Pioneer-aarch64.app.zip"])),
+                        release(
+                            "v1.2.3-beta.1",
+                            Some(vec![
+                                "Pioneer-aarch64.app.zip",
+                                DESKTOP_UPDATE_MANIFEST_FILE,
+                            ]),
+                        ),
+                    ];
+                    releases
+                },
+                "v1.2.3-beta.1",
+            ),
+            (
+                "stable_release_selects_previous_release_while_latest_manifest_is_missing",
+                DesktopReleaseChannel::Stable,
+                {
+                    let releases = vec![
+                        release("v1.2.3", Some(vec!["Pioneer-aarch64.app.zip"])),
+                        release(
+                            "v1.2.2",
+                            Some(vec![
+                                "Pioneer-aarch64.app.zip",
+                                DESKTOP_UPDATE_MANIFEST_FILE,
+                            ]),
+                        ),
+                    ];
+                    releases
+                },
+                "v1.2.2",
+            ),
+            (
+                "stable_release_ignores_ready_prerelease",
+                DesktopReleaseChannel::Stable,
+                {
+                    let mut prerelease =
+                        release("v1.3.0-beta.1", Some(vec![DESKTOP_UPDATE_MANIFEST_FILE]));
+                    prerelease.prerelease = true;
+                    let releases = vec![
+                        prerelease,
+                        release("v1.2.2", Some(vec![DESKTOP_UPDATE_MANIFEST_FILE])),
+                    ];
+                    releases
+                },
+                "v1.2.2",
+            ),
+        ] {
+            let selected = select_channel_release_tag(channel, releases.iter()).expect(case);
+            assert_eq!(selected, expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn channel_release_failures_keep_their_exact_error_class() {
+        for (case, channel, releases, expected) in [
+            (
+                "returns_typed_error_when_channel_tag_is_missing",
+                DesktopReleaseChannel::Beta,
+                {
+                    let releases = ["v1.0.0", "v1.1.0-canary.1"].map(|tag| release(tag, None));
+                    releases.into_iter().collect::<Vec<_>>()
+                },
+                DesktopReleaseErrorCode::ChannelTagNotFound,
+            ),
+            (
+                "release_with_assets_requires_manifest_asset",
+                DesktopReleaseChannel::Stable,
+                {
+                    let release = release("v1.2.3", Some(vec!["Pioneer-aarch64.app.zip"]));
+                    vec![release]
+                },
+                DesktopReleaseErrorCode::ManifestNotPublished,
+            ),
+            (
+                "channel_release_without_manifest_is_retryable",
+                DesktopReleaseChannel::Beta,
+                {
+                    let releases = vec![release(
+                        "v1.2.3-beta.1",
+                        Some(vec!["Pioneer-aarch64.app.zip"]),
+                    )];
+                    releases.into_iter().collect::<Vec<_>>()
+                },
+                DesktopReleaseErrorCode::ManifestNotPublished,
+            ),
+        ] {
+            let error = select_channel_release_tag(channel, releases.iter()).expect_err(case);
+            assert_eq!(error.code(), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn manifest_asset_readiness_keeps_absent_and_present_assets_compatible() {
+        for assets in [
+            None,
+            Some(vec![
+                "Pioneer-aarch64.app.zip",
+                DESKTOP_UPDATE_MANIFEST_FILE,
+            ]),
+        ] {
+            let release = release("v1.2.3", assets);
+            assert!(release_may_have_manifest_asset(&release));
+            assert_eq!(
+                select_channel_release_tag(DesktopReleaseChannel::Stable, [&release]).unwrap(),
+                "v1.2.3"
+            );
         }
     }
 }

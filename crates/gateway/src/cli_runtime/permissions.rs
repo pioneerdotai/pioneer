@@ -215,162 +215,6 @@ mod tests {
     }
 
     #[test]
-    fn restricted_profile_maps_to_provider_policy() {
-        let result = adapt_cli_runtime_permissions_for_turn(
-            CLIAgentRuntimeKind::Codex,
-            Some(&selection(TurnPermissionMode::Supervised)),
-            Some(TurnCLIRuntimeOptions {
-                sandbox: None,
-                effort: None,
-                personality: None,
-                summary: None,
-                steer_if_active: None,
-            }),
-        );
-
-        assert_eq!(result.output.approval_policy, "on-request");
-        assert_eq!(result.options.sandbox, None);
-    }
-
-    #[test]
-    fn codex_security_supervised_profile_does_not_emit_pre_snapshot_sandbox() {
-        let result = adapt_cli_runtime_permissions_for_turn(
-            CLIAgentRuntimeKind::Codex,
-            Some(&selection(TurnPermissionMode::Supervised)),
-            None,
-        );
-
-        assert_eq!(result.output.approval_policy, "on-request");
-        assert_eq!(result.options.sandbox, None);
-    }
-
-    #[test]
-    fn codex_profiles_map_to_supported_approval_policies() {
-        let cases = [
-            (
-                TurnPermissionMode::FullAccess,
-                "never",
-                CLIRuntimePermissionMappingQuality::Exact,
-            ),
-            (
-                TurnPermissionMode::AutoAcceptEdits,
-                "on-request",
-                CLIRuntimePermissionMappingQuality::StricterFallback,
-            ),
-            (
-                TurnPermissionMode::Supervised,
-                "on-request",
-                CLIRuntimePermissionMappingQuality::Exact,
-            ),
-        ];
-
-        for (mode, expected_policy, expected_quality) in cases {
-            let result = adapt_cli_runtime_permissions_for_turn(
-                CLIAgentRuntimeKind::Codex,
-                Some(&selection(mode)),
-                None,
-            );
-
-            assert_eq!(result.output.approval_policy, expected_policy);
-            assert_eq!(result.output.mapping_quality, expected_quality);
-        }
-    }
-
-    #[test]
-    fn profile_mapping_preserves_non_permission_runtime_options() {
-        let result = adapt_cli_runtime_permissions_for_turn(
-            CLIAgentRuntimeKind::Claude,
-            Some(&selection(TurnPermissionMode::AutoAcceptEdits)),
-            Some(TurnCLIRuntimeOptions {
-                sandbox: None,
-                effort: None,
-                personality: Some("concise".to_owned()),
-                summary: None,
-                steer_if_active: None,
-            }),
-        );
-
-        assert_eq!(result.output.approval_policy, "acceptEdits");
-        assert_eq!(
-            result.output.mapping_quality,
-            CLIRuntimePermissionMappingQuality::Exact
-        );
-        assert_eq!(result.options.personality.as_deref(), Some("concise"));
-    }
-
-    #[test]
-    fn claude_profiles_map_to_supported_permission_modes() {
-        let cases = [
-            (
-                TurnPermissionMode::FullAccess,
-                "bypassPermissions",
-                CLIRuntimePermissionMappingQuality::Exact,
-            ),
-            (
-                TurnPermissionMode::AutoAcceptEdits,
-                "acceptEdits",
-                CLIRuntimePermissionMappingQuality::Exact,
-            ),
-            (
-                TurnPermissionMode::Supervised,
-                "default",
-                CLIRuntimePermissionMappingQuality::Exact,
-            ),
-        ];
-
-        for (mode, expected_policy, expected_quality) in cases {
-            let result = adapt_cli_runtime_permissions_for_turn(
-                CLIAgentRuntimeKind::Claude,
-                Some(&selection(mode)),
-                None,
-            );
-
-            assert_eq!(result.output.approval_policy, expected_policy);
-            assert_eq!(result.output.mapping_quality, expected_quality);
-        }
-    }
-
-    #[test]
-    fn opencode_profiles_map_exactly_to_server_permission_rules() {
-        let cases = [
-            (TurnPermissionMode::FullAccess, "allow"),
-            (TurnPermissionMode::AutoAcceptEdits, "auto_accept_edits"),
-            (TurnPermissionMode::Supervised, "ask"),
-        ];
-
-        for (mode, expected_policy) in cases {
-            let result = adapt_cli_runtime_permissions_for_turn(
-                CLIAgentRuntimeKind::OpenCode,
-                Some(&selection(mode)),
-                None,
-            );
-
-            assert_eq!(result.output.approval_policy, expected_policy);
-            assert_eq!(
-                result.output.mapping_quality,
-                CLIRuntimePermissionMappingQuality::Exact
-            );
-            assert_eq!(result.options.sandbox, None);
-        }
-    }
-
-    #[test]
-    fn claude_cli_runtime_full_access_permission_mapping_uses_bypass_permissions() {
-        let result = adapt_cli_runtime_permissions_for_turn(
-            CLIAgentRuntimeKind::Claude,
-            Some(&selection(TurnPermissionMode::FullAccess)),
-            None,
-        );
-
-        assert_eq!(result.output.approval_policy, "bypassPermissions");
-        assert_eq!(
-            result.output.mapping_quality,
-            CLIRuntimePermissionMappingQuality::Exact
-        );
-        assert_eq!(result.options.sandbox, None);
-    }
-
-    #[test]
     fn adapter_preserves_non_permission_cli_options() {
         let result = adapt_cli_runtime_permissions_for_turn(
             CLIAgentRuntimeKind::Codex,
@@ -446,5 +290,29 @@ mod tests {
             codex_permissions_profile_for_security_snapshot(&snapshot),
             ":workspace"
         );
+    }
+
+    #[test]
+    fn runtime_permission_profiles_preserve_provider_policy_and_mapping_quality() {
+        use CLIAgentRuntimeKind::{Claude, Codex, OpenCode};
+        use CLIRuntimePermissionMappingQuality::{Exact, StricterFallback};
+        use TurnPermissionMode::{AutoAcceptEdits, FullAccess, Supervised};
+        for (runtime, mode, expected_policy, expected_quality) in [
+            (Codex, FullAccess, "never", Exact),
+            (Codex, AutoAcceptEdits, "on-request", StricterFallback),
+            (Codex, Supervised, "on-request", Exact),
+            (Claude, FullAccess, "bypassPermissions", Exact),
+            (Claude, AutoAcceptEdits, "acceptEdits", Exact),
+            (Claude, Supervised, "default", Exact),
+            (OpenCode, FullAccess, "allow", Exact),
+            (OpenCode, AutoAcceptEdits, "auto_accept_edits", Exact),
+            (OpenCode, Supervised, "ask", Exact),
+        ] {
+            let result =
+                adapt_cli_runtime_permissions_for_turn(runtime, Some(&selection(mode)), None);
+            assert_eq!(result.output.approval_policy, expected_policy);
+            assert_eq!(result.output.mapping_quality, expected_quality);
+            assert_eq!(result.options.sandbox, None);
+        }
     }
 }

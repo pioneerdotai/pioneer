@@ -811,67 +811,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_mcp_servers() {
-        let error = parse_install_config("{}", context()).unwrap_err();
-        assert_eq!(error.diagnostic.code, "missing_mcp_servers");
-    }
-
-    #[test]
-    fn rejects_invalid_json_document() {
-        let error = parse_install_config("{", context()).unwrap_err();
-        assert_eq!(error.diagnostic.code, "invalid_json");
-    }
-
-    #[test]
-    fn rejects_ambiguous_transport() {
-        let input = r#"{"mcpServers":{"resend":{"command":"npx","url":"http://x.test"}}}"#;
-        let plan = parse_install_config(input, context()).unwrap();
-        assert_eq!(plan.items[0].diagnostics[0].code, "ambiguous_transport");
-    }
-
-    #[test]
-    fn rejects_missing_transport() {
-        let input = r#"{"mcpServers":{"resend":{}}}"#;
-        let plan = parse_install_config(input, context()).unwrap();
-        assert_eq!(plan.items[0].diagnostics[0].code, "missing_transport");
-    }
-
-    #[test]
-    fn rejects_invalid_command() {
-        let input = r#"{"mcpServers":{"resend":{"command":""}}}"#;
-        let plan = parse_install_config(input, context()).unwrap();
-        assert_eq!(plan.items[0].diagnostics[0].code, "invalid_command");
-    }
-
-    #[test]
-    fn rejects_invalid_shapes() {
-        let input = r#"{
-          "mcpServers": {
-            "resend": {
-              "command": "npx",
-              "args": "bad",
-              "env": []
-            }
-          }
-        }"#;
-        let plan = parse_install_config(input, context()).unwrap();
-        let codes = plan.items[0]
-            .diagnostics
-            .iter()
-            .map(|item| item.code.as_str())
-            .collect::<Vec<_>>();
-        assert!(codes.contains(&"invalid_args"));
-        assert!(codes.contains(&"invalid_env"));
-    }
-
-    #[test]
-    fn rejects_invalid_url() {
-        let input = r#"{"mcpServers":{"resend":{"url":"ftp://example.com/mcp"}}}"#;
-        let plan = parse_install_config(input, context()).unwrap();
-        assert_eq!(plan.items[0].diagnostics[0].code, "invalid_url");
-    }
-
-    #[test]
     fn rejects_every_credential_bearing_url_component() {
         for url in [
             "https://user:password@example.com/mcp",
@@ -889,35 +828,6 @@ mod tests {
             );
             assert!(plan.items[0].installation.is_none());
         }
-    }
-
-    #[test]
-    fn rejects_invalid_headers_shape() {
-        let input = r#"{"mcpServers":{"resend":{"url":"https://example.com/mcp","headers":[]}}}"#;
-        let plan = parse_install_config(input, context()).unwrap();
-        assert_eq!(plan.items[0].diagnostics[0].code, "invalid_headers");
-    }
-
-    #[test]
-    fn rejects_enabled_disabled_conflict_and_invalid_timeout() {
-        let input = r#"{
-          "mcpServers": {
-            "resend": {
-              "command": "npx",
-              "enabled": true,
-              "disabled": false,
-              "timeout": "slow"
-            }
-          }
-        }"#;
-        let plan = parse_install_config(input, context()).unwrap();
-        let codes = plan.items[0]
-            .diagnostics
-            .iter()
-            .map(|item| item.code.as_str())
-            .collect::<Vec<_>>();
-        assert!(codes.contains(&"invalid_enabled_state"));
-        assert!(codes.contains(&"invalid_timeout"));
     }
 
     #[test]
@@ -1058,5 +968,86 @@ mod tests {
                 .unwrap(),
             &McpUnavailableReason::NotStarted
         );
+    }
+
+    #[test]
+    fn document_errors_report_literal_codes() {
+        for (input, expected_code) in [("{}", "missing_mcp_servers"), ("{", "invalid_json")] {
+            let error = parse_install_config(input, context()).unwrap_err();
+            assert_eq!(error.diagnostic.code, expected_code, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn invalid_server_inputs_report_first_diagnostic() {
+        for (input, expected_code) in [
+            (
+                r#"{"mcpServers":{"resend":{"command":"npx","url":"http://x.test"}}}"#,
+                "ambiguous_transport",
+            ),
+            (r#"{"mcpServers":{"resend":{}}}"#, "missing_transport"),
+            (
+                r#"{"mcpServers":{"resend":{"command":""}}}"#,
+                "invalid_command",
+            ),
+            (
+                r#"{"mcpServers":{"resend":{"url":"ftp://example.com/mcp"}}}"#,
+                "invalid_url",
+            ),
+            (
+                r#"{"mcpServers":{"resend":{"url":"https://example.com/mcp","headers":[]}}}"#,
+                "invalid_headers",
+            ),
+        ] {
+            let plan = parse_install_config(input, context()).unwrap();
+            assert_eq!(
+                plan.items[0].diagnostics[0].code, expected_code,
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_server_fields_accumulate_required_diagnostics() {
+        for (input, expected_codes) in [
+            (
+                r#"{
+          "mcpServers": {
+            "resend": {
+              "command": "npx",
+              "args": "bad",
+              "env": []
+            }
+          }
+        }"#,
+                ["invalid_args", "invalid_env"],
+            ),
+            (
+                r#"{
+          "mcpServers": {
+            "resend": {
+              "command": "npx",
+              "enabled": true,
+              "disabled": false,
+              "timeout": "slow"
+            }
+          }
+        }"#,
+                ["invalid_enabled_state", "invalid_timeout"],
+            ),
+        ] {
+            let plan = parse_install_config(input, context()).unwrap();
+            let codes = plan.items[0]
+                .diagnostics
+                .iter()
+                .map(|item| item.code.as_str())
+                .collect::<Vec<_>>();
+            for expected_code in expected_codes {
+                assert!(
+                    codes.contains(&expected_code),
+                    "missing {expected_code} for {input}"
+                );
+            }
+        }
     }
 }

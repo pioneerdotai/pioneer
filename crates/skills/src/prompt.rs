@@ -472,44 +472,9 @@ mod tests {
         );
         assert!(built.text.contains("Skill asset root: `/tmp/weather`"));
         assert!(!built.text.contains("/tmp/weather/SKILL.md"));
-    }
-
-    #[test]
-    fn skill_prompt_policy_footer_mentions_current_turn_permissions() {
-        let active = vec![resolved("weather", "Get weather forecasts.")];
-
-        let built = build_skill_prompt(
-            active.as_slice(),
-            SkillPromptBudget {
-                max_chars: 2_000,
-                compact_mode_threshold: 6,
-                include_read_skill_hint: true,
-            },
-        );
-
         assert!(built.text.contains(
             "Skill runtime tools remain subject to the current turn permissions and sandbox"
         ));
-    }
-
-    #[test]
-    fn explicit_capability_stays_compact_without_full_body() {
-        let active = vec![resolved("weather", "Get weather forecasts.")];
-
-        let built = build_skill_prompt(
-            active.as_slice(),
-            SkillPromptBudget {
-                max_chars: 2_000,
-                compact_mode_threshold: 6,
-                include_read_skill_hint: true,
-            },
-        );
-
-        assert!(
-            built
-                .text
-                .contains(&format!("skill:{}", active[0].skill_id))
-        );
         assert!(!built.text.contains("[Skill Body:"));
         assert!(!built.text.contains("\nbody\n"));
     }

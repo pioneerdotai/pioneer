@@ -750,214 +750,6 @@ mod tests {
     }
 
     #[test]
-    fn maps_user_identity_to_durable_user_memory() {
-        let semantic = semantic(
-            MemoryCategory::Identity,
-            MemorySubject::CurrentUser,
-            MemoryAttribute::Name,
-            MemoryScopeHint::UserGlobal,
-            MemoryDurability::LongLived,
-        );
-
-        let classification = classify_semantic_memory_fact(&semantic, None);
-
-        assert_eq!(classification.fact_class, MemoryFactClass::UserIdentity);
-        assert_eq!(
-            classification.lifetime_class,
-            MemoryLifetimeClass::LongLived
-        );
-        assert_eq!(
-            classification.proposed_ownership_class,
-            MemoryOwnershipClass::DurableUserMemory
-        );
-    }
-
-    #[test]
-    fn maps_communication_preference_structurally() {
-        let semantic = semantic(
-            MemoryCategory::Preference,
-            MemorySubject::CurrentUser,
-            MemoryAttribute::CommunicationStyle,
-            MemoryScopeHint::UserWorkspace,
-            MemoryDurability::LongLived,
-        );
-
-        let classification = classify_semantic_memory_fact(&semantic, None);
-
-        assert_eq!(
-            classification.fact_class,
-            MemoryFactClass::CommunicationPreference
-        );
-        assert_eq!(
-            classification.proposed_ownership_class,
-            MemoryOwnershipClass::DurableUserMemory
-        );
-    }
-
-    #[test]
-    fn maps_project_decision_to_workspace_memory() {
-        let semantic = semantic(
-            MemoryCategory::ProjectDecision,
-            MemorySubject::Project,
-            MemoryAttribute::PhaseNaming,
-            MemoryScopeHint::ProjectWorkspace,
-            MemoryDurability::ProjectLifetime,
-        );
-
-        let classification = classify_semantic_memory_fact(&semantic, None);
-
-        assert_eq!(classification.fact_class, MemoryFactClass::ProjectDecision);
-        assert_eq!(
-            classification.lifetime_class,
-            MemoryLifetimeClass::ProjectLifetime
-        );
-        assert_eq!(
-            classification.proposed_ownership_class,
-            MemoryOwnershipClass::DurableWorkspaceMemory
-        );
-    }
-
-    #[test]
-    fn keeps_unknown_scope_hint_audit_only() {
-        let semantic = semantic(
-            MemoryCategory::Identity,
-            MemorySubject::CurrentUser,
-            MemoryAttribute::Name,
-            MemoryScopeHint::Unknown,
-            MemoryDurability::LongLived,
-        );
-
-        let classification = classify_semantic_memory_fact(&semantic, None);
-
-        assert_eq!(classification.fact_class, MemoryFactClass::UserIdentity);
-        assert_eq!(
-            classification.proposed_ownership_class,
-            MemoryOwnershipClass::AuditOnly
-        );
-    }
-
-    #[test]
-    fn maps_todo_to_thread_local_thread_lifetime_context() {
-        let semantic = semantic(
-            MemoryCategory::Todo,
-            MemorySubject::CurrentUser,
-            MemoryAttribute::Custom,
-            MemoryScopeHint::UserWorkspace,
-            MemoryDurability::Transient,
-        );
-
-        let classification = classify_semantic_memory_fact(&semantic, None);
-
-        assert_eq!(classification.fact_class, MemoryFactClass::ThreadLocalState);
-        assert_eq!(
-            classification.lifetime_class,
-            MemoryLifetimeClass::ThreadLifetime
-        );
-        assert_eq!(
-            classification.proposed_ownership_class,
-            MemoryOwnershipClass::ThreadEpisodicContext
-        );
-    }
-
-    #[test]
-    fn maps_project_todo_to_task_lifecycle_state() {
-        let semantic = semantic(
-            MemoryCategory::Todo,
-            MemorySubject::Project,
-            MemoryAttribute::Custom,
-            MemoryScopeHint::ProjectWorkspace,
-            MemoryDurability::SessionOnly,
-        );
-
-        let classification = classify_semantic_memory_fact(&semantic, None);
-
-        assert_eq!(
-            classification.fact_class,
-            MemoryFactClass::TaskLifecycleState
-        );
-        assert_eq!(
-            classification.lifetime_class,
-            MemoryLifetimeClass::TaskLifetime
-        );
-        assert_eq!(
-            classification.proposed_ownership_class,
-            MemoryOwnershipClass::TaskRuntimeState
-        );
-    }
-
-    #[test]
-    fn maps_operational_observation_to_domain_runtime_state() {
-        let semantic = semantic(
-            MemoryCategory::ProjectFact,
-            MemorySubject::Workspace,
-            MemoryAttribute::Custom,
-            MemoryScopeHint::ProjectWorkspace,
-            MemoryDurability::Transient,
-        );
-
-        let classification = classify_semantic_memory_fact(&semantic, None);
-
-        assert_eq!(
-            classification.fact_class,
-            MemoryFactClass::OperationalObservation
-        );
-        assert_eq!(
-            classification.lifetime_class,
-            MemoryLifetimeClass::NaturallyExpiring
-        );
-        assert_eq!(
-            classification.proposed_ownership_class,
-            MemoryOwnershipClass::DomainRuntimeState
-        );
-    }
-
-    #[test]
-    fn maps_artifact_project_fact_to_tool_result_fact() {
-        let semantic = semantic(
-            MemoryCategory::ProjectFact,
-            MemorySubject::Artifact,
-            MemoryAttribute::Custom,
-            MemoryScopeHint::ProjectWorkspace,
-            MemoryDurability::Transient,
-        );
-
-        let classification = classify_semantic_memory_fact(&semantic, None);
-
-        assert_eq!(classification.fact_class, MemoryFactClass::ToolResultFact);
-        assert_eq!(
-            classification.lifetime_class,
-            MemoryLifetimeClass::NaturallyExpiring
-        );
-        assert_eq!(
-            classification.proposed_ownership_class,
-            MemoryOwnershipClass::DomainRuntimeState
-        );
-    }
-
-    #[test]
-    fn maps_secret_semantic_to_reject_ownership_class() {
-        let mut semantic = semantic(
-            MemoryCategory::Identity,
-            MemorySubject::CurrentUser,
-            MemoryAttribute::Custom,
-            MemoryScopeHint::UserGlobal,
-            MemoryDurability::LongLived,
-        );
-        semantic.sensitivity = MemorySensitivityHint::Secret;
-
-        let classification = classify_semantic_memory_fact(&semantic, None);
-
-        assert_eq!(
-            classification.fact_class,
-            MemoryFactClass::SecretOrCredential
-        );
-        assert_eq!(
-            classification.proposed_ownership_class,
-            MemoryOwnershipClass::Reject
-        );
-    }
-
-    #[test]
     fn maps_project_fact_only_when_context_is_structurally_clear() {
         let semantic_without_context = semantic(
             MemoryCategory::ProjectFact,
@@ -1016,53 +808,6 @@ mod tests {
         assert_eq!(classification.thread_id.as_deref(), Some("thread-1"));
         assert_eq!(classification.turn_id.as_deref(), Some("turn-1"));
         assert_eq!(classification.workspace_id.as_deref(), Some("workspace-1"));
-    }
-
-    #[test]
-    fn source_context_classifies_assistant_evidence() {
-        let evidence = evidence_with_source_ref("turn.post_turn:assistant");
-
-        let classification = classify_memory_source_context(MemorySourceContextInput {
-            has_assistant_text: true,
-            evidence: Some(&evidence),
-            ..MemorySourceContextInput::default()
-        });
-
-        assert_eq!(
-            classification.context_kind,
-            MemorySourceContextKind::AssistantResponse
-        );
-        assert_eq!(
-            classification.actor_role,
-            MemoryEvidenceActorRole::Assistant
-        );
-        assert_eq!(
-            classification.evidence_class,
-            MemoryEvidenceClass::AssistantInference
-        );
-        assert!(!classification.source_is_user_assertion);
-    }
-
-    #[test]
-    fn source_context_classifies_tool_evidence_without_text_matching() {
-        let evidence = evidence_with_source_ref("tool:read_file");
-
-        let classification = classify_memory_source_context(MemorySourceContextInput {
-            has_tool_events: true,
-            evidence: Some(&evidence),
-            ..MemorySourceContextInput::default()
-        });
-
-        assert_eq!(
-            classification.context_kind,
-            MemorySourceContextKind::ToolResult
-        );
-        assert_eq!(classification.actor_role, MemoryEvidenceActorRole::Tool);
-        assert_eq!(
-            classification.evidence_class,
-            MemoryEvidenceClass::ToolObservation
-        );
-        assert!(classification.source_is_system_owned_state);
     }
 
     #[test]
@@ -1153,44 +898,6 @@ mod tests {
             Some("thread-provenance")
         );
         assert_eq!(classification.turn_id.as_deref(), Some("turn-provenance"));
-    }
-
-    #[test]
-    fn source_context_does_not_mark_user_text_as_assertion_without_evidence_ref() {
-        let classification = classify_memory_source_context(MemorySourceContextInput {
-            has_user_text: true,
-            ..MemorySourceContextInput::default()
-        });
-
-        assert_eq!(
-            classification.context_kind,
-            MemorySourceContextKind::DirectUserConversation
-        );
-        assert_eq!(classification.actor_role, MemoryEvidenceActorRole::User);
-        assert_eq!(
-            classification.evidence_class,
-            MemoryEvidenceClass::MissingOrWeak
-        );
-        assert!(!classification.source_is_user_assertion);
-    }
-
-    #[test]
-    fn source_context_classifies_domain_events_as_system_runtime() {
-        let classification = classify_memory_source_context(MemorySourceContextInput {
-            has_domain_events: true,
-            ..MemorySourceContextInput::default()
-        });
-
-        assert_eq!(
-            classification.context_kind,
-            MemorySourceContextKind::SystemRuntime
-        );
-        assert_eq!(classification.actor_role, MemoryEvidenceActorRole::System);
-        assert_eq!(
-            classification.evidence_class,
-            MemoryEvidenceClass::SystemObservation
-        );
-        assert!(classification.source_is_system_owned_state);
     }
 
     fn evidence_with_source_ref(source_ref: &str) -> MemoryWriteEvidence {
@@ -1477,5 +1184,207 @@ mod tests {
             }),
         );
         metadata
+    }
+
+    #[test]
+    fn semantic_dimensions_map_to_explicit_fact_lifetime_and_ownership() {
+        for (case, input, fact, lifetime, ownership) in [
+            (
+                "maps_user_identity_to_durable_user_memory",
+                semantic(
+                    MemoryCategory::Identity,
+                    MemorySubject::CurrentUser,
+                    MemoryAttribute::Name,
+                    MemoryScopeHint::UserGlobal,
+                    MemoryDurability::LongLived,
+                ),
+                MemoryFactClass::UserIdentity,
+                Some(MemoryLifetimeClass::LongLived),
+                MemoryOwnershipClass::DurableUserMemory,
+            ),
+            (
+                "maps_communication_preference_structurally",
+                semantic(
+                    MemoryCategory::Preference,
+                    MemorySubject::CurrentUser,
+                    MemoryAttribute::CommunicationStyle,
+                    MemoryScopeHint::UserWorkspace,
+                    MemoryDurability::LongLived,
+                ),
+                MemoryFactClass::CommunicationPreference,
+                None,
+                MemoryOwnershipClass::DurableUserMemory,
+            ),
+            (
+                "maps_project_decision_to_workspace_memory",
+                semantic(
+                    MemoryCategory::ProjectDecision,
+                    MemorySubject::Project,
+                    MemoryAttribute::PhaseNaming,
+                    MemoryScopeHint::ProjectWorkspace,
+                    MemoryDurability::ProjectLifetime,
+                ),
+                MemoryFactClass::ProjectDecision,
+                Some(MemoryLifetimeClass::ProjectLifetime),
+                MemoryOwnershipClass::DurableWorkspaceMemory,
+            ),
+            (
+                "maps_todo_to_thread_local_thread_lifetime_context",
+                semantic(
+                    MemoryCategory::Todo,
+                    MemorySubject::CurrentUser,
+                    MemoryAttribute::Custom,
+                    MemoryScopeHint::UserWorkspace,
+                    MemoryDurability::Transient,
+                ),
+                MemoryFactClass::ThreadLocalState,
+                Some(MemoryLifetimeClass::ThreadLifetime),
+                MemoryOwnershipClass::ThreadEpisodicContext,
+            ),
+            (
+                "maps_project_todo_to_task_lifecycle_state",
+                semantic(
+                    MemoryCategory::Todo,
+                    MemorySubject::Project,
+                    MemoryAttribute::Custom,
+                    MemoryScopeHint::ProjectWorkspace,
+                    MemoryDurability::SessionOnly,
+                ),
+                MemoryFactClass::TaskLifecycleState,
+                Some(MemoryLifetimeClass::TaskLifetime),
+                MemoryOwnershipClass::TaskRuntimeState,
+            ),
+            (
+                "maps_operational_observation_to_domain_runtime_state",
+                semantic(
+                    MemoryCategory::ProjectFact,
+                    MemorySubject::Workspace,
+                    MemoryAttribute::Custom,
+                    MemoryScopeHint::ProjectWorkspace,
+                    MemoryDurability::Transient,
+                ),
+                MemoryFactClass::OperationalObservation,
+                Some(MemoryLifetimeClass::NaturallyExpiring),
+                MemoryOwnershipClass::DomainRuntimeState,
+            ),
+            (
+                "maps_artifact_project_fact_to_tool_result_fact",
+                semantic(
+                    MemoryCategory::ProjectFact,
+                    MemorySubject::Artifact,
+                    MemoryAttribute::Custom,
+                    MemoryScopeHint::ProjectWorkspace,
+                    MemoryDurability::Transient,
+                ),
+                MemoryFactClass::ToolResultFact,
+                Some(MemoryLifetimeClass::NaturallyExpiring),
+                MemoryOwnershipClass::DomainRuntimeState,
+            ),
+            (
+                "maps_secret_semantic_to_reject_ownership_class",
+                {
+                    let mut semantic = semantic(
+                        MemoryCategory::Identity,
+                        MemorySubject::CurrentUser,
+                        MemoryAttribute::Custom,
+                        MemoryScopeHint::UserGlobal,
+                        MemoryDurability::LongLived,
+                    );
+                    semantic.sensitivity = MemorySensitivityHint::Secret;
+                    semantic
+                },
+                MemoryFactClass::SecretOrCredential,
+                None,
+                MemoryOwnershipClass::Reject,
+            ),
+            (
+                "keeps_unknown_scope_hint_audit_only",
+                semantic(
+                    MemoryCategory::Identity,
+                    MemorySubject::CurrentUser,
+                    MemoryAttribute::Name,
+                    MemoryScopeHint::Unknown,
+                    MemoryDurability::LongLived,
+                ),
+                MemoryFactClass::UserIdentity,
+                None,
+                MemoryOwnershipClass::AuditOnly,
+            ),
+        ] {
+            let classification = classify_semantic_memory_fact(&input, None);
+            assert_eq!(classification.fact_class, fact, "{case}");
+            if let Some(lifetime) = lifetime {
+                assert_eq!(classification.lifetime_class, lifetime, "{case}");
+            }
+            assert_eq!(classification.proposed_ownership_class, ownership, "{case}");
+        }
+    }
+
+    #[test]
+    fn source_context_non_asserting_conversation_matrix() {
+        let evidence_0 = evidence_with_source_ref("turn.post_turn:assistant");
+        for (case, input, context, actor, evidence_class) in [
+            (
+                "source_context_classifies_assistant_evidence",
+                MemorySourceContextInput {
+                    has_assistant_text: true,
+                    evidence: Some(&evidence_0),
+                    ..MemorySourceContextInput::default()
+                },
+                MemorySourceContextKind::AssistantResponse,
+                MemoryEvidenceActorRole::Assistant,
+                MemoryEvidenceClass::AssistantInference,
+            ),
+            (
+                "source_context_does_not_mark_user_text_as_assertion_without_evidence_ref",
+                MemorySourceContextInput {
+                    has_user_text: true,
+                    ..MemorySourceContextInput::default()
+                },
+                MemorySourceContextKind::DirectUserConversation,
+                MemoryEvidenceActorRole::User,
+                MemoryEvidenceClass::MissingOrWeak,
+            ),
+        ] {
+            let classification = classify_memory_source_context(input);
+            assert_eq!(classification.context_kind, context, "{case}");
+            assert_eq!(classification.actor_role, actor, "{case}");
+            assert_eq!(classification.evidence_class, evidence_class, "{case}");
+            assert!(!classification.source_is_user_assertion, "{case}");
+        }
+    }
+
+    #[test]
+    fn source_context_system_owned_observation_matrix() {
+        let evidence_0 = evidence_with_source_ref("tool:read_file");
+        for (case, input, context, actor, evidence_class) in [
+            (
+                "source_context_classifies_tool_evidence_without_text_matching",
+                MemorySourceContextInput {
+                    has_tool_events: true,
+                    evidence: Some(&evidence_0),
+                    ..MemorySourceContextInput::default()
+                },
+                MemorySourceContextKind::ToolResult,
+                MemoryEvidenceActorRole::Tool,
+                MemoryEvidenceClass::ToolObservation,
+            ),
+            (
+                "source_context_classifies_domain_events_as_system_runtime",
+                MemorySourceContextInput {
+                    has_domain_events: true,
+                    ..MemorySourceContextInput::default()
+                },
+                MemorySourceContextKind::SystemRuntime,
+                MemoryEvidenceActorRole::System,
+                MemoryEvidenceClass::SystemObservation,
+            ),
+        ] {
+            let classification = classify_memory_source_context(input);
+            assert_eq!(classification.context_kind, context, "{case}");
+            assert_eq!(classification.actor_role, actor, "{case}");
+            assert_eq!(classification.evidence_class, evidence_class, "{case}");
+            assert!(classification.source_is_system_owned_state, "{case}");
+        }
     }
 }

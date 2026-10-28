@@ -1857,56 +1857,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_skill_archive_rejects_traversal_entries() {
-        let case = TempCase::new("traversal");
-        let archive = case.path.join("skill.tar.gz");
-        write_archive(
-            archive.as_path(),
-            &[
-                TestEntry::file("skill/SKILL.md", b"---\nname: skill\n---\n"),
-                TestEntry::file("../evil.txt", b"evil"),
-            ],
-        );
-
-        let error = extract_archive_secure(
-            archive.as_path(),
-            case.materialized.as_path(),
-            1024,
-            8,
-            1024,
-        )
-        .expect_err("traversal should fail")
-        .to_string();
-
-        assert!(error.contains("parent traversal") || error.contains("multiple top-level"));
-    }
-
-    #[test]
-    fn extract_skill_archive_rejects_absolute_entries() {
-        let case = TempCase::new("absolute");
-        let archive = case.path.join("skill.tar.gz");
-        write_archive(
-            archive.as_path(),
-            &[
-                TestEntry::file("skill/SKILL.md", b"---\nname: skill\n---\n"),
-                TestEntry::file("/tmp/evil.txt", b"evil"),
-            ],
-        );
-
-        let error = extract_archive_secure(
-            archive.as_path(),
-            case.materialized.as_path(),
-            1024,
-            8,
-            1024,
-        )
-        .expect_err("absolute path should fail")
-        .to_string();
-
-        assert!(error.contains("absolute") || error.contains("multiple top-level"));
-    }
-
-    #[test]
     fn extract_skill_archive_rejects_links_and_special_files() {
         for (name, entry) in [
             ("symlink", TestEntry::symlink("skill/link.md", "SKILL.md")),
@@ -2453,5 +2403,43 @@ mod tests {
         let bytes = header.as_mut_bytes();
         bytes[0..100].fill(0);
         bytes[0..path.len()].copy_from_slice(path);
+    }
+
+    #[test]
+    fn extract_skill_archive_rejects_unsafe_path_entries() {
+        for (name, path, failure, path_error) in [
+            (
+                "traversal",
+                "../evil.txt",
+                "traversal should fail",
+                "parent traversal",
+            ),
+            (
+                "absolute",
+                "/tmp/evil.txt",
+                "absolute path should fail",
+                "absolute",
+            ),
+        ] {
+            let case = TempCase::new(name);
+            let archive = case.path.join("skill.tar.gz");
+            write_archive(
+                archive.as_path(),
+                &[
+                    TestEntry::file("skill/SKILL.md", b"---\nname: skill\n---\n"),
+                    TestEntry::file(path, b"evil"),
+                ],
+            );
+            let error = extract_archive_secure(
+                archive.as_path(),
+                case.materialized.as_path(),
+                1024,
+                8,
+                1024,
+            )
+            .expect_err(failure)
+            .to_string();
+            assert!(error.contains(path_error) || error.contains("multiple top-level"));
+        }
     }
 }

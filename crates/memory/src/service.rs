@@ -4764,6 +4764,7 @@ mod tests {
             .write_semantic_memory(context.clone(), valid.clone())
             .await
             .unwrap();
+        assert_eq!(first.relation, MemoryWriteRelation::Novel);
         let failure = service
             .write_semantic_memory(context.clone(), invalid.clone())
             .await
@@ -4777,6 +4778,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay.relation, MemoryWriteRelation::Duplicate);
+        assert!(replay.evidence_merged);
         assert_eq!(
             first.record.as_ref().unwrap().id,
             replay.record.as_ref().unwrap().id
@@ -4795,40 +4797,6 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(records.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn duplicate_semantic_retry_merges_active_memory_instead_of_creating_duplicate() {
-        let (service, store) = test_service().await;
-        let context = duplicate_safe_context();
-        let params = user_name_semantic_params();
-
-        let first = service
-            .write_semantic_memory(context.clone(), params.clone())
-            .await
-            .expect("first semantic write succeeds");
-        let second = service
-            .write_semantic_memory(context.clone(), params.clone())
-            .await
-            .expect("retry semantic write succeeds");
-
-        assert_eq!(first.relation, MemoryWriteRelation::Novel);
-        assert_eq!(second.relation, MemoryWriteRelation::Duplicate);
-        assert!(second.evidence_merged);
-        assert_eq!(
-            first.record.as_ref().map(|record| record.id.as_str()),
-            second.record.as_ref().map(|record| record.id.as_str())
-        );
-
-        let records = store
-            .list_agent_memory_records(AgentMemoryListFilter {
-                scopes: vec![params.scope],
-                statuses: vec![MemoryStatus::Active],
-                ..AgentMemoryListFilter::default()
-            })
-            .await
-            .expect("memory records list");
         assert_eq!(records.len(), 1);
         assert_eq!(
             metadata_evidence_count(records[0].metadata_json.as_deref().unwrap_or("{}")),

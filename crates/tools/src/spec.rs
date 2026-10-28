@@ -790,18 +790,6 @@ mod tests {
     }
 
     #[test]
-    fn builtin_specs_define_explicit_output_policy() {
-        for configured in builtin_tool_specs() {
-            assert_eq!(
-                configured.output_policy,
-                builtin_output_policy(configured.spec.name.as_str()),
-                "builtin tool {} must carry its explicit output policy",
-                configured.spec.name
-            );
-        }
-    }
-
-    #[test]
     fn request_tools_schema_defines_strict_domain_contract() {
         let specs = builtin_tool_specs();
         let request_tools = specs

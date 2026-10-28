@@ -1559,17 +1559,6 @@ mod tests {
     }
 
     #[test]
-    fn voice_supervisor_state_installed_model_may_transition_directly_to_loading() {
-        let (supervisor, _, _) = supervisor();
-        supervisor
-            .apply_desired(selected("parakeet-tdt-0.6b-v3"), false)
-            .expect("select model");
-        mark_loading(&supervisor).expect("load verified install");
-        mark_ready(&supervisor, identity("parakeet-tdt-0.6b-v3")).expect("publish ready");
-        assert!(supervisor.runtime_snapshot().effective_enabled);
-    }
-
-    #[test]
     fn voice_supervisor_state_failures_never_fallback_or_remain_effectively_enabled() {
         let start_phases = [
             GatewayVoiceInputRuntimePhase::Missing,

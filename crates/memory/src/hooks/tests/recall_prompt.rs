@@ -16,7 +16,7 @@ async fn memory_deterministic_recall_hook_contributes_prompt_context_from_policy
         .await
         .expect("recall hook executes");
 
-    assert!(provider.recall_call_count() > 0);
+    assert_eq!(provider.recall_call_count(), 1);
     assert_eq!(provider.materialize_call_count(), 0);
     assert_has_memory_recall_audit(&response, "memory.recall.deterministic");
     let contributions = prompt_context_contributions(&response);
@@ -126,7 +126,17 @@ async fn active_memory_hook_contributes_read_only_prompt_context() {
         .await
         .expect("active recall hook executes");
 
-    assert!(provider.recall_call_count() > 0);
+    assert_eq!(provider.recall_call_count(), 1);
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.as_str() == "memory.active_recall.decision"
+            && diagnostic.message.as_str().contains("status=run")
+    }));
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .as_str()
+            .contains("memory.active_recall.provider_unavailable")
+    }));
     assert_eq!(provider.materialize_call_count(), 0);
     let request = provider
         .mode_recall_requests()
@@ -167,50 +177,6 @@ async fn active_memory_hook_contributes_read_only_prompt_context() {
 }
 
 #[tokio::test]
-async fn active_memory_hook_runs_for_memory_sensitive_turns() {
-    for input_text in [
-        "continue the previous architecture implementation with the same constraints",
-        "use my durable preferences and identity details when answering this",
-        "apply the project decisions and history from our earlier work",
-        "before answering, consider what we discussed in prior threads",
-    ] {
-        let provider = Arc::new(TestRecallMemoryProvider::with_recall(
-            active_project_snapshot(),
-        ));
-        let hook = ActiveMemoryRecallHook {
-            memory_provider: provider.clone(),
-            episodic_provider: None,
-            config: MemoryActiveRecallConfig {
-                max_queries: 1,
-                ..MemoryActiveRecallConfig::default()
-            },
-        };
-
-        let response = hook
-            .execute(test_active_prompt_context_hook_request(
-                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-                HookPromptContextSet::default(),
-                input_text,
-            ))
-            .await
-            .expect("active recall hook executes");
-
-        assert_eq!(provider.recall_call_count(), 1, "{input_text}");
-        assert!(
-            response
-                .contributions
-                .iter()
-                .any(|contribution| matches!(contribution, HookContribution::PromptContext(_))),
-            "{input_text}"
-        );
-        assert!(response.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code.as_str() == "memory.active_recall.decision"
-                && diagnostic.message.as_str().contains("status=run")
-        }));
-    }
-}
-
-#[tokio::test]
 async fn active_memory_hook_uses_valid_preflight_json_plan() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         active_project_snapshot(),
@@ -247,7 +213,7 @@ async fn active_memory_hook_uses_valid_preflight_json_plan() {
         .await
         .expect("active recall hook executes");
 
-    assert!(provider.recall_call_count() > 0);
+    assert_eq!(provider.recall_call_count(), 1);
     let request = provider
         .mode_recall_requests()
         .into_iter()
@@ -275,68 +241,6 @@ async fn active_memory_hook_uses_valid_preflight_json_plan() {
         panic!("expected prompt context contribution");
     };
     assert!(!context.content.as_str().contains("preflight provider ok"));
-}
-
-#[tokio::test]
-async fn active_recall_hook_executes_preflight_plan_without_legacy_provider() {
-    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
-        active_project_snapshot(),
-    ));
-    let hook = ActiveMemoryRecallHook {
-        memory_provider: provider.clone(),
-        episodic_provider: None,
-        config: MemoryActiveRecallConfig {
-            max_queries: 1,
-            ..MemoryActiveRecallConfig::default()
-        },
-    };
-    let plan = parse_active_memory_decision_json(
-        r#"{"durable":{"status":"run","reasonCode":"provider_run","confidence":0.92,"modes":["profile"],"targets":[{"scopeKind":"user","factClass":"user_identity","category":"identity","subject":"current_user","attribute":"name"}],"diagnostics":["preflight provider ok"]},"episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}}"#,
-    )
-    .expect("provider-owned preflight plan uses memory parser");
-    let input = TurnPostPreflightPromptContextHookInput::from_parts(
-        "what is my name?",
-        Some("test-model"),
-        Some("test-provider"),
-    )
-    .with_active_memory_recall_preflight_plan(
-        serde_json::to_value(plan).expect("active recall plan serializes"),
-    );
-    let mut request = test_active_prompt_context_hook_request(
-        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-        HookPromptContextSet::default(),
-        "what is my name?",
-    );
-    request.input = HookInput::turn_post_preflight_prompt_context(input);
-
-    let response = hook
-        .execute(request)
-        .await
-        .expect("active recall hook executes");
-
-    assert_eq!(provider.recall_call_count(), 1);
-    let request = provider
-        .mode_recall_requests()
-        .into_iter()
-        .next()
-        .expect("preflight plan should drive mode-native recall");
-    assert_eq!(request.mode, MemoryRecallMode::Profile);
-    assert!(
-        response
-            .contributions
-            .iter()
-            .any(|contribution| matches!(contribution, HookContribution::PromptContext(_)))
-    );
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code.as_str() == "memory.active_recall.decision"
-            && diagnostic.message.as_str().contains("reason=provider_run")
-    }));
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic
-            .message
-            .as_str()
-            .contains("preflight provider ok")
-    }));
 }
 
 #[tokio::test]
@@ -390,146 +294,6 @@ async fn active_memory_hook_respects_policy_and_config_skips() {
     assert_no_prompt_context_contributions(&deterministic_only);
 
     assert_eq!(provider.recall_call_count(), 0);
-}
-
-#[tokio::test]
-async fn active_memory_hook_uses_mode_native_recall_for_short_turns() {
-    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
-        active_project_snapshot(),
-    ));
-    let hook = ActiveMemoryRecallHook {
-        memory_provider: provider.clone(),
-        episodic_provider: None,
-        config: MemoryActiveRecallConfig {
-            max_queries: 1,
-            ..MemoryActiveRecallConfig::default()
-        },
-    };
-
-    let response = hook
-        .execute(test_active_prompt_context_hook_request(
-            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-            HookPromptContextSet::default(),
-            "как меня зовут?",
-        ))
-        .await
-        .expect("active recall hook executes");
-
-    assert_eq!(provider.recall_call_count(), 1);
-    let request = provider
-        .mode_recall_requests()
-        .into_iter()
-        .next()
-        .expect("active recall request recorded");
-    assert_eq!(request.mode, MemoryRecallMode::Project);
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code.as_str() == "memory.active_recall.decision"
-            && diagnostic.message.as_str().contains("status=run")
-    }));
-}
-
-#[tokio::test]
-async fn active_memory_hook_without_preflight_plan_uses_local_deterministic_plan() {
-    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
-        active_project_snapshot(),
-    ));
-    let hook = ActiveMemoryRecallHook {
-        memory_provider: provider.clone(),
-        episodic_provider: None,
-        config: MemoryActiveRecallConfig {
-            max_queries: 1,
-            ..MemoryActiveRecallConfig::default()
-        },
-    };
-
-    let response = hook
-        .execute(test_active_prompt_context_hook_request(
-            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-            HookPromptContextSet::default(),
-            "continue the architecture work using prior project decisions",
-        ))
-        .await
-        .expect("missing preflight plan uses local active recall fallback");
-
-    assert_eq!(provider.recall_call_count(), 1);
-    assert!(
-        response
-            .contributions
-            .iter()
-            .any(|contribution| matches!(contribution, HookContribution::PromptContext(_)))
-    );
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic
-            .message
-            .as_str()
-            .contains("memory.active_recall.provider_unavailable")
-    }));
-}
-
-#[tokio::test]
-async fn active_memory_hook_runs_even_when_deterministic_context_exists() {
-    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
-        active_project_snapshot(),
-    ));
-    let hook = ActiveMemoryRecallHook {
-        memory_provider: provider.clone(),
-        episodic_provider: None,
-        config: MemoryActiveRecallConfig::default(),
-    };
-    let deterministic_context = prompt_context_set_from_prompt_context_contribution(
-        memory_recall_prompt_context_contribution(recalled_city_snapshot())
-            .expect("deterministic context contribution"),
-    );
-
-    let response = hook
-        .execute(test_active_prompt_context_hook_request(
-            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-            deterministic_context,
-            "continue the previous work with the same constraints",
-        ))
-        .await
-        .expect("active recall hook executes");
-
-    assert!(provider.recall_call_count() > 0);
-    assert!(
-        response
-            .diagnostics
-            .iter()
-            .any(|diagnostic| { diagnostic.code.as_str() == "memory.active_recall.execution" })
-    );
-}
-
-#[tokio::test]
-async fn active_memory_hook_deduplicates_after_running_with_deterministic_context() {
-    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
-        recalled_city_snapshot(),
-    ));
-    let hook = ActiveMemoryRecallHook {
-        memory_provider: provider.clone(),
-        episodic_provider: None,
-        config: MemoryActiveRecallConfig::default(),
-    };
-    let deterministic_context = prompt_context_set_from_prompt_context_contribution(
-        memory_recall_prompt_context_contribution(recalled_city_snapshot())
-            .expect("deterministic context contribution"),
-    );
-
-    let response = hook
-        .execute(test_active_prompt_context_hook_request(
-            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-            deterministic_context,
-            "continue the previous work with the same constraints",
-        ))
-        .await
-        .expect("active recall hook executes");
-
-    assert!(provider.recall_call_count() > 0);
-    assert!(
-        response
-            .diagnostics
-            .iter()
-            .any(|diagnostic| { diagnostic.code.as_str() == "memory.active_recall.dedup" })
-    );
 }
 
 #[tokio::test]
@@ -650,136 +414,6 @@ async fn active_memory_hook_rejects_invalid_preflight_plan_without_legacy_provid
     );
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.active_recall.preflight_plan_invalid"
-    }));
-}
-
-#[tokio::test]
-async fn active_memory_hook_executes_preflight_provider_error_fallback_plan() {
-    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
-        active_project_snapshot(),
-    ));
-    let hook = ActiveMemoryRecallHook {
-        memory_provider: provider.clone(),
-        episodic_provider: None,
-        config: MemoryActiveRecallConfig {
-            max_queries: 1,
-            ..MemoryActiveRecallConfig::default()
-        },
-    };
-    let input = TurnPostPreflightPromptContextHookInput::from_parts(
-        "continue the architecture work using prior project decisions",
-        Some("test-model"),
-        Some("test-provider"),
-    )
-    .with_active_memory_recall_preflight_plan(json!({
-        "durable": {
-            "status": "run",
-            "reasonCode": "memory_likely",
-            "confidence": 0.65,
-            "modes": ["project"],
-            "targets": [],
-            "providerFallbackUsed": true,
-            "diagnostics": ["memory.active_recall.provider_failed"]
-        },
-        "episodic": {
-            "status": "skip",
-            "reasonCode": "provider_skip",
-            "confidence": 1.0,
-            "queries": []
-        }
-    }));
-    let mut request = test_active_prompt_context_hook_request(
-        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-        HookPromptContextSet::default(),
-        "continue the architecture work using prior project decisions",
-    );
-    request.input = HookInput::turn_post_preflight_prompt_context(input);
-
-    let response = hook
-        .execute(request)
-        .await
-        .expect("preflight provider failure fallback is best-effort");
-
-    assert_eq!(provider.recall_call_count(), 1);
-    assert!(
-        response
-            .contributions
-            .iter()
-            .any(|contribution| matches!(contribution, HookContribution::PromptContext(_)))
-    );
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic
-            .message
-            .as_str()
-            .contains("memory.active_recall.provider_failed")
-    }));
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic
-            .metadata
-            .get(&hook_metadata_key("provider_fallback_used"))
-            == Some(&HookValue::Bool(true))
-    }));
-}
-
-#[tokio::test]
-async fn active_memory_hook_executes_preflight_timeout_fallback_plan() {
-    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
-        active_project_snapshot(),
-    ));
-    let hook = ActiveMemoryRecallHook {
-        memory_provider: provider.clone(),
-        episodic_provider: None,
-        config: MemoryActiveRecallConfig {
-            max_queries: 1,
-            ..MemoryActiveRecallConfig::default()
-        },
-    };
-    let input = TurnPostPreflightPromptContextHookInput::from_parts(
-        "continue the architecture work using prior project decisions",
-        Some("test-model"),
-        Some("test-provider"),
-    )
-    .with_active_memory_recall_preflight_plan(json!({
-        "durable": {
-            "status": "run",
-            "reasonCode": "memory_likely",
-            "confidence": 0.65,
-            "modes": ["project"],
-            "targets": [],
-            "providerFallbackUsed": true,
-            "diagnostics": ["memory.active_recall.provider_timeout"]
-        },
-        "episodic": {
-            "status": "skip",
-            "reasonCode": "provider_skip",
-            "confidence": 1.0,
-            "queries": []
-        }
-    }));
-    let mut request = test_active_prompt_context_hook_request(
-        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-        HookPromptContextSet::default(),
-        "continue the architecture work using prior project decisions",
-    );
-    request.input = HookInput::turn_post_preflight_prompt_context(input);
-
-    let response = hook
-        .execute(request)
-        .await
-        .expect("preflight timeout fallback is best-effort");
-
-    assert_eq!(provider.recall_call_count(), 1);
-    assert!(
-        response
-            .contributions
-            .iter()
-            .any(|contribution| matches!(contribution, HookContribution::PromptContext(_)))
-    );
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic
-            .message
-            .as_str()
-            .contains("memory.active_recall.provider_timeout")
     }));
 }
 
@@ -1720,7 +1354,10 @@ async fn memory_prompt_contract_hook_policy_and_tool_visibility_matrix() {
             memory_policy_set(&MemoryTurnPolicy::no_use()),
             true,
             &[MEMORY_SEARCH_TOOL],
-            prompt_context_set.clone(),
+            prompt_context_set_from_prompt_context_contribution(
+                memory_recall_prompt_context_contribution(recalled_city_snapshot())
+                    .expect("deterministic memory context can be built"),
+            ),
         ))
         .await
         .expect("no-use policy is best-effort");
@@ -1822,5 +1459,131 @@ fn active_recall_planner_input_for_test() -> ActiveRecallPlannerInput {
         has_task_context: false,
         episodic_capabilities: MemoryEpisodicRecallCapabilities::default(),
         thread_episodic: MemoryActiveRecallThreadEpisodicSummary::default(),
+    }
+}
+
+#[test]
+fn active_memory_hook_deterministic_context_snapshot_matrix() {
+    for (snapshot, diagnostic_code) in [
+        (active_project_snapshot(), "memory.active_recall.execution"),
+        (recalled_city_snapshot(), "memory.active_recall.dedup"),
+    ] {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("active recall row runtime builds");
+        runtime.block_on(async {
+            let provider = Arc::new(TestRecallMemoryProvider::with_recall(snapshot));
+            let hook = ActiveMemoryRecallHook {
+                memory_provider: provider.clone(),
+                episodic_provider: None,
+                config: MemoryActiveRecallConfig::default(),
+            };
+            let deterministic_context = prompt_context_set_from_prompt_context_contribution(
+                memory_recall_prompt_context_contribution(recalled_city_snapshot())
+                    .expect("deterministic context contribution"),
+            );
+
+            let response = hook
+                .execute(test_active_prompt_context_hook_request(
+                    memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                    deterministic_context,
+                    "continue the previous work with the same constraints",
+                ))
+                .await
+                .expect("active recall hook executes");
+
+            assert!(provider.recall_call_count() > 0, "{diagnostic_code}");
+            assert!(
+                response
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| { diagnostic.code.as_str() == diagnostic_code }),
+                "{diagnostic_code}"
+            );
+        });
+    }
+}
+
+#[test]
+fn active_memory_hook_preflight_fallback_diagnostic_matrix() {
+    for fallback_diagnostic in [
+        "memory.active_recall.provider_failed",
+        "memory.active_recall.provider_timeout",
+    ] {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("preflight fallback row runtime builds");
+        runtime.block_on(async {
+            let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+                active_project_snapshot(),
+            ));
+            let hook = ActiveMemoryRecallHook {
+                memory_provider: provider.clone(),
+                episodic_provider: None,
+                config: MemoryActiveRecallConfig {
+                    max_queries: 1,
+                    ..MemoryActiveRecallConfig::default()
+                },
+            };
+            let input = TurnPostPreflightPromptContextHookInput::from_parts(
+                "continue the architecture work using prior project decisions",
+                Some("test-model"),
+                Some("test-provider"),
+            )
+            .with_active_memory_recall_preflight_plan(json!({
+                "durable": {
+                    "status": "run",
+                    "reasonCode": "memory_likely",
+                    "confidence": 0.65,
+                    "modes": ["project"],
+                    "targets": [],
+                    "providerFallbackUsed": true,
+                    "diagnostics": [fallback_diagnostic]
+                },
+                "episodic": {
+                    "status": "skip",
+                    "reasonCode": "provider_skip",
+                    "confidence": 1.0,
+                    "queries": []
+                }
+            }));
+            let mut request = test_active_prompt_context_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                HookPromptContextSet::default(),
+                "continue the architecture work using prior project decisions",
+            );
+            request.input = HookInput::turn_post_preflight_prompt_context(input);
+
+            let response = hook
+                .execute(request)
+                .await
+                .expect("preflight fallback is best-effort");
+
+            assert_eq!(provider.recall_call_count(), 1, "{fallback_diagnostic}");
+            assert!(
+                response.contributions.iter().any(|contribution| {
+                    matches!(contribution, HookContribution::PromptContext(_))
+                }),
+                "{fallback_diagnostic}"
+            );
+            assert!(
+                response.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.message.as_str().contains(fallback_diagnostic)
+                }),
+                "{fallback_diagnostic}"
+            );
+            // Preserves the error-row oracle and adds the same positive oracle to timeout.
+            assert!(
+                response.diagnostics.iter().any(|diagnostic| {
+                    diagnostic
+                        .metadata
+                        .get(&hook_metadata_key("provider_fallback_used"))
+                        == Some(&HookValue::Bool(true))
+                }),
+                "{fallback_diagnostic}"
+            );
+        });
     }
 }

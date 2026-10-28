@@ -97,35 +97,6 @@ async fn discovered_turn<C: ConnectionTrait>(db: &C, after: Option<&str>) -> Opt
 }
 
 #[tokio::test]
-async fn fully_compacted_history_has_no_discovery_candidates() {
-    let store = store().await;
-    seed_compacted_history(&store).await;
-    ready(&store).await;
-    let db = store.database_connection();
-    assert_eq!(
-        stream::Entity::find().count(&db).await.unwrap(),
-        COMPACTED_HISTORY_TURNS
-    );
-    assert!(discovered_turn(&db, None).await.is_none());
-    assert!(discovered_turn(&db, Some("history-10000")).await.is_none());
-    let outcome = store
-        .cleanup_projection_receipts_quantum(None)
-        .await
-        .unwrap();
-    assert!(outcome.backfill_ready);
-    assert!(outcome.last_turn_id.is_none());
-    assert_eq!(outcome.rows_deleted, 0);
-    assert_eq!(outcome.source_bytes, 0);
-    assert!(!outcome.deferred);
-    assert!(!outcome.failed);
-    assert_eq!(receipt::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(
-        turn_event::Entity::find().count(&db).await.unwrap(),
-        COMPACTED_HISTORY_TURNS
-    );
-}
-
-#[tokio::test]
 async fn discovery_seeks_only_work_in_keyset_order_and_uses_the_partial_index() {
     let store = store().await;
     seed_compacted_history(&store).await;
@@ -1039,6 +1010,9 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
     assert!(empty.backfill_ready);
     assert!(empty.last_turn_id.is_none());
     assert_eq!(empty.rows_deleted, 0);
+    assert_eq!(empty.source_bytes, 0);
+    assert!(!empty.deferred);
+    assert!(!empty.failed);
     assert!(events.0.lock().unwrap().is_empty());
     {
         let observed = reads.0.lock().unwrap();
@@ -1079,6 +1053,15 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
             2
         );
     }
+    assert_eq!(receipt::Entity::find().count(&database).await.unwrap(), 0);
+    assert_eq!(
+        stream::Entity::find().count(&database).await.unwrap(),
+        COMPACTED_HISTORY_TURNS
+    );
+    assert_eq!(
+        turn_event::Entity::find().count(&database).await.unwrap(),
+        COMPACTED_HISTORY_TURNS
+    );
     blocker.rollback().await.unwrap();
     seed(&store, "turn", 2, 2).await;
     let blocker = database.begin().await.unwrap();

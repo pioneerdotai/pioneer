@@ -1924,69 +1924,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_management_acquisition_never_clobbers_active_mcp_launch() {
-        let factory = Arc::new(FakeFactory::default());
-        let manager = manager_with_factory(factory.clone());
-        let key =
-            CLIAgentRuntimeSessionKey::new("ws", "claude", "claude-management").expect("valid key");
-        let provider_session_id = uuid::Uuid::new_v4();
-        let active = manager
-            .get_or_start_with_launch_spec(
-                key.clone(),
-                CliSessionLaunchSpec::claude_new(
-                    CLIAgentRuntimeSessionStartOptions::default(),
-                    CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-a", 'a')),
-                    provider_session_id,
-                ),
-            )
-            .await
-            .unwrap();
-        let management = manager
-            .existing_or_start_management(
-                key,
-                CliSessionLaunchSpec::codex_management(CLIAgentRuntimeSessionStartOptions {
-                    approval_policy: Some("management-defaults-must-not-replace".to_owned()),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-
-        assert!(active.ptr_eq(&management));
-        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
-        assert_eq!(factory.closes.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
     async fn management_and_fork_acquisition_never_clobbers_mcp_session() {
-        let factory = Arc::new(FakeFactory::default());
-        let manager = manager_with_factory(factory.clone());
-        let key = key("management-no-clobber");
-        let active = manager
-            .get_or_start_with_launch_spec(
-                key.clone(),
+        for (key, launch, approval_policy) in [
+            (
+                key("management-no-clobber"),
                 CliSessionLaunchSpec::codex(
                     CLIAgentRuntimeSessionStartOptions::default(),
                     CliMcpSessionLaunch::Codex(codex_mcp_launch_projection("turn-a", 'a')),
                     Some("native-thread".to_owned()),
                 ),
-            )
-            .await
-            .unwrap();
-        let management = manager
-            .existing_or_start_management(
-                key,
-                CliSessionLaunchSpec::codex_management(CLIAgentRuntimeSessionStartOptions {
-                    approval_policy: Some("different-management-policy".to_owned()),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-
-        assert!(active.ptr_eq(&management));
-        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
-        assert_eq!(factory.closes.load(Ordering::SeqCst), 0);
+                "different-management-policy",
+            ),
+            (
+                CLIAgentRuntimeSessionKey::new("ws", "claude", "claude-management")
+                    .expect("valid key"),
+                CliSessionLaunchSpec::claude_new(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-a", 'a')),
+                    uuid::Uuid::new_v4(),
+                ),
+                "management-defaults-must-not-replace",
+            ),
+        ] {
+            let factory = Arc::new(FakeFactory::default());
+            let manager = manager_with_factory(factory.clone());
+            let active = manager
+                .get_or_start_with_launch_spec(key.clone(), launch)
+                .await
+                .unwrap();
+            let management = manager
+                .existing_or_start_management(
+                    key,
+                    CliSessionLaunchSpec::codex_management(CLIAgentRuntimeSessionStartOptions {
+                        approval_policy: Some(approval_policy.to_owned()),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            assert!(active.ptr_eq(&management));
+            assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(factory.closes.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]

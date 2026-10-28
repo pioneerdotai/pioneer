@@ -65,8 +65,6 @@ mod util;
 pub use repositories::native_event_cleanup::{
     NativeEventCleanupBootstrap, NativeEventCleanupMetrics,
 };
-#[cfg(test)]
-use repositories::native_event_cleanup_baseline::NativeEventCleanupOutcome;
 pub use repositories::projection_receipt_cleanup::ProjectionReceiptCleanupOutcome;
 
 pub use events::{
@@ -7983,31 +7981,6 @@ impl CrudStore {
         filter: CliRuntimeNativeEventListFilter,
     ) -> Result<Vec<CliRuntimeNativeEventRecord>> {
         cli_runtime_binding::list_native_events(&self.connection, filter).await
-    }
-
-    #[cfg(test)]
-    pub async fn cleanup_native_events_baseline_quantum(
-        &self,
-        after_rowid: i64,
-    ) -> Result<NativeEventCleanupOutcome> {
-        self.run_background_database_quantum(|| async {
-            let page =
-                repositories::native_event_cleanup_baseline::prepare(&self.connection, after_rowid)
-                    .await?;
-            let mut outcome = NativeEventCleanupOutcome {
-                last_rowid: page.last().map(|row| row.source_rowid),
-                rows_scanned: page.len() as u64,
-                rows_deleted: 0,
-            };
-            if !page.is_empty() {
-                // One DELETE revalidates eligibility under the maintenance writer.
-                outcome.rows_deleted =
-                    repositories::native_event_cleanup_baseline::apply(&self.connection, &page)
-                        .await?;
-            }
-            Ok(outcome)
-        })
-        .await
     }
 
     /// One bounded, turn-addressed maintenance quantum. No source-table scan.
@@ -45142,13 +45115,31 @@ mod tests {
             sequence += 1;
         }
 
-        let compacted = store
-            .with_maintenance_access()
-            .cleanup_native_events_baseline_quantum(0)
+        let initial = store
+            .list_cli_runtime_native_events(CliRuntimeNativeEventListFilter {
+                runtime_id: Some("codex".to_owned()),
+                thread_id: Some(thread_id.to_owned()),
+                ..Default::default()
+            })
             .await
-            .expect("compaction should succeed");
-        assert_eq!(compacted.rows_scanned, 9);
-        assert_eq!(compacted.rows_deleted, 6);
+            .expect("initial native events should list");
+        assert_eq!(initial.len(), 9);
+        let maintenance = store.with_maintenance_access();
+        let mut deleted = 0;
+        let mut finished = false;
+        for _ in 0..20 {
+            let metrics = maintenance
+                .cleanup_native_events_quantum()
+                .await
+                .expect("cleanup should succeed");
+            deleted += metrics.events_deleted;
+            if metrics.jobs_examined == 0 {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "cleanup should settle within the bounded fixture");
+        assert_eq!(deleted, 6);
 
         let remaining = store
             .list_cli_runtime_native_events(CliRuntimeNativeEventListFilter {
@@ -53270,6 +53261,22 @@ mod tests {
         assert_eq!(
             checkpoint.checkpoint_kind,
             TurnExecutionCheckpointKind::WindowExhausted
+        );
+        let stored_checkpoint = store
+            .database_connection()
+            .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT checkpoint_kind FROM turn_execution_checkpoint WHERE id = ?",
+                [checkpoint.id.clone().into()],
+            ))
+            .await
+            .expect("stored checkpoint kind should query")
+            .expect("stored checkpoint should exist");
+        assert_eq!(
+            stored_checkpoint
+                .try_get::<String>("", "checkpoint_kind")
+                .unwrap(),
+            "window_exhausted"
         );
 
         assert_eq!(

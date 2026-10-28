@@ -277,23 +277,6 @@ mod tests {
     }
 
     #[test]
-    fn cross_capsule_route_accepts_an_authorized_same_workspace_edge() {
-        let source = envelope();
-        let mut route = route();
-        route.same_capsule = false;
-        let execution_id = AgentExecutionId::new("E12345678901234567890").unwrap();
-        let target = AgentStartTarget::RoutedThread {
-            route_id: pioneer_protocol::AgentDelegationRouteId::new("R12345678901234567890")
-                .unwrap(),
-            thread_id: "T12345678901234567891".to_owned(),
-        };
-        // Composite route authorization accepts a same-workspace
-        // cross-capsule edge and the commit boundary revalidates its durable
-        // policy and route generations.
-        assert!(authorize_route(&request(&route, &source, &execution_id, &target)).is_ok());
-    }
-
-    #[test]
     fn route_denials_have_same_public_message() {
         assert_eq!(
             RouteDenyReason::SourceExport.public_message(),

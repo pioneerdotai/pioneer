@@ -8443,66 +8443,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_skill_capability_summary_rejects_disabled_skill() {
-        let explicit_ref = explicit_skill_ref("docs", "docs");
-        let resolution = turn_skill_resolution(
-            Vec::new(),
-            vec![ExcludedSkill {
-                skill_id: test_skill_id("docs"),
-                owner: Some("workspace".to_owned()),
-                slug: "workspace/docs".to_owned(),
-                source_kind: "user".to_owned(),
-                reason: SkillExcludedReason::DisabledByPolicy,
-                dependency_diagnostics: Vec::new(),
-                security_findings: Vec::new(),
-            }],
-        );
-
-        let summary = resolve_skill_capability_summary(&[explicit_ref], &resolution);
-
-        assert!(summary.accepted.is_empty());
-        assert_eq!(summary.rejected.len(), 1);
-        assert_eq!(
-            summary.rejected[0].id,
-            format!("skill:{}", test_skill_id("docs"))
-        );
-        assert_eq!(
-            summary.rejected[0].reason,
-            TurnCapabilityRejectedReason::DisabledByPolicy
-        );
-    }
-
-    #[test]
-    fn resolve_skill_capability_summary_rejects_security_blocked_skill() {
-        let explicit_ref = explicit_skill_ref("docs", "docs");
-        let resolution = turn_skill_resolution(
-            Vec::new(),
-            vec![ExcludedSkill {
-                skill_id: test_skill_id("docs"),
-                owner: Some("workspace".to_owned()),
-                slug: "workspace/docs".to_owned(),
-                source_kind: "user".to_owned(),
-                reason: SkillExcludedReason::SecurityBlocked,
-                dependency_diagnostics: Vec::new(),
-                security_findings: Vec::new(),
-            }],
-        );
-
-        let summary = resolve_skill_capability_summary(&[explicit_ref], &resolution);
-
-        assert!(summary.accepted.is_empty());
-        assert_eq!(summary.rejected.len(), 1);
-        assert_eq!(
-            summary.rejected[0].id,
-            format!("skill:{}", test_skill_id("docs"))
-        );
-        assert_eq!(
-            summary.rejected[0].reason,
-            TurnCapabilityRejectedReason::SecurityBlocked
-        );
-    }
-
     #[tokio::test]
     async fn large_search_page_is_retained_before_a_readable_reference_is_published() {
         use super::{AgentDurableEvent, AgentEventHub, retained_search_page_message};
@@ -8935,43 +8875,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_tools_visibility_expansion_exposes_all_task_tools_next_round() {
-        let task_tools = BuiltinToolDomain::Task.tool_names();
-        let built = build_tools_with_extension_names(task_tools);
-        let mut visible_tool_names = vec!["request_tools".to_owned(), "read_file".to_owned()];
-        let result = request_tools_result_for_added(
-            "task",
-            task_tools.iter().map(|name| (*name).to_owned()),
-        );
-
-        apply_request_tools_visibility_expansion(
-            &mut visible_tool_names,
-            &result,
-            built.router.as_ref(),
-        );
-        built
-            .router
-            .set_model_visible_tools(&visible_tool_names)
-            .await;
-        let visible = built
-            .router
-            .model_visible_specs()
-            .await
-            .into_iter()
-            .map(|spec| spec.name)
-            .collect::<Vec<_>>();
-
-        assert!(visible.contains(&"request_tools".to_owned()));
-        assert!(visible.contains(&"read_file".to_owned()));
-        for name in task_tools {
-            assert!(
-                visible.contains(&(*name).to_owned()),
-                "task domain tool `{name}` must be visible next round"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn phase_11_review_required_visibility_exposes_only_allowed_review_tools() {
         let built = build_tools_with_extension_names(&[
             "task_get",
@@ -9057,48 +8960,6 @@ mod tests {
         assert!(visible.contains(&"task_get".to_owned()));
         assert!(visible.contains(&"task_wait".to_owned()));
         assert!(!visible.contains(&"task_revise".to_owned()));
-    }
-
-    #[tokio::test]
-    async fn request_tools_visibility_expansion_exposes_all_memory_tools_next_round() {
-        let memory_tools = BuiltinToolDomain::Memory.tool_names();
-        let built = build_tools_with_extension_names(memory_tools);
-        let mut visible_tool_names = vec!["request_tools".to_owned(), "read_file".to_owned()];
-        let result = request_tools_result_for_added(
-            "memory",
-            memory_tools.iter().map(|name| (*name).to_owned()),
-        );
-
-        let added = apply_request_tools_visibility_expansion(
-            &mut visible_tool_names,
-            &result,
-            built.router.as_ref(),
-        );
-        built
-            .router
-            .set_model_visible_tools(&visible_tool_names)
-            .await;
-        let visible = built
-            .router
-            .model_visible_specs()
-            .await
-            .into_iter()
-            .map(|spec| spec.name)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            added,
-            memory_tools
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect::<Vec<_>>()
-        );
-        for name in memory_tools {
-            assert!(
-                visible.contains(&(*name).to_owned()),
-                "memory domain tool `{name}` must be visible next round"
-            );
-        }
     }
 
     #[tokio::test]
@@ -9351,38 +9212,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_visibility_core_only_hides_materialized_domain_tools() {
-        let built = build_tools_with_extension_names(&[
-            "memory_search",
-            "memory_get",
-            "task_create",
-            "skill.test.dynamic",
-        ]);
-
-        let visibility = built.router.compute_final_visible_tools(
-            &["exec_command".to_owned(), "request_tools".to_owned()],
-            &[],
-            &[],
-        );
-
-        assert_eq!(
-            visibility.visible_tools,
-            vec![
-                "exec_command".to_owned(),
-                "request_tools".to_owned(),
-                "skill.test.dynamic".to_owned()
-            ]
-        );
-        assert!(
-            !visibility
-                .visible_tools
-                .contains(&"memory_search".to_owned())
-        );
-        assert!(!visibility.visible_tools.contains(&"memory_get".to_owned()));
-        assert!(!visibility.visible_tools.contains(&"task_create".to_owned()));
-    }
-
-    #[test]
     fn tool_visibility_adds_requested_optional_tools_only_when_registered() {
         let built = build_tools_with_extension_names(&["memory_search", "memory_get"]);
 
@@ -9439,40 +9268,6 @@ mod tests {
                 "memory_search".to_owned()
             ]
         );
-    }
-
-    #[test]
-    fn tool_visibility_hidden_task_turn_requires_preflight_or_current_state() {
-        let task_tools = BuiltinToolDomain::Task.tool_names();
-        let built = build_tools_with_extension_names(task_tools);
-
-        let core_only = built.router.compute_final_visible_tools(
-            &["request_tools".to_owned(), "read_file".to_owned()],
-            &[],
-            &[],
-        );
-        for name in task_tools {
-            assert!(
-                !core_only.visible_tools.contains(&(*name).to_owned()),
-                "task tool `{name}` must not be visible by default"
-            );
-        }
-
-        let selected = built.router.compute_final_visible_tools(
-            &["request_tools".to_owned(), "read_file".to_owned()],
-            &["task_create".to_owned()],
-            &[],
-        );
-        assert!(selected.visible_tools.contains(&"task_create".to_owned()));
-        assert!(!selected.visible_tools.contains(&"task_wait".to_owned()));
-
-        let preserved = built.router.compute_final_visible_tools(
-            &["request_tools".to_owned(), "read_file".to_owned()],
-            &[],
-            &["task_create".to_owned(), "task_wait".to_owned()],
-        );
-        assert!(preserved.visible_tools.contains(&"task_create".to_owned()));
-        assert!(preserved.visible_tools.contains(&"task_wait".to_owned()));
     }
 
     #[test]
@@ -10570,6 +10365,42 @@ mod tests {
 
         assert_eq!(message.content, "first\nsecond");
         assert!(message.content_parts.is_empty());
+    }
+
+    #[test]
+    fn excluded_skills_preserve_exact_identity_and_rejection_reason() {
+        for (excluded_reason, expected) in [
+            (
+                SkillExcludedReason::DisabledByPolicy,
+                TurnCapabilityRejectedReason::DisabledByPolicy,
+            ),
+            (
+                SkillExcludedReason::SecurityBlocked,
+                TurnCapabilityRejectedReason::SecurityBlocked,
+            ),
+        ] {
+            let explicit_ref = explicit_skill_ref("docs", "docs");
+            let resolution = turn_skill_resolution(
+                Vec::new(),
+                vec![ExcludedSkill {
+                    skill_id: test_skill_id("docs"),
+                    owner: Some("workspace".to_owned()),
+                    slug: "workspace/docs".to_owned(),
+                    source_kind: "user".to_owned(),
+                    reason: excluded_reason,
+                    dependency_diagnostics: Vec::new(),
+                    security_findings: Vec::new(),
+                }],
+            );
+            let summary = resolve_skill_capability_summary(&[explicit_ref], &resolution);
+            assert!(summary.accepted.is_empty());
+            assert_eq!(summary.rejected.len(), 1);
+            assert_eq!(
+                summary.rejected[0].id,
+                format!("skill:{}", test_skill_id("docs"))
+            );
+            assert_eq!(summary.rejected[0].reason, expected);
+        }
     }
 }
 

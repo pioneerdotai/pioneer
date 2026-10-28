@@ -9345,33 +9345,6 @@ while read line; do :; done
     }
 
     #[tokio::test]
-    async fn command_approval_accept_writes_codex_decision_payload() {
-        assert_command_approval_decision_response(
-            CodexCommandApprovalDecision::Accept,
-            json!("accept"),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn command_approval_accept_for_session_writes_codex_decision_payload() {
-        assert_command_approval_decision_response(
-            CodexCommandApprovalDecision::AcceptForSession,
-            json!("acceptForSession"),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn command_approval_decline_writes_codex_decision_payload() {
-        assert_command_approval_decision_response(
-            CodexCommandApprovalDecision::Decline,
-            json!("decline"),
-        )
-        .await;
-    }
-
-    #[tokio::test]
     async fn command_approval_cancel_writes_decision_and_can_interrupt_turn() {
         let (rpc, mut server_reader, mut server_writer) = client_pair();
         let mut server_requests = rpc
@@ -9506,33 +9479,6 @@ while read line; do :; done
         assert_eq!(decoded.native_item_id.as_deref(), Some("codex-item-1"));
         assert_eq!(decoded.started_at_ms, Some(1234));
         assert_eq!(decoded.raw["futureField"], json!(true));
-    }
-
-    #[tokio::test]
-    async fn file_change_approval_accept_writes_codex_decision_payload() {
-        assert_file_change_approval_decision_response(
-            CodexFileChangeApprovalDecision::Accept,
-            json!("accept"),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn file_change_approval_decline_writes_codex_decision_payload() {
-        assert_file_change_approval_decision_response(
-            CodexFileChangeApprovalDecision::Decline,
-            json!("decline"),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn file_change_approval_cancel_writes_codex_decision_payload() {
-        assert_file_change_approval_decision_response(
-            CodexFileChangeApprovalDecision::Cancel,
-            json!("cancel"),
-        )
-        .await;
     }
 
     async fn assert_file_change_approval_decision_response(
@@ -12015,96 +11961,6 @@ while read line; do :; done
         );
     }
 
-    #[tokio::test]
-    async fn frame_beyond_spool_budget_requests_session_recovery() {
-        let budget = crate::NativeEventBudget {
-            max_frame_bytes: 128,
-            max_recovery_frame_bytes: 256,
-            ..crate::NativeEventBudget::default()
-        };
-        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
-        let mut diagnostics = client
-            .take_diagnostic_receiver()
-            .expect("diagnostic receiver");
-        let pending_client = client.clone();
-        let pending = tokio::spawn(async move {
-            pending_client
-                .request_value("account/read", Some(json!({})), Duration::from_secs(2))
-                .await
-        });
-        let _request = read_server_line(&mut server_reader).await;
-        server_writer
-            .write_all(
-                format!(
-                    "{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"{}\"}}}}\n",
-                    "x".repeat(512)
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("write frame beyond finite spool budget");
-
-        let diagnostic = tokio::time::timeout(Duration::from_secs(2), diagnostics.recv())
-            .await
-            .expect("session recovery diagnostic should arrive")
-            .expect("diagnostic channel should deliver recovery request");
-        assert_eq!(
-            diagnostic.kind,
-            CodexJsonlRpcClientDiagnosticKind::SessionRecoveryRequired
-        );
-        assert!(
-            diagnostic
-                .message
-                .contains("recovery frame exceeds 256 bytes")
-        );
-        assert!(matches!(
-            pending.await.expect("pending task should join"),
-            Err(CodexJsonlRpcClientError::TransportClosed { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn malformed_oversized_frame_requests_session_recovery() {
-        let budget = crate::NativeEventBudget {
-            max_frame_bytes: 128,
-            max_recovery_frame_bytes: 2 * 1024,
-            ..crate::NativeEventBudget::default()
-        };
-        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
-        let mut diagnostics = client
-            .take_diagnostic_receiver()
-            .expect("diagnostic receiver");
-        let pending_client = client.clone();
-        let pending = tokio::spawn(async move {
-            pending_client
-                .request_value("account/read", Some(json!({})), Duration::from_secs(2))
-                .await
-        });
-        let _request = read_server_line(&mut server_reader).await;
-        let malformed = format!(
-            "{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"thread\",\"text\":\"{}\"\n",
-            "x".repeat(512)
-        );
-        server_writer
-            .write_all(malformed.as_bytes())
-            .await
-            .expect("write malformed oversized frame");
-
-        let diagnostic = tokio::time::timeout(Duration::from_secs(2), diagnostics.recv())
-            .await
-            .expect("session recovery diagnostic should arrive")
-            .expect("diagnostic channel should deliver recovery request");
-        assert_eq!(
-            diagnostic.kind,
-            CodexJsonlRpcClientDiagnosticKind::SessionRecoveryRequired
-        );
-        assert!(diagnostic.message.contains("failed to stream oversized"));
-        assert!(matches!(
-            pending.await.expect("pending task should join"),
-            Err(CodexJsonlRpcClientError::TransportClosed { .. })
-        ));
-    }
-
     fn codex_account_probe_config(root: &Path, executable: &Path) -> CodexAccountProbeConfig {
         CodexAccountProbeConfig {
             executable: executable.to_string_lossy().into_owned(),
@@ -12875,5 +12731,98 @@ while read line; do :; done
         );
         let target = fs::read_link(link).expect("read symlink");
         assert_eq!(target, expected_target);
+    }
+
+    #[tokio::test]
+    async fn command_approval_decisions_write_exact_codex_payloads() {
+        for (decision, expected) in [
+            (CodexCommandApprovalDecision::Accept, json!("accept")),
+            (
+                CodexCommandApprovalDecision::AcceptForSession,
+                json!("acceptForSession"),
+            ),
+            (CodexCommandApprovalDecision::Decline, json!("decline")),
+        ] {
+            assert_command_approval_decision_response(decision, expected).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn file_change_approval_decisions_write_exact_codex_payloads() {
+        for (decision, expected) in [
+            (CodexFileChangeApprovalDecision::Accept, json!("accept")),
+            (CodexFileChangeApprovalDecision::Decline, json!("decline")),
+            (CodexFileChangeApprovalDecision::Cancel, json!("cancel")),
+        ] {
+            assert_file_change_approval_decision_response(decision, expected).await;
+        }
+    }
+
+    #[test]
+    fn unrecoverable_oversized_frames_request_recovery_and_close_pending_requests() {
+        for (max_recovery_frame_bytes, frame, write_message, expected_message) in [
+            (
+                256,
+                format!(
+                    "{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"{}\"}}}}\n",
+                    "x".repeat(512)
+                ),
+                "write frame beyond finite spool budget",
+                "recovery frame exceeds 256 bytes",
+            ),
+            (
+                2 * 1024,
+                format!(
+                    "{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"thread\",\"text\":\"{}\"\n",
+                    "x".repeat(512)
+                ),
+                "write malformed oversized frame",
+                "failed to stream oversized",
+            ),
+        ] {
+            let body = async {
+                let budget = crate::NativeEventBudget {
+                    max_frame_bytes: 128,
+                    max_recovery_frame_bytes,
+                    ..crate::NativeEventBudget::default()
+                };
+                let (client, mut server_reader, mut server_writer) =
+                    client_pair_with_budget(budget);
+                let mut diagnostics = client
+                    .take_diagnostic_receiver()
+                    .expect("diagnostic receiver");
+                let pending_client = client.clone();
+                let pending = tokio::spawn(async move {
+                    pending_client
+                        .request_value("account/read", Some(json!({})), Duration::from_secs(2))
+                        .await
+                });
+                let _request = read_server_line(&mut server_reader).await;
+                server_writer
+                    .write_all(frame.as_bytes())
+                    .await
+                    .expect(write_message);
+                let diagnostic = tokio::time::timeout(Duration::from_secs(2), diagnostics.recv())
+                    .await
+                    .expect("session recovery diagnostic should arrive")
+                    .expect("diagnostic channel should deliver recovery request");
+                assert_eq!(
+                    diagnostic.kind,
+                    CodexJsonlRpcClientDiagnosticKind::SessionRecoveryRequired
+                );
+                assert!(diagnostic.message.contains(expected_message));
+                assert!(matches!(
+                    pending.await.expect("pending task should join"),
+                    Err(CodexJsonlRpcClientError::TransportClosed { .. })
+                ));
+            };
+            let body = std::pin::pin!(body);
+            let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(body);
+        }
     }
 }

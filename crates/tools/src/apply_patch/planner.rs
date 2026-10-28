@@ -672,55 +672,6 @@ mod tests {
     }
 
     #[test]
-    fn add_then_update_consumes_virtual_predecessor() {
-        let patch = "*** Begin Patch\n*** Add File: new.txt\n+old\n*** Update File: new.txt\n@@\n-old\n+new\n*** End Patch";
-        let planned = plan_text(patch, &[]).unwrap();
-        assert_eq!(planned.workspace.files()["new.txt"].bytes, b"new");
-        assert_eq!(planned.operations.len(), 2);
-    }
-
-    #[test]
-    fn add_then_replace_uses_planner_version_without_model_token() {
-        let patch = "*** Begin Patch\n*** Add File: file.txt\n+middle\n*** Replace File: file.txt\n+final\n*** End Patch";
-        let planned = plan_text(patch, &[]).unwrap();
-        assert_eq!(planned.workspace.files()["file.txt"].bytes, b"final");
-    }
-
-    #[test]
-    fn replace_preserves_bom_crlf_and_final_newline() {
-        let token = FileVersionToken::from_bytes(b"\xef\xbb\xbfold\r\n");
-        let patch = format!(
-            "*** Begin Patch\n*** Replace File: file.txt\n*** If-Match: {token}\n+final\n*** End Patch"
-        );
-        let planned = plan_text(&patch, &[("file.txt", "\u{feff}old\r\n")]).unwrap();
-        assert_eq!(
-            planned.workspace.files()["file.txt"].bytes,
-            b"\xef\xbb\xbffinal\r\n"
-        );
-    }
-
-    #[test]
-    fn delete_then_add_recreates_path() {
-        let token = FileVersionToken::from_bytes(b"old");
-        let patch = format!(
-            "*** Begin Patch\n*** Delete File: file.txt\n*** If-Match: {token}\n*** Add File: file.txt\n+new\n*** End Patch"
-        );
-        let planned = plan_text(&patch, &[("file.txt", "old")]).unwrap();
-        assert_eq!(planned.workspace.files()["file.txt"].bytes, b"new");
-    }
-
-    #[test]
-    fn move_then_update_uses_destination() {
-        let token = FileVersionToken::from_bytes(b"old");
-        let patch = format!(
-            "*** Begin Patch\n*** Update File: old.txt\n*** If-Match: {token}\n*** Move to: new.txt\n*** If-Destination: absent\n@@\n-old\n+moved\n*** Update File: new.txt\n@@\n-moved\n+final\n*** End Patch"
-        );
-        let planned = plan_text(&patch, &[("old.txt", "old")]).unwrap();
-        assert!(!planned.workspace.contains("old.txt"));
-        assert_eq!(planned.workspace.files()["new.txt"].bytes, b"final");
-    }
-
-    #[test]
     fn move_to_virtual_destination_rejects_model_exact_guard() {
         let source_token = FileVersionToken::from_bytes(b"source");
         let virtual_destination_token = FileVersionToken::from_bytes(b"destination");
@@ -758,13 +709,96 @@ mod tests {
     }
 
     #[test]
-    fn reusing_a_deleted_path_does_not_keep_stale_move_cycle_edges() {
-        let token = FileVersionToken::from_bytes(b"a");
-        let patch = format!(
-            "*** Begin Patch\n*** Update File: a\n*** If-Match: {token}\n*** Move to: b\n*** If-Destination: absent\n@@\n-a\n+b\n*** Delete File: b\n*** Add File: b\n+fresh\n*** Update File: b\n*** Move to: a\n*** If-Destination: absent\n@@\n-fresh\n+final\n*** End Patch"
-        );
-        let planned = plan_text(&patch, &[("a", "a")]).unwrap();
-        assert_eq!(planned.workspace.files()["a"].bytes, b"final");
-        assert!(!planned.workspace.contains("b"));
+    fn patch_sequences_preserve_the_exact_virtual_workspace_and_operation_count() {
+        for (case, patch, files, expected_path, expected_bytes, expected_operations) in [
+            (
+                "add_then_update_consumes_virtual_predecessor",
+                {
+                    let patch = "*** Begin Patch\n*** Add File: new.txt\n+old\n*** Update File: new.txt\n@@\n-old\n+new\n*** End Patch";
+                    patch.to_string()
+                },
+                vec![],
+                "new.txt",
+                &b"new"[..],
+                2,
+            ),
+            (
+                "add_then_replace_uses_planner_version_without_model_token",
+                {
+                    let patch = "*** Begin Patch\n*** Add File: file.txt\n+middle\n*** Replace File: file.txt\n+final\n*** End Patch";
+                    patch.to_string()
+                },
+                vec![],
+                "file.txt",
+                &b"final"[..],
+                2,
+            ),
+            (
+                "replace_preserves_bom_crlf_and_final_newline",
+                {
+                    let token = FileVersionToken::from_bytes(b"\xef\xbb\xbfold\r\n");
+                    let patch = format!(
+                        "*** Begin Patch\n*** Replace File: file.txt\n*** If-Match: {token}\n+final\n*** End Patch"
+                    );
+                    patch.to_string()
+                },
+                vec![("file.txt", "\u{feff}old\r\n")],
+                "file.txt",
+                &b"\xef\xbb\xbffinal\r\n"[..],
+                1,
+            ),
+            (
+                "delete_then_add_recreates_path",
+                {
+                    let token = FileVersionToken::from_bytes(b"old");
+                    let patch = format!(
+                        "*** Begin Patch\n*** Delete File: file.txt\n*** If-Match: {token}\n*** Add File: file.txt\n+new\n*** End Patch"
+                    );
+                    patch.to_string()
+                },
+                vec![("file.txt", "old")],
+                "file.txt",
+                &b"new"[..],
+                2,
+            ),
+            (
+                "move_then_update_uses_destination",
+                {
+                    let token = FileVersionToken::from_bytes(b"old");
+                    let patch = format!(
+                        "*** Begin Patch\n*** Update File: old.txt\n*** If-Match: {token}\n*** Move to: new.txt\n*** If-Destination: absent\n@@\n-old\n+moved\n*** Update File: new.txt\n@@\n-moved\n+final\n*** End Patch"
+                    );
+                    patch.to_string()
+                },
+                vec![("old.txt", "old")],
+                "new.txt",
+                &b"final"[..],
+                2,
+            ),
+            (
+                "reusing_a_deleted_path_does_not_keep_stale_move_cycle_edges",
+                {
+                    let token = FileVersionToken::from_bytes(b"a");
+                    let patch = format!(
+                        "*** Begin Patch\n*** Update File: a\n*** If-Match: {token}\n*** Move to: b\n*** If-Destination: absent\n@@\n-a\n+b\n*** Delete File: b\n*** Add File: b\n+fresh\n*** Update File: b\n*** Move to: a\n*** If-Destination: absent\n@@\n-fresh\n+final\n*** End Patch"
+                    );
+                    patch.to_string()
+                },
+                vec![("a", "a")],
+                "a",
+                &b"final"[..],
+                4,
+            ),
+        ] {
+            let planned = plan_text(&patch, &files).expect(case);
+            let files = planned
+                .workspace
+                .files()
+                .iter()
+                .map(|(path, file)| (path.as_str(), file.bytes.as_slice()))
+                .collect::<Vec<_>>();
+            assert_eq!(files, vec![(expected_path, expected_bytes)], "{case}");
+            assert_eq!(planned.operations.len(), expected_operations, "{case}");
+        }
     }
 }

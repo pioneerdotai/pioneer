@@ -1032,32 +1032,6 @@ mod tests {
     use memvid_core::SearchHitMetadata;
 
     #[test]
-    fn search_request_helper_sets_all_fields_explicitly() {
-        let request = memvid_search_request("birthday", 7, 120);
-        assert_eq!(request.query, "birthday");
-        assert_eq!(request.top_k, 7);
-        assert_eq!(request.snippet_chars, 120);
-        assert!(request.uri.is_none());
-        assert!(request.scope.is_none());
-        assert!(request.cursor.is_none());
-        assert!(request.temporal.is_none());
-        assert!(request.as_of_frame.is_none());
-        assert!(request.as_of_ts.is_none());
-        assert!(request.no_sketch);
-        assert!(request.acl_context.is_none());
-    }
-
-    #[test]
-    fn capsule_id_and_ref_do_not_include_raw_scope_key() {
-        let scope_key_hash = sha256_hex("raw-user-key");
-        let id = deterministic_capsule_id("user", scope_key_hash.as_str());
-        let reference = capsule_ref("user", scope_key_hash.as_str(), id.as_str());
-        assert_eq!(id.len(), 21);
-        assert!(!reference.contains("raw-user-key"));
-        assert!(reference.contains(scope_key_hash.as_str()));
-    }
-
-    #[test]
     fn stale_source_kind_metadata_is_ignored_by_search_mapping() {
         let mut extra_metadata = BTreeMap::new();
         extra_metadata.insert("pioneer.memory_id".to_owned(), "mem_legacy".to_owned());

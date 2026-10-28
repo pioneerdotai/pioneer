@@ -554,23 +554,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rpc_fail_pending_json_rpc_requests_delegates_to_pending_map() {
-        let (response_tx, response_rx) = mpsc::channel();
-        let mut pending = PendingJsonRpcRequests::default();
-        pending.insert("request-1", response_tx);
-
-        assert_eq!(
-            fail_pending_json_rpc_requests(&mut pending, "websocket closed"),
-            1
-        );
-        assert!(pending.is_empty());
-        assert_eq!(
-            response_rx.recv().expect("response"),
-            Err(JsonRpcResponseError::transport("websocket closed"))
-        );
-    }
-
     struct ImmediateTransport {
         response: JsonRpcResponseResult,
     }

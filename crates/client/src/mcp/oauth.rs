@@ -1102,37 +1102,7 @@ mod tests {
         assert_eq!(shell.open.load(Ordering::SeqCst), 0);
         core.stop_mcp_oauth();
     }
-    #[test]
-    fn duplicate_effects_preserve_browser_failure_fallback() {
-        let core = crate::catalog_test_support::client();
-        let shell = Arc::new(Shell::default());
-        core.set_mcp_oauth_shell(shell.clone());
-        let event = event(McpOAuthState::AwaitingCallback);
-        for _ in 0..3 {
-            assert!(
-                core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(
-                    event.clone()
-                ))
-            );
-        }
-        wait_browser(&core);
-        assert_eq!(shell.open.load(Ordering::SeqCst), 1);
-        wait_browser(&core);
-        assert!(
-            core.mcp_oauth_presentation("workspace", "server")
-                .unwrap()
-                .1
-        );
-        wait_browser(&core);
-        assert!(
-            core.mcp_oauth_presentation("workspace", "server")
-                .unwrap()
-                .0
-                .authorization_url
-                .is_some()
-        );
-        core.stop_mcp_oauth();
-    }
+
     #[test]
     fn manual_browser_retry_requires_live_operation_and_updates_failure_projection() {
         let core = crate::catalog_test_support::client();
@@ -1305,6 +1275,21 @@ mod tests {
     }
     #[test]
     fn current_cleanup_replaces_old_denied_but_not_new_consent() {
+        for pending in [
+            McpOAuthState::Preparing,
+            McpOAuthState::AwaitingCallback,
+            McpOAuthState::Exchanging,
+            McpOAuthState::Resolving,
+        ] {
+            assert_eq!(
+                effective_oauth_management_state(
+                    Some(pending),
+                    Some(McpOAuthState::CleanupRequired),
+                    false
+                ),
+                Some(pending)
+            );
+        }
         let core = crate::catalog_test_support::client();
         let shell = Arc::new(Shell::default());
         core.set_mcp_oauth_shell(shell.clone());
@@ -1376,7 +1361,11 @@ mod tests {
         let shell = Arc::new(Shell::default());
         core.set_mcp_oauth_shell(shell.clone());
         let pending = event(McpOAuthState::AwaitingCallback);
-        core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(pending.clone()));
+        assert!(
+            core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(
+                pending.clone(),
+            ))
+        );
         for _ in 0..2 {
             core.observe_mcp_oauth_notification(&GatewayNotification::McpChanged(
                 pioneer_protocol::McpChangedNotification {
@@ -1389,14 +1378,19 @@ mod tests {
                     }],
                 },
             ));
-            core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(
-                pending.clone(),
-            ));
+            assert!(
+                core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(
+                    pending.clone(),
+                ))
+            );
         }
         assert_eq!(shell.release.load(Ordering::SeqCst), 0);
         wait_browser(&core);
         assert_eq!(shell.open.load(Ordering::SeqCst), 1);
-        assert!(core.mcp_oauth_presentation("workspace", "server").is_some());
+        let (presentation, failed_browser) =
+            core.mcp_oauth_presentation("workspace", "server").unwrap();
+        assert!(failed_browser);
+        assert!(presentation.authorization_url.is_some());
         core.stop_mcp_oauth();
     }
     #[test]

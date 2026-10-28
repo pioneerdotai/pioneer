@@ -616,43 +616,6 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_order_preserves_ordered_provider_values() {
-        assert_eq!(
-            ordered_known_reasoning_effort_options(&[
-                "low".to_owned(),
-                "medium".to_owned(),
-                "high".to_owned()
-            ]),
-            vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()]
-        );
-    }
-
-    #[test]
-    fn reasoning_effort_order_sorts_unordered_known_values() {
-        assert_eq!(
-            ordered_known_reasoning_effort_options(&[
-                "high".to_owned(),
-                "low".to_owned(),
-                "x-high".to_owned(),
-                "low".to_owned()
-            ]),
-            vec!["low".to_owned(), "high".to_owned(), "xhigh".to_owned()]
-        );
-    }
-
-    #[test]
-    fn reasoning_effort_order_drops_unknown_provider_values() {
-        assert_eq!(
-            ordered_known_reasoning_effort_options(&[
-                "low".to_owned(),
-                "turbo-high".to_owned(),
-                "maximum".to_owned(),
-            ]),
-            vec!["low".to_owned(), "max".to_owned()]
-        );
-    }
-
-    #[test]
     fn reasoning_effort_rows_require_supported_model_and_options() {
         assert!(reasoning_effort_rows_for_model(&model("gpt-5", None), None).is_empty());
         assert!(
@@ -786,5 +749,34 @@ mod tests {
                 .language_summary,
             "en, de"
         );
+    }
+
+    #[test]
+    fn reasoning_effort_order_normalizes_sorts_and_filters_known_values() {
+        for (case, options, expected) in [
+            (
+                "ordered",
+                vec!["low", "medium", "high"],
+                vec!["low", "medium", "high"],
+            ),
+            (
+                "unordered aliases and duplicates",
+                vec!["high", "low", "x-high", "low"],
+                vec!["low", "high", "xhigh"],
+            ),
+            (
+                "unknown and maximum alias",
+                vec!["low", "turbo-high", "maximum"],
+                vec!["low", "max"],
+            ),
+        ] {
+            let options = options.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let expected = expected.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(
+                ordered_known_reasoning_effort_options(&options),
+                expected,
+                "{case}"
+            );
+        }
     }
 }

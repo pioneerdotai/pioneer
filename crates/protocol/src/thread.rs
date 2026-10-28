@@ -738,22 +738,6 @@ mod tests {
     }
 
     #[test]
-    fn thread_start_params_round_trip_workspace_id() {
-        let params: ThreadStartParams = serde_json::from_value(json!({
-            "thread_id": "thr_123",
-            "workspace_id": "ws_123"
-        }))
-        .expect("params should decode");
-        assert_eq!(params.workspace_id, "ws_123");
-
-        let encoded = serde_json::to_value(params).expect("params should encode");
-        assert_eq!(
-            encoded,
-            json!({"thread_id": "thr_123", "workspace_id": "ws_123"})
-        );
-    }
-
-    #[test]
     fn thread_tree_response_defaults_agents_docs_and_omits_content_in_summaries() {
         let decoded: ThreadTreeResponse = serde_json::from_value(json!({
             "workspace_id": "ws_123",
@@ -791,40 +775,6 @@ mod tests {
             .expect("summary should be present");
         assert!(summary.get("content").is_none());
         assert_eq!(summary.get("char_count"), Some(&json!(12)));
-    }
-
-    #[test]
-    fn thread_start_params_require_workspace_id() {
-        let error = serde_json::from_value::<ThreadStartParams>(json!({
-            "thread_id": "thr_123"
-        }))
-        .expect_err("workspace_id is required");
-        assert!(error.to_string().contains("workspace_id"));
-    }
-
-    #[test]
-    fn thread_start_params_round_trip_thread_id() {
-        let params: ThreadStartParams = serde_json::from_value(json!({
-            "workspace_id": "ws_123",
-            "thread_id": "thr_123"
-        }))
-        .expect("params should decode");
-        assert_eq!(params.thread_id, "thr_123");
-
-        let encoded = serde_json::to_value(params).expect("params should encode");
-        assert_eq!(
-            encoded,
-            json!({"thread_id": "thr_123", "workspace_id": "ws_123"})
-        );
-    }
-
-    #[test]
-    fn thread_start_params_require_thread_id() {
-        let error = serde_json::from_value::<ThreadStartParams>(json!({
-            "workspace_id": "ws_123"
-        }))
-        .expect_err("thread_id is required");
-        assert!(error.to_string().contains("thread_id"));
     }
 
     #[test]
@@ -973,5 +923,41 @@ mod tests {
         for protected in ["display_name", "nickname", "role_key", "membership"] {
             assert!(changed_value.get(protected).is_none());
         }
+    }
+
+    #[test]
+    fn thread_start_params_require_explicit_identifiers() {
+        for (input, rejection_message, expected_field) in [
+            (
+                json!({"thread_id": "thr_123"}),
+                "workspace_id is required",
+                "workspace_id",
+            ),
+            (
+                json!({"workspace_id": "ws_123"}),
+                "thread_id is required",
+                "thread_id",
+            ),
+        ] {
+            let error =
+                serde_json::from_value::<ThreadStartParams>(input).expect_err(rejection_message);
+            assert!(error.to_string().contains(expected_field));
+        }
+    }
+
+    #[test]
+    fn thread_start_params_round_trip_workspace_and_thread_ids() {
+        let params: ThreadStartParams = serde_json::from_value(json!({
+            "thread_id": "thr_123",
+            "workspace_id": "ws_123"
+        }))
+        .expect("params should decode");
+        assert_eq!(params.workspace_id, "ws_123");
+        assert_eq!(params.thread_id, "thr_123");
+        let encoded = serde_json::to_value(params).expect("params should encode");
+        assert_eq!(
+            encoded,
+            json!({"thread_id": "thr_123", "workspace_id": "ws_123"})
+        );
     }
 }

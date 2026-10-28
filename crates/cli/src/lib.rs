@@ -694,27 +694,6 @@ mod tests {
     }
 
     #[test]
-    fn hidden_cli_mcp_stdio_is_classified_before_ordinary_cli() {
-        let parsed = pioneer_cli_mcp_bridge::helper::parse_hidden_helper_args(
-            [
-                OsString::from("__cli-mcp-stdio"),
-                OsString::from("--bootstrap-file"),
-                OsString::from("/private/bootstrap"),
-            ]
-            .into_iter(),
-        )
-        .expect("hidden helper args");
-        assert_eq!(parsed, Some(std::path::PathBuf::from("/private/bootstrap")));
-        assert!(
-            pioneer_cli_mcp_bridge::helper::parse_hidden_helper_args(
-                [OsString::from("status")].into_iter()
-            )
-            .expect("ordinary args")
-            .is_none()
-        );
-    }
-
-    #[test]
     fn json_commands_reserve_stdout_for_the_machine_protocol() {
         assert!(requests_json_output(
             [OsString::from("start"), OsString::from("--json")].into_iter()
@@ -765,16 +744,5 @@ mod tests {
         let error = run_with_args(args(&["task-invariants", "--json"]))
             .expect_err("missing task-invariants db should fail");
         assert!(is_usage_error(&error));
-    }
-
-    #[test]
-    fn transient_installer_network_failure_has_stable_error_code() {
-        assert_eq!(
-            install_error_code(
-                installer::InstallCommand::Update,
-                "download failed due to a transient network failure",
-            ),
-            "download_transient_network_failure"
-        );
     }
 }

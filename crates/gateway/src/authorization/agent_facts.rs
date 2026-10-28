@@ -401,15 +401,6 @@ mod tests {
     use super::*;
     use pioneer_protocol::{AgentIdentityId, AgentIdentityStatus};
 
-    fn security_decision_is_capacity_independent(
-        envelope: &AgentSecurityEnvelope,
-        action: ResourceAction,
-        _resource_policy: &AgentWorkResourcePolicy,
-        _resource_state: &str,
-    ) -> bool {
-        envelope.allows(action)
-    }
-
     fn envelope() -> AgentSecurityEnvelope {
         let facts = AgentAuthorizationFacts {
             identity_id: AgentIdentityId::new("A12345678901234567890").unwrap(),
@@ -422,21 +413,6 @@ mod tests {
         facts
             .derive_envelope(RoleDefinitionRegistry::new())
             .expect("thread agent role is registered")
-    }
-
-    #[test]
-    fn capacity_state_does_not_change_security() {
-        let envelope = envelope();
-        let policy = AgentWorkResourcePolicy::default();
-        let action = ResourceAction::ChildStart;
-        assert_eq!(
-            security_decision_is_capacity_independent(&envelope, action, &policy, "available"),
-            security_decision_is_capacity_independent(&envelope, action, &policy, "queued")
-        );
-        assert_eq!(
-            security_decision_is_capacity_independent(&envelope, action, &policy, "saturated"),
-            true
-        );
     }
 
     #[test]

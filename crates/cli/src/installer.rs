@@ -3573,50 +3573,6 @@ fi
 
     #[cfg(not(windows))]
     #[test]
-    fn unix_path_setup_updates_profile_without_creating_bash_profile() {
-        let _guard = env_lock().lock().expect("env lock poisoned");
-
-        let home = unique_temp_path("home-profile-no-bash-profile");
-        fs::create_dir_all(&home).expect("create temp home dir");
-        let bin_dir = home.join(".local").join("bin");
-        fs::create_dir_all(&bin_dir).expect("create bin dir");
-        let profile = home.join(".profile");
-        fs::write(&profile, "# test profile\n").expect("write .profile");
-
-        let old_home = std::env::var_os("HOME");
-        let old_path = std::env::var_os("PATH");
-        let old_shell = std::env::var_os("SHELL");
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::set_var("PATH", "/usr/bin:/bin");
-            std::env::set_var("SHELL", "/bin/bash");
-        }
-
-        let result =
-            ensure_unix_user_path_configured(&bin_dir).expect("path setup should not fail");
-
-        restore_env_var("HOME", old_home);
-        restore_env_var("PATH", old_path);
-        restore_env_var("SHELL", old_shell);
-
-        let profile_content = fs::read_to_string(&profile).expect("read .profile");
-        assert!(result.path_updated);
-        assert!(
-            result.warnings.is_empty(),
-            "warnings: {:#?}",
-            result.warnings
-        );
-        assert!(profile_content.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
-        assert!(
-            !home.join(".bash_profile").exists(),
-            "installer should not create .bash_profile and shadow .profile"
-        );
-
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[cfg(not(windows))]
-    #[test]
     fn unix_path_setup_updates_existing_bash_profile_for_bash() {
         let _guard = env_lock().lock().expect("env lock poisoned");
 
@@ -3656,49 +3612,6 @@ fi
         assert_eq!(
             fs::read_to_string(&profile).expect("read .profile"),
             "# profile\n"
-        );
-
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn unix_path_setup_updates_zprofile_for_zsh_without_creating_zshrc() {
-        let _guard = env_lock().lock().expect("env lock poisoned");
-
-        let home = unique_temp_path("home-zsh-zprofile");
-        fs::create_dir_all(&home).expect("create temp home dir");
-        let bin_dir = home.join(".local").join("bin");
-        fs::create_dir_all(&bin_dir).expect("create bin dir");
-
-        let old_home = std::env::var_os("HOME");
-        let old_path = std::env::var_os("PATH");
-        let old_shell = std::env::var_os("SHELL");
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::set_var("PATH", "/usr/bin:/bin");
-            std::env::set_var("SHELL", "/bin/zsh");
-        }
-
-        let result =
-            ensure_unix_user_path_configured(&bin_dir).expect("path setup should not fail");
-
-        restore_env_var("HOME", old_home);
-        restore_env_var("PATH", old_path);
-        restore_env_var("SHELL", old_shell);
-
-        let zprofile = home.join(".zprofile");
-        let zprofile_content = fs::read_to_string(&zprofile).expect("read .zprofile");
-        assert!(result.path_updated);
-        assert!(
-            result.warnings.is_empty(),
-            "warnings: {:#?}",
-            result.warnings
-        );
-        assert!(zprofile_content.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
-        assert!(
-            !home.join(".zshrc").exists(),
-            "installer should not create .zshrc as a side effect of PATH setup"
         );
 
         let _ = fs::remove_dir_all(&home);
@@ -3913,5 +3826,63 @@ fi
         .into_bytes();
         response.extend_from_slice(body);
         response
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_path_setup_updates_shell_profile_without_creating_shadow_file() {
+        let cases = [
+            (
+                "home-profile-no-bash-profile",
+                "/bin/bash",
+                &[(".profile", "# test profile\n")][..],
+                ".profile",
+                ".bash_profile",
+            ),
+            (
+                "home-zsh-zprofile",
+                "/bin/zsh",
+                &[][..],
+                ".zprofile",
+                ".zshrc",
+            ),
+        ];
+        for (prefix, shell, initial_files, target_name, absent_name) in cases {
+            let _guard = env_lock().lock().expect("env lock poisoned");
+            let home = unique_temp_path(prefix);
+            fs::create_dir_all(&home).expect("create temp home dir");
+            let bin_dir = home.join(".local").join("bin");
+            fs::create_dir_all(&bin_dir).expect("create bin dir");
+            for (name, content) in initial_files {
+                fs::write(home.join(name), content).expect("write initial profile");
+            }
+            let old_home = std::env::var_os("HOME");
+            let old_path = std::env::var_os("PATH");
+            let old_shell = std::env::var_os("SHELL");
+            unsafe {
+                std::env::set_var("HOME", &home);
+                std::env::set_var("PATH", "/usr/bin:/bin");
+                std::env::set_var("SHELL", shell);
+            }
+            let result =
+                ensure_unix_user_path_configured(&bin_dir).expect("path setup should not fail");
+            restore_env_var("HOME", old_home);
+            restore_env_var("PATH", old_path);
+            restore_env_var("SHELL", old_shell);
+            let profile_content =
+                fs::read_to_string(home.join(target_name)).expect("read target profile");
+            assert!(result.path_updated);
+            assert!(
+                result.warnings.is_empty(),
+                "warnings: {:#?}",
+                result.warnings
+            );
+            assert!(profile_content.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
+            assert!(
+                !home.join(absent_name).exists(),
+                "installer should not create {absent_name} for {shell}"
+            );
+            let _ = fs::remove_dir_all(&home);
+        }
     }
 }

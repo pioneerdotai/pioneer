@@ -11448,17 +11448,6 @@ mod tests {
     };
     use sea_orm::{ConnectionTrait, Database};
 
-    fn exact_task_execution_actor(
-        execution_id: &str,
-    ) -> Result<pioneer_protocol::PersistedActorRef> {
-        let execution_id = AgentExecutionId::new(execution_id.to_owned()).map_err(|error| {
-            anyhow!("invalid task execution actor id `{execution_id}`: {error:?}")
-        })?;
-        Ok(pioneer_protocol::PersistedActorRef::AgentExecution(
-            execution_id,
-        ))
-    }
-
     fn test_task_run_turn() -> TaskRunTurn {
         TaskRunTurn {
             id: "task_run_turn".to_owned(),
@@ -11506,19 +11495,6 @@ mod tests {
         let mut self_rooted = valid;
         self_rooted.root_thread_id = task_run_turn.thread_id.clone();
         assert!(validate_task_thread_lineage(&task_run_turn, self_rooted).is_err());
-    }
-
-    #[test]
-    fn executable_task_actor_is_always_an_agent_execution() {
-        let actor = exact_task_execution_actor("E12345678901234567890")
-            .expect("valid execution id should become an agent actor");
-        assert_eq!(
-            actor,
-            pioneer_protocol::PersistedActorRef::AgentExecution(
-                pioneer_protocol::AgentExecutionId::new("E12345678901234567890").unwrap()
-            )
-        );
-        assert!(exact_task_execution_actor("system").is_err());
     }
 
     #[test]

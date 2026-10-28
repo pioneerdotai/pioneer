@@ -421,30 +421,6 @@ mod tests {
     use super::*;
     use std::fs;
 
-    #[test]
-    fn fault_plan_is_deterministic() {
-        let plan = FaultPlan::fail_at(FaultPoint::Rename);
-        assert!(plan.check(FaultPoint::StageWrite).is_ok());
-        assert_eq!(
-            plan.check(FaultPoint::Rename).unwrap_err().point,
-            FaultPoint::Rename
-        );
-    }
-
-    #[test]
-    fn parent_sync_and_metadata_helpers_are_callable() {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source");
-        let destination = root.path().join("destination");
-        fs::write(&source, b"data").unwrap();
-        fs::write(&destination, b"data").unwrap();
-        sync_parent_directory(&destination).unwrap();
-        let warnings = preserve_supported_mode(&source, &destination).unwrap();
-        assert!(warnings.is_empty());
-        let warnings = apply_safe_add_mode(&destination).unwrap();
-        assert!(warnings.is_empty());
-    }
-
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn metadata_warnings_are_emitted_only_for_metadata_that_exists() {

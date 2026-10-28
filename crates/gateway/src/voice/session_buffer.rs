@@ -605,25 +605,6 @@ mod tests {
     }
 
     #[test]
-    fn active_session_buffers_ordered_chunks() {
-        let store = GatewayVoiceSessionBufferStore::default();
-        store
-            .start_session("voice_session_1", target_format())
-            .expect("start session");
-
-        let first = store
-            .append_chunk(header("voice_session_1", 0), vec![0; 640])
-            .expect("first chunk");
-        let second = store
-            .append_chunk(header("voice_session_1", 1), vec![1; 640])
-            .expect("second chunk");
-
-        assert_eq!(first.buffered_chunks, 1);
-        assert_eq!(second.buffered_chunks, 2);
-        assert_eq!(second.buffered_bytes, 3_840);
-    }
-
-    #[test]
     fn take_session_audio_returns_samples_and_releases_buffer() {
         let store = GatewayVoiceSessionBufferStore::default();
         store
@@ -689,32 +670,6 @@ mod tests {
     }
 
     #[test]
-    fn buffer_memory_limit_is_enforced() {
-        let store = GatewayVoiceSessionBufferStore::default();
-        store
-            .start_session("voice_session_1", target_format())
-            .expect("start session");
-        store
-            .append_chunk(
-                header("voice_session_1", 0),
-                vec![0; VOICE_SESSION_MAX_BUFFERED_BYTES / 3],
-            )
-            .expect("max chunk aggregate");
-
-        let error = store
-            .append_chunk(header("voice_session_1", 1), vec![0; 2])
-            .expect_err("buffer cap should fail");
-
-        assert_eq!(error.kind, VoiceChunkIngestErrorKind::BufferLimitExceeded);
-        assert_eq!(
-            store
-                .buffered_bytes_for_test("voice_session_1")
-                .expect("buffered bytes"),
-            VOICE_SESSION_MAX_BUFFERED_BYTES
-        );
-    }
-
-    #[test]
     fn voice_incremental_drain_retains_lifetime_budget_and_sequence_history() {
         let store = GatewayVoiceSessionBufferStore::default();
         store.start_session("session", target_format()).unwrap();
@@ -724,6 +679,10 @@ mod tests {
                 vec![0; VOICE_SESSION_MAX_BUFFERED_BYTES / 3],
             )
             .unwrap();
+        assert_eq!(
+            store.buffered_bytes_for_test("session").unwrap(),
+            VOICE_SESSION_MAX_BUFFERED_BYTES
+        );
         assert_eq!(
             store
                 .next_processing_chunk("session")
@@ -744,6 +703,10 @@ mod tests {
                 .kind,
             VoiceChunkIngestErrorKind::BufferLimitExceeded
         );
+        assert_eq!(
+            store.buffered_bytes_for_test("session").unwrap(),
+            VOICE_SESSION_MAX_BUFFERED_BYTES
+        );
     }
 
     #[test]
@@ -759,16 +722,16 @@ mod tests {
                 receiver,
             )
             .unwrap();
-        store
+        let first = store
             .append_chunk(header("session", 0), vec![0; 640])
             .unwrap();
-        assert_eq!(
-            store
-                .append_chunk(header("session", 3), vec![0; 640])
-                .unwrap()
-                .missing_chunks,
-            2
-        );
+        assert_eq!(first.buffered_chunks, 1);
+        let second = store
+            .append_chunk(header("session", 3), vec![0; 640])
+            .unwrap();
+        assert_eq!(second.missing_chunks, 2);
+        assert_eq!(second.buffered_chunks, 2);
+        assert_eq!(second.buffered_bytes, 3_840);
         assert!(
             store
                 .append_chunk(header("session", 0), vec![0; 640])

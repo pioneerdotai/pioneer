@@ -433,51 +433,12 @@ fn invalid_message_error(error: serde_json::Error) -> JsonlRpcDecodeError {
 #[cfg(test)]
 mod tests {
     use super::{
-        JsonlRpcDecodeErrorKind, JsonlRpcId, JsonlRpcIncomingMessage, JsonlRpcNotification,
-        JsonlRpcRequest, decode_jsonl_rpc_line, encode_jsonl_rpc_notification_line,
-        encode_jsonl_rpc_request_line, read_jsonl_rpc_message, read_jsonl_rpc_message_with_budget,
+        JsonlRpcDecodeErrorKind, JsonlRpcId, JsonlRpcIncomingMessage, JsonlRpcRequest,
+        decode_jsonl_rpc_line, read_jsonl_rpc_message, read_jsonl_rpc_message_with_budget,
         write_jsonl_rpc_request,
     };
     use serde_json::{Value as JsonValue, json};
     use tokio::io::BufReader;
-
-    #[test]
-    fn jsonl_rpc_encodes_client_request_without_jsonrpc_header() {
-        let request = JsonlRpcRequest::new(
-            0,
-            "initialize",
-            Some(json!({
-                "clientInfo": {
-                    "name": "pioneer_desktop",
-                    "title": "Pioneer",
-                    "version": "0.1.0"
-                }
-            })),
-        );
-
-        let encoded =
-            encode_jsonl_rpc_request_line(&request).expect("request should serialize to JSONL");
-        assert!(encoded.ends_with('\n'));
-
-        let decoded: JsonValue =
-            serde_json::from_str(&encoded).expect("encoded request should be valid JSON");
-        assert_eq!(decoded.get("method"), Some(&json!("initialize")));
-        assert_eq!(decoded.get("id"), Some(&json!(0)));
-        assert!(decoded.get("params").is_some());
-        assert!(decoded.get("jsonrpc").is_none());
-    }
-
-    #[test]
-    fn jsonl_rpc_encodes_client_notification_without_id_or_jsonrpc_header() {
-        let notification = JsonlRpcNotification::new("initialized", Some(json!({})));
-
-        let encoded = encode_jsonl_rpc_notification_line(&notification)
-            .expect("notification should serialize to JSONL");
-        let decoded: JsonValue =
-            serde_json::from_str(&encoded).expect("encoded notification should be valid JSON");
-
-        assert_eq!(decoded, json!({"method": "initialized", "params": {}}));
-    }
 
     #[test]
     fn jsonl_rpc_decodes_initialize_response_and_preserves_unknown_fields() {

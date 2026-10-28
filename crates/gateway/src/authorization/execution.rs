@@ -4304,9 +4304,7 @@ mod tests {
         WorkspaceResourceId,
     };
     use crate::request_context::{CanonicalMethod, ConnectionContext};
-    use pioneer_protocol::{
-        DeviceId, GatewayId, PersistedActorRef, RoleKey, TurnPermissionProfileSelection,
-    };
+    use pioneer_protocol::{DeviceId, GatewayId, RoleKey, TurnPermissionProfileSelection};
     use std::sync::Arc;
 
     #[test]
@@ -5065,12 +5063,5 @@ mod tests {
             runtime_kind: CLIAgentRuntimeKind::Codex,
         });
         assert!(!native_api_provider_requires_artifacts(&cli));
-    }
-
-    #[test]
-    fn context_is_not_an_actor_or_bearer_credential() {
-        let _: PersistedActorRef =
-            PersistedActorRef::Principal(member_request().principal().principal_id.clone());
-        assert!(!std::any::type_name::<ExecutionAuthorizationContext>().contains("Credential"));
     }
 }

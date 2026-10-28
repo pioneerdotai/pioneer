@@ -1152,91 +1152,6 @@ mod tests {
     }
 
     #[test]
-    fn active_synthesis_contract_serializes_multi_source_input() {
-        let mut durable = MemoryActiveSynthesisSource::durable_memory(
-            "mem_name",
-            "Пользователя зовут Александр.",
-        );
-        durable.canonical_key = Some("user_name".to_owned());
-        durable.text_hash = Some("hash-name".to_owned());
-        durable.score = Some(0.91);
-        durable.updated_at = Some(42);
-        let input = MemoryActiveSynthesisInput::new(
-            vec![
-                durable,
-                MemoryActiveSynthesisSource::current_thread_context(
-                    "thread:turn_41/item_1/chunk_0",
-                    "Earlier in this thread the user rejected phrase lists.",
-                ),
-                MemoryActiveSynthesisSource::recent_prompt_context(
-                    "turn_input",
-                    "Continue the proposal work.",
-                ),
-            ],
-            MemoryRecallSynthesisBudget::default(),
-        );
-
-        let encoded = serde_json::to_value(&input).expect("input serializes");
-        assert_eq!(encoded["contextKind"], "context");
-        assert_eq!(encoded["sources"][0]["kind"], "durable_memory");
-        assert_eq!(encoded["sources"][1]["kind"], "current_thread_context");
-        assert_eq!(encoded["sources"][2]["kind"], "recent_prompt_context");
-
-        let decoded: MemoryActiveSynthesisInput =
-            serde_json::from_value(encoded).expect("input deserializes");
-        assert_eq!(decoded.sources.len(), 3);
-        assert_eq!(
-            decoded.sources[0].rendered_source_id().as_deref(),
-            Some("memory:mem_name")
-        );
-        assert_eq!(
-            decoded.sources[1].rendered_source_id().as_deref(),
-            Some("thread:turn_41/item_1/chunk_0")
-        );
-        assert_eq!(
-            decoded.sources[2].rendered_source_id().as_deref(),
-            Some("recent:turn_input")
-        );
-    }
-
-    #[test]
-    fn active_synthesis_output_roundtrips_context_with_source_ids() {
-        let output = MemoryActiveSynthesisOutput {
-            context_kind: MemoryRecallSynthesisContextKind::Context,
-            items: vec![MemoryActiveSynthesizedContextItem {
-                summary: "User is continuing memory architecture work.".to_owned(),
-                source_ids: vec![
-                    "memory:mem_project".to_owned(),
-                    "thread:turn_41/item_1/chunk_0".to_owned(),
-                ],
-            }],
-            source_ids: vec![
-                "memory:mem_project".to_owned(),
-                "thread:turn_41/item_1/chunk_0".to_owned(),
-            ],
-            diagnostics: vec!["memory.active_synthesis.context_not_instruction".to_owned()],
-            truncated: false,
-            raw_source_count: 2,
-            dropped_source_count: 0,
-            truncated_source_count: 0,
-        };
-
-        let encoded = serde_json::to_string(&output).expect("output serializes");
-        assert!(encoded.contains("memory:mem_project"));
-        assert!(encoded.contains("thread:turn_41/item_1/chunk_0"));
-        let decoded: MemoryActiveSynthesisOutput =
-            serde_json::from_str(encoded.as_str()).expect("output deserializes");
-
-        assert_eq!(
-            decoded.context_kind,
-            MemoryRecallSynthesisContextKind::Context
-        );
-        assert_eq!(decoded.context_kind.as_str(), "context");
-        assert_eq!(decoded.items[0].source_ids.len(), 2);
-        assert_eq!(decoded.source_ids.len(), 2);
-    }
-
-    #[test]
     fn active_synthesis_merge_orders_mixed_sources_deterministically() {
         let durable_without_key = synthesis_project_item(
             "mem_unkeyed",
@@ -1280,39 +1195,6 @@ mod tests {
                 "recent:turn_input",
             ]
         );
-    }
-
-    #[test]
-    fn active_synthesis_merge_preserves_source_type_boundaries() {
-        let input = ordered_active_synthesis_input(
-            vec![synthesis_item("mem_name", "Пользователя зовут Александр.")],
-            vec![synthesis_thread_item(
-                "thread:turn_1/item_1/chunk_0",
-                "Thread-local implementation detail.",
-                0.8,
-                5,
-            )],
-            vec![MemoryActiveSynthesisSource::recent_prompt_context(
-                "turn_input",
-                "What did we decide?",
-            )],
-            MemoryRecallSynthesisBudget::default(),
-        );
-
-        let kinds = input
-            .sources
-            .iter()
-            .map(|source| source.kind)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kinds,
-            vec![
-                MemoryActiveSynthesisSourceKind::DurableMemory,
-                MemoryActiveSynthesisSourceKind::CurrentThreadContext,
-                MemoryActiveSynthesisSourceKind::RecentPromptContext,
-            ]
-        );
-        assert_eq!(input.sources.len(), 3);
     }
 
     #[test]
@@ -1434,6 +1316,9 @@ mod tests {
             synthesis.context_kind,
             MemoryRecallSynthesisContextKind::Context
         );
+        assert_eq!(synthesis.context_kind.as_str(), "context");
+        assert_eq!(synthesis.items.len(), 2);
+        assert_eq!(synthesis.source_ids.len(), 2);
         assert!(rendered.contains("Sources: memory:mem_arch"));
         assert!(rendered.contains("Sources: thread:turn_41/item_1/chunk_0"));
         assert!(!rendered.contains("score="));

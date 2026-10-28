@@ -466,327 +466,6 @@ fn post_turn_parser_accepts_class_based_valid_ontology_proposals() {
 }
 
 #[test]
-fn post_turn_parser_rejects_invalid_ontology_proposal_safely() {
-    let raw = serde_json::json!({
-        "facts": [{
-            "semantic": {
-                "intent": "explicit_store",
-                "explicitness": "explicit",
-                "category": "identity",
-                "subject": "current_user",
-                "attribute": "name",
-                "scope_hint": "user_global",
-                "durability": "long_lived",
-                "sensitivity": "personal",
-                "certainty": "high"
-            },
-            "ontology": {
-                "fact_class": "future_fact_class",
-                "lifetime_class": "long_lived",
-                "evidence_class": "direct_user_assertion",
-                "proposed_ownership_class": "durable_user_memory"
-            },
-            "content": "Имя пользователя: Александр",
-            "value": "Александр",
-            "evidence": {
-                "source_ref": "turn.post_turn:user",
-                "quote_or_span": "Меня зовут Александр",
-                "extractor_reason": "The user directly stated their name."
-            }
-        }]
-    });
-
-    let parsed = parse_memory_post_turn_extractor_json(
-        raw.to_string().as_str(),
-        &MemoryPostTurnExtractorConfig::default(),
-    )
-    .expect("invalid proposal value rejects the fact, not the whole payload");
-
-    assert_eq!(parsed.raw_fact_count, 1);
-    assert_eq!(parsed.validation_rejected_count, 1);
-    assert!(parsed.facts.is_empty());
-    assert!(
-        parsed
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.contains("unknown_ontology_proposal"))
-    );
-}
-
-#[test]
-fn post_turn_parser_rejects_partial_ontology_proposal() {
-    let raw = serde_json::json!({
-        "facts": [{
-            "semantic": {
-                "intent": "explicit_store",
-                "explicitness": "explicit",
-                "category": "identity",
-                "subject": "current_user",
-                "attribute": "name",
-                "scope_hint": "user_global",
-                "durability": "long_lived",
-                "sensitivity": "personal",
-                "certainty": "high"
-            },
-            "ontology": {
-                "fact_class": "user_identity",
-                "lifetime_class": "long_lived"
-            },
-            "content": "Имя пользователя: Александр",
-            "value": "Александр",
-            "evidence": {
-                "source_ref": "turn.post_turn:user",
-                "quote_or_span": "Меня зовут Александр",
-                "extractor_reason": "The user directly stated their name."
-            }
-        }]
-    });
-
-    let parsed = parse_memory_post_turn_extractor_json(
-        raw.to_string().as_str(),
-        &MemoryPostTurnExtractorConfig::default(),
-    )
-    .expect("partial proposal rejects the fact, not the whole payload");
-
-    assert_eq!(parsed.raw_fact_count, 1);
-    assert_eq!(parsed.validation_rejected_count, 1);
-    assert!(parsed.facts.is_empty());
-    assert!(
-        parsed
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.contains("partial_ontology_proposal"))
-    );
-}
-
-#[test]
-fn post_turn_parser_rejects_invalid_proposal_enum_without_dropping_payload() {
-    let raw = serde_json::json!({
-        "facts": [{
-            "semantic": {
-                "intent": "explicit_store",
-                "explicitness": "explicit",
-                "category": "identity",
-                "subject": "current_user",
-                "attribute": "name",
-                "scope_hint": "user_global",
-                "durability": "long_lived",
-                "sensitivity": "personal",
-                "certainty": "high"
-            },
-            "ontology": {
-                "fact_class": "user_identity",
-                "lifetime_class": "long_lived",
-                "evidence_class": "future_evidence",
-                "proposed_ownership_class": "durable_user_memory"
-            },
-            "content": "Имя пользователя: Александр",
-            "value": "Александр",
-            "evidence": {
-                "source_ref": "turn.post_turn:user",
-                "quote_or_span": "Меня зовут Александр",
-                "extractor_reason": "The user directly stated their name."
-            }
-        }]
-    });
-
-    let parsed = parse_memory_post_turn_extractor_json(
-        raw.to_string().as_str(),
-        &MemoryPostTurnExtractorConfig::default(),
-    )
-    .expect("invalid proposal enum rejects the fact, not the whole payload");
-
-    assert_eq!(parsed.raw_fact_count, 1);
-    assert_eq!(parsed.validation_rejected_count, 1);
-    assert!(parsed.facts.is_empty());
-    assert!(
-        parsed
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.contains("invalid_ontology_proposal_enum"))
-    );
-}
-
-#[test]
-fn post_turn_parser_proposal_cannot_rescue_missing_evidence() {
-    let raw = serde_json::json!({
-        "facts": [{
-            "semantic": {
-                "intent": "explicit_store",
-                "explicitness": "explicit",
-                "category": "identity",
-                "subject": "current_user",
-                "attribute": "name",
-                "scope_hint": "user_global",
-                "durability": "long_lived",
-                "sensitivity": "personal",
-                "certainty": "high"
-            },
-            "ontology": {
-                "fact_class": "user_identity",
-                "lifetime_class": "long_lived",
-                "evidence_class": "direct_user_assertion",
-                "proposed_ownership_class": "durable_user_memory"
-            },
-            "content": "Имя пользователя: Александр",
-            "value": "Александр",
-            "evidence": {
-                "source_ref": "turn.post_turn:user",
-                "extractor_reason": "The user directly stated their name."
-            }
-        }]
-    });
-
-    let parsed = parse_memory_post_turn_extractor_json(
-        raw.to_string().as_str(),
-        &MemoryPostTurnExtractorConfig::default(),
-    )
-    .expect("missing evidence JSON shape parses but fact is rejected");
-
-    assert_eq!(parsed.raw_fact_count, 1);
-    assert_eq!(parsed.validation_rejected_count, 1);
-    assert!(parsed.facts.is_empty());
-    assert!(
-        parsed
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.contains("missing_evidence_quote"))
-    );
-}
-
-#[test]
-fn post_turn_parser_suppresses_weak_evidence_and_unclear_ownership_proposals() {
-    let weak_evidence = serde_json::json!({
-        "facts": [{
-            "semantic": {
-                "intent": "explicit_store",
-                "explicitness": "explicit",
-                "category": "identity",
-                "subject": "current_user",
-                "attribute": "name",
-                "scope_hint": "user_global",
-                "durability": "long_lived",
-                "sensitivity": "personal",
-                "certainty": "high"
-            },
-            "ontology": {
-                "fact_class": "user_identity",
-                "lifetime_class": "long_lived",
-                "evidence_class": "missing_or_weak",
-                "proposed_ownership_class": "durable_user_memory"
-            },
-            "content": "Имя пользователя: Александр",
-            "value": "Александр",
-            "evidence": {
-                "source_ref": "turn.post_turn:user",
-                "quote_or_span": "Меня зовут Александр",
-                "extractor_reason": "The user directly stated their name."
-            }
-        }]
-    });
-    let weak = parse_memory_post_turn_extractor_json(
-        weak_evidence.to_string().as_str(),
-        &MemoryPostTurnExtractorConfig::default(),
-    )
-    .expect("weak evidence payload parses");
-    assert_eq!(weak.validation_rejected_count, 1);
-    assert!(weak.facts.is_empty());
-    assert!(
-        weak.diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.contains("weak_evidence_class"))
-    );
-
-    let unclear_ownership = serde_json::json!({
-        "facts": [{
-            "semantic": {
-                "intent": "explicit_store",
-                "explicitness": "explicit",
-                "category": "identity",
-                "subject": "current_user",
-                "attribute": "name",
-                "scope_hint": "user_global",
-                "durability": "long_lived",
-                "sensitivity": "personal",
-                "certainty": "high"
-            },
-            "ontology": {
-                "fact_class": "user_identity",
-                "lifetime_class": "long_lived",
-                "evidence_class": "direct_user_assertion",
-                "proposed_ownership_class": "audit_only"
-            },
-            "content": "Имя пользователя: Александр",
-            "value": "Александр",
-            "evidence": {
-                "source_ref": "turn.post_turn:user",
-                "quote_or_span": "Меня зовут Александр",
-                "extractor_reason": "The user directly stated their name."
-            }
-        }]
-    });
-    let unclear = parse_memory_post_turn_extractor_json(
-        unclear_ownership.to_string().as_str(),
-        &MemoryPostTurnExtractorConfig::default(),
-    )
-    .expect("unclear ownership payload parses");
-    assert_eq!(unclear.validation_rejected_count, 1);
-    assert!(unclear.facts.is_empty());
-    assert!(
-        unclear
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.contains("unclear_or_rejected_ownership"))
-    );
-}
-
-#[test]
-fn post_turn_parser_requires_source_ref_when_proposal_is_present() {
-    let raw = serde_json::json!({
-        "facts": [{
-            "semantic": {
-                "intent": "explicit_store",
-                "explicitness": "explicit",
-                "category": "identity",
-                "subject": "current_user",
-                "attribute": "name",
-                "scope_hint": "user_global",
-                "durability": "long_lived",
-                "sensitivity": "personal",
-                "certainty": "high"
-            },
-            "ontology": {
-                "fact_class": "user_identity",
-                "lifetime_class": "long_lived",
-                "evidence_class": "direct_user_assertion",
-                "proposed_ownership_class": "durable_user_memory"
-            },
-            "content": "Имя пользователя: Александр",
-            "value": "Александр",
-            "evidence": {
-                "quote_or_span": "Меня зовут Александр",
-                "extractor_reason": "The user directly stated their name."
-            }
-        }]
-    });
-
-    let parsed = parse_memory_post_turn_extractor_json(
-        raw.to_string().as_str(),
-        &MemoryPostTurnExtractorConfig::default(),
-    )
-    .expect("missing source ref rejects the fact, not the whole payload");
-
-    assert_eq!(parsed.validation_rejected_count, 1);
-    assert!(parsed.facts.is_empty());
-    assert!(
-        parsed
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.contains("missing_evidence_source_ref"))
-    );
-}
-
-#[test]
 fn post_turn_parser_rejects_assistant_inference_about_user() {
     let raw = serde_json::json!({
         "facts": [{
@@ -881,45 +560,6 @@ fn post_turn_parser_allows_valid_thread_episodic_proposal() {
             .proposed_ownership_class,
         MemoryOwnershipClass::ThreadEpisodicContext
     );
-}
-
-#[test]
-fn post_turn_parser_computes_scores_instead_of_trusting_llm_numbers() {
-    let raw = serde_json::json!({
-        "facts": [{
-            "semantic": {
-                "intent": "explicit_store",
-                "explicitness": "explicit",
-                "category": "identity",
-                "subject": "current_user",
-                "attribute": "name",
-                "scope_hint": "user_global",
-                "durability": "long_lived",
-                "sensitivity": "personal",
-                "certainty": "high"
-            },
-            "content": "User's name is Александр.",
-            "value": "Александр",
-            "evidence": {
-                "source_ref": "turn.post_turn:user",
-                "quote_or_span": "Меня зовут Александр.",
-                "extractor_reason": "User explicitly stated their name."
-            },
-            "confidence": 0.0,
-            "importance": 0.0
-        }]
-    });
-
-    let parsed = parse_memory_post_turn_extractor_json(
-        raw.to_string().as_str(),
-        &MemoryPostTurnExtractorConfig::default(),
-    )
-    .expect("valid extractor JSON parses");
-
-    assert_eq!(parsed.facts.len(), 1);
-    let fact = &parsed.facts[0];
-    assert!(fact.confidence.expect("computed confidence") > 0.95);
-    assert!(fact.importance.expect("computed importance") > 0.90);
 }
 
 #[test]
@@ -1033,6 +673,8 @@ fn post_turn_parser_rejects_assistant_self_description_from_assistant_text() {
     assert_eq!(parsed.raw_fact_count, 2);
     assert_eq!(parsed.facts.len(), 1);
     assert_eq!(parsed.facts[0].semantic.subject, MemorySubject::CurrentUser);
+    assert!(parsed.facts[0].confidence.expect("computed confidence") > 0.95);
+    assert!(parsed.facts[0].importance.expect("computed importance") > 0.90);
     assert!(
         parsed
             .diagnostics
@@ -1116,6 +758,10 @@ async fn post_turn_extractor_writes_semantic_fact_through_provider() {
 
     assert!(response.contributions.is_empty());
     assert_eq!(extractor_provider.call_count(), 1);
+    let contexts = extractor_provider.contexts();
+    assert_eq!(contexts.len(), 1);
+    assert_eq!(contexts[0].model.as_deref(), Some("test-model"));
+    assert_eq!(contexts[0].model_provider.as_deref(), Some("test-provider"));
     assert_eq!(write_provider.manifest_call_count(), 1);
     assert_eq!(write_provider.write_call_count(), 1);
     let params = write_provider
@@ -1323,35 +969,6 @@ async fn post_turn_extractor_uses_configured_model_override() {
         params.metadata.get("model_provider"),
         Some(&serde_json::json!("memory-provider"))
     );
-}
-
-#[tokio::test]
-async fn post_turn_extractor_uses_thread_model_when_not_configured() {
-    let write_provider = Arc::new(TestMemoryWriteProvider::default());
-    let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
-        valid_post_turn_extractor_json(),
-    ));
-    let hook = MemoryPostTurnExtractorHook {
-        write_provider: Some(write_provider),
-        extractor_provider: Some(extractor_provider.clone()),
-        config: MemoryPostTurnExtractorConfig::default(),
-    };
-
-    hook.execute(test_post_turn_hook_request(
-        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-        "Меня зовут Александр",
-        "Понял.",
-    ))
-    .await
-    .expect("post-turn extractor executes");
-
-    let context = extractor_provider
-        .contexts()
-        .into_iter()
-        .next()
-        .expect("extractor context recorded");
-    assert_eq!(context.model.as_deref(), Some("test-model"));
-    assert_eq!(context.model_provider.as_deref(), Some("test-provider"));
 }
 
 #[tokio::test]
@@ -1663,6 +1280,7 @@ async fn post_turn_extractor_runs_for_direct_user_turns_with_runtime_events() {
     assert_eq!(write_provider.manifest_call_count(), 1);
     assert_eq!(extractor_provider.call_count(), 1);
     assert_eq!(write_provider.write_call_count(), 1);
+    assert_eq!(write_provider.write_params().len(), 1);
     assert_eq!(
         write_provider
             .write_params()
@@ -1673,7 +1291,29 @@ async fn post_turn_extractor_runs_for_direct_user_turns_with_runtime_events() {
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.post_turn_extractor.completed"
             && diagnostic.message.as_str().contains("write_attempts=1")
+            && diagnostic.message.as_str().contains("write_successes=1")
     }));
+    let params = write_provider
+        .write_params()
+        .into_iter()
+        .next()
+        .expect("write params recorded");
+    assert_eq!(
+        params.disposition,
+        Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy)
+    );
+    assert_eq!(
+        params.metadata.get("policy_source"),
+        Some(&serde_json::json!("default_fallback"))
+    );
+    assert_eq!(
+        params.metadata.get("policy_reason_code"),
+        Some(&serde_json::json!("classifier_unavailable"))
+    );
+    assert_eq!(
+        params.source_context_kind,
+        Some(MemorySourceContextKind::DirectUserConversation)
+    );
 }
 
 #[tokio::test]
@@ -1810,6 +1450,14 @@ async fn post_turn_extractor_skips_ineligible_source_classes_before_provider_cal
         assert_eq!(extractor_provider.call_count(), 0, "{label}");
         assert_eq!(write_provider.write_call_count(), 0, "{label}");
         assert_post_turn_eligibility_skip(&response, reason);
+        if label == "no_use_policy" {
+            assert!(response.diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .metadata
+                    .get(&hook_metadata_key("policy_reason_code"))
+                    == Some(&HookValue::Text("memory_no_use".to_owned()))
+            }));
+        }
     }
 }
 
@@ -1882,63 +1530,6 @@ async fn permissive_fallback_does_not_override_typed_source_ineligibility() {
         assert_eq!(write_provider.write_call_count(), 0, "{label}");
         assert_post_turn_eligibility_skip(&response, reason);
     }
-}
-
-#[tokio::test]
-async fn post_turn_extractor_runs_under_permissive_classifier_fallback() {
-    let write_provider = Arc::new(TestMemoryWriteProvider::default());
-    let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
-        valid_post_turn_extractor_json(),
-    ));
-    let hook = MemoryPostTurnExtractorHook {
-        write_provider: Some(write_provider.clone()),
-        extractor_provider: Some(extractor_provider.clone()),
-        config: MemoryPostTurnExtractorConfig::default(),
-    };
-    let policy = MemoryTurnPolicy::permissive_classifier_fallback(
-        MemoryPolicyReasonCode::ClassifierUnavailable,
-    );
-
-    let response = hook
-        .execute(test_post_turn_hook_request(
-            memory_policy_set(&policy),
-            "Меня зовут Александр",
-            "Понял.",
-        ))
-        .await
-        .expect("classifier fallback extraction executes");
-
-    assert!(response.contributions.is_empty());
-    assert_eq!(write_provider.manifest_call_count(), 1);
-    assert_eq!(extractor_provider.call_count(), 1);
-    assert_eq!(write_provider.write_call_count(), 1);
-    assert_eq!(write_provider.write_params().len(), 1);
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code.as_str() == "memory.post_turn_extractor.completed"
-            && diagnostic.message.as_str().contains("write_attempts=1")
-            && diagnostic.message.as_str().contains("write_successes=1")
-    }));
-    let params = write_provider
-        .write_params()
-        .into_iter()
-        .next()
-        .expect("write params recorded");
-    assert_eq!(
-        params.disposition,
-        Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy)
-    );
-    assert_eq!(
-        params.metadata.get("policy_source"),
-        Some(&serde_json::json!("default_fallback"))
-    );
-    assert_eq!(
-        params.metadata.get("policy_reason_code"),
-        Some(&serde_json::json!("classifier_unavailable"))
-    );
-    assert_eq!(
-        params.source_context_kind,
-        Some(MemorySourceContextKind::DirectUserConversation)
-    );
 }
 
 #[tokio::test]
@@ -2401,4 +1992,123 @@ async fn manifest_failure_precedes_checkpoint_replay() {
         failure.code()
     );
     assert_eq!(writes.write_call_count(), 0);
+}
+
+#[test]
+fn invalid_ontology_or_evidence_rejects_only_the_fact_with_safe_reason() {
+    let identity_fact = serde_json::json!({
+        "semantic": {
+            "intent": "explicit_store",
+            "explicitness": "explicit",
+            "category": "identity",
+            "subject": "current_user",
+            "attribute": "name",
+            "scope_hint": "user_global",
+            "durability": "long_lived",
+            "sensitivity": "personal",
+            "certainty": "high"
+        },
+        "ontology": {},
+        "content": "Имя пользователя: Александр",
+        "value": "Александр",
+        "evidence": {
+            "source_ref": "turn.post_turn:user",
+            "quote_or_span": "Меня зовут Александр",
+            "extractor_reason": "The user directly stated their name."
+        }
+    });
+    let cases: &[(&str, serde_json::Value, &[&str])] = &[
+        (
+            "unknown_ontology_proposal",
+            serde_json::json!({
+                "fact_class": "future_fact_class",
+                "lifetime_class": "long_lived",
+                "evidence_class": "direct_user_assertion",
+                "proposed_ownership_class": "durable_user_memory"
+            }),
+            &[],
+        ),
+        (
+            "partial_ontology_proposal",
+            serde_json::json!({
+                "fact_class": "user_identity",
+                "lifetime_class": "long_lived"
+            }),
+            &[],
+        ),
+        (
+            "invalid_ontology_proposal_enum",
+            serde_json::json!({
+                "fact_class": "user_identity",
+                "lifetime_class": "long_lived",
+                "evidence_class": "future_evidence",
+                "proposed_ownership_class": "durable_user_memory"
+            }),
+            &[],
+        ),
+        (
+            "missing_evidence_quote",
+            serde_json::json!({
+                "fact_class": "user_identity",
+                "lifetime_class": "long_lived",
+                "evidence_class": "direct_user_assertion",
+                "proposed_ownership_class": "durable_user_memory"
+            }),
+            &["quote_or_span"],
+        ),
+        (
+            "missing_evidence_source_ref",
+            serde_json::json!({
+                "fact_class": "user_identity",
+                "lifetime_class": "long_lived",
+                "evidence_class": "direct_user_assertion",
+                "proposed_ownership_class": "durable_user_memory"
+            }),
+            &["source_ref"],
+        ),
+        (
+            "weak_evidence_class",
+            serde_json::json!({
+                "fact_class": "user_identity",
+                "lifetime_class": "long_lived",
+                "evidence_class": "missing_or_weak",
+                "proposed_ownership_class": "durable_user_memory"
+            }),
+            &[],
+        ),
+        (
+            "unclear_or_rejected_ownership",
+            serde_json::json!({
+                "fact_class": "user_identity",
+                "lifetime_class": "long_lived",
+                "evidence_class": "direct_user_assertion",
+                "proposed_ownership_class": "audit_only"
+            }),
+            &[],
+        ),
+    ];
+    for (reason, ontology, missing_evidence_fields) in cases {
+        let mut fact = identity_fact.clone();
+        fact["ontology"] = ontology.clone();
+        for field in *missing_evidence_fields {
+            fact["evidence"].as_object_mut().unwrap().remove(*field);
+        }
+        let document = serde_json::json!({ "facts": [fact] });
+        let parsed = parse_memory_post_turn_extractor_json(
+            document.to_string().as_str(),
+            &MemoryPostTurnExtractorConfig::default(),
+        )
+        .expect("valid document rejects only its invalid fact");
+
+        assert_eq!(parsed.raw_fact_count, 1, "{reason}");
+        assert_eq!(parsed.validation_rejected_count, 1, "{reason}");
+        assert!(parsed.facts.is_empty(), "{reason}");
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains(reason)),
+            "{reason}"
+        );
+    }
 }

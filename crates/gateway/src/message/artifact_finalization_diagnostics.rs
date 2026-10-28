@@ -199,26 +199,6 @@ mod tests {
     }
 
     #[test]
-    fn artifact_diagnostic_reports_prepared_but_unregistered_output() {
-        let (_temp, output) = materialized_prepared(false);
-        let diagnostics = diagnose_artifact_finalization(&[output], None, Some("Done."));
-
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == ArtifactFinalizationDiagnosticCode::PreparedOutputUnregistered
-                && diagnostic.message.contains("artifact_register")
-        }));
-    }
-
-    #[test]
-    fn artifact_diagnostic_ignores_registered_prepared_output() {
-        let (_temp, output) = materialized_prepared(true);
-        let diagnostics =
-            diagnose_artifact_finalization(&[output], None, Some("Registered artifact is ready."));
-
-        assert!(diagnostics.is_empty());
-    }
-
-    #[test]
     fn artifact_diagnostic_ignores_unused_unregistered_prepare_without_file() {
         let diagnostics = diagnose_artifact_finalization(
             &[prepared("/tmp/pioneer-output/missing-report.txt", false)],
@@ -266,27 +246,6 @@ mod tests {
     }
 
     #[test]
-    fn artifact_retry_instruction_names_artifact_register_and_safe_path() {
-        let (_temp, output) = materialized_prepared(false);
-        let output_path = output.output_path.display().to_string();
-        let diagnostics = diagnose_artifact_finalization(&[output], None, Some("Done."));
-
-        let instruction = artifact_finalization_retry_instruction(&diagnostics, false)
-            .expect("unregistered prepared output should trigger one retry");
-
-        assert!(instruction.contains("artifact_register"));
-        assert!(instruction.contains(output_path.as_str()));
-    }
-
-    #[test]
-    fn artifact_retry_instruction_is_suppressed_after_retry_used() {
-        let (_temp, output) = materialized_prepared(false);
-        let diagnostics = diagnose_artifact_finalization(&[output], None, Some("Done."));
-
-        assert!(artifact_finalization_retry_instruction(&diagnostics, true).is_none());
-    }
-
-    #[test]
     fn artifact_retry_successful_registration_clears_diagnostic() {
         let (_temp, output) = materialized_prepared(true);
         let diagnostics =
@@ -297,9 +256,22 @@ mod tests {
     }
 
     #[test]
-    fn artifact_retry_terminal_error_reports_failure_after_one_attempt() {
+    fn artifact_unregistered_output_correction_policy() {
         let (_temp, output) = materialized_prepared(false);
+        let output_path = output.output_path.display().to_string();
         let diagnostics = diagnose_artifact_finalization(&[output], None, Some("Done."));
+
+        let instruction = artifact_finalization_retry_instruction(&diagnostics, false)
+            .expect("unregistered prepared output should trigger one retry");
+
+        assert!(instruction.contains("artifact_register"));
+        assert!(instruction.contains(output_path.as_str()));
+        assert!(artifact_finalization_retry_instruction(&diagnostics, true).is_none());
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ArtifactFinalizationDiagnosticCode::PreparedOutputUnregistered
+                && diagnostic.message.contains("artifact_register")
+        }));
 
         let error = artifact_finalization_terminal_error(&diagnostics);
 

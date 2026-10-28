@@ -841,53 +841,57 @@ mod tests {
     }
 
     #[test]
-    fn test_get_box_segments_horizontal() {
-        let seg = get_box_segments('─').unwrap();
-        assert_eq!(seg.left, Some(Light));
-        assert_eq!(seg.right, Some(Light));
-        assert_eq!(seg.top, None);
-        assert_eq!(seg.bottom, None);
-    }
-
-    #[test]
-    fn test_get_box_segments_vertical() {
-        let seg = get_box_segments('│').unwrap();
-        assert_eq!(seg.left, None);
-        assert_eq!(seg.right, None);
-        assert_eq!(seg.top, Some(Light));
-        assert_eq!(seg.bottom, Some(Light));
-    }
-
-    #[test]
-    fn test_get_box_segments_corner() {
-        let seg = get_box_segments('┌').unwrap();
-        assert_eq!(seg.left, None);
-        assert_eq!(seg.right, Some(Light));
-        assert_eq!(seg.top, None);
-        assert_eq!(seg.bottom, Some(Light));
-    }
-
-    #[test]
-    fn test_get_box_segments_cross() {
-        let seg = get_box_segments('┼').unwrap();
-        assert_eq!(seg.left, Some(Light));
-        assert_eq!(seg.right, Some(Light));
-        assert_eq!(seg.top, Some(Light));
-        assert_eq!(seg.bottom, Some(Light));
-    }
-
-    #[test]
-    fn test_get_box_segments_double() {
-        let seg = get_box_segments('═').unwrap();
-        assert_eq!(seg.left, Some(Double));
-        assert_eq!(seg.right, Some(Double));
-        assert_eq!(seg.top, None);
-        assert_eq!(seg.bottom, None);
-    }
-
-    #[test]
-    fn test_get_box_segments_invalid() {
-        assert!(get_box_segments('A').is_none());
-        assert!(get_box_segments(' ').is_none());
+    fn box_drawing_characters_have_their_exact_segment_matrix() {
+        for (ch, expected) in [
+            (
+                '─',
+                Some(BoxSegments {
+                    top: None,
+                    bottom: None,
+                    left: Some(Light),
+                    right: Some(Light),
+                }),
+            ),
+            (
+                '│',
+                Some(BoxSegments {
+                    top: Some(Light),
+                    bottom: Some(Light),
+                    left: None,
+                    right: None,
+                }),
+            ),
+            (
+                '┌',
+                Some(BoxSegments {
+                    top: None,
+                    bottom: Some(Light),
+                    left: None,
+                    right: Some(Light),
+                }),
+            ),
+            (
+                '┼',
+                Some(BoxSegments {
+                    top: Some(Light),
+                    bottom: Some(Light),
+                    left: Some(Light),
+                    right: Some(Light),
+                }),
+            ),
+            (
+                '═',
+                Some(BoxSegments {
+                    top: None,
+                    bottom: None,
+                    left: Some(Double),
+                    right: Some(Double),
+                }),
+            ),
+            ('A', None),
+            (' ', None),
+        ] {
+            assert_eq!(get_box_segments(ch), expected, "{ch}");
+        }
     }
 }

@@ -482,43 +482,6 @@ mod tests {
     use gpui_kit::{point, px};
 
     #[test]
-    fn test_pixel_to_cell() {
-        let position = point(px(100.0), px(50.0));
-        let origin = point(px(10.0), px(10.0));
-        let cell_width = px(10.0);
-        let cell_height = px(20.0);
-
-        let point = pixel_to_cell(position, origin, cell_width, cell_height);
-        assert_eq!(point.column.0, 9);
-        assert_eq!(point.line.0, 2);
-    }
-
-    #[test]
-    fn test_pixel_to_cell_at_origin() {
-        let position = point(px(10.0), px(10.0));
-        let origin = point(px(10.0), px(10.0));
-        let cell_width = px(10.0);
-        let cell_height = px(20.0);
-
-        let point = pixel_to_cell(position, origin, cell_width, cell_height);
-        assert_eq!(point.column.0, 0);
-        assert_eq!(point.line.0, 0);
-    }
-
-    #[test]
-    fn test_pixel_to_cell_negative_coordinates() {
-        // Coordinates before origin should clamp to 0
-        let position = point(px(5.0), px(5.0));
-        let origin = point(px(10.0), px(10.0));
-        let cell_width = px(10.0);
-        let cell_height = px(20.0);
-
-        let point = pixel_to_cell(position, origin, cell_width, cell_height);
-        assert_eq!(point.column.0, 0);
-        assert_eq!(point.line.0, 0);
-    }
-
-    #[test]
     fn test_selection_type_from_clicks() {
         assert_eq!(selection_type_from_clicks(1), SelectionType::Simple);
         assert_eq!(selection_type_from_clicks(2), SelectionType::Word);
@@ -528,145 +491,54 @@ mod tests {
     }
 
     #[test]
-    fn test_selection_contains() {
-        let selection = Selection::new(
-            AlacPoint::new(Line(5), Column(10)),
-            AlacPoint::new(Line(7), Column(20)),
-            SelectionType::Simple,
-        );
-
-        // Point within selection
-        assert!(selection.contains(AlacPoint::new(Line(6), Column(15))));
-
-        // Start and end points
-        assert!(selection.contains(AlacPoint::new(Line(5), Column(10))));
-        assert!(selection.contains(AlacPoint::new(Line(7), Column(20))));
-
-        // Points outside selection
-        assert!(!selection.contains(AlacPoint::new(Line(4), Column(15))));
-        assert!(!selection.contains(AlacPoint::new(Line(8), Column(15))));
-    }
-
-    #[test]
-    fn test_selection_contains_reverse() {
-        // Test with end < start (reversed selection)
-        let selection = Selection::new(
-            AlacPoint::new(Line(7), Column(20)),
-            AlacPoint::new(Line(5), Column(10)),
-            SelectionType::Simple,
-        );
-
-        // Should still work correctly
-        assert!(selection.contains(AlacPoint::new(Line(6), Column(15))));
-        assert!(selection.contains(AlacPoint::new(Line(5), Column(10))));
-        assert!(selection.contains(AlacPoint::new(Line(7), Column(20))));
-    }
-
-    #[test]
-    fn test_mouse_button_report_left_click() {
-        let point = AlacPoint::new(Line(5), Column(10));
-        let mode = TermMode::MOUSE_REPORT_CLICK;
-
-        let bytes = mouse_button_report(MouseButton::Left, true, point, 0, mode);
-        assert!(bytes.is_some());
-
-        let sequence = String::from_utf8(bytes.unwrap()).unwrap();
-        // SGR format: ESC[<button;col;row M
-        // Line 5 (0-indexed) = row 6 (1-indexed)
-        // Column 10 (0-indexed) = col 11 (1-indexed)
-        assert_eq!(sequence, "\x1b[<0;11;6M");
-    }
-
-    #[test]
-    fn test_mouse_button_report_right_release() {
-        let point = AlacPoint::new(Line(0), Column(0));
-        let mode = TermMode::MOUSE_REPORT_CLICK;
-
-        let bytes = mouse_button_report(MouseButton::Right, false, point, 0, mode);
-        assert!(bytes.is_some());
-
-        let sequence = String::from_utf8(bytes.unwrap()).unwrap();
-        // Right button = 2, released = 'm'
-        assert_eq!(sequence, "\x1b[<2;1;1m");
-    }
-
-    #[test]
-    fn test_mouse_button_report_with_modifiers() {
-        let point = AlacPoint::new(Line(0), Column(0));
-        let mode = TermMode::MOUSE_REPORT_CLICK;
-        let modifiers = encode_modifiers(true, true, true); // Shift + Alt + Ctrl = 28
-
-        let bytes = mouse_button_report(MouseButton::Left, true, point, modifiers, mode);
-        assert!(bytes.is_some());
-
-        let sequence = String::from_utf8(bytes.unwrap()).unwrap();
-        // Button 0 + modifiers 28 = 28
-        assert_eq!(sequence, "\x1b[<28;1;1M");
-    }
-
-    #[test]
-    fn test_mouse_button_report_disabled() {
-        let point = AlacPoint::new(Line(0), Column(0));
-        let mode = TermMode::empty();
-
-        let bytes = mouse_button_report(MouseButton::Left, true, point, 0, mode);
-        assert!(bytes.is_none());
-    }
-
-    #[test]
-    fn test_scroll_report_mouse_mode() {
-        let point = AlacPoint::new(Line(5), Column(10));
-        let mode = TermMode::MOUSE_REPORT_CLICK;
-
-        // Scroll up
-        let bytes = scroll_report(3, point, 0, mode);
-        assert!(bytes.is_some());
-        let sequence = String::from_utf8(bytes.unwrap()).unwrap();
-        // Wheel up = button 64
-        assert_eq!(sequence, "\x1b[<64;11;6M");
-
-        // Scroll down
-        let bytes = scroll_report(-2, point, 0, mode);
-        assert!(bytes.is_some());
-        let sequence = String::from_utf8(bytes.unwrap()).unwrap();
-        // Wheel down = button 65
-        assert_eq!(sequence, "\x1b[<65;11;6M");
-    }
-
-    #[test]
-    fn test_scroll_report_alternate_screen() {
-        let point = AlacPoint::new(Line(0), Column(0));
-        let mode = TermMode::ALT_SCREEN;
-
-        // Scroll up in alternate screen = arrow up keys
-        let bytes = scroll_report(3, point, 0, mode);
-        assert!(bytes.is_some());
-        let sequence = bytes.unwrap();
-        // Should be 3 arrow up sequences
-        assert_eq!(sequence, b"\x1b[A\x1b[A\x1b[A");
-    }
-
-    #[test]
-    fn test_scroll_report_alternate_screen_app_cursor() {
-        let point = AlacPoint::new(Line(0), Column(0));
-        let mode = TermMode::ALT_SCREEN | TermMode::APP_CURSOR;
-
-        // Scroll down with app cursor mode
-        let bytes = scroll_report(-2, point, 0, mode);
-        assert!(bytes.is_some());
-        let sequence = bytes.unwrap();
-        // Should be 2 arrow down sequences in app cursor format
-        assert_eq!(sequence, b"\x1bOB\x1bOB");
-    }
-
-    #[test]
-    fn test_scroll_report_normal_screen() {
-        let point = AlacPoint::new(Line(0), Column(0));
-        let mode = TermMode::empty();
-
-        // In normal screen mode, scrolling should be handled locally
-        let bytes = scroll_report(3, point, 0, mode);
-        assert!(bytes.is_none());
+    fn sgr_mouse_reports_preserve_buttons_modifiers_coordinates_and_disabled_mode() {
+        for (case, button, pressed, line, col, modifiers, mode, expected) in [
+            (
+                "test_mouse_button_report_left_click",
+                MouseButton::Left,
+                true,
+                5,
+                10,
+                0,
+                TermMode::MOUSE_REPORT_CLICK,
+                Some("\x1b[<0;11;6M"),
+            ),
+            (
+                "test_mouse_button_report_right_release",
+                MouseButton::Right,
+                false,
+                0,
+                0,
+                0,
+                TermMode::MOUSE_REPORT_CLICK,
+                Some("\x1b[<2;1;1m"),
+            ),
+            (
+                "test_mouse_button_report_with_modifiers",
+                MouseButton::Left,
+                true,
+                0,
+                0,
+                encode_modifiers(true, true, true),
+                TermMode::MOUSE_REPORT_CLICK,
+                Some("\x1b[<28;1;1M"),
+            ),
+            (
+                "test_mouse_button_report_disabled",
+                MouseButton::Left,
+                true,
+                0,
+                0,
+                0,
+                TermMode::empty(),
+                None,
+            ),
+        ] {
+            let point = AlacPoint::new(Line(line), Column(col));
+            let bytes = mouse_button_report(button, pressed, point, modifiers, mode);
+            let sequence = bytes.map(|bytes| String::from_utf8(bytes).unwrap());
+            assert_eq!(sequence.as_deref(), expected, "{case}");
+        }
     }
 
     #[test]
@@ -707,5 +579,101 @@ mod tests {
         let bytes = scroll_to_arrow_keys(-100, mode);
         let expected = b"\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B";
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn pixel_to_cell_preserves_offset_origin_and_clamping() {
+        for (case, x, y, column, line) in [
+            ("offset", 100.0, 50.0, 9, 2),
+            ("origin", 10.0, 10.0, 0, 0),
+            ("before_origin", 5.0, 5.0, 0, 0),
+        ] {
+            let cell = pixel_to_cell(
+                point(px(x), px(y)),
+                point(px(10.0), px(10.0)),
+                px(10.0),
+                px(20.0),
+            );
+            assert_eq!((cell.column.0, cell.line.0), (column, line), "{case}");
+        }
+    }
+
+    #[test]
+    fn selection_contains_preserves_forward_and_reverse_boundaries() {
+        for (case, start, end, probes) in [
+            (
+                "forward",
+                (5, 10),
+                (7, 20),
+                &[
+                    ((6, 15), true),
+                    ((5, 10), true),
+                    ((7, 20), true),
+                    ((4, 15), false),
+                    ((8, 15), false),
+                ][..],
+            ),
+            (
+                "reverse",
+                (7, 20),
+                (5, 10),
+                &[((6, 15), true), ((5, 10), true), ((7, 20), true)][..],
+            ),
+        ] {
+            let selection = Selection::new(
+                AlacPoint::new(Line(start.0), Column(start.1)),
+                AlacPoint::new(Line(end.0), Column(end.1)),
+                SelectionType::Simple,
+            );
+            for &((line, column), expected) in probes {
+                assert_eq!(
+                    selection.contains(AlacPoint::new(Line(line), Column(column))),
+                    expected,
+                    "{case} ({line}, {column})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_report_preserves_mouse_cursor_and_scrollback_modes() {
+        for (case, delta, line, column, mode, expected) in [
+            (
+                "mouse_up",
+                3,
+                5,
+                10,
+                TermMode::MOUSE_REPORT_CLICK,
+                Some(&b"\x1b[<64;11;6M"[..]),
+            ),
+            (
+                "mouse_down",
+                -2,
+                5,
+                10,
+                TermMode::MOUSE_REPORT_CLICK,
+                Some(&b"\x1b[<65;11;6M"[..]),
+            ),
+            (
+                "alternate",
+                3,
+                0,
+                0,
+                TermMode::ALT_SCREEN,
+                Some(&b"\x1b[A\x1b[A\x1b[A"[..]),
+            ),
+            (
+                "application_cursor",
+                -2,
+                0,
+                0,
+                TermMode::ALT_SCREEN | TermMode::APP_CURSOR,
+                Some(&b"\x1bOB\x1bOB"[..]),
+            ),
+            ("scrollback", 3, 0, 0, TermMode::empty(), None),
+        ] {
+            let actual = scroll_report(delta, AlacPoint::new(Line(line), Column(column)), 0, mode);
+            assert_eq!(actual.as_deref(), expected, "{case}");
+        }
     }
 }

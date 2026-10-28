@@ -1339,6 +1339,8 @@ async fn semantic_identity_writes_share_canonical_key_and_merge_evidence() {
         )
         .await
         .expect("duplicate semantic write");
+    assert_eq!(second.canonical_key.key, "user/global:identity:self:name");
+    assert_eq!(second.semantic_fingerprint, first.semantic_fingerprint);
     assert_eq!(second.relation, MemoryWriteRelation::Duplicate);
     assert!(!second.created);
     assert!(second.evidence_merged);
@@ -2072,7 +2074,7 @@ async fn semantic_write_extractor_ontology_proposal_is_advisory_only() {
 
 #[tokio::test]
 async fn semantic_thread_episodic_route_response_carries_deferred_refs() {
-    let (_store, _backend, service) = setup_service().await;
+    let (store, _backend, service) = setup_service().await;
     let turn_id = "turn_thread_episodic_route_info";
     let response = service
         .write_semantic_memory(
@@ -2115,6 +2117,38 @@ async fn semantic_thread_episodic_route_response_carries_deferred_refs() {
         route.canonical_key.as_deref(),
         Some("user/default:todo:self:custom_4de127d381235b26")
     );
+
+    let decisions = store
+        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+        .await
+        .expect("quality decisions");
+    assert!(decisions.iter().any(|decision| {
+        decision.turn_id.as_deref() == Some(turn_id)
+            && decision.action == MemoryQualityAction::RouteToThreadEpisodic
+    }));
+
+    let search = service
+        .search(
+            user_context(385),
+            MemorySearchParams {
+                query: "revisit active debugging branch".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("deferred fact is not searchable");
+    assert!(search.hits.is_empty());
+    let recall = service
+        .recall_for_prompt(
+            user_context(385),
+            MemoryRecallParams {
+                query: "revisit active debugging branch".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("deferred fact is not prompt memory");
+    assert!(recall.items.is_empty());
 }
 
 #[tokio::test]
@@ -2232,6 +2266,18 @@ async fn semantic_task_state_route_response_is_deferred_and_not_memory() {
         .await
         .expect("search");
     assert!(search.hits.is_empty());
+
+    let recall = service
+        .recall_for_prompt(
+            workspace_context("ws_route_task", 389),
+            MemoryRecallParams {
+                query: "child task waiting for provider output".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("task runtime state is not prompt memory");
+    assert!(recall.items.is_empty());
 }
 
 #[tokio::test]
@@ -2327,6 +2373,17 @@ async fn semantic_domain_state_routes_are_deferred_and_not_memory() {
             .await
             .expect("recall");
         assert!(recall.items.is_empty(), "{query}");
+        let search = service
+            .search(
+                workspace_context("ws_route_domain", 392),
+                MemorySearchParams {
+                    query: query.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("domain runtime state is not searchable");
+        assert!(search.hits.is_empty(), "{query}");
     }
 }
 
@@ -2467,7 +2524,7 @@ async fn semantic_force_reject_response_is_rejected_terminal_route() {
 
 #[tokio::test]
 async fn semantic_quarantine_response_is_audit_only_terminal_route() {
-    let (_store, _backend, service) = setup_service().await;
+    let (store, _backend, service) = setup_service().await;
     let response = service
         .write_semantic_memory(
             user_context(395),
@@ -2505,6 +2562,29 @@ async fn semantic_quarantine_response_is_audit_only_terminal_route() {
         .await
         .expect("recall");
     assert!(recall.items.is_empty());
+
+    let decisions = store
+        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+        .await
+        .expect("quality decisions");
+    assert!(decisions.iter().any(|decision| {
+        decision.turn_id.as_deref() == Some("turn_quarantine_audit_only_route")
+            && decision.action == MemoryQualityAction::Quarantine
+            && decision
+                .reason_codes
+                .contains(&MemoryQualityReasonCode::UnknownFactClass)
+    }));
+    let search = service
+        .search(
+            user_context(396),
+            MemorySearchParams {
+                query: "unknown custom fact".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("audit-only fact is not searchable");
+    assert!(search.hits.is_empty());
 }
 
 #[tokio::test]
@@ -2577,128 +2657,6 @@ async fn semantic_weak_evidence_and_unknown_lifetime_do_not_create_review_candid
         decision.turn_id.as_deref() == Some("turn_unknown_lifetime_quarantine")
             && decision.action == MemoryQualityAction::Quarantine
     }));
-}
-
-#[tokio::test]
-async fn semantic_quality_gate_routes_and_quarantines_without_exposing_memory() {
-    let (store, _backend, service) = setup_service().await;
-    let routed_thread = service
-        .write_semantic_memory(
-            user_context(370),
-            semantic_write_params(
-                thread_local_todo_semantic(),
-                "Thread-only follow-up should stay out of durable memory.",
-                "thread-only follow-up",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_quality_route_thread",
-            ),
-        )
-        .await
-        .expect("thread route write");
-    assert!(routed_thread.record.is_none());
-    assert!(routed_thread.candidate.is_none());
-
-    let mut task_params = semantic_write_params(
-        task_lifecycle_semantic(),
-        "Task runtime state should stay out of durable memory.",
-        "task runtime state",
-        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-        "turn_quality_route_task",
-    );
-    task_params.source_context_kind = Some(MemorySourceContextKind::TaskRuntime);
-    let routed_task = service
-        .write_semantic_memory(workspace_context("ws_quality", 371), task_params)
-        .await
-        .expect("task route write");
-    assert!(routed_task.record.is_none());
-    assert!(routed_task.candidate.is_none());
-
-    let mut tool_params = semantic_write_params(
-        tool_result_semantic(),
-        "Tool observation should stay out of durable memory.",
-        "tool observation",
-        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-        "turn_quality_route_tool",
-    );
-    tool_params.scope = scope(MemoryScopeKind::Workspace, "ws_quality");
-    tool_params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
-    let routed_tool = service
-        .write_semantic_memory(workspace_context("ws_quality", 372), tool_params)
-        .await
-        .expect("tool route write");
-    assert!(routed_tool.record.is_none());
-    assert!(routed_tool.candidate.is_none());
-
-    let quarantined = service
-        .write_semantic_memory(
-            user_context(373),
-            semantic_write_params(
-                unknown_custom_semantic(),
-                "Unknown custom fact should be quarantined.",
-                "unknown custom fact",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_quality_quarantine_unknown",
-            ),
-        )
-        .await
-        .expect("quarantine write");
-    assert!(quarantined.record.is_none());
-    assert!(quarantined.candidate.is_none());
-
-    let decisions = store
-        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
-        .await
-        .expect("quality decisions");
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some("turn_quality_route_thread")
-            && decision.action == MemoryQualityAction::RouteToThreadEpisodic
-    }));
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some("turn_quality_route_task")
-            && decision.action == MemoryQualityAction::RouteToTaskState
-    }));
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some("turn_quality_route_tool")
-            && decision.action == MemoryQualityAction::RouteToDomainState
-    }));
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some("turn_quality_quarantine_unknown")
-            && decision.action == MemoryQualityAction::Quarantine
-            && decision
-                .reason_codes
-                .contains(&MemoryQualityReasonCode::UnknownFactClass)
-    }));
-
-    for query in [
-        "thread-only follow-up",
-        "task runtime state",
-        "tool observation",
-        "unknown custom fact",
-    ] {
-        let search = service
-            .search(
-                workspace_context("ws_quality", 374),
-                MemorySearchParams {
-                    query: query.to_owned(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("search");
-        assert!(search.hits.is_empty(), "{query}");
-
-        let recall = service
-            .recall_for_prompt(
-                workspace_context("ws_quality", 375),
-                MemoryRecallParams {
-                    query: query.to_owned(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("recall");
-        assert!(recall.items.is_empty(), "{query}");
-    }
 }
 
 #[tokio::test]

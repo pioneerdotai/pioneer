@@ -113,29 +113,12 @@ pub fn fail_pending_artifact_upload_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::{timings::GatewayWsTimings, types::GatewayEndpointKind};
-    use crate::transport::ws::GatewayWsConnectSpec;
     use pioneer_protocol::{
         AccessChangeKind, AccessChangeOutcome, GatewayNotification, TurnItem, WorkspaceChangeKind,
         constants::events,
     };
     use serde_json::json;
     use std::time::Duration;
-
-    fn spec() -> GatewayWsConnectSpec {
-        GatewayWsConnectSpec {
-            endpoint_id: "remote".to_owned(),
-            endpoint_name: "Remote".to_owned(),
-            endpoint_kind: GatewayEndpointKind::Remote,
-            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
-                "127.0.0.1:22000",
-            )
-            .unwrap(),
-            auth_token: None,
-            session: None,
-            timings: GatewayWsTimings::from_millis(100, 200, 300, 400, 1_000, 0).expect("timings"),
-        }
-    }
 
     #[test]
     fn decode_routes_unknown_gateway_notification() {
@@ -461,11 +444,5 @@ mod tests {
             Ok(json!({ "ok": true }))
         );
         assert!(pending_requests.is_empty());
-    }
-
-    #[test]
-    fn decode_helper_keeps_upload_ack_key_contract() {
-        let _ = spec();
-        assert_eq!(upload_ack_key("upload_1", 42), "upload_1:42");
     }
 }

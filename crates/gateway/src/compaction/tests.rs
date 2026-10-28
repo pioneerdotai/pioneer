@@ -2269,33 +2269,6 @@ async fn completed_history_runner_preserves_its_owner_database_scope() {
     }
 }
 
-#[test]
-fn indexed_runner_payload_keeps_unicode_character_cursor_stable() {
-    let source = pioneer_compaction::SourceRef {
-        scope: "event:turn".into(),
-        id: "unicode".into(),
-        version: "event-revision:1".into(),
-    };
-    let text = "a漢🌍é".repeat(12_345);
-    let indexed = IndexedPayload::new(text.clone());
-    let mut rebuilt = String::new();
-    let mut cursor = 0;
-    loop {
-        let fragment = indexed.fragment(&source, cursor).unwrap();
-        let repeated = indexed.fragment(&source, cursor).unwrap();
-        assert_eq!(fragment.reference, repeated.reference);
-        assert_eq!(fragment.text, repeated.text);
-        assert_eq!(fragment.next_character, repeated.next_character);
-        rebuilt.push_str(&fragment.text);
-        let Some(next) = fragment.next_character else {
-            break;
-        };
-        assert_eq!(next, cursor + fragment.text.chars().count() as u64);
-        cursor = next;
-    }
-    assert_eq!(rebuilt, text);
-}
-
 fn historical_command_fixture(output: &str) -> pioneer_protocol::TurnItem {
     use pioneer_protocol::{
         ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot, ToolStoragePayload, TurnItem,
@@ -2419,88 +2392,6 @@ fn compaction_source_projection_normalizes_item_and_event_before_fragmenting() {
         historical_source_model_payload(&event_source, updated_raw.clone(), 0).unwrap(),
         updated_raw
     );
-}
-
-#[test]
-fn durable_character_cursor_remains_bound_to_its_text_projection() {
-    let source = SourceRef {
-        scope: "item:turn".into(),
-        id: "item-source".into(),
-        version: "item-revision:1".into(),
-    };
-    let raw = serde_json::to_string(&historical_command_fixture(&"cursor-output ".repeat(2_000)))
-        .unwrap();
-    let current = historical_source_model_payload(
-        &source,
-        raw.clone(),
-        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
-    )
-    .unwrap();
-    assert_ne!(raw.len(), current.len());
-
-    let mut legacy_json = serde_json::to_value(
-        RunnerState::new(900_000, &ModelBudget::new(None, None, None), 500, None).unwrap(),
-    )
-    .unwrap();
-    legacy_json
-        .as_object_mut()
-        .unwrap()
-        .remove("source_text_projection_version");
-    legacy_json["cursor"]["character"] = serde_json::json!(37);
-    let legacy: RunnerState = serde_json::from_value(legacy_json).unwrap();
-    assert_eq!(legacy.source_text_projection_version, 0);
-    assert_eq!(source_text_projection_for_cursor(&legacy, &source), 0);
-    let legacy_text = historical_source_model_payload(
-        &source,
-        raw.clone(),
-        legacy.source_text_projection_version,
-    )
-    .unwrap();
-    let expected = IndexedPayload::new(raw)
-        .fragment(&source, legacy.cursor.character)
-        .unwrap();
-    assert_eq!(
-        IndexedPayload::new(legacy_text)
-            .fragment(&source, legacy.cursor.character)
-            .unwrap()
-            .text,
-        expected.text
-    );
-    let retry = legacy.claim(0).unwrap();
-    let retry_after_restart: RunnerState =
-        serde_json::from_str(&serde_json::to_string(&retry).unwrap()).unwrap();
-    assert_eq!(retry_after_restart.cursor, legacy.cursor);
-    assert_eq!(retry_after_restart.source_text_projection_version, 0);
-    let mut legacy_boundary = legacy.clone();
-    legacy_boundary.cursor.character = 0;
-    assert_eq!(
-        source_text_projection_for_cursor(&legacy_boundary, &source),
-        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
-    );
-
-    let fresh = RunnerState::new(900_000, &ModelBudget::new(None, None, None), 500, None).unwrap();
-    assert_eq!(
-        fresh.source_text_projection_version,
-        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
-    );
-    let restarted: RunnerState =
-        serde_json::from_str(&serde_json::to_string(&fresh).unwrap()).unwrap();
-    assert_eq!(
-        restarted.source_text_projection_version,
-        fresh.source_text_projection_version
-    );
-    let indexed = IndexedPayload::new(current.clone());
-    let mut rebuilt = String::new();
-    let mut cursor = 0;
-    loop {
-        let fragment = indexed.fragment(&source, cursor).unwrap();
-        rebuilt.push_str(&fragment.text);
-        let Some(next) = fragment.next_character else {
-            break;
-        };
-        cursor = next;
-    }
-    assert_eq!(rebuilt, current);
 }
 
 #[test]
@@ -2897,7 +2788,8 @@ fn ordinary_active_api_tool_result_is_not_rewritten_by_history_projection() {
 
 #[tokio::test]
 async fn runner_keeps_large_compressed_active_payload_while_loading_reference_only_excerpt() {
-    let f = fixture(&"漢🌍".repeat(40_000), vec![], true, false).await;
+    let text = "a漢🌍é".repeat(40_000);
+    let f = fixture(&text, vec![], true, false).await;
     let reference_payload =
         canonical_reasoning_event_payload("reference-reasoning", &"reference ".repeat(20_000));
     f.store.database_connection().execute_raw(Statement::from_sql_and_values(
@@ -2974,6 +2866,31 @@ async fn runner_keeps_large_compressed_active_payload_while_loading_reference_on
         .await
         .unwrap();
     assert!(!second.text.is_empty());
+    let mut rebuilt = String::new();
+    let mut cursor = 0;
+    loop {
+        let fragment = f
+            .runner
+            .active_payload_fragment("thread", &source, cursor)
+            .await
+            .unwrap();
+        let repeated = f
+            .runner
+            .active_payload_fragment("thread", &source, cursor)
+            .await
+            .unwrap();
+        assert_eq!(fragment.reference, source);
+        assert_eq!(fragment.reference, repeated.reference);
+        assert_eq!(fragment.text, repeated.text);
+        assert_eq!(fragment.next_character, repeated.next_character);
+        rebuilt.push_str(&fragment.text);
+        let Some(next) = fragment.next_character else {
+            break;
+        };
+        assert_eq!(next, cursor + fragment.text.chars().count() as u64);
+        cursor = next;
+    }
+    assert_eq!(rebuilt, text);
     let after = {
         let cache = f.runner.active_payload.lock().await;
         Arc::as_ptr(&cache.as_ref().unwrap().payload)
@@ -3476,6 +3393,7 @@ async fn legacy_frozen_failed_provider_observation_restores_portable_execution_a
         .unwrap()
         .reference;
     let mut legacy = super::history::legacy_provider_observation(&payload).unwrap();
+    assert!(legacy.content.contains("opaque-secret"));
     legacy.provenance = Some(MessageProvenance {
         logical_turn_id: Some("turn".into()),
         workspace_id: "ws".into(),
@@ -5298,14 +5216,17 @@ async fn compaction_runner_durably_finishes_legacy_cursor_before_projecting_next
     )
     .unwrap();
     let legacy_offset = 73_u64;
-    let mut legacy_state = serde_json::to_value(
-        f.store
-            .compaction_runner_state("operation")
-            .await
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
+    let fresh = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fresh.source_text_projection_version,
+        COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION
+    );
+    let mut legacy_state = serde_json::to_value(fresh).unwrap();
     legacy_state
         .as_object_mut()
         .unwrap()

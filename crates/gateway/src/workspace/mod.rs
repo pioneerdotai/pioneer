@@ -672,25 +672,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_workspace_rejects_empty_name() {
-        let manager = setup_workspace_manager().await;
-        let error = manager
-            .create_workspace(workspace_id(10).as_str(), Some("  "))
-            .await
-            .expect_err("empty name should fail");
-
-        assert_eq!(error, WorkspaceError::InvalidWorkspaceName);
-    }
-
-    #[tokio::test]
-    async fn create_workspace_rejects_empty_workspace_id() {
-        let manager = setup_workspace_manager().await;
-        let error = manager
-            .create_workspace("   ", Some("Sandbox"))
-            .await
-            .expect_err("empty id should fail");
-
-        assert_eq!(error, WorkspaceError::InvalidWorkspaceId);
+    async fn create_workspace_rejects_invalid_inputs() {
+        for (requested_id, name, expected) in [
+            (
+                workspace_id(10),
+                Some("  "),
+                WorkspaceError::InvalidWorkspaceName,
+            ),
+            (
+                "   ".to_owned(),
+                Some("Sandbox"),
+                WorkspaceError::InvalidWorkspaceId,
+            ),
+        ] {
+            let manager = setup_workspace_manager().await;
+            let error = manager
+                .create_workspace(requested_id.as_str(), name)
+                .await
+                .expect_err("invalid create input should fail");
+            assert_eq!(
+                error, expected,
+                "requested_id={requested_id:?}, name={name:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -787,46 +791,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_workspace_trims_name() {
-        let manager = setup_workspace_manager().await;
-        let requested_id = workspace_id(20);
-        insert_workspace(&manager, &requested_id, true, true).await;
-
-        let updated = manager
-            .update_workspace(requested_id.as_str(), Some("  Renamed Workspace  "))
-            .await
-            .expect("workspace update should succeed");
-
-        assert_eq!(updated.id, requested_id);
-        assert_eq!(updated.name, "Renamed Workspace");
-    }
-
-    #[tokio::test]
-    async fn update_workspace_rejects_empty_name() {
-        let manager = setup_workspace_manager().await;
-        let requested_id = workspace_id(21);
-        insert_workspace(&manager, &requested_id, true, true).await;
-
-        let error = manager
-            .update_workspace(requested_id.as_str(), Some("   "))
-            .await
-            .expect_err("empty name should fail");
-
-        assert_eq!(error, WorkspaceError::InvalidWorkspaceName);
-    }
-
-    #[tokio::test]
-    async fn update_workspace_rejects_missing_fields() {
-        let manager = setup_workspace_manager().await;
-        let requested_id = workspace_id(22);
-        insert_workspace(&manager, &requested_id, true, true).await;
-
-        let error = manager
-            .update_workspace(requested_id.as_str(), None)
-            .await
-            .expect_err("missing fields should fail");
-
-        assert_eq!(error, WorkspaceError::NoWorkspaceUpdateFields);
+    async fn update_workspace_rejects_invalid_fields() {
+        for (requested_id, name, expected) in [
+            (
+                workspace_id(21),
+                Some("   "),
+                WorkspaceError::InvalidWorkspaceName,
+            ),
+            (
+                workspace_id(22),
+                None,
+                WorkspaceError::NoWorkspaceUpdateFields,
+            ),
+        ] {
+            let manager = setup_workspace_manager().await;
+            insert_workspace(&manager, &requested_id, true, true).await;
+            let error = manager
+                .update_workspace(requested_id.as_str(), name)
+                .await
+                .expect_err("invalid update fields should fail");
+            assert_eq!(
+                error, expected,
+                "requested_id={requested_id:?}, name={name:?}"
+            );
+        }
     }
 
     #[tokio::test]

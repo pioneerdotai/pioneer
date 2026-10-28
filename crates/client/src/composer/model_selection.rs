@@ -473,13 +473,10 @@ mod tests {
     }
 
     #[test]
-    fn task_turn_defaults_survive_sidebar_navigation() {
-        check_task_turn_navigation(false);
-    }
-
-    #[test]
-    fn task_turn_defaults_survive_navigation_publication_first() {
-        check_task_turn_navigation(true);
+    fn task_turn_defaults_survive_both_navigation_publication_orders() {
+        for publication_first in [false, true] {
+            check_task_turn_navigation(publication_first);
+        }
     }
 
     #[test]
@@ -586,175 +583,149 @@ mod tests {
     }
 
     #[test]
-    fn active_thread_with_turns_wins_over_newer_workspace_turn() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_a"),
-            Some("ws"),
-            vec![
-                candidate("thread_a", "ws", 10, true, "openai", "gpt-5.4"),
-                candidate("thread_b", "ws", 20, true, "anthropic", "claude-sonnet-4.5"),
-            ],
-        );
-
-        assert_eq!(resolved, selection("openai", "gpt-5.4"));
-    }
-
-    #[test]
-    fn active_thread_with_turns_restores_reasoning_effort() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_a"),
-            Some("ws"),
-            vec![
-                candidate_with_effort(
-                    "thread_a",
+    fn resolver_preserves_active_and_workspace_fallback_cases() {
+        for (case, active_thread, workspace, candidates, expected) in [
+            (
+                "active_thread_with_turns_wins_over_newer_workspace_turn",
+                Some("thread_a"),
+                Some("ws"),
+                vec![
+                    candidate("thread_a", "ws", 10, true, "openai", "gpt-5.4"),
+                    candidate("thread_b", "ws", 20, true, "anthropic", "claude-sonnet-4.5"),
+                ],
+                selection("openai", "gpt-5.4"),
+            ),
+            (
+                "active_thread_with_turns_restores_reasoning_effort",
+                Some("thread_a"),
+                Some("ws"),
+                vec![
+                    candidate_with_effort(
+                        "thread_a",
+                        "ws",
+                        10,
+                        true,
+                        "openai",
+                        "gpt-5.4",
+                        Some("high"),
+                    ),
+                    candidate("thread_b", "ws", 20, true, "anthropic", "claude-sonnet-4.5"),
+                ],
+                selection_with_effort("openai", "gpt-5.4", Some("high")),
+            ),
+            (
+                "empty_active_thread_uses_latest_workspace_turn",
+                Some("thread_empty"),
+                Some("ws"),
+                vec![
+                    candidate("thread_empty", "ws", 30, false, "openai", "default"),
+                    candidate("thread_old", "ws", 10, true, "openai", "gpt-5.4"),
+                    candidate(
+                        "thread_new",
+                        "ws",
+                        20,
+                        true,
+                        "openrouter",
+                        "anthropic/claude",
+                    ),
+                ],
+                selection("openrouter", "anthropic/claude"),
+            ),
+            (
+                "empty_active_thread_restores_latest_workspace_turn_reasoning_effort",
+                Some("thread_empty"),
+                Some("ws"),
+                vec![
+                    candidate("thread_empty", "ws", 30, false, "openai", "default"),
+                    candidate_with_effort(
+                        "thread_old",
+                        "ws",
+                        10,
+                        true,
+                        "openai",
+                        "gpt-5.4",
+                        Some("low"),
+                    ),
+                    candidate_with_effort(
+                        "thread_new",
+                        "ws",
+                        20,
+                        true,
+                        "openrouter",
+                        "anthropic/claude",
+                        Some("high"),
+                    ),
+                ],
+                selection_with_effort("openrouter", "anthropic/claude", Some("high")),
+            ),
+            (
+                "workspace_without_active_thread_uses_latest_workspace_turn",
+                None,
+                Some("ws"),
+                vec![
+                    candidate("thread_empty", "ws", 30, false, "openai", "default"),
+                    candidate("thread_old", "ws", 10, true, "openai", "gpt-5.4"),
+                    candidate(
+                        "thread_new",
+                        "ws",
+                        20,
+                        true,
+                        "openrouter",
+                        "anthropic/claude",
+                    ),
+                    candidate("thread_other", "other", 40, true, "anthropic", "claude"),
+                ],
+                selection("openrouter", "anthropic/claude"),
+            ),
+            (
+                "empty_workspace_keeps_model_selection_blank",
+                Some("thread_empty"),
+                Some("ws"),
+                vec![candidate(
+                    "thread_empty",
                     "ws",
-                    10,
-                    true,
+                    30,
+                    false,
                     "openai",
-                    "gpt-5.4",
-                    Some("high"),
-                ),
-                candidate("thread_b", "ws", 20, true, "anthropic", "claude-sonnet-4.5"),
-            ],
-        );
-
-        assert_eq!(
-            resolved,
-            selection_with_effort("openai", "gpt-5.4", Some("high"))
-        );
-    }
-
-    #[test]
-    fn empty_active_thread_uses_latest_workspace_turn() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_empty"),
-            Some("ws"),
-            vec![
-                candidate("thread_empty", "ws", 30, false, "openai", "default"),
-                candidate("thread_old", "ws", 10, true, "openai", "gpt-5.4"),
-                candidate(
-                    "thread_new",
-                    "ws",
-                    20,
-                    true,
-                    "openrouter",
-                    "anthropic/claude",
-                ),
-            ],
-        );
-
-        assert_eq!(resolved, selection("openrouter", "anthropic/claude"));
-    }
-
-    #[test]
-    fn empty_active_thread_restores_latest_workspace_turn_reasoning_effort() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_empty"),
-            Some("ws"),
-            vec![
-                candidate("thread_empty", "ws", 30, false, "openai", "default"),
-                candidate_with_effort(
-                    "thread_old",
-                    "ws",
-                    10,
-                    true,
-                    "openai",
-                    "gpt-5.4",
-                    Some("low"),
-                ),
-                candidate_with_effort(
-                    "thread_new",
-                    "ws",
-                    20,
-                    true,
-                    "openrouter",
-                    "anthropic/claude",
-                    Some("high"),
-                ),
-            ],
-        );
-
-        assert_eq!(
-            resolved,
-            selection_with_effort("openrouter", "anthropic/claude", Some("high"))
-        );
-    }
-
-    #[test]
-    fn workspace_without_active_thread_uses_latest_workspace_turn() {
-        let resolved = resolve_composer_model_selection(
-            None,
-            Some("ws"),
-            vec![
-                candidate("thread_empty", "ws", 30, false, "openai", "default"),
-                candidate("thread_old", "ws", 10, true, "openai", "gpt-5.4"),
-                candidate(
-                    "thread_new",
-                    "ws",
-                    20,
-                    true,
-                    "openrouter",
-                    "anthropic/claude",
-                ),
-                candidate("thread_other", "other", 40, true, "anthropic", "claude"),
-            ],
-        );
-
-        assert_eq!(resolved, selection("openrouter", "anthropic/claude"));
-    }
-
-    #[test]
-    fn empty_workspace_keeps_model_selection_blank() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_empty"),
-            Some("ws"),
-            vec![candidate(
-                "thread_empty",
-                "ws",
-                30,
-                false,
-                "openai",
-                "default",
-            )],
-        );
-
-        assert_eq!(resolved, None);
-    }
-
-    #[test]
-    fn fallback_ignores_other_workspaces() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_empty"),
-            Some("ws_a"),
-            vec![
-                candidate("thread_empty", "ws_a", 30, false, "openai", "default"),
-                candidate("thread_b", "ws_b", 40, true, "anthropic", "claude"),
-                candidate("thread_a", "ws_a", 20, true, "openai", "gpt-5.4"),
-            ],
-        );
-
-        assert_eq!(resolved, selection("openai", "gpt-5.4"));
-    }
-
-    #[test]
-    fn active_thread_from_other_workspace_does_not_win_when_workspace_is_explicit() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_old_active"),
-            Some("ws_b"),
-            vec![
-                candidate("thread_old_active", "ws_a", 30, true, "openai", "gpt-5.4"),
-                candidate(
-                    "thread_b",
-                    "ws_b",
-                    20,
-                    true,
-                    "openrouter",
-                    "anthropic/claude",
-                ),
-            ],
-        );
-
-        assert_eq!(resolved, selection("openrouter", "anthropic/claude"));
+                    "default",
+                )],
+                None,
+            ),
+            (
+                "fallback_ignores_other_workspaces",
+                Some("thread_empty"),
+                Some("ws_a"),
+                vec![
+                    candidate("thread_empty", "ws_a", 30, false, "openai", "default"),
+                    candidate("thread_b", "ws_b", 40, true, "anthropic", "claude"),
+                    candidate("thread_a", "ws_a", 20, true, "openai", "gpt-5.4"),
+                ],
+                selection("openai", "gpt-5.4"),
+            ),
+            (
+                "active_thread_from_other_workspace_does_not_win_when_workspace_is_explicit",
+                Some("thread_old_active"),
+                Some("ws_b"),
+                vec![
+                    candidate("thread_old_active", "ws_a", 30, true, "openai", "gpt-5.4"),
+                    candidate(
+                        "thread_b",
+                        "ws_b",
+                        20,
+                        true,
+                        "openrouter",
+                        "anthropic/claude",
+                    ),
+                ],
+                selection("openrouter", "anthropic/claude"),
+            ),
+        ] {
+            assert_eq!(
+                resolve_composer_model_selection(active_thread, workspace, candidates),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]

@@ -2291,7 +2291,6 @@ mod tests {
         MemoryEpisodicRecallCapabilities, MemoryTurnContext, MemoryTurnPolicy,
         build_active_recall_local_preflight_plan,
         build_active_recall_local_preflight_plan_with_thread_summary,
-        parse_active_memory_decision_json,
     };
     use pioneer_protocol::{
         MemoryAttribute, MemoryCategory, MemoryFactClass, MemoryScopeKind, MemorySubject,
@@ -2819,6 +2818,19 @@ mod tests {
                 "contextChars": 0
             })
         );
+        assert_eq!(
+            value["memory"]["activeRecall"]["decisionContext"]["inputTextPreview"],
+            JsonValue::String("как меня зовут?".to_owned())
+        );
+        assert_eq!(
+            value["memory"]["activeRecall"]["decisionRequest"]["configMode"],
+            JsonValue::String("hybrid".to_owned())
+        );
+        assert_eq!(
+            value["memory"]["activeRecall"]["decisionRequest"]["fallbackPolicy"],
+            JsonValue::String("deterministic".to_owned())
+        );
+
         let mut deterministic_with_internal_fields = sample_input();
         deterministic_with_internal_fields
             .memory
@@ -2845,26 +2857,6 @@ mod tests {
         assert!(!serialized.contains("\"source\""));
         assert!(!serialized.contains("\"alwaysVisible\""));
         assert!(!serialized.contains("\"currentlyVisible\""));
-    }
-
-    #[test]
-    fn preflight_input_reuses_active_recall_decision_request_contract() {
-        let value = serde_json::to_value(sample_input()).expect("input serializes");
-
-        assert_eq!(
-            value["memory"]["activeRecall"]["decisionContext"]["inputTextPreview"],
-            JsonValue::String("как меня зовут?".to_owned())
-        );
-        assert_eq!(
-            value["memory"]["activeRecall"]["decisionRequest"]["configMode"],
-            JsonValue::String("hybrid".to_owned())
-        );
-        assert_eq!(
-            value["memory"]["activeRecall"]["decisionRequest"]["fallbackPolicy"],
-            JsonValue::String("deterministic".to_owned())
-        );
-
-        let serialized = serde_json::to_string(&value).expect("value serializes");
         assert!(!serialized.contains("plannerEnabled"));
         assert!(!serialized.contains("plannerNeeded"));
     }
@@ -2884,33 +2876,6 @@ mod tests {
 
         serde_json::from_value::<TurnPreflightInput>(with_source)
             .expect_err("candidate tools must not carry provenance/source fields");
-    }
-
-    #[test]
-    fn preflight_tools_input_adapts_compact_tool_index_without_schemas() {
-        let input = turn_preflight_tools_input_from_index(pioneer_tools::PreflightToolIndex {
-            core_tools: vec!["exec_command".to_owned(), "request_tools".to_owned()],
-            candidate_tools: vec![pioneer_tools::PreflightCandidateToolDescriptor {
-                name: "memory_search".to_owned(),
-                domain: BuiltinToolDomain::Memory,
-                additional_domains: Vec::new(),
-                summary: "Search durable memory.".to_owned(),
-                mutation: false,
-            }],
-        });
-
-        assert_eq!(
-            input.core_tools,
-            vec!["exec_command".to_owned(), "request_tools".to_owned()]
-        );
-        assert_eq!(input.candidate_tools.len(), 1);
-        assert_eq!(input.candidate_tools[0].name, "memory_search");
-        assert_eq!(input.candidate_tools[0].domain, BuiltinToolDomain::Memory);
-
-        let serialized = serde_json::to_string(&input).expect("tools input serializes");
-        assert!(!serialized.contains("parameters"));
-        assert!(!serialized.contains("properties"));
-        assert!(!serialized.contains("jsonSchema"));
     }
 
     fn sample_turn_input() -> TurnPreflightTurnInput {
@@ -3248,32 +3213,6 @@ mod tests {
     }
 
     #[test]
-    fn preflight_local_host_final_active_recall_is_omitted_from_provider_input() {
-        let modules = build_local_preflight_module_plans(
-            sample_tool_index(),
-            sample_deterministic_summary(),
-            sample_memory_local_plan(
-                false,
-                sample_skip_decision(ActiveMemoryDecisionReasonCode::DeterministicOnly),
-            ),
-        );
-
-        let provider_input = modules.provider_input(sample_turn_input());
-
-        assert!(!modules.active_recall_provider_planning_needed());
-        assert!(provider_input.memory.active_recall.is_none());
-        let host_local = modules
-            .host_local_active_recall_plan()
-            .expect("host-local final active recall is retained for final composition");
-        assert_eq!(host_local.source, TurnPreflightPlanSource::HostLocal);
-        assert_eq!(host_local.fallback_reason, None);
-        assert_eq!(
-            host_local.decision.reason_code,
-            ActiveMemoryDecisionReasonCode::DeterministicOnly
-        );
-    }
-
-    #[test]
     fn preflight_local_provider_needed_active_recall_enters_provider_input() {
         let modules = build_local_preflight_module_plans(
             sample_tool_index(),
@@ -3406,6 +3345,7 @@ mod tests {
                 TurnPreflightPlanSource::HostLocal,
                 "{label}"
             );
+            assert_eq!(host_local.fallback_reason, None, "{label}");
             assert_eq!(host_local.decision.reason_code, reason_code, "{label}");
             assert_eq!(host_local.decision.status, status, "{label}");
         }
@@ -3595,40 +3535,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_preflight_plan_rejects_host_owned_diagnostics_shape() {
-        let mut value = sample_provider_plan_json();
-        value["diagnostics"] = json!({
-            "preflightFailed": true,
-            "diagnostics": [{ "code": "preflight.failed" }]
-        });
-
-        serde_json::from_value::<ProviderTurnPreflightPlan>(value)
-            .expect_err("provider diagnostics must not accept final-plan diagnostics object");
-    }
-
-    #[test]
-    fn provider_preflight_plan_rejects_invalid_or_overlong_diagnostics() {
-        let mut invalid_code = sample_provider_plan_json();
-        invalid_code["diagnostics"] = json!([{ "code": "Preflight.Timeout" }]);
-        serde_json::from_value::<ProviderTurnPreflightPlan>(invalid_code)
-            .expect_err("provider diagnostic codes must be structured");
-
-        let mut overlong_code = sample_provider_plan_json();
-        overlong_code["diagnostics"] =
-            json!([{ "code": "x".repeat(PREFLIGHT_DIAGNOSTIC_CODE_MAX_CHARS + 1) }]);
-        serde_json::from_value::<ProviderTurnPreflightPlan>(overlong_code)
-            .expect_err("provider diagnostic codes must be bounded");
-
-        let mut overlong_message = sample_provider_plan_json();
-        overlong_message["diagnostics"] = json!([{
-            "code": "preflight.message_too_long",
-            "message": "x".repeat(PREFLIGHT_DIAGNOSTIC_MESSAGE_MAX_CHARS + 1)
-        }]);
-        serde_json::from_value::<ProviderTurnPreflightPlan>(overlong_message)
-            .expect_err("provider diagnostic messages must be bounded");
-    }
-
-    #[test]
     fn provider_memory_active_recall_rejects_host_owned_memory_fields() {
         let mut value = sample_provider_plan_json();
         value["memory"]["activeRecall"]["debugFallback"] = json!(true);
@@ -3733,17 +3639,6 @@ mod tests {
         let plan = compose_turn_preflight_plan(&local_modules, result);
         assert_eq!(plan.source, TurnPreflightPlanSource::Fallback);
         assert!(plan.diagnostics.preflight_failed);
-    }
-
-    #[test]
-    fn preflight_invalid_provider_response_is_not_a_transient_network_failure() {
-        let failure = TurnPreflightProviderRequestFailure::response_validation(
-            "response_json_parse",
-            anyhow::anyhow!("invalid provider response"),
-            "{",
-        );
-
-        assert!(!failure.is_transient_network());
     }
 
     #[tokio::test]
@@ -3974,8 +3869,11 @@ mod tests {
             Some(240)
         );
         assert_eq!(
-            plan.memory.active_recall.decision.all_diagnostics()[0],
-            "memory.active_recall.provider_called"
+            plan.memory.active_recall.decision.all_diagnostics(),
+            vec![
+                "memory.active_recall.provider_called".to_owned(),
+                "memory.active_recall.identity_lookup".to_owned()
+            ]
         );
     }
 
@@ -4029,34 +3927,6 @@ mod tests {
             None
         );
         assert!(plan.memory.active_recall.decision.provider_used);
-    }
-
-    #[test]
-    fn preflight_memory_fallback_provider_success_preserves_memory_provider_metadata() {
-        let modules = sample_provider_needed_modules();
-        let plan = compose_turn_preflight_plan(&modules, sample_provider_success(1));
-
-        assert_eq!(
-            plan.memory.active_recall.source,
-            TurnPreflightPlanSource::Provider
-        );
-        assert!(plan.memory.active_recall.decision.provider_used);
-        assert!(!plan.memory.active_recall.decision.provider_fallback_used);
-        assert_eq!(
-            plan.memory.active_recall.decision.provider_input_chars,
-            Some(1_200)
-        );
-        assert_eq!(
-            plan.memory.active_recall.decision.provider_output_chars,
-            Some(240)
-        );
-        assert_eq!(
-            plan.memory.active_recall.decision.all_diagnostics(),
-            vec![
-                "memory.active_recall.provider_called".to_owned(),
-                "memory.active_recall.identity_lookup".to_owned()
-            ]
-        );
     }
 
     #[test]
@@ -4359,52 +4229,6 @@ mod tests {
             plan.memory.active_recall.fallback_reason,
             Some(TurnPreflightFallbackReason::InvalidJson)
         );
-        assert!(plan.memory.active_recall.decision.provider_fallback_used);
-        assert_eq!(
-            plan.memory.active_recall.decision.provider_input_chars,
-            Some(1_200)
-        );
-        assert_eq!(
-            plan.memory.active_recall.decision.provider_output_chars,
-            Some(240)
-        );
-        assert!(
-            plan.memory
-                .active_recall
-                .decision
-                .all_diagnostics()
-                .iter()
-                .any(|diagnostic| diagnostic == "memory.active_recall.invalid_json")
-        );
-
-        let value = serde_json::to_value(&plan).expect("final plan serializes");
-        assert!(value.get("modules").is_none());
-        assert_eq!(value["tools"]["visibleTools"], json!([]));
-        assert_eq!(value["diagnostics"]["preflightFailed"], json!(true));
-    }
-
-    #[test]
-    fn preflight_memory_fallback_final_failure_uses_memory_owned_deterministic_plan() {
-        let modules = sample_provider_needed_modules();
-        let plan = compose_turn_preflight_plan(
-            &modules,
-            sample_provider_failure(TurnPreflightFallbackReason::InvalidJson),
-        );
-
-        assert_eq!(plan.source, TurnPreflightPlanSource::Fallback);
-        assert_eq!(
-            plan.fallback_reason,
-            Some(TurnPreflightFallbackReason::InvalidJson)
-        );
-        assert!(plan.tools.visible_tools.is_empty());
-        assert_eq!(
-            plan.memory.active_recall.source,
-            TurnPreflightPlanSource::Fallback
-        );
-        assert_eq!(
-            plan.memory.active_recall.fallback_reason,
-            Some(TurnPreflightFallbackReason::InvalidJson)
-        );
         assert_eq!(
             plan.memory.active_recall.decision.status,
             ActiveMemoryDecisionStatus::Run
@@ -4430,82 +4254,11 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic == "memory.active_recall.invalid_json")
         );
-    }
 
-    #[test]
-    fn memory_identity_flow_provider_final_failure_keeps_tools_core_only_and_memory_fallback() {
-        let modules = sample_provider_needed_modules();
-        let plan = compose_turn_preflight_plan(
-            &modules,
-            sample_provider_failure(TurnPreflightFallbackReason::InvalidJson),
-        );
-
-        assert_eq!(plan.source, TurnPreflightPlanSource::Fallback);
-        assert_eq!(
-            plan.fallback_reason,
-            Some(TurnPreflightFallbackReason::InvalidJson)
-        );
-        assert!(
-            plan.tools.visible_tools.is_empty(),
-            "tools module fallback must not reveal hidden lazy-domain builtin tools"
-        );
-        assert_eq!(
-            modules.tools.input.core_tools,
-            vec!["exec_command".to_owned(), "request_tools".to_owned()]
-        );
-        assert_eq!(
-            plan.memory.active_recall.source,
-            TurnPreflightPlanSource::Fallback
-        );
-        assert_eq!(
-            plan.memory.active_recall.decision.status,
-            ActiveMemoryDecisionStatus::Run
-        );
-        assert!(plan.memory.active_recall.decision.provider_fallback_used);
-        assert!(
-            plan.memory
-                .active_recall
-                .decision
-                .all_diagnostics()
-                .iter()
-                .any(|diagnostic| diagnostic == "memory.active_recall.invalid_json")
-        );
-    }
-
-    #[test]
-    fn preflight_compose_final_failure_honors_memory_skip_fallback_policy() {
-        let modules = build_local_preflight_module_plans(
-            sample_tool_index(),
-            sample_deterministic_summary(),
-            sample_memory_local_plan_from_memory(
-                MemoryActiveRecallPlannerFallbackPolicy::SkipActiveRecall,
-            ),
-        );
-
-        let plan = compose_turn_preflight_plan(
-            &modules,
-            sample_provider_failure(TurnPreflightFallbackReason::ProviderError),
-        );
-
-        assert_eq!(plan.source, TurnPreflightPlanSource::Fallback);
-        assert!(plan.tools.visible_tools.is_empty());
-        assert_eq!(
-            plan.memory.active_recall.decision.status,
-            ActiveMemoryDecisionStatus::Skip
-        );
-        assert_eq!(
-            plan.memory.active_recall.decision.reason_code,
-            ActiveMemoryDecisionReasonCode::ProviderSkip
-        );
-        assert!(plan.memory.active_recall.decision.provider_fallback_used);
-        assert!(
-            plan.memory
-                .active_recall
-                .decision
-                .all_diagnostics()
-                .iter()
-                .any(|diagnostic| diagnostic == "planner_fallback_skip")
-        );
+        let value = serde_json::to_value(&plan).expect("final plan serializes");
+        assert!(value.get("modules").is_none());
+        assert_eq!(value["tools"]["visibleTools"], json!([]));
+        assert_eq!(value["diagnostics"]["preflightFailed"], json!(true));
     }
 
     #[test]
@@ -4546,22 +4299,6 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic == "planner_fallback_skip")
         );
-    }
-
-    #[test]
-    fn preflight_compose_rejects_host_owned_provider_metadata_before_composition() {
-        let raw = json!({
-            "source": "provider",
-            "tools": {
-                "visibleTools": ["memory_search"]
-            }
-        })
-        .to_string();
-
-        let error = parse_provider_turn_preflight_plan_json(raw.as_str())
-            .expect_err("provider-owned output must reject host-owned final-plan fields");
-
-        assert!(error.to_string().contains("source"));
     }
 
     #[test]
@@ -4697,54 +4434,6 @@ mod tests {
     }
 
     #[test]
-    fn final_preflight_plan_can_represent_provider_owned_memory_plan() {
-        let provider_call = TurnPreflightProviderCallMetadata {
-            provider: "openai".to_owned(),
-            model: "gpt-test".to_owned(),
-            attempt: 1,
-            input_chars: 900,
-            output_chars: 240,
-            elapsed_ms: 800,
-        };
-        let provider_plan: ProviderTurnPreflightPlan =
-            serde_json::from_value(sample_provider_plan_json()).expect("provider plan parses");
-        let provider_active_recall = provider_plan
-            .memory
-            .and_then(|memory| memory.active_recall)
-            .expect("provider active recall");
-        let decision_json = serde_json::to_string(&provider_active_recall)
-            .expect("provider active recall serializes");
-        let decision = parse_active_memory_decision_json(decision_json.as_str())
-            .expect("provider active recall uses existing memory parser");
-        let final_plan = TurnPreflightPlan {
-            source: TurnPreflightPlanSource::Provider,
-            fallback_reason: None,
-            tools: TurnPreflightToolsPlan {
-                visible_tools: provider_plan.tools.visible_tools,
-            },
-            memory: TurnPreflightMemoryPlan {
-                active_recall: TurnPreflightMemoryActiveRecallPlan {
-                    source: TurnPreflightPlanSource::Provider,
-                    fallback_reason: None,
-                    decision,
-                },
-            },
-            diagnostics: TurnPreflightDiagnostics {
-                preflight_failed: false,
-                diagnostics: provider_plan.diagnostics,
-                module_diagnostics: BTreeMap::new(),
-            },
-            provider_call: Some(provider_call),
-        };
-
-        assert_eq!(final_plan.source, TurnPreflightPlanSource::Provider);
-        assert_eq!(
-            final_plan.provider_call.as_ref().map(|call| call.attempt),
-            Some(1)
-        );
-    }
-
-    #[test]
     fn final_preflight_plan_can_represent_synthetic_module_fallback() {
         let value = json!({
             "source": "fallback",
@@ -4803,6 +4492,38 @@ mod tests {
         assert!(plan.memory.active_recall.decision.provider_fallback_used);
     }
     include!("preflight_failure_diagnostics_tests.rs");
+
+    #[test]
+    fn provider_preflight_plan_rejects_invalid_diagnostics() {
+        for (diagnostics, expect_message) in [
+            (
+                json!({
+                    "preflightFailed": true,
+                    "diagnostics": [{ "code": "preflight.failed" }]
+                }),
+                "provider diagnostics must not accept final-plan diagnostics object",
+            ),
+            (
+                json!([{ "code": "Preflight.Timeout" }]),
+                "provider diagnostic codes must be structured",
+            ),
+            (
+                json!([{ "code": "x".repeat(PREFLIGHT_DIAGNOSTIC_CODE_MAX_CHARS + 1) }]),
+                "provider diagnostic codes must be bounded",
+            ),
+            (
+                json!([{
+                    "code": "preflight.message_too_long",
+                    "message": "x".repeat(PREFLIGHT_DIAGNOSTIC_MESSAGE_MAX_CHARS + 1)
+                }]),
+                "provider diagnostic messages must be bounded",
+            ),
+        ] {
+            let mut value = sample_provider_plan_json();
+            value["diagnostics"] = diagnostics;
+            serde_json::from_value::<ProviderTurnPreflightPlan>(value).expect_err(expect_message);
+        }
+    }
 }
 
 #[cfg(test)]

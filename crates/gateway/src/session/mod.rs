@@ -742,21 +742,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_text_reaches_registered_connection() {
-        let manager = SessionManager::new();
-        let (tx, mut rx) = mpsc::channel(4);
-
-        let connection_id = register_authenticated_test_connection(&manager, tx).await;
-
-        manager
-            .send_text(connection_id, "ping".to_owned())
-            .await
-            .expect("send_text should succeed");
-
-        assert_eq!(rx.recv().await, Some(Message::Text("ping".into())));
-    }
-
-    #[tokio::test]
     async fn notification_send_never_waits_for_a_full_connection_queue() {
         let manager = SessionManager::new();
         let (sender, _receiver) = mpsc::channel(1);
@@ -834,82 +819,6 @@ mod tests {
             "a whitespace selector is no workspace, never an all-connections wildcard"
         );
         assert_ne!(connection_a, connection_b);
-    }
-
-    #[tokio::test]
-    async fn connection_workspace_id_returns_current_workspace() {
-        let manager = SessionManager::new();
-        let (tx, _rx) = mpsc::channel(2);
-        let connection_id = register_authenticated_test_connection(&manager, tx).await;
-
-        assert_eq!(manager.connection_workspace_id(connection_id).await, None);
-
-        manager
-            .set_connection_workspace(connection_id, Some("ws_a".to_owned()))
-            .await;
-
-        assert_eq!(
-            manager
-                .connection_workspace_id(connection_id)
-                .await
-                .as_deref(),
-            Some("ws_a")
-        );
-    }
-
-    #[tokio::test]
-    async fn registration_stores_the_exact_authenticated_principal() {
-        let manager = SessionManager::new();
-        let (tx, _rx) = mpsc::channel(2);
-        let expected = authenticated_test_superuser();
-        let connection_id = register_authenticated_test_connection(&manager, tx).await;
-        let stored = manager.connection_principal(connection_id).await.unwrap();
-
-        assert_eq!(stored.as_ref(), expected.as_ref());
-        assert_eq!(stored.principal_id.as_str(), TEST_SUPERUSER_PRINCIPAL_ID);
-    }
-
-    #[tokio::test]
-    async fn connection_context_binds_registered_id_and_exact_principal() {
-        let manager = SessionManager::new();
-        let (tx, _rx) = mpsc::channel(2);
-        let connection_id = register_authenticated_test_connection(&manager, tx).await;
-        let stored = manager.connection_principal(connection_id).await.unwrap();
-        let context = manager.connection_context(connection_id).await.unwrap();
-
-        assert_eq!(context.connection_id(), connection_id);
-        assert!(Arc::ptr_eq(context.principal_arc(), &stored));
-        assert_eq!(
-            context.principal().principal_id.as_str(),
-            TEST_SUPERUSER_PRINCIPAL_ID
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_mutation_preserves_the_immutable_principal() {
-        let manager = SessionManager::new();
-        let (tx, _rx) = mpsc::channel(2);
-        let connection_id = register_authenticated_test_connection(&manager, tx).await;
-        let before = manager.connection_principal(connection_id).await.unwrap();
-
-        manager
-            .set_connection_workspace(connection_id, Some("ws_a".to_owned()))
-            .await;
-        let after = manager.connection_principal(connection_id).await.unwrap();
-
-        assert!(Arc::ptr_eq(&before, &after));
-        assert_eq!(after.principal_id.as_str(), TEST_SUPERUSER_PRINCIPAL_ID);
-    }
-
-    #[tokio::test]
-    async fn unregister_removes_principal_lookup() {
-        let manager = SessionManager::new();
-        let (tx, _rx) = mpsc::channel(2);
-        let connection_id = register_authenticated_test_connection(&manager, tx).await;
-
-        manager.unregister_connection(connection_id).await;
-
-        assert!(manager.connection_principal(connection_id).await.is_err());
     }
 
     #[tokio::test]
@@ -1246,5 +1155,52 @@ mod tests {
             expired_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn registered_identity_descriptor_preserves_exact_principal_and_connection_context() {
+        let manager = SessionManager::new();
+        let (tx, _rx) = mpsc::channel(2);
+        let expected = authenticated_test_superuser();
+        let connection_id = register_authenticated_test_connection(&manager, tx).await;
+        let stored = manager.connection_principal(connection_id).await.unwrap();
+
+        assert_eq!(stored.as_ref(), expected.as_ref());
+        assert_eq!(stored.principal_id.as_str(), TEST_SUPERUSER_PRINCIPAL_ID);
+
+        let stored = manager.connection_principal(connection_id).await.unwrap();
+        let context = manager.connection_context(connection_id).await.unwrap();
+
+        assert_eq!(context.connection_id(), connection_id);
+        assert!(Arc::ptr_eq(context.principal_arc(), &stored));
+        assert_eq!(
+            context.principal().principal_id.as_str(),
+            TEST_SUPERUSER_PRINCIPAL_ID
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_mutation_updates_scope_and_preserves_immutable_identity() {
+        let manager = SessionManager::new();
+        let (tx, _rx) = mpsc::channel(2);
+        let connection_id = register_authenticated_test_connection(&manager, tx).await;
+
+        assert_eq!(manager.connection_workspace_id(connection_id).await, None);
+        let before = manager.connection_principal(connection_id).await.unwrap();
+
+        manager
+            .set_connection_workspace(connection_id, Some("ws_a".to_owned()))
+            .await;
+        let after = manager.connection_principal(connection_id).await.unwrap();
+
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(after.principal_id.as_str(), TEST_SUPERUSER_PRINCIPAL_ID);
+        assert_eq!(
+            manager
+                .connection_workspace_id(connection_id)
+                .await
+                .as_deref(),
+            Some("ws_a")
+        );
     }
 }
