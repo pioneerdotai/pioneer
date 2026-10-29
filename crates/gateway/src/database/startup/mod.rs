@@ -1,5 +1,4 @@
 mod authorization_integrity_audit;
-mod child_launch_grant_backfill;
 mod execution_authority_integrity;
 pub(crate) mod thread_episodic_workspace_capsule_refill;
 mod turn_event_projection_stream_state_backfill;
@@ -453,10 +452,6 @@ async fn run_inner(
     run_stage!(
         pioneer_observability::GatewayOperationStage::DatabaseTurnEventProjectionBackfill,
         turn_event_projection_stream_state_backfill::run(crud_store.as_ref())
-    );
-    run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseChildLaunchGrantBackfill,
-        child_launch_grant_backfill::run(crud_store.as_ref())
     );
     run_stage!(
         pioneer_observability::GatewayOperationStage::DatabaseAuthorizationIntegrityAudit,

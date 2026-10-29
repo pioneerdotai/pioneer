@@ -5239,7 +5239,7 @@ async fn pause_excludes_due_trigger_and_resume_restores_future_fire() {
 }
 
 #[tokio::test]
-async fn scheduled_agent_task_executes_from_version_one_child_launch_grant_without_write_on_read() {
+async fn scheduler_reads_version_one_child_launch_grant_without_rewriting_its_snapshot() {
     let runtime = runtime().await;
     let starts = Arc::new(AtomicUsize::new(0));
     let release = Arc::new(Notify::new());
@@ -5343,7 +5343,7 @@ async fn scheduled_agent_task_executes_from_version_one_child_launch_grant_witho
     .expect("upcast Task child launch grant should decode");
     assert_eq!(
         projected["child_launch_grant"]["version"],
-        serde_json::json!(2)
+        serde_json::json!(1)
     );
 
     let stored = pioneer_entity::task_actor_contract::Entity::find_by_id(response.task.id)

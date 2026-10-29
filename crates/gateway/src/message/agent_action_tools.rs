@@ -422,6 +422,12 @@ async fn load_execution_child_launch_ceiling<C: sea_orm::ConnectionTrait>(
         .context("AgentExecution has no immutable launch grant")?;
     let grant: serde_json::Value = serde_json::from_str(grant.grant_json.as_str())
         .context("AgentExecution launch grant is invalid")?;
+    execution_child_launch_ceiling(&grant)
+}
+
+pub(super) fn execution_child_launch_ceiling(
+    grant: &serde_json::Value,
+) -> anyhow::Result<pioneer_protocol::ChildAgentLaunchGrantSet> {
     let ceiling: pioneer_protocol::ChildAgentLaunchGrantSet = serde_json::from_value(
         grant
             .get("child_launch_grant")
@@ -429,7 +435,7 @@ async fn load_execution_child_launch_ceiling<C: sea_orm::ConnectionTrait>(
             .context("AgentExecution has no immutable child launch ceiling")?,
     )
     .context("AgentExecution child launch ceiling is invalid")?;
-    ceiling.validate().map_err(|error| {
+    ceiling.validate_for_execution().map_err(|error| {
         anyhow::anyhow!("AgentExecution child launch ceiling failed validation: {error:?}")
     })?;
     Ok(ceiling)
@@ -2128,6 +2134,7 @@ async fn restore_persisted_agent_action_binding(
         .await?
         .ok_or_else(|| anyhow::anyhow!("persisted AgentExecution grant is missing"))?;
     let grant: serde_json::Value = serde_json::from_str(grant.grant_json.as_str())?;
+    execution_child_launch_ceiling(&grant)?;
     let profile: pioneer_protocol::AgentExecutionProfileProjection = serde_json::from_value(
         grant
             .get("profile")
@@ -3969,6 +3976,7 @@ async fn dispatch_agent_action_outbox_row_inner(
         .map_err(|error| anyhow::anyhow!("invalid durable StartAgent execution: {error:?}"))?;
     let execution_generation = u64::try_from(dispatch.execution_generation)
         .map_err(|_| anyhow::anyhow!("invalid durable StartAgent generation"))?;
+    execution_child_launch_ceiling(&grant)?;
     let (adapter, options, capabilities) =
         crate::authorization::materialize_persisted_task_agent_action_binding(
             execution_id,
