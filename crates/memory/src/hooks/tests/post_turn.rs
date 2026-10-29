@@ -1160,36 +1160,45 @@ async fn post_turn_extractor_skips_non_success_turns() {
         extractor_provider: Some(extractor_provider.clone()),
         config: MemoryPostTurnExtractorConfig::default(),
     };
-    let mut request = test_post_turn_hook_request(
-        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-        "Меня зовут Александр",
-        "Понял.",
-    );
-    request.input = HookInput::turn_post_turn(TurnPostTurnHookInput::from_parts_with_model(
-        TurnPostTurnStatus::ProviderFailure,
-        Some("test-model"),
-        Some("test-provider"),
-        Some("Меня зовут Александр"),
-        None::<&str>,
-        Some("provider failed"),
-        Vec::new(),
-        Vec::new(),
-        pioneer_hooks::TurnPostTurnHookInputLimits::default(),
-    ));
+    for (status, label) in [
+        (TurnPostTurnStatus::ProviderFailure, "provider_failure"),
+        (TurnPostTurnStatus::Interrupted, "interrupted"),
+    ] {
+        let mut request = test_post_turn_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            "Меня зовут Александр",
+            "Понял.",
+        );
+        request.input = HookInput::turn_post_turn(TurnPostTurnHookInput::from_parts_with_model(
+            status,
+            Some("test-model"),
+            Some("test-provider"),
+            Some("Меня зовут Александр"),
+            None::<&str>,
+            Some("provider failed"),
+            Vec::new(),
+            Vec::new(),
+            pioneer_hooks::TurnPostTurnHookInputLimits::default(),
+        ));
 
-    let response = hook
-        .execute(request)
-        .await
-        .expect("non-success post-turn hook is best-effort");
-    assert_eq!(extractor_provider.call_count(), 0);
-    assert_eq!(write_provider.write_call_count(), 0);
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code.as_str() == "memory.post_turn_eligibility.non_success_status"
-            && diagnostic.metadata.get(&hook_metadata_key("skip_reason"))
-                == Some(&HookValue::Text("non_success_status".to_owned()))
-            && diagnostic.metadata.get(&hook_metadata_key("turn_status"))
-                == Some(&HookValue::Text("provider_failure".to_owned()))
-    }));
+        // A repeated dispatch of a cancelled turn must still skip extraction.
+        let response = hook
+            .execute(request.clone())
+            .await
+            .expect("non-success post-turn hook is best-effort");
+        hook.execute(request)
+            .await
+            .expect("repeated non-success dispatch");
+        assert_eq!(extractor_provider.call_count(), 0);
+        assert_eq!(write_provider.write_call_count(), 0);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.post_turn_eligibility.non_success_status"
+                && diagnostic.metadata.get(&hook_metadata_key("skip_reason"))
+                    == Some(&HookValue::Text("non_success_status".to_owned()))
+                && diagnostic.metadata.get(&hook_metadata_key("turn_status"))
+                    == Some(&HookValue::Text(label.to_owned()))
+        }));
+    }
 }
 
 #[tokio::test]
