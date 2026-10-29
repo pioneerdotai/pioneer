@@ -5949,6 +5949,7 @@ mod tests {
 
     #[tokio::test]
     async fn primary_chat_requires_provider_owned_overflow_before_durable_compaction() {
+        use anyhow::Result;
         use pioneer_protocol::AgentDurableEvent;
         use pioneer_provider::{
             ChatRequest, ChatResponse, Provider, ProviderFailureClassification, StreamChunk,
