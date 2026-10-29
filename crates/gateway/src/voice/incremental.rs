@@ -15,21 +15,25 @@ use super::{
         VoiceTranscriptionNoSpeechReason, VoiceTranscriptionStrategy,
     },
     vad::{
-        SmoothedVadFrame, SmoothedVoiceVad, VOICE_VAD_FRAME_SAMPLES, VoiceActivityDetector,
-        VoiceSpeechSegment, VoiceVadConfig,
+        SmoothedVadFrame, SmoothedVoiceVad, VOICE_VAD_FRAME_SAMPLES, VadInterval,
+        VoiceActivityDetector, VoiceSpeechSegment, VoiceVadConfig,
     },
 };
 use pioneer_protocol::{
     VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ, VoiceAudioFormat, VoiceError, VoiceErrorKind,
 };
 use std::{
+    collections::VecDeque,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-// Frame-aligned engineering bounds, not measured quality/latency optima.
+// Source-duration engineering bounds, not measured quality/latency optima.
+// Energy-only fallback scans real PCM at the original 30 ms resolution.
+// This is a cut-search grid, NOT the neural detector input frame contract.
+const BOUNDARY_SCAN_SAMPLES: usize = 480;
 const REFRESH_SAMPLES: usize = 3 * VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ as usize;
 const MIN_ADVANCE_SAMPLES: usize = 2 * REFRESH_SAMPLES;
 const LEFT_CONTEXT_SAMPLES: usize = REFRESH_SAMPLES / 2;
@@ -37,11 +41,12 @@ const MAX_ALIGNMENT_UNITS: usize = 2048;
 const MAX_CONTEXT_ANCHOR_BYTES: usize = 256;
 const MAX_SPEECH_WINDOW_SAMPLES: usize = 6 * REFRESH_SAMPLES;
 // Pause policy: retain 3 s unresolved + 1.5 s real confirmed left context,
-// within the existing 18 s window. 1.2 s quiet includes VAD's 450 ms hangover.
+// within the existing 18 s window. 1.2 s quiet includes VAD's 448 ms hangover.
 // A carried span gets at most two continuations and 6 s of input-time lifetime.
 // Oversized text is sealed instead of retaining an unbounded linguistic history.
 const PAUSE_WINDOW_SAMPLES: usize = REFRESH_SAMPLES + LEFT_CONTEXT_SAMPLES;
-const PAUSE_SEAL_SAMPLES: usize = 40 * VOICE_VAD_FRAME_SAMPLES;
+// Keep the original 1.2 s source-time target, independent of VAD framing.
+const PAUSE_SEAL_SAMPLES: usize = 16000 * 1200 / 1000;
 const PAUSE_LIFETIME_SAMPLES: usize = 2 * REFRESH_SAMPLES;
 const MAX_PAUSE_CONTINUATIONS: usize = 2;
 const MAX_PAUSE_TEXT_BYTES: usize = 512;
@@ -237,6 +242,7 @@ fn process_buffered<D: VoiceActivityDetector>(
             .iter()
             .map(|chunk| chunk.normalized_samples.len())
             .sum();
+        let mut source_map = PreparedSourceMap::default();
         let mut speech = Vec::with_capacity(source_samples.max(if is_moonshine_base {
             MIN_MOONSHINE_BASE_INPUT_SAMPLES
         } else {
@@ -258,6 +264,7 @@ fn process_buffered<D: VoiceActivityDetector>(
                             .map_err(|_| worker_error("failed to segment voice audio"))?;
                         ensure_active(cancellation)?;
                         if let SmoothedVadFrame::Speech(samples) = classified {
+                            source_map.append(&vad.take_emitted_intervals());
                             speech.extend(samples);
                         }
                         pending.clear();
@@ -265,14 +272,18 @@ fn process_buffered<D: VoiceActivityDetector>(
                 }
             }
             ensure_active(cancellation)?;
-            speech.extend(
-                vad.finish_incremental_tail(&pending)
-                    .map_err(|_| worker_error("failed to segment final voice audio"))?,
-            );
+            let tail = vad
+                .finish_incremental_tail(&pending)
+                .map_err(|_| worker_error("failed to segment final voice audio"))?;
+            if !tail.is_empty() {
+                source_map.append(&vad.take_emitted_intervals());
+                speech.extend(tail);
+            }
         }
         ensure_active(cancellation)?;
         let signal_stats = signal.finish();
-        let speech_samples = speech.len();
+        let speech_samples = source_map.real_samples;
+        debug_assert_eq!(speech_samples, speech.len());
         if speech_samples == 0 {
             return Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
                 no_speech: VoiceTranscriptionNoSpeech {
@@ -286,6 +297,12 @@ fn process_buffered<D: VoiceActivityDetector>(
             prepare_moonshine_base_samples(&mut speech);
         }
         let native_samples = speech.len();
+        // Keep the exact real-source mapping alive through this one call. The
+        // range [speech_samples, native_samples) is synthetic native input only.
+        debug_assert_eq!(
+            source_map.source_at(speech_samples.saturating_sub(1)),
+            source_map.spans.last().map(|span| span.source_end - 1)
+        );
         let buffer = PreparedSpeechBuffer {
             sample_rate_hz: VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ,
             total_samples: signal_stats.total_samples,
@@ -457,11 +474,210 @@ enum PauseState {
     Resumed(PauseContext),
 }
 
+// Buffered mode needs source spans through its single ASR call, but no VAD
+// probability history. Merge adjacent emissions; space is bounded by admitted
+// source samples and only genuinely removed gaps add another span.
+#[derive(Clone, Copy)]
+struct PreparedSourceSpan {
+    prepared: usize,
+    source_start: usize,
+    source_end: usize,
+}
+
+#[derive(Default)]
+struct PreparedSourceMap {
+    spans: Vec<PreparedSourceSpan>,
+    real_samples: usize,
+}
+
+impl PreparedSourceMap {
+    fn append(&mut self, intervals: &[VadInterval]) {
+        for interval in intervals {
+            if let Some(last) = self
+                .spans
+                .last_mut()
+                .filter(|last| last.source_end == interval.start)
+            {
+                last.source_end = interval.end;
+            } else {
+                self.spans.push(PreparedSourceSpan {
+                    prepared: self.real_samples,
+                    source_start: interval.start,
+                    source_end: interval.end,
+                });
+            }
+            self.real_samples += interval.end - interval.start;
+        }
+    }
+
+    fn source_at(&self, prepared: usize) -> Option<usize> {
+        self.spans.iter().find_map(|span| {
+            let offset = prepared.checked_sub(span.prepared)?;
+            (offset < span.source_end - span.source_start).then_some(span.source_start + offset)
+        })
+    }
+}
+
+// Mapping is private preparation metadata. Coordinates in `prepared` count
+// unique real ASR PCM, before per-call replay/padding; source counts ALL input.
+// Only intervals still supporting the current <=18 s window are retained.
+#[derive(Clone, Copy, Debug)]
+struct PreparedInterval {
+    prepared: usize,
+    source: VadInterval,
+}
+
+#[derive(Default)]
+struct AudioTimeline {
+    intervals: VecDeque<PreparedInterval>,
+}
+
+impl AudioTimeline {
+    fn append(&mut self, prepared: usize, start: usize, end: usize, intervals: &[VadInterval]) {
+        for interval in intervals {
+            let first = start.max(interval.start);
+            let last = end.min(interval.end);
+            if first < last {
+                self.intervals.push_back(PreparedInterval {
+                    prepared: prepared + first - start,
+                    source: VadInterval {
+                        start: first,
+                        end: last,
+                        ..*interval
+                    },
+                });
+            }
+        }
+    }
+
+    fn retain_from(&mut self, prepared: usize) {
+        while self.intervals.front().is_some_and(|interval| {
+            interval.prepared + interval.source.end - interval.source.start <= prepared
+        }) {
+            self.intervals.pop_front();
+        }
+        if let Some(interval) = self.intervals.front_mut() {
+            if interval.prepared < prepared {
+                interval.source.start += prepared - interval.prepared;
+                interval.prepared = prepared;
+            }
+        }
+    }
+
+    // Exact sample mapping. Deleted source silence and native padding have no
+    // entry. At a concatenation seam the next real sample owns the coordinate.
+    fn source_at(&self, prepared: usize) -> Option<usize> {
+        self.intervals.iter().find_map(|interval| {
+            let offset = prepared.checked_sub(interval.prepared)?;
+            (offset < interval.source.end - interval.source.start)
+                .then_some(interval.source.start + offset)
+        })
+    }
+
+    fn prepared_at(&self, source: usize) -> Option<usize> {
+        self.intervals.iter().find_map(|interval| {
+            (source >= interval.source.start && source < interval.source.end)
+                .then(|| interval.prepared + source - interval.source.start)
+        })
+    }
+
+    fn pause_boundary(
+        &self,
+        origin: usize,
+        earliest: usize,
+        latest: usize,
+        preferred: usize,
+    ) -> Option<usize> {
+        let mut best: Option<(usize, usize, f32)> = None; // cut, real quiet duration, mean probability
+        let mut run: Option<(usize, usize, usize, usize, f32, usize)> = None;
+        let mut run_start = None;
+        let mut consider = |run: (usize, usize, usize, usize, f32, usize)| {
+            let (source_start, source_end, pcm_start, pcm_end, sum, count) = run;
+            let duration = source_end - source_start;
+            if duration < 2 * VOICE_VAD_FRAME_SAMPLES {
+                return;
+            }
+            let first = pcm_start.max(origin + earliest);
+            let last = pcm_end.min(origin + latest);
+            if first > last {
+                return;
+            }
+            // Source midpoint can lie in removed silence. In that case use its
+            // real concatenation seam, never pretend source time is ASR time.
+            let middle = source_start + duration / 2;
+            let mapped = self
+                .prepared_at(middle)
+                .or_else(|| {
+                    self.intervals
+                        .iter()
+                        .find(|interval| interval.source.start >= middle)
+                        .map(|interval| interval.prepared)
+                })
+                .unwrap_or(pcm_end);
+            let cut = mapped.clamp(first, last) - origin;
+            let mean = sum / count as f32;
+            if best.is_none_or(|(prior, length, probability)| {
+                duration > length
+                    || (duration == length
+                        && (cut.abs_diff(preferred), mean)
+                            .partial_cmp(&(prior.abs_diff(preferred), probability))
+                            == Some(std::cmp::Ordering::Less))
+            }) {
+                best = Some((cut, duration, mean));
+            }
+        };
+        for interval in &self.intervals {
+            let source = interval.source;
+            // Use the same hysteretic VAD decision as smoothing/quiet clock.
+            if source.voice {
+                if let Some(quiet) = run.take() {
+                    consider(quiet);
+                }
+                run_start = None;
+            } else {
+                // A source gap can hide an unconfirmed positive frame that
+                // prefill later evicted. Only full-input VAD continuity proves
+                // that retained quiet edges belong to the same pause.
+                if run_start != Some(source.quiet_run_start) {
+                    if let Some(quiet) = run.take() {
+                        consider(quiet);
+                    }
+                    run_start = Some(source.quiet_run_start);
+                }
+                let pcm_end = interval.prepared + source.end - source.start;
+                match run.as_mut() {
+                    Some(quiet) => {
+                        quiet.1 = source.end;
+                        quiet.3 = pcm_end;
+                        quiet.4 += source.probability;
+                        quiet.5 += 1;
+                    }
+                    None => {
+                        run = Some((
+                            source.start,
+                            source.end,
+                            interval.prepared,
+                            pcm_end,
+                            source.probability,
+                            1,
+                        ))
+                    }
+                }
+            }
+        }
+        if let Some(quiet) = run {
+            consider(quiet);
+        }
+        best.map(|(cut, _, _)| cut)
+    }
+}
+
 struct IncrementalSpeech<D> {
     is_moonshine_base: bool,
     vad: SmoothedVoiceVad<D>,
     pending: Vec<f32>,
     speech: Vec<f32>,
+    timeline: AudioTimeline,
     window_start_sample: usize, // cursor in the unique VAD-emitted speech stream
     // Unique VAD-emitted source samples, independent of context replay/padding.
     speech_samples: usize,
@@ -480,6 +696,10 @@ struct IncrementalSpeech<D> {
     signal: SignalAccumulator,
     source_samples: usize, // processed input, including discarded silence
     pause: PauseState,
+    pause_projection_deferred: bool,
+    // A consensus prefix confirmed WITHOUT evicting any uncertain audio. This
+    // bounded reference excludes it on the next changed whole hypothesis.
+    held_prefix: Option<String>,
 }
 impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
     fn new(is_moonshine_base: bool, detector: D) -> Result<Self, VoiceError> {
@@ -489,6 +709,7 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
                 .map_err(|_| worker_error("failed to initialize voice VAD"))?,
             pending: Vec::with_capacity(VOICE_VAD_FRAME_SAMPLES),
             speech: Vec::with_capacity(MAX_SPEECH_WINDOW_SAMPLES),
+            timeline: AudioTimeline::default(),
             window_start_sample: 0,
             speech_samples: 0,
             fragments: 0,
@@ -504,6 +725,8 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
             signal: SignalAccumulator::default(),
             source_samples: 0,
             pause: PauseState::Speech,
+            pause_projection_deferred: false,
+            held_prefix: None,
         })
     }
 
@@ -544,13 +767,36 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         cancellation: &CancellationToken,
         transcriber: &impl VoiceSpeechTranscriber,
     ) -> Result<(), VoiceError> {
-        if self.speech.len() > PAUSE_WINDOW_SAMPLES {
+        if self.speech.len() > PAUSE_WINDOW_SAMPLES && !self.pause_projection_deferred {
             // The same ownership projection as a full window, with a fixed
             // source fence. At most whole + two partition probes + left probe;
             // never retry to force textual agreement.
-            let cut = self.speech.len() - REFRESH_SAMPLES;
-            self.project_window(cut, cut, cut, store, id, cancellation, transcriber)?;
-            self.next_refresh_samples = self.speech.len() + REFRESH_SAMPLES;
+            // Retained = left context + (len - cut) <= 4.5 s. Keep at
+            // least 1.5 s unresolved, advance owned PCM by >= one frame, and
+            // leave enough left context. Unlike a symmetric tolerance these
+            // one-sided bounds cannot exceed the retained-window budget.
+            let earliest = (self.speech.len() + LEFT_CONTEXT_SAMPLES - PAUSE_WINDOW_SAMPLES)
+                .max(self.context_samples + VOICE_VAD_FRAME_SAMPLES)
+                .max(LEFT_CONTEXT_SAMPLES);
+            let latest = self.speech.len() - LEFT_CONTEXT_SAMPLES;
+            let cut = self.preferred_boundary(earliest, latest);
+            if self.project_window(
+                cut,
+                earliest,
+                latest,
+                false,
+                store,
+                id,
+                cancellation,
+                transcriber,
+            )? {
+                self.next_refresh_samples = self.speech.len() + REFRESH_SAMPLES;
+            } else {
+                // Keep the disputed text AND its supporting PCM. No retry on
+                // every quiet frame; a changed span or mandatory cap ends this
+                // deferral. Lifetime, text and final quiet budgets still apply.
+                self.pause_projection_deferred = true;
+            }
         }
         if !store.processing_skip_preview(id) {
             self.refresh(store, id, cancellation, transcriber)?;
@@ -596,6 +842,9 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         cancellation: &CancellationToken,
         transcriber: &impl VoiceSpeechTranscriber,
     ) -> Result<(), VoiceError> {
+        self.pause_projection_deferred = false;
+        let intervals = self.vad.take_emitted_intervals();
+        let mut source = self.source_samples - samples.len();
         while !samples.is_empty() {
             if self.speech.len() == MAX_SPEECH_WINDOW_SAMPLES {
                 // Mandatory resource work, independent of preview cadence and
@@ -607,6 +856,10 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
             let room = MAX_SPEECH_WINDOW_SAMPLES - self.speech.len();
             let until_refresh = self.next_refresh_samples - self.speech.len();
             let take = samples.len().min(room).min(until_refresh);
+            self.timeline
+                .append(self.speech_samples, source, source + take, &intervals);
+            debug_assert_eq!(self.timeline.source_at(self.speech_samples), Some(source));
+            source += take;
             self.speech.extend_from_slice(&samples[..take]);
             self.candidate_current = false;
             self.speech_samples += take;
@@ -637,7 +890,23 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
     ) -> Result<(), VoiceError> {
         if !self.candidate_current || self.decoded_samples != self.speech.len() {
             let full = self.decode(&self.speech, store, id, cancellation, transcriber)?;
-            let start = if self.context_samples == 0 {
+            let start = if let Some(prefix) = &self.held_prefix {
+                // If native timing also validates this exact prefix, prefer it.
+                // Otherwise the same occurrence-preserving alignment as context
+                // exclusion maps the immutable text reference into the new whole.
+                timed_boundaries(&full, self.speech.len())
+                    .and_then(|boundaries| {
+                        boundaries
+                            .into_iter()
+                            .find(|boundary| {
+                                boundary.text_end == prefix.len()
+                                    && full.text.get(..boundary.text_end) == Some(prefix.as_str())
+                                    && is_text_boundary(&full.text, boundary.text_end)
+                            })
+                            .map(|boundary| boundary.text_end)
+                    })
+                    .unwrap_or_else(|| align_boundary(&full.text, prefix, &self.hypothesis))
+            } else if self.context_samples == 0 {
                 0
             } else {
                 timed_boundaries(&full, self.speech.len())
@@ -663,18 +932,27 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         cancellation: &CancellationToken,
         transcriber: &impl VoiceSpeechTranscriber,
     ) -> Result<(), VoiceError> {
-        let preferred_cut = partition_boundary(&self.speech, self.context_samples);
         let earliest = self.context_samples + MIN_ADVANCE_SAMPLES;
         let latest = self.speech.len() - REFRESH_SAMPLES;
+        let preferred_cut = self.preferred_boundary(earliest, latest);
         self.project_window(
             preferred_cut,
             earliest,
             latest,
+            true,
             store,
             id,
             cancellation,
             transcriber,
         )
+        .map(|_| ())
+    }
+
+    fn preferred_boundary(&self, earliest: usize, latest: usize) -> usize {
+        let preferred = (earliest + latest) / 2;
+        self.timeline
+            .pause_boundary(self.window_start_sample, earliest, latest, preferred)
+            .unwrap_or_else(|| partition_boundary_in(&self.speech, earliest, latest))
     }
 
     fn project_window(
@@ -682,11 +960,12 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         preferred_cut: usize,
         earliest: usize,
         latest: usize,
+        mandatory: bool,
         store: &GatewayVoiceSessionBufferStore,
         id: &str,
         cancellation: &CancellationToken,
         transcriber: &impl VoiceSpeechTranscriber,
-    ) -> Result<(), VoiceError> {
+    ) -> Result<bool, VoiceError> {
         self.refresh(store, id, cancellation, transcriber)?;
         let timing = timed_boundaries(&self.full_hypothesis, self.speech.len());
         let timed_cut = timing.as_ref().and_then(|boundaries| {
@@ -695,6 +974,7 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
                 .filter(|boundary| {
                     boundary.end >= earliest
                         && boundary.end <= latest
+                        && boundary.text_end >= self.owned_text_start
                         && is_text_boundary(&self.full_hypothesis.text, boundary.text_end)
                 })
                 // All text with the same reported end belongs on the same
@@ -727,15 +1007,34 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
                 cancellation,
                 transcriber,
             )?;
-            (
-                preferred_cut,
-                project_boundary(
-                    &self.full_hypothesis.text,
-                    &left.text,
-                    &right.text,
-                    Some((preferred_cut, self.speech.len())),
-                ),
-            )
+            let projection = boundary_projection(
+                &self.full_hypothesis.text,
+                &left.text,
+                &right.text,
+                Some((preferred_cut, self.speech.len())),
+            );
+            if projection.ambiguous() && !mandatory {
+                // Every optimal candidate assigns this prefix to the left. It
+                // can become immutable while ALL supporting PCM stays owned.
+                // Do not keep an unbounded textual reference across new audio.
+                let common = projection.first.max(self.owned_text_start);
+                if common > self.owned_text_start && common <= MAX_PAUSE_TEXT_BYTES {
+                    append_text(
+                        &mut self.text,
+                        &self.full_hypothesis.text[self.owned_text_start..common],
+                        self.owned_text_start > 0,
+                    );
+                    self.fragments += 1;
+                    self.held_prefix = Some(self.full_hypothesis.text[..common].to_owned());
+                    self.owned_text_start = common;
+                    self.hypothesis = self.full_hypothesis.text[common..].trim().to_owned();
+                }
+                return Ok(false);
+            }
+            // At the hard cap the finite fallback is the best-cost candidate
+            // nearest the PCM partition, then prefix fit and original order.
+            // Equal-cost alternatives are evidence of ambiguity, not confidence.
+            (preferred_cut, projection.selected)
         };
         let text_end = text_end.max(self.owned_text_start);
         // Keep actual left audio across the boundary, including a word that may
@@ -777,8 +1076,10 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         self.fragments += 1;
         self.speech.drain(..context_start);
         self.window_start_sample += context_start;
+        self.timeline.retain_from(self.window_start_sample);
         self.context_samples = LEFT_CONTEXT_SAMPLES;
         self.context_text = context_text;
+        self.held_prefix = None;
         // Carry the projected ownership reference, but it is not a final
         // candidate for the changed PCM/ownership boundaries. Refresh once
         // before Commit can reuse it, even if no new source arrived.
@@ -789,7 +1090,7 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         self.hypothesis = tail.trim().to_owned();
         self.decoded_samples = self.speech.len();
         self.candidate_current = false;
-        Ok(())
+        Ok(true)
     }
 
     fn flush(
@@ -813,6 +1114,7 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         self.fragments += 1;
         self.window_start_sample += self.speech.len();
         self.speech.clear();
+        self.timeline.intervals.clear();
         self.hypothesis.clear();
         self.full_hypothesis = VoiceSpeechHypothesis::default();
         self.owned_text_start = 0;
@@ -822,6 +1124,8 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         self.candidate_current = false;
         self.next_refresh_samples = REFRESH_SAMPLES;
         self.pause = PauseState::Speech;
+        self.pause_projection_deferred = false;
+        self.held_prefix = None;
         Ok(())
     }
 
@@ -870,15 +1174,18 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
 
 // Candidate only: low energy is not proof of a word boundary. Native timing
 // takes priority; text-only engines use bounded full-sequence alignment below.
-fn partition_boundary(samples: &[f32], context_samples: usize) -> usize {
-    let first = (context_samples + MIN_ADVANCE_SAMPLES).div_ceil(VOICE_VAD_FRAME_SAMPLES);
-    let last = (samples.len() - REFRESH_SAMPLES) / VOICE_VAD_FRAME_SAMPLES;
+fn partition_boundary_in(samples: &[f32], earliest: usize, latest: usize) -> usize {
+    let first = earliest.div_ceil(BOUNDARY_SCAN_SAMPLES);
+    let last = latest / BOUNDARY_SCAN_SAMPLES;
+    if first > last {
+        return (earliest + latest) / 2;
+    }
     let midpoint = (first + last) / 2;
     (first..=last)
         .min_by(|a, b| {
             let energy = |frame: usize| {
-                let cut = frame * VOICE_VAD_FRAME_SAMPLES;
-                samples[cut - VOICE_VAD_FRAME_SAMPLES..cut + VOICE_VAD_FRAME_SAMPLES]
+                let cut = frame * BOUNDARY_SCAN_SAMPLES;
+                samples[cut - BOUNDARY_SCAN_SAMPLES..cut + BOUNDARY_SCAN_SAMPLES]
                     .iter()
                     .map(|sample| f64::from(*sample).powi(2))
                     .sum::<f64>()
@@ -888,7 +1195,7 @@ fn partition_boundary(samples: &[f32], context_samples: usize) -> usize {
                 .then_with(|| a.abs_diff(midpoint).cmp(&b.abs_diff(midpoint)))
         })
         .expect("partition interval is nonempty")
-        * VOICE_VAD_FRAME_SAMPLES
+        * BOUNDARY_SCAN_SAMPLES
 }
 
 struct TimedBoundary {
@@ -900,7 +1207,8 @@ struct TimedBoundary {
 // SDK "segments" can be subword tokens. Timing alone must not confirm a
 // fragment inside a whitespace-delimited word or separate its punctuation.
 fn is_text_boundary(text: &str, end: usize) -> bool {
-    end == 0 || end == text.len() || text[end..].starts_with(char::is_whitespace)
+    text.is_char_boundary(end)
+        && (end == 0 || end == text.len() || text[end..].starts_with(char::is_whitespace))
 }
 
 fn timed_boundaries(
@@ -1116,12 +1424,36 @@ fn align_boundary(whole: &str, left: &str, right: &str) -> usize {
 // removes technical replay. They need different tie priors: favoring the best
 // prefix fit is conservative for exclusion, but can discard left ownership at
 // a partition. Neither prior establishes exact acoustic correspondence.
+#[derive(Debug)]
+struct BoundaryProjection {
+    selected: usize,
+    first: usize,
+    last: usize,
+    cost: usize,
+    alternative_cost: Option<usize>,
+}
+
+impl BoundaryProjection {
+    fn ambiguous(&self) -> bool {
+        self.first != self.last && self.alternative_cost == Some(self.cost)
+    }
+}
+
 fn project_boundary(
     whole: &str,
     left: &str,
     right: &str,
     partition: Option<(usize, usize)>,
 ) -> usize {
+    boundary_projection(whole, left, right, partition).selected
+}
+
+fn boundary_projection(
+    whole: &str,
+    left: &str,
+    right: &str,
+    partition: Option<(usize, usize)>,
+) -> BoundaryProjection {
     let mut whole_units = alignment_units(whole, false);
     let mut left_units = alignment_units(left, false);
     let mut right_units = alignment_units(right, false);
@@ -1192,10 +1524,27 @@ fn project_boundary(
             )
         })
         .unwrap_or(0);
-    if split == 0 {
-        0
-    } else {
-        whole_units[split - 1].end
+    let offset = |index: usize| {
+        if index == 0 {
+            0
+        } else {
+            whole_units[index - 1].end
+        }
+    };
+    let cost_at = |index: usize| prefix[index] + suffix[whole_units.len() - index];
+    let cost = cost_at(split);
+    let mut candidates = (0..=whole_units.len()).filter(|index| cost_at(*index) == cost);
+    let first = candidates.next().unwrap_or(split);
+    let last = candidates.last().unwrap_or(first);
+    BoundaryProjection {
+        selected: offset(split),
+        first: offset(first),
+        last: offset(last),
+        cost,
+        alternative_cost: (0..=whole_units.len())
+            .filter(|index| *index != split)
+            .map(cost_at)
+            .min(),
     }
 }
 
@@ -1292,8 +1641,40 @@ mod tests {
     use pioneer_protocol::{VoiceAudioEncoding, VoiceChunkFrameHeader};
     use std::sync::Mutex;
 
+    // A fixture word is 30 ms independent of the 32 ms neural VAD frame.
+    const TEST_WORD_SAMPLES: usize = 480;
+
     fn test_detector() -> super::super::vad::EnergyVoiceActivityDetector {
         super::super::vad::EnergyVoiceActivityDetector::new(0.02).unwrap()
+    }
+
+    // These planner tests start AFTER preparation; their synthetic voiced PCM
+    // has explicit source ownership. End-to-end tests below use the real VAD.
+    impl IncrementalSpeech<super::super::vad::EnergyVoiceActivityDetector> {
+        fn accept_prepared_for_test(
+            &mut self,
+            samples: &[f32],
+            store: &GatewayVoiceSessionBufferStore,
+            id: &str,
+            cancellation: &CancellationToken,
+            transcriber: &impl VoiceSpeechTranscriber,
+        ) -> Result<(), VoiceError> {
+            let interval = VadInterval {
+                start: self.source_samples,
+                end: self.source_samples + samples.len(),
+                probability: 0.9,
+                voice: true,
+                quiet_run_start: self.source_samples,
+            };
+            self.timeline.append(
+                self.speech_samples,
+                interval.start,
+                interval.end,
+                &[interval],
+            );
+            self.source_samples += samples.len();
+            self.accept_speech(samples, store, id, cancellation, transcriber)
+        }
     }
 
     // Entering frame N proves that all handling of frame N-1, including its
@@ -1520,9 +1901,9 @@ mod tests {
 
     #[test]
     fn buffered_vad_joins_speech_once_without_replaying_long_pauses() {
-        let mut audio = vec![12000; 960];
-        audio.extend(vec![0; 480 * 40]);
-        audio.extend(vec![16000; 960 + 79]);
+        let mut audio = vec![12000; 1024];
+        audio.extend(vec![0; 512 * 40]);
+        audio.extend(vec![16000; 1024 + 79]);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let capture = calls.clone();
         let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
@@ -1530,11 +1911,11 @@ mod tests {
             Ok("joined".to_owned())
         }));
         closed_input_mode(&audio, 137, false, &fake, true).unwrap();
-        // Existing VAD: fifteen frames of hangover after first speech; fifteen
-        // preceding frames (fourteen noise + first onset) at the next onset.
-        let mut expected = vec![12000.0 / 32768.0; 960];
-        expected.extend(vec![0.0; 480 * (15 + 14)]);
-        expected.extend(vec![16000.0 / 32768.0; 960 + 79]);
+        // Fourteen 32 ms hangover frames, then thirteen real quiet frames
+        // preceding the two-frame onset. The middle of the long pause is removed.
+        let mut expected = vec![12000.0 / 32768.0; 1024];
+        expected.extend(vec![0.0; 512 * (14 + 13)]);
+        expected.extend(vec![16000.0 / 32768.0; 1024 + 79]);
         assert_eq!(*calls.lock().unwrap(), vec![expected]);
     }
 
@@ -1866,7 +2247,7 @@ mod tests {
         }));
         let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
         state
-            .accept_speech(
+            .accept_prepared_for_test(
                 &vec![0.5; REFRESH_SAMPLES],
                 &store,
                 "session",
@@ -1878,7 +2259,7 @@ mod tests {
         assert!(state.text.is_empty());
         assert_eq!(state.window_start_sample, 0);
         state
-            .accept_speech(
+            .accept_prepared_for_test(
                 &vec![0.5; REFRESH_SAMPLES],
                 &store,
                 "session",
@@ -1917,12 +2298,12 @@ mod tests {
         }));
         let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
         state
-            .accept_speech(&[0.5; 7], &store, "session", &token, &fake)
+            .accept_prepared_for_test(&[0.5; 7], &store, "session", &token, &fake)
             .unwrap();
         state.flush(&store, "session", &token, &fake).unwrap();
         let confirmed_end = state.window_start_sample;
         state
-            .accept_speech(
+            .accept_prepared_for_test(
                 &vec![0.25; REFRESH_SAMPLES],
                 &store,
                 "session",
@@ -1932,7 +2313,7 @@ mod tests {
             .unwrap();
         assert_eq!(state.hypothesis, "ошибочный хвост");
         state
-            .accept_speech(
+            .accept_prepared_for_test(
                 &vec![0.25; REFRESH_SAMPLES],
                 &store,
                 "session",
@@ -1947,7 +2328,7 @@ mod tests {
         assert_eq!(state.text, "подтверждено");
         assert_eq!(state.window_start_sample, confirmed_end);
         state
-            .accept_speech(&[0.75; 7], &store, "session", &token, &fake)
+            .accept_prepared_for_test(&[0.75; 7], &store, "session", &token, &fake)
             .unwrap();
         state.flush(&store, "session", &token, &fake).unwrap();
         assert_eq!(state.text, "подтверждено исправленный хвост");
@@ -1960,7 +2341,7 @@ mod tests {
     // source ownership as well as the exact full sequence of repeated tokens.
     fn frame_transcript(samples: &[f32]) -> String {
         samples
-            .chunks(VOICE_VAD_FRAME_SAMPLES)
+            .chunks(TEST_WORD_SAMPLES)
             .filter_map(|frame| {
                 let sample = *frame.iter().find(|sample| **sample != 0.0)?;
                 Some(if sample > 0.3 {
@@ -1977,7 +2358,7 @@ mod tests {
     fn continuous_speech_advances_bounded_windows_preserving_repetitions_and_packets() {
         let audio: Vec<i16> = (0..50 * 16000 + 7)
             .map(|index| {
-                if index / VOICE_VAD_FRAME_SAMPLES % 4 < 2 {
+                if index / TEST_WORD_SAMPLES % 4 < 2 {
                     12000
                 } else {
                     6000
@@ -1999,14 +2380,13 @@ mod tests {
                 let text = frame_transcript(&samples);
                 let segments = timestamps.then(|| {
                     samples
-                        .chunks(VOICE_VAD_FRAME_SAMPLES)
+                        .chunks(TEST_WORD_SAMPLES)
                         .enumerate()
                         .filter_map(|(index, frame)| {
                             let text = frame_transcript(frame);
                             (!text.is_empty()).then(|| transcribe_rs::TranscriptionSegment {
-                                start: (index * VOICE_VAD_FRAME_SAMPLES) as f32 / 16000.0,
-                                end: ((index * VOICE_VAD_FRAME_SAMPLES + frame.len()) as f32)
-                                    / 16000.0,
+                                start: (index * TEST_WORD_SAMPLES) as f32 / 16000.0,
+                                end: ((index * TEST_WORD_SAMPLES + frame.len()) as f32) / 16000.0,
                                 text,
                             })
                         })
@@ -2033,7 +2413,7 @@ mod tests {
     fn unspaced_text_preserves_all_characters_and_repeats_across_window_advances() {
         fn recognize(samples: &[f32], spaced: bool) -> String {
             samples
-                .chunks(VOICE_VAD_FRAME_SAMPLES)
+                .chunks(TEST_WORD_SAMPLES)
                 .map(|frame| match (frame[0] * 32768.0) as i16 {
                     12000 => "甲",
                     6000 => "乙.",
@@ -2047,7 +2427,7 @@ mod tests {
         }
         let pattern = [12000, 12000, 6000, 3000, 15000, 18000, 18000];
         let audio: Vec<i16> = (0..50 * 16000 + 7)
-            .map(|index| pattern[index / VOICE_VAD_FRAME_SAMPLES % pattern.len()])
+            .map(|index| pattern[index / TEST_WORD_SAMPLES % pattern.len()])
             .collect();
         let normalized: Vec<_> = audio.iter().map(|s| f32::from(*s) / 32768.0).collect();
         for spaced in [false, true] {
@@ -2087,12 +2467,15 @@ mod tests {
                 // All context/probe inputs remain exact, frame-aligned source
                 // slices; no padding, fabricated PCM or per-packet oracle state.
                 for call in calls.iter() {
-                    assert!(normalized.chunks(VOICE_VAD_FRAME_SAMPLES).enumerate().any(
-                        |(frame, _)| {
-                            let start = frame * VOICE_VAD_FRAME_SAMPLES;
-                            normalized.get(start..start + call.len()) == Some(call.as_slice())
-                        }
-                    ));
+                    assert!(
+                        normalized
+                            .chunks(TEST_WORD_SAMPLES)
+                            .enumerate()
+                            .any(|(frame, _)| {
+                                let start = frame * TEST_WORD_SAMPLES;
+                                normalized.get(start..start + call.len()) == Some(call.as_slice())
+                            })
+                    );
                 }
             }
         }
@@ -2102,7 +2485,7 @@ mod tests {
     fn non_cjk_unspaced_text_refines_a_single_unit_through_multiple_advances() {
         fn recognize(samples: &[f32], symbols: &[char]) -> String {
             samples
-                .chunks(VOICE_VAD_FRAME_SAMPLES)
+                .chunks(TEST_WORD_SAMPLES)
                 .map(|frame| {
                     let index = (((frame[0] * 32768.0) as i16 - 12000) / 500) as usize;
                     symbols[index]
@@ -2114,7 +2497,7 @@ mod tests {
         for phrase in ["ทดสอบระบบ", "اختبارنظام"] {
             let symbols: Vec<_> = phrase.chars().collect();
             let audio: Vec<i16> = (0..50 * 16000 + 7)
-                .map(|index| 12000 + 500 * (index / VOICE_VAD_FRAME_SAMPLES % symbols.len()) as i16)
+                .map(|index| 12000 + 500 * (index / TEST_WORD_SAMPLES % symbols.len()) as i16)
                 .collect();
             let normalized: Vec<_> = audio.iter().map(|s| f32::from(*s) / 32768.0).collect();
             let expected = recognize(&normalized, &symbols);
@@ -2153,12 +2536,15 @@ mod tests {
                 assert!(calls.len() <= 3 * (audio.len() / REFRESH_SAMPLES + 1) + 1);
                 assert!(calls.iter().map(Vec::len).sum::<usize>() <= 12 * audio.len());
                 for call in calls.iter() {
-                    assert!(normalized.chunks(VOICE_VAD_FRAME_SAMPLES).enumerate().any(
-                        |(frame, _)| {
-                            let start = frame * VOICE_VAD_FRAME_SAMPLES;
-                            normalized.get(start..start + call.len()) == Some(call.as_slice())
-                        }
-                    ));
+                    assert!(
+                        normalized
+                            .chunks(TEST_WORD_SAMPLES)
+                            .enumerate()
+                            .any(|(frame, _)| {
+                                let start = frame * TEST_WORD_SAMPLES;
+                                normalized.get(start..start + call.len()) == Some(call.as_slice())
+                            })
+                    );
                 }
             }
         }
@@ -2183,7 +2569,7 @@ mod tests {
         fn recognize(samples: &[f32], suffix: &str) -> String {
             let symbols: Vec<_> = "ทดสอบระบบ".chars().collect();
             let mut text = String::new();
-            for frame in samples.chunks(VOICE_VAD_FRAME_SAMPLES) {
+            for frame in samples.chunks(TEST_WORD_SAMPLES) {
                 let sample = (frame[0] * 32768.0) as i16;
                 if sample == 26000 {
                     text.push_str(suffix);
@@ -2194,12 +2580,11 @@ mod tests {
             text.trim().to_owned()
         }
         let mut audio: Vec<i16> = (0..20 * 16000 + 7)
-            .map(|index| 12000 + 500 * (index / VOICE_VAD_FRAME_SAMPLES % 9) as i16)
+            .map(|index| 12000 + 500 * (index / TEST_WORD_SAMPLES % 9) as i16)
             .collect();
         // The first whole and right probe end in OK; the left/context probes
         // do not. New audio extends beyond OK before the changed final refresh.
-        audio[MAX_SPEECH_WINDOW_SAMPLES - VOICE_VAD_FRAME_SAMPLES..MAX_SPEECH_WINDOW_SAMPLES]
-            .fill(26000);
+        audio[MAX_SPEECH_WINDOW_SAMPLES - TEST_WORD_SAMPLES..MAX_SPEECH_WINDOW_SAMPLES].fill(26000);
         let normalized: Vec<_> = audio.iter().map(|s| f32::from(*s) / 32768.0).collect();
         for suffix in [" OK ", " OK OK "] {
             for packet_samples in [317, 1600] {
@@ -2725,16 +3110,15 @@ mod tests {
         };
         assert_eq!(
             transcript.diagnostics.speech_samples,
-            MAX_SPEECH_WINDOW_SAMPLES + 15 * VOICE_VAD_FRAME_SAMPLES
+            MAX_SPEECH_WINDOW_SAMPLES + 256 + 14 * VOICE_VAD_FRAME_SAMPLES
         );
         assert_eq!(signal_stats.total_samples, audio.len());
         let calls = calls.lock().unwrap();
-        // One ordinary cap projection, then one smaller pause projection.
-        // The final candidate must use the newly bounded PCM, including hangover.
-        assert_eq!(calls.len(), 9);
-        let mut final_source = vec![12000.0 / 32768.0; 72000 - 15 * 480];
-        final_source.extend(vec![0.0; 15 * 480]);
-        assert_eq!(calls.last().unwrap(), &final_source);
+        // The pause's equal-cost ownership candidates defer eviction. The
+        // unchanged full candidate is reused at Commit without quiet retries.
+        assert_eq!(calls.len(), 7);
+        let normalized: Vec<_> = audio.iter().map(|s| f32::from(*s) / 32768.0).collect();
+        assert_eq!(calls[4], normalized[144000..295424]);
         assert!(
             calls
                 .iter()
@@ -2770,7 +3154,7 @@ mod tests {
     fn long_contextual_rewording_and_punctuation_keep_all_repeated_occurrences() {
         fn recognize(samples: &[f32]) -> String {
             let phrases: Vec<_> = samples
-                .chunks(VOICE_VAD_FRAME_SAMPLES)
+                .chunks(TEST_WORD_SAMPLES)
                 .map(|frame| {
                     if frame[0] > 0.7 {
                         if samples.len() <= REFRESH_SAMPLES {
@@ -2804,14 +3188,14 @@ mod tests {
         }
         let mut audio: Vec<i16> = (0..50 * 16000)
             .map(|index| {
-                if index / VOICE_VAD_FRAME_SAMPLES % 4 < 2 {
+                if index / TEST_WORD_SAMPLES % 4 < 2 {
                     12000
                 } else {
                     6000
                 }
             })
             .collect();
-        audio[..VOICE_VAD_FRAME_SAMPLES].fill(24000);
+        audio[..TEST_WORD_SAMPLES].fill(24000);
         let normalized: Vec<_> = audio
             .iter()
             .map(|sample| f32::from(*sample) / 32768.0)
@@ -2825,7 +3209,7 @@ mod tests {
         let token = CancellationToken::new();
         let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
         state
-            .accept_speech(
+            .accept_prepared_for_test(
                 &normalized[..REFRESH_SAMPLES],
                 &store,
                 "session",
@@ -2835,7 +3219,7 @@ mod tests {
             .unwrap();
         assert!(state.hypothesis.starts_with("ОШИБКА"));
         state
-            .accept_speech(
+            .accept_prepared_for_test(
                 &normalized[REFRESH_SAMPLES..MAX_SPEECH_WINDOW_SAMPLES],
                 &store,
                 "session",
@@ -2994,7 +3378,7 @@ mod tests {
 
     #[test]
     fn vad_short_pause_keeps_context_and_preserves_seven_sample_moonshine_tail() {
-        let mut audio = vec![12000; 960];
+        let mut audio = vec![12000; 1024];
         audio.extend(vec![0; 16 * VOICE_VAD_FRAME_SAMPLES]);
         audio.extend([6000; 7]);
         let fake = TestSpeechTranscriber(Arc::new(|buffer| {
@@ -3022,7 +3406,7 @@ mod tests {
             assert_eq!(transcript.diagnostics.speech_samples, audio.len());
             assert_eq!(transcript.diagnostics.segment_count, 1);
             assert_eq!(signal_stats.total_samples, audio.len());
-            assert_eq!(signal_stats.non_zero_samples, 960 + 7);
+            assert_eq!(signal_stats.non_zero_samples, 1024 + 7);
         }
     }
 
@@ -3030,11 +3414,11 @@ mod tests {
     fn short_pause_revises_only_owned_tail_with_packet_independent_source() {
         for resume in [false, true] {
             let mut audio = vec![12000; 96000];
-            audio.extend(vec![0; 480 * 16]);
+            audio.extend(vec![0; 512 * 16]);
             if resume {
-                audio.extend(vec![6000; 967]);
+                audio.extend(vec![6000; 1031]);
             }
-            for packet in [137, 480, 1600] {
+            for packet in [137, 512, 1600] {
                 let calls = Arc::new(Mutex::new(Vec::new()));
                 let capture = calls.clone();
                 let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
@@ -3043,11 +3427,11 @@ mod tests {
                         "prefix corrected tail"
                     } else {
                         match samples.len() {
-                            103200 => "immutable prefix wrong tail",
-                            55200 => "immutable prefix",
-                            48000 => "wrong tail",
+                            103424 => "immutable prefix wrong tail",
+                            67200 => "immutable prefix",
+                            36224 => "wrong tail",
                             24000 => "prefix",
-                            72000 => "prefix wrong tail",
+                            60224 => "prefix wrong tail",
                             count => panic!("unexpected source span {count}"),
                         }
                     };
@@ -3075,8 +3459,8 @@ mod tests {
                 // A real final decode of the retained span, after the ownership
                 // fence changed. The dropped silence is recovered once as prefill
                 // only when continuation is present; old hangover is not reissued.
-                let source_end = if resume { audio.len() } else { 103200 };
-                assert_eq!(calls.last().unwrap(), &normalized[31200..source_end]);
+                let source_end = if resume { audio.len() } else { 103424 };
+                assert_eq!(calls.last().unwrap(), &normalized[43200..source_end]);
                 assert!(calls.iter().all(|call| call.len() <= 288000));
                 assert_eq!(transcript.diagnostics.speech_samples, source_end);
                 assert_eq!(transcript.diagnostics.total_samples, audio.len());
@@ -3088,9 +3472,9 @@ mod tests {
     #[test]
     fn long_silence_seals_once_without_decoding_or_retaining_each_noise_frame() {
         for quiet_frames in [40, 1000] {
-            let mut audio = vec![12000; 960];
-            audio.extend(vec![0; quiet_frames * 480]);
-            audio.extend(vec![6000; 967]);
+            let mut audio = vec![12000; 1024];
+            audio.extend(vec![0; quiet_frames * 512]);
+            audio.extend(vec![6000; 1031]);
             for packet in [137, 1600] {
                 let calls = Arc::new(Mutex::new(Vec::new()));
                 let capture = calls.clone();
@@ -3111,12 +3495,15 @@ mod tests {
                 };
                 assert_eq!(transcript.text, "first second");
                 let calls = calls.lock().unwrap();
-                let mut first = vec![12000.0 / 32768.0; 960];
-                first.extend(vec![0.0; 15 * 480]);
-                let mut second = vec![0.0; 14 * 480];
-                second.extend(vec![6000.0 / 32768.0; 967]);
+                let mut first = vec![12000.0 / 32768.0; 1024];
+                first.extend(vec![0.0; 14 * 512]);
+                let mut second = vec![0.0; 13 * 512];
+                second.extend(vec![6000.0 / 32768.0; 1031]);
                 assert_eq!(*calls, vec![first, second]);
-                assert_eq!(transcript.diagnostics.speech_samples, 960 + 29 * 480 + 967);
+                assert_eq!(
+                    transcript.diagnostics.speech_samples,
+                    1024 + 27 * 512 + 1031
+                );
                 assert_eq!(transcript.diagnostics.total_samples, audio.len());
             }
         }
@@ -3125,7 +3512,7 @@ mod tests {
     #[test]
     fn real_repetition_across_short_pause_is_not_text_deduplicated() {
         let mut audio = vec![12000; 960];
-        audio.extend(vec![0; 16 * 480]);
+        audio.extend(vec![0; 16 * TEST_WORD_SAMPLES]);
         audio.extend(vec![12000; 960]);
         let fake = TestSpeechTranscriber(Arc::new(|buffer| {
             Ok(frame_transcript(&buffer.flattened_samples()))
@@ -3191,33 +3578,33 @@ mod tests {
                 }
                 Ok("corrected continuation".to_owned())
             }));
-            let mut audio = vec![12000; 960];
-            audio.extend(vec![0; 16 * 480]);
+            let mut audio = vec![12000; 1024];
+            audio.extend(vec![0; 16 * 512]);
             append_test_packet(&store, "session", 0, &audio);
             let (detector, checkpoints) = CheckpointDetector::new(vec![19, 29, 43]);
             std::thread::scope(|scope| {
                 let worker = scope
                     .spawn(|| super::process(&store, "session", &token, &fake, false, detector));
                 let before_commit = receive.recv_timeout(std::time::Duration::from_secs(5));
-                // The first pause decode is frame 18 (2 speech + 16 quiet).
+                // The first pause decode is frame 17 (2 speech + 15 quiet).
                 // Frame 19 can only enter after the candidate was accepted.
-                append_test_packet(&store, "session", 1, &[0; 480]);
-                audio.extend([0; 480]);
+                append_test_packet(&store, "session", 1, &[0; 512]);
+                audio.extend([0; 512]);
                 let accepted = checkpoints.recv_timeout(std::time::Duration::from_secs(5));
                 let mut quiet_progress = Vec::new();
                 if action == "seal" {
                     // Remain open: frame 29 proves ten additional quiet frames
                     // have completed after acceptance, with no changed ASR PCM.
-                    append_test_packet(&store, "session", 2, &[0; 10 * 480]);
-                    audio.extend([0; 10 * 480]);
+                    append_test_packet(&store, "session", 2, &[0; 10 * 512]);
+                    audio.extend([0; 10 * 512]);
                     quiet_progress.push((
                         checkpoints.recv_timeout(std::time::Duration::from_secs(5)),
                         calls.lock().unwrap().len(),
                     ));
-                    // Seal is frame 42 (2 speech + 40 quiet); entering frame 43
+                    // Seal is frame 40 (2 speech + 38 quiet); entering frame 43
                     // proves seal has run before Commit, not because of close.
-                    append_test_packet(&store, "session", 3, &[0; 14 * 480]);
-                    audio.extend([0; 14 * 480]);
+                    append_test_packet(&store, "session", 3, &[0; 14 * 512]);
+                    audio.extend([0; 14 * 512]);
                     quiet_progress.push((
                         checkpoints.recv_timeout(std::time::Duration::from_secs(5)),
                         calls.lock().unwrap().len(),
@@ -3226,7 +3613,7 @@ mod tests {
                 if action == "cancel_paused" {
                     token.cancel();
                 } else if !matches!(action, "commit" | "seal") {
-                    append_test_packet(&store, "session", 2, &[6000; 967]);
+                    append_test_packet(&store, "session", 2, &[6000; 1031]);
                 }
                 let _completion = store.finish_processing("session").unwrap();
                 assert!(store.finish_processing("session").is_err());
@@ -3243,8 +3630,8 @@ mod tests {
                         "open-inbox quiet frames must reuse the accepted candidate"
                     );
                 }
-                let mut first_source = vec![12000.0 / 32768.0; 960];
-                first_source.extend([0.0; 7200]);
+                let mut first_source = vec![12000.0 / 32768.0; 1024];
+                first_source.extend([0.0; 7168]);
                 assert_eq!(calls.lock().unwrap()[0], first_source);
                 match action {
                     "empty" => {
@@ -3257,7 +3644,7 @@ mod tests {
                             no_speech.reason,
                             VoiceTranscriptionNoSpeechReason::EmptyTranscript
                         );
-                        assert_eq!(no_speech.total_samples, audio.len() + 967);
+                        assert_eq!(no_speech.total_samples, audio.len() + 1031);
                     }
                     "error" | "cancel" | "cancel_paused" => {
                         let Err(error) = result else {
@@ -3290,9 +3677,9 @@ mod tests {
                         assert_eq!(
                             transcript.diagnostics.speech_samples,
                             if matches!(action, "commit" | "seal") {
-                                8160
+                                8192
                             } else {
-                                audio.len() + 967
+                                audio.len() + 1031
                             }
                         );
                         assert_eq!(
@@ -3301,7 +3688,7 @@ mod tests {
                                 + if matches!(action, "commit" | "seal") {
                                     0
                                 } else {
-                                    967
+                                    1031
                                 }
                         );
                         assert_eq!(
@@ -3321,11 +3708,11 @@ mod tests {
             );
             if !matches!(action, "commit" | "cancel_paused" | "seal") {
                 let mut expected: Vec<_> = if action == "oversized" {
-                    vec![0.0; 960]
+                    vec![0.0; 1536]
                 } else {
                     audio.iter().map(|s| f32::from(*s) / 32768.0).collect()
                 };
-                expected.extend([6000.0 / 32768.0; 967]);
+                expected.extend([6000.0 / 32768.0; 1031]);
                 assert_eq!(calls.lock().unwrap()[1], expected);
             }
         }
@@ -3334,15 +3721,15 @@ mod tests {
     #[test]
     fn pause_context_expires_after_two_continuations_or_source_lifetime() {
         for lifetime in [false, true] {
-            let mut audio = vec![12000; 960];
-            audio.extend(vec![0; 16 * 480]);
+            let mut audio = vec![12000; 1024];
+            audio.extend(vec![0; 16 * 512]);
             if lifetime {
                 audio.extend(vec![6000; 6 * 16000]);
             } else {
                 for amplitude in [10000, 8000, 6000] {
-                    audio.extend(vec![amplitude; 960]);
+                    audio.extend(vec![amplitude; 1024]);
                     if amplitude != 6000 {
-                        audio.extend(vec![0; 16 * 480]);
+                        audio.extend(vec![0; 16 * 512]);
                     }
                 }
             }
@@ -3471,7 +3858,7 @@ mod tests {
 
     #[test]
     fn moonshine_native_short_commit_preserves_source_at_minimum_boundary() {
-        for count in [1, 7, 479, 480, 487, 959, 960, 967, 1599, 1600, 1601] {
+        for count in [1, 7, 479, 512, 487, 959, 1024, 1031, 1599, 1600, 1601] {
             let audio: Vec<_> = (0..count)
                 .map(|index| [12000_i16, -6000, 3000][index % 3])
                 .collect();
@@ -3541,7 +3928,7 @@ mod tests {
 
     #[test]
     fn voice_incremental_short_onset_and_subframe_recordings_are_preserved() {
-        for count in [1, 137, 479, 480, 487, 959, 960, 967] {
+        for count in [1, 137, 479, 512, 487, 959, 1024, 1031] {
             let audio = vec![12000; count];
             let (result, calls) = partitioned(&audio, 317);
             assert!(matches!(
@@ -3554,7 +3941,7 @@ mod tests {
 
     #[test]
     fn voice_incremental_silence_never_calls_inference() {
-        for count in [0, 1, 479, 960, 50000] {
+        for count in [0, 1, 479, 1024, 50000] {
             let (result, calls) = partitioned(&vec![0; count], 317);
             assert!(matches!(
                 result,
@@ -3569,7 +3956,7 @@ mod tests {
         for buffered in [false, true] {
             let store = GatewayVoiceSessionBufferStore::default();
             let cancellation = CancellationToken::new();
-            for (id, amplitude, count) in [("first", 12000_i16, 967), ("second", 6000_i16, 1)] {
+            for (id, amplitude, count) in [("first", 12000_i16, 1031), ("second", 6000_i16, 1)] {
                 let (_sender, receiver) = oneshot::channel();
                 store
                     .start_processing(
@@ -3600,7 +3987,7 @@ mod tests {
                 let _completion = store.finish_processing(id).unwrap();
             }
             let first = TestSpeechTranscriber(Arc::new(|buffer| {
-                assert_eq!(buffer.flattened_samples(), vec![12000.0 / 32768.0; 967]);
+                assert_eq!(buffer.flattened_samples(), vec![12000.0 / 32768.0; 1031]);
                 Ok("first result".to_owned())
             }));
             let second = TestSpeechTranscriber(Arc::new(|buffer| {
@@ -3641,7 +4028,7 @@ mod tests {
             };
             assert_eq!(first.text, "first result");
             assert_eq!(second.text, "second result");
-            assert_eq!(first.diagnostics.total_samples, 967);
+            assert_eq!(first.diagnostics.total_samples, 1031);
             assert_eq!(second.diagnostics.total_samples, 1);
         }
     }
@@ -3650,7 +4037,7 @@ mod tests {
     fn voice_incremental_next_onset_does_not_replay_previous_hangover() {
         for buffered in [false, true] {
             for remainder in [0, 1, 137, 479] {
-                let mut audio = vec![12000; 960];
+                let mut audio = vec![12000; 1024];
                 audio.extend(vec![0; 16 * VOICE_VAD_FRAME_SAMPLES]);
                 // Only one complete frame in the final onset. Commit must
                 // recover it, with or without a short remainder.
@@ -3678,7 +4065,7 @@ mod tests {
                     assert_eq!(transcript.diagnostics.speech_samples, audio.len());
                     assert_eq!(transcript.diagnostics.total_samples, audio.len());
                     assert_eq!(signal_stats.total_samples, audio.len());
-                    assert_eq!(signal_stats.non_zero_samples, 1440 + remainder);
+                    assert_eq!(signal_stats.non_zero_samples, 1536 + remainder);
                 }
             }
         }
@@ -3792,15 +4179,15 @@ mod tests {
                 )
                 .unwrap();
             }
-            let mut audio = vec![if mode == "no_speech" { 0 } else { 12000 }; 960];
-            audio.extend([0; 16 * 480]);
+            let mut audio = vec![if mode == "no_speech" { 0 } else { 12000 }; 1024];
+            audio.extend([0; 16 * 512]);
             append_test_packet(&store, "candidate", 0, &audio);
             if mode != "no_speech" {
                 receive_a
                     .recv_timeout(std::time::Duration::from_secs(5))
                     .unwrap();
             }
-            append_test_packet(&store, "candidate", 1, &[0; 480]);
+            append_test_packet(&store, "candidate", 1, &[0; 512]);
             assert_eq!(
                 checkpoint_a
                     .recv_timeout(std::time::Duration::from_secs(5))
@@ -3814,7 +4201,7 @@ mod tests {
                     .apply_desired(VoiceInputDesiredState::default(), false)
                     .unwrap();
             }
-            append_test_packet(&store, "peer", 0, &[6000; 960]);
+            append_test_packet(&store, "peer", 0, &[6000; 1024]);
             let peer_completion = store.finish_processing("peer").unwrap();
             if mode != "stale" {
                 receive_b
@@ -3873,7 +4260,7 @@ mod tests {
                         no_speech.reason,
                         VoiceTranscriptionNoSpeechReason::NoSpeechDetected
                     );
-                    assert_eq!(no_speech.total_samples, 19 * 480);
+                    assert_eq!(no_speech.total_samples, 19 * 512);
                 }
                 _ => {
                     let GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. } =
@@ -3882,8 +4269,8 @@ mod tests {
                         panic!("cached transcript expected");
                     };
                     assert_eq!(transcript.text, "accepted pause candidate");
-                    assert_eq!(transcript.diagnostics.total_samples, 19 * 480);
-                    assert_eq!(transcript.diagnostics.speech_samples, 8160);
+                    assert_eq!(transcript.diagnostics.total_samples, 19 * 512);
+                    assert_eq!(transcript.diagnostics.speech_samples, 8192);
                     assert_eq!(transcript.diagnostics.segment_count, 1);
                 }
             }
@@ -3901,12 +4288,12 @@ mod tests {
             let calls = calls.lock().unwrap();
             assert_eq!(calls.len(), if mode == "cached" { 2 } else { 1 });
             if mode != "no_speech" {
-                let mut expected = vec![12000.0 / 32768.0; 960];
-                expected.extend([0.0; 7200]);
+                let mut expected = vec![12000.0 / 32768.0; 1024];
+                expected.extend([0.0; 7168]);
                 assert_eq!(calls[0], expected);
             }
             if mode != "stale" {
-                assert_eq!(calls.last().unwrap(), &vec![6000.0 / 32768.0; 960]);
+                assert_eq!(calls.last().unwrap(), &vec![6000.0 / 32768.0; 1024]);
             }
             assert!(!workers.has_active_work());
         }
@@ -3979,7 +4366,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-                append_test_packet(&store, "session", 0, &[12000; 960]);
+                append_test_packet(&store, "session", 0, &[12000; 1024]);
                 let completion = store.finish_processing("session").unwrap();
                 tokio::time::timeout(std::time::Duration::from_secs(5), receive.recv())
                     .await
@@ -4018,5 +4405,513 @@ mod tests {
                 assert!(receive.try_recv().is_err());
             }
         }
+    }
+
+    #[test]
+    fn real_samples_cross_packet_and_v4_frame_boundaries_once_in_both_modes() {
+        struct RecordingVad(Arc<Mutex<Vec<Vec<f32>>>>);
+        impl VoiceActivityDetector for RecordingVad {
+            fn speech_probability(&mut self, frame: &[f32]) -> anyhow::Result<f32> {
+                self.0.lock().unwrap().push(frame.to_vec());
+                Ok(0.9)
+            }
+        }
+        for count in [1, 511, 512, 513, 1024, 1615] {
+            let audio: Vec<i16> = (0..count).map(|ix| 8000 + ix as i16).collect();
+            let expected: Vec<_> = audio
+                .iter()
+                .map(|sample| f32::from(*sample) / 32768.0)
+                .collect();
+            for packet in [1, 137, 511, 512, 513, 1600] {
+                for buffered in [false, true] {
+                    let store = GatewayVoiceSessionBufferStore::default();
+                    let (_sender, receiver) = oneshot::channel();
+                    store
+                        .start_processing(
+                            "session".to_owned(),
+                            VoiceAudioFormat::pioneer_streaming_target(),
+                            CancellationToken::new(),
+                            receiver,
+                        )
+                        .unwrap();
+                    for (sequence, chunk) in audio.chunks(packet).enumerate() {
+                        append_test_packet(&store, "session", sequence as u64, chunk);
+                    }
+                    let _completion = store.finish_processing("session").unwrap();
+                    let vad_calls = Arc::new(Mutex::new(Vec::new()));
+                    let asr_calls = Arc::new(Mutex::new(Vec::new()));
+                    let captured = asr_calls.clone();
+                    let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
+                        captured.lock().unwrap().push(buffer.flattened_samples());
+                        Ok("short speech".to_owned())
+                    }));
+                    let detector = RecordingVad(vad_calls.clone());
+                    let token = CancellationToken::new();
+                    let result = if buffered {
+                        super::process_buffered(&store, "session", &token, &fake, false, detector)
+                    } else {
+                        super::process(&store, "session", &token, &fake, false, detector)
+                    }
+                    .unwrap();
+                    assert_eq!(*asr_calls.lock().unwrap(), vec![expected.clone()]);
+                    let frames = vad_calls.lock().unwrap();
+                    assert_eq!(frames.len(), count.div_ceil(512));
+                    assert!(frames.iter().all(|frame| frame.len() == 512));
+                    let classified = frames.concat();
+                    assert_eq!(&classified[..count], expected);
+                    assert!(classified[count..].iter().all(|sample| *sample == 0.0));
+                    let GatewayVoiceSessionPipelineOutcome::Transcript {
+                        transcript,
+                        signal_stats,
+                    } = result
+                    else {
+                        panic!("speech");
+                    };
+                    assert_eq!(transcript.diagnostics.speech_samples, count);
+                    assert_eq!(transcript.diagnostics.total_samples, count);
+                    assert_eq!(signal_stats.total_samples, count);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pause_uses_nearest_admissible_word_end_and_coincident_repetitions() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured = calls.clone();
+        let fake = HypothesisTranscriber(move |buffer: &PreparedSpeechBuffer| {
+            let count = buffer.speech_samples();
+            captured.lock().unwrap().push(count);
+            Ok(if count == 112000 {
+                VoiceSpeechHypothesis {
+                    text: "prefix да да tail".to_owned(),
+                    segments: Some(
+                        [
+                            (0.0, 2.0, "prefix"),
+                            (2.0, 4.8, "да"),
+                            (4.8, 4.8, "да"),
+                            (4.8, 7.0, "tail"),
+                        ]
+                        .into_iter()
+                        .map(|(start, end, text)| transcribe_rs::TranscriptionSegment {
+                            start,
+                            end,
+                            text: text.to_owned(),
+                        })
+                        .collect(),
+                    ),
+                }
+            } else {
+                VoiceSpeechHypothesis::text_only(
+                    if count == LEFT_CONTEXT_SAMPLES {
+                        "да да"
+                    } else {
+                        "да да tail"
+                    }
+                    .to_owned(),
+                )
+            })
+        });
+        let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
+        state.speech = vec![0.5; 112000];
+        state.speech_samples = 112000;
+        state
+            .prepare_pause(&open_store(), "session", &CancellationToken::new(), &fake)
+            .unwrap();
+        assert_eq!(state.text, "prefix да да");
+        assert_eq!(state.hypothesis, "tail");
+        assert_eq!(state.window_start_sample, 52800);
+        assert_eq!(state.speech.len(), 59200);
+        assert!(state.speech.len() <= PAUSE_WINDOW_SAMPLES);
+        assert_eq!(*calls.lock().unwrap(), vec![112000, 24000, 59200]);
+    }
+
+    #[test]
+    fn equal_alignment_costs_hold_text_with_audio_once_then_force_finite_progress() {
+        let tied = boundary_projection("a a a", "a", "a", Some((50, 100)));
+        assert_eq!((tied.first, tied.last, tied.selected), (1, 3, 3));
+        assert_eq!((tied.cost, tied.alternative_cost), (2, Some(2)));
+        assert!(tied.ambiguous());
+        let unique = boundary_projection("a b", "a", "b", Some((50, 100)));
+        assert!(!unique.ambiguous());
+        assert_eq!((unique.first, unique.last, unique.cost), (1, 1, 0));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured = calls.clone();
+        let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
+            let count = buffer.speech_samples();
+            captured.lock().unwrap().push(count);
+            Ok(if count == 112000 {
+                "a a a a"
+            } else if count == 96000 || count == MAX_SPEECH_WINDOW_SAMPLES {
+                "a a a"
+            } else {
+                "a"
+            }
+            .to_owned())
+        }));
+        let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
+        state.speech = vec![0.5; 96000];
+        state.speech_samples = 96000;
+        let store = open_store();
+        let token = CancellationToken::new();
+        state
+            .prepare_pause(&store, "session", &token, &fake)
+            .unwrap();
+        state
+            .prepare_pause(&store, "session", &token, &fake)
+            .unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert_eq!(state.text, "a");
+        assert_eq!(state.hypothesis, "a a");
+        assert_eq!(state.speech.len(), 96000);
+        assert_eq!(state.window_start_sample, 0);
+        state.speech.resize(112000, 0.5);
+        state.speech_samples = 112000;
+        state.refresh(&store, "session", &token, &fake).unwrap();
+        assert_eq!(state.text, "a");
+        assert_eq!(state.hypothesis, "a a a"); // a new occurrence survives exclusion
+        state.speech.resize(MAX_SPEECH_WINDOW_SAMPLES, 0.5);
+        state.speech_samples = MAX_SPEECH_WINDOW_SAMPLES;
+        state
+            .advance_window(&store, "session", &token, &fake)
+            .unwrap();
+        assert_eq!(state.text, "a a");
+        assert_eq!(state.hypothesis, "a");
+        assert_eq!(state.window_start_sample, 144000);
+        assert_eq!(calls.lock().unwrap().len(), 8);
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|count| *count <= MAX_SPEECH_WINDOW_SAMPLES)
+        );
+    }
+
+    #[test]
+    fn prepared_mapping_excludes_removed_silence_and_survives_partial_evictions() {
+        let mut timeline = AudioTimeline::default();
+        let mut buffered = PreparedSourceMap::default();
+        // Two real retained edges around a discarded source interval. ASR time
+        // is contiguous at 512 while source jumps from 512 to 8192.
+        let intervals = [
+            VadInterval {
+                start: 0,
+                end: 512,
+                probability: 0.0,
+                voice: false,
+                quiet_run_start: 0,
+            },
+            VadInterval {
+                start: 8192,
+                end: 8704,
+                probability: 0.0,
+                voice: false,
+                quiet_run_start: 0,
+            },
+            VadInterval {
+                start: 8704,
+                end: 9216,
+                probability: 0.9,
+                voice: true,
+                quiet_run_start: 8704,
+            },
+        ];
+        buffered.append(&intervals);
+        timeline.append(0, 0, 512, &intervals[..1]);
+        timeline.append(512, 8192, 9216, &intervals[1..]);
+        assert_eq!(buffered.spans.len(), 2);
+        assert_eq!(buffered.real_samples, 1536);
+        for (pcm, source) in [
+            (0, 0),
+            (511, 511),
+            (512, 8192),
+            (1023, 8703),
+            (1024, 8704),
+            (1535, 9215),
+        ] {
+            assert_eq!(timeline.source_at(pcm), Some(source));
+            assert_eq!(timeline.prepared_at(source), Some(pcm));
+            assert_eq!(buffered.source_at(pcm), Some(source));
+        }
+        assert_eq!(timeline.prepared_at(4096), None);
+        assert_eq!(buffered.source_at(1536), None); // includes native-only padding
+        assert_eq!(timeline.pause_boundary(0, 100, 1000, 700), Some(512));
+        timeline.retain_from(700);
+        assert_eq!(timeline.source_at(699), None);
+        assert_eq!(timeline.source_at(700), Some(8380));
+        for ix in 0..1600 {
+            let prepared = 1536 + ix * 512;
+            let source = 9216 + ix * 512;
+            timeline.append(
+                prepared,
+                source,
+                source + 512,
+                &[VadInterval {
+                    start: source,
+                    end: source + 512,
+                    probability: 0.9,
+                    voice: true,
+                    quiet_run_start: source,
+                }],
+            );
+            let origin = (prepared + 512).saturating_sub(MAX_SPEECH_WINDOW_SAMPLES);
+            timeline.retain_from(origin);
+            assert_eq!(timeline.source_at(prepared + 511), Some(source + 511));
+            if origin > 0 {
+                assert_eq!(timeline.source_at(origin - 1), None);
+            }
+            assert!(timeline.intervals.len() <= MAX_SPEECH_WINDOW_SAMPLES.div_ceil(512) + 1);
+        }
+    }
+
+    #[test]
+    fn timing_validation_rejects_bad_order_padding_and_non_utf8_text_fences() {
+        for (start, end) in [
+            (f32::NAN, 1.0),
+            (0.0, f32::INFINITY),
+            (-0.1, 0.5),
+            (1.0, 0.5),
+            (0.0, 1.1),
+        ] {
+            let hypothesis = VoiceSpeechHypothesis {
+                text: "да".to_owned(),
+                segments: Some(vec![transcribe_rs::TranscriptionSegment {
+                    start,
+                    end,
+                    text: "да".to_owned(),
+                }]),
+            };
+            assert!(timed_boundaries(&hypothesis, 16000).is_none());
+        }
+        let hypothesis = VoiceSpeechHypothesis {
+            text: "да да".to_owned(),
+            segments: Some(vec![
+                transcribe_rs::TranscriptionSegment {
+                    start: 0.0,
+                    end: 0.7,
+                    text: "да".to_owned(),
+                },
+                transcribe_rs::TranscriptionSegment {
+                    start: 0.6,
+                    end: 1.0,
+                    text: "да".to_owned(),
+                },
+            ]),
+        };
+        assert!(timed_boundaries(&hypothesis, 16000).is_none());
+        assert!(!is_text_boundary("да tail", 1));
+        assert!(!is_text_boundary("да tail", usize::MAX));
+    }
+
+    #[test]
+    fn timestamp_cut_cannot_escape_the_retained_window_and_tail_bounds() {
+        let fake = HypothesisTranscriber(|buffer: &PreparedSpeechBuffer| {
+            Ok(if buffer.speech_samples() == 112000 {
+                VoiceSpeechHypothesis {
+                    text: "early admissible late".to_owned(),
+                    segments: Some(
+                        [
+                            (0.0, 3.999, "early"),
+                            (3.999, 4.0625, "admissible"),
+                            (4.0625, 7.0, "late"),
+                        ]
+                        .into_iter()
+                        .map(|(start, end, text)| transcribe_rs::TranscriptionSegment {
+                            start,
+                            end,
+                            text: text.to_owned(),
+                        })
+                        .collect(),
+                    ),
+                }
+            } else {
+                assert_eq!(buffer.speech_samples(), 24000); // no partition probes
+                VoiceSpeechHypothesis::text_only("admissible".to_owned())
+            })
+        });
+        let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
+        state.speech = vec![0.5; 112000];
+        state.speech_samples = 112000;
+        assert!(
+            state
+                .project_window(
+                    64000,
+                    64000,
+                    88000,
+                    false,
+                    &open_store(),
+                    "session",
+                    &CancellationToken::new(),
+                    &fake
+                )
+                .unwrap()
+        );
+        assert_eq!(state.window_start_sample + state.context_samples, 65000);
+        assert_eq!(state.text, "early admissible");
+        assert_eq!(state.hypothesis, "late");
+        assert!(state.speech.len() <= 72000);
+        assert!(state.speech.len() - state.context_samples >= 24000);
+    }
+
+    #[test]
+    fn vad_pause_duration_beats_nearby_low_energy_during_window_planning() {
+        struct Pauses(usize);
+        impl VoiceActivityDetector for Pauses {
+            fn speech_probability(&mut self, _: &[f32]) -> anyhow::Result<f32> {
+                let index = self.0;
+                self.0 += 1;
+                Ok(
+                    if (220..230).contains(&index) || (329..333).contains(&index) {
+                        0.1
+                    } else {
+                        0.9
+                    },
+                )
+            }
+        }
+        let mut state = IncrementalSpeech::new(false, Pauses(0)).unwrap();
+        let fake = TestSpeechTranscriber(Arc::new(|_| Ok("speech".to_owned())));
+        let store = open_store();
+        let token = CancellationToken::new();
+        for index in 0..562 {
+            // Real noisy pauses have HIGHER energy than nearby voiced samples.
+            let quiet = (220..230).contains(&index) || (329..333).contains(&index);
+            let frame = vec![if quiet { 0.5 } else { 0.01 }; 512];
+            let classified = state.vad.push_incremental_frame(&frame).unwrap();
+            state.source_samples += 512;
+            if let SmoothedVadFrame::Speech(samples) = classified {
+                state
+                    .accept_speech(&samples, &store, "session", &token, &fake)
+                    .unwrap();
+            }
+        }
+        let earliest = 96000;
+        let latest = state.speech.len() - 48000;
+        assert_eq!(state.preferred_boundary(earliest, latest), 115200);
+        assert_ne!(
+            partition_boundary_in(&state.speech, earliest, latest),
+            115200
+        );
+        assert_eq!(state.timeline.source_at(115200), Some(115200));
+        assert!(state.timeline.intervals.len() <= MAX_SPEECH_WINDOW_SAMPLES.div_ceil(512) + 6);
+    }
+
+    #[test]
+    fn evicted_positive_vad_frame_separates_pauses_but_a_quiet_gap_keeps_continuity() {
+        struct Pauses {
+            frame: usize,
+            middle_probability: f32,
+        }
+        impl VoiceActivityDetector for Pauses {
+            fn speech_probability(&mut self, _: &[f32]) -> anyhow::Result<f32> {
+                let index = self.frame;
+                self.frame += 1;
+                Ok(if index == 215 {
+                    self.middle_probability
+                } else if (200..232).contains(&index) || (274..294).contains(&index) {
+                    0.0
+                } else {
+                    0.9
+                })
+            }
+        }
+        // Established speech, 15 quiet frames, one disputed frame, 16 quiet,
+        // two onset frames, 40 voiced frames, then a competing 20-frame pause.
+        // Only the middle probability changes; prefill removes the same five
+        // source frames, including that middle frame, in both cases.
+        for (middle_probability, expected_cut, expected_source) in [
+            (0.9, 142848, 145408), // the actual 20-frame pause wins
+            (0.0, 109568, 112128), // a continuous 32-frame pause wins at its seam
+        ] {
+            let mut state = IncrementalSpeech::new(
+                false,
+                Pauses {
+                    frame: 0,
+                    middle_probability,
+                },
+            )
+            .unwrap();
+            let fake = TestSpeechTranscriber(Arc::new(|_| Ok("speech".to_owned())));
+            let store = open_store();
+            let token = CancellationToken::new();
+            for _ in 0..562 {
+                let classified = state.vad.push_incremental_frame(&[0.5; 512]).unwrap();
+                state.source_samples += 512;
+                if let SmoothedVadFrame::Speech(samples) = classified {
+                    // Production acceptance transfers emitted VAD metadata,
+                    // including any splits at a refresh boundary, to the planner.
+                    state
+                        .accept_speech(&samples, &store, "session", &token, &fake)
+                        .unwrap();
+                }
+            }
+            assert_eq!(state.speech_samples, 557 * 512);
+            assert_eq!(state.timeline.prepared_at(215 * 512), None);
+            let latest = state.speech.len() - REFRESH_SAMPLES;
+            assert_eq!(state.preferred_boundary(96000, latest), expected_cut);
+            assert_eq!(
+                state.timeline.source_at(expected_cut),
+                Some(expected_source)
+            );
+
+            // Clip inside the first quiet edge. Its run identity must survive
+            // while sample coordinates and the returned local cut move together.
+            let origin = 201 * 512 + 137;
+            state.timeline.retain_from(origin);
+            assert_eq!(state.timeline.source_at(origin), Some(origin));
+            assert_eq!(
+                state.timeline.pause_boundary(
+                    origin,
+                    0,
+                    latest - origin,
+                    (96000 + latest) / 2 - origin,
+                ),
+                Some(expected_cut - origin),
+            );
+        }
+    }
+
+    #[test]
+    fn final_pause_seal_keeps_the_original_source_time_target_with_32ms_frames() {
+        struct SpeechThenQuiet(usize);
+        impl VoiceActivityDetector for SpeechThenQuiet {
+            fn speech_probability(&mut self, _: &[f32]) -> anyhow::Result<f32> {
+                self.0 += 1;
+                Ok(if self.0 <= 2 { 0.9 } else { 0.0 })
+            }
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured = calls.clone();
+        let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
+            captured.lock().unwrap().push(buffer.flattened_samples());
+            Ok("speech".to_owned())
+        }));
+        let mut state = IncrementalSpeech::new(false, SpeechThenQuiet(0)).unwrap();
+        let store = open_store();
+        let token = CancellationToken::new();
+        for index in 0..40 {
+            let frame = vec![if index < 2 { 0.5 } else { 0.0 }; 512];
+            let classified = state.vad.push_incremental_frame(&frame).unwrap();
+            state.source_samples += 512;
+            match classified {
+                SmoothedVadFrame::Speech(samples) => state
+                    .accept_speech(&samples, &store, "session", &token, &fake)
+                    .unwrap(),
+                SmoothedVadFrame::Noise => state.pause(&store, "session", &token, &fake).unwrap(),
+            }
+            if index == 38 {
+                assert_eq!(state.vad.quiet_samples(), 18944); // 1184 ms <1200
+                assert!(state.text.is_empty());
+                assert_eq!(state.speech.len(), 8192);
+            }
+        }
+        assert_eq!(state.vad.quiet_samples(), 19456); // 1216 ms: first >=1200
+        assert_eq!(state.text, "speech");
+        assert!(state.speech.is_empty());
+        assert_eq!(state.speech_samples, 8192);
+        let mut expected = vec![0.5; 1024];
+        expected.extend([0.0; 7168]);
+        assert_eq!(*calls.lock().unwrap(), vec![expected]); // cached seal, no repeat ASR
     }
 }
