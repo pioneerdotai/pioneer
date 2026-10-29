@@ -946,6 +946,13 @@ pub(in crate::message) struct HistoricalTaskFixture {
 pub(in crate::message) async fn historical_task_fixture(
     mode: TaskDeliveryMode,
 ) -> HistoricalTaskFixture {
+    historical_task_fixture_with_delivery_target(mode, "continuity-root").await
+}
+
+pub(in crate::message) async fn historical_task_fixture_with_delivery_target(
+    mode: TaskDeliveryMode,
+    destination_thread_id: &str,
+) -> HistoricalTaskFixture {
     let provider = Arc::new(
         CaptureSummaryProvider::new("unexpected model execution")
             .named("openai")
@@ -956,6 +963,15 @@ pub(in crate::message) async fn historical_task_fixture(
         provider.clone(),
     ));
     let (processor, workspace) = processor_with_registry(registry).await;
+    if mode == TaskDeliveryMode::Thread && destination_thread_id != "continuity-root" {
+        ensure_test_superuser_execution_turn(
+            &processor,
+            &workspace,
+            destination_thread_id,
+            "historical-delivery-target-turn",
+        )
+        .await;
+    }
     let mut params = test_task_create_params(
         &workspace,
         "continuity-root",
@@ -967,7 +983,7 @@ pub(in crate::message) async fn historical_task_fixture(
         mode,
         thread_target: (mode == TaskDeliveryMode::Thread)
             .then_some(pioneer_protocol::TaskDeliveryThreadTarget::ExactThread),
-        thread_id: (mode == TaskDeliveryMode::Thread).then(|| "continuity-root".to_owned()),
+        thread_id: (mode == TaskDeliveryMode::Thread).then(|| destination_thread_id.to_owned()),
         webhook_url: None,
         include_result: true,
         format: TaskDeliveryFormat::Summary,
@@ -1069,6 +1085,8 @@ impl HistoricalTaskFixture {
             .await
             .unwrap()
             .unwrap();
+        let destination_thread_id = actor.delivery.destination_thread_id.clone().unwrap();
+        assert_ne!(destination_thread_id, self.facts.home_root_thread_id);
         let admission = store
             .get_task_execution_admission(&self.response.task.id)
             .await
@@ -1096,9 +1114,9 @@ impl HistoricalTaskFixture {
             .create_agent_delegation_route(pioneer_crud::AgentDelegationRouteInput {
                 id: id.clone(),
                 source_execution_id: self.execution.id.clone(),
-                destination_thread_id: "continuity-root".into(),
+                destination_thread_id: destination_thread_id.clone(),
                 source_capsule_id: Some(self.facts.home_root_thread_id.clone()),
-                destination_capsule_id: Some("continuity-root".into()),
+                destination_capsule_id: Some(destination_thread_id),
                 source_workspace_id: Some(self.response.task.workspace_id.clone()),
                 destination_workspace_id: Some(self.response.task.workspace_id.clone()),
                 source_gateway_id: Some("local".into()),

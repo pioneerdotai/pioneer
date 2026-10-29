@@ -1717,7 +1717,9 @@ mod recovery_failure_tests {
 #[cfg(test)]
 mod historical_grant_delivery_tests {
     use super::*;
-    use crate::message::tests::task_launch_continuity::historical_task_fixture;
+    use crate::message::tests::task_launch_continuity::{
+        historical_task_fixture, historical_task_fixture_with_delivery_target,
+    };
     use pioneer_protocol::{TaskDeliveryStatus, TurnItem, TurnItemEventPayload};
     use sea_orm::{
         ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
@@ -1899,7 +1901,16 @@ mod historical_grant_delivery_tests {
     #[tokio::test]
     async fn historical_delivery_still_rejects_corrupt_snapshots_and_revoked_authority() {
         for corruption in ["outer", "nested", "task", "identity", "route"] {
-            let fixture = historical_task_fixture(TaskDeliveryMode::Thread).await;
+            let destination_thread_id = if corruption == "route" {
+                "historical-delivery-target"
+            } else {
+                "continuity-root"
+            };
+            let fixture = historical_task_fixture_with_delivery_target(
+                TaskDeliveryMode::Thread,
+                destination_thread_id,
+            )
+            .await;
             let processor = &fixture.processor;
             let store = &processor.crud_store;
             let db = store.database_connection();
@@ -1925,7 +1936,7 @@ mod historical_grant_delivery_tests {
             if let Some((id, authority, fingerprint, generation)) = route {
                 assert!(
                     processor
-                        .prepare_task_delivery_agent_action(&delivery, Some("continuity-root"))
+                        .prepare_task_delivery_agent_action(&delivery, Some(destination_thread_id))
                         .await
                         .unwrap()
                         .is_some(),
@@ -2020,7 +2031,7 @@ mod historical_grant_delivery_tests {
             );
             assert!(
                 store
-                    .get_turn("continuity-root", &turn_id)
+                    .get_turn(destination_thread_id, &turn_id)
                     .await
                     .unwrap()
                     .is_none()
