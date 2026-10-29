@@ -15189,7 +15189,9 @@ async fn detached_composer_live_ordering_impl() {
                 .get_turn_item_events(parent, turn_id)
                 .await
                 .unwrap()
-                .is_none()
+                .expect("parent thread must exist")
+                .events
+                .is_empty()
         );
         assert!(
             processor
@@ -15644,7 +15646,9 @@ async fn assert_composer_durable_size_admission(
             .get_turn_item_events(parent, turn_id)
             .await
             .unwrap()
-            .is_none()
+            .expect("parent thread must exist")
+            .events
+            .is_empty()
     );
     let tasks = service
         .list_tasks(TaskListParams {
@@ -15695,12 +15699,14 @@ async fn assert_composer_durable_size_admission(
             .is_some()
     );
     assert!(
-        processor
+        !processor
             .crud_store
             .get_turn_item_events(parent, turn_id)
             .await
             .unwrap()
-            .is_some()
+            .expect("parent thread must exist")
+            .events
+            .is_empty()
     );
     assert_eq!(
         processor.crud_store.get_turn_inputs(turn_id).await.unwrap(),
