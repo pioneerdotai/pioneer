@@ -346,6 +346,13 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
         assert!(receive(fast.rx).await.is_ok());
         assert!(f.gate.state.lock().unwrap().flush_blocked);
         f.gate.release(false);
+        // A peer reply can arrive while the writer still owns the previous
+        // flush. Complete a round trip with the gate open before blocking the
+        // next write, so that write owns the writer and leaves the handoff free.
+        let flushed = request(&f.commands, "synthetic/after-flush");
+        assert_eq!(f.next_request().await["id"], flushed.id);
+        f.reply(&flushed.id).await;
+        assert!(receive(flushed.rx).await.is_ok());
         f.gate.block();
         let blocked = request(&f.commands, "synthetic/blocked");
         f.gate.wait_entered().await;
