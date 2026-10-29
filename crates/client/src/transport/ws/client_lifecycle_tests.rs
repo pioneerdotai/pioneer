@@ -306,6 +306,15 @@ impl Fixture {
         )
     }
 
+    async fn consume_initial_heartbeat(&mut self) {
+        // The immediate timer tick can arrive after an application frame.
+        // Finish it before a gate can mistake it for the intended blocked RPC.
+        let Message::Ping(payload) = self.peer.next().await.unwrap().unwrap() else {
+            panic!("expected initial heartbeat");
+        };
+        self.peer.send(Message::Pong(payload)).await.unwrap();
+    }
+
     async fn next_data(&mut self) -> Message {
         loop {
             match self.peer.next().await.unwrap().unwrap() {
@@ -406,6 +415,7 @@ impl JsonRpcRequestTransport for ReceiptTransport {
 async fn cancel_bypasses_ordinary_backlog_without_displacing_pong_or_reader() {
     timeout(Duration::from_secs(10), async {
         let mut f = Fixture::start().await;
+        f.consume_initial_heartbeat().await;
         let first = request(&f.commands, "synthetic/first");
         assert_eq!(f.next_request().await["id"], first.id);
         f.gate.wait_flushed().await;
@@ -415,6 +425,10 @@ async fn cancel_bypasses_ordinary_backlog_without_displacing_pong_or_reader() {
         let queued = request(&f.commands, "synthetic/queued");
         let overflow = request(&f.commands, "synthetic/overflow");
         assert!(receive(overflow.rx).await.is_err());
+        assert!(
+            queued.response.is_active(),
+            "queued RPC must retain its handoff"
+        );
         let cancel = cancel_request(&f.receipt);
         let (rejected, rejected_rx) = mpsc::channel();
         let rejected = JsonRpcResponseSender::new(
@@ -476,6 +490,7 @@ async fn cancel_bypasses_ordinary_backlog_without_displacing_pong_or_reader() {
 async fn renewal_keeps_its_reserve_with_full_data_handoff_and_pending_cancel() {
     timeout(Duration::from_secs(10), async {
         let mut f = Fixture::start().await;
+        f.consume_initial_heartbeat().await;
         let first = request(&f.commands, "synthetic/ready");
         assert_eq!(f.next_request().await["id"], first.id);
         f.gate.wait_flushed().await;
@@ -485,6 +500,7 @@ async fn renewal_keeps_its_reserve_with_full_data_handoff_and_pending_cancel() {
         let queued = request(&f.commands, "synthetic/queued");
         let overflow = request(&f.commands, "synthetic/overflow");
         assert!(receive(overflow.rx).await.is_err());
+        assert!(queued.response.is_active(), "queued RPC must retain its handoff");
         let cancel = cancel_request(&f.receipt);
         let mut next = f.spec.clone();
         next.auth_token = Some(AuthSecretString::new("renewed-synthetic-access"));
@@ -536,6 +552,7 @@ async fn unpolled_socket_owner_completes_retained_cancel_and_closes_admission() 
 async fn queued_expired_cancel_never_writes_or_rebinds_to_replacement_socket() {
     timeout(Duration::from_secs(10), async {
         let mut f = Fixture::start().await;
+        f.consume_initial_heartbeat().await;
         let ready = request(&f.commands, "synthetic/ready");
         assert_eq!(f.next_request().await["id"], ready.id);
         f.gate.wait_flushed().await;
