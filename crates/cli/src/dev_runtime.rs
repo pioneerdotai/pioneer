@@ -34,7 +34,7 @@ pub(crate) fn prepare(config: &AppConfig, source: &Path) -> Result<PreparedRunti
     #[cfg(windows)]
     let interpreters = [("py", Some("-3")), ("python3", None), ("python", None)];
     #[cfg(not(windows))]
-    let interpreters = [("python3", None)];
+    let interpreters = [("python3", None::<&str>)];
     let mut output = None;
     for (program, version) in interpreters {
         let mut command = Command::new(program);
