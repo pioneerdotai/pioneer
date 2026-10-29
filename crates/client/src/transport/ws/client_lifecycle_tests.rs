@@ -20,7 +20,7 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 struct GateState {
     blocked: bool,
     flush_blocked: bool,
-    block_flush_on_write: bool,
+    block_flush_after_write: bool,
     writes: u64,
     flushed_writes: u64,
     reported: bool,
@@ -42,9 +42,9 @@ impl WriteGate {
         state.reported = false;
     }
 
-    fn block_flush(&self) {
+    fn block_flush_after_write(&self) {
         let mut state = self.state.lock().unwrap();
-        state.block_flush_on_write = true;
+        state.block_flush_after_write = true;
         state.reported = false;
     }
 
@@ -75,7 +75,7 @@ impl WriteGate {
         let mut state = self.state.lock().unwrap();
         state.blocked = false;
         state.flush_blocked = false;
-        state.block_flush_on_write = false;
+        state.block_flush_after_write = false;
         state.failed = failed;
         if let Some(waker) = state.waker.take() {
             waker.wake();
@@ -151,8 +151,8 @@ impl AsyncWrite for GatedSocket {
         {
             let mut state = self.gate.state.lock().unwrap();
             state.writes += 1;
-            if state.block_flush_on_write {
-                state.block_flush_on_write = false;
+            if state.block_flush_after_write {
+                state.block_flush_after_write = false;
                 state.flush_blocked = true;
             }
         }
@@ -382,6 +382,13 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
     let phase = std::cell::Cell::new("starting fixture");
     timeout(Duration::from_secs(10), async {
         let mut f = Fixture::start().await;
+        // Consume the monitor's immediate heartbeat before arming a gate for
+        // application data, so a delayed first tick cannot own the blocked flush.
+        phase.set("receiving initial heartbeat");
+        let Message::Ping(payload) = f.peer.next().await.unwrap().unwrap() else {
+            panic!("expected initial heartbeat");
+        };
+        f.peer.send(Message::Pong(payload)).await.unwrap();
         phase.set("receiving first request");
         let first = request(&f.commands, "synthetic/first");
         assert_eq!(f.next_request().await["id"], first.id);
@@ -392,7 +399,9 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
         // The peer can respond before send/flush completes. Registration must
         // already exist, and response processing must not depend on writer exit.
         phase.set("receiving request with flush blocked");
-        f.gate.block_flush();
+        // Repeated flush polls for the first request may still be in flight.
+        // Block only after the next write has put its bytes on the socket.
+        f.gate.block_flush_after_write();
         let fast = request(&f.commands, "synthetic/fast");
         assert_eq!(f.next_request().await["id"], fast.id);
         phase.set("waiting for blocked flush");
@@ -412,12 +421,9 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
         assert!(receive(flushed.rx).await.is_ok());
         phase.set("waiting for round trip flush");
         f.gate.wait_flushed().await;
-        // Observe this request's bytes before filling the handoff. A gate
-        // notification alone can come from an earlier buffered socket write.
-        phase.set("waiting for blocked request flush");
-        f.gate.block_flush();
+        phase.set("waiting for blocked write");
+        f.gate.block();
         let blocked = request(&f.commands, "synthetic/blocked");
-        assert_eq!(f.next_request().await["id"], blocked.id);
         f.gate.wait_entered().await;
 
         phase.set("filling writer handoff");
@@ -441,22 +447,22 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
             "websocket writer handoff full or closed"
         );
 
-        // A ready response must complete while the writer's flush stays blocked.
+        // A ready response must complete while poll_write remains blocked.
         phase.set("receiving response while write is blocked");
         f.reply(&first.id).await;
         assert_eq!(receive(first.rx).await.unwrap(), json!({"ok":true}));
-        assert!(f.gate.state.lock().unwrap().flush_blocked);
+        assert!(f.gate.state.lock().unwrap().blocked);
         phase.set("waiting for queued request timeout");
         assert_eq!(
             timed.await.unwrap().unwrap_err().to_string(),
             crate::rpc::request_timeout_message("synthetic/timeout")
         );
-        phase.set("releasing blocked request flush");
+        phase.set("receiving blocked request after write release");
         f.reply(&timed_id).await; // late response cannot recreate observation
         f.gate.release(false);
+        assert_eq!(f.next_request().await["id"], blocked.id);
         f.reply(&blocked.id).await;
         assert!(receive(blocked.rx).await.is_ok());
-        f.gate.wait_flushed().await;
 
         // Retired-before-dequeue and retired-in-handoff requests cannot precede
         // this marker on the socket. This also proves the connection stayed live.
