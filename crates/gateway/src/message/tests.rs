@@ -1,6 +1,9 @@
 #[path = "tests/workspace_scope.rs"]
 mod workspace_scope;
 
+#[path = "tests/authorization_reads.rs"]
+mod authorization_reads;
+
 #[cfg(unix)]
 #[path = "tests/title_recovery.rs"]
 mod title_recovery;
@@ -66,6 +69,9 @@ mod task_webhooks;
 
 #[path = "tests/thread_launch_choices.rs"]
 mod thread_launch_choices;
+
+#[path = "tests/native_turn_event_delivery_workers.rs"]
+mod native_turn_event_delivery_workers;
 
 #[path = "tests/reconciliation_workers.rs"]
 mod reconciliation_workers;
@@ -15127,9 +15133,12 @@ async fn detached_composer_live_ordering_impl() {
 
     // An already-owned optional outbox worker cannot deliver during admission.
     // The controlled barrier pauses after live publication, before Task creation.
-    processor
-        .native_turn_event_delivery_kick_running
-        .store(true, Ordering::SeqCst);
+    for owner in [
+        &processor.native_turn_event_delivery_workers.live,
+        &processor.native_turn_event_delivery_workers.episodic,
+    ] {
+        owner.running.store(true, Ordering::SeqCst);
+    }
     processor.arm_completed_history_preparation_barrier("__detached_composer_before_task_create__");
     // Keep the full message longer than the Task title without depending on
     // whitespace that the existing UserMessage materialization normalizes.
@@ -15247,9 +15256,12 @@ async fn detached_composer_live_ordering_impl() {
     request_task.await.unwrap();
     // Restore automatic delivery before normal queries/operations. Its later
     // replay retains the same durable item identity and cannot create a second row.
-    processor
-        .native_turn_event_delivery_kick_running
-        .store(false, Ordering::SeqCst);
+    for owner in [
+        &processor.native_turn_event_delivery_workers.live,
+        &processor.native_turn_event_delivery_workers.episodic,
+    ] {
+        owner.running.store(false, Ordering::SeqCst);
+    }
     processor.kick_native_turn_event_deliveries();
     let items = store
         .get_turn_item_events(parent, turn_id)
@@ -42910,7 +42922,8 @@ async fn save_and_deliver_episodic_wake_for_test(
         .unwrap();
     processor
         .process_claimed_native_turn_event_delivery(delivery.clone())
-        .await;
+        .await
+        .unwrap();
     let ack = pioneer_entity::turn_event_delivery::Entity::find_by_id(delivery.id.clone())
         .one(&store.database_connection())
         .await
@@ -43711,7 +43724,8 @@ async fn episodic_completed_and_updated_deliveries_ack_only_after_reconciliation
         .await;
     processor
         .process_claimed_native_turn_event_delivery(first.clone())
-        .await;
+        .await
+        .unwrap();
     let failed = pioneer_entity::turn_event_delivery::Entity::find_by_id(first.id.clone())
         .one(&crud_store.database_connection())
         .await
@@ -43746,7 +43760,8 @@ async fn episodic_completed_and_updated_deliveries_ack_only_after_reconciliation
     assert_eq!(retry.id, first.id);
     processor
         .process_claimed_native_turn_event_delivery(retry.clone())
-        .await;
+        .await
+        .unwrap();
     let job = crud_store
         .list_thread_episodic_index_jobs_for_thread(&workspace_id, thread_id, 10)
         .await
@@ -43756,7 +43771,8 @@ async fn episodic_completed_and_updated_deliveries_ack_only_after_reconciliation
     // A repeated delivery reconciles idempotently and cannot ACK an old lease.
     processor
         .process_claimed_native_turn_event_delivery(retry)
-        .await;
+        .await
+        .unwrap();
     let updated = crud_store
         .claim_due_turn_event_deliveries(
             pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER,
@@ -43774,7 +43790,8 @@ async fn episodic_completed_and_updated_deliveries_ack_only_after_reconciliation
     let updated_id = updated.id.clone();
     processor
         .process_claimed_native_turn_event_delivery(updated)
-        .await;
+        .await
+        .unwrap();
     let delivered = pioneer_entity::turn_event_delivery::Entity::find_by_id(updated_id)
         .one(&crud_store.database_connection())
         .await
@@ -64520,13 +64537,11 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
                         break;
                     }
                 }
-                processor
-                    .process_due_native_turn_event_deliveries(now_timestamp_secs(), 128)
-                    .await
-                    .unwrap();
-                while processor
-                    .native_turn_event_delivery_kick_running
-                    .load(Ordering::Acquire)
+                processor.kick_native_turn_event_deliveries();
+                while !processor
+                    .native_turn_event_delivery_workers
+                    .tasks
+                    .is_empty()
                 {
                     tokio::task::yield_now().await;
                 }
@@ -80744,9 +80759,12 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
     // Model an already-owned optional delivery worker. Its separate Critical
     // control-plane kick may overlap the observer, while this fixture measures
     // the synchronous guarded lifecycle append and its durable outbox row.
-    processor
-        .native_turn_event_delivery_kick_running
-        .store(true, Ordering::SeqCst);
+    for owner in [
+        &processor.native_turn_event_delivery_workers.live,
+        &processor.native_turn_event_delivery_workers.episodic,
+    ] {
+        owner.running.store(true, Ordering::SeqCst);
+    }
     store.database_connection().execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) \

@@ -282,7 +282,8 @@ async fn deliver_completion_live(
             }
             processor
                 .process_claimed_native_turn_event_delivery(delivery)
-                .await;
+                .await
+                .unwrap();
         }
         if let Some(claim) = completion_claim {
             return claim;
@@ -396,9 +397,12 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
         // Own the existing optional-delivery worker in this fixture. Drive its
         // production claim/process path at controlled points of the cancellation
         // barrier, instead of racing the coalesced background kick.
-        processor
-            .native_turn_event_delivery_kick_running
-            .store(true, Ordering::SeqCst);
+        for owner in [
+            &processor.native_turn_event_delivery_workers.live,
+            &processor.native_turn_event_delivery_workers.episodic,
+        ] {
+            owner.running.store(true, Ordering::SeqCst);
+        }
     }
     // Seed only the exact durable state left by the old Gateway. Neither its
     // ThreadManager nor its actor is present in this process.
@@ -1026,7 +1030,8 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
         // repeats canonical delivery without another append or pre-start call.
         delivery_processor
             .process_claimed_native_turn_event_delivery(completion_delivery)
-            .await;
+            .await
+            .unwrap();
         let repeated = serde_json::to_value(
             recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await,
         )
@@ -1082,9 +1087,12 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
 
         // Controlled delivery and redelivery are complete. Restore automatic
         // kicks so the next Turn's real cancellation delivers TurnFailed.
-        processor
-            .native_turn_event_delivery_kick_running
-            .store(false, Ordering::SeqCst);
+        for owner in [
+            &processor.native_turn_event_delivery_workers.live,
+            &processor.native_turn_event_delivery_workers.episodic,
+        ] {
+            owner.running.store(false, Ordering::SeqCst);
+        }
 
         // Exercise ordinary authenticated admission, including its foreground
         // running-Turn gate, instead of a concurrent child or Message start.
@@ -1742,9 +1750,12 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
             // Drive the durable live consumer explicitly after replay. A failed
             // background delivery can otherwise remain in retry backoff when
             // the synchronous repeat Stop returns its successful response.
-            processor
-                .native_turn_event_delivery_kick_running
-                .store(true, Ordering::SeqCst);
+            for owner in [
+                &processor.native_turn_event_delivery_workers.live,
+                &processor.native_turn_event_delivery_workers.episodic,
+            ] {
+                owner.running.store(true, Ordering::SeqCst);
+            }
             db.execute_unprepared("CREATE TRIGGER reject_early_projection BEFORE UPDATE OF status ON turn WHEN NEW.status = 'interrupted' BEGIN SELECT RAISE(ABORT, 'fixture projection unavailable'); END").await.unwrap();
             for suffix in ["first-pending", "repeat-pending"] {
                 let id = generate_test_request_id("initialstop", suffix);
@@ -1795,9 +1806,12 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 completion_live_delivery(&store, turn).await.status,
                 "delivered"
             );
-            processor
-                .native_turn_event_delivery_kick_running
-                .store(false, Ordering::SeqCst);
+            for owner in [
+                &processor.native_turn_event_delivery_workers.live,
+                &processor.native_turn_event_delivery_workers.episodic,
+            ] {
+                owner.running.store(false, Ordering::SeqCst);
+            }
         }
         InitialStopPhase::NativeTaskBeforeRegistration => {
             processor.bind_task_bridge().await;
@@ -2170,6 +2184,29 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                             .await
                             .unwrap()
                     );
+                    // The accepted canonical Stop fences even the first child,
+                    // whose Turn is still in_progress until ordered projection.
+                    assert!(
+                        store
+                            .native_cancellation_was_accepted(&first_turn)
+                            .await
+                            .unwrap()
+                    );
+                    let error = processor
+                        .guard_execution_side_effect(
+                            &first_turn,
+                            crate::authorization::ResourceAction::ProviderUse,
+                        )
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        error
+                            .downcast_ref::<crate::authorization::ExecutionTurnNotInProgress>()
+                            .unwrap()
+                            .status(),
+                        TurnStatus::Interrupted
+                    );
+                    assert!(processor.guard_execution_commit(&first_turn).await.is_err());
                     timeout(Duration::from_secs(10), async {
                         while provider_cancelled.load(Ordering::SeqCst) != children.len() as u64 {
                             tokio::task::yield_now().await;
