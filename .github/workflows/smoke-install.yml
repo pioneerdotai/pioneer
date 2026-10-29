@@ -56,7 +56,7 @@ jobs:
             echo "SMOKE_ASSET=${asset_path}"
             echo "SMOKE_CHECKSUMS=${smoke_dir}/SHA256SUMS"
             echo "SMOKE_INSTALL_ROOT=${install_root}"
-            echo "SMOKE_BINARY=${install_root}/bin/pioneer"
+            echo "SMOKE_BINARY=${install_root}/bin/cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
           } >> "${GITHUB_ENV}"
 
       - name: install-force-start-with-path-warning
@@ -302,12 +302,6 @@ jobs:
           if (Test-Path -Path $env:SMOKE_INSTALL_ROOT -PathType Container) {
             Remove-Item -Path $env:SMOKE_INSTALL_ROOT -Recurse -Force
           }
-          if ($env:LOCALAPPDATA) {
-            $userBin = Join-Path $env:LOCALAPPDATA "Pioneer\\bin\\pioneer.exe"
-            if (Test-Path -Path $userBin -PathType Leaf) {
-              Remove-Item -Path $userBin -Force
-            }
-          }
 
   smoke-linux:
     name: smoke-linux
@@ -473,14 +467,14 @@ jobs:
           & $env:SMOKE_BINARY version --json | Write-Output
           $statusJson = & $env:SMOKE_BINARY status --json
           $status = $statusJson | ConvertFrom-Json
-          $expectedUserBin = Join-Path $env:LOCALAPPDATA "Pioneer\\bin"
+          $expectedUserBin = Join-Path $env:SMOKE_INSTALL_ROOT "bin"
           $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
           $userPathParts = @()
           if ($userPath) {
             $userPathParts = $userPath -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
           }
           if (-not ($userPathParts -contains $expectedUserBin)) {
-            throw "expected user PATH to contain Pioneer user bin directory: $expectedUserBin"
+            throw "expected user PATH to contain the managed Gateway directory: $expectedUserBin"
           }
 
           if (-not $status.service_active) {
