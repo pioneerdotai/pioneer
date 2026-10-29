@@ -23,6 +23,7 @@ import zipfile
 import tarfile
 
 BUNDLE_ID = "ai.pioneer.gateway"
+DEV_BUNDLE_ID = "ai.pioneer.gateway.dev"
 DECLARATION = Path(__file__).with_name("cua-release.json")
 TARGETS = {
     "aarch64-apple-darwin": "darwin-universal",
@@ -62,7 +63,7 @@ def release():
 
 
 def safe_name(name):
-    if "\\" in name or "\x00" in name or ":" in name:
+    if "\\" in name or ":" in name or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in name):
         raise ValueError(f"Unsafe archive member: {name!r}")
     parts = PurePosixPath(name).parts
     if not parts or name.startswith("/") or any(part in ("..", "") for part in parts):
@@ -79,11 +80,11 @@ def safe_name(name):
 def extract(archive, destination):
     """Reject every unsafe/duplicate/link entry before writing a single file."""
     destination.mkdir(parents=True, exist_ok=False)
-    seen, files, total = set(), [], 0
+    seen, files, directories, total = set(), [], [], 0
     if zipfile.is_zipfile(archive):
         container = zipfile.ZipFile(archive)
         entries = container.infolist()
-        rows = [(entry, entry.filename, entry.is_dir(), entry.file_size,
+        rows = [(entry, entry.orig_filename, entry.is_dir(), entry.file_size,
                  stat.S_IFMT(entry.external_attr >> 16)) for entry in entries]
         opener = container.open
     else:
@@ -99,23 +100,47 @@ def extract(archive, destination):
             folded = name.casefold()
             if folded in seen or kind not in (0, stat.S_IFREG, stat.S_IFDIR):
                 raise ValueError(f"Duplicate or nonregular archive member: {name}")
-            if kind == stat.S_IFDIR and not directory:
-                raise ValueError("Archive directory type mismatch")
+            if kind != 0 and kind != (stat.S_IFDIR if directory else stat.S_IFREG):
+                raise ValueError("Archive member type mismatch")
+            # DOS ZIP producers do not declare Unix permission bits; Windows
+            # executables run by extension and destination ACLs govern access.
+            if isinstance(entry, zipfile.ZipInfo):
+                mode = entry.external_attr >> 16 if entry.create_system == 3 else (0o755 if directory else 0o644)
+            else:
+                mode = entry.mode
+            if mode & 0o7022:
+                raise ValueError("Unsafe archive permissions")
             seen.add(folded)
             total += size
-            if total > MAX_BYTES or size > 512 * 1024 * 1024 or size < 0 or len(seen) > 10000:
+            if (total > MAX_BYTES or size > 512 * 1024 * 1024 or size < 0 or len(seen) > 10000
+                    or (directory and size != 0)):
                 raise ValueError("CUA archive exceeds extraction budget")
             if not directory:
-                files.append((entry, name, size))
-        for entry, name, size in files:
+                files.append((entry, name, size, mode))
+            else:
+                directories.append((name, mode))
+        filenames = {name.casefold() for _, name, _, _ in files}
+        names = [name for _, name, _, _ in files] + [name for name, _ in directories]
+        if any(parent.as_posix().casefold() in filenames
+               for name in names for parent in PurePosixPath(name).parents if parent.parts):
+            raise ValueError("Archive member conflicts with a parent file")
+        for name, _ in directories:
+            (destination / name).mkdir(parents=True, exist_ok=True)
+        for entry, name, size, mode in files:
             output = destination / name
             output.parent.mkdir(parents=True, exist_ok=True)
             with opener(entry) as source, output.open("xb") as target:
-                shutil.copyfileobj(source, target)
-            if output.stat().st_size != size:
+                written = 0
+                while chunk := source.read(min(1024 * 1024, size - written + 1)):
+                    written += len(chunk)
+                    if written > size or written > 512 * 1024 * 1024:
+                        raise ValueError("Archive member exceeds declared size")
+                    target.write(chunk)
+            if written != size:
                 raise ValueError("Archive member size mismatch")
-            mode = (entry.external_attr >> 16) if isinstance(entry, zipfile.ZipInfo) else entry.mode
-            output.chmod(0o755 if mode & 0o111 else 0o644)
+            output.chmod(mode & 0o777)
+        for name, mode in sorted(directories, key=lambda row: len(PurePosixPath(row[0]).parts), reverse=True):
+            (destination / name).chmod(mode & 0o777)
     finally:
         container.close()
 
@@ -237,7 +262,11 @@ def prepare(target, out):
 
 def check_prepared(target, prepared):
     selected = release()
-    metadata = json.loads((prepared / "prepared.json").read_text())
+    receipt = prepared / "prepared.json"
+    if (prepared.is_symlink() or not prepared.is_dir() or receipt.is_symlink()
+            or not receipt.is_file() or receipt.stat().st_size > 1024 * 1024):
+        raise ValueError("Invalid prepared CUA directory or receipt")
+    metadata = json.loads(receipt.read_text())
     actual = file_inventory(prepared / "runtime")
     if (metadata.get("schema_version") != 1 or metadata.get("release") != selected
             or metadata.get("target") != target or metadata.get("upstream_asset") != selected["assets"][TARGETS[target]]
@@ -274,7 +303,7 @@ def verify_macos(root):
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
 
 
-def validate_tree(target, root, verify_signatures=False):
+def validate_tree(target, root, verify_signatures=False, development=False):
     if target not in TARGETS:
         raise ValueError(f"Unsupported CUA target: {target}")
     selected = release()
@@ -286,45 +315,51 @@ def validate_tree(target, root, verify_signatures=False):
             or manifest.get("permission_owner") != "gateway" or manifest.get("daemon") != expected_daemon
             or manifest.get("upstream_asset") != selected["assets"][TARGETS[target]]):
         raise ValueError("Gateway CUA package identity mismatch")
+    if development and manifest.get("gateway_bundle_identifier") != DEV_BUNDLE_ID:
+        raise ValueError("Dev Gateway CUA identity mismatch")
     actual = file_inventory(root, ("cua/manifest.json",))
     if manifest.get("files") != actual or manifest.get("sha256") != digest(root / "cua" / expected_daemon):
         raise ValueError("Gateway CUA payload inventory or checksum mismatch")
     suffix = ".exe" if "windows" in target else ""
-    required = {"pioneer" + suffix, "cua/" + expected_daemon,
+    gateway_name = ("cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
+                    if "apple-darwin" in target else "pioneer" + suffix)
+    if any(not name.startswith("cua/") and name != gateway_name for name in actual):
+        raise ValueError("Gateway CUA package contains files outside the selected runtime layout")
+    required = {gateway_name, "cua/" + expected_daemon,
                 "cua/LICENSE.cua-driver.md", "cua/THIRD_PARTY_NOTICES.md"}
     for name in required_runtime(target) - {"cua-driver" + suffix}:
         required.add("cua/" + name)
     if "apple-darwin" in target:
-        required.update({"cua/Pioneer Gateway.app/Contents/MacOS/pioneer", "cua/Pioneer Gateway.app/Contents/Info.plist"})
+        required.add("cua/Pioneer Gateway.app/Contents/Info.plist")
     if not required.issubset(actual):
         raise ValueError(f"Gateway CUA payload is missing required files: {sorted(required - set(actual))}")
-    architecture(root / ("pioneer" + suffix), target)
+    architecture(root / gateway_name, target)
     architecture(root / "cua" / expected_daemon, target)
     if "windows" in target:
         architecture(root / "cua/cua-driver-uia.exe", target)
     if "apple-darwin" in target:
         gateway = root / "cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
-        architecture(gateway, target)
-        native = runpy.run_path(str(Path(__file__).with_name("collect-symbols.py")))
-        root_bytes, app_bytes = (root / "pioneer").read_bytes(), gateway.read_bytes()
-        if (native["identity"](root_bytes) != native["identity"](app_bytes)
-                or native["build_manifest"](root_bytes) != native["build_manifest"](app_bytes)):
-            raise ValueError("Root and app Gateway module/build identities differ")
+        with (gateway.parent.parent / "Info.plist").open("rb") as source:
+            info = plistlib.load(source)
+        bundle_id = DEV_BUNDLE_ID if development else BUNDLE_ID
+        bundle_name = "Pioneer Gateway Dev" if development else "Pioneer Gateway"
+        if (info.get("CFBundleIdentifier") != bundle_id or info.get("CFBundleName") != bundle_name
+                or info.get("CFBundleExecutable") != "pioneer"):
+            raise ValueError("Gateway bundle identity mismatch")
         if target == "x86_64-apple-darwin":
-            libraries = list(root.glob("libonnxruntime*.dylib"))
+            libraries = list(gateway.parent.glob("libonnxruntime*.dylib"))
             if not libraries:
-                raise ValueError("Intel Gateway root ONNX libraries missing")
-            nested = {path.name for path in gateway.parent.glob("libonnxruntime*.dylib")}
-            if nested != {path.name for path in libraries}:
-                raise ValueError("Root/app ONNX inventory mismatch")
+                raise ValueError("Intel Gateway bundle ONNX libraries missing")
             for library in libraries:
                 architecture(library, target)
-                if digest(library) != digest(gateway.parent / library.name):
-                    raise ValueError("Root/app ONNX copies differ")
         if verify_signatures:
-            verify_macos(root)
-            notary = runpy.run_path(str(Path(__file__).with_name("macos-notary.py")))
-            notary["validate_ticket"](root / "cua/Pioneer Gateway.app")
+            if development:
+                subprocess.run(["codesign", "--verify", "--deep", "--strict",
+                                str(root / "cua/Pioneer Gateway.app")], check=True)
+            else:
+                verify_macos(root)
+                notary = runpy.run_path(str(Path(__file__).with_name("macos-notary.py")))
+                notary["validate_ticket"](root / "cua/Pioneer Gateway.app")
     elif verify_signatures:
         raise ValueError("Signature verification mode requires a macOS target")
     return manifest
@@ -402,15 +437,14 @@ def package(target, binary, prepared, archive, notary_log_dir=None):
         payload = root / "cua"
         shutil.copytree(prepared / "runtime", payload)
         suffix = ".exe" if "windows" in target else ""
-        shutil.copy2(binary, root / ("pioneer" + suffix))
-        (root / ("pioneer" + suffix)).chmod(0o755)
         daemon = payload / daemon_name(target)
         if macos:
             contents = payload / "Pioneer Gateway.app/Contents"
             (contents / "MacOS").mkdir(parents=True)
             (contents / "Helpers").mkdir()
             gateway = contents / "MacOS/pioneer"
-            shutil.copy2(root / "pioneer", gateway)
+            shutil.copy2(binary, gateway)
+            gateway.chmod(0o755)
             (payload / "cua-driver").rename(daemon)
             daemon.chmod(0o755)
             with (contents / "Info.plist").open("wb") as output:
@@ -420,30 +454,26 @@ def package(target, binary, prepared, archive, notary_log_dir=None):
                     NSAppleEventsUsageDescription="Pioneer Gateway controls applications on this computer to carry out your authorized computer-use tasks."), output)
             if target == "x86_64-apple-darwin":
                 for library in libraries:
-                    shutil.copy2(library, root / library.name)
+                    shutil.copy2(library, gateway.parent / library.name)
             entitlements = Path(temporary) / "gateway-entitlements.plist"
             # Public hardened-runtime entitlement used by the daemon's existing
             # Apple Events integration. Screen capture/accessibility remain TCC
             # grants; this is not an App Sandbox or upstream provisioning profile.
             entitlements.write_bytes(plistlib.dumps({"com.apple.security.automation.apple-events": True}))
-            for executable in [root / "pioneer", daemon, *root.glob("*.dylib")]:
+            for executable in [gateway, daemon, *gateway.parent.glob("*.dylib")]:
                 options = ["--entitlements", str(entitlements)] if executable.suffix != ".dylib" else []
                 subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",
                                 *options, "--sign", identity, str(executable)], check=True)
-            shutil.copy2(root / "pioneer", gateway)
-            for library in root.glob("*.dylib"):
-                shutil.copy2(library, gateway.parent / library.name)
             subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",
                             "--entitlements", str(entitlements), "--sign", identity,
                             str(contents.parent)], check=True)
-            # App signing may update its main executable's signature, which seals
-            # bundle resources. Keep the separately signed standalone bootstrap;
-            # validation compares their invariant module/build identities.
             verify_macos(root)
             zip_tree(root, notary_archive)
             state_file.write_text(json.dumps(dict(inputs=inputs, signed_files=file_inventory(root)), indent=2) + "\n")
             _finish_macos(root, notary_archive, notary_log_dir)
         else:
+            shutil.copy2(binary, root / ("pioneer" + suffix))
+            (root / ("pioneer" + suffix)).chmod(0o755)
             # CI artifact transfer flattens Unix permission bits; restore only
             # the known runtime executables rather than making all files executable.
             daemon.chmod(0o755)
@@ -473,6 +503,120 @@ def _finish_package(target, root, selected, metadata, archive):
         partial.replace(archive)
 
 
+def dev_source(binary, root, target):
+    """A saved service executable must refresh from its original Cargo output."""
+    binary = binary.resolve(strict=True)
+    if binary.is_relative_to(root):
+        generation = root / binary.relative_to(root).parts[0]
+        receipt_path = generation / "dev-inputs.json"
+        if (generation.is_symlink() or receipt_path.is_symlink() or not receipt_path.is_file()
+                or receipt_path.stat().st_size > 1024 * 1024):
+            raise ValueError("Invalid dev runtime generation or source receipt")
+        validate_tree(target, generation / "payload", "apple-darwin" in target, development=True)
+        receipt = json.loads(receipt_path.read_text())
+        source = Path(receipt["source"])
+        if not source.is_absolute() or source.is_relative_to(root):
+            raise ValueError("Invalid dev Gateway source receipt")
+        binary = source.resolve(strict=True)
+    if not binary.is_file():
+        raise ValueError("The source Gateway executable is missing; run cargo start from the checkout")
+    architecture(binary, target)
+    return binary
+
+
+def dev(target, binary, root):
+    """Compose the current debug Gateway, never compile or install a release.
+
+    Generations are immutable and persistent: service registration never points
+    into a TemporaryDirectory. A failed preparation cannot publish a generation.
+    This is one dev contour; callers must stop it before switching builds.
+    """
+    if target not in TARGETS:
+        raise ValueError(f"Unsupported CUA target: {target}")
+    expected = Path.home() / ".pioneer.dev/gateway-runtime"
+    if root != expected:
+        raise ValueError("CUA dev preparation requires the isolated dev runtime directory")
+    for path in (root, *root.parents):
+        if path.is_symlink():
+            raise ValueError("Dev runtime directories must not traverse links")
+    root.mkdir(parents=True, exist_ok=True)
+    binary = dev_source(binary, root, target)
+    selected = release()
+    # A declaration change selects new inputs. Existing prepared inputs are
+    # checked against the full declaration, architecture and every file digest.
+    declaration_key = hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()
+    prepared = root / f"prepared-{target}-{declaration_key}"
+    if not prepared.exists():
+        prepare(target, prepared)
+    metadata = check_prepared(target, prepared)
+    inputs = dict(target=target, source=str(binary), gateway_sha256=digest(binary),
+                  prepared=metadata, helper_sha256=digest(Path(__file__)))
+    libraries = []
+    if target == "x86_64-apple-darwin":
+        # Use this Cargo output's native companions, never another Gateway's.
+        libraries = sorted(binary.parent.glob("libonnxruntime*.dylib"))
+        if not libraries:
+            raise ValueError("Intel debug Gateway requires libonnxruntime dylibs beside the Cargo executable")
+        inputs["onnx"] = {path.name: digest(path) for path in libraries}
+    key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+    generation = root / key
+    macos = "apple-darwin" in target
+    executable = ("cua/Pioneer Gateway.app/Contents/MacOS/pioneer" if macos
+                  else "pioneer.exe" if "windows" in target else "pioneer")
+    if generation.exists():
+        receipt_path = generation / "dev-inputs.json"
+        if (generation.is_symlink() or receipt_path.is_symlink() or not receipt_path.is_file()
+                or receipt_path.stat().st_size > 1024 * 1024
+                or json.loads(receipt_path.read_text()) != inputs):
+            raise ValueError("Dev runtime generation does not match the current source inputs")
+        validate_tree(target, generation / "payload", macos, development=True)
+        return generation / "payload" / executable
+    with tempfile.TemporaryDirectory(prefix=".dev-compose-", dir=root) as temporary:
+        staging = Path(temporary) / "generation"
+        payload = staging / "payload"
+        shutil.copytree(prepared / "runtime", payload / "cua")
+        gateway = payload / executable
+        gateway.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(binary, gateway)
+        if digest(gateway) != inputs["gateway_sha256"]:
+            raise ValueError("Cargo executable changed during dev runtime preparation; retry start")
+        gateway.chmod(0o755)
+        daemon = payload / "cua" / daemon_name(target)
+        if macos:
+            contents = gateway.parent.parent
+            daemon.parent.mkdir()
+            (payload / "cua/cua-driver").rename(daemon)
+            with (contents / "Info.plist").open("wb") as output:
+                plistlib.dump(dict(CFBundleIdentifier=DEV_BUNDLE_ID, CFBundleName="Pioneer Gateway Dev",
+                    CFBundleExecutable="pioneer", CFBundlePackageType="APPL", CFBundleVersion=selected["version"],
+                    LSUIElement=True, LSMinimumSystemVersion="13.0",
+                    NSAppleEventsUsageDescription="Pioneer Gateway Dev controls applications for your authorized development computer-use tasks."), output)
+            for library in libraries:
+                destination = gateway.parent / library.name
+                shutil.copy2(library, destination)
+                if digest(destination) != inputs["onnx"][library.name]:
+                    raise ValueError("Debug native library changed during preparation")
+            for native in [daemon, *gateway.parent.glob("*.dylib")]:
+                subprocess.run(["codesign", "--force", "--sign", "-", str(native)], check=True)
+            # A stable, separate local designated requirement; no Developer ID,
+            # hardened runtime, notarization or production TCC identity involved.
+            subprocess.run(["codesign", "--force", "--sign", "-", "--identifier", DEV_BUNDLE_ID,
+                "--requirements", f'=designated => identifier "{DEV_BUNDLE_ID}"', str(contents.parent)], check=True)
+        else:
+            daemon.chmod(0o755)
+            if "linux" in target:
+                (payload / "cua/wayland-helper/install.sh").chmod(0o755)
+        manifest = dict(schema_version=1, repository=selected["repository"], revision=selected["revision"],
+            version=selected["version"], release_tag=selected["tag"], target=target, permission_owner="gateway",
+            upstream_asset=metadata["upstream_asset"], daemon=daemon_name(target), gateway_bundle_identifier=DEV_BUNDLE_ID,
+            sha256=digest(daemon), files=file_inventory(payload, ("cua/manifest.json",)))
+        (payload / "cua/manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        (staging / "dev-inputs.json").write_text(json.dumps(inputs, indent=2) + "\n")
+        validate_tree(target, payload, macos, development=True)
+        staging.rename(generation)
+    return generation / "payload" / executable
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -486,13 +630,19 @@ def main():
     validate_parser = commands.add_parser("validate")
     validate_parser.add_argument("--archive", type=Path, required=True)
     validate_parser.add_argument("--verify-signatures", action="store_true")
-    for command_parser in (prepare_parser, package_parser, validate_parser):
+    dev_parser = commands.add_parser("dev")
+    dev_parser.add_argument("--binary", type=Path, required=True)
+    dev_parser.add_argument("--root", type=Path, required=True)
+    for command_parser in (prepare_parser, package_parser, validate_parser, dev_parser):
         command_parser.add_argument("--target", choices=sorted(TARGETS), required=True)
     args = parser.parse_args()
     if args.command == "prepare":
         prepare(args.target, args.out)
     elif args.command == "package":
         package(args.target, args.binary, args.prepared, args.archive, args.notary_log_dir)
+    elif args.command == "dev":
+        binary = dev(args.target, args.binary, args.root)
+        print(json.dumps(dict(binary=str(binary), root=str(binary.parents[4] if "apple-darwin" in args.target else binary.parent))))
     else:
         validate_archive(args.target, args.archive, args.verify_signatures)
 
