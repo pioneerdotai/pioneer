@@ -291,10 +291,20 @@ async fn exhausted_discovery_uses_indexed_null_and_timed_ranges_with_a_large_clo
         outbox.update(&db).await.unwrap();
         seed_action_for_discovery(&db, id, "start_agent", now).await;
     }
-    // Upgrade existing ledger data after rolling back both draft indexes.
+    // Roll back through the named outbox migration even when newer, unrelated
+    // migrations have been appended to the registry.
+    let applied = Migrator::get_applied_migrations(&db).await.unwrap();
+    let target = applied
+        .iter()
+        .position(|migration| {
+            migration.name() == "m20261026_000001_agent_start_reconciliation_index"
+        })
+        .unwrap();
+    let rollback_steps = (applied.len() - target).try_into().unwrap();
+    // Upgrade existing ledger data after rolling back both outbox indexes.
     // The old immediate range must be restored while the exhausted index is
     // absent; reapplying must restore the production selectors and their plans.
-    Migrator::down(&db, Some(2)).await.unwrap();
+    Migrator::down(&db, Some(rollback_steps)).await.unwrap();
     assert!(db.query_all_raw(Statement::from_string(DatabaseBackend::Sqlite,
         "EXPLAIN QUERY PLAN SELECT id FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_immediate WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 ORDER BY created_at,id LIMIT 1"
     )).await.is_ok());
