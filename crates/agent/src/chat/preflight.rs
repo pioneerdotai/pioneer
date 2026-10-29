@@ -3296,27 +3296,46 @@ mod tests {
                     sample_provider_plan_json().to_string(),
                 )
             };
-            let result = super::super::run_agent_turn_preflight_stage(
-                Arc::new(crate::AgentEventHub::new()),
+            let events = Arc::new(crate::AgentEventHub::new());
+            let mut durable = events.take_durable_receiver().await.unwrap();
+            let prompt_context = EffectiveTurnPromptContextSet::empty();
+            let runtime_context = crate::AgentTurnHookRuntimeContext {
+                task_id: task_context.then(|| "task_1".to_owned()),
+                conversation_thread_id: Some("conversation_1".to_owned()),
+                ..Default::default()
+            };
+            let stage = super::super::run_agent_turn_preflight_stage(
+                events.clone(),
                 Arc::new(ProviderRegistry::new(|_| "unused".to_owned())),
                 provider.clone(),
                 "thread-model",
                 true,
                 &config,
                 &policies,
-                &EffectiveTurnPromptContextSet::empty(),
+                &prompt_context,
                 sample_tool_index(),
                 "ws_1",
                 "thr_1",
                 "turn_1",
-                &crate::AgentTurnHookRuntimeContext {
-                    task_id: task_context.then(|| "task_1".to_owned()),
-                    conversation_thread_id: Some("conversation_1".to_owned()),
-                    ..Default::default()
-                },
+                &runtime_context,
                 "как меня зовут?",
-            )
-            .await;
+            );
+            // Preflight waits for durable usage observations to be committed.
+            // Supply the consumer normally owned by the Gateway event loop.
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::pin!(stage);
+                loop {
+                    tokio::select! {
+                        result = &mut stage => break result,
+                        event = durable.recv() => {
+                            event.expect("preflight durable lane must stay open");
+                            durable.acknowledge_last(Ok(()));
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("preflight and durable usage acknowledgements must finish");
             let TurnPreflightLocalActiveRecallState::ProviderNeeded { input, .. } =
                 &result.local_modules.memory.active_recall
             else {
