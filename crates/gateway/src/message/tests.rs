@@ -4,6 +4,9 @@ mod detached_work_projection;
 #[path = "tests/workspace_scope.rs"]
 mod workspace_scope;
 
+#[path = "tests/authorization_reads.rs"]
+mod authorization_reads;
+
 #[cfg(unix)]
 #[path = "tests/title_recovery.rs"]
 mod title_recovery;

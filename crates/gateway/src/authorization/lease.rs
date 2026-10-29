@@ -185,15 +185,12 @@ impl ExecutionLeaseRegistry {
         )
         .await?
         .context("execution turn no longer exists")?;
-        let (_, turn) = store
-            .get_turn(scope.thread_id.as_str(), execution_id)
+        let status = store
+            .get_turn_execution_status(scope.thread_id.as_str(), execution_id)
             .await?
             .context("execution turn disappeared during lease validation")?;
-        if turn.status != TurnStatus::InProgress {
-            return Err(ExecutionTurnNotInProgress {
-                status: turn.status,
-            }
-            .into());
+        if status != TurnStatus::InProgress {
+            return Err(ExecutionTurnNotInProgress { status }.into());
         }
         // Canonical cancellation may be accepted while its ordered projection
         // is deferred. The receipt fences execution across that durable gap.
