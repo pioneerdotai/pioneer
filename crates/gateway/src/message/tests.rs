@@ -39159,24 +39159,35 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
     )
     .await;
 
-    let mut child_dispatched = false;
-    for _ in 0..200 {
-        let batch =
-            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
-                .await
-                .expect("direct Agent outbox dispatch should succeed");
-        assert!(
-            batch.errors.is_empty(),
-            "direct Agent outbox storage should succeed: {:?}",
-            batch.errors
+    // Thread creation can be the first delivered outbox row. Keep driving the
+    // real dispatcher while the parent prepares and commits the child start.
+    let opened = timeout(Duration::from_secs(30), async {
+        let permission = recv_notification_by_method_timeout(
+            &mut rx,
+            events::TURN_PERMISSION_REQUEST_OPENED,
+            Duration::from_secs(30),
         );
-        if batch.delivered > 0 {
-            child_dispatched = true;
-            break;
+        tokio::pin!(permission);
+        loop {
+            tokio::select! {
+                opened = &mut permission => break opened,
+                _ = sleep(Duration::from_millis(25)) => {
+                    let batch = crate::message::agent_action_tools::process_due_agent_action_outbox(
+                        &processor, 64,
+                    )
+                    .await
+                    .expect("direct Agent outbox dispatch should succeed");
+                    assert!(
+                        batch.errors.is_empty(),
+                        "direct Agent outbox storage should succeed: {:?}",
+                        batch.errors
+                    );
+                }
+            }
         }
-        sleep(Duration::from_millis(25)).await;
-    }
-    if !child_dispatched {
+    })
+    .await;
+    if opened.is_err() {
         let db = crud_store.database_connection();
         let outbox_rows = pioneer_entity::agent_action_outbox::Entity::find()
             .all(&db)
@@ -39214,13 +39225,12 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
             .await
             .expect("direct Agent root events should load");
         panic!(
-            "direct Agent child must be activated through its durable outbox; provider_rounds={:?}; root_turn={root_turn:#?}; root_events={root_events:#?}",
+            "direct Agent child must request permission after durable outbox dispatch; provider_rounds={:?}; root_turn={root_turn:#?}; root_events={root_events:#?}",
             provider.rounds()
         );
     }
-    // Outbox delivery precedes child preflight and tool admission, just as it
-    // does for native Tasks. Use the same bounded child launch wait.
-    let opened = recv_native_task_permission_opened(&mut rx).await;
+    let opened =
+        opened.expect("direct Agent child must request permission within the launch budget");
     let opened_request = opened
         .params
         .as_ref()
