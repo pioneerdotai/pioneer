@@ -17246,12 +17246,14 @@ fn owned_voice_ingress_case(
             } else if terminal == "sealed_tail_error" {
                 assert_eq!(
                     calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, 55200, 7687]
+                    vec![48000, 55296, 7943]
                 );
                 let mut confirmed_source = vec![12000.0 / 32768.0; 48000];
-                confirmed_source.extend([0.0; 7200]);
+                // The mixed 512-sample frame ends at 48128, followed by
+                // fourteen real hangover frames before the span is sealed.
+                confirmed_source.extend([0.0; 7296]);
                 assert_eq!(calls[1], confirmed_source);
-                let mut tail = vec![0.0; 7680];
+                let mut tail = vec![0.0; 7936];
                 tail.extend([3000.0 / 32768.0; 7]);
                 assert_eq!(calls[2], tail);
             } else if matches!(terminal, "closed_13" | "closed_17") {

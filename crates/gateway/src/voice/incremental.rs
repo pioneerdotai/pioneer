@@ -3303,11 +3303,12 @@ mod tests {
         );
         assert_eq!(signal_stats.total_samples, audio.len());
         let calls = calls.lock().unwrap();
-        // The pause's equal-cost ownership candidates defer eviction. The
-        // unchanged full candidate is reused at Commit without quiet retries.
-        assert_eq!(calls.len(), 7);
+        // The pause projects ownership with a whole-span decode, two partition
+        // probes and a context probe. Commit refreshes the changed retained PCM.
+        assert_eq!(calls.len(), 9);
         let normalized: Vec<_> = audio.iter().map(|s| f32::from(*s) / 32768.0).collect();
         assert_eq!(calls[4], normalized[144000..295424]);
+        assert_eq!(calls[8], normalized[235200..295424]);
         assert!(
             calls
                 .iter()
