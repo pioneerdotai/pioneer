@@ -223,13 +223,7 @@ fn endpoint_error_status(error: &anyhow::Error) -> Option<u16> {
             return Some(status.as_u16());
         }
     }
-    // The supported adapters format non-success responses as `API error
-    // (429 Too Many Requests): ...`. Parse only that fixed prefix, never an
-    // arbitrary three-digit sequence in a provider-controlled body or URL.
-    let message = format!("{error:#}");
-    let rest = message.split_once("API error (")?.1;
-    let status = rest.get(..3)?.parse::<u16>().ok()?;
-    (100..600).contains(&status).then_some(status)
+    None
 }
 
 fn redacted_endpoint_error(
@@ -3316,6 +3310,69 @@ mod tests {
             assert_eq!(b.chat(chat_request()).await.unwrap().text, "fixture reply");
             assert_eq!(server_a.await.unwrap(), expected_path);
             assert_eq!(server_b.await.unwrap(), expected_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_facts_survive_private_context_before_endpoint_redaction() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            socket.read(&mut request).await.unwrap();
+            let body = "private_body says 403; retry-after: 99";
+            socket.write_all(format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nRetry-After: 3\r\nConnection: close\r\n\r\n{body}", body.len()
+            ).as_bytes()).await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client.get(url).send().await.unwrap();
+        let status_error = response.error_for_status_ref().unwrap_err();
+        assert_eq!(
+            crate::providers::OpenRouterProvider::new("fixture")
+                .classify_failure(&status_error.into())
+                .unwrap()
+                .http_status,
+            Some(429),
+        );
+        let raw = crate::http::provider_api_error(response, "OpenAI")
+            .await
+            .context("private_context API error (403 Forbidden)");
+        server.await.unwrap();
+        let inner = crate::providers::OpenAiProvider::new("fixture");
+        let before = inner.classify_failure(&raw).unwrap();
+        assert_eq!(before.http_status, Some(429));
+        assert_eq!(before.retry_after_ms, Some(3000));
+        let safe = redacted_endpoint_error(&inner, raw, ProviderFailureStage::Connect)
+            .context("safe caller context");
+        let registry = ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok("fixture".into()),
+            |_, _| Ok(None),
+            |_, _| Ok(Some("http://127.0.0.1/private_endpoint/v1".into())),
+            ProviderTimeoutPolicy::default(),
+        );
+        let consumer = registry.get_or_create("openai").unwrap();
+        assert_eq!(consumer.classify_failure(&safe).unwrap(), before);
+        assert!(!format!("{safe:#} {safe:#?}").contains("private_"));
+        assert!(
+            !safe
+                .chain()
+                .any(|cause| cause.is::<crate::failure::ProviderHttpFailure>())
+        );
+
+        // A reqwest failure before a response, and a local diagnostic that
+        // imitates the old adapter prefix, provide no HTTP status evidence.
+        let transport = client.get("http://[403").send().await.unwrap_err();
+        for raw in [
+            anyhow::Error::from(transport),
+            anyhow::anyhow!("API error (403 Forbidden): private_body"),
+        ] {
+            let safe = redacted_endpoint_error(&inner, raw, ProviderFailureStage::Connect);
+            assert_eq!(consumer.classify_failure(&safe).unwrap().http_status, None);
+            assert!(!format!("{safe:#} {safe:#?}").contains("private_"));
         }
     }
 
