@@ -1,14 +1,49 @@
 use anyhow::{Context, Result};
-use pioneer_entity::turn_event;
+use pioneer_entity::{compaction_event_revision, turn_event};
 use pioneer_protocol::TurnItem;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
+};
 
 use crate::events::{AppendedTurnEvent, TurnEventPayload};
 use pioneer_protocol::generate_id;
 
 const DB_ID_LEN: usize = 21;
+
+/// The existing canonical item index is written in the acceptance transaction,
+/// independently of the projection watermark. No payload decoding is needed.
+pub(crate) async fn has_accepted_item_completion<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+    before_sequence: Option<i64>,
+) -> Result<bool> {
+    let ids = compaction_event_revision::Entity::find()
+        .select_only()
+        .column(compaction_event_revision::Column::SourceId)
+        .filter(compaction_event_revision::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(compaction_event_revision::Column::ItemId.eq(item_id.to_owned()))
+        .filter(compaction_event_revision::Column::Present.eq(1))
+        .into_query();
+    let mut query = turn_event::Entity::find()
+        .filter(turn_event::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(
+            turn_event::Column::EventType.eq(pioneer_protocol::constants::events::ITEM_COMPLETED),
+        )
+        .filter(turn_event::Column::Id.in_subquery(ids));
+    if let Some(sequence) = before_sequence {
+        query = query.filter(turn_event::Column::Sequence.lt(sequence));
+    }
+    Ok(query
+        .select_only()
+        .column(turn_event::Column::Id)
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_some())
+}
 
 /// CPU-only representation of an append. Serialization, idempotency-key
 /// derivation and ID generation happen before a caller begins a write

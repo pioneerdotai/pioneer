@@ -354,7 +354,15 @@ impl CliMcpLedgerLeaderReservation {
 impl Drop for CliMcpLedgerLeaderReservation {
     fn drop(&mut self) {
         if !self.completed {
-            self.ledger.finish(&self.key, Err(cancelled_error()));
+            // Losing the response future is not an execution cancellation ACK.
+            self.ledger.finish(
+                &self.key,
+                Err(FacadeProtocolError::new(
+                    FACADE_CALL_FAILED,
+                    "MCP response was not confirmed",
+                    "response_unconfirmed",
+                )),
+            );
         }
     }
 }
@@ -967,21 +975,48 @@ impl CliMcpToolFacade {
             }
         };
 
-        let outcome = self
-            .execute_leader_call(
-                context,
-                request_id,
-                name,
-                arguments,
-                progress_token,
-                native_call,
-                admission_deadline,
-                authorization.thread_id,
-                authorization.turn_id,
-                cancellation,
+        // Keep the existing call capacity reservation through final progress,
+        // even though the replay reply becomes available before that await.
+        let permit = self
+            .acquire_call_permit(&cancellation, admission_deadline)
+            .await;
+        let outcome = match &permit {
+            Ok(_) => {
+                self.execute_leader_call(
+                    context,
+                    request_id,
+                    name,
+                    arguments,
+                    progress_token.clone(),
+                    native_call,
+                    admission_deadline,
+                    authorization.thread_id,
+                    authorization.turn_id,
+                    cancellation,
+                )
+                .await
+            }
+            Err(error) => Err(error.clone()),
+        };
+        leader.complete(outcome.clone());
+        // Cache the complete replay response before optional transport work.
+        // This confirms execution/result availability, never first delivery.
+        if outcome.is_ok()
+            && let Some(progress_token) = progress_token
+        {
+            let _ = timeout(
+                self.limits.max_queue_wait,
+                self.progress_sink
+                    .send_progress(CliMcpProgressNotification {
+                        progress_token,
+                        progress: 1.0,
+                        total: 1.0,
+                        message: "MCP tool call completed",
+                    }),
             )
             .await;
-        leader.complete(outcome.clone());
+        }
+        drop(permit);
         outcome
     }
 
@@ -999,9 +1034,6 @@ impl CliMcpToolFacade {
         turn_id: String,
         cancellation: CancellationToken,
     ) -> Result<JsonValue, FacadeProtocolError> {
-        let _permit = self
-            .acquire_call_permit(&cancellation, admission_deadline)
-            .await?;
         if cancellation.is_cancelled() {
             return Err(cancelled_error());
         }
@@ -1047,29 +1079,15 @@ impl CliMcpToolFacade {
             arguments,
             origin: TurnMcpInvocationOrigin::CliFacade,
         };
-        let invocation = self.invoker.invoke(invocation, cancellation.clone());
-        let result = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(cancelled_error()),
-            outcome = invocation => outcome.map_err(invocation_error)?,
-        };
-        if cancellation.is_cancelled() {
-            return Err(cancelled_error());
-        }
+        // The invoker owns cancellation and the execution outcome once admitted.
+        // Dropping it here can lose a committed mutation or its history write.
+        // A late client cancellation does not replace an already obtained result.
+        let result = self
+            .invoker
+            .invoke(invocation, cancellation)
+            .await
+            .map_err(invocation_error)?;
 
-        if let Some(progress_token) = progress_token {
-            let _ = timeout(
-                self.limits.max_queue_wait,
-                self.progress_sink
-                    .send_progress(CliMcpProgressNotification {
-                        progress_token,
-                        progress: 1.0,
-                        total: 1.0,
-                        message: "MCP tool call completed",
-                    }),
-            )
-            .await;
-        }
         let result = canonical_call_result(result)?;
         Ok(result)
     }

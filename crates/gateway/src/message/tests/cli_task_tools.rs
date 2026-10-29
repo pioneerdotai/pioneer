@@ -650,7 +650,8 @@ async fn deliver_task_cli_outcome(
             "serverName":if identified {"pioneer_tasks"} else {"foreign"},
             "serverInstallationId":if identified {"pioneer-task-tools-v1"} else {"foreign"},
             "providerCallId":call_id,"invocationCorrelationId":format!("fixture-{call_id}"),
-            "sessionGeneration":binding.mcp.unwrap().session_generation,
+            "sessionGeneration":binding.mcp.as_ref().unwrap().session_generation,
+            "manifestHash":binding.mcp.as_ref().unwrap().manifest_hash,
             "arguments":arguments,"result":returned,"success":native_success,
             "status":if native_success {"completed"} else {"failed"},
             "message":"display preview deliberately contains no task facts"})),
@@ -886,6 +887,55 @@ fn cli_terminal_outcomes_require_successful_identified_durable_delivery() {
                         .await
                         .unwrap();
                 assert!(!result.is_error);
+                // A confirmed execution in canonical history is not a native
+                // delivery receipt, even when its complete Task payload exists.
+                let cli = processor
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let frozen = processor
+                    .crud_store
+                    .list_turn_mcp_bindings(&turn_id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|binding| binding.canonical_callable_name == tool)
+                    .unwrap();
+                let invocation = TurnMcpInvocation {
+                    workspace_id: cli.workspace_id,
+                    thread_id: cli.thread_id,
+                    turn_id: turn_id.clone(),
+                    runtime_id: Some(cli.runtime_id),
+                    session_generation: Some(cli.mcp.as_ref().unwrap().session_generation as u64),
+                    provider_call_id: "terminal-outcome".into(),
+                    native_call: Some(crate::turn_mcp::invoker::NativeMcpCallIdentity {
+                        native_thread_id: cli.native_thread_id,
+                        native_turn_id: cli.native_turn_id.unwrap(),
+                        native_item_id: "terminal-outcome".into(),
+                    }),
+                    admission_deadline: None,
+                    canonical_callable_name: tool.into(),
+                    arguments: args.clone(),
+                    origin: TurnMcpInvocationOrigin::CliFacade,
+                };
+                let execution = crate::cli_runtime::projector::confirmed_mcp_call_completed(
+                    &invocation,
+                    &frozen,
+                    &cli.mcp.unwrap().manifest_hash,
+                    &Ok(result.clone()),
+                    false,
+                );
+                processor
+                    .crud_store
+                    .materialize_item_completed(execution, now_timestamp_secs())
+                    .await
+                    .unwrap();
+                assert!(
+                    observed_cli_tasks(&processor, &turn_id).await.is_empty(),
+                    "canonical execution alone must not bypass the Task delivery gate"
+                );
                 deliver_task_cli_outcome(
                     &harness,
                     &processor,
