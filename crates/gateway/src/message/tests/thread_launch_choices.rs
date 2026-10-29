@@ -5825,10 +5825,15 @@ async fn fresh_detached_rpc_completes_after_task_commit_when_authority_reload_fa
         "thread_id":thread_id,"turn_id":turn_id,"input":[{"type":"text","text":"Accept this work once"}],
         "model":"gpt-5.4","model_provider":"openai","mode":"Agent"}}).to_string();
     processor.arm_completed_history_preparation_barrier("__detached_thread_after_task_commit__");
-    let start = processor.process_request_for_connection(connection, &request);
+    let start = crate::public_error::test_support::capture_events_async(
+        processor.process_request_for_connection(connection, &request),
+    );
     tokio::pin!(start);
     tokio::select! {
-        _ = &mut start => panic!("RPC must pause after Task acceptance"),
+        (_, diagnostics) = &mut start => {
+            let responses: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            panic!("RPC must pause after Task acceptance; responses={responses:?}; diagnostics={diagnostics:?}");
+        },
         _ = processor.wait_for_completed_history_preparation_barrier() => {},
     }
     let tasks = processor
@@ -6060,7 +6065,7 @@ async fn replaced_gateway_resolves_detached_admission_before_commit_and_after_us
                 .id;
             // Drop the interrupted delivery before the Task/action transaction.
         } else {
-            let (tx, _rx) = mpsc::channel(128);
+            let (tx, mut rx) = mpsc::channel(128);
             let connection =
                 register_authenticated_test_connection(processor.session_manager.as_ref(), tx)
                     .await;
@@ -6069,10 +6074,15 @@ async fn replaced_gateway_resolves_detached_admission_before_commit_and_after_us
             let request = json!({"jsonrpc":"2.0","id":request_id,"method":"turn/start","params":{
                 "thread_id":thread_id,"turn_id":turn_id,"input":[{"type":"text","text":"User crash window"}],
                 "model":"gpt-5.4","model_provider":"openai","mode":"Agent"}}).to_string();
-            let start = processor.process_request_for_connection(connection, &request);
+            let start = crate::public_error::test_support::capture_events_async(
+                processor.process_request_for_connection(connection, &request),
+            );
             tokio::pin!(start);
             tokio::select! {
-                _ = &mut start => panic!("user admission must pause at its commit window"),
+                (_, diagnostics) = &mut start => {
+                    let responses: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+                    panic!("user admission must pause at its commit window (accepted={accepted}); responses={responses:?}; diagnostics={diagnostics:?}");
+                },
                 _ = processor.wait_for_completed_history_preparation_barrier() => {},
             }
         }
