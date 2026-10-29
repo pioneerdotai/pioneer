@@ -28,6 +28,7 @@ struct ComposerPreparationContext {
 #[derive(Default)]
 pub(crate) struct ComposerSendController {
     tasks: Vec<std::thread::JoinHandle<()>>,
+    budgets: Vec<(ComposerOperationIdentity, crate::rpc::RequestBudget)>,
 }
 
 impl Drop for ComposerSendController {
@@ -177,6 +178,28 @@ pub fn resolve_selected_execution_target(
     selected_execution_target_from_runtimes(Some(provider_key), runtimes.as_slice())
 }
 
+fn resolve_selected_execution_target_with_budget(
+    core: &ClientCore,
+    workspace_id: &str,
+    selected_provider: Option<&str>,
+    budget: &crate::rpc::RequestBudget,
+) -> anyhow::Result<SelectedExecutionTarget> {
+    budget.check()?;
+    let Some(provider) = selected_provider
+        .map(str::trim)
+        .filter(|provider| runtime_id_from_cli_runtime_provider_key(provider).is_some())
+    else {
+        return Ok(SelectedExecutionTarget {
+            execution_backend: None,
+        });
+    };
+    let _startup_readiness = pioneer_observability::turn_startup::current_stage(
+        pioneer_observability::turn_startup::Stage::ReadinessWait,
+    );
+    let runtimes = core.read_provider_runtimes_with_budget(workspace_id, true, budget)?;
+    selected_execution_target_from_runtimes(Some(provider), &runtimes.runtimes)
+}
+
 pub fn selected_execution_target_from_runtimes(
     selected_provider: Option<&str>,
     runtimes: &[RuntimeSummary],
@@ -291,27 +314,155 @@ pub fn resolve_turn_selection(
     })
 }
 
+/// Derive a finite operation allowance from the existing serial work: five
+/// ordinary RPCs (session, subscription, runtime, capabilities, dispatch), then
+/// upload start/finish and 30s ACKs for the existing 256 KiB recommended chunks.
+/// The current gateway's artifact capability/start responses both prescribe
+/// 256 KiB chunks (1 MiB maximum). A different negotiated chunk size still uses
+/// this single fixed deadline; successful stages never extend it. The existing
+/// per-call caps and gateway upload TTL remain authoritative.
+fn composer_send_timeout<F: ClientFileSystem + ?Sized>(
+    plan: &ComposerOperationPlan,
+    file_system: &F,
+) -> std::time::Duration {
+    let mut timeout = crate::rpc::RPC_REQUEST_TIMEOUT.saturating_mul(5);
+    for attachment in &plan.draft.domain.attachments {
+        if matches!(
+            attachment.upload_state,
+            super::attachments::ComposerAttachmentUploadState::Uploaded { .. }
+        ) {
+            continue;
+        }
+        let path = crate::platform::ClientPath::new(attachment.path.clone());
+        // Estimation must not validate local paths before the existing endpoint
+        // upload policy decides whether they need reading. An unavailable stat
+        // gets the current gateway's maximum-file allowance; preparation still
+        // owns validation and reports filesystem errors when an upload is needed.
+        let size = file_system
+            .metadata(&path)
+            .map(|metadata| metadata.len)
+            .unwrap_or(50 * 1024 * 1024);
+        let chunks = size.div_ceil(256 * 1024).max(1);
+        timeout = timeout.saturating_add(crate::rpc::RPC_REQUEST_TIMEOUT.saturating_mul(2));
+        timeout = timeout.saturating_add(
+            std::time::Duration::from_secs(30)
+                .saturating_mul(u32::try_from(chunks).unwrap_or(u32::MAX)),
+        );
+    }
+    timeout
+}
+
 impl ClientCore {
+    fn register_composer_send_budget(
+        &self,
+        identity: &ComposerOperationIdentity,
+        budget: crate::rpc::RequestBudget,
+    ) -> anyhow::Result<()> {
+        // Same order as publication: draft owner -> send controller. Cancellation
+        // cannot publish between validation and installation of the budget.
+        let store = self.composer_store.lock().expect("composer store poisoned");
+        anyhow::ensure!(
+            !self.is_stopped()
+                && store
+                    .drafts
+                    .get(&identity.thread_id)
+                    .is_some_and(|draft| draft.draft_id() == identity.draft_id
+                        && draft
+                            .operation()
+                            .is_some_and(|op| op.identity == *identity && op.pending())),
+            "Composer send cancelled"
+        );
+        let mut sends = self
+            .composer_sends
+            .lock()
+            .expect("composer send controller poisoned");
+        anyhow::ensure!(
+            !sends.budgets.iter().any(|(id, _)| id == identity),
+            "Composer send already submitted"
+        );
+        sends.budgets.push((identity.clone(), budget));
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_composer_send_budget(
+        &self,
+        thread_id: &str,
+        publication: Option<&super::store::ComposerPublication>,
+    ) {
+        let mut sends = self
+            .composer_sends
+            .lock()
+            .expect("composer send controller poisoned");
+        sends.budgets.retain(|(id, budget)| {
+            let current = id.thread_id != thread_id
+                || publication.is_some_and(|publication| {
+                    id.draft_id == publication.draft_id()
+                        && publication
+                            .operation()
+                            .is_some_and(|op| op.identity == *id && op.pending())
+                });
+            if !current {
+                budget.cancel();
+            }
+            current
+        });
+        drop(sends);
+        self.notify_send_readiness();
+    }
+
+    pub(crate) fn cancel_composer_send_budgets(&self) {
+        let budgets = std::mem::take(
+            &mut self
+                .composer_sends
+                .lock()
+                .expect("composer send controller poisoned")
+                .budgets,
+        );
+        for (_, budget) in budgets {
+            budget.cancel();
+        }
+        self.notify_send_readiness();
+    }
+
+    fn retire_composer_send_budget(&self, identity: &ComposerOperationIdentity) {
+        let mut sends = self
+            .composer_sends
+            .lock()
+            .expect("composer send controller poisoned");
+        sends.budgets.retain(|(id, budget)| {
+            if id == identity {
+                budget.cancel();
+                false
+            } else {
+                true
+            }
+        });
+        drop(sends);
+        self.notify_send_readiness();
+    }
+
     pub(super) fn wait_composer_session_refresh(
         &self,
         identity: &ComposerOperationIdentity,
+        budget: &crate::rpc::RequestBudget,
     ) -> anyhow::Result<()> {
         let _startup_wait = pioneer_observability::turn_startup::stage(
             &identity.startup_observation_key(),
             pioneer_observability::turn_startup::Stage::ClientSessionWait,
         );
-        while self.gateway_refresh_in_flight() {
+        budget.notify_on_cancel(&self.send_readiness);
+        loop {
+            let sequence = self.send_readiness_sequence();
+            budget.check()?;
             anyhow::ensure!(
                 self.composer_operation_plan(identity).is_some(),
                 "Composer operation cancelled"
             );
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            if !self.gateway_refresh_in_flight() {
+                return Ok(());
+            }
+            self.wait_send_readiness(sequence, budget.deadline())?;
         }
-        anyhow::ensure!(
-            self.composer_operation_plan(identity).is_some(),
-            "Composer operation cancelled"
-        );
-        Ok(())
     }
 
     pub fn submit_composer_send<F: ClientFileSystem + ?Sized>(
@@ -336,9 +487,17 @@ impl ClientCore {
         let result = pioneer_observability::turn_startup::scope_sync(
             Some(identity.startup_observation_key()),
             || {
-                self.wait_composer_session_refresh(&identity).and_then(|_| {
-                    self.prepare_and_send_composer(identity.clone(), file_system, context)
-                })
+                let plan = self
+                    .composer_operation_plan(&identity)
+                    .ok_or_else(|| anyhow::anyhow!("Composer send cancelled"))?;
+                let timeout = composer_send_timeout(&plan, file_system);
+                let deadline = std::time::Instant::now()
+                    .checked_add(timeout)
+                    .ok_or_else(|| anyhow::anyhow!("Composer Send allowance exceeded"))?;
+                let budget = crate::rpc::RequestBudget::new(deadline);
+                self.register_composer_send_budget(&identity, budget.clone())?;
+                self.wait_composer_session_refresh(&identity, &budget)?;
+                self.prepare_and_send_composer(identity.clone(), file_system, context, &budget)
             },
         );
         if let Err(error) = &result {
@@ -347,11 +506,12 @@ impl ClientCore {
                 pioneer_observability::turn_startup::Outcome::Failed,
             );
             self.complete_composer_operation(
-                identity,
+                identity.clone(),
                 ComposerOperationCompletion::Failed {
                     message: format!("{error:#}"),
                 },
             );
+            self.retire_composer_send_budget(&identity);
         }
         result
     }
@@ -361,6 +521,7 @@ impl ClientCore {
         operation: ComposerOperationIdentity,
         file_system: &F,
         context: ComposerSendContext,
+        budget: &crate::rpc::RequestBudget,
     ) -> anyhow::Result<ComposerSendResult> {
         let ComposerSendContext {
             workspace_id: requested_workspace_id,
@@ -369,7 +530,6 @@ impl ClientCore {
         } = context;
         let skill_picker =
             self.composer_catalog_skill_picker(&operation.thread_id, operation.draft_id, "");
-        let runtime = self.transport_runtime();
         let plan = self
             .composer_operation_plan(&operation)
             .filter(|plan| plan.kind == ComposerOperationKind::Send)
@@ -453,12 +613,10 @@ impl ClientCore {
             }
         }
 
-        // A planned access-token rotation replaces the WebSocket connection. The
-        // replacement connection has no thread subscriptions, even though the
-        // client-side thread coordinator is still warm. Re-establish the
-        // authoritative workspace scope and subscription before any composer
-        // preparation or optimistic local mutation.
-        self.refresh_thread_subscription(&runtime.ws_command_sender(), &thread_id, &workspace_id)?;
+        // Carry exactly the socket that acknowledged the subscription through
+        // preparation and dispatch; token renewal on that socket retains it.
+        let connection = self.ensure_thread_subscription(&thread_id, &workspace_id, budget)?;
+        let transport = budget.bind(connection.clone());
 
         let selection = {
             let inner = self;
@@ -479,10 +637,11 @@ impl ClientCore {
                 execution_backend: None,
             }
         } else {
-            resolve_selected_execution_target(
+            resolve_selected_execution_target_with_budget(
                 self,
                 workspace_id.as_str(),
                 selection.selected_provider.as_deref(),
+                budget,
             )?
         };
         let cli_runtime_selected = execution_target.execution_backend.is_some();
@@ -499,7 +658,7 @@ impl ClientCore {
         }
         let prepared = self.prepare_composer_send(
             &operation,
-            &runtime.ws_command_sender(),
+            &transport,
             file_system,
             ComposerPreparationContext {
                 workspace_id: workspace_id.clone(),
@@ -533,11 +692,17 @@ impl ClientCore {
             },
             prepared,
         );
-        let semantic_timeline_patch = self.send_prepared_composer_turn(
+        budget.check()?;
+        anyhow::ensure!(
+            connection.is_current(),
+            "Thread subscription transport retired"
+        );
+        let semantic_timeline_patch = self.send_prepared_composer_turn_using(
             operation,
             workspace_id,
             submit_reduction,
             failure_message,
+            transport,
         )?;
 
         Ok(ComposerSendResult {
@@ -546,22 +711,6 @@ impl ClientCore {
             pending_request_id,
             semantic_timeline_patch,
         })
-    }
-
-    fn send_prepared_composer_turn(
-        self: &std::sync::Arc<Self>,
-        identity: ComposerOperationIdentity,
-        workspace_id: String,
-        reduction: super::turn_prepare::PreparedComposerTurnSubmitReduction,
-        failure_message: String,
-    ) -> anyhow::Result<crate::timeline::semantic::SemanticTimelineCachePatch> {
-        self.send_prepared_composer_turn_using(
-            identity,
-            workspace_id,
-            reduction,
-            failure_message,
-            self.transport_runtime().ws_command_sender(),
-        )
     }
 
     fn send_prepared_composer_turn_using<
@@ -594,7 +743,6 @@ impl ClientCore {
                 };
                 let result = (|| -> anyhow::Result<_> {
                     anyhow::ensure!(current(), "Composer send cancelled");
-                    anyhow::ensure!(current(), "Composer send cancelled");
                     ws_commands::turn_start(
                         &sender,
                         crate::turns::start::turn_start_params_from_plan(
@@ -621,7 +769,7 @@ impl ClientCore {
                 );
                 if core.apply_thread_start_send_result(token, reduction) {
                     core.complete_composer_operation(
-                        identity,
+                        identity.clone(),
                         if accepted {
                             ComposerOperationCompletion::Sent
                         } else {
@@ -631,6 +779,7 @@ impl ClientCore {
                         },
                     );
                 }
+                core.retire_composer_send_budget(&identity);
             });
         match task {
             Ok(task) => {
@@ -1160,6 +1309,94 @@ mod tests {
         }
     }
     #[test]
+    fn refresh_readiness_handles_ready_and_completion_between_predicate_and_registration() {
+        let (core, identity) = fixture();
+        let budget = crate::rpc::RequestBudget::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        core.wait_composer_session_refresh(&identity, &budget)
+            .unwrap();
+        let refresh = core.schedule_gateway_refresh().unwrap();
+        assert!(core.start_gateway_refresh(refresh));
+        let sequence = core.send_readiness_sequence();
+        assert!(core.gateway_refresh_in_flight());
+        assert!(core.finish_gateway_refresh(refresh));
+        // Exact race window: completion follows the predicate and precedes wait
+        // registration. A lost notification would hit the supplied deadline.
+        core.wait_send_readiness(sequence, budget.deadline())
+            .unwrap();
+        core.wait_composer_session_refresh(&identity, &budget)
+            .unwrap();
+    }
+
+    #[test]
+    fn refresh_waiters_wake_for_cancel_revoke_shutdown_and_refresh_failure() {
+        for exit in [
+            "cancel",
+            "budget_cancel",
+            "revoke",
+            "shutdown",
+            "refresh_failure",
+        ] {
+            let (core, identity) = fixture();
+            let budget = crate::rpc::RequestBudget::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            );
+            core.register_composer_send_budget(&identity, budget.clone())
+                .unwrap();
+            let refresh = core.schedule_gateway_refresh().unwrap();
+            assert!(core.start_gateway_refresh(refresh));
+            let (checked, checked_rx) = std::sync::mpsc::sync_channel(1);
+            let (proceed, proceed_rx) = std::sync::mpsc::sync_channel(1);
+            let (finished, finished_rx) = std::sync::mpsc::sync_channel(1);
+            let waiting_core = core.clone();
+            let waiting_budget = budget.clone();
+            let waiting_identity = identity.clone();
+            let waiter = std::thread::spawn(move || {
+                waiting_budget.notify_on_cancel(&waiting_core.send_readiness);
+                let sequence = waiting_core.send_readiness_sequence();
+                assert!(waiting_core.gateway_refresh_in_flight());
+                checked.send(()).unwrap();
+                proceed_rx.recv().unwrap();
+                let result = waiting_core
+                    .wait_send_readiness(sequence, waiting_budget.deadline())
+                    .and_then(|_| {
+                        waiting_core
+                            .wait_composer_session_refresh(&waiting_identity, &waiting_budget)
+                    });
+                finished.send(result.is_ok()).unwrap();
+            });
+            checked_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            match exit {
+                "cancel" => {
+                    core.complete_composer_operation(
+                        identity.clone(),
+                        ComposerOperationCompletion::Cancelled,
+                    );
+                }
+                "budget_cancel" => budget.cancel(),
+                "revoke" => core.begin_authorization_epoch(None),
+                "shutdown" => core.shutdown(),
+                "refresh_failure" => core.cancel_gateway_refresh(),
+                _ => unreachable!(),
+            }
+            proceed.send(()).unwrap();
+            assert_eq!(
+                finished_rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap(),
+                exit == "refresh_failure"
+            );
+            waiter.join().unwrap();
+            if exit != "refresh_failure" {
+                assert!(budget.check().is_err());
+            }
+        }
+    }
+
+    #[test]
     fn preparation_consumes_captured_draft_and_duplicate_does_no_io() {
         let (core, identity) = fixture();
         let transport = Transport::new(|| {});
@@ -1301,6 +1538,95 @@ mod tests {
         }
     }
 
+    struct DeferredSendTransport {
+        admitted: std::sync::mpsc::SyncSender<crate::rpc::JsonRpcResponseSender>,
+    }
+    impl crate::rpc::JsonRpcRequestTransport for DeferredSendTransport {
+        fn send_json_rpc_request(
+            &self,
+            _: String,
+            payload: String,
+            response: crate::rpc::JsonRpcResponseSender,
+        ) -> Result<(), String> {
+            let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(request["method"], "turn/start");
+            self.admitted
+                .send(response)
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    #[test]
+    fn edit_revoke_and_shutdown_retire_admitted_send_without_replacing_new_draft() {
+        for exit in ["edit", "revoke", "shutdown"] {
+            let (core, identity) = fixture();
+            let reduction = ready_send(&core, &identity);
+            let composer_scope = crate::core::ClientScope::Composer {
+                thread_id: "a".into(),
+            };
+            let previous = core.snapshot(&composer_scope).unwrap();
+            let mut stale = (*core.composer_snapshot("a").unwrap()).clone();
+            stale.operation.as_mut().unwrap().status = ComposerOperationStatus::Cancelled;
+            let budget = crate::rpc::RequestBudget::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            );
+            core.register_composer_send_budget(&identity, budget.clone())
+                .unwrap();
+            let (admitted, admitted_rx) = std::sync::mpsc::sync_channel(1);
+            core.send_prepared_composer_turn_using(
+                identity.clone(),
+                "workspace".into(),
+                reduction,
+                "send failed".into(),
+                budget.bind(DeferredSendTransport { admitted }),
+            )
+            .unwrap();
+            let response = admitted_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            if exit == "edit" {
+                let rejected = core.publish(
+                    &crate::core::ClientMutationAuthority { _private: () },
+                    composer_scope,
+                    previous.revisions(),
+                    Arc::new(stale),
+                    vec![],
+                );
+                assert_eq!(rejected.outcome(), ClientTransitionOutcome::Stale);
+                assert!(
+                    budget.check().is_ok(),
+                    "a rejected publication cannot cancel the current operation"
+                );
+                assert!(response.is_active());
+            }
+            match exit {
+                "edit" => {
+                    core.composer_intent(ComposerIntent::EditText {
+                        thread_id: "a".into(),
+                        draft_id: identity.draft_id,
+                        text: "new draft".into(),
+                    });
+                }
+                "revoke" => core.begin_authorization_epoch(None),
+                "shutdown" => core.shutdown(),
+                _ => unreachable!(),
+            }
+            assert!(budget.check().is_err());
+            assert!(
+                response.send(Ok(serde_json::json!({}))).is_err(),
+                "late response cannot resurrect local observation"
+            );
+            join_sends(&core);
+            assert!(core.composer_sends.lock().unwrap().budgets.is_empty());
+            if exit == "edit" {
+                assert_eq!(
+                    core.composer_snapshot("a").unwrap().draft().text,
+                    "new draft"
+                );
+            }
+        }
+    }
+
     fn ready_send(
         core: &ClientCore,
         identity: &ComposerOperationIdentity,
@@ -1354,6 +1680,184 @@ mod tests {
         for task in tasks {
             task.join().unwrap();
         }
+    }
+
+    #[test]
+    fn submitted_send_reuses_warm_subscription_and_renews_only_for_new_socket() {
+        struct Rpc {
+            thread: Thread,
+            subscriptions: std::sync::atomic::AtomicUsize,
+            turns: std::sync::Mutex<Vec<Turn>>,
+        }
+        impl crate::rpc::JsonRpcRequestTransport for Rpc {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "thread/start" => {
+                        self.subscriptions
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        serde_json::to_value(ThreadStartResponse {
+                            thread: self.thread.clone(),
+                            sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+                        })
+                        .unwrap()
+                    }
+                    "turn/start" => {
+                        let params: TurnStartParams =
+                            serde_json::from_value(request["params"].clone()).unwrap();
+                        let turn = Turn {
+                            id: params.turn_id,
+                            status: TurnStatus::InProgress,
+                            turn_kind: TurnKind::Conversation,
+                            origin: TurnOrigin::User,
+                            mode: ThreadMode::Message,
+                            author: None,
+                            reply_to_turn_id: None,
+                            mentions: vec![],
+                            message_revision: 0,
+                            message_deleted: false,
+                            error: None,
+                            prompt_manifest: None,
+                            permission_profile: default_turn_permission_profile_snapshot(),
+                        };
+                        self.turns.lock().unwrap().push(turn.clone());
+                        serde_json::to_value(TurnStartResponse { turn }).unwrap()
+                    }
+                    method => panic!("unexpected message Send RPC: {method}"),
+                };
+                response.send(Ok(result)).map_err(|error| error.to_string())
+            }
+        }
+        let core = crate::catalog_test_support::settings_client();
+        let thread: Thread = serde_json::from_value(serde_json::json!({
+            "id": "a", "workspace_id": "workspace", "preview": "Synthetic", "mode": "Message",
+            "model": "model", "model_provider": "provider", "created_at": 1, "updated_at": 1,
+            "status": "Idle", "turns": []
+        }))
+        .unwrap();
+        core.upsert_thread(thread.clone());
+        let event = crate::transport::ws::GatewayWsEvent::Connected {
+            connection_id: 7,
+            endpoint_id: "endpoint".into(),
+            endpoint_name: "Synthetic".into(),
+            gateway_base_url: GatewayBaseUrl::parse_presentation("https://synthetic.invalid")
+                .unwrap(),
+        };
+        core.transport_runtime().inject_test_event(event.clone());
+        core.transport_runtime().drain_ws_events();
+        {
+            let mut session = core.gateway_session.lock().unwrap();
+            session.observe_transport(&event);
+            core.publish_gateway_session(&session);
+        }
+        core.transport_runtime()
+            .ws_command_sender()
+            .set_http_session_access_for_test(Some(crate::transport::http::GatewayHttpAccess {
+                gateway_base_url: GatewayBaseUrl::parse_presentation("https://synthetic.invalid")
+                    .unwrap(),
+                gateway_id: GatewayId::new("GAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                session_id: AuthSessionId::new("SAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                generation: 7,
+                access_expires_at_unix: u64::MAX,
+                access_token: AuthSecretString::new("initial"),
+            }));
+        let rpc = Arc::new(Rpc {
+            thread,
+            subscriptions: std::sync::atomic::AtomicUsize::new(0),
+            turns: Default::default(),
+        });
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(rpc.clone());
+        core.composer_intent(ComposerIntent::Open {
+            thread_id: "a".into(),
+            defaults: ComposerDomainState {
+                selected_mode: ThreadMode::Message,
+                ..Default::default()
+            },
+        });
+        for (stage, expected_subscriptions) in
+            [("cold", 1), ("warm", 1), ("renewal", 1), ("reconnect", 2)]
+        {
+            if stage == "renewal" {
+                let mut access = core
+                    .transport_runtime()
+                    .ws_command_sender()
+                    .current_gateway_http_access()
+                    .unwrap();
+                access.access_token = AuthSecretString::new("renewed-on-same-socket");
+                core.transport_runtime()
+                    .ws_command_sender()
+                    .set_http_session_access_for_test(Some(access));
+            }
+            if stage == "reconnect" {
+                // Core has not processed a disconnect; same logical ID alone is insufficient.
+                core.transport_runtime().inject_test_event(event.clone());
+                core.transport_runtime().drain_ws_events();
+            }
+            let draft_id = core.composer_snapshot("a").unwrap().draft_id();
+            core.composer_intent(ComposerIntent::EditText {
+                thread_id: "a".into(),
+                draft_id,
+                text: stage.into(),
+            });
+            core.composer_intent(ComposerIntent::BeginOperation {
+                thread_id: "a".into(),
+                draft_id,
+                operation: ComposerOperationKind::Send,
+            });
+            let identity = core
+                .composer_snapshot("a")
+                .unwrap()
+                .operation()
+                .unwrap()
+                .identity
+                .clone();
+            core.submit_composer_send(
+                identity,
+                &Files,
+                ComposerSendContext {
+                    workspace_id: Some("workspace".into()),
+                    endpoint_kind: None,
+                    failure_message: "send failed".into(),
+                },
+            )
+            .unwrap();
+            join_sends(&core);
+            assert_eq!(
+                rpc.subscriptions.load(std::sync::atomic::Ordering::SeqCst),
+                expected_subscriptions,
+                "{stage}"
+            );
+            let mut turn = rpc.turns.lock().unwrap().last().unwrap().clone();
+            turn.status = TurnStatus::Completed;
+            core.apply_thread_notification(GatewayNotification::TurnCompleted(
+                TurnCompletedNotification {
+                    workspace_id: "workspace".into(),
+                    thread_id: "a".into(),
+                    turn,
+                },
+            ));
+        }
+        let turns = rpc.turns.lock().unwrap();
+        assert_eq!(turns.len(), 4);
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| &turn.id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4
+        );
+        core.shutdown();
     }
 
     #[test]
