@@ -417,7 +417,13 @@ mod tests {
         let mut pending_upload_chunks = HashMap::new();
         let mut pending_artifact_upload_chunks = HashMap::new();
         let (response_tx, response_rx) = std::sync::mpsc::channel();
-        pending_requests.insert("req_1".to_owned(), response_tx);
+        pending_requests.insert(
+            "req_1".to_owned(),
+            crate::rpc::JsonRpcResponseSender::new(
+                response_tx,
+                std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+            ),
+        );
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let payload = json!({
