@@ -501,13 +501,6 @@ impl MessageProcessor {
             pioneer_observability::GatewayOperationVariant::ThreadTreePrincipalScoped
         });
         let workspace_id = authorization.workspace_id().to_owned();
-        let connection_workspace_stage = trace
-            .stage(pioneer_observability::GatewayOperationStage::ThreadTreeConnectionWorkspaceSet);
-        self.session_manager
-            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-            .await;
-        connection_workspace_stage.succeed();
-
         let threads = match self
             .list_threads_snapshot_for_authorization(
                 authorization,

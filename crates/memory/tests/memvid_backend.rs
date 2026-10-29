@@ -169,6 +169,13 @@ async fn put_get_reopen_and_update_by_uri() {
         .await
         .expect("find capsule")
         .expect("capsule exists");
+    assert_eq!(put.capsule_id.as_deref().expect("capsule id").len(), 21);
+    assert!(
+        put.capsule_ref
+            .as_deref()
+            .expect("capsule ref")
+            .contains(resolved.scope_key_hash.as_str())
+    );
     let path = capsule_path(capsule.storage_uri.as_str());
     assert!(path.exists());
     assert!(

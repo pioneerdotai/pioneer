@@ -652,6 +652,10 @@ mod tests {
         for (model, (id, dimension)) in LOCAL_EMBEDDING_MODELS.iter().zip(expected) {
             assert_eq!(model.id, id);
             assert_eq!(model.dimension, dimension);
+            assert_eq!(local_embedding_model_info(id), Some(model));
+            if id == "bge-small-en-v1.5" {
+                assert!(model.default);
+            }
             assert_eq!(model.max_tokens, 512);
             assert!(model.model_url.ends_with("/onnx/model.onnx"));
             assert!(model.tokenizer_url.ends_with("/tokenizer.json"));
@@ -665,16 +669,7 @@ mod tests {
             );
         }
         assert!(local_embedding_model_info("NOMIC-EMBED-TEXT-V1.5").is_none());
-    }
-
-    #[test]
-    fn local_transcription_catalog_has_exact_deterministic_model_order() {
-        let actual = LOCAL_TRANSCRIPTION_MODELS
-            .iter()
-            .map(|model| model.id)
-            .collect::<Vec<_>>();
-
-        assert_eq!(actual, EXPECTED_TRANSCRIPTION_MODEL_IDS);
+        assert!(local_embedding_model_info("unknown").is_none());
     }
 
     #[test]

@@ -994,15 +994,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_completions_url_built_correctly() {
-        let provider = CopilotProvider::new("key");
-        assert_eq!(
-            provider.chat_completions_url(),
-            "https://api.githubcopilot.com/chat/completions"
-        );
-    }
-
-    #[test]
     fn custom_gateway_prefix_routes_chat_and_models() {
         let provider = CopilotProvider::with_base_url_and_timeout_policy(
             "key",
@@ -1046,17 +1037,19 @@ mod tests {
     }
 
     #[test]
-    fn provider_name() {
+    fn provider_defaults_preserve_identity_capabilities_and_chat_url() {
         let provider = CopilotProvider::new("key");
-        assert_eq!(provider.name(), "copilot");
-    }
 
-    #[test]
-    fn provider_capabilities() {
-        let provider = CopilotProvider::new("key");
+        assert_eq!(provider.name(), "copilot");
+
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);
+
+        assert_eq!(
+            provider.chat_completions_url(),
+            "https://api.githubcopilot.com/chat/completions"
+        );
     }
 }
 

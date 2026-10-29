@@ -808,19 +808,6 @@ mod tests {
     }
 
     #[test]
-    fn gateway_and_principal_id_schemas_are_constrained_strings() {
-        for schema in [
-            serde_json::to_value(schemars::schema_for!(GatewayId)).unwrap(),
-            serde_json::to_value(schemars::schema_for!(PrincipalId)).unwrap(),
-        ] {
-            assert_eq!(schema["type"], "string");
-            assert_eq!(schema["minLength"], 21);
-            assert_eq!(schema["maxLength"], 21);
-            assert_eq!(schema["pattern"], "^[A-Za-z0-9]{21}$");
-        }
-    }
-
-    #[test]
     fn auth_domain_ids_are_distinct_constrained_string_types() {
         let raw = "D00000000000000000001";
         let device = DeviceId::new(raw).expect("device id");
@@ -897,16 +884,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_id_schema_is_a_constrained_string() {
-        let schema = serde_json::to_value(schemars::schema_for!(SkillId)).unwrap();
-
-        assert_eq!(schema["type"], "string");
-        assert_eq!(schema["minLength"], SKILL_ID_LEN);
-        assert_eq!(schema["maxLength"], SKILL_ID_LEN);
-        assert_eq!(schema["pattern"], "^[A-Za-z0-9]{21}$");
-    }
-
-    #[test]
     fn skill_pack_id_round_trips_as_a_string() {
         let value = "ZyXwVuTsRqPoNmLkJi987";
         let id = SkillPackId::new(value).expect("valid skill pack id");
@@ -958,12 +935,35 @@ mod tests {
     }
 
     #[test]
-    fn skill_pack_id_schema_is_a_constrained_string() {
-        let schema = serde_json::to_value(schemars::schema_for!(SkillPackId)).unwrap();
-
-        assert_eq!(schema["type"], "string");
-        assert_eq!(schema["minLength"], SKILL_PACK_ID_LEN);
-        assert_eq!(schema["maxLength"], SKILL_PACK_ID_LEN);
-        assert_eq!(schema["pattern"], "^[A-Za-z0-9]{21}$");
+    fn checked_id_schemas_are_constrained_strings() {
+        assert_eq!(SKILL_ID_LEN, 21);
+        assert_eq!(SKILL_PACK_ID_LEN, 21);
+        for (name, schema, expected_len) in [
+            (
+                "GatewayId",
+                serde_json::to_value(schemars::schema_for!(GatewayId)).unwrap(),
+                21,
+            ),
+            (
+                "PrincipalId",
+                serde_json::to_value(schemars::schema_for!(PrincipalId)).unwrap(),
+                21,
+            ),
+            (
+                "SkillId",
+                serde_json::to_value(schemars::schema_for!(SkillId)).unwrap(),
+                SKILL_ID_LEN,
+            ),
+            (
+                "SkillPackId",
+                serde_json::to_value(schemars::schema_for!(SkillPackId)).unwrap(),
+                SKILL_PACK_ID_LEN,
+            ),
+        ] {
+            assert_eq!(schema["type"], "string", "{name}");
+            assert_eq!(schema["minLength"], expected_len, "{name}");
+            assert_eq!(schema["maxLength"], expected_len, "{name}");
+            assert_eq!(schema["pattern"], "^[A-Za-z0-9]{21}$", "{name}");
+        }
     }
 }

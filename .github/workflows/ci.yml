@@ -53,7 +53,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo update -p cua-driver-sdk
           cargo check --locked --workspace
           if [[ "${{ runner.os }}" == "macOS" ]]; then
             export MACOSX_DEPLOYMENT_TARGET=13.0
@@ -76,6 +75,10 @@ jobs:
         with:
           ref: ${{ github.sha }}
           submodules: recursive
+
+      - name: test-release-packaging
+        shell: bash
+        run: python3 -m unittest discover -s scripts/packaging -p 'test_*.py'
 
       - &linux-toolchain
         name: setup-rust
@@ -149,7 +152,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo update -p cua-driver-sdk
           cargo check --locked -p pioneer-cli
 
       # A separate Cargo invocation keeps CU features out of these server owners.

@@ -2264,103 +2264,6 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_shell_full_policy_persists_bounded_shell_output() {
-        let payload = serde_json::json!({
-            "command": ["/bin/sh", "-c", "printf VISIBLE_DYNAMIC_SHELL_SENTINEL"],
-            "exit_code": 0,
-            "stdout": "VISIBLE_DYNAMIC_SHELL_SENTINEL",
-            "stderr": "",
-            "timed_out": false,
-            "duration_ms": 4,
-            "truncated": false
-        });
-        let policy = ToolOutputPolicySnapshot {
-            llm: LlmOutputPolicy::Full {
-                max_bytes: 2 * 1024 * 1024,
-            },
-            llm_retention: LlmRetentionPolicy::UntilTurnTerminal {
-                max_bytes: 2 * 1024 * 1024,
-            },
-            timeline: TimelineOutputPolicy::Full {
-                max_bytes: 1024 * 1024,
-            },
-            storage: StorageOutputPolicy::Full {
-                max_bytes: 1024 * 1024,
-            },
-            recovery: RecoveryOutputPolicy::MetadataOnly,
-            deltas: DeltaOutputPolicy::PersistAndDisplay {
-                max_chunk_bytes: 64 * 1024,
-                max_total_bytes: 1024 * 1024,
-            },
-        };
-
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_dynamic_shell",
-            tool_name: "skill.tests-my-skill.echo-shell",
-            arguments: &serde_json::json!({}),
-            raw_output_text: "VISIBLE_DYNAMIC_SHELL_SENTINEL",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &policy,
-            output_projection: &ToolOutputProjectionKind::DynamicShell,
-        });
-
-        assert!(
-            serde_json::to_string(&envelope.display)
-                .unwrap()
-                .contains("VISIBLE_DYNAMIC_SHELL_SENTINEL")
-        );
-        assert!(
-            serde_json::to_string(&envelope.storage)
-                .unwrap()
-                .contains("VISIBLE_DYNAMIC_SHELL_SENTINEL")
-        );
-    }
-
-    #[test]
-    fn dynamic_shell_without_full_policy_hashes_shell_output_for_storage() {
-        let payload = serde_json::json!({
-            "command": ["/bin/sh", "-c", "printf hidden-output"],
-            "exit_code": 0,
-            "stdout": "SECRET_DYNAMIC_SHELL_SENTINEL",
-            "stderr": "",
-            "timed_out": false,
-            "duration_ms": 4,
-            "truncated": false
-        });
-        let policy = ToolOutputPolicySnapshot::for_tool_name("dynamic_tool");
-
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_dynamic_shell",
-            tool_name: "skill.tests-my-skill.echo-shell",
-            arguments: &serde_json::json!({}),
-            raw_output_text: "SECRET_DYNAMIC_SHELL_SENTINEL",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &policy,
-            output_projection: &ToolOutputProjectionKind::DynamicShell,
-        });
-
-        assert!(
-            serde_json::to_string(&envelope.llm_view)
-                .unwrap()
-                .contains("SECRET_DYNAMIC_SHELL_SENTINEL")
-        );
-        assert!(
-            !serde_json::to_string(&envelope.display)
-                .unwrap()
-                .contains("SECRET_DYNAMIC_SHELL_SENTINEL")
-        );
-        assert!(
-            !serde_json::to_string(&envelope.storage)
-                .unwrap()
-                .contains("SECRET_DYNAMIC_SHELL_SENTINEL")
-        );
-    }
-
-    #[test]
     fn dynamic_function_proxy_to_model_only_target_does_not_persist_raw_output() {
         let payload = serde_json::json!({
             "path": "/tmp/secret.txt",
@@ -2570,6 +2473,84 @@ mod tests {
                     .contains("SECRET_MODEL_ONLY_SENTINEL"),
                 "{tool_name} storage leaked raw content"
             );
+        }
+    }
+
+    #[test]
+    fn dynamic_shell_projection_visibility_matrix() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "command": ["/bin/sh", "-c", "printf VISIBLE_DYNAMIC_SHELL_SENTINEL"],
+                    "exit_code": 0,
+                    "stdout": "VISIBLE_DYNAMIC_SHELL_SENTINEL",
+                    "stderr": "",
+                    "timed_out": false,
+                    "duration_ms": 4,
+                    "truncated": false
+                }),
+                ToolOutputPolicySnapshot {
+                    llm: LlmOutputPolicy::Full {
+                        max_bytes: 2 * 1024 * 1024,
+                    },
+                    llm_retention: LlmRetentionPolicy::UntilTurnTerminal {
+                        max_bytes: 2 * 1024 * 1024,
+                    },
+                    timeline: TimelineOutputPolicy::Full {
+                        max_bytes: 1024 * 1024,
+                    },
+                    storage: StorageOutputPolicy::Full {
+                        max_bytes: 1024 * 1024,
+                    },
+                    recovery: RecoveryOutputPolicy::MetadataOnly,
+                    deltas: DeltaOutputPolicy::PersistAndDisplay {
+                        max_chunk_bytes: 64 * 1024,
+                        max_total_bytes: 1024 * 1024,
+                    },
+                },
+                "VISIBLE_DYNAMIC_SHELL_SENTINEL",
+                &["display", "storage"][..],
+                &[][..],
+            ),
+            (
+                serde_json::json!({
+                    "command": ["/bin/sh", "-c", "printf hidden-output"],
+                    "exit_code": 0,
+                    "stdout": "SECRET_DYNAMIC_SHELL_SENTINEL",
+                    "stderr": "",
+                    "timed_out": false,
+                    "duration_ms": 4,
+                    "truncated": false
+                }),
+                ToolOutputPolicySnapshot::for_tool_name("dynamic_tool"),
+                "SECRET_DYNAMIC_SHELL_SENTINEL",
+                &["llm"][..],
+                &["display", "storage"][..],
+            ),
+        ];
+        for (payload, policy, sentinel, present_views, absent_views) in cases {
+            let envelope = project_tool_result(ToolProjectionInput {
+                call_id: "call_dynamic_shell",
+                tool_name: "skill.tests-my-skill.echo-shell",
+                arguments: &serde_json::json!({}),
+                raw_output_text: sentinel,
+                raw_output_json: &payload,
+                success: true,
+                outcome: &ok_outcome(),
+                output_policy: &policy,
+                output_projection: &ToolOutputProjectionKind::DynamicShell,
+            });
+            let views = serde_json::json!({
+                "llm": envelope.llm_view,
+                "display": envelope.display,
+                "storage": envelope.storage,
+            });
+            for view in present_views {
+                assert!(views[view].to_string().contains(sentinel), "{view}");
+            }
+            for view in absent_views {
+                assert!(!views[view].to_string().contains(sentinel), "{view}");
+            }
         }
     }
 }

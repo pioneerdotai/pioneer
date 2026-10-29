@@ -857,17 +857,7 @@ mod clock_tests {
             view.set_visible(false, cx);
         });
     }
-    #[core::prelude::v1::test]
-    fn embedded_dino_frames_preserve_order_and_delay_table() {
-        let assets = decode_running_dino_assets().unwrap();
-        assert!(assets.frame_count() > 1);
-        assert_eq!(assets.dark.len(), assets.light.len());
-        for (light, dark) in assets.light.iter().zip(&assets.dark) {
-            assert_eq!(light.delay, dark.delay);
-            assert_eq!(light.image.frame_count(), 1);
-            assert_eq!(dark.image.frame_count(), 1);
-        }
-    }
+
     #[test]
     fn running_indicator_decode_has_a_bounded_pixel_budget() {
         let assets = decode_running_dino_assets().unwrap();
@@ -898,7 +888,13 @@ mod clock_tests {
                     .assets
                     .as_ref()
                     .expect("visible indicator must load its frames");
+                assert!(assets.frame_count() > 1);
+                assert_eq!(assets.dark.len(), assets.light.len());
+                for (light, dark) in assets.light.iter().zip(&assets.dark) {
+                    assert_eq!(light.delay, dark.delay);
+                }
                 for frame in assets.light.iter().chain(&assets.dark) {
+                    assert_eq!(frame.image.frame_count(), 1);
                     identities.insert(frame.image.id);
                 }
             });

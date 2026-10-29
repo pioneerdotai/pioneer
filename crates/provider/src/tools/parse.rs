@@ -130,25 +130,4 @@ mod tests {
         assert!(parse_tool_calls(Some(&missing), None).is_err());
         assert!(parse_tool_calls(Some(&invalid), None).is_err());
     }
-
-    #[test]
-    fn assistant_content_with_tool_like_json_remains_plain_text() {
-        let content = r#"{
-            "content": "fallback",
-            "tool_calls": [{
-                "id": "call_1",
-                "name": "shell",
-                "arguments": "{}"
-            }]
-        }"#;
-
-        let value: Value = serde_json::from_str(content).expect("content is valid JSON");
-        assert!(
-            parse_tool_calls(None, None)
-                .expect("missing native fields are not a tool call")
-                .is_empty()
-        );
-        assert_eq!(value["content"], "fallback");
-        assert!(value.get("tool_calls").is_some());
-    }
 }

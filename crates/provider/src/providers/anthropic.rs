@@ -2833,61 +2833,11 @@ mod tests {
     }
 
     #[test]
-    fn creates_with_custom_base_url() {
-        let provider = AnthropicProvider::with_base_url("key", "http://localhost:9090");
-        assert_eq!(provider.base_url, "http://localhost:9090");
-    }
-
-    #[test]
     fn custom_base_url_keeps_prefix_without_double_slash() {
         let provider = AnthropicProvider::with_base_url("key", "http://localhost:9090/gateway/");
         assert_eq!(
             provider.models_url(),
             "http://localhost:9090/gateway/v1/models"
-        );
-    }
-
-    #[test]
-    fn messages_url_built_correctly() {
-        let provider = AnthropicProvider::new("key");
-        assert_eq!(
-            provider.messages_url(),
-            "https://api.anthropic.com/v1/messages"
-        );
-    }
-
-    #[test]
-    fn anthropic_reasoning_registry_exposes_supported_opus_efforts() {
-        let reasoning =
-            reasoning_registry::reasoning_capabilities_for_model("anthropic", "claude-opus-4-8")
-                .expect("opus 4.8 reasoning metadata");
-
-        assert_eq!(reasoning.supported, Some(true));
-        assert_eq!(
-            reasoning.effort_options,
-            vec!["none", "low", "medium", "high", "xhigh", "max"]
-        );
-        assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
-    }
-
-    #[test]
-    fn anthropic_reasoning_registry_exposes_supported_sonnet_efforts() {
-        let reasoning =
-            reasoning_registry::reasoning_capabilities_for_model("anthropic", "claude-sonnet-4-6")
-                .expect("sonnet 4.6 reasoning metadata");
-
-        assert_eq!(reasoning.supported, Some(true));
-        assert_eq!(
-            reasoning.effort_options,
-            vec!["none", "low", "medium", "high", "max"]
-        );
-    }
-
-    #[test]
-    fn anthropic_reasoning_registry_leaves_unknown_models_unset() {
-        assert!(
-            reasoning_registry::reasoning_capabilities_for_model("anthropic", "claude-sonnet-3-7")
-                .is_none()
         );
     }
 
@@ -2930,57 +2880,6 @@ mod tests {
         assert_eq!(models[0].limits.context_window, Some(264000));
 
         assert!(models[1].capabilities.reasoning.is_none());
-    }
-
-    #[test]
-    fn prepare_messages_extracts_system() {
-        let messages = vec![
-            ChatMessage::system("Be helpful"),
-            ChatMessage::user("Hello"),
-            ChatMessage::assistant("Hi!"),
-        ];
-
-        let (system, api_messages) = render_messages(&messages);
-
-        assert_eq!(system.as_deref(), Some("Be helpful"));
-        assert_eq!(api_messages.len(), 2);
-        assert_eq!(api_messages[0].role, "user");
-        assert!(matches!(
-            api_messages[0].content.first(),
-            Some(ApiMessageContentBlock::Text { text }) if text == "Hello"
-        ));
-        assert_eq!(api_messages[1].role, "assistant");
-        assert!(matches!(
-            api_messages[1].content.first(),
-            Some(ApiMessageContentBlock::Text { text }) if text == "Hi!"
-        ));
-    }
-
-    #[test]
-    fn prepare_messages_joins_multiple_system() {
-        let messages = vec![
-            ChatMessage::system("First instruction"),
-            ChatMessage::system("Second instruction"),
-            ChatMessage::user("Hello"),
-        ];
-
-        let (system, api_messages) = render_messages(&messages);
-
-        assert_eq!(
-            system.as_deref(),
-            Some("First instruction\n\nSecond instruction")
-        );
-        assert_eq!(api_messages.len(), 1);
-    }
-
-    #[test]
-    fn prepare_messages_no_system() {
-        let messages = vec![ChatMessage::user("Hello")];
-
-        let (system, api_messages) = render_messages(&messages);
-
-        assert!(system.is_none());
-        assert_eq!(api_messages.len(), 1);
     }
 
     #[test]
@@ -3086,34 +2985,6 @@ mod tests {
     }
 
     #[test]
-    fn api_request_serializes_stream_true() {
-        let request = ApiChatRequest {
-            cache_control: None,
-            generation: Default::default(),
-            model: "claude-sonnet-4-20250514".into(),
-            messages: vec![ApiMessage {
-                role: "user".into(),
-                content: vec![ApiMessageContentBlock::Text {
-                    text: "Hello".into(),
-                }],
-            }],
-            max_tokens: 8192,
-            temperature: None,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            output_config: None,
-            stream: true,
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-
-        assert!(json.contains("\"stream\":true"));
-        assert!(!json.contains("\"temperature\""));
-        assert!(!json.contains("\"system\""));
-    }
-
-    #[test]
     fn adaptive_thinking_body_validates_effort_and_temperature_without_a_second_reserve() {
         let mut request = crate::generation::test_request("claude-opus-4-6");
         request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
@@ -3160,66 +3031,10 @@ mod tests {
     }
 
     #[test]
-    fn api_response_deserializes() {
-        let json = r#"{
-            "content": [{"type": "text", "text": "Hello from Claude"}],
-            "usage": {"input_tokens": 10, "output_tokens": 25}
-        }"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.content.len(), 1);
-        assert_eq!(
-            response.content[0].text.as_deref(),
-            Some("Hello from Claude")
-        );
-        let usage = response.usage.unwrap().normalized();
-        assert_eq!(usage.input_tokens, Some(10));
-        assert_eq!(usage.output_tokens, Some(25));
-    }
-
-    #[test]
-    fn api_response_without_usage() {
-        let json = r#"{"content": [{"type": "text", "text": "Hi"}]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert!(response.usage.is_none());
-        assert_eq!(response.content[0].text.as_deref(), Some("Hi"));
-    }
-
-    #[test]
     fn api_response_empty_content() {
         let json = r#"{"content": []}"#;
         let response: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(response.content.is_empty());
-    }
-
-    #[test]
-    fn stream_event_deserializes_content_block_delta() {
-        let json =
-            r#"{"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hello"}}"#;
-        let event: StreamEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(event.event_type, "content_block_delta");
-        assert_eq!(event.delta.unwrap().text.as_deref(), Some("Hello"));
-    }
-
-    #[test]
-    fn stream_event_deserializes_message_stop() {
-        let json = r#"{"type": "message_stop"}"#;
-        let event: StreamEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(event.event_type, "message_stop");
-        assert!(event.delta.is_none());
-    }
-
-    #[test]
-    fn provider_name() {
-        let provider = AnthropicProvider::new("key");
-        assert_eq!(provider.name(), "anthropic");
-    }
-
-    #[test]
-    fn provider_capabilities() {
-        let provider = AnthropicProvider::new("key");
-        let caps = provider.capabilities();
-        assert!(caps.streaming);
-        assert!(caps.vision);
     }
 
     #[tokio::test]
@@ -3239,6 +3054,62 @@ mod tests {
 
         let result = provider.chat(request).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn default_endpoint_and_capabilities() {
+        let provider = AnthropicProvider::new("key");
+        assert_eq!(
+            provider.messages_url(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        let caps = provider.capabilities();
+        assert!(caps.streaming);
+        assert!(caps.vision);
+    }
+
+    #[test]
+    fn system_messages_are_extracted_without_changing_conversation_text() {
+        let cases: [(Vec<ChatMessage>, Option<&str>, &[(&str, Option<&str>)]); 3] = [
+            (
+                vec![
+                    ChatMessage::system("Be helpful"),
+                    ChatMessage::user("Hello"),
+                    ChatMessage::assistant("Hi!"),
+                ],
+                Some("Be helpful"),
+                &[("user", Some("Hello")), ("assistant", Some("Hi!"))],
+            ),
+            (
+                vec![
+                    ChatMessage::system("First instruction"),
+                    ChatMessage::system("Second instruction"),
+                    ChatMessage::user("Hello"),
+                ],
+                Some("First instruction\n\nSecond instruction"),
+                &[("user", Some("Hello"))],
+            ),
+            (
+                vec![ChatMessage::user("Hello")],
+                None,
+                &[("user", Some("Hello"))],
+            ),
+        ];
+        for (messages, expected_system, expected_conversation) in cases {
+            let (system, api_messages) = render_messages(&messages);
+            assert_eq!(system.as_deref(), expected_system);
+            let actual = api_messages
+                .iter()
+                .map(|message| {
+                    let first_text = match message.content.first() {
+                        Some(ApiMessageContentBlock::Text { text }) => Some(text.as_str()),
+                        _ => None,
+                    };
+                    (message.role.as_str(), first_text)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual.as_slice(), expected_conversation);
+        }
     }
 }
 

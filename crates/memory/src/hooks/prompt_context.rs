@@ -284,28 +284,6 @@ pub(super) fn render_memory_manifest(manifest: &MemoryManifest) -> String {
     }
     lines.join("\n")
 }
-#[cfg(test)]
-pub(crate) fn memory_recall_prompt_input(
-    available_tool_names: Vec<String>,
-    policy: MemoryRecallPromptPolicy,
-    recall_snapshot: MemoryRecallSnapshot,
-) -> MemoryRecallPromptInput {
-    MemoryRecallPromptInput {
-        available_tool_names,
-        policy,
-        recalled_items: recall_snapshot
-            .items
-            .into_iter()
-            .map(memory_recall_prompt_item)
-            .collect(),
-        recalled_context: None,
-        active_context: None,
-        thread_context: None,
-        task_context: None,
-        truncated: recall_snapshot.truncated,
-    }
-}
-
 pub(super) fn memory_prompt_section_contributions_from_context(
     available_tool_names: Vec<String>,
     policy: MemoryRecallPromptPolicy,
@@ -396,17 +374,4 @@ fn thread_context_prompt_section_contribution_from_context(
         diagnostics: Vec::new(),
         truncated: section_truncated,
     }))
-}
-
-#[cfg(test)]
-pub(super) fn memory_recall_prompt_item(item: MemoryRecallItem) -> MemoryRecallPromptItem {
-    MemoryRecallPromptItem {
-        memory_id: item.memory_id,
-        scope_label: scope_label(&item.scope),
-        category_label: category_label(item.category).to_owned(),
-        key: item.key,
-        content: item.content,
-        score: item.score,
-        updated_at_label: date_label(item.updated_at),
-    }
 }

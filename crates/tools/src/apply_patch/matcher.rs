@@ -387,22 +387,6 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_concurrent_lines_survive() {
-        let patch =
-            update("*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** End Patch");
-        let result = apply_update("external\nold\nother\n", &patch).unwrap();
-        assert_eq!(result.content, "external\nnew\nother\n");
-    }
-
-    #[test]
-    fn duplicate_exact_context_is_ambiguous() {
-        let patch =
-            update("*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** End Patch");
-        let error = apply_update("old\nold\n", &patch).unwrap_err();
-        assert_eq!(error.code, MatchErrorCode::AmbiguousContext);
-    }
-
-    #[test]
     fn repeated_context_scan_keeps_bounded_diagnostics() {
         let patch =
             update("*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** End Patch");
@@ -413,70 +397,82 @@ mod tests {
     }
 
     #[test]
-    fn whitespace_ladder_and_eof_are_deterministic() {
-        let patch =
-            update("*** Begin Patch\n*** Update File: file.txt\n@@\n-old  \n+new\n*** End Patch");
-        let result = apply_update("old  \nlast", &patch).unwrap();
-        assert_eq!(result.content, "new\nlast");
-        let eof_patch = update(
-            "*** Begin Patch\n*** Update File: file.txt\n@@\n-last\n+end\n*** End of File\n*** End Patch",
-        );
-        assert_eq!(
-            apply_update("first\r\nlast\r\n", &eof_patch)
-                .unwrap()
-                .content,
-            "first\r\nend\r\n"
-        );
+    fn successful_patch_updates_preserve_exact_text() {
+        for (case, source, patch, expected) in [
+            (
+                "unrelated_concurrent_lines_survive:0",
+                "external\nold\nother\n",
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** End Patch",
+                "external\nnew\nother\n",
+            ),
+            (
+                "whitespace_ladder_and_eof_are_deterministic:1",
+                "old  \nlast",
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-old  \n+new\n*** End Patch",
+                "new\nlast",
+            ),
+            (
+                "whitespace_ladder_and_eof_are_deterministic:2",
+                "first\r\nlast\r\n",
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-last\n+end\n*** End of File\n*** End Patch",
+                "first\r\nend\r\n",
+            ),
+            (
+                "bom_and_crlf_are_preserved:3",
+                "\u{feff}old\r\nkeep\r\n",
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** End Patch",
+                "\u{feff}new\r\nkeep\r\n",
+            ),
+            (
+                "lone_cr_line_endings_are_preserved:4",
+                "old\rkeep\r",
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** End Patch",
+                "new\rkeep\r",
+            ),
+            (
+                "insertion_only_hunk_honors_context_marker:5",
+                "first\nmiddle\nlast\n",
+                "*** Begin Patch\n*** Update File: file.txt\n@@ middle\n+inserted\n*** End Patch",
+                "first\nmiddle\ninserted\nlast\n",
+            ),
+            (
+                "insertion_at_eof_separates_a_non_terminated_last_line:6",
+                "last",
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n+inserted\n*** End Patch",
+                "last\ninserted",
+            ),
+            (
+                "inserted_lines_use_dominant_ending_in_mixed_source:7",
+                "first\nmiddle\r\nlast\r\n",
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-middle\n+changed\n*** End Patch",
+                "first\nchanged\nlast\r\n",
+            ),
+        ] {
+            let patch = update(patch);
+            let result = apply_update(source, &patch).expect(case);
+            assert_eq!(result.content, expected, "{case}");
+        }
     }
 
     #[test]
-    fn bom_and_crlf_are_preserved() {
-        let patch =
-            update("*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** End Patch");
-        let result = apply_update("\u{feff}old\r\nkeep\r\n", &patch).unwrap();
-        assert_eq!(result.content, "\u{feff}new\r\nkeep\r\n");
-    }
-
-    #[test]
-    fn lone_cr_line_endings_are_preserved() {
-        let patch =
-            update("*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** End Patch");
-        let result = apply_update("old\rkeep\r", &patch).unwrap();
-        assert_eq!(result.content, "new\rkeep\r");
-    }
-
-    #[test]
-    fn punctuation_near_match_is_rejected() {
-        let patch = update(
-            "*** Begin Patch\n*** Update File: file.txt\n@@\n-plain - text\n+changed\n*** End Patch",
-        );
-        let error = apply_update("plain — text\n", &patch).unwrap_err();
-        assert_eq!(error.code, MatchErrorCode::ContextNotFound);
-    }
-
-    #[test]
-    fn insertion_only_hunk_honors_context_marker() {
-        let patch = update(
-            "*** Begin Patch\n*** Update File: file.txt\n@@ middle\n+inserted\n*** End Patch",
-        );
-        let result = apply_update("first\nmiddle\nlast\n", &patch).unwrap();
-        assert_eq!(result.content, "first\nmiddle\ninserted\nlast\n");
-    }
-
-    #[test]
-    fn insertion_at_eof_separates_a_non_terminated_last_line() {
-        let patch =
-            update("*** Begin Patch\n*** Update File: file.txt\n@@\n+inserted\n*** End Patch");
-        let result = apply_update("last", &patch).unwrap();
-        assert_eq!(result.content, "last\ninserted");
-    }
-
-    #[test]
-    fn inserted_lines_use_dominant_ending_in_mixed_source() {
-        let patch = update(
-            "*** Begin Patch\n*** Update File: file.txt\n@@\n-middle\n+changed\n*** End Patch",
-        );
-        let result = apply_update("first\nmiddle\r\nlast\r\n", &patch).unwrap();
-        assert_eq!(result.content, "first\nchanged\nlast\r\n");
+    fn patch_matching_rejects_ambiguous_or_changed_punctuation() {
+        for (case, source, patch, expected) in [
+            (
+                "duplicate_exact_context_is_ambiguous:0",
+                "old\nold\n",
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** End Patch",
+                MatchErrorCode::AmbiguousContext,
+            ),
+            (
+                "punctuation_near_match_is_rejected:1",
+                "plain — text\n",
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-plain - text\n+changed\n*** End Patch",
+                MatchErrorCode::ContextNotFound,
+            ),
+        ] {
+            let patch = update(patch);
+            let error = apply_update(source, &patch).expect_err(case);
+            assert_eq!(error.code, expected, "{case}");
+        }
     }
 }

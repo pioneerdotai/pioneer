@@ -1352,36 +1352,6 @@ mod tests {
     }
 
     #[test]
-    fn child_launch_grant_migrates_original_version_one_to_version_two() {
-        let source = version_one_grant(true);
-        assert_eq!(
-            source["fingerprint"],
-            json!("fc747ed91c91bd27b7ed9378961fedb2c57de5eba831ae5bfd5e3745e29e0af3")
-        );
-        let migrated = migrate_child_launch_grant_v1_to_v2(source)
-            .expect("original version 1 grant should migrate");
-        let migrated: ChildAgentLaunchGrantSet =
-            serde_json::from_value(migrated).expect("migrated grant should decode");
-        assert_eq!(migrated.version, 2);
-        assert!(migrated.validate().is_ok());
-    }
-
-    #[test]
-    fn child_launch_grant_migrates_version_one_with_optional_permission_fields() {
-        let source = version_one_grant(false);
-        assert_eq!(
-            source["fingerprint"],
-            json!("3ea9513e6206d823b6988c7f258869b425c3249a5b76c8672c86454c19615c24")
-        );
-        let migrated = migrate_child_launch_grant_v1_to_v2(source)
-            .expect("version 1 grant with optional permission fields should migrate");
-        let migrated: ChildAgentLaunchGrantSet =
-            serde_json::from_value(migrated).expect("migrated grant should decode");
-        assert_eq!(migrated.version, 2);
-        assert!(migrated.validate().is_ok());
-    }
-
-    #[test]
     fn child_launch_grant_migration_preserves_version_one_implicit_allow_list_restrictions() {
         let mut source = version_one_grant(false);
         source["maxPermissionProfile"]["effective_policy"]["allowed_tools"] = json!(["read_file"]);
@@ -1558,6 +1528,30 @@ mod tests {
             "start_agent_intent.json",
         ] {
             assert!(names.contains(required), "schema missing {required}");
+        }
+    }
+
+    #[test]
+    fn child_launch_grant_migrates_both_version_one_permission_shapes() {
+        for (original_policy_shape, expected_fingerprint, migration_message) in [
+            (
+                true,
+                "fc747ed91c91bd27b7ed9378961fedb2c57de5eba831ae5bfd5e3745e29e0af3",
+                "original version 1 grant should migrate",
+            ),
+            (
+                false,
+                "3ea9513e6206d823b6988c7f258869b425c3249a5b76c8672c86454c19615c24",
+                "version 1 grant with optional permission fields should migrate",
+            ),
+        ] {
+            let source = version_one_grant(original_policy_shape);
+            assert_eq!(source["fingerprint"], json!(expected_fingerprint));
+            let migrated = migrate_child_launch_grant_v1_to_v2(source).expect(migration_message);
+            let migrated: ChildAgentLaunchGrantSet =
+                serde_json::from_value(migrated).expect("migrated grant should decode");
+            assert_eq!(migrated.version, 2);
+            assert!(migrated.validate().is_ok());
         }
     }
 }

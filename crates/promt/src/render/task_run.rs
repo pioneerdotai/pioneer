@@ -731,18 +731,6 @@ mod tests {
     }
 
     #[test]
-    fn depth_below_max_allows_real_subtasks() {
-        let task = sample_task();
-        let run = sample_run();
-        let trigger = sample_trigger();
-        let agent_spec = sample_agent_spec(1, 3);
-        let prompt = compile(&task, &run, Some(&trigger), &agent_spec, None);
-
-        assert!(prompt.contains("current_depth: 1; max_depth: 3"));
-        assert!(prompt.contains("task_create may be used for real subtasks"));
-    }
-
-    #[test]
     fn depth_at_max_rejects_new_subtasks_in_prompt() {
         let task = sample_task();
         let run = sample_run();

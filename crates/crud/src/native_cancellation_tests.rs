@@ -1972,6 +1972,15 @@ async fn native_cancellation_production_upgrade_and_latest_down() {
     );
     assert_upgrade_schema(&db, false).await;
     historical.assert_preserved(&db).await;
+    assert_eq!(
+        CancellationSchemaFixtureMigrator::get_pending_migrations_read_only(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|migration| migration.name().to_owned())
+            .collect::<Vec<_>>(),
+        vec![cancellation.clone()],
+    );
     migrate_with::<CancellationSchemaFixtureMigrator>(&db, None, false)
         .await
         .unwrap();
@@ -2106,73 +2115,6 @@ async fn native_cancellation_production_up_preserves_accepted_context_markers_an
 }
 
 #[tokio::test]
-async fn native_cancellation_production_empty_down_and_reup_preserve_main_schema() {
-    let cancellation = cancellation_migration_name();
-    assert_ne!(cancellation, "m20261001_000001_native_cancellation_context");
-    assert_eq!(
-        CancellationSchemaFixtureMigrator::migrations()
-            .last()
-            .unwrap()
-            .name(),
-        cancellation
-    );
-    let db = pioneer_sqlite::SqliteDatabase::from_single_connection(
-        Database::connect("sqlite::memory:").await.unwrap(),
-    );
-    migrate_with::<MainSchemaFixtureMigrator>(&db, None, false)
-        .await
-        .unwrap();
-    let main_applied = CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&db)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|migration| migration.name().to_owned())
-        .collect::<Vec<_>>();
-    assert_upgrade_schema(&db, false).await;
-    migrate_with::<CancellationSchemaFixtureMigrator>(&db, None, false)
-        .await
-        .unwrap();
-    assert_upgrade_schema(&db, true).await;
-    migrate_with::<CancellationSchemaFixtureMigrator>(&db, Some(1), true)
-        .await
-        .unwrap();
-    assert_upgrade_schema(&db, false).await;
-    assert_eq!(
-        CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&db)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|migration| migration.name().to_owned())
-            .collect::<Vec<_>>(),
-        main_applied,
-    );
-    assert_eq!(
-        CancellationSchemaFixtureMigrator::get_pending_migrations_read_only(&db)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|migration| migration.name().to_owned())
-            .collect::<Vec<_>>(),
-        vec![cancellation.clone()],
-    );
-    migrate_with::<CancellationSchemaFixtureMigrator>(&db, None, false)
-        .await
-        .unwrap();
-    assert_upgrade_schema(&db, true).await;
-    let mut expected = main_applied;
-    expected.push(cancellation);
-    assert_eq!(
-        CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&db)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|migration| migration.name().to_owned())
-            .collect::<Vec<_>>(),
-        expected,
-    );
-}
-
-#[tokio::test]
 async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_event_index() {
     use migration::SchemaManager;
     for compressed in [false, true] {
@@ -2187,6 +2129,7 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
         migrate_with::<MainSchemaFixtureMigrator>(&db, None, false)
             .await
             .unwrap();
+        assert_upgrade_schema(&db, false).await;
         let transaction = db.begin().await.unwrap();
         assert!(
             SchemaManager::new(&*transaction)
@@ -2209,6 +2152,7 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
             .unwrap();
         }
         migrate_fixture(&db, None, false).await.unwrap();
+        assert_upgrade_schema(&db, true).await;
         let transaction = db.begin().await.unwrap();
         let schema = SchemaManager::new(&*transaction);
         for column in [
@@ -2279,6 +2223,7 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
         transaction.rollback().await.unwrap();
         // Empty down is safe and retryable; durable rows/markers are covered separately.
         migrate_fixture(&db, Some(1), true).await.unwrap();
+        assert_upgrade_schema(&db, false).await;
         let transaction = db.begin().await.unwrap();
         assert!(
             SchemaManager::new(&*transaction)
@@ -2291,6 +2236,7 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
         );
         transaction.rollback().await.unwrap();
         migrate_fixture(&db, None, false).await.unwrap();
+        assert_upgrade_schema(&db, true).await;
     }
 }
 

@@ -15,9 +15,17 @@ pub(crate) fn init_system_menus(cx: &mut App) {
     cx.on_action(hide_other_apps);
     cx.on_action(show_all_apps);
     cx.on_action(quit_app);
-    cx.bind_keys([KeyBinding::new("secondary-h", HideApp, None)]);
-    cx.bind_keys([KeyBinding::new("secondary-alt-h", HideOtherApps, None)]);
-    cx.bind_keys([KeyBinding::new("secondary-q", QuitApp, None)]);
+    // Static keybindings require explicit modifiers, rather than the secondary alias.
+    let (hide_key, hide_others_key, quit_key) = if cx.platform_info().is_mac() {
+        ("cmd-h", "cmd-alt-h", "cmd-q")
+    } else {
+        ("ctrl-h", "ctrl-alt-h", "ctrl-q")
+    };
+    cx.bind_keys([
+        KeyBinding::new(hide_key, HideApp, None),
+        KeyBinding::new(hide_others_key, HideOtherApps, None),
+        KeyBinding::new(quit_key, QuitApp, None),
+    ]);
     cx.set_menus(vec![Menu {
         name: t!("menu.app.name").into(),
         disabled: false,
@@ -87,4 +95,44 @@ fn show_all_apps(_: &ShowAllApps, cx: &mut App) {
 
 fn quit_app(_: &QuitApp, cx: &mut App) {
     crate::client_runtime::DesktopRuntimeCoordinator::request_quit(cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::{
+        Action, Keystroke, OperatingSystem, PlatformInfo, PlatformTarget, TestAppContext,
+    };
+
+    #[gpui_kit::test]
+    fn system_menus_initialize_with_host_shortcuts(cx: &mut TestAppContext) {
+        for (os, shortcuts) in [
+            (OperatingSystem::Mac, ["cmd-h", "cmd-alt-h", "cmd-q"]),
+            (OperatingSystem::Windows, ["ctrl-h", "ctrl-alt-h", "ctrl-q"]),
+            (OperatingSystem::Linux, ["ctrl-h", "ctrl-alt-h", "ctrl-q"]),
+        ] {
+            let mut app = cx.new_app();
+            app.set_platform_info(PlatformInfo {
+                os,
+                target: PlatformTarget::Native,
+            });
+            app.update(|cx| {
+                init_system_menus(cx);
+
+                let keymap = cx.key_bindings();
+                let keymap = keymap.borrow();
+                let actions: [&dyn Action; 3] = [&HideApp, &HideOtherApps, &QuitApp];
+                for (action, shortcut) in actions.into_iter().zip(shortcuts) {
+                    let keystroke = Keystroke::parse(shortcut).unwrap();
+                    assert!(
+                        keymap.bindings_for_action(action).any(|binding| {
+                            binding.match_keystrokes(&[keystroke.clone()]) == Some(false)
+                        }),
+                        "missing {shortcut} for {} on {os:?}",
+                        action.name()
+                    );
+                }
+            });
+        }
+    }
 }

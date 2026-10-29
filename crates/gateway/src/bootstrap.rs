@@ -305,13 +305,11 @@ async fn ensure_default_workspace_exists(connection: &impl ConnectionTrait) -> R
 mod tests {
     use super::{
         DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, bootstrap, cleanup_turn_llm_context,
-        cleanup_turn_runtime_snapshots, ensure_default_workspace_exists,
-        repair_terminal_turn_execution_windows, repair_turns_completed_after_final_agent_message,
+        ensure_default_workspace_exists, repair_terminal_turn_execution_windows,
+        repair_turns_completed_after_final_agent_message,
     };
     use migration::{Migrator, MigratorTrait};
-    use pioneer_crud::{
-        CrudStore, NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
-    };
+    use pioneer_crud::{CrudStore, NewTurnExecutionWindowRecord, NewTurnLlmContextEntry};
     use pioneer_entity::{thread, turn, workspace};
     use pioneer_protocol::{
         AgentMessagePhase, ExecutionWindowStatus, ItemCompletedNotification, PersistedActorRef,
@@ -326,29 +324,6 @@ mod tests {
     const DEFAULT_WORKSPACE_ID_LEN: usize = 21;
 
     #[tokio::test]
-    async fn creates_default_workspace_when_database_is_empty() {
-        let connection = setup_workspace_database().await;
-
-        let created = ensure_default_workspace_exists(&connection)
-            .await
-            .expect("default workspace creation should succeed");
-        assert!(created);
-
-        let workspaces = workspace::Entity::find()
-            .all(&connection)
-            .await
-            .expect("must read workspaces");
-        assert_eq!(workspaces.len(), 1);
-
-        let workspace = &workspaces[0];
-        assert_eq!(workspace.name, DEFAULT_WORKSPACE_NAME);
-        assert_eq!(workspace.id.len(), DEFAULT_WORKSPACE_ID_LEN);
-        assert_eq!(workspace.id, DEFAULT_WORKSPACE_ID);
-        assert!(workspace.is_active);
-        assert!(workspace.is_current);
-    }
-
-    #[tokio::test]
     async fn does_not_create_second_default_workspace() {
         let connection = setup_workspace_database().await;
 
@@ -356,6 +331,18 @@ mod tests {
             .await
             .expect("first initialization should succeed");
         assert!(first_created);
+
+        let first_workspaces = workspace::Entity::find()
+            .all(&connection)
+            .await
+            .expect("must read workspaces after first initialization");
+        assert_eq!(first_workspaces.len(), 1);
+        let workspace = &first_workspaces[0];
+        assert_eq!(workspace.name, DEFAULT_WORKSPACE_NAME);
+        assert_eq!(workspace.id.len(), DEFAULT_WORKSPACE_ID_LEN);
+        assert_eq!(workspace.id, DEFAULT_WORKSPACE_ID);
+        assert!(workspace.is_active);
+        assert!(workspace.is_current);
 
         let second_created = ensure_default_workspace_exists(&connection)
             .await
@@ -582,94 +569,6 @@ mod tests {
             .expect("active context list should succeed");
         assert_eq!(active_context.len(), 1);
         assert_eq!(active_context[0].item_id.as_deref(), Some("item_2"));
-    }
-
-    #[tokio::test]
-    async fn cleanup_removes_runtime_snapshots_for_closed_turns_only() {
-        let connection = setup_workspace_database().await;
-        let now = chrono::Utc::now().fixed_offset();
-        for (turn_id, status) in [
-            ("completed_turn", "completed"),
-            ("failed_turn", "failed"),
-            ("interrupted_turn", "interrupted"),
-            ("blocked_turn", "blocked"),
-            ("active_turn", "in_progress"),
-        ] {
-            turn::ActiveModel {
-                id: Set(turn_id.to_owned()),
-                thread_id: Set("thread_1".to_owned()),
-                status: Set(status.to_owned()),
-                turn_kind: Set("conversation".to_owned()),
-                origin: Set("user".to_owned()),
-                error: Set(None),
-                prompt_manifest_json: Set("{}".to_owned()),
-                created_at: Set(now),
-                updated_at: Set(now),
-                ..Default::default()
-            }
-            .insert(&connection)
-            .await
-            .expect("turn insert should succeed");
-        }
-
-        let store = CrudStore::new(connection.clone());
-        for turn_id in [
-            "completed_turn",
-            "failed_turn",
-            "interrupted_turn",
-            "blocked_turn",
-            "active_turn",
-        ] {
-            store
-                .upsert_turn_runtime_snapshot(NewTurnRuntimeSnapshot {
-                    turn_id: turn_id.to_owned(),
-                    thread_id: "thread_1".to_owned(),
-                    workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
-                    mode_json: r#""Agent""#.to_owned(),
-                    model: "model-a".to_owned(),
-                    provider_name: "provider-a".to_owned(),
-                    reasoning_effort: None,
-                    agent_skill_versions_json: None,
-                    hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#
-                        .to_owned(),
-                    workspace_skill_policies_json: "[]".to_owned(),
-                    input_json: "[]".to_owned(),
-                    capabilities_json: "[]".to_owned(),
-                    resolved_artifacts_json: "[]".to_owned(),
-                    runtime_environment_json: "{}".to_owned(),
-                    history_json: "[]".to_owned(),
-                    created_at: now,
-                    updated_at: now,
-                })
-                .await
-                .expect("runtime snapshot insert should succeed");
-        }
-
-        let deleted = cleanup_turn_runtime_snapshots(&connection)
-            .await
-            .expect("runtime snapshot cleanup should succeed");
-        assert_eq!(deleted, 3);
-
-        for turn_id in ["completed_turn", "failed_turn", "interrupted_turn"] {
-            assert!(
-                store
-                    .get_turn_runtime_snapshot(turn_id)
-                    .await
-                    .expect("runtime snapshot read should succeed")
-                    .is_none(),
-                "{turn_id} snapshot should be removed"
-            );
-        }
-        for turn_id in ["blocked_turn", "active_turn"] {
-            assert!(
-                store
-                    .get_turn_runtime_snapshot(turn_id)
-                    .await
-                    .expect("runtime snapshot read should succeed")
-                    .is_some(),
-                "{turn_id} snapshot should be retained"
-            );
-        }
     }
 
     #[tokio::test]

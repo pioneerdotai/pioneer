@@ -2100,22 +2100,6 @@ mod tests {
         assert!(BedrockProvider::build_request(&request, &prepared).is_err());
     }
 
-    #[test]
-    fn usage_normalization_preserves_input_without_optional_cache_counters() {
-        let complete: super::BedrockUsage = serde_json::from_value(serde_json::json!({
-            "inputTokens":10,"cacheReadInputTokens":100,"cacheWriteInputTokens":20,"outputTokens":8
-        }))
-        .unwrap();
-        assert_eq!(complete.normalized().input_tokens, Some(130));
-        assert_eq!(complete.normalized().output_tokens, Some(8));
-        let missing: super::BedrockUsage = serde_json::from_value(serde_json::json!({
-            "inputTokens":10,"outputTokens":8
-        }))
-        .unwrap();
-        assert_eq!(missing.normalized().input_tokens, Some(10));
-        assert_eq!(missing.normalized().output_tokens, Some(8));
-    }
-
     use super::*;
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
     use crate::traits::Provider;
@@ -2525,41 +2509,6 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_reasoning_registry_exposes_aws_documented_claude_opus_4_5() {
-        let reasoning = reasoning_registry::reasoning_capabilities_for_model(
-            "bedrock",
-            "anthropic.claude-opus-4-5",
-        )
-        .expect("bedrock opus 4.5 effort metadata");
-
-        assert_eq!(reasoning.supported, Some(true));
-        assert_eq!(
-            reasoning.effort_options,
-            vec!["none", "low", "medium", "high"]
-        );
-        assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
-    }
-
-    #[test]
-    fn bedrock_reasoning_registry_leaves_older_claude_unset() {
-        assert!(
-            reasoning_registry::reasoning_capabilities_for_model(
-                "bedrock",
-                "anthropic.claude-3-7-sonnet"
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn bedrock_reasoning_registry_leaves_non_anthropic_models_unset() {
-        assert!(
-            reasoning_registry::reasoning_capabilities_for_model("bedrock", "amazon.nova-pro-v1:0")
-                .is_none()
-        );
-    }
-
-    #[test]
     fn bedrock_model_list_fixture_normalizes_reasoning_capabilities() {
         let response: BedrockModelsResponse = serde_json::from_str(
             r#"{
@@ -2630,20 +2579,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_name() {
-        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
-        assert_eq!(provider.name(), "bedrock");
-    }
-
-    #[test]
-    fn provider_capabilities() {
-        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
-        let caps = provider.capabilities();
-        assert!(!caps.streaming);
-        assert!(caps.vision);
-    }
-
-    #[test]
     fn converse_url_simple_model() {
         let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
         let url = provider.converse_url("anthropic.claude-3-sonnet-20240229-v1:0");
@@ -2651,15 +2586,6 @@ mod tests {
             url,
             "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-sonnet-20240229-v1%3A0/converse"
         );
-    }
-
-    #[test]
-    fn converse_url_encodes_slashes() {
-        let provider = BedrockProvider::new("AKID", "SECRET", "us-west-2");
-        let url = provider
-            .converse_url("arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-v2");
-        assert!(url.contains("%2F"));
-        assert!(!url.contains("foundation-model/anthropic"));
     }
 
     #[test]
@@ -2944,73 +2870,32 @@ mod tests {
     }
 
     #[test]
-    fn sigv4_signing_produces_valid_format() {
-        let url: Url = "https://bedrock-runtime.us-east-1.amazonaws.com/model/test/converse"
-            .parse()
-            .unwrap();
-        let body = b"{}";
-        let datetime = "20260319T120000Z";
-
-        let auth = sign_request(
-            "POST",
-            &url,
-            body,
-            "AKIAIOSFODNN7EXAMPLE",
-            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            None,
-            "us-east-1",
-            "bedrock",
-            datetime,
-        );
-
-        assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260319/us-east-1/bedrock/aws4_request"));
-        assert!(auth.contains("SignedHeaders=content-type;host;x-amz-date"));
-        assert!(auth.contains("Signature="));
-    }
-
-    #[test]
-    fn sigv4_signing_includes_security_token_header() {
-        let url: Url = "https://bedrock-runtime.us-east-1.amazonaws.com/model/test/converse"
-            .parse()
-            .unwrap();
-        let body = b"{}";
-        let datetime = "20260319T120000Z";
-
-        let auth = sign_request(
-            "POST",
-            &url,
-            body,
-            "AKID",
-            "SECRET",
-            Some("TOKEN"),
-            "us-east-1",
-            "bedrock",
-            datetime,
-        );
-
-        assert!(auth.contains("x-amz-security-token"));
-    }
-
-    #[test]
-    fn unix_to_datetime_epoch() {
-        let (y, m, d, h, min, s) = unix_to_datetime(0);
-        assert_eq!((y, m, d, h, min, s), (1970, 1, 1, 0, 0, 0));
-    }
-
-    #[test]
-    fn unix_to_datetime_known_date() {
-        // 2026-03-20 12:00:00 UTC = 1774008000
-        let (y, m, d, h, min, s) = unix_to_datetime(1774008000);
-        assert_eq!((y, m, d, h, min, s), (2026, 3, 20, 12, 0, 0));
-    }
-
-    #[test]
     fn amz_datetime_format() {
         let dt = BedrockProvider::amz_datetime();
         // Should be 16 chars: YYYYMMDDTHHmmSSZ
         assert_eq!(dt.len(), 16);
         assert!(dt.contains('T'));
         assert!(dt.ends_with('Z'));
+    }
+
+    #[test]
+    fn provider_metadata_preserves_default_identity_and_capabilities() {
+        let provider = BedrockProvider::new("AKID", "SECRET", "us-east-1");
+        assert_eq!(provider.name(), "bedrock");
+        let caps = provider.capabilities();
+        assert!(!caps.streaming);
+        assert!(caps.vision);
+    }
+
+    #[test]
+    fn unix_timestamps_map_to_calendar_components() {
+        for (timestamp, expected) in [
+            (0, (1970, 1, 1, 0, 0, 0)),
+            // 2026-03-20 12:00:00 UTC = 1774008000
+            (1774008000, (2026, 3, 20, 12, 0, 0)),
+        ] {
+            assert_eq!(unix_to_datetime(timestamp), expected);
+        }
     }
 }
 

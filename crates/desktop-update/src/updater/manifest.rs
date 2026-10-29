@@ -265,65 +265,9 @@ mod tests {
         assert_eq!(manifest.assets[0].name, "Pioneer-aarch64.app.zip");
     }
 
-    #[test]
-    fn rejects_wrong_schema_version() {
-        let mut value = valid_manifest();
-        value["schema_version"] = json!(2);
-
-        assert_error_code(value, DesktopManifestErrorCode::WrongSchemaVersion);
-    }
-
-    #[test]
-    fn rejects_wrong_product() {
-        let mut value = valid_manifest();
-        value["product"] = json!("pioneer-gateway");
-
-        assert_error_code(value, DesktopManifestErrorCode::WrongProduct);
-    }
-
-    #[test]
-    fn rejects_missing_required_field() {
-        let mut value = valid_manifest();
-        value.as_object_mut().unwrap().remove("tag");
-
-        assert_error_code(value, DesktopManifestErrorCode::MissingField);
-    }
-
-    #[test]
-    fn rejects_empty_required_field() {
-        let mut value = valid_manifest();
-        value["assets"][0]["name"] = json!(" ");
-
-        assert_error_code(value, DesktopManifestErrorCode::EmptyField);
-    }
-
-    #[test]
-    fn rejects_invalid_sha256() {
-        let mut value = valid_manifest();
-        value["assets"][0]["sha256"] =
-            json!("ABCDEFabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdef");
-
-        assert_error_code(value, DesktopManifestErrorCode::InvalidSha256);
-    }
-
-    #[test]
-    fn rejects_duplicate_os_arch_kind_entries() {
-        let mut value = valid_manifest();
-        let duplicate = value["assets"][0].clone();
-        value["assets"].as_array_mut().unwrap().push(duplicate);
-
-        assert_error_code(value, DesktopManifestErrorCode::DuplicateAsset);
-    }
-
     fn parse_manifest(value: Value) -> super::DesktopUpdateManifest {
         let bytes = serde_json::to_vec(&value).unwrap();
         parse_desktop_update_manifest(&bytes).unwrap()
-    }
-
-    fn assert_error_code(value: Value, expected_code: DesktopManifestErrorCode) {
-        let bytes = serde_json::to_vec(&value).unwrap();
-        let error = parse_desktop_update_manifest(&bytes).unwrap_err();
-        assert_eq!(error.code(), expected_code);
     }
 
     fn valid_manifest() -> Value {
@@ -353,5 +297,71 @@ mod tests {
                 }
             ]
         })
+    }
+
+    #[test]
+    fn invalid_desktop_manifests_report_their_exact_validation_code() {
+        for (case, value, expected) in [
+            (
+                "rejects_wrong_schema_version",
+                {
+                    let mut value = valid_manifest();
+                    value["schema_version"] = json!(2);
+                    value
+                },
+                DesktopManifestErrorCode::WrongSchemaVersion,
+            ),
+            (
+                "rejects_wrong_product",
+                {
+                    let mut value = valid_manifest();
+                    value["product"] = json!("pioneer-gateway");
+                    value
+                },
+                DesktopManifestErrorCode::WrongProduct,
+            ),
+            (
+                "rejects_missing_required_field",
+                {
+                    let mut value = valid_manifest();
+                    value.as_object_mut().unwrap().remove("tag");
+                    value
+                },
+                DesktopManifestErrorCode::MissingField,
+            ),
+            (
+                "rejects_empty_required_field",
+                {
+                    let mut value = valid_manifest();
+                    value["assets"][0]["name"] = json!(" ");
+                    value
+                },
+                DesktopManifestErrorCode::EmptyField,
+            ),
+            (
+                "rejects_invalid_sha256",
+                {
+                    let mut value = valid_manifest();
+                    value["assets"][0]["sha256"] =
+                        json!("ABCDEFabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdef");
+                    value
+                },
+                DesktopManifestErrorCode::InvalidSha256,
+            ),
+            (
+                "rejects_duplicate_os_arch_kind_entries",
+                {
+                    let mut value = valid_manifest();
+                    let duplicate = value["assets"][0].clone();
+                    value["assets"].as_array_mut().unwrap().push(duplicate);
+                    value
+                },
+                DesktopManifestErrorCode::DuplicateAsset,
+            ),
+        ] {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let error = parse_desktop_update_manifest(&bytes).expect_err(case);
+            assert_eq!(error.code(), expected, "{case}");
+        }
     }
 }

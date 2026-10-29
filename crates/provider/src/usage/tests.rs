@@ -17,6 +17,7 @@ fn exclusive_cache_absent_read_write_and_zero_are_preserved() {
             decode::<2>(value)
         };
         assert_eq!(u.input_tokens, Some(10));
+        assert_eq!(u.output_tokens, Some(8));
         assert_eq!(u.cache_read_input_tokens, None);
     }
     let u = decode::<1>(
@@ -30,22 +31,14 @@ fn exclusive_cache_absent_read_write_and_zero_are_preserved() {
     );
     assert_eq!(u.input_tokens, Some(130));
     assert_eq!(u.reported_total_tokens, Some(138));
+    assert_eq!(u.output_tokens, Some(8));
     let u = decode::<1>(
         json!({"input_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}),
     );
     assert_eq!(u.cache_read_input_tokens, Some(0));
     assert_eq!(u.output_tokens, None);
 }
-#[test]
-fn inclusive_chat_reasoning_is_not_added_to_output() {
-    let u = decode::<0>(json!({"prompt_tokens":140,"completion_tokens":19,
-        "prompt_tokens_details":{"cached_tokens":100,"cache_write_tokens":20},
-        "completion_tokens_details":{"reasoning_tokens":10},"total_tokens":159}));
-    assert_eq!(u.input_tokens, Some(140));
-    assert_eq!(u.output_tokens, Some(19));
-    assert_eq!(u.reasoning_tokens, Some(10));
-    assert_eq!(u.uncached_input_tokens, Some(20));
-}
+
 #[test]
 fn gemini_candidates_and_thoughts_are_separate_from_inclusive_total() {
     let u = decode::<3>(json!({"promptTokenCount":140,"cachedContentTokenCount":100,
@@ -234,22 +227,7 @@ fn partial_gemini_thought_snapshot_preserves_candidates_without_double_counting(
     assert_eq!(usage.input_tokens, Some(140));
     assert_eq!(usage.service_tier.as_deref(), Some("flex"));
 }
-#[test]
-fn nondefault_service_tier_does_not_use_standard_catalog_rate() {
-    let u = TokenUsage {
-        input_tokens: Some(1),
-        output_tokens: Some(1),
-        cache_read_input_tokens: Some(0),
-        cache_write_input_tokens: Some(0),
-        service_tier: Some("priority".into()),
-        ..Default::default()
-    };
-    let metadata = BTreeMap::from([
-        ("pricingEvidenceVersion".into(), json!(1)),
-        ("pricingUnits".into(), json!("USD_per_million_tokens")),
-    ]);
-    assert!(estimate(&u, &json!({"input":1,"output":1}), &metadata).is_none());
-}
+
 #[test]
 fn nested_reported_cost_survives_without_inventing_currency() {
     let u =

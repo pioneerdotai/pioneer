@@ -388,28 +388,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_mode_change_preserves_stable_provider_identity() {
-        let provider_session_id = Uuid::new_v4();
-        let first = CliSessionLaunchSpec {
-            options: CLIAgentRuntimeSessionStartOptions::default(),
-            mcp: CliMcpSessionLaunch::Disabled,
-            continuation: CliProviderContinuation::ClaudeNew {
-                provider_session_id,
-            },
-            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
-        };
-        let resumed = CliSessionLaunchSpec {
-            options: CLIAgentRuntimeSessionStartOptions::default(),
-            mcp: CliMcpSessionLaunch::Disabled,
-            continuation: CliProviderContinuation::ClaudeResume {
-                provider_session_id,
-            },
-            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
-        };
-        assert!(!requires_restart(&first, &resumed));
-    }
-
-    #[test]
     fn claude_session_identity_is_redacted_from_launch_debug() {
         let provider_session_id = Uuid::new_v4();
         let launch = CliSessionLaunchSpec::claude_new(

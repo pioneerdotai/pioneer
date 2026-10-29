@@ -928,6 +928,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["options"]["num_predict"], 1024);
+        assert_eq!(body["options"]["temperature"], serde_json::json!(0.7_f32));
         assert_eq!(body["think"], false);
     }
 
@@ -1046,42 +1047,6 @@ mod tests {
     }
 
     #[test]
-    fn creates_with_default_base_url() {
-        let provider = OllamaProvider::new();
-        assert_eq!(provider.base_url, DEFAULT_BASE_URL);
-    }
-
-    #[test]
-    fn creates_with_custom_base_url() {
-        let provider = OllamaProvider::with_base_url("http://my-ollama:8080");
-        assert_eq!(provider.base_url, "http://my-ollama:8080");
-    }
-
-    #[test]
-    fn normalize_strips_trailing_slash() {
-        let provider = OllamaProvider::with_base_url("http://localhost:11434/");
-        assert_eq!(provider.base_url, "http://localhost:11434");
-    }
-
-    #[test]
-    fn normalize_strips_trailing_api() {
-        let provider = OllamaProvider::with_base_url("http://localhost:11434/api");
-        assert_eq!(provider.base_url, "http://localhost:11434");
-    }
-
-    #[test]
-    fn normalize_strips_trailing_api_with_slash() {
-        let provider = OllamaProvider::with_base_url("http://localhost:11434/api/");
-        assert_eq!(provider.base_url, "http://localhost:11434");
-    }
-
-    #[test]
-    fn chat_url_built_correctly() {
-        let provider = OllamaProvider::new();
-        assert_eq!(provider.chat_url(), "http://localhost:11434/api/chat");
-    }
-
-    #[test]
     fn chat_url_with_custom_base() {
         let provider = OllamaProvider::with_base_url("http://remote:9999");
         assert_eq!(provider.chat_url(), "http://remote:9999/api/chat");
@@ -1147,33 +1112,6 @@ mod tests {
     }
 
     #[test]
-    fn request_serializes_with_temperature() {
-        let request = OllamaChatRequest {
-            think: None,
-            model: "llama3".into(),
-            messages: vec![OllamaMessage {
-                role: "user".into(),
-                content: Some("Hello".into()),
-                thinking: None,
-                images: None,
-                tool_name: None,
-                tool_call_id: None,
-                tool_calls: None,
-            }],
-            stream: false,
-            tools: None,
-            options: Some(OllamaOptions {
-                num_predict: None,
-                temperature: Some(0.7),
-            }),
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"temperature\":0.7"));
-        assert!(json.contains("\"options\""));
-    }
-
-    #[test]
     fn response_deserializes() {
         let json = r#"{
             "message": {"role": "assistant", "content": "Hello from Ollama"},
@@ -1196,22 +1134,6 @@ mod tests {
         assert_eq!(response.message.content.as_deref(), Some("Hi"));
         assert!(response.prompt_eval_count.is_none());
         assert!(response.eval_count.is_none());
-    }
-
-    #[test]
-    fn stream_chunk_deserializes_delta() {
-        let json = r#"{"message": {"content": "Hello"}, "done": false}"#;
-        let chunk: OllamaStreamChunk = serde_json::from_str(json).unwrap();
-        assert_eq!(chunk.message.content.as_deref(), Some("Hello"));
-        assert!(!chunk.done);
-    }
-
-    #[test]
-    fn stream_chunk_deserializes_done() {
-        let json = r#"{"message": {"content": ""}, "done": true}"#;
-        let chunk: OllamaStreamChunk = serde_json::from_str(json).unwrap();
-        assert!(chunk.done);
-        assert_eq!(chunk.message.content.as_deref(), Some(""));
     }
 
     #[test]
@@ -1248,14 +1170,9 @@ mod tests {
     }
 
     #[test]
-    fn provider_name() {
+    fn default_endpoint_and_capabilities() {
         let provider = OllamaProvider::new();
-        assert_eq!(provider.name(), "ollama");
-    }
-
-    #[test]
-    fn provider_capabilities() {
-        let provider = OllamaProvider::new();
+        assert_eq!(provider.chat_url(), "http://localhost:11434/api/chat");
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);

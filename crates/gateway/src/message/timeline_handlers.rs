@@ -614,14 +614,6 @@ impl MessageProcessor {
             u64::try_from(blocks.len()).unwrap_or(u64::MAX),
         );
 
-        let connection_workspace_stage = trace.stage(
-            pioneer_observability::GatewayOperationStage::ThreadTimelineConnectionWorkspaceSet,
-        );
-        self.session_manager
-            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-            .await;
-        connection_workspace_stage.succeed();
-
         let response_payload = ThreadTimelinePageResponse {
             workspace_id,
             thread_id: requested_thread_id,
@@ -802,9 +794,6 @@ impl MessageProcessor {
                 }
             };
             let workspace_id = authorization.workspace_id().to_owned();
-            self.session_manager
-                .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-                .await;
             let response_payload = TurnWorkPageResponse {
                 workspace_id,
                 thread_id: params.thread_id,
@@ -901,10 +890,6 @@ impl MessageProcessor {
                 return;
             }
         };
-
-        self.session_manager
-            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-            .await;
 
         let response_payload = TurnWorkPageResponse {
             workspace_id,
@@ -1065,9 +1050,6 @@ impl MessageProcessor {
         };
 
         let workspace_id = snapshot.projection.workspace_id.clone();
-        self.session_manager
-            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-            .await;
 
         let response_payload = TurnWorkItemsGetResponse {
             workspace_id,

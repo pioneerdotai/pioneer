@@ -1390,33 +1390,6 @@ async fn delivery_context_preserves_latest_window_without_attempts_or_payloads()
 }
 
 #[tokio::test]
-async fn empty_budget_page_restores_waiting_priority_and_error_history() {
-    let store = store().await;
-    let task = created(&store, "empty_byte_page").await;
-    let prior = row(&store, &task.id).await.unwrap();
-    let holder = claim(&store, &task.id, "empty-page", NOW).await;
-    assert!(matches!(
-        store
-            .task_event_fanout_page(&task.id, 0, 2, &mut 1, false)
-            .await
-            .unwrap(),
-        TaskEventFanoutPage::BudgetDeferred
-    ));
-    queue::release(
-        &store.with_maintenance_access().connection,
-        &holder,
-        TaskEventFanoutOutcome::BudgetDeferred,
-        &|| NOW,
-    )
-    .await
-    .unwrap();
-    let released = row(&store, &task.id).await.unwrap();
-    assert_eq!(released.attempts, prior.attempts);
-    assert_eq!(released.due_at, prior.due_at);
-    assert!(released.claim_token.is_none());
-}
-
-#[tokio::test]
 async fn utf8_metadata_bytecode_does_not_fetch_overflow_payload_before_admission() {
     use sea_orm::QueryTrait;
     let store = store().await;

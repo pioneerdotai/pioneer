@@ -1278,6 +1278,46 @@ mod tests {
     }
 
     #[test]
+    fn background_and_late_directory_reads_preserve_navigation() {
+        use crate::navigation::NavigationIntent;
+        for late in [false, true] {
+            let core = ClientCore::new();
+            core.navigate(
+                NavigationIntent::SelectWorkspace {
+                    workspace_id: Some(if late { "a" } else { "b" }.into()),
+                },
+                None,
+            );
+            let publication = core
+                .refresh_workspace_tree_with_transport(
+                    "a",
+                    &TreeReply {
+                        core: &core,
+                        response: response(vec![thread("a1", "a", 1)], &[], &[]),
+                        during: |core: &ClientCore| {
+                            if late {
+                                core.navigate(
+                                    NavigationIntent::SelectWorkspace {
+                                        workspace_id: Some("b".into()),
+                                    },
+                                    None,
+                                );
+                            }
+                        },
+                    },
+                )
+                .unwrap();
+            assert_eq!(core.navigation_snapshot().workspace_id(), Some("b"));
+            assert!(core.navigation_snapshot().active_thread_id().is_none());
+            assert!(publication.snapshot().threads_by_id.contains_key("a1"));
+            assert_eq!(
+                publication.load().unwrap().state,
+                ThreadTreeLoadState::Ready
+            );
+        }
+    }
+
+    #[test]
     fn rpc_and_live_directory_summaries_preserve_titles_drafts_and_metadata() {
         let core = ClientCore::new();
         let mut full = conversation_thread("t", "a", 1, Some("high"));

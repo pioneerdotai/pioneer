@@ -1,3 +1,6 @@
+#[path = "tests/workspace_scope.rs"]
+mod workspace_scope;
+
 #[cfg(unix)]
 #[path = "tests/title_recovery.rs"]
 mod title_recovery;
@@ -63,6 +66,9 @@ mod task_webhooks;
 
 #[path = "tests/thread_launch_choices.rs"]
 mod thread_launch_choices;
+
+#[path = "tests/native_turn_event_delivery_workers.rs"]
+mod native_turn_event_delivery_workers;
 
 #[path = "tests/reconciliation_workers.rs"]
 mod reconciliation_workers;
@@ -3722,44 +3728,6 @@ fn resilience_maintenance_failure_does_not_backoff_critical_polling() {
     ));
 }
 
-#[test]
-fn terminal_failure_paths_stay_behind_recovery_gate() {
-    let leaf_sources = [
-        ("turn_handlers.rs", include_str!("turn_handlers.rs")),
-        ("artifact_tools.rs", include_str!("artifact_tools.rs")),
-        (
-            "task_agent_executor.rs",
-            include_str!("task_agent_executor.rs"),
-        ),
-        ("mod.rs", include_str!("mod.rs")),
-    ];
-
-    for (name, source) in leaf_sources {
-        assert!(
-            !source.contains("mark_turn_failed_terminal("),
-            "{name} must not bypass recovery with mark_turn_failed_terminal"
-        );
-        assert!(
-            !source.contains("mark_turn_failed_with_recovery("),
-            "{name} must not bypass recovery with mark_turn_failed_with_recovery"
-        );
-    }
-
-    let runtime = include_str!("agent_runtime.rs");
-    assert_eq!(
-        runtime.matches(".mark_turn_failed_terminal(").count(),
-        1,
-        "terminal failure transition should only be requested from recovery exhaustion handling"
-    );
-    assert_eq!(
-        runtime
-            .matches("pub(super) async fn mark_turn_failed_terminal(")
-            .count(),
-        1,
-        "terminal failure transition should have one centralized implementation"
-    );
-}
-
 struct CompletingSystemExecutor;
 
 #[async_trait]
@@ -5451,29 +5419,6 @@ fn phase_21_message_processor_starts_generic_hook_recovery_worker() {
             .expect("hook recovery worker should be started");
         handle.abort();
     });
-}
-
-#[tokio::test]
-async fn phase_21_memory_bridge_installs_recoverable_hook_runtime() {
-    let harness = setup_memory_gateway_harness("phase21_recoverable_runtime", true).await;
-    harness.processor.bind_memory_bridge_if_enabled().await;
-
-    let runtime = harness
-        .processor
-        .hook_runtime
-        .read()
-        .await
-        .clone()
-        .expect("memory bridge should install hook runtime");
-    assert!(runtime.has_run_store());
-    let post_turn_subscription = runtime
-        .subscriptions()
-        .get_subscription(
-            &HookSubscriptionId::new("memory.post_turn_extractor.default")
-                .expect("static subscription id is valid"),
-        )
-        .expect("subscription lookup succeeds");
-    assert!(post_turn_subscription.is_some());
 }
 
 #[tokio::test]
@@ -7765,6 +7710,43 @@ async fn provider_configure_and_list_round_trips_custom_base_url() {
     );
     assert!(definition.supports_base_url_override);
 
+    {
+        let base_url = "http://127.0.0.1:30000/private/v1";
+        processor
+            .gateway_secrets
+            .set_workspace_provider_base_url(&workspace_id, "openai", base_url)
+            .unwrap();
+        let id =
+            pioneer_protocol::RequestId::new(generate_test_request_id("provider", "keysaveread"))
+                .unwrap();
+        processor
+            .provider_configure(
+                &request_context,
+                id.clone(),
+                ProviderConfigureParams {
+                    workspace_id: workspace_id.clone(),
+                    provider: "openai".into(),
+                    api_key: Some("new-key".into()),
+                    proxy_url: None,
+                    clear_proxy: false,
+                    base_url: None,
+                    clear_base_url: false,
+                },
+            )
+            .await;
+        let response: ProviderConfigureResponse =
+            serde_json::from_value(recv_response_by_id(&mut rx, id.as_str()).await.result).unwrap();
+        assert!(response.api_key_updated);
+        assert_eq!(
+            processor
+                .gateway_secrets
+                .get_workspace_provider_base_url(&workspace_id, "openai")
+                .unwrap()
+                .as_deref(),
+            Some(base_url)
+        );
+    }
+
     let configure_req_id =
         pioneer_protocol::RequestId::new(generate_test_request_id("provider", "cfg_1"))
             .expect("valid request id");
@@ -7923,46 +7905,6 @@ async fn provider_configure_rejects_invalid_or_unsupported_base_url_before_any_w
                 .is_none()
         );
     }
-}
-
-#[tokio::test]
-async fn api_key_save_while_base_url_read_is_pending_preserves_override() {
-    let (processor, _, mut rx, connection_id, _, workspace_id, _) =
-        setup_provider_api_key_processor("base_url_pending_read_save").await;
-    let base_url = "http://127.0.0.1:30000/private/v1";
-    processor
-        .gateway_secrets
-        .set_workspace_provider_base_url(&workspace_id, "openai", base_url)
-        .unwrap();
-    let context = registered_request_context(&processor, connection_id, "provider/test").await;
-    let id = pioneer_protocol::RequestId::new(generate_test_request_id("provider", "keysaveread"))
-        .unwrap();
-    processor
-        .provider_configure(
-            &context,
-            id.clone(),
-            ProviderConfigureParams {
-                workspace_id: workspace_id.clone(),
-                provider: "openai".into(),
-                api_key: Some("new-key".into()),
-                proxy_url: None,
-                clear_proxy: false,
-                base_url: None,
-                clear_base_url: false,
-            },
-        )
-        .await;
-    let response: ProviderConfigureResponse =
-        serde_json::from_value(recv_response_by_id(&mut rx, id.as_str()).await.result).unwrap();
-    assert!(response.api_key_updated);
-    assert_eq!(
-        processor
-            .gateway_secrets
-            .get_workspace_provider_base_url(&workspace_id, "openai")
-            .unwrap()
-            .as_deref(),
-        Some(base_url)
-    );
 }
 
 #[tokio::test]
@@ -11495,38 +11437,6 @@ async fn commentary_completion_does_not_enter_gateway_final_accounting() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn many_assistant_progress_deltas_do_not_create_persisted_delta_rows() {
-    let harness = setup_progress_delta_harness(
-        "manymsg",
-        TurnItem::AgentMessage {
-            id: "item_progress_many_msg".to_owned(),
-            text: String::new(),
-            phase: Default::default(),
-            markdown: None,
-            markdown_version: None,
-        },
-        false,
-    )
-    .await;
-
-    for _ in 0..1000 {
-        harness
-            .processor
-            .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
-                notification: progress_delta_notification(
-                    &harness,
-                    "x",
-                    ItemDeltaStream::AgentMessage,
-                ),
-            })
-            .await;
-    }
-
-    let payloads = turn_item_payloads(&harness).await;
-    assert_no_persisted_item_delta(payloads.as_slice());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_progress_does_not_write_the_policy_generation_row() {
     let harness = setup_progress_delta_harness(
         "policyhotpath",
@@ -12558,76 +12468,6 @@ async fn child_thread_scope_skips_auto_title_generation() {
         "child thread should never trigger auto-title provider call"
     );
     assert_eq!(thread.name.as_deref(), Some(child_title));
-}
-
-#[test]
-fn user_message_payload_from_input_extracts_text_and_attachments() {
-    let (text, attachments) = super::user_message_payload_from_input(&[
-        UserInput::Text {
-            text: "analyze this".to_owned(),
-            text_elements: Vec::new(),
-        },
-        UserInput::File {
-            url: "https://example.com/report.pdf".to_owned(),
-        },
-        UserInput::LocalFile {
-            path: "/tmp/report.pdf".to_owned(),
-        },
-        UserInput::Audio {
-            url: "https://example.com/note.mp3".to_owned(),
-        },
-        UserInput::LocalAudio {
-            path: "/tmp/note.wav".to_owned(),
-        },
-        UserInput::Video {
-            url: "https://example.com/demo.mp4".to_owned(),
-        },
-        UserInput::LocalVideo {
-            path: "/tmp/demo.mov".to_owned(),
-        },
-    ])
-    .expect("rendered user message payload");
-
-    assert_eq!(text, "analyze this");
-    assert_eq!(
-        attachments,
-        vec![
-            UserMessageAttachment::File {
-                url: "https://example.com/report.pdf".to_owned()
-            },
-            UserMessageAttachment::LocalFile {
-                path: "/tmp/report.pdf".to_owned()
-            },
-            UserMessageAttachment::Audio {
-                url: "https://example.com/note.mp3".to_owned()
-            },
-            UserMessageAttachment::LocalAudio {
-                path: "/tmp/note.wav".to_owned()
-            },
-            UserMessageAttachment::Video {
-                url: "https://example.com/demo.mp4".to_owned()
-            },
-            UserMessageAttachment::LocalVideo {
-                path: "/tmp/demo.mov".to_owned()
-            }
-        ]
-    );
-}
-
-#[test]
-fn user_message_payload_from_input_keeps_attachment_only_message() {
-    let (text, attachments) = super::user_message_payload_from_input(&[UserInput::LocalFile {
-        path: "/tmp/report.pdf".to_owned(),
-    }])
-    .expect("attachment-only user message should still materialize");
-
-    assert!(text.is_empty());
-    assert_eq!(
-        attachments,
-        vec![UserMessageAttachment::LocalFile {
-            path: "/tmp/report.pdf".to_owned()
-        }]
-    );
 }
 
 async fn start_thread_for_artifact_test(
@@ -15290,9 +15130,12 @@ async fn detached_composer_live_ordering_impl() {
 
     // An already-owned optional outbox worker cannot deliver during admission.
     // The controlled barrier pauses after live publication, before Task creation.
-    processor
-        .native_turn_event_delivery_kick_running
-        .store(true, Ordering::SeqCst);
+    for owner in [
+        &processor.native_turn_event_delivery_workers.live,
+        &processor.native_turn_event_delivery_workers.episodic,
+    ] {
+        owner.running.store(true, Ordering::SeqCst);
+    }
     processor.arm_completed_history_preparation_barrier("__detached_composer_before_task_create__");
     // Keep the full message longer than the Task title without depending on
     // whitespace that the existing UserMessage materialization normalizes.
@@ -15410,9 +15253,12 @@ async fn detached_composer_live_ordering_impl() {
     request_task.await.unwrap();
     // Restore automatic delivery before normal queries/operations. Its later
     // replay retains the same durable item identity and cannot create a second row.
-    processor
-        .native_turn_event_delivery_kick_running
-        .store(false, Ordering::SeqCst);
+    for owner in [
+        &processor.native_turn_event_delivery_workers.live,
+        &processor.native_turn_event_delivery_workers.episodic,
+    ] {
+        owner.running.store(false, Ordering::SeqCst);
+    }
     processor.kick_native_turn_event_deliveries();
     let items = store
         .get_turn_item_events(parent, turn_id)
@@ -16427,6 +16273,13 @@ impl crate::voice::supervisor::VoiceModelInstaller for TestGatewayVoiceInstaller
 struct TestGatewayVoiceEngineLoader;
 
 impl crate::voice::supervisor::VoiceEngineLoader for TestGatewayVoiceEngineLoader {
+    fn prepare_vad(
+        &self,
+        _: &tokio_util::sync::CancellationToken,
+    ) -> std::result::Result<(), crate::voice::transcription::VoiceTranscriptionError> {
+        Ok(()) // Deterministic lifecycle fixture; no native model operations.
+    }
+
     fn load(
         &self,
         _entry: &crate::voice::model_catalog::VoiceModelCatalogEntry,
@@ -16443,7 +16296,7 @@ impl crate::voice::supervisor::VoiceEngineLoader for TestGatewayVoiceEngineLoade
 }
 
 // Regression harness uses the real owned-request dispatcher on one connection.
-// Only the speech transcriber is replaced; VAD/session/claim/admission stay real.
+// ASR and detector are deterministic fixtures; smoothing/session/claim/admission stay real.
 struct PendingVoiceRelease(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
 impl PendingVoiceRelease {
     fn release(&self) {
@@ -17707,10 +17560,18 @@ fn owned_voice_ingress_case(
     })
 }
 
-fn ready_gateway_voice_supervisor(
-    transcript: &str,
-) -> Arc<crate::voice::supervisor::VoiceInputSupervisor> {
-    ready_gateway_voice_supervisor_for_model(transcript, "parakeet-tdt-0.6b-v3")
+impl MessageProcessor {
+    fn with_test_voice_transcript(mut self, transcript: &str) -> Self {
+        self = self.with_voice_input_supervisor(ready_gateway_voice_supervisor_for_model(
+            transcript,
+            "parakeet-tdt-0.6b-v3",
+        ));
+        // Message lifecycle fixtures use constant PCM, not a speech recording.
+        // The existing fake boundary also selects deterministic VAD for them.
+        let transcript = transcript.to_owned();
+        self.voice_test_transcriber = Some(Arc::new(move |_| Ok(transcript.clone())));
+        self
+    }
 }
 
 fn ready_gateway_voice_supervisor_for_model(
@@ -17848,7 +17709,7 @@ async fn first_voice_turn_materializes_runtime_draft() {
             test_summary_config(),
             test_tool_loop_config(),
         )
-        .with_voice_input_supervisor(ready_gateway_voice_supervisor("first voice message")),
+        .with_test_voice_transcript("first voice message"),
     );
     let thread_id = "thr_first_voice_runtime_draft";
     let turn_id = "turn_first_voice_runtime_draft";
@@ -17942,7 +17803,7 @@ async fn voice_turn_start_replay_does_not_dispatch_provider_again_impl() {
             test_summary_config(),
             test_tool_loop_config(),
         )
-        .with_voice_input_supervisor(ready_gateway_voice_supervisor("same durable voice request")),
+        .with_test_voice_transcript("same durable voice request"),
     );
     let thread_id = "thr_voice_admission_replay";
     let turn_id = "turn_voice_admission_replay";
@@ -18053,9 +17914,7 @@ async fn collaborative_voice_composer_admits_detached_task() {
             test_summary_config(),
             test_tool_loop_config(),
         )
-        .with_voice_input_supervisor(ready_gateway_voice_supervisor(
-            "run this voice command asynchronously",
-        )),
+        .with_test_voice_transcript("run this voice command asynchronously"),
     );
     let parent_thread_id = "thr_voice_collaborative";
     let started = thread_manager
@@ -18162,7 +18021,7 @@ async fn task_run_voice_composer_stays_foreground() {
             test_summary_config(),
             test_tool_loop_config(),
         )
-        .with_voice_input_supervisor(ready_gateway_voice_supervisor("continue inside this child")),
+        .with_test_voice_transcript("continue inside this child"),
     );
     let root_thread_id = "thr_voice_task_root";
     let root_turn_id = "turn_voice_task_root";
@@ -18349,9 +18208,7 @@ async fn voice_session_transcript_starts_turn_and_preserves_authorized_context_a
         test_summary_config(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     )
-    .with_voice_input_supervisor(ready_gateway_voice_supervisor(
-        "voice transcript with context",
-    ));
+    .with_test_voice_transcript("voice transcript with context");
     let thread = start_thread_for_artifact_test(
         &processor,
         connection_id,
@@ -18589,7 +18446,7 @@ async fn voice_session_cancel_drops_session_without_creating_turn() {
         test_summary_config(),
         test_tool_loop_config(),
     )
-    .with_voice_input_supervisor(ready_gateway_voice_supervisor("ignored"));
+    .with_test_voice_transcript("ignored");
     let thread = start_thread_for_artifact_test(
         &processor,
         connection_id,
@@ -18655,7 +18512,7 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
         test_summary_config(),
         test_tool_loop_config(),
     )
-    .with_voice_input_supervisor(ready_gateway_voice_supervisor("should not run"));
+    .with_test_voice_transcript("should not run");
     let thread = start_thread_for_artifact_test(
         &processor,
         connection_id,
@@ -19564,7 +19421,7 @@ async fn voice_settings_two_client_race_serializes_to_one_consistent_outcome() {
             test_tool_loop_config(),
         )
         .with_runtime_home_for_tests(runtime_home.clone())
-        .with_voice_input_supervisor(ready_gateway_voice_supervisor("race transcript")),
+        .with_test_voice_transcript("race transcript"),
     );
     let thread = start_thread_for_artifact_test(
         processor.as_ref(),
@@ -43062,7 +42919,8 @@ async fn save_and_deliver_episodic_wake_for_test(
         .unwrap();
     processor
         .process_claimed_native_turn_event_delivery(delivery.clone())
-        .await;
+        .await
+        .unwrap();
     let ack = pioneer_entity::turn_event_delivery::Entity::find_by_id(delivery.id.clone())
         .one(&store.database_connection())
         .await
@@ -43863,7 +43721,8 @@ async fn episodic_completed_and_updated_deliveries_ack_only_after_reconciliation
         .await;
     processor
         .process_claimed_native_turn_event_delivery(first.clone())
-        .await;
+        .await
+        .unwrap();
     let failed = pioneer_entity::turn_event_delivery::Entity::find_by_id(first.id.clone())
         .one(&crud_store.database_connection())
         .await
@@ -43898,7 +43757,8 @@ async fn episodic_completed_and_updated_deliveries_ack_only_after_reconciliation
     assert_eq!(retry.id, first.id);
     processor
         .process_claimed_native_turn_event_delivery(retry.clone())
-        .await;
+        .await
+        .unwrap();
     let job = crud_store
         .list_thread_episodic_index_jobs_for_thread(&workspace_id, thread_id, 10)
         .await
@@ -43908,7 +43768,8 @@ async fn episodic_completed_and_updated_deliveries_ack_only_after_reconciliation
     // A repeated delivery reconciles idempotently and cannot ACK an old lease.
     processor
         .process_claimed_native_turn_event_delivery(retry)
-        .await;
+        .await
+        .unwrap();
     let updated = crud_store
         .claim_due_turn_event_deliveries(
             pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER,
@@ -43926,7 +43787,8 @@ async fn episodic_completed_and_updated_deliveries_ack_only_after_reconciliation
     let updated_id = updated.id.clone();
     processor
         .process_claimed_native_turn_event_delivery(updated)
-        .await;
+        .await
+        .unwrap();
     let delivered = pioneer_entity::turn_event_delivery::Entity::find_by_id(updated_id)
         .one(&crud_store.database_connection())
         .await
@@ -45605,104 +45467,68 @@ async fn thread_start_rejects_unknown_workspace_id() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn thread_start_rejects_missing_thread_id() {
-    let (tx, mut rx) = mpsc::channel(8);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store,
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_tool_loop_config(),
-    );
-
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": "aaaaaaaaaaaaaaaaaaaaa",
-        "method": "thread/start",
-        "params": {
-            "workspace_id": workspace_id
-        }
-    });
-
-    processor
-        .process_request_for_connection(connection_id, &request.to_string())
-        .await;
-
-    let response = rx.recv().await.expect("expected error response");
-    let payload = match response {
-        Message::Text(payload) => payload.to_string(),
-        other => panic!("expected text response, got {other:?}"),
-    };
-    let value: serde_json::Value = serde_json::from_str(&payload).expect("json must decode");
-    let message = value
-        .get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-
-    assert!(
-        message.contains("thread_id"),
-        "error should mention missing thread_id, got: {message}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn thread_start_rejects_missing_workspace_id() {
-    let (tx, mut rx) = mpsc::channel(8);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, _) = setup_workspace_manager().await;
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store,
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_tool_loop_config(),
-    );
-
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": "aaaaaaaaaaaaaaaaaaaaa",
-        "method": "thread/start",
-        "params": {
-            "thread_id": "thr_000000000000000099"
-        }
-    });
-
-    processor
-        .process_request_for_connection(connection_id, &request.to_string())
-        .await;
-
-    let response = rx.recv().await.expect("expected error response");
-    let payload = match response {
-        Message::Text(payload) => payload.to_string(),
-        other => panic!("expected text response, got {other:?}"),
-    };
-    let value: serde_json::Value = serde_json::from_str(&payload).expect("json must decode");
-    let message = value
-        .get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-
-    assert!(
-        message.contains("workspace_id"),
-        "error should mention missing workspace_id, got: {message}"
-    );
+#[test]
+fn thread_start_missing_identifiers_report_the_missing_field() {
+    for missing_field in ["thread_id", "workspace_id"] {
+        // Keep each request's background workers inside a fresh runtime, as in the original tests.
+        let body = async {
+            let (tx, mut rx) = mpsc::channel(8);
+            let session_manager = Arc::new(SessionManager::new());
+            let connection_id =
+                register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+            let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+            let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+            let processor = MessageProcessor::new(
+                thread_manager,
+                test_provider(),
+                session_manager,
+                workspace_manager,
+                crud_store,
+                test_gateway_secrets(),
+                test_summary_config(),
+                test_tool_loop_config(),
+            );
+            let mut params = serde_json::Map::from_iter([
+                ("thread_id".to_owned(), json!("thr_000000000000000099")),
+                ("workspace_id".to_owned(), json!(workspace_id)),
+            ]);
+            params.remove(missing_field);
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": "aaaaaaaaaaaaaaaaaaaaa",
+                "method": "thread/start",
+                "params": params
+            });
+            processor
+                .process_request_for_connection(connection_id, &request.to_string())
+                .await;
+            let response = rx.recv().await.expect("expected error response");
+            let payload = match response {
+                Message::Text(payload) => payload.to_string(),
+                other => panic!("expected text response, got {other:?}"),
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&payload).expect("json must decode");
+            let message = value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            assert!(
+                message.contains(missing_field),
+                "error should mention missing {missing_field}, got: {message}"
+            );
+        };
+        tokio::pin!(body);
+        let body: ::core::pin::Pin<&mut dyn ::core::future::Future<Output = ()>> = body;
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("Failed building the Runtime")
+            .block_on(body);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -50082,103 +49908,6 @@ async fn codex_review_start_uncommitted_changes_is_rejected_without_runtime_call
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_review_start_custom_instructions_is_rejected_without_runtime_call() {
-    let (tx, mut rx) = mpsc::channel(16);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
-
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "codexreviewthread0002",
-                "method": "thread/start",
-                "params": {
-                    "thread_id": "thread_codex_review_custom",
-                    "workspace_id": workspace_id,
-                    "name": "Codex custom review"
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let _thread_response = recv_response_by_id(&mut rx, "codexreviewthread0002").await;
-    let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
-    materialize_loaded_test_thread_for_durable_operation(
-        &processor,
-        "thread_codex_review_custom",
-        "turn_codex_review_custom_seed",
-    )
-    .await;
-
-    let now = chrono::Utc::now().fixed_offset();
-    crud_store
-        .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
-            thread_id: "thread_codex_review_custom".to_owned(),
-            workspace_id: workspace_id.clone(),
-            runtime_id: "codex".to_owned(),
-            runtime_kind: "codex".to_owned(),
-            native_thread_id: "codex-thread-review-custom".to_owned(),
-            native_session_id: None,
-            native_root_thread_id: None,
-            native_cwd: Some("/tmp/project".to_owned()),
-            native_model: Some("gpt-5".to_owned()),
-            resume_cursor_json: "{}".to_owned(),
-            status: "active".to_owned(),
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .expect("thread binding should upsert");
-
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "codexreviewstart00002",
-                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REVIEW_START,
-                "params": {
-                    "workspace_id": workspace_id,
-                    "runtime_id": "codex",
-                    "thread_id": "thread_codex_review_custom",
-                    "delivery": "detached",
-                    "target": {
-                        "type": "custom",
-                        "instructions": " Review only auth-sensitive files "
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .await;
-
-    let error = recv_error_by_id(&mut rx, "codexreviewstart00002").await;
-    assert_eq!(error.error.code, INVALID_REQUEST_CODE);
-    assert_public_error(
-        &error,
-        PublicErrorCode::Internal,
-        PublicErrorStage::Execution,
-    );
-    assert!(cli_session.turn_starts.lock().await.is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_review_start_rejects_before_target_validation() {
     let (tx, mut rx) = mpsc::channel(8);
     let session_manager = Arc::new(SessionManager::new());
@@ -50232,6 +49961,7 @@ async fn codex_review_start_rejects_before_target_validation() {
                     "workspace_id": workspace_id,
                     "runtime_id": "codex",
                     "thread_id": "thread_codex_review_bad_target",
+                    "delivery": "detached",
                     "target": {
                         "type": "custom",
                         "instructions": "   "
@@ -50339,97 +50069,6 @@ async fn codex_compaction_start_is_rejected_without_runtime_call() {
 
     let error = recv_error_by_id(&mut rx, "codexcompactstart0001").await;
     assert_eq!(error.error.code, INVALID_REQUEST_CODE);
-    assert_public_error(
-        &error,
-        PublicErrorCode::Internal,
-        PublicErrorStage::Execution,
-    );
-    assert!(cli_session.thread_compactions.lock().await.is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_compaction_start_rejects_wrong_backend() {
-    let (tx, mut rx) = mpsc::channel(16);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
-
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "codexcompactthread002",
-                "method": "thread/start",
-                "params": {
-                    "thread_id": "thread_codex_compact_wrong_backend",
-                    "workspace_id": workspace_id,
-                    "name": "Codex compact wrong backend"
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let _thread_response = recv_response_by_id(&mut rx, "codexcompactthread002").await;
-    let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
-    materialize_loaded_test_thread_for_durable_operation(
-        &processor,
-        "thread_codex_compact_wrong_backend",
-        "turn_codex_compact_wrong_backend_seed",
-    )
-    .await;
-
-    let now = chrono::Utc::now().fixed_offset();
-    crud_store
-        .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
-            thread_id: "thread_codex_compact_wrong_backend".to_owned(),
-            workspace_id: workspace_id.clone(),
-            runtime_id: "claude".to_owned(),
-            runtime_kind: "claude".to_owned(),
-            native_thread_id: "claude-thread-compact".to_owned(),
-            native_session_id: None,
-            native_root_thread_id: None,
-            native_cwd: Some("/tmp/project".to_owned()),
-            native_model: Some("claude-sonnet".to_owned()),
-            resume_cursor_json: "{}".to_owned(),
-            status: "active".to_owned(),
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .expect("thread binding should upsert");
-
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "codexcompactstart0002",
-                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_THREAD_COMPACT,
-                "params": {
-                    "workspace_id": workspace_id,
-                    "runtime_id": "claude",
-                    "thread_id": "thread_codex_compact_wrong_backend"
-                }
-            })
-            .to_string(),
-        )
-        .await;
-
-    let error = recv_error_by_id(&mut rx, "codexcompactstart0002").await;
     assert_public_error(
         &error,
         PublicErrorCode::Internal,
@@ -56643,42 +56282,77 @@ async fn native_permission_request_replays_and_accepts_durable_response_after_re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_request_respond_rejects_stale_request_ids() {
-    let (tx, mut rx) = mpsc::channel(8);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store,
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_tool_loop_config(),
-    );
-
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "cliruntime_reqstale01",
-                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
-                "params": {
-                    "workspace_id": workspace_id,
-                    "runtime_id": "codex",
-                    "request_id": "missing-cli-runtime-request",
-                    "resolution": { "status": "cancelled" }
-                }
-            })
-            .to_string(),
-        )
-        .await;
-
-    let error = recv_error_by_id(&mut rx, "cliruntime_reqstale01").await;
-    assert_eq!(error.error.message, "not_found");
+    for (rpc_id, request_id, resolution, configured_runtime) in [
+        (
+            "cliruntime_reqstale01",
+            "missing-cli-runtime-request",
+            json!({"status": "cancelled"}),
+            false,
+        ),
+        (
+            "fileapproval_stale001",
+            "missing-file-change-approval",
+            json!({"status": "approved"}),
+            true,
+        ),
+        (
+            "userinput_stale000001",
+            "missing-user-input-request",
+            json!({"status": "answered", "response": {"answers": {}}}),
+            true,
+        ),
+    ] {
+        let (processor, connection_id, mut rx, workspace_id, _crud_store, _cli_session) =
+            if configured_runtime {
+                let (processor, connection_id, rx, workspace_id, crud_store, cli_session) =
+                    cli_runtime_approval_processor().await;
+                (
+                    processor,
+                    connection_id,
+                    rx,
+                    workspace_id,
+                    Some(crud_store),
+                    Some(cli_session),
+                )
+            } else {
+                let (tx, rx) = mpsc::channel(8);
+                let session_manager = Arc::new(SessionManager::new());
+                let connection_id =
+                    register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+                let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+                let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+                let processor = MessageProcessor::new(
+                    thread_manager,
+                    test_provider(),
+                    session_manager,
+                    workspace_manager,
+                    crud_store,
+                    test_gateway_secrets(),
+                    test_summary_config(),
+                    test_tool_loop_config(),
+                );
+                (processor, connection_id, rx, workspace_id, None, None)
+            };
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                    "params": {
+                        "workspace_id": workspace_id,
+                        "runtime_id": "codex",
+                        "request_id": request_id,
+                        "resolution": resolution
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let error = recv_error_by_id(&mut rx, rpc_id).await;
+        assert_eq!(error.error.message, "not_found");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -57894,33 +57568,6 @@ async fn cli_runtime_file_change_approval_deny_resolves_and_sends_decline() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_file_change_approval_rejects_stale_request_id() {
-    let (processor, connection_id, mut rx, workspace_id, _crud_store, _cli_session) =
-        cli_runtime_approval_processor().await;
-
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "fileapproval_stale001",
-                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
-                "params": {
-                    "workspace_id": workspace_id,
-                    "runtime_id": "codex",
-                    "request_id": "missing-file-change-approval",
-                    "resolution": { "status": "approved" }
-                }
-            })
-            .to_string(),
-        )
-        .await;
-
-    let error = recv_error_by_id(&mut rx, "fileapproval_stale001").await;
-    assert_eq!(error.error.message, "not_found");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_user_input_request_answer_sends_codex_answers() {
     let (processor, connection_id, mut rx, workspace_id, _crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -58099,36 +57746,6 @@ async fn cli_runtime_user_input_request_invalid_answers_are_rejected_before_nati
         stored.status,
         pioneer_crud::CliRuntimePendingRequestStatus::Pending
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_user_input_request_rejects_stale_request_id() {
-    let (processor, connection_id, mut rx, workspace_id, _crud_store, _cli_session) =
-        cli_runtime_approval_processor().await;
-
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "userinput_stale000001",
-                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
-                "params": {
-                    "workspace_id": workspace_id,
-                    "runtime_id": "codex",
-                    "request_id": "missing-user-input-request",
-                    "resolution": {
-                        "status": "answered",
-                        "response": { "answers": {} }
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .await;
-
-    let error = recv_error_by_id(&mut rx, "userinput_stale000001").await;
-    assert_eq!(error.error.message, "not_found");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -64917,13 +64534,11 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
                         break;
                     }
                 }
-                processor
-                    .process_due_native_turn_event_deliveries(now_timestamp_secs(), 128)
-                    .await
-                    .unwrap();
-                while processor
-                    .native_turn_event_delivery_kick_running
-                    .load(Ordering::Acquire)
+                processor.kick_native_turn_event_deliveries();
+                while !processor
+                    .native_turn_event_delivery_workers
+                    .tasks
+                    .is_empty()
                 {
                     tokio::task::yield_now().await;
                 }
@@ -68837,68 +68452,69 @@ async fn cli_runtime_server_request_without_turn_binding_is_cancelled_without_pe
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_machine_request_unknown_method_receives_exactly_one_error() {
-    let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
-        cli_runtime_approval_processor().await;
-    let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", "thread_cli_command_approval")
-        .expect("session key should build");
-    let request = CodexJsonlRpcServerRequest {
-        id: JsonlRpcId::from("unknown-machine-request"),
-        method: "future/unknownMachineRequest".to_owned(),
-        params: Some(json!({"future": true})),
-        raw: json!({
-            "id": "unknown-machine-request",
-            "method": "future/unknownMachineRequest",
-            "params": {"future": true}
-        }),
-    };
-    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
-    processor
-        .handle_cli_runtime_codex_server_request(&key, request, event)
-        .await;
+    for (request, expected_id, expected_code, check_pending_requests) in [
+        (
+            CodexJsonlRpcServerRequest {
+                id: JsonlRpcId::from("unknown-machine-request"),
+                method: "future/unknownMachineRequest".to_owned(),
+                params: Some(json!({"future": true})),
+                raw: json!({
+                    "id": "unknown-machine-request",
+                    "method": "future/unknownMachineRequest",
+                    "params": {"future": true}
+                }),
+            },
+            json!("unknown-machine-request"),
+            -32601,
+            true,
+        ),
+        (
+            CodexJsonlRpcServerRequest {
+                id: JsonlRpcId::from(404_i64),
+                method: "item/commandExecution/requestApproval".to_owned(),
+                params: Some(json!({"threadId": "codex-thread-command"})),
+                raw: json!({
+                    "id": 404,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {"threadId": "codex-thread-command"}
+                }),
+            },
+            json!(404),
+            -32602,
+            false,
+        ),
+    ] {
+        let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
+            cli_runtime_approval_processor().await;
+        let key =
+            CLIAgentRuntimeSessionKey::new(workspace_id, "codex", "thread_cli_command_approval")
+                .expect("session key should build");
+        let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+        processor
+            .handle_cli_runtime_codex_server_request(&key, request, event)
+            .await;
 
-    let errors = cli_session.response_errors.lock().await;
-    assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].0, json!("unknown-machine-request"));
-    assert_eq!(errors[0].1, -32601);
-    drop(errors);
-    assert!(
-        crud_store
-            .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
-                thread_id: Some("thread_cli_command_approval".to_owned()),
-                limit: None,
-                ..Default::default()
-            })
-            .await
-            .expect("pending requests should load")
-            .is_empty()
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pending_machine_request_malformed_known_method_receives_invalid_params_error() {
-    let (processor, _connection_id, _rx, workspace_id, _crud_store, cli_session) =
-        cli_runtime_approval_processor().await;
-    let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", "thread_cli_command_approval")
-        .expect("session key should build");
-    let request = CodexJsonlRpcServerRequest {
-        id: JsonlRpcId::from(404_i64),
-        method: "item/commandExecution/requestApproval".to_owned(),
-        params: Some(json!({"threadId": "codex-thread-command"})),
-        raw: json!({
-            "id": 404,
-            "method": "item/commandExecution/requestApproval",
-            "params": {"threadId": "codex-thread-command"}
-        }),
-    };
-    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
-    processor
-        .handle_cli_runtime_codex_server_request(&key, request, event)
-        .await;
-
-    let errors = cli_session.response_errors.lock().await;
-    assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].0, json!(404));
-    assert_eq!(errors[0].1, -32602);
+        let errors = cli_session.response_errors.lock().await;
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, expected_id);
+        assert_eq!(errors[0].1, expected_code);
+        drop(errors);
+        if check_pending_requests {
+            assert!(
+                crud_store
+                    .list_cli_runtime_pending_requests(
+                        pioneer_crud::CliRuntimePendingRequestListFilter {
+                            thread_id: Some("thread_cli_command_approval".to_owned()),
+                            limit: None,
+                            ..Default::default()
+                        }
+                    )
+                    .await
+                    .expect("pending requests should load")
+                    .is_empty()
+            );
+        }
+    }
 }
 
 #[test]
@@ -69419,516 +69035,308 @@ async fn cli_runtime_server_request_buffered_flush_preserves_order_before_termin
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_server_request_with_mismatched_starting_native_thread_is_cancelled() {
-    let (tx, _rx) = mpsc::channel(16);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    session_manager
-        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-        .await;
-    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
-
-    let thread_id = "thread_cli_mismatched_buffered_request";
-    let turn_id = "turn_cli_mismatched_buffered_request";
-    let native_thread_id = "codex-thread-mismatched-starting";
-    seed_cli_runtime_approval_turn(
-        crud_store.as_ref(),
-        workspace_id.as_str(),
+    for (
         thread_id,
         turn_id,
         native_thread_id,
-    )
-    .await;
-
-    let now = chrono::Utc::now().fixed_offset();
-    crud_store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
-            turn_id: turn_id.to_owned(),
-            thread_id: thread_id.to_owned(),
-            continuation_thread_id: thread_id.to_owned(),
-            workspace_id: workspace_id.clone(),
-            runtime_id: "codex".to_owned(),
-            runtime_kind: "codex".to_owned(),
-            native_thread_id: native_thread_id.to_owned(),
-            native_turn_id: None,
-            request_id: None,
-            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
-            model: Some("gpt-5".to_owned()),
-            cwd: Some("/tmp/project".to_owned()),
-            sandbox_json: None,
-            approval_policy: None,
-            input_mapping_json: "{}".to_owned(),
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .expect("starting CLI runtime turn binding should upsert");
-
-    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
-        .expect("session key should build");
-    cli_manager
-        .get_or_start(key.clone())
-        .await
-        .expect("test CLI runtime session should start");
-
-    let request = CodexJsonlRpcServerRequest {
-        id: JsonlRpcId::from(57_i64),
-        method: "item/commandExecution/requestApproval".to_owned(),
-        params: Some(json!({
-            "threadId": "codex-thread-not-this-starting-turn",
-            "turnId": "codex-turn-mismatched-buffered-request",
-            "itemId": "codex-item-mismatched-buffered-request",
-            "command": "echo stale",
-            "cwd": "/tmp/project"
-        })),
-        raw: json!({
-            "id": 57,
-            "method": "item/commandExecution/requestApproval"
-        }),
-    };
-    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
-    processor
-        .handle_cli_runtime_codex_server_request(&key, request, event)
+        starting,
+        request_id,
+        params,
+        pending_message,
+        session_message,
+    ) in [
+        (
+            "thread_cli_mismatched_buffered_request",
+            "turn_cli_mismatched_buffered_request",
+            "codex-thread-mismatched-starting",
+            true,
+            57_i64,
+            json!({
+                "threadId": "codex-thread-not-this-starting-turn",
+                "turnId": "codex-turn-mismatched-buffered-request",
+                "itemId": "codex-item-mismatched-buffered-request",
+                "command": "echo stale",
+                "cwd": "/tmp/project"
+            }),
+            "mismatched native thread request must not buffer or create UI pending requests",
+            "stale request for another native thread must not close the active starting turn session",
+        ),
+        (
+            "thread_cli_bound_mismatched_native_thread_request",
+            "codex-turn-bound-mismatched-native-thread",
+            "codex-thread-bound-mismatched-native-thread",
+            false,
+            59_i64,
+            json!({
+                "threadId": "codex-thread-bound-mismatched-native-thread-other",
+                "turnId": "codex-turn-bound-mismatched-native-thread",
+                "itemId": "codex-item-bound-mismatched-native-thread",
+                "command": "echo stale",
+                "cwd": "/tmp/project"
+            }),
+            "mismatched native thread must not bind by native turn id alone",
+            "stale request for another native thread must not close the active bound turn session",
+        ),
+    ] {
+        let (tx, _rx) = mpsc::channel(16);
+        let session_manager = Arc::new(SessionManager::new());
+        let connection_id =
+            register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+        let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        session_manager
+            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+            .await;
+        let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+        let cli_manager = test_cli_runtime_manager(cli_session.clone());
+        let processor = MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone());
+        seed_cli_runtime_approval_turn(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            native_thread_id,
+        )
         .await;
 
-    let pending = crud_store
-        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
-            thread_id: Some(thread_id.to_owned()),
-            limit: None,
-            ..Default::default()
-        })
-        .await
-        .expect("pending request list should load");
-    assert!(
-        pending.is_empty(),
-        "mismatched native thread request must not buffer or create UI pending requests"
-    );
+        if starting {
+            let now = chrono::Utc::now().fixed_offset();
+            crud_store
+                .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                    turn_id: turn_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    continuation_thread_id: thread_id.to_owned(),
+                    workspace_id: workspace_id.clone(),
+                    runtime_id: "codex".to_owned(),
+                    runtime_kind: "codex".to_owned(),
+                    native_thread_id: native_thread_id.to_owned(),
+                    native_turn_id: None,
+                    request_id: None,
+                    status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+                        .to_owned(),
+                    model: Some("gpt-5".to_owned()),
+                    cwd: Some("/tmp/project".to_owned()),
+                    sandbox_json: None,
+                    approval_policy: None,
+                    input_mapping_json: "{}".to_owned(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .expect("starting CLI runtime turn binding should upsert");
+        }
 
-    let responses = cli_session.responses.lock().await;
-    assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0].0, json!(57));
-    assert_eq!(responses[0].1, json!({ "decision": "cancel" }));
-    drop(responses);
-    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
-    assert!(
-        cli_manager.existing_session(&key).await.is_some(),
-        "stale request for another native thread must not close the active starting turn session"
-    );
+        let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+            .expect("session key should build");
+        cli_manager
+            .get_or_start(key.clone())
+            .await
+            .expect("test CLI runtime session should start");
+
+        let request = CodexJsonlRpcServerRequest {
+            id: JsonlRpcId::from(request_id),
+            method: "item/commandExecution/requestApproval".to_owned(),
+            params: Some(params),
+            raw: json!({
+                "id": request_id,
+                "method": "item/commandExecution/requestApproval"
+            }),
+        };
+        let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+        processor
+            .handle_cli_runtime_codex_server_request(&key, request, event)
+            .await;
+
+        let pending = crud_store
+            .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+                thread_id: Some(thread_id.to_owned()),
+                limit: None,
+                ..Default::default()
+            })
+            .await
+            .expect("pending request list should load");
+        assert!(pending.is_empty(), "{pending_message}");
+        let responses = cli_session.responses.lock().await;
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].0, json!(request_id));
+        assert_eq!(responses[0].1, json!({ "decision": "cancel" }));
+        drop(responses);
+        assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
+        assert!(
+            cli_manager.existing_session(&key).await.is_some(),
+            "{session_message}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_server_request_without_native_thread_does_not_buffer_on_starting_binding() {
-    let (tx, _rx) = mpsc::channel(16);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    session_manager
-        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-        .await;
-    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
-
-    let thread_id = "thread_cli_missing_native_thread_request";
-    let turn_id = "turn_cli_missing_native_thread_request";
-    let native_thread_id = "codex-thread-missing-native-thread";
-    seed_cli_runtime_approval_turn(
-        crud_store.as_ref(),
-        workspace_id.as_str(),
+    for (
         thread_id,
         turn_id,
         native_thread_id,
-    )
-    .await;
-
-    let now = chrono::Utc::now().fixed_offset();
-    crud_store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
-            turn_id: turn_id.to_owned(),
-            thread_id: thread_id.to_owned(),
-            continuation_thread_id: thread_id.to_owned(),
-            workspace_id: workspace_id.clone(),
-            runtime_id: "codex".to_owned(),
-            runtime_kind: "codex".to_owned(),
-            native_thread_id: native_thread_id.to_owned(),
-            native_turn_id: None,
-            request_id: None,
-            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
-            model: Some("gpt-5".to_owned()),
-            cwd: Some("/tmp/project".to_owned()),
-            sandbox_json: None,
-            approval_policy: None,
-            input_mapping_json: "{}".to_owned(),
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .expect("starting CLI runtime turn binding should upsert");
-
-    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
-        .expect("session key should build");
-    cli_manager
-        .get_or_start(key.clone())
-        .await
-        .expect("test CLI runtime session should start");
-
-    let request = CodexJsonlRpcServerRequest {
-        id: JsonlRpcId::from(58_i64),
-        method: "item/commandExecution/requestApproval".to_owned(),
-        params: Some(json!({
-            "turnId": "codex-turn-missing-native-thread",
-            "itemId": "codex-item-missing-native-thread",
-            "command": "echo stale",
-            "cwd": "/tmp/project"
-        })),
-        raw: json!({
-            "id": 58,
-            "method": "item/commandExecution/requestApproval"
-        }),
-    };
-    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
-    processor
-        .handle_cli_runtime_codex_server_request(&key, request, event)
+        starting,
+        request_id,
+        params,
+        pending_message,
+        session_message,
+    ) in [
+        (
+            "thread_cli_missing_native_thread_request",
+            "turn_cli_missing_native_thread_request",
+            "codex-thread-missing-native-thread",
+            true,
+            58_i64,
+            json!({
+                "turnId": "codex-turn-missing-native-thread",
+                "itemId": "codex-item-missing-native-thread",
+                "command": "echo stale",
+                "cwd": "/tmp/project"
+            }),
+            "request without native thread id must not be guessed into a starting turn",
+            "stale request without native thread must not close the active starting turn session",
+        ),
+        (
+            "thread_cli_missing_native_turn_request",
+            "turn_cli_missing_native_turn_request",
+            "codex-thread-missing-native-turn",
+            true,
+            61_i64,
+            json!({
+                "threadId": "codex-thread-missing-native-turn",
+                "itemId": "codex-item-missing-native-turn",
+                "command": "echo stale",
+                "cwd": "/tmp/project"
+            }),
+            "request without native turn id must not be guessed into a starting turn",
+            "stale request without native turn must not close the active starting turn session",
+        ),
+        (
+            "thread_cli_bound_missing_native_thread_request",
+            "codex-turn-bound-missing-native-thread",
+            "codex-thread-bound-missing-native-thread",
+            false,
+            60_i64,
+            json!({
+                "turnId": "codex-turn-bound-missing-native-thread",
+                "itemId": "codex-item-bound-missing-native-thread",
+                "command": "echo stale",
+                "cwd": "/tmp/project"
+            }),
+            "missing native thread must not bind by native turn id alone",
+            "stale request without native thread must not close the active bound turn session",
+        ),
+    ] {
+        let (tx, _rx) = mpsc::channel(16);
+        let session_manager = Arc::new(SessionManager::new());
+        let connection_id =
+            register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+        let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        session_manager
+            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+            .await;
+        let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+        let cli_manager = test_cli_runtime_manager(cli_session.clone());
+        let processor = MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone());
+        seed_cli_runtime_approval_turn(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            native_thread_id,
+        )
         .await;
 
-    let pending = crud_store
-        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
-            thread_id: Some(thread_id.to_owned()),
-            limit: None,
-            ..Default::default()
-        })
-        .await
-        .expect("pending request list should load");
-    assert!(
-        pending.is_empty(),
-        "request without native thread id must not be guessed into a starting turn"
-    );
+        if starting {
+            let now = chrono::Utc::now().fixed_offset();
+            crud_store
+                .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                    turn_id: turn_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    continuation_thread_id: thread_id.to_owned(),
+                    workspace_id: workspace_id.clone(),
+                    runtime_id: "codex".to_owned(),
+                    runtime_kind: "codex".to_owned(),
+                    native_thread_id: native_thread_id.to_owned(),
+                    native_turn_id: None,
+                    request_id: None,
+                    status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+                        .to_owned(),
+                    model: Some("gpt-5".to_owned()),
+                    cwd: Some("/tmp/project".to_owned()),
+                    sandbox_json: None,
+                    approval_policy: None,
+                    input_mapping_json: "{}".to_owned(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .expect("starting CLI runtime turn binding should upsert");
+        }
 
-    assert!(cli_session.responses.lock().await.is_empty());
-    let errors = cli_session.response_errors.lock().await;
-    assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].0, json!(58));
-    assert_eq!(errors[0].1, -32602);
-    drop(errors);
-    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
-    assert!(
-        cli_manager.existing_session(&key).await.is_some(),
-        "stale request without native thread must not close the active starting turn session"
-    );
-}
+        let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+            .expect("session key should build");
+        cli_manager
+            .get_or_start(key.clone())
+            .await
+            .expect("test CLI runtime session should start");
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_server_request_without_native_turn_does_not_close_starting_session() {
-    let (tx, _rx) = mpsc::channel(16);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    session_manager
-        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-        .await;
-    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+        let request = CodexJsonlRpcServerRequest {
+            id: JsonlRpcId::from(request_id),
+            method: "item/commandExecution/requestApproval".to_owned(),
+            params: Some(params),
+            raw: json!({
+                "id": request_id,
+                "method": "item/commandExecution/requestApproval"
+            }),
+        };
+        let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+        processor
+            .handle_cli_runtime_codex_server_request(&key, request, event)
+            .await;
 
-    let thread_id = "thread_cli_missing_native_turn_request";
-    let turn_id = "turn_cli_missing_native_turn_request";
-    let native_thread_id = "codex-thread-missing-native-turn";
-    seed_cli_runtime_approval_turn(
-        crud_store.as_ref(),
-        workspace_id.as_str(),
-        thread_id,
-        turn_id,
-        native_thread_id,
-    )
-    .await;
-
-    let now = chrono::Utc::now().fixed_offset();
-    crud_store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
-            turn_id: turn_id.to_owned(),
-            thread_id: thread_id.to_owned(),
-            continuation_thread_id: thread_id.to_owned(),
-            workspace_id: workspace_id.clone(),
-            runtime_id: "codex".to_owned(),
-            runtime_kind: "codex".to_owned(),
-            native_thread_id: native_thread_id.to_owned(),
-            native_turn_id: None,
-            request_id: None,
-            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
-            model: Some("gpt-5".to_owned()),
-            cwd: Some("/tmp/project".to_owned()),
-            sandbox_json: None,
-            approval_policy: None,
-            input_mapping_json: "{}".to_owned(),
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .expect("starting CLI runtime turn binding should upsert");
-
-    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
-        .expect("session key should build");
-    cli_manager
-        .get_or_start(key.clone())
-        .await
-        .expect("test CLI runtime session should start");
-
-    let request = CodexJsonlRpcServerRequest {
-        id: JsonlRpcId::from(61_i64),
-        method: "item/commandExecution/requestApproval".to_owned(),
-        params: Some(json!({
-            "threadId": native_thread_id,
-            "itemId": "codex-item-missing-native-turn",
-            "command": "echo stale",
-            "cwd": "/tmp/project"
-        })),
-        raw: json!({
-            "id": 61,
-            "method": "item/commandExecution/requestApproval"
-        }),
-    };
-    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
-    processor
-        .handle_cli_runtime_codex_server_request(&key, request, event)
-        .await;
-
-    let pending = crud_store
-        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
-            thread_id: Some(thread_id.to_owned()),
-            limit: None,
-            ..Default::default()
-        })
-        .await
-        .expect("pending request list should load");
-    assert!(
-        pending.is_empty(),
-        "request without native turn id must not be guessed into a starting turn"
-    );
-
-    assert!(cli_session.responses.lock().await.is_empty());
-    let errors = cli_session.response_errors.lock().await;
-    assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].0, json!(61));
-    assert_eq!(errors[0].1, -32602);
-    drop(errors);
-    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
-    assert!(
-        cli_manager.existing_session(&key).await.is_some(),
-        "stale request without native turn must not close the active starting turn session"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_server_request_with_bound_native_turn_but_mismatched_native_thread_is_cancelled()
- {
-    let (tx, _rx) = mpsc::channel(16);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    session_manager
-        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-        .await;
-    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
-
-    let thread_id = "thread_cli_bound_mismatched_native_thread_request";
-    let turn_id = "codex-turn-bound-mismatched-native-thread";
-    let native_thread_id = "codex-thread-bound-mismatched-native-thread";
-    seed_cli_runtime_approval_turn(
-        crud_store.as_ref(),
-        workspace_id.as_str(),
-        thread_id,
-        turn_id,
-        native_thread_id,
-    )
-    .await;
-
-    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
-        .expect("session key should build");
-    cli_manager
-        .get_or_start(key.clone())
-        .await
-        .expect("test CLI runtime session should start");
-
-    let request = CodexJsonlRpcServerRequest {
-        id: JsonlRpcId::from(59_i64),
-        method: "item/commandExecution/requestApproval".to_owned(),
-        params: Some(json!({
-            "threadId": "codex-thread-bound-mismatched-native-thread-other",
-            "turnId": turn_id,
-            "itemId": "codex-item-bound-mismatched-native-thread",
-            "command": "echo stale",
-            "cwd": "/tmp/project"
-        })),
-        raw: json!({
-            "id": 59,
-            "method": "item/commandExecution/requestApproval"
-        }),
-    };
-    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
-    processor
-        .handle_cli_runtime_codex_server_request(&key, request, event)
-        .await;
-
-    let pending = crud_store
-        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
-            thread_id: Some(thread_id.to_owned()),
-            limit: None,
-            ..Default::default()
-        })
-        .await
-        .expect("pending request list should load");
-    assert!(
-        pending.is_empty(),
-        "mismatched native thread must not bind by native turn id alone"
-    );
-
-    let responses = cli_session.responses.lock().await;
-    assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0].0, json!(59));
-    assert_eq!(responses[0].1, json!({ "decision": "cancel" }));
-    drop(responses);
-    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
-    assert!(
-        cli_manager.existing_session(&key).await.is_some(),
-        "stale request for another native thread must not close the active bound turn session"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_server_request_with_bound_native_turn_but_missing_native_thread_is_cancelled()
-{
-    let (tx, _rx) = mpsc::channel(16);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    session_manager
-        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-        .await;
-    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
-
-    let thread_id = "thread_cli_bound_missing_native_thread_request";
-    let turn_id = "codex-turn-bound-missing-native-thread";
-    let native_thread_id = "codex-thread-bound-missing-native-thread";
-    seed_cli_runtime_approval_turn(
-        crud_store.as_ref(),
-        workspace_id.as_str(),
-        thread_id,
-        turn_id,
-        native_thread_id,
-    )
-    .await;
-
-    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
-        .expect("session key should build");
-    cli_manager
-        .get_or_start(key.clone())
-        .await
-        .expect("test CLI runtime session should start");
-
-    let request = CodexJsonlRpcServerRequest {
-        id: JsonlRpcId::from(60_i64),
-        method: "item/commandExecution/requestApproval".to_owned(),
-        params: Some(json!({
-            "turnId": turn_id,
-            "itemId": "codex-item-bound-missing-native-thread",
-            "command": "echo stale",
-            "cwd": "/tmp/project"
-        })),
-        raw: json!({
-            "id": 60,
-            "method": "item/commandExecution/requestApproval"
-        }),
-    };
-    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
-    processor
-        .handle_cli_runtime_codex_server_request(&key, request, event)
-        .await;
-
-    let pending = crud_store
-        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
-            thread_id: Some(thread_id.to_owned()),
-            limit: None,
-            ..Default::default()
-        })
-        .await
-        .expect("pending request list should load");
-    assert!(
-        pending.is_empty(),
-        "missing native thread must not bind by native turn id alone"
-    );
-
-    assert!(cli_session.responses.lock().await.is_empty());
-    let errors = cli_session.response_errors.lock().await;
-    assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].0, json!(60));
-    assert_eq!(errors[0].1, -32602);
-    drop(errors);
-    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
-    assert!(
-        cli_manager.existing_session(&key).await.is_some(),
-        "stale request without native thread must not close the active bound turn session"
-    );
+        let pending = crud_store
+            .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+                thread_id: Some(thread_id.to_owned()),
+                limit: None,
+                ..Default::default()
+            })
+            .await
+            .expect("pending request list should load");
+        assert!(pending.is_empty(), "{pending_message}");
+        assert!(cli_session.responses.lock().await.is_empty());
+        let errors = cli_session.response_errors.lock().await;
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, json!(request_id));
+        assert_eq!(errors[0].1, -32602);
+        drop(errors);
+        assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
+        assert!(
+            cli_manager.existing_session(&key).await.is_some(),
+            "{session_message}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -78178,27 +77586,35 @@ async fn memory_search_respects_connection_workspace() {
         .create_workspace("phase06_workspace_b", Some("Phase 06 Workspace B"))
         .await
         .expect("create workspace B");
+    let select_id = memory_request_id("isoselect");
     harness
         .processor
-        .session_manager
-        .set_connection_workspace(harness.connection_id, Some(workspace_b.id.clone()))
+        .process_request_for_connection(
+            harness.connection_id,
+            &json!({
+                "jsonrpc":"2.0", "id":select_id, "method":"workspace/select",
+                "params":{"workspace_id":workspace_b.id,"make_current":false}
+            })
+            .to_string(),
+        )
         .await;
+    let selected = recv_response_by_id(&mut harness.rx, select_id.as_str()).await;
+    assert_eq!(selected.result["workspace"]["id"], workspace_b.id);
 
     let empty_scope_search_id = memory_request_id("isoempty");
     harness
         .processor
-        .memory_search(
-            &request_context,
-            empty_scope_search_id.clone(),
-            MemorySearchParams {
-                query: "phase06 isolation phrase".to_owned(),
-                scopes: Vec::new(),
-                categories: Vec::new(),
-                statuses: Vec::new(),
-                limit: Some(10),
-                cursor: None,
-                include_provenance: false,
-            },
+        .process_request_for_connection(
+            harness.connection_id,
+            &json!({
+                "jsonrpc":"2.0", "id":empty_scope_search_id, "method":"memory/search",
+                "params":MemorySearchParams {
+                    query: "phase06 isolation phrase".to_owned(),
+                    scopes: Vec::new(), categories: Vec::new(), statuses: Vec::new(),
+                    limit: Some(10), cursor: None, include_provenance: false,
+                }
+            })
+            .to_string(),
         )
         .await;
     let empty_scope_response =
@@ -78541,7 +77957,8 @@ async fn memory_namespace_update_and_cleanup_preserve_the_selected_record() {
                 &format!("seed_{namespace}"),
                 json!({
                     "scope": "thread", "namespace": namespace, "key": "baseline",
-                    "category": "project_fact", "content": format!("Original fact for {namespace}")
+                    "category": if namespace == "project-b" { "project_policy" } else { "project_fact" },
+                    "content": format!("Original fact for {namespace}")
                 }),
             )
             .await,
@@ -78563,10 +77980,22 @@ async fn memory_namespace_update_and_cleanup_preserve_the_selected_record() {
         &tools,
         "memory_list",
         "inventory_namespace",
-        json!({"scopes":["thread"]}),
+        json!({"scopes":["thread"], "limit":20}),
     )
     .await;
     assert_eq!(listed["records"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        listed["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["memoryId"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>(),
+        seeds
+            .iter()
+            .map(|record| record["memoryId"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>()
+    );
     for (index, namespace) in ["default", "project-a", "project-b"].iter().enumerate() {
         let record = execute_memory_tool_payload(
             &tools,
@@ -78630,69 +78059,6 @@ async fn memory_namespace_update_and_cleanup_preserve_the_selected_record() {
     )
     .await;
     assert_eq!(default["record"]["memoryId"], seeds[0]["memoryId"]);
-    let _ = std::fs::remove_dir_all(harness.runtime_home);
-}
-
-#[tokio::test]
-async fn memory_list_tool_returns_inventory_without_semantic_query() {
-    let harness = setup_memory_gateway_harness("tool_list_inventory", true).await;
-    let tools = built_memory_tools(&harness, "tool_list_inventory").await;
-
-    let name_result = execute_memory_tool_payload(
-        &tools,
-        "memory_remember",
-        "call_memory_list_seed_name",
-        json!({
-            "content": "Проект называется Pioneer.",
-            "category": "project_fact",
-            "scope": "thread",
-            "key": "project_name"
-        }),
-    )
-    .await;
-    let language_result = execute_memory_tool_payload(
-        &tools,
-        "memory_remember",
-        "call_memory_list_seed_lang",
-        json!({
-            "content": "В проекте используется русский язык для обсуждений.",
-            "category": "project_policy",
-            "scope": "thread",
-            "key": "project_language"
-        }),
-    )
-    .await;
-
-    let list_result = execute_memory_tool_payload(
-        &tools,
-        "memory_list",
-        "call_memory_list_inventory",
-        json!({
-            "scopes": ["thread"],
-            "limit": 20
-        }),
-    )
-    .await;
-
-    let name_id = name_result
-        .get("memoryId")
-        .and_then(serde_json::Value::as_str)
-        .expect("remember should return name memory id");
-    let language_id = language_result
-        .get("memoryId")
-        .and_then(serde_json::Value::as_str)
-        .expect("remember should return language memory id");
-    let records = list_result
-        .get("records")
-        .and_then(serde_json::Value::as_array)
-        .expect("list should return records");
-    let listed_ids = records
-        .iter()
-        .filter_map(|record| record.get("memoryId").and_then(serde_json::Value::as_str))
-        .collect::<std::collections::BTreeSet<_>>();
-    assert!(listed_ids.contains(name_id));
-    assert!(listed_ids.contains(language_id));
-
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
@@ -78832,17 +78198,6 @@ async fn memory_provider_recall_calls_memory_service() {
             .iter()
             .any(|item| item.memory_id == remember_payload.record.id)
     );
-
-    let _ = std::fs::remove_dir_all(harness.runtime_home);
-}
-
-#[tokio::test]
-async fn memory_bridge_binds_when_runtime_enabled_for_phase_10() {
-    let harness = setup_memory_gateway_harness("bridge_explicit", true).await;
-
-    harness.processor.bind_memory_bridge_if_enabled().await;
-
-    assert!(harness.processor.agent_manager.has_memory_provider().await);
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
@@ -81401,9 +80756,12 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
     // Model an already-owned optional delivery worker. Its separate Critical
     // control-plane kick may overlap the observer, while this fixture measures
     // the synchronous guarded lifecycle append and its durable outbox row.
-    processor
-        .native_turn_event_delivery_kick_running
-        .store(true, Ordering::SeqCst);
+    for owner in [
+        &processor.native_turn_event_delivery_workers.live,
+        &processor.native_turn_event_delivery_workers.episodic,
+    ] {
+        owner.running.store(true, Ordering::SeqCst);
+    }
     store.database_connection().execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) \

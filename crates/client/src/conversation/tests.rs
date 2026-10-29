@@ -3,13 +3,12 @@ use super::reducer::{ConversationProjector, ConversationViewState};
 use super::{Conversation, ConversationEvent, MAX_EVENT_LOG_LEN, TimelineEntryStatus, TurnPhase};
 use pioneer_protocol::{
     ArtifactKind, ArtifactRef, ArtifactStatus, ExecutionWindowExhaustionReason,
-    ExecutionWindowStatus, ItemDeltaStream, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
-    SkillId, SkillPackId, SystemEventLevel, Thread, ThreadHistoryEvent, ThreadHistoryEventPayload,
-    ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus,
-    ToolDisplayPayload, ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata,
-    ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
-    ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
-    ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
+    ExecutionWindowStatus, ItemDeltaStream, RecoveryAction, RecoveryJobStatus, SkillId,
+    SkillPackId, SystemEventLevel, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
+    ThreadStatus, ToolCallStatus, ToolDisplayPayload, ToolLoopBudgetAction,
+    ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,
+    ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage,
+    ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
     TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
@@ -17,7 +16,7 @@ use pioneer_protocol::{
     TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
     TurnPermissionAuditRequestKey, TurnPermissionDecisionReason, TurnPermissionMode,
     TurnPermissionProfileSource, TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary,
-    TurnSkillPackPresentationSummary, TurnStatus, UserInput, UserMessageAttachment,
+    TurnSkillPackPresentationSummary, TurnStatus, UserMessageAttachment,
 };
 
 const THREAD_ID: &str = "thr_000000000000000001";
@@ -484,46 +483,32 @@ fn permission_audit_projection_stores_sanitized_decision_history() {
 }
 
 #[test]
-fn permission_audit_history_hydrates_shared_projection_and_timeline_row() {
+fn permission_audit_allow_once_projects_shared_projection_and_timeline_row() {
     let mut conversation = Conversation::new(THREAD_ID);
-    let events = vec![
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 1,
-            created_at: 1_000,
-            payload: ThreadHistoryEventPayload::TurnStarted {
-                workspace_id: WORKSPACE_ID.to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn: Turn {
-                    id: TURN_ID.to_owned(),
-                    status: TurnStatus::InProgress,
-                    turn_kind: Default::default(),
-                    origin: Default::default(),
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
-                    prompt_manifest: None,
-                    permission_profile: default_test_permission_profile(),
-                },
-                input: Vec::new(),
-            },
+    conversation.apply(ConversationEvent::TurnStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: Turn {
+            id: TURN_ID.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: default_test_permission_profile(),
         },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 2,
-            created_at: 2_000,
-            payload: ThreadHistoryEventPayload::TurnPermissionAudit(permission_audit_event(
-                TurnPermissionAuditEventKind::ApprovalResolved,
-                Some(TurnPermissionAuditDecision::AllowOnce),
-            )),
-        },
-    ];
-
-    conversation.hydrate_history(&events);
+    });
+    conversation.apply(ConversationEvent::TurnPermissionAudit {
+        event: permission_audit_event(
+            TurnPermissionAuditEventKind::ApprovalResolved,
+            Some(TurnPermissionAuditDecision::AllowOnce),
+        ),
+    });
 
     let audit = conversation.projection().permission_audit_for_turn(TURN_ID);
     assert_eq!(audit.len(), 1);
@@ -674,43 +659,6 @@ fn sample_tool_recovery_policy() -> ToolRecoveryPolicySnapshot {
     }
 }
 
-fn sample_web_fetch_item(
-    item_id: &str,
-    status: pioneer_protocol::ToolCallStatus,
-    recovery_policy: Option<ToolRecoveryPolicySnapshot>,
-) -> TurnItem {
-    TurnItem::WebFetch {
-        id: item_id.to_owned(),
-        tool_name: "web_fetch".to_owned(),
-        arguments: serde_json::json!({ "url": "https://example.com/policy" }),
-        status,
-        recovery_policy,
-        output_policy: ToolOutputPolicySnapshot::for_tool_name("web_fetch"),
-        display: ToolDisplayPayload::Hidden,
-        storage: ToolStoragePayload::Metadata {
-            metadata: ToolMetadata::from_json(serde_json::json!({
-                "url": "https://example.com/policy"
-            })),
-        },
-        recovery: None,
-        url: Some("https://example.com/policy".to_owned()),
-        final_url: None,
-        status_code: None,
-        content_type: None,
-        extract_mode: None,
-        resolved_mode: None,
-        bytes_received: None,
-        elapsed_ms: None,
-        truncated: None,
-        title: None,
-        word_count: None,
-        links: Vec::new(),
-        success: None,
-        outcome: None,
-        observation: None,
-    }
-}
-
 #[test]
 fn send_stays_blocked_until_terminal_event() {
     let mut conversation = Conversation::new(THREAD_ID);
@@ -726,7 +674,19 @@ fn send_stays_blocked_until_terminal_event() {
         attachments: Vec::new(),
     });
     assert!(!conversation.can_submit_message());
+    assert_eq!(conversation.status_label(), "starting");
+    assert!(conversation.projection().composer_locked);
     assert_eq!(pending_request_id(&conversation), Some(PENDING_REQUEST_ID));
+    let first = conversation
+        .event_log()
+        .front()
+        .expect("actual start event logged");
+    assert_eq!(first.sequence, 1);
+    assert_eq!(first.thread_id, THREAD_ID);
+    assert_eq!(first.turn_id.as_deref(), Some(TURN_ID));
+    assert_eq!(first.item_id, None);
+    assert_eq!(first.kind, EventKind::LocalTurnStartRequested);
+    assert_eq!(first.payload["LocalTurnStartRequested"]["turn_id"], TURN_ID);
 
     conversation.apply(ConversationEvent::LocalTurnStartAccepted {
         thread_id: THREAD_ID.to_owned(),
@@ -735,6 +695,8 @@ fn send_stays_blocked_until_terminal_event() {
         mode: ThreadMode::Agent,
     });
     assert!(!conversation.can_submit_message());
+    assert_eq!(conversation.status_label(), "running");
+    assert_eq!(conversation.in_flight_turn_id(), Some(TURN_ID));
 
     conversation.apply(ConversationEvent::TurnStarted {
         thread_id: THREAD_ID.to_owned(),
@@ -869,55 +831,7 @@ fn agent_review_system_event_projects_to_completed_timeline_row() {
 }
 
 #[test]
-fn agent_compaction_system_event_projects_to_completed_timeline_row() {
-    let mut conversation = Conversation::new(THREAD_ID);
-    conversation.apply(ConversationEvent::ItemStarted {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item: TurnItem::SystemEvent {
-            id: "native_compaction_1".to_owned(),
-            level: SystemEventLevel::Info,
-            message: "Context compaction started".to_owned(),
-            code: Some("agent_context_compaction".to_owned()),
-            details: Some(serde_json::json!({
-                "status": "started",
-                "nativeItemKind": "contextCompaction"
-            })),
-        },
-    });
-    conversation.apply(ConversationEvent::ItemCompleted {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item: TurnItem::SystemEvent {
-            id: "native_compaction_1".to_owned(),
-            level: SystemEventLevel::Info,
-            message: "Context compaction completed".to_owned(),
-            code: Some("agent_context_compaction".to_owned()),
-            details: Some(serde_json::json!({
-                "status": "completed",
-                "nativeItemKind": "contextCompaction"
-            })),
-        },
-    });
-
-    let entry = conversation
-        .projection()
-        .timeline
-        .first()
-        .expect("compaction system event should create a timeline row");
-    let item = conversation
-        .projection()
-        .item_for_timeline_entry(entry)
-        .expect("compaction timeline item should resolve");
-    assert_eq!(item.status, TimelineEntryStatus::Completed);
-    assert_eq!(item.partial_text, "Context compaction completed");
-    let (message, details) = system_event_details(&conversation, "agent_context_compaction");
-    assert_eq!(message, "Context compaction completed");
-    assert_eq!(details.get("status"), Some(&serde_json::json!("completed")));
-}
-
-#[test]
-fn compaction_lifecycle_live_updates_and_reconnect_keep_one_terminal_row() {
+fn compaction_lifecycle_live_updates_keep_one_terminal_row() {
     for (terminal, expected) in [
         ("completed", TimelineEntryStatus::Completed),
         ("failed", TimelineEntryStatus::Failed),
@@ -945,45 +859,38 @@ fn compaction_lifecycle_live_updates_and_reconnect_keep_one_terminal_row() {
             live.projection().items[0].status,
             TimelineEntryStatus::Running
         );
+        let expected_text = match terminal {
+            "completed" => "Context completed",
+            "failed" => "Context failed",
+            "cancelled" => "Context cancelled",
+            _ => unreachable!(),
+        };
         for _ in 0..2 {
             live.apply(ConversationEvent::ItemCompleted {
                 thread_id: THREAD_ID.into(),
                 turn_id: TURN_ID.into(),
                 item: item(terminal),
             });
+            let entry = live
+                .projection()
+                .timeline
+                .first()
+                .expect("compaction timeline row");
+            let resolved = live
+                .projection()
+                .item_for_timeline_entry(entry)
+                .expect("compaction timeline item should resolve");
+            assert_eq!(resolved.id, "compaction:stable");
+            assert_eq!(resolved.status, expected);
+            assert_eq!(resolved.partial_text, expected_text);
+            let (message, details) = system_event_details(&live, "agent_context_compaction");
+            assert_eq!(message, expected_text);
+            assert_eq!(details.get("status"), Some(&serde_json::json!(terminal)));
         }
         assert_eq!(live.projection().timeline.len(), 1);
         assert_eq!(live.projection().items[0].status, expected);
-        let history = [
-            ThreadHistoryEvent {
-                turn_id: TURN_ID.into(),
-                sequence: 1,
-                created_at: 1000,
-                payload: ThreadHistoryEventPayload::ItemStarted {
-                    workspace_id: WORKSPACE_ID.into(),
-                    thread_id: THREAD_ID.into(),
-                    turn_id: TURN_ID.into(),
-                    item: item("started"),
-                },
-            },
-            ThreadHistoryEvent {
-                turn_id: TURN_ID.into(),
-                sequence: 2,
-                created_at: 2000,
-                payload: ThreadHistoryEventPayload::ItemCompleted {
-                    workspace_id: WORKSPACE_ID.into(),
-                    thread_id: THREAD_ID.into(),
-                    turn_id: TURN_ID.into(),
-                    item: item(terminal),
-                },
-            },
-        ];
-        let mut restored = Conversation::new(THREAD_ID);
-        restored.hydrate_history(&history);
-        assert_eq!(restored.projection().timeline.len(), 1);
-        assert_eq!(restored.projection().items[0].status, expected);
         assert_eq!(
-            restored.projection().items[0].item.item_id(),
+            live.projection().items[0].item.item_id(),
             "compaction:stable"
         );
     }
@@ -1104,81 +1011,109 @@ fn durable_pack_attachments_replace_optimistic_message_without_duplicates() {
 
 #[test]
 fn send_unlocks_only_on_terminal_failed_or_cancelled() {
-    let mut conversation = Conversation::new(THREAD_ID);
+    for accept_second in [false, true] {
+        let mut conversation = Conversation::new(THREAD_ID);
 
-    conversation.apply(ConversationEvent::LocalTurnStartRequested {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        pending_request_id: PENDING_REQUEST_ID.to_owned(),
-        mode: ThreadMode::Agent,
-        user_text: "hello".to_owned(),
-        attachments: Vec::new(),
-    });
+        conversation.apply(ConversationEvent::LocalTurnStartRequested {
+            thread_id: THREAD_ID.to_owned(),
+            turn_id: TURN_ID.to_owned(),
+            pending_request_id: PENDING_REQUEST_ID.to_owned(),
+            mode: ThreadMode::Agent,
+            user_text: "hello".to_owned(),
+            attachments: Vec::new(),
+        });
 
-    conversation.apply(ConversationEvent::TurnFailed {
-        thread_id: THREAD_ID.to_owned(),
-        turn: Turn {
-            id: TURN_ID.to_owned(),
-            status: TurnStatus::Failed,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: Some("network".to_owned()),
+        conversation.apply(ConversationEvent::TurnFailed {
+            thread_id: THREAD_ID.to_owned(),
+            turn: Turn {
+                id: TURN_ID.to_owned(),
+                status: TurnStatus::Failed,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: Some("network".to_owned()),
 
-            prompt_manifest: None,
+                prompt_manifest: None,
 
-            permission_profile: default_test_permission_profile(),
-        },
-    });
+                permission_profile: default_test_permission_profile(),
+            },
+        });
 
-    assert!(conversation.can_submit_message());
-    assert_eq!(conversation.status_label(), "failed");
+        assert!(conversation.can_submit_message());
+        assert_eq!(conversation.status_label(), "failed");
+        assert_eq!(
+            conversation
+                .projection()
+                .turns
+                .iter()
+                .find(|turn| turn.id == TURN_ID)
+                .unwrap()
+                .phase,
+            TurnPhase::Failed
+        );
 
-    conversation.apply(ConversationEvent::LocalTurnStartRequested {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: "turn_000000000000000002".to_owned(),
-        pending_request_id: "req_000000000000000002".to_owned(),
-        mode: ThreadMode::Agent,
-        user_text: "again".to_owned(),
-        attachments: Vec::new(),
-    });
-    assert!(!conversation.can_submit_message());
+        conversation.apply(ConversationEvent::LocalTurnStartRequested {
+            thread_id: THREAD_ID.to_owned(),
+            turn_id: "turn_000000000000000002".to_owned(),
+            pending_request_id: "req_000000000000000002".to_owned(),
+            mode: ThreadMode::Agent,
+            user_text: "again".to_owned(),
+            attachments: Vec::new(),
+        });
+        if accept_second {
+            conversation.apply(ConversationEvent::LocalTurnStartAccepted {
+                thread_id: THREAD_ID.to_owned(),
+                turn_id: "turn_000000000000000002".to_owned(),
+                pending_request_id: "req_000000000000000002".to_owned(),
+                mode: ThreadMode::Agent,
+            });
+            assert_eq!(conversation.status_label(), "running");
+        }
+        assert!(!conversation.can_submit_message());
 
-    conversation.apply(ConversationEvent::TurnFailed {
-        thread_id: THREAD_ID.to_owned(),
-        turn: Turn {
-            id: "turn_000000000000000002".to_owned(),
-            status: TurnStatus::Interrupted,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: Some("cancelled".to_owned()),
+        conversation.apply(ConversationEvent::TurnFailed {
+            thread_id: THREAD_ID.to_owned(),
+            turn: Turn {
+                id: "turn_000000000000000002".to_owned(),
+                status: TurnStatus::Interrupted,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: Some("cancelled".to_owned()),
 
-            prompt_manifest: None,
+                prompt_manifest: None,
 
-            permission_profile: default_test_permission_profile(),
-        },
-    });
+                permission_profile: default_test_permission_profile(),
+            },
+        });
 
-    assert!(conversation.can_submit_message());
-    assert_eq!(conversation.status_label(), "cancelled");
-    let current_turn = conversation
-        .projection()
-        .turns
-        .iter()
-        .find(|turn| turn.id == "turn_000000000000000002")
-        .expect("turn should exist");
-    assert_eq!(current_turn.phase, TurnPhase::Cancelled);
+        assert!(conversation.can_submit_message());
+        assert_eq!(conversation.status_label(), "cancelled");
+        let current_turn = conversation
+            .projection()
+            .turns
+            .iter()
+            .find(|turn| turn.id == "turn_000000000000000002")
+            .expect("turn should exist");
+        assert_eq!(current_turn.phase, TurnPhase::Cancelled);
+        assert_eq!(
+            conversation.turn_flow_state(),
+            &super::state_machine::TurnFlowState::Cancelled {
+                turn_id: "turn_000000000000000002".to_owned(),
+                error: Some("cancelled".to_owned()),
+            }
+        );
+    }
 }
 
 #[test]
@@ -1621,8 +1556,17 @@ fn conversation_codex_reasoning_summary_does_not_overwrite_agent_message_text() 
     assert_eq!(reasoning_item.partial_text, "Reasoning summary");
     assert!(!reasoning_item.partial_text.contains("Final answer"));
     assert_eq!(reasoning_item.status, TimelineEntryStatus::Completed);
+    assert_eq!(conversation.status_label(), "completing");
     assert!(conversation.tick());
     assert_eq!(conversation.status_label(), "completed");
+    assert!(conversation.can_submit_message());
+    let final_agent_item = conversation
+        .projection()
+        .items
+        .iter()
+        .find(|item| item.id == "codex_agent_item")
+        .expect("agent message must survive completion tick");
+    assert_eq!(final_agent_item.final_text.as_deref(), Some("Final answer"));
 }
 
 #[test]
@@ -1778,27 +1722,34 @@ fn timeline_codex_tool_output_and_file_change_rows_render_existing_tool_items() 
 
 #[test]
 fn item_delta_without_started_item_does_not_create_orphan_row() {
-    let mut conversation = Conversation::new(THREAD_ID);
-
-    conversation.apply(ConversationEvent::ItemDelta {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item_id: "call_partial_task_tool_name".to_owned(),
-        delta: "tas".to_owned(),
-        stream: Some(ItemDeltaStream::ToolProgress),
-        payload: None,
-        markdown: None,
-        markdown_version: None,
-    });
-
-    assert!(
-        conversation.projection().items.is_empty(),
-        "progress for an unknown durable item must not create a visible orphan row"
-    );
-    assert!(
-        conversation.projection().timeline.is_empty(),
-        "unknown progress must not append a timeline entry"
-    );
+    for (item_id, delta, stream) in [
+        ("item_unknown", "noop", None),
+        (
+            "call_partial_task_tool_name",
+            "tas",
+            Some(ItemDeltaStream::ToolProgress),
+        ),
+    ] {
+        let mut conversation = Conversation::new(THREAD_ID);
+        conversation.apply(ConversationEvent::ItemDelta {
+            thread_id: THREAD_ID.to_owned(),
+            turn_id: TURN_ID.to_owned(),
+            item_id: item_id.to_owned(),
+            delta: delta.to_owned(),
+            stream,
+            payload: None,
+            markdown: None,
+            markdown_version: None,
+        });
+        assert!(
+            conversation.projection().items.is_empty(),
+            "progress for an unknown durable item must not create a visible orphan row"
+        );
+        assert!(
+            conversation.projection().timeline.is_empty(),
+            "unknown progress must not append a timeline entry"
+        );
+    }
 }
 
 #[test]
@@ -2285,65 +2236,7 @@ fn tool_item_projection_preserves_recovery_policy_without_timeline_noise() {
 }
 
 #[test]
-fn history_hydration_preserves_tool_recovery_policy_snapshot() {
-    let mut conversation = Conversation::new(THREAD_ID);
-    let item_id = "item_history_policy";
-    let recovery_policy = sample_tool_recovery_policy();
-
-    conversation.hydrate_history(&[
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 1,
-            created_at: 1_000,
-            payload: ThreadHistoryEventPayload::TurnStarted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn: Turn {
-                    id: TURN_ID.to_owned(),
-                    status: TurnStatus::InProgress,
-                    turn_kind: Default::default(),
-                    origin: Default::default(),
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
-                    prompt_manifest: None,
-                    permission_profile: default_test_permission_profile(),
-                },
-                input: Vec::new(),
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 2,
-            created_at: 1_100,
-            payload: ThreadHistoryEventPayload::ItemStarted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item: sample_web_fetch_item(
-                    item_id,
-                    pioneer_protocol::ToolCallStatus::InProgress,
-                    Some(recovery_policy.clone()),
-                ),
-            },
-        },
-    ]);
-
-    let item = conversation
-        .projection()
-        .items
-        .iter()
-        .find(|value| value.id == item_id)
-        .expect("hydrated web_fetch item should exist");
-    assert_eq!(item.item.recovery_policy(), Some(&recovery_policy));
-}
-
-#[test]
-fn history_hydration_keeps_dynamic_model_only_body_out_of_desktop_state() {
+fn dynamic_tool_metadata_survives_live_completion() {
     let mut conversation = Conversation::new(THREAD_ID);
     let item_id = "item_dynamic_http_history";
     let dynamic_item = TurnItem::DynamicToolCall {
@@ -2369,71 +2262,50 @@ fn history_hydration_keeps_dynamic_model_only_body_out_of_desktop_state() {
         observation: None,
     };
 
-    conversation.hydrate_history(&[
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 1,
-            created_at: 1_000,
-            payload: ThreadHistoryEventPayload::TurnStarted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn: Turn {
-                    id: TURN_ID.to_owned(),
-                    status: TurnStatus::InProgress,
-                    turn_kind: Default::default(),
-                    origin: Default::default(),
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
-                    prompt_manifest: None,
-                    permission_profile: default_test_permission_profile(),
-                },
-                input: Vec::new(),
-            },
+    conversation.apply(ConversationEvent::TurnStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: Turn {
+            id: TURN_ID.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: default_test_permission_profile(),
         },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 2,
-            created_at: 1_100,
-            payload: ThreadHistoryEventPayload::ItemStarted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item: TurnItem::DynamicToolCall {
-                    id: item_id.to_owned(),
-                    tool_name: "skill.tests-http-skill.fetch-secret".to_owned(),
-                    arguments: serde_json::json!({}),
-                    status: pioneer_protocol::ToolCallStatus::InProgress,
-                    recovery_policy: None,
-                    execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
-                    output_policy: ToolOutputPolicySnapshot::for_tool_name("dynamic_tool"),
-                    display: ToolDisplayPayload::Hidden,
-                    storage: ToolStoragePayload::Metadata {
-                        metadata: ToolMetadata::from_json(serde_json::json!({"state": "running"})),
-                    },
-                    recovery: None,
-                    success: None,
-                    outcome: None,
-                    observation: None,
-                },
+    });
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::DynamicToolCall {
+            id: item_id.to_owned(),
+            tool_name: "skill.tests-http-skill.fetch-secret".to_owned(),
+            arguments: serde_json::json!({}),
+            status: pioneer_protocol::ToolCallStatus::InProgress,
+            recovery_policy: None,
+            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("dynamic_tool"),
+            display: ToolDisplayPayload::Hidden,
+            storage: ToolStoragePayload::Metadata {
+                metadata: ToolMetadata::from_json(serde_json::json!({"state": "running"})),
             },
+            recovery: None,
+            success: None,
+            outcome: None,
+            observation: None,
         },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 3,
-            created_at: 1_200,
-            payload: ThreadHistoryEventPayload::ItemCompleted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item: dynamic_item,
-            },
-        },
-    ]);
+    });
+    conversation.apply(ConversationEvent::ItemCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: dynamic_item,
+    });
 
     let item = conversation
         .projection()
@@ -2442,27 +2314,7 @@ fn history_hydration_keeps_dynamic_model_only_body_out_of_desktop_state() {
         .find(|value| value.id == item_id)
         .expect("hydrated dynamic item should exist");
     let desktop_state = format!("{:?}", item);
-    assert!(!desktop_state.contains("SECRET_DYNAMIC_HTTP_BODY_SENTINEL"));
     assert!(desktop_state.contains("bodyHash"));
-}
-
-#[test]
-fn item_delta_without_started_item_does_not_break_view_state() {
-    let mut conversation = Conversation::new(THREAD_ID);
-
-    conversation.apply(ConversationEvent::ItemDelta {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item_id: "item_unknown".to_owned(),
-        delta: "noop".to_owned(),
-        stream: None,
-        payload: None,
-        markdown: None,
-        markdown_version: None,
-    });
-
-    assert!(conversation.projection().timeline.is_empty());
-    assert!(conversation.projection().items.is_empty());
 }
 
 #[test]
@@ -2572,92 +2424,58 @@ fn timeout_event_without_recovery_job_marks_no_automatic_recovery() {
 }
 
 #[test]
-fn history_hydration_restores_recovery_events_without_terminal_duplicate() {
+fn live_recovery_events_do_not_duplicate_terminal_failure() {
     let item_id = "item_reasoning_recovery";
     let recovery_job_id = "job_reasoning_recovery";
     let mut conversation = Conversation::new(THREAD_ID);
 
-    conversation.hydrate_history(&[
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 1,
-            created_at: 1_000,
-            payload: ThreadHistoryEventPayload::TurnStarted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn: Turn {
-                    id: TURN_ID.to_owned(),
-                    status: TurnStatus::InProgress,
-                    turn_kind: Default::default(),
-                    origin: Default::default(),
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
-                    prompt_manifest: None,
-                    permission_profile: default_test_permission_profile(),
-                },
-                input: Vec::new(),
-            },
+    conversation.apply(ConversationEvent::TurnStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: Turn {
+            id: TURN_ID.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: default_test_permission_profile(),
         },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 2,
-            created_at: 1_100,
-            payload: ThreadHistoryEventPayload::ItemStarted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item: TurnItem::Reasoning {
-                    id: item_id.to_owned(),
-                    summary: vec![],
-                    content: vec![],
-                },
-            },
+    });
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::Reasoning {
+            id: item_id.to_owned(),
+            summary: vec![],
+            content: vec![],
         },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 3,
-            created_at: 1_200,
-            payload: ThreadHistoryEventPayload::ItemRecoveryOpened {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item_id: item_id.to_owned(),
-                item_type: TurnItemType::Reasoning,
-                recovery_job_id: recovery_job_id.to_owned(),
-                trigger: RecoveryTrigger::ProviderError,
-                action: RecoveryAction::MarkFailed,
-                attempt_number: 1,
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 4,
-            created_at: 1_300,
-            payload: ThreadHistoryEventPayload::ItemRecoveryExhausted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item_id: item_id.to_owned(),
-                item_type: TurnItemType::Reasoning,
-                recovery_job_id: recovery_job_id.to_owned(),
-                attempt_number: 1,
-                status: RecoveryJobStatus::Failed,
-                error_message: "recovery policy marks this failure as terminal".to_owned(),
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 5,
-            created_at: 1_400,
-            payload: ThreadHistoryEventPayload::TurnFailed {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn: Turn {
+    });
+    conversation.apply(ConversationEvent::ItemRecoveryOpened {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item_id: item_id.to_owned(),
+        item_type: TurnItemType::Reasoning,
+        recovery_job_id: recovery_job_id.to_owned(),
+        attempt_number: 1,
+    });
+    conversation.apply(ConversationEvent::ItemRecoveryExhausted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item_id: item_id.to_owned(),
+        item_type: TurnItemType::Reasoning,
+        recovery_job_id: recovery_job_id.to_owned(),
+        attempt_number: 1,
+        status: RecoveryJobStatus::Failed,
+        error_message: "recovery policy marks this failure as terminal".to_owned(),
+    });
+    conversation.apply(ConversationEvent::TurnFailed { thread_id: THREAD_ID.to_owned(),
+turn: Turn {
                     id: TURN_ID.to_owned(),
                     status: TurnStatus::Failed,
                     turn_kind: Default::default(),
@@ -2673,10 +2491,7 @@ fn history_hydration_restores_recovery_events_without_terminal_duplicate() {
                     )),
                     prompt_manifest: None,
                     permission_profile: default_test_permission_profile(),
-                },
-            },
-        },
-    ]);
+                } });
 
     let system_events = conversation
         .projection()
@@ -2700,145 +2515,79 @@ fn history_hydration_restores_recovery_events_without_terminal_duplicate() {
     );
 }
 
-fn recovery_failure_sequence(
-    from_history: bool,
-    recovery: Option<(&str, &str)>,
-    turn_error: &str,
-) -> Conversation {
-    let mut events = vec![ThreadHistoryEvent {
-        turn_id: TURN_ID.to_owned(),
-        sequence: 1,
-        created_at: 1_000,
-        payload: ThreadHistoryEventPayload::TurnStarted {
-            workspace_id: WORKSPACE_ID.to_owned(),
-            thread_id: THREAD_ID.to_owned(),
-            turn: turn_snapshot(TURN_ID, TurnStatus::InProgress, None),
-            input: vec![],
-        },
-    }];
+fn recovery_failure_sequence(recovery: Option<(&str, &str)>, turn_error: &str) -> Conversation {
+    let mut conversation = Conversation::new(THREAD_ID);
+    apply_in_progress_turn(&mut conversation);
     if let Some((recovery_turn, message)) = recovery {
-        events.push(ThreadHistoryEvent {
+        conversation.apply(ConversationEvent::ItemRecoveryExhausted {
+            thread_id: THREAD_ID.to_owned(),
             turn_id: recovery_turn.to_owned(),
-            sequence: 2,
-            created_at: 1_100,
-            payload: ThreadHistoryEventPayload::ItemRecoveryExhausted {
-                workspace_id: WORKSPACE_ID.to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: recovery_turn.to_owned(),
-                item_id: "item_recovery_failure".to_owned(),
-                item_type: TurnItemType::Reasoning,
-                recovery_job_id: "job_recovery_failure".to_owned(),
-                attempt_number: 2,
-                status: RecoveryJobStatus::Exhausted,
-                error_message: message.to_owned(),
-            },
+            item_id: "item_recovery_failure".to_owned(),
+            item_type: TurnItemType::Reasoning,
+            recovery_job_id: "job_recovery_failure".to_owned(),
+            attempt_number: 2,
+            status: RecoveryJobStatus::Exhausted,
+            error_message: message.to_owned(),
         });
     }
-    events.push(ThreadHistoryEvent {
-        turn_id: TURN_ID.to_owned(),
-        sequence: 3,
-        created_at: 1_200,
-        payload: ThreadHistoryEventPayload::TurnFailed {
-            workspace_id: WORKSPACE_ID.to_owned(),
-            thread_id: THREAD_ID.to_owned(),
-            turn: turn_snapshot(TURN_ID, TurnStatus::Failed, Some(turn_error.to_owned())),
-        },
+    conversation.apply(ConversationEvent::TurnFailed {
+        thread_id: THREAD_ID.to_owned(),
+        turn: turn_snapshot(TURN_ID, TurnStatus::Failed, Some(turn_error.to_owned())),
     });
-    let mut conversation = Conversation::new(THREAD_ID);
-    if from_history {
-        conversation.hydrate_history(&events);
-    } else {
-        for event in events {
-            conversation.apply(match event.payload {
-                ThreadHistoryEventPayload::TurnStarted {
-                    thread_id, turn, ..
-                } => ConversationEvent::TurnStarted { thread_id, turn },
-                ThreadHistoryEventPayload::ItemRecoveryExhausted {
-                    thread_id,
-                    turn_id,
-                    item_id,
-                    item_type,
-                    recovery_job_id,
-                    attempt_number,
-                    status,
-                    error_message,
-                    ..
-                } => ConversationEvent::ItemRecoveryExhausted {
-                    thread_id,
-                    turn_id,
-                    item_id,
-                    item_type,
-                    recovery_job_id,
-                    attempt_number,
-                    status,
-                    error_message,
-                },
-                ThreadHistoryEventPayload::TurnFailed {
-                    thread_id, turn, ..
-                } => ConversationEvent::TurnFailed { thread_id, turn },
-                _ => unreachable!("fixture contains only recovery terminal events"),
-            });
-        }
-    }
     conversation
 }
 
 #[test]
-fn matching_recovery_failure_has_one_system_event_live_and_from_history() {
-    for from_history in [false, true] {
-        for message in [
-            "Last provider request was denied due to authentication or permissions: HTTP 403. Recovery stopped: attempt limit exhausted.",
-            "An opaque terminal reason.",
-        ] {
-            let conversation =
-                recovery_failure_sequence(from_history, Some((TURN_ID, message)), message);
-            let system_events = conversation
-                .projection()
-                .items
-                .iter()
-                .filter(|item| matches!(item.item, TurnItem::SystemEvent { .. }))
-                .collect::<Vec<_>>();
-            assert_eq!(system_events.len(), 1);
-            assert!(matches!(&system_events[0].item,
-                TurnItem::SystemEvent { code: Some(code), details: Some(details), .. }
-                    if code == "item_recovery_exhausted"
-                        && details["error_message"].as_str() == Some(message)));
-            assert_eq!(
-                conversation.projection().last_error.as_deref(),
-                Some(message)
-            );
-        }
+fn matching_recovery_failure_has_one_system_event_live() {
+    for message in [
+        "Last provider request was denied due to authentication or permissions: HTTP 403. Recovery stopped: attempt limit exhausted.",
+        "An opaque terminal reason.",
+    ] {
+        let conversation = recovery_failure_sequence(Some((TURN_ID, message)), message);
+        let system_events = conversation
+            .projection()
+            .items
+            .iter()
+            .filter(|item| matches!(item.item, TurnItem::SystemEvent { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(system_events.len(), 1);
+        assert!(matches!(&system_events[0].item,
+        TurnItem::SystemEvent { code: Some(code), details: Some(details), .. }
+            if code == "item_recovery_exhausted"
+                && details["error_message"].as_str() == Some(message)));
+        assert_eq!(
+            conversation.projection().last_error.as_deref(),
+            Some(message)
+        );
     }
 }
 
 #[test]
-fn recovery_failure_keeps_distinct_and_standalone_turn_errors_live_and_from_history() {
+fn recovery_failure_keeps_distinct_and_standalone_turn_errors_live() {
     let message =
         "Last provider request failed: HTTP 403. Recovery stopped: attempt limit exhausted.";
-    for from_history in [false, true] {
-        for recovery in [
-            Some((TURN_ID, "another failure")),
-            Some(("turn_other_recovery", message)),
-            None,
-        ] {
-            let conversation = recovery_failure_sequence(from_history, recovery, message);
-            let system_events = conversation
-                .projection()
-                .items
-                .iter()
-                .filter(|item| matches!(item.item, TurnItem::SystemEvent { .. }))
-                .collect::<Vec<_>>();
-            assert_eq!(system_events.len(), if recovery.is_some() { 2 } else { 1 });
-            let turn_failure = system_events
-                .iter()
-                .find(|item| {
-                    item.turn_id == TURN_ID
-                        && matches!(&item.item,
-                    TurnItem::SystemEvent { code: Some(code), .. } if code == "turn_failed")
-                })
-                .expect("a distinct or standalone Turn failure must remain visible");
-            assert_eq!(turn_failure.partial_text, message);
-        }
+    for recovery in [
+        Some((TURN_ID, "another failure")),
+        Some(("turn_other_recovery", message)),
+        None,
+    ] {
+        let conversation = recovery_failure_sequence(recovery, message);
+        let system_events = conversation
+            .projection()
+            .items
+            .iter()
+            .filter(|item| matches!(item.item, TurnItem::SystemEvent { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(system_events.len(), if recovery.is_some() { 2 } else { 1 });
+        let turn_failure = system_events
+            .iter()
+            .find(|item| {
+                item.turn_id == TURN_ID
+                    && matches!(&item.item,
+            TurnItem::SystemEvent { code: Some(code), .. } if code == "turn_failed")
+            })
+            .expect("a distinct or standalone Turn failure must remain visible");
+        assert_eq!(turn_failure.partial_text, message);
     }
 }
 
@@ -2895,114 +2644,6 @@ fn foreign_thread_events_do_not_modify_local_projection() {
     assert!(conversation.projection().timeline.is_empty());
     assert!(conversation.projection().turns.is_empty());
     assert!(conversation.can_submit_message());
-}
-
-#[test]
-fn replay_style_sequence_restores_final_state() {
-    let mut conversation = Conversation::new(THREAD_ID);
-
-    conversation.apply(ConversationEvent::TurnStarted {
-        thread_id: THREAD_ID.to_owned(),
-        turn: Turn {
-            id: TURN_ID.to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-
-            prompt_manifest: None,
-
-            permission_profile: default_test_permission_profile(),
-        },
-    });
-    conversation.apply(ConversationEvent::ItemStarted {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item: TurnItem::Reasoning {
-            id: "item_reasoning".to_owned(),
-            summary: vec![],
-            content: vec![],
-        },
-    });
-    conversation.apply(ConversationEvent::ItemCompleted {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item: TurnItem::Reasoning {
-            id: "item_reasoning".to_owned(),
-            summary: vec!["thinking done".to_owned()],
-            content: vec![],
-        },
-    });
-    conversation.apply(ConversationEvent::ItemStarted {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item: TurnItem::AgentMessage {
-            id: "item_answer".to_owned(),
-            text: String::new(),
-            phase: Default::default(),
-            markdown: None,
-            markdown_version: None,
-        },
-    });
-    conversation.apply(ConversationEvent::ItemDelta {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item_id: "item_answer".to_owned(),
-        delta: "final".to_owned(),
-        stream: None,
-        payload: None,
-        markdown: None,
-        markdown_version: None,
-    });
-    conversation.apply(ConversationEvent::ItemCompleted {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item: TurnItem::AgentMessage {
-            id: "item_answer".to_owned(),
-            text: "final".to_owned(),
-            phase: Default::default(),
-            markdown: None,
-            markdown_version: None,
-        },
-    });
-    conversation.apply(ConversationEvent::TurnCompleted {
-        thread_id: THREAD_ID.to_owned(),
-        turn: Turn {
-            id: TURN_ID.to_owned(),
-            status: TurnStatus::Completed,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-
-            prompt_manifest: None,
-
-            permission_profile: default_test_permission_profile(),
-        },
-    });
-    assert_eq!(conversation.status_label(), "completing");
-    assert!(conversation.tick());
-
-    let answer = conversation
-        .projection()
-        .items
-        .iter()
-        .find(|item| item.id == "item_answer")
-        .expect("assistant answer should exist");
-    assert_eq!(answer.final_text.as_deref(), Some("final"));
-    assert!(conversation.can_submit_message());
-    assert_eq!(conversation.status_label(), "completed");
 }
 
 #[test]
@@ -3262,10 +2903,16 @@ fn execution_window_events_project_runtime_rows_without_ending_turn() {
         .iter()
         .map(|event| event.kind)
         .collect::<Vec<_>>();
-    assert!(kinds.contains(&EventKind::TurnExecutionWindowStarted));
-    assert!(kinds.contains(&EventKind::TurnExecutionWindowExhausted));
-    assert!(kinds.contains(&EventKind::TurnExecutionWindowCheckpointed));
-    assert!(kinds.contains(&EventKind::TurnExecutionWindowContinued));
+    assert_eq!(
+        kinds,
+        vec![
+            EventKind::TurnStarted,
+            EventKind::TurnExecutionWindowStarted,
+            EventKind::TurnExecutionWindowExhausted,
+            EventKind::TurnExecutionWindowCheckpointed,
+            EventKind::TurnExecutionWindowContinued,
+        ]
+    );
 
     assert_eq!(conversation.status_label(), "running");
     assert!(!conversation.can_submit_message());
@@ -3398,7 +3045,13 @@ fn execution_window_blocked_projects_controlled_pause_not_failure() {
         .iter()
         .map(|event| event.kind)
         .collect::<Vec<_>>();
-    assert!(kinds.contains(&EventKind::TurnExecutionWindowBlocked));
+    assert_eq!(
+        kinds,
+        vec![
+            EventKind::TurnStarted,
+            EventKind::TurnExecutionWindowBlocked
+        ]
+    );
 
     let (message, details) = system_event_details(&conversation, "turn_execution_window_blocked");
     assert_eq!(message, "Execution paused: max_total_windows_exceeded");
@@ -3419,10 +3072,30 @@ fn execution_window_blocked_projects_controlled_pause_not_failure() {
         Some("max_agent_rounds_per_window")
     );
     assert!(details.get("payload").is_none());
+    assert!(matches!(
+        conversation.turn_flow_state(),
+        super::state_machine::TurnFlowState::Blocked { turn_id } if turn_id == TURN_ID
+    ));
+    // A late terminal must traverse and respect the real blocked guard.
+    conversation.apply(ConversationEvent::TurnCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: turn_snapshot(TURN_ID, TurnStatus::Completed, None),
+    });
+    assert_eq!(conversation.status_label(), "blocked");
+    assert!(conversation.can_submit_message());
+    assert_eq!(
+        conversation
+            .projection()
+            .turns
+            .iter()
+            .find(|turn| turn.id == TURN_ID)
+            .map(|turn| turn.phase),
+        Some(TurnPhase::Blocked)
+    );
 }
 
 #[test]
-fn turn_blocked_resume_metadata_projects_live_and_history() {
+fn turn_blocked_resume_metadata_projects_live() {
     let resume = TurnBlockedResumeMetadata {
         reason_class: "model_not_found".to_owned(),
         human_message: "Model is unavailable".to_owned(),
@@ -3479,62 +3152,14 @@ fn turn_blocked_resume_metadata_projects_live_and_history() {
         Some("rec_000000000000000001")
     );
 
-    let mut replay = Conversation::new(THREAD_ID);
-    replay.hydrate_history(&[
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 1,
-            created_at: 1_000,
-            payload: ThreadHistoryEventPayload::TurnStarted {
-                workspace_id: WORKSPACE_ID.to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn: Turn {
-                    id: TURN_ID.to_owned(),
-                    status: TurnStatus::InProgress,
-                    turn_kind: Default::default(),
-                    origin: Default::default(),
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
-                    prompt_manifest: None,
-                    permission_profile: default_test_permission_profile(),
-                },
-                input: Vec::new(),
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 2,
-            created_at: 1_100,
-            payload: ThreadHistoryEventPayload::TurnBlocked {
-                workspace_id: WORKSPACE_ID.to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn: blocked_turn,
-                resume: Some(resume.clone()),
-            },
-        },
-    ]);
-
-    let replay_turn = replay
-        .projection()
-        .turns
-        .iter()
-        .find(|turn| turn.id == TURN_ID)
-        .expect("blocked turn should replay");
-    assert_eq!(replay_turn.resume.as_ref(), Some(&resume));
-    let (_replay_message, replay_details) = system_event_details(&replay, "turn_blocked_resumable");
     assert_eq!(
-        replay_details
+        live_details
             .get("latest_checkpoint_id")
             .and_then(|value| value.as_str()),
         Some("chk_000000000000000001")
     );
     assert_eq!(
-        replay_details
+        live_details
             .get("can_resume_same_turn")
             .and_then(|value| value.as_bool()),
         Some(true)
@@ -3542,445 +3167,152 @@ fn turn_blocked_resume_metadata_projects_live_and_history() {
 }
 
 #[test]
-fn history_hydration_replays_tool_retry_events_like_live_events() {
-    let mut live = Conversation::new(THREAD_ID);
-    apply_in_progress_turn(&mut live);
-    live.apply(ConversationEvent::ItemToolRetryScheduled {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item_id: "item_web_fetch_retry".to_owned(),
-        item_type: TurnItemType::WebFetch,
-        tool_retry_episode_id: "tool_retry_turn_1_1".to_owned(),
-        tool_name: "web_fetch".to_owned(),
-        attempt_number: 1,
-        error_class: ToolRetryErrorClass::Timeout,
-        retry_hint: "retry with a smaller request".to_owned(),
-        budgets: tool_retry_budget_usage(),
-        failure_signature_fingerprint: "sig_timeout".to_owned(),
-        reason: "recoverable_tool_output".to_owned(),
-    });
-    live.apply(ConversationEvent::TurnToolLoopBudgetExceeded {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        limit_kind: ToolLoopBudgetLimitKind::AgentRounds,
-        limit: 32,
-        observed: 33,
-        action: ToolLoopBudgetAction::ContinueInNextWindow,
-        reason: "agent_rounds_exceeded".to_owned(),
-    });
+fn item_handlers_preserve_typed_items_and_reasoning_duration() {
+    let mut projector = ConversationProjector::default();
+    let handlers = super::handlers::TurnItemHandlerRegistry::default();
+    projector.apply_turn_started(
+        &Turn {
+            id: TURN_ID.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
 
-    let mut replay = Conversation::new(THREAD_ID);
-    replay.hydrate_history(&[
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 1,
-            created_at: 1_000,
-            payload: ThreadHistoryEventPayload::TurnStarted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn: Turn {
-                    id: TURN_ID.to_owned(),
-                    status: TurnStatus::InProgress,
-                    turn_kind: Default::default(),
-                    origin: Default::default(),
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
-                    prompt_manifest: None,
-                    permission_profile: default_test_permission_profile(),
-                },
-                input: Vec::new(),
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 2,
-            created_at: 1_100,
-            payload: ThreadHistoryEventPayload::ItemToolRetryScheduled {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item_id: "item_web_fetch_retry".to_owned(),
-                item_type: TurnItemType::WebFetch,
-                tool_retry_episode_id: "tool_retry_turn_1_1".to_owned(),
-                tool_name: "web_fetch".to_owned(),
-                attempt_number: 1,
-                error_class: ToolRetryErrorClass::Timeout,
-                retry_hint: "retry with a smaller request".to_owned(),
-                budgets: tool_retry_budget_usage(),
-                failure_signature_fingerprint: "sig_timeout".to_owned(),
-                reason: "recoverable_tool_output".to_owned(),
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 3,
-            created_at: 1_200,
-            payload: ThreadHistoryEventPayload::TurnToolLoopBudgetExceeded {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                limit_kind: ToolLoopBudgetLimitKind::AgentRounds,
-                limit: 32,
-                observed: 33,
-                action: ToolLoopBudgetAction::ContinueInNextWindow,
-                reason: "agent_rounds_exceeded".to_owned(),
-            },
-        },
-    ]);
+            prompt_manifest: None,
 
-    let live_kinds = live
-        .event_log()
-        .iter()
-        .map(|event| event.kind)
-        .collect::<Vec<_>>();
-    let replay_kinds = replay
-        .event_log()
-        .iter()
-        .map(|event| event.kind)
-        .collect::<Vec<_>>();
-    assert_eq!(live_kinds, replay_kinds);
-    assert_eq!(replay.status_label(), "running");
-    assert_eq!(
-        live.projection()
-            .items
-            .iter()
-            .filter(|item| item.item_type == "system_event")
-            .count(),
-        replay
-            .projection()
-            .items
-            .iter()
-            .filter(|item| item.item_type == "system_event")
-            .count()
+            permission_profile: default_test_permission_profile(),
+        },
+        1_000,
     );
-}
+    handlers.apply_started(
+        &mut projector,
+        TURN_ID.to_owned().as_str(),
+        &TurnItem::UserMessage {
+            id: "item_user_history".to_owned(),
+            text: "history prompt".to_owned(),
+            attachments: Vec::new(),
+        },
+        1_100,
+    );
+    handlers.apply_completed(
+        &mut projector,
+        TURN_ID.to_owned().as_str(),
+        &TurnItem::UserMessage {
+            id: "item_user_history".to_owned(),
+            text: "history prompt".to_owned(),
+            attachments: Vec::new(),
+        },
+        1_200,
+    );
+    handlers.apply_started(
+        &mut projector,
+        TURN_ID.to_owned().as_str(),
+        &TurnItem::Reasoning {
+            id: "item_reasoning_history".to_owned(),
+            summary: Vec::new(),
+            content: Vec::new(),
+        },
+        2_000,
+    );
+    handlers.apply_completed(
+        &mut projector,
+        TURN_ID.to_owned().as_str(),
+        &TurnItem::Reasoning {
+            id: "item_reasoning_history".to_owned(),
+            summary: vec!["done".to_owned()],
+            content: Vec::new(),
+        },
+        32_500,
+    );
+    handlers.apply_started(
+        &mut projector,
+        TURN_ID.to_owned().as_str(),
+        &TurnItem::AgentMessage {
+            id: "item_answer_history".to_owned(),
+            text: String::new(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+        32_900,
+    );
+    handlers.apply_delta(
+        &mut projector,
+        TURN_ID,
+        "item_answer_history",
+        "history ",
+        None,
+        None,
+        None,
+        None,
+        33_100,
+    );
+    handlers.apply_completed(
+        &mut projector,
+        TURN_ID.to_owned().as_str(),
+        &TurnItem::AgentMessage {
+            id: "item_answer_history".to_owned(),
+            text: "history response".to_owned(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+        33_200,
+    );
+    projector.apply_turn_completed(
+        &Turn {
+            id: TURN_ID.to_owned(),
+            status: TurnStatus::Completed,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
 
-#[test]
-fn history_hydration_replays_execution_window_events_like_live_events() {
-    let mut live = Conversation::new(THREAD_ID);
-    apply_in_progress_turn(&mut live);
-    live.apply(ConversationEvent::TurnExecutionWindowStarted {
-        notification: window_started_notification("win_000000000000000001", 1),
-    });
-    live.apply(ConversationEvent::TurnExecutionWindowExhausted {
-        notification: window_exhausted_notification("win_000000000000000001", 1),
-    });
-    live.apply(ConversationEvent::TurnExecutionWindowCheckpointed {
-        notification: window_checkpointed_notification("win_000000000000000001", 1),
-    });
-    live.apply(ConversationEvent::TurnExecutionWindowContinued {
-        notification: window_continued_notification("win_000000000000000002", 2),
-    });
+            prompt_manifest: None,
 
-    let mut replay = Conversation::new(THREAD_ID);
-    replay.hydrate_history(&[
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 1,
-            created_at: 1_000,
-            payload: ThreadHistoryEventPayload::TurnStarted {
-                workspace_id: WORKSPACE_ID.to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn: Turn {
-                    id: TURN_ID.to_owned(),
-                    status: TurnStatus::InProgress,
-                    turn_kind: Default::default(),
-                    origin: Default::default(),
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
-                    prompt_manifest: None,
-                    permission_profile: default_test_permission_profile(),
-                },
-                input: Vec::new(),
-            },
+            permission_profile: default_test_permission_profile(),
         },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 2,
-            created_at: 1_100,
-            payload: ThreadHistoryEventPayload::TurnExecutionWindowStarted(
-                window_started_notification("win_000000000000000001", 1),
-            ),
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 3,
-            created_at: 1_200,
-            payload: ThreadHistoryEventPayload::TurnExecutionWindowExhausted(
-                window_exhausted_notification("win_000000000000000001", 1),
-            ),
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 4,
-            created_at: 1_300,
-            payload: ThreadHistoryEventPayload::TurnExecutionWindowCheckpointed(
-                window_checkpointed_notification("win_000000000000000001", 1),
-            ),
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 5,
-            created_at: 1_400,
-            payload: ThreadHistoryEventPayload::TurnExecutionWindowContinued(
-                window_continued_notification("win_000000000000000002", 2),
-            ),
-        },
-    ]);
+        33_400,
+    );
+    projector.finalize_turn_completed(TURN_ID, 33_400);
 
-    let live_kinds = live
-        .event_log()
-        .iter()
-        .map(|event| event.kind)
-        .collect::<Vec<_>>();
-    let replay_kinds = replay
-        .event_log()
-        .iter()
-        .map(|event| event.kind)
-        .collect::<Vec<_>>();
-    assert_eq!(live_kinds, replay_kinds);
-    assert_eq!(replay.status_label(), "running");
-    assert!(!replay.can_submit_message());
-
-    let live_system_events = live
-        .projection()
-        .items
-        .iter()
-        .filter_map(|item| match &item.item {
-            TurnItem::SystemEvent {
-                message,
-                code: Some(code),
-                ..
-            } => Some((code.clone(), message.clone())),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let replay_system_events = replay
-        .projection()
-        .items
-        .iter()
-        .filter_map(|item| match &item.item {
-            TurnItem::SystemEvent {
-                message,
-                code: Some(code),
-                ..
-            } => Some((code.clone(), message.clone())),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(live_system_events, replay_system_events);
-}
-
-#[test]
-fn hydrate_history_restores_all_items_and_thinking_duration() {
-    let mut conversation = Conversation::new(THREAD_ID);
-    let events = vec![
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 1,
-            created_at: 1_000,
-            payload: ThreadHistoryEventPayload::TurnStarted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn: Turn {
-                    id: TURN_ID.to_owned(),
-                    status: TurnStatus::InProgress,
-                    turn_kind: Default::default(),
-                    origin: Default::default(),
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
-
-                    prompt_manifest: None,
-
-                    permission_profile: default_test_permission_profile(),
-                },
-                input: vec![UserInput::Text {
-                    text: "history prompt".to_owned(),
-                    text_elements: Vec::new(),
-                }],
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 2,
-            created_at: 1_100,
-            payload: ThreadHistoryEventPayload::ItemStarted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item: TurnItem::UserMessage {
-                    id: "item_user_history".to_owned(),
-                    text: "history prompt".to_owned(),
-                    attachments: Vec::new(),
-                },
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 3,
-            created_at: 1_200,
-            payload: ThreadHistoryEventPayload::ItemCompleted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item: TurnItem::UserMessage {
-                    id: "item_user_history".to_owned(),
-                    text: "history prompt".to_owned(),
-                    attachments: Vec::new(),
-                },
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 4,
-            created_at: 2_000,
-            payload: ThreadHistoryEventPayload::ItemStarted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item: TurnItem::Reasoning {
-                    id: "item_reasoning_history".to_owned(),
-                    summary: Vec::new(),
-                    content: Vec::new(),
-                },
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 5,
-            created_at: 32_500,
-            payload: ThreadHistoryEventPayload::ItemCompleted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item: TurnItem::Reasoning {
-                    id: "item_reasoning_history".to_owned(),
-                    summary: vec!["done".to_owned()],
-                    content: Vec::new(),
-                },
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 6,
-            created_at: 32_900,
-            payload: ThreadHistoryEventPayload::ItemStarted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item: TurnItem::AgentMessage {
-                    id: "item_answer_history".to_owned(),
-                    text: String::new(),
-                    phase: Default::default(),
-                    markdown: None,
-                    markdown_version: None,
-                },
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 7,
-            created_at: 33_100,
-            payload: ThreadHistoryEventPayload::ItemDelta {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item_id: "item_answer_history".to_owned(),
-                delta: "history ".to_owned(),
-                stream: None,
-                payload: None,
-                markdown: None,
-                markdown_version: None,
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 8,
-            created_at: 33_200,
-            payload: ThreadHistoryEventPayload::ItemCompleted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item: TurnItem::AgentMessage {
-                    id: "item_answer_history".to_owned(),
-                    text: "history response".to_owned(),
-                    phase: Default::default(),
-                    markdown: None,
-                    markdown_version: None,
-                },
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 9,
-            created_at: 33_400,
-            payload: ThreadHistoryEventPayload::TurnCompleted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn: Turn {
-                    id: TURN_ID.to_owned(),
-                    status: TurnStatus::Completed,
-                    turn_kind: Default::default(),
-                    origin: Default::default(),
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
-
-                    prompt_manifest: None,
-
-                    permission_profile: default_test_permission_profile(),
-                },
-            },
-        },
-    ];
-
-    conversation.hydrate_history(&events);
-
-    let user_entry = conversation
-        .projection()
+    let user_entry = projector
+        .view_state()
         .timeline
         .iter()
         .find(|entry| entry.item_id == "item_user_history")
         .expect("hydrated user entry should exist");
-    let user_item = conversation
-        .projection()
+    let user_item = projector
+        .view_state()
         .item_for_timeline_entry(user_entry)
         .expect("hydrated user timeline item should resolve");
     assert_eq!(user_item.partial_text, "history prompt");
 
-    let reasoning_entry = conversation
-        .projection()
+    let reasoning_entry = projector
+        .view_state()
         .timeline
         .iter()
         .find(|entry| entry.item_id == "item_reasoning_history")
         .expect("hydrated reasoning item should exist");
-    let reasoning_item = conversation
-        .projection()
+    let reasoning_item = projector
+        .view_state()
         .items
         .iter()
         .find(|item| item.id == "item_reasoning_history")
         .expect("hydrated reasoning view item should exist");
-    let reasoning_timeline_item = conversation
-        .projection()
+    let reasoning_timeline_item = projector
+        .view_state()
         .item_for_timeline_entry(reasoning_entry)
         .expect("hydrated reasoning timeline item should resolve");
     assert!(
@@ -3990,131 +3322,91 @@ fn hydrate_history_restores_all_items_and_thinking_duration() {
     assert_eq!(reasoning_item.started_at_unix_ms, Some(2_000));
     assert_eq!(reasoning_item.completed_at_unix_ms, Some(32_500));
 
-    let answer_entry = conversation
-        .projection()
+    let answer_entry = projector
+        .view_state()
         .timeline
         .iter()
         .find(|entry| entry.item_id == "item_answer_history")
         .expect("hydrated assistant item should exist");
-    let answer_item = conversation
-        .projection()
+    let answer_item = projector
+        .view_state()
         .item_for_timeline_entry(answer_entry)
         .expect("hydrated assistant timeline item should resolve");
     assert_eq!(answer_item.partial_text, "history response");
-
-    assert_eq!(conversation.status_label(), "completed");
-    assert!(conversation.can_submit_message());
 }
 
 #[test]
-fn hydrate_history_preserves_reasoning_delta_text_when_completed_payload_is_empty() {
+fn reasoning_delta_survives_live_empty_completion() {
     let mut conversation = Conversation::new(THREAD_ID);
-    let events = vec![
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 1,
-            created_at: 1_000,
-            payload: ThreadHistoryEventPayload::TurnStarted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn: Turn {
-                    id: TURN_ID.to_owned(),
-                    status: TurnStatus::InProgress,
-                    turn_kind: Default::default(),
-                    origin: Default::default(),
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
+    conversation.apply(ConversationEvent::TurnStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: Turn {
+            id: TURN_ID.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
 
-                    prompt_manifest: None,
+            prompt_manifest: None,
 
-                    permission_profile: default_test_permission_profile(),
-                },
-                input: vec![UserInput::Text {
-                    text: "reasoning test".to_owned(),
-                    text_elements: Vec::new(),
-                }],
-            },
+            permission_profile: default_test_permission_profile(),
         },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 2,
-            created_at: 2_000,
-            payload: ThreadHistoryEventPayload::ItemStarted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item: TurnItem::Reasoning {
-                    id: "item_reasoning_delta_history".to_owned(),
-                    summary: Vec::new(),
-                    content: Vec::new(),
-                },
-            },
+    });
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::Reasoning {
+            id: "item_reasoning_delta_history".to_owned(),
+            summary: Vec::new(),
+            content: Vec::new(),
         },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 3,
-            created_at: 3_000,
-            payload: ThreadHistoryEventPayload::ItemDelta {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item_id: "item_reasoning_delta_history".to_owned(),
-                delta: "Reasoning chunk".to_owned(),
-                stream: Some(ItemDeltaStream::Generic),
-                payload: None,
-                markdown: None,
-                markdown_version: None,
-            },
+    });
+    conversation.apply(ConversationEvent::ItemDelta {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item_id: "item_reasoning_delta_history".to_owned(),
+        delta: "Reasoning chunk".to_owned(),
+        stream: Some(ItemDeltaStream::Generic),
+        payload: None,
+        markdown: None,
+        markdown_version: None,
+    });
+    conversation.apply(ConversationEvent::ItemCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::Reasoning {
+            id: "item_reasoning_delta_history".to_owned(),
+            summary: Vec::new(),
+            content: Vec::new(),
         },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 4,
-            created_at: 4_000,
-            payload: ThreadHistoryEventPayload::ItemCompleted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn_id: TURN_ID.to_owned(),
-                item: TurnItem::Reasoning {
-                    id: "item_reasoning_delta_history".to_owned(),
-                    summary: Vec::new(),
-                    content: Vec::new(),
-                },
-            },
-        },
-        ThreadHistoryEvent {
-            turn_id: TURN_ID.to_owned(),
-            sequence: 5,
-            created_at: 5_000,
-            payload: ThreadHistoryEventPayload::TurnCompleted {
-                workspace_id: "ws_000000000000000001".to_owned(),
-                thread_id: THREAD_ID.to_owned(),
-                turn: Turn {
-                    id: TURN_ID.to_owned(),
-                    status: TurnStatus::Completed,
-                    turn_kind: Default::default(),
-                    origin: Default::default(),
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
+    });
+    conversation.apply(ConversationEvent::TurnCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: Turn {
+            id: TURN_ID.to_owned(),
+            status: TurnStatus::Completed,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
 
-                    prompt_manifest: None,
+            prompt_manifest: None,
 
-                    permission_profile: default_test_permission_profile(),
-                },
-            },
+            permission_profile: default_test_permission_profile(),
         },
-    ];
-
-    conversation.hydrate_history(&events);
+    });
+    assert!(conversation.tick());
 
     let reasoning_entry = conversation
         .projection()

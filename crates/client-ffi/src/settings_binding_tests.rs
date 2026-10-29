@@ -18,6 +18,7 @@ fn voice_mode_intent_json_dispatch_owns_the_shared_voice_page() {
         observed_scopes: Default::default(),
         diagnostics: Default::default(),
         avatar_cache: Default::default(),
+        voice_capture: Default::default(),
     };
     runtime.initialize(r#"{"platform":"ios"}"#).unwrap();
     runtime
@@ -63,6 +64,7 @@ fn independent_direct_and_ffi_profile_replay_preserves_owner_and_page_isolation(
 
             diagnostics: Default::default(),
             avatar_cache: Default::default(),
+            voice_capture: Default::default(),
         };
         runtime
             .initialize(&format!(r#"{{"platform":"{platform}"}}"#))

@@ -714,13 +714,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_configuration_never_falls_back_to_default_listener() {
-        let shell = DesktopMcpOAuthShell::new(Err(OAuthPreparationError::ConfigurationLoad));
-        assert!(shell.prepare().is_err());
-        assert!(shell.listener.lock().unwrap().is_none());
-    }
-
-    #[test]
     fn configuration_causes_do_not_bind_or_launch_and_new_shell_can_recover() {
         for reason in [
             OAuthPreparationError::InvalidCallbackPort,

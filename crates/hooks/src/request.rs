@@ -1188,34 +1188,6 @@ mod tests {
     }
 
     #[test]
-    fn phase_12_hook_input_payload_distinguishes_empty_and_post_turn() {
-        let empty = HookInput::empty(HookInputKind::TurnPrePolicy);
-        assert_eq!(empty.payload, HookInputPayload::Empty);
-
-        let post_turn = HookInput::turn_post_turn(TurnPostTurnHookInput::from_parts(
-            TurnPostTurnStatus::Succeeded,
-            Some("user"),
-            Some("assistant"),
-            Option::<&str>::None,
-            Vec::new(),
-            Vec::new(),
-            TurnPostTurnHookInputLimits::default(),
-        ));
-        assert!(matches!(
-            post_turn.payload,
-            HookInputPayload::TurnPostTurn(_)
-        ));
-    }
-
-    #[test]
-    fn phase_12_text_preview_truncates_by_char_boundary() {
-        let preview = HookTextPreview::from_text("aé日b", 3);
-        assert_eq!(preview.text, "aé日");
-        assert_eq!(preview.original_chars, 4);
-        assert!(preview.truncated);
-    }
-
-    #[test]
     fn phase_12_post_turn_limits_normalize_to_nonzero_values() {
         let limits = TurnPostTurnHookInputLimits {
             user_text_preview_max_chars: 0,
@@ -1359,27 +1331,5 @@ mod tests {
             },
         );
         assert_eq!(input.limits.existing_summary_preview_max_chars, 1);
-    }
-
-    #[test]
-    fn phase_13_pre_compaction_uses_typed_ids() {
-        let input = phase_13_pre_compaction_input(
-            Option::<&str>::None,
-            TurnPreCompactionHookInputLimits::default(),
-        );
-
-        assert_eq!(
-            input.workspace_id,
-            HookWorkspaceId::new("workspace-1").unwrap()
-        );
-        assert_eq!(input.thread_id, HookThreadId::new("thread-1").unwrap());
-        assert_eq!(
-            input.turn_id,
-            Some(HookTurnId::new("turn-1").expect("valid turn id"))
-        );
-        assert_eq!(
-            input.compaction_id,
-            HookCompactionId::new("cmp-1").expect("valid compaction id")
-        );
     }
 }

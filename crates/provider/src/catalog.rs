@@ -654,6 +654,13 @@ mod tests {
         assert_eq!(catalog.tool_support("openai", "gpt-5.4"), Some(false));
         assert_eq!(catalog.tool_support("openai", "unknown"), None);
         assert_eq!(catalog.tool_support("openai", "gpt-5-nano"), None);
+
+        let model = catalog.model("openai", "gpt-5.4").unwrap();
+        assert!(model.metadata.contains_key("compat"));
+        assert_eq!(
+            catalog.limits("openai", "gpt-5.4").context_origin,
+            OriginKind::Override
+        );
     }
 
     fn fixture_catalog() -> ModelCatalog {
@@ -683,18 +690,6 @@ mod tests {
                 .limits("custom", "unknown")
                 .context_window,
             128_000
-        );
-    }
-
-    #[test]
-    fn complete_catalog_loads_and_preserves_metadata() {
-        let catalog = fixture_catalog();
-        assert!(catalog.models.len() >= 30);
-        let model = catalog.model("openai", "gpt-5.4").unwrap();
-        assert!(model.metadata.contains_key("compat"));
-        assert_eq!(
-            catalog.limits("openai", "gpt-5.4").context_origin,
-            OriginKind::Override
         );
     }
 

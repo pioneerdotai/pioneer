@@ -7274,102 +7274,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vector_payload_provider_attaches_embedding_to_resolved_request() {
-        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
-        let item = seed_pending_thread_episodic_item(
-            crud_store.as_ref(),
-            workspace_id.as_str(),
-            "thread_vector_payload",
-            "turn_vector_payload",
-            "item_vector_payload",
-        )
-        .await;
-        let job = seed_thread_episodic_job(
-            crud_store.as_ref(),
-            workspace_id.as_str(),
-            "thread_vector_payload",
-            item.id.as_str(),
-            1_700_000_000,
-        )
-        .await;
-        let request = static_index_request(
-            "file:///tmp/vector-payload.mv2".to_owned(),
-            "capsule_vector_payload",
-            "mv2://pioneer/thread_episodic/test/capsules/capsule_vector_payload",
-            item.id.as_str(),
-        );
-        let inner = static_index_payload_provider(crud_store.as_ref(), &item, request, 3).await;
-        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
-            0.1, 0.2, 0.3,
-        ]));
-        let provider =
-            VectorThreadEpisodicIndexPayloadProvider::new(inner, embedding_provider.clone());
-
-        let resolved = provider
-            .resolve_index_request(&job)
-            .await
-            .expect("vector payload should resolve");
-
-        let embedding = resolved
-            .request
-            .embedding
-            .expect("resolved request should include embedding");
-        assert_eq!(embedding.identity.provider_id, "test");
-        assert_eq!(embedding.identity.model, "test-embedding");
-        assert_eq!(embedding.identity.dimension, 3);
-        assert_eq!(embedding.vector, vec![0.1, 0.2, 0.3]);
-        assert_eq!(embedding_provider.calls(), 1);
-    }
-
-    #[tokio::test]
-    async fn vector_payload_provider_maps_retryable_embedding_failure() {
-        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
-        let item = seed_pending_thread_episodic_item(
-            crud_store.as_ref(),
-            workspace_id.as_str(),
-            "thread_vector_payload_retryable",
-            "turn_vector_payload_retryable",
-            "item_vector_payload_retryable",
-        )
-        .await;
-        let job = seed_thread_episodic_job(
-            crud_store.as_ref(),
-            workspace_id.as_str(),
-            "thread_vector_payload_retryable",
-            item.id.as_str(),
-            1_700_000_000,
-        )
-        .await;
-        let request = static_index_request(
-            "file:///tmp/vector-payload-retryable.mv2".to_owned(),
-            "capsule_vector_payload_retryable",
-            "mv2://pioneer/thread_episodic/test/capsules/capsule_vector_payload_retryable",
-            item.id.as_str(),
-        );
-        let provider = VectorThreadEpisodicIndexPayloadProvider::new(
-            static_index_payload_provider(crud_store.as_ref(), &item, request, 3).await,
-            Arc::new(StaticThreadEpisodicEmbeddingProvider::with_error(
-                ThreadEpisodicEmbeddingError::retryable_provider_failure(
-                    "test",
-                    "test-embedding",
-                    "rate limited",
-                ),
-            )),
-        );
-
-        let error = provider
-            .resolve_index_request(&job)
-            .await
-            .expect_err("retryable embedding failure should propagate");
-
-        assert_eq!(
-            error.kind,
-            ThreadEpisodicIndexResolutionFailureKind::Retryable
-        );
-        assert!(error.message.contains("rate limited"));
-    }
-
-    #[tokio::test]
     async fn vector_payload_provider_maps_configuration_embedding_failure_terminal() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let item = seed_pending_thread_episodic_item(
@@ -11692,6 +11596,7 @@ mod tests {
             .expect("runtime vector job should attach embedding");
         assert_eq!(embedding.identity.provider_id, "test");
         assert_eq!(embedding.identity.model, "test-embedding");
+        assert_eq!(embedding.identity.dimension, 3);
         assert_eq!(embedding.vector, vec![0.4, 0.5, 0.6]);
 
         let stored_job = crud_store

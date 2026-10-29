@@ -648,22 +648,6 @@ mod tests {
     };
 
     #[test]
-    fn quality_gate_contract_defaults_to_quarantine() {
-        let mut input = base_input();
-        input.evidence_class = MemoryEvidenceClass::AssistantInference;
-
-        let decision = MemoryQualityGate::decide(&input);
-
-        assert_eq!(decision.action, MemoryQualityAction::Quarantine);
-        assert_eq!(decision.target_ownership, MemoryOwnershipClass::AuditOnly);
-        assert_eq!(
-            decision.reason_codes,
-            vec![MemoryQualityReasonCode::NoQualityAllowRule]
-        );
-        assert!(!decision.candidate_auto_approve_allowed);
-    }
-
-    #[test]
     fn semantic_write_input_builder_uses_typed_fields_only() {
         let params = MemorySemanticWriteParams {
             scope: MemoryScope {
@@ -799,211 +783,6 @@ mod tests {
     }
 
     #[test]
-    fn hard_rejects_when_turn_disables_memory_writes() {
-        let mut input = base_input();
-        input.memory_write_disabled_for_turn = true;
-
-        assert_force_reject(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::Reject,
-            &[MemoryQualityReasonCode::MemoryWriteDisabledForTurn],
-        );
-    }
-
-    #[test]
-    fn hard_rejects_secret_or_credential_facts() {
-        let mut input = base_input();
-        input.fact_class = MemoryFactClass::SecretOrCredential;
-
-        assert_force_reject(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::Reject,
-            &[MemoryQualityReasonCode::SecretOrCredential],
-        );
-    }
-
-    #[test]
-    fn hard_rejects_regulated_sensitive_fact_without_user_approval_or_policy() {
-        let mut input = base_input();
-        input.fact_class = MemoryFactClass::RegulatedSensitiveFact;
-        input.explicit_user_approval = false;
-        input.sensitive_memory_policy_allowed = false;
-
-        assert_force_reject(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::Reject,
-            &[MemoryQualityReasonCode::RegulatedSensitiveWithoutUserApproval],
-        );
-    }
-
-    #[test]
-    fn hard_rejects_system_owned_state_as_durable_memory() {
-        let mut input = base_input();
-        input.source_context_kind = MemorySourceContextKind::SystemRuntime;
-        input.evidence_class = MemoryEvidenceClass::SystemObservation;
-        input.ownership_class = MemoryOwnershipClass::DurableWorkspaceMemory;
-
-        assert_force_reject(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::AuditOnly,
-            &[
-                MemoryQualityReasonCode::SystemOwnedStateNotMemory,
-                MemoryQualityReasonCode::SourceNotAuthoritativeForDurableMemory,
-            ],
-        );
-    }
-
-    #[test]
-    fn hard_rejects_task_runtime_as_durable_user_memory() {
-        let mut input = base_input();
-        input.source_context_kind = MemorySourceContextKind::TaskRuntime;
-        input.evidence_class = MemoryEvidenceClass::TaskRuntimeObservation;
-        input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
-
-        assert_force_reject(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::TaskRuntimeState,
-            &[
-                MemoryQualityReasonCode::TaskStateNotUserMemory,
-                MemoryQualityReasonCode::OwnershipMismatch,
-            ],
-        );
-    }
-
-    #[test]
-    fn hard_rejects_task_runtime_as_any_durable_memory() {
-        for ownership_class in [
-            MemoryOwnershipClass::DurableUserMemory,
-            MemoryOwnershipClass::DurableWorkspaceMemory,
-            MemoryOwnershipClass::DurableAgentMemory,
-        ] {
-            let mut input = base_input();
-            input.source_context_kind = MemorySourceContextKind::TaskRuntime;
-            input.evidence_class = MemoryEvidenceClass::TaskRuntimeObservation;
-            input.ownership_class = ownership_class;
-
-            assert_force_reject(
-                MemoryQualityGate::decide(&input),
-                MemoryOwnershipClass::TaskRuntimeState,
-                &[
-                    MemoryQualityReasonCode::TaskStateNotUserMemory,
-                    MemoryQualityReasonCode::OwnershipMismatch,
-                ],
-            );
-        }
-    }
-
-    #[test]
-    fn hard_rejects_tool_result_as_durable_user_memory() {
-        let mut input = base_input();
-        input.source_context_kind = MemorySourceContextKind::ToolResult;
-        input.evidence_class = MemoryEvidenceClass::ToolObservation;
-        input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
-
-        assert_force_reject(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::DomainRuntimeState,
-            &[
-                MemoryQualityReasonCode::ToolResultNotUserMemory,
-                MemoryQualityReasonCode::OwnershipMismatch,
-            ],
-        );
-    }
-
-    #[test]
-    fn hard_rejects_tool_result_as_any_durable_memory() {
-        for ownership_class in [
-            MemoryOwnershipClass::DurableUserMemory,
-            MemoryOwnershipClass::DurableWorkspaceMemory,
-            MemoryOwnershipClass::DurableAgentMemory,
-        ] {
-            let mut input = base_input();
-            input.source_context_kind = MemorySourceContextKind::ToolResult;
-            input.evidence_class = MemoryEvidenceClass::ToolObservation;
-            input.ownership_class = ownership_class;
-
-            assert_force_reject(
-                MemoryQualityGate::decide(&input),
-                MemoryOwnershipClass::DomainRuntimeState,
-                &[
-                    MemoryQualityReasonCode::ToolResultNotUserMemory,
-                    MemoryQualityReasonCode::OwnershipMismatch,
-                ],
-            );
-        }
-    }
-
-    #[test]
-    fn hard_rejects_assistant_inference_as_user_or_workspace_memory() {
-        let mut input = base_input();
-        input.source_context_kind = MemorySourceContextKind::AssistantResponse;
-        input.evidence_class = MemoryEvidenceClass::AssistantInference;
-        input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
-
-        assert_force_reject(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::AuditOnly,
-            &[
-                MemoryQualityReasonCode::AssistantInferenceNotDurableEvidence,
-                MemoryQualityReasonCode::SourceNotAuthoritativeForDurableMemory,
-            ],
-        );
-    }
-
-    #[test]
-    fn hard_rejects_non_durable_lifetime_for_durable_memory() {
-        let mut input = base_input();
-        input.lifetime_class = MemoryLifetimeClass::SessionOnly;
-        input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
-
-        assert_force_reject(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::Reject,
-            &[MemoryQualityReasonCode::NonDurableLifetime],
-        );
-    }
-
-    #[test]
-    fn hard_rejects_missing_or_weak_evidence() {
-        let mut input = base_input();
-        input.evidence_class = MemoryEvidenceClass::MissingOrWeak;
-
-        assert_force_reject(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::Reject,
-            &[MemoryQualityReasonCode::WeakOrMissingEvidence],
-        );
-    }
-
-    #[test]
-    fn hard_rejects_duplicate_or_suppressed_duplicate_relation() {
-        let mut input = base_input();
-        input.relation = MemoryWriteRelation::SuppressedByRejection;
-
-        assert_force_reject(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::AuditOnly,
-            &[MemoryQualityReasonCode::DuplicateExistingMemory],
-        );
-    }
-
-    #[test]
-    fn hard_reject_precedence_beats_otherwise_valid_candidate() {
-        let mut input = base_input();
-        input.fact_class = MemoryFactClass::SecretOrCredential;
-        input.relation = MemoryWriteRelation::Novel;
-
-        let decision = MemoryQualityGate::decide(&input);
-
-        assert_eq!(decision.action, MemoryQualityAction::ForceReject);
-        assert_eq!(
-            decision.reason_codes,
-            vec![MemoryQualityReasonCode::SecretOrCredential]
-        );
-        assert!(!decision.candidate_auto_approve_allowed);
-    }
-
-    #[test]
     fn hard_reject_opt_out_beats_secret_reason() {
         let mut input = base_input();
         input.memory_write_disabled_for_turn = true;
@@ -1014,176 +793,6 @@ mod tests {
         assert_eq!(
             decision.reason_codes,
             vec![MemoryQualityReasonCode::MemoryWriteDisabledForTurn]
-        );
-    }
-
-    #[test]
-    fn routes_thread_local_state_to_thread_episodic_context() {
-        let mut input = base_input();
-        input.fact_class = MemoryFactClass::ThreadLocalState;
-        input.lifetime_class = MemoryLifetimeClass::ThreadLifetime;
-        input.ownership_class = MemoryOwnershipClass::ThreadEpisodicContext;
-
-        assert_decision(
-            MemoryQualityGate::decide(&input),
-            MemoryQualityAction::RouteToThreadEpisodic,
-            MemoryOwnershipClass::ThreadEpisodicContext,
-            &[
-                MemoryQualityReasonCode::RouteThreadEpisodic,
-                MemoryQualityReasonCode::NonDurableLifetime,
-            ],
-        );
-    }
-
-    #[test]
-    fn routes_task_lifecycle_state_to_task_runtime_state() {
-        let mut input = base_input();
-        input.source_context_kind = MemorySourceContextKind::TaskRuntime;
-        input.evidence_class = MemoryEvidenceClass::TaskRuntimeObservation;
-        input.fact_class = MemoryFactClass::TaskLifecycleState;
-        input.lifetime_class = MemoryLifetimeClass::TaskLifetime;
-        input.ownership_class = MemoryOwnershipClass::TaskRuntimeState;
-
-        assert_decision(
-            MemoryQualityGate::decide(&input),
-            MemoryQualityAction::RouteToTaskState,
-            MemoryOwnershipClass::TaskRuntimeState,
-            &[
-                MemoryQualityReasonCode::RouteTaskState,
-                MemoryQualityReasonCode::TaskLifetime,
-            ],
-        );
-    }
-
-    #[test]
-    fn routes_tool_owned_observation_to_domain_state() {
-        let mut input = base_input();
-        input.source_context_kind = MemorySourceContextKind::ToolResult;
-        input.evidence_class = MemoryEvidenceClass::ToolObservation;
-        input.fact_class = MemoryFactClass::ToolResultFact;
-        input.lifetime_class = MemoryLifetimeClass::NaturallyExpiring;
-        input.ownership_class = MemoryOwnershipClass::DomainRuntimeState;
-
-        assert_decision(
-            MemoryQualityGate::decide(&input),
-            MemoryQualityAction::RouteToDomainState,
-            MemoryOwnershipClass::DomainRuntimeState,
-            &[
-                MemoryQualityReasonCode::RouteDomainState,
-                MemoryQualityReasonCode::ToolOwnedState,
-            ],
-        );
-    }
-
-    #[test]
-    fn routes_system_owned_observation_to_domain_state() {
-        let mut input = base_input();
-        input.source_context_kind = MemorySourceContextKind::SystemRuntime;
-        input.evidence_class = MemoryEvidenceClass::SystemObservation;
-        input.fact_class = MemoryFactClass::DomainOwnedState;
-        input.lifetime_class = MemoryLifetimeClass::NaturallyExpiring;
-        input.ownership_class = MemoryOwnershipClass::DomainRuntimeState;
-
-        assert_decision(
-            MemoryQualityGate::decide(&input),
-            MemoryQualityAction::RouteToDomainState,
-            MemoryOwnershipClass::DomainRuntimeState,
-            &[
-                MemoryQualityReasonCode::RouteDomainState,
-                MemoryQualityReasonCode::SystemOwnedStateNotMemory,
-            ],
-        );
-    }
-
-    #[test]
-    fn routes_generated_summary_to_thread_episodic_context() {
-        let mut input = base_input();
-        input.source_context_kind = MemorySourceContextKind::GeneratedSummary;
-        input.evidence_class = MemoryEvidenceClass::GeneratedSummary;
-        input.fact_class = MemoryFactClass::GeneratedSummaryFact;
-        input.lifetime_class = MemoryLifetimeClass::Unknown;
-        input.ownership_class = MemoryOwnershipClass::ThreadEpisodicContext;
-
-        assert_decision(
-            MemoryQualityGate::decide(&input),
-            MemoryQualityAction::RouteToThreadEpisodic,
-            MemoryOwnershipClass::ThreadEpisodicContext,
-            &[
-                MemoryQualityReasonCode::GeneratedSummaryNotDurableMemory,
-                MemoryQualityReasonCode::RouteThreadEpisodic,
-            ],
-        );
-    }
-
-    #[test]
-    fn quarantines_unknown_source_context() {
-        let mut input = base_input();
-        input.source_context_kind = MemorySourceContextKind::Unknown;
-
-        assert_quarantine(
-            MemoryQualityGate::decide(&input),
-            &[MemoryQualityReasonCode::UnknownSourceContext],
-        );
-    }
-
-    #[test]
-    fn quarantines_unknown_fact_class() {
-        let mut input = base_input();
-        input.fact_class = MemoryFactClass::Unknown;
-
-        assert_quarantine(
-            MemoryQualityGate::decide(&input),
-            &[MemoryQualityReasonCode::UnknownFactClass],
-        );
-    }
-
-    #[test]
-    fn quarantines_unknown_lifetime_for_durable_memory() {
-        let mut input = base_input();
-        input.lifetime_class = MemoryLifetimeClass::Unknown;
-        input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
-
-        assert_quarantine(
-            MemoryQualityGate::decide(&input),
-            &[MemoryQualityReasonCode::UnknownLifetime],
-        );
-    }
-
-    #[test]
-    fn quarantines_ownership_mismatch() {
-        let mut input = base_input();
-        input.fact_class = MemoryFactClass::ProjectDecision;
-        input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
-
-        assert_quarantine(
-            MemoryQualityGate::decide(&input),
-            &[MemoryQualityReasonCode::OwnershipMismatch],
-        );
-    }
-
-    #[test]
-    fn quarantines_imported_content_without_source_policy() {
-        let mut input = base_input();
-        input.source_context_kind = MemorySourceContextKind::ImportedDocument;
-
-        assert_quarantine(
-            MemoryQualityGate::decide(&input),
-            &[MemoryQualityReasonCode::SourcePolicyMissing],
-        );
-    }
-
-    #[test]
-    fn quarantines_when_no_positive_allow_rule_matches() {
-        let mut input = base_input();
-        input.source_context_kind = MemorySourceContextKind::DirectUserConversation;
-        input.fact_class = MemoryFactClass::UserIdentity;
-        input.lifetime_class = MemoryLifetimeClass::LongLived;
-        input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
-        input.evidence_class = MemoryEvidenceClass::AssistantInference;
-
-        assert_quarantine(
-            MemoryQualityGate::decide(&input),
-            &[MemoryQualityReasonCode::NoQualityAllowRule],
         );
     }
 
@@ -1199,190 +808,6 @@ mod tests {
             MemoryQualityGate::decide(&input),
             MemoryOwnershipClass::Reject,
             &[MemoryQualityReasonCode::MemoryWriteDisabledForTurn],
-        );
-    }
-
-    #[test]
-    fn routing_wins_before_default_quarantine_for_non_durable_state() {
-        let mut input = base_input();
-        input.fact_class = MemoryFactClass::ThreadLocalState;
-        input.lifetime_class = MemoryLifetimeClass::ThreadLifetime;
-        input.ownership_class = MemoryOwnershipClass::ThreadEpisodicContext;
-
-        assert_eq!(
-            MemoryQualityGate::decide(&input).action,
-            MemoryQualityAction::RouteToThreadEpisodic
-        );
-    }
-
-    #[test]
-    fn allows_direct_user_identity_candidate() {
-        let mut input = base_input();
-        input.fact_class = MemoryFactClass::UserIdentity;
-        input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
-
-        assert_candidate_policy(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::DurableUserMemory,
-            &[
-                MemoryQualityReasonCode::CandidatePolicyAllowed,
-                MemoryQualityReasonCode::DurableUserIdentity,
-                MemoryQualityReasonCode::NovelCandidate,
-            ],
-            true,
-        );
-    }
-
-    #[test]
-    fn allows_direct_user_profile_candidate() {
-        let mut input = base_input();
-        input.fact_class = MemoryFactClass::UserBiography;
-        input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
-
-        assert_candidate_policy(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::DurableUserMemory,
-            &[
-                MemoryQualityReasonCode::CandidatePolicyAllowed,
-                MemoryQualityReasonCode::DurableUserProfile,
-                MemoryQualityReasonCode::NovelCandidate,
-            ],
-            true,
-        );
-    }
-
-    #[test]
-    fn allows_direct_user_preference_candidate() {
-        let mut input = base_input();
-        input.fact_class = MemoryFactClass::CommunicationPreference;
-        input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
-
-        assert_candidate_policy(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::DurableUserMemory,
-            &[
-                MemoryQualityReasonCode::CandidatePolicyAllowed,
-                MemoryQualityReasonCode::DurableUserPreference,
-                MemoryQualityReasonCode::NovelCandidate,
-            ],
-            true,
-        );
-    }
-
-    #[test]
-    fn allows_recurring_instruction_for_user_or_workspace_candidate() {
-        let mut input = base_input();
-        input.fact_class = MemoryFactClass::RecurringUserInstruction;
-        input.ownership_class = MemoryOwnershipClass::DurableWorkspaceMemory;
-
-        assert_candidate_policy(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::DurableWorkspaceMemory,
-            &[
-                MemoryQualityReasonCode::CandidatePolicyAllowed,
-                MemoryQualityReasonCode::DurableRecurringInstruction,
-                MemoryQualityReasonCode::NovelCandidate,
-            ],
-            true,
-        );
-    }
-
-    #[test]
-    fn allows_project_decision_candidate() {
-        let mut input = base_input();
-        input.fact_class = MemoryFactClass::ProjectDecision;
-        input.lifetime_class = MemoryLifetimeClass::ProjectLifetime;
-        input.ownership_class = MemoryOwnershipClass::DurableWorkspaceMemory;
-
-        assert_candidate_policy(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::DurableWorkspaceMemory,
-            &[
-                MemoryQualityReasonCode::CandidatePolicyAllowed,
-                MemoryQualityReasonCode::DurableProjectMemory,
-                MemoryQualityReasonCode::NovelCandidate,
-            ],
-            true,
-        );
-    }
-
-    #[test]
-    fn allows_user_confirmed_agent_memory_candidate() {
-        let mut input = base_input();
-        input.fact_class = MemoryFactClass::AssistantSelfDescription;
-        input.evidence_class = MemoryEvidenceClass::UserApproval;
-        input.ownership_class = MemoryOwnershipClass::DurableAgentMemory;
-
-        assert_candidate_policy(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::DurableAgentMemory,
-            &[
-                MemoryQualityReasonCode::CandidatePolicyAllowed,
-                MemoryQualityReasonCode::UserConfirmedAgentMemory,
-                MemoryQualityReasonCode::NovelCandidate,
-            ],
-            true,
-        );
-    }
-
-    #[test]
-    fn assistant_originated_self_description_does_not_reach_candidate_policy() {
-        let mut input = base_input();
-        input.source_context_kind = MemorySourceContextKind::AssistantResponse;
-        input.evidence_class = MemoryEvidenceClass::AssistantInference;
-        input.fact_class = MemoryFactClass::AssistantSelfDescription;
-        input.ownership_class = MemoryOwnershipClass::DurableAgentMemory;
-
-        assert_quarantine(
-            MemoryQualityGate::decide(&input),
-            &[MemoryQualityReasonCode::NoQualityAllowRule],
-        );
-    }
-
-    #[test]
-    fn contradiction_can_reach_candidate_policy_but_cannot_auto_approve() {
-        let mut input = base_input();
-        input.relation = MemoryWriteRelation::Contradiction;
-
-        assert_candidate_policy(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::DurableUserMemory,
-            &[
-                MemoryQualityReasonCode::CandidatePolicyAllowed,
-                MemoryQualityReasonCode::DurableUserIdentity,
-                MemoryQualityReasonCode::ContradictsExistingMemory,
-                MemoryQualityReasonCode::RequiresResolution,
-            ],
-            false,
-        );
-    }
-
-    #[test]
-    fn compatible_update_reaches_candidate_policy_with_relation_reason() {
-        let mut input = base_input();
-        input.relation = MemoryWriteRelation::CompatibleUpdate;
-
-        assert_candidate_policy(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::DurableUserMemory,
-            &[
-                MemoryQualityReasonCode::CandidatePolicyAllowed,
-                MemoryQualityReasonCode::DurableUserIdentity,
-                MemoryQualityReasonCode::CompatibleUpdate,
-            ],
-            true,
-        );
-    }
-
-    #[test]
-    fn duplicate_never_reaches_candidate_policy() {
-        let mut input = base_input();
-        input.relation = MemoryWriteRelation::Duplicate;
-
-        assert_force_reject(
-            MemoryQualityGate::decide(&input),
-            MemoryOwnershipClass::AuditOnly,
-            &[MemoryQualityReasonCode::DuplicateExistingMemory],
         );
     }
 
@@ -1478,5 +903,524 @@ mod tests {
             decision.candidate_auto_approve_allowed,
             candidate_auto_approve_allowed
         );
+    }
+
+    #[test]
+    fn hard_rejection_reasons_preserve_source_ownership_and_evidence_boundaries() {
+        type QualityCase = (
+            &'static str,
+            fn(&mut MemoryQualityGateInput),
+            MemoryOwnershipClass,
+            &'static [MemoryQualityReasonCode],
+        );
+        let cases: &[QualityCase] = &[
+            (
+                "hard_rejects_when_turn_disables_memory_writes",
+                |input| {
+                    input.memory_write_disabled_for_turn = true;
+                },
+                MemoryOwnershipClass::Reject,
+                &[MemoryQualityReasonCode::MemoryWriteDisabledForTurn],
+            ),
+            (
+                "hard_rejects_secret_or_credential_facts",
+                |input| {
+                    input.fact_class = MemoryFactClass::SecretOrCredential;
+                },
+                MemoryOwnershipClass::Reject,
+                &[MemoryQualityReasonCode::SecretOrCredential],
+            ),
+            (
+                "hard_rejects_regulated_sensitive_fact_without_user_approval_or_policy",
+                |input| {
+                    input.fact_class = MemoryFactClass::RegulatedSensitiveFact;
+                    input.explicit_user_approval = false;
+                    input.sensitive_memory_policy_allowed = false;
+                },
+                MemoryOwnershipClass::Reject,
+                &[MemoryQualityReasonCode::RegulatedSensitiveWithoutUserApproval],
+            ),
+            (
+                "hard_rejects_system_owned_state_as_durable_memory",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::SystemRuntime;
+                    input.evidence_class = MemoryEvidenceClass::SystemObservation;
+                    input.ownership_class = MemoryOwnershipClass::DurableWorkspaceMemory;
+                },
+                MemoryOwnershipClass::AuditOnly,
+                &[
+                    MemoryQualityReasonCode::SystemOwnedStateNotMemory,
+                    MemoryQualityReasonCode::SourceNotAuthoritativeForDurableMemory,
+                ],
+            ),
+            (
+                "hard_rejects_task_runtime_as_any_durable_memory:DurableUserMemory",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::TaskRuntime;
+                    input.evidence_class = MemoryEvidenceClass::TaskRuntimeObservation;
+                    input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
+                },
+                MemoryOwnershipClass::TaskRuntimeState,
+                &[
+                    MemoryQualityReasonCode::TaskStateNotUserMemory,
+                    MemoryQualityReasonCode::OwnershipMismatch,
+                ],
+            ),
+            (
+                "hard_rejects_task_runtime_as_any_durable_memory:DurableWorkspaceMemory",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::TaskRuntime;
+                    input.evidence_class = MemoryEvidenceClass::TaskRuntimeObservation;
+                    input.ownership_class = MemoryOwnershipClass::DurableWorkspaceMemory;
+                },
+                MemoryOwnershipClass::TaskRuntimeState,
+                &[
+                    MemoryQualityReasonCode::TaskStateNotUserMemory,
+                    MemoryQualityReasonCode::OwnershipMismatch,
+                ],
+            ),
+            (
+                "hard_rejects_task_runtime_as_any_durable_memory:DurableAgentMemory",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::TaskRuntime;
+                    input.evidence_class = MemoryEvidenceClass::TaskRuntimeObservation;
+                    input.ownership_class = MemoryOwnershipClass::DurableAgentMemory;
+                },
+                MemoryOwnershipClass::TaskRuntimeState,
+                &[
+                    MemoryQualityReasonCode::TaskStateNotUserMemory,
+                    MemoryQualityReasonCode::OwnershipMismatch,
+                ],
+            ),
+            (
+                "hard_rejects_tool_result_as_any_durable_memory:DurableUserMemory",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::ToolResult;
+                    input.evidence_class = MemoryEvidenceClass::ToolObservation;
+                    input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
+                },
+                MemoryOwnershipClass::DomainRuntimeState,
+                &[
+                    MemoryQualityReasonCode::ToolResultNotUserMemory,
+                    MemoryQualityReasonCode::OwnershipMismatch,
+                ],
+            ),
+            (
+                "hard_rejects_tool_result_as_any_durable_memory:DurableWorkspaceMemory",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::ToolResult;
+                    input.evidence_class = MemoryEvidenceClass::ToolObservation;
+                    input.ownership_class = MemoryOwnershipClass::DurableWorkspaceMemory;
+                },
+                MemoryOwnershipClass::DomainRuntimeState,
+                &[
+                    MemoryQualityReasonCode::ToolResultNotUserMemory,
+                    MemoryQualityReasonCode::OwnershipMismatch,
+                ],
+            ),
+            (
+                "hard_rejects_tool_result_as_any_durable_memory:DurableAgentMemory",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::ToolResult;
+                    input.evidence_class = MemoryEvidenceClass::ToolObservation;
+                    input.ownership_class = MemoryOwnershipClass::DurableAgentMemory;
+                },
+                MemoryOwnershipClass::DomainRuntimeState,
+                &[
+                    MemoryQualityReasonCode::ToolResultNotUserMemory,
+                    MemoryQualityReasonCode::OwnershipMismatch,
+                ],
+            ),
+            (
+                "hard_rejects_assistant_inference_as_user_or_workspace_memory",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::AssistantResponse;
+                    input.evidence_class = MemoryEvidenceClass::AssistantInference;
+                    input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
+                },
+                MemoryOwnershipClass::AuditOnly,
+                &[
+                    MemoryQualityReasonCode::AssistantInferenceNotDurableEvidence,
+                    MemoryQualityReasonCode::SourceNotAuthoritativeForDurableMemory,
+                ],
+            ),
+            (
+                "hard_rejects_non_durable_lifetime_for_durable_memory",
+                |input| {
+                    input.lifetime_class = MemoryLifetimeClass::SessionOnly;
+                    input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
+                },
+                MemoryOwnershipClass::Reject,
+                &[MemoryQualityReasonCode::NonDurableLifetime],
+            ),
+            (
+                "hard_rejects_missing_or_weak_evidence",
+                |input| {
+                    input.evidence_class = MemoryEvidenceClass::MissingOrWeak;
+                },
+                MemoryOwnershipClass::Reject,
+                &[MemoryQualityReasonCode::WeakOrMissingEvidence],
+            ),
+            (
+                "hard_rejects_duplicate_or_suppressed_duplicate_relation",
+                |input| {
+                    input.relation = MemoryWriteRelation::SuppressedByRejection;
+                },
+                MemoryOwnershipClass::AuditOnly,
+                &[MemoryQualityReasonCode::DuplicateExistingMemory],
+            ),
+            (
+                "duplicate_never_reaches_candidate_policy",
+                |input| {
+                    input.relation = MemoryWriteRelation::Duplicate;
+                },
+                MemoryOwnershipClass::AuditOnly,
+                &[MemoryQualityReasonCode::DuplicateExistingMemory],
+            ),
+        ];
+        for &(case, configure, ownership, reasons) in cases {
+            let mut input = base_input();
+            configure(&mut input);
+            eprintln!("quality gate case: {case}");
+            assert_force_reject(MemoryQualityGate::decide(&input), ownership, reasons);
+        }
+    }
+
+    #[test]
+    fn non_durable_inputs_route_to_their_owning_state() {
+        type QualityCase = (
+            &'static str,
+            fn(&mut MemoryQualityGateInput),
+            MemoryQualityAction,
+            MemoryOwnershipClass,
+            &'static [MemoryQualityReasonCode],
+        );
+        let cases: &[QualityCase] = &[
+            (
+                "routes_thread_local_state_to_thread_episodic_context",
+                |input| {
+                    input.fact_class = MemoryFactClass::ThreadLocalState;
+                    input.lifetime_class = MemoryLifetimeClass::ThreadLifetime;
+                    input.ownership_class = MemoryOwnershipClass::ThreadEpisodicContext;
+                },
+                MemoryQualityAction::RouteToThreadEpisodic,
+                MemoryOwnershipClass::ThreadEpisodicContext,
+                &[
+                    MemoryQualityReasonCode::RouteThreadEpisodic,
+                    MemoryQualityReasonCode::NonDurableLifetime,
+                ],
+            ),
+            (
+                "routes_task_lifecycle_state_to_task_runtime_state",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::TaskRuntime;
+                    input.evidence_class = MemoryEvidenceClass::TaskRuntimeObservation;
+                    input.fact_class = MemoryFactClass::TaskLifecycleState;
+                    input.lifetime_class = MemoryLifetimeClass::TaskLifetime;
+                    input.ownership_class = MemoryOwnershipClass::TaskRuntimeState;
+                },
+                MemoryQualityAction::RouteToTaskState,
+                MemoryOwnershipClass::TaskRuntimeState,
+                &[
+                    MemoryQualityReasonCode::RouteTaskState,
+                    MemoryQualityReasonCode::TaskLifetime,
+                ],
+            ),
+            (
+                "routes_tool_owned_observation_to_domain_state",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::ToolResult;
+                    input.evidence_class = MemoryEvidenceClass::ToolObservation;
+                    input.fact_class = MemoryFactClass::ToolResultFact;
+                    input.lifetime_class = MemoryLifetimeClass::NaturallyExpiring;
+                    input.ownership_class = MemoryOwnershipClass::DomainRuntimeState;
+                },
+                MemoryQualityAction::RouteToDomainState,
+                MemoryOwnershipClass::DomainRuntimeState,
+                &[
+                    MemoryQualityReasonCode::RouteDomainState,
+                    MemoryQualityReasonCode::ToolOwnedState,
+                ],
+            ),
+            (
+                "routes_system_owned_observation_to_domain_state",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::SystemRuntime;
+                    input.evidence_class = MemoryEvidenceClass::SystemObservation;
+                    input.fact_class = MemoryFactClass::DomainOwnedState;
+                    input.lifetime_class = MemoryLifetimeClass::NaturallyExpiring;
+                    input.ownership_class = MemoryOwnershipClass::DomainRuntimeState;
+                },
+                MemoryQualityAction::RouteToDomainState,
+                MemoryOwnershipClass::DomainRuntimeState,
+                &[
+                    MemoryQualityReasonCode::RouteDomainState,
+                    MemoryQualityReasonCode::SystemOwnedStateNotMemory,
+                ],
+            ),
+            (
+                "routes_generated_summary_to_thread_episodic_context",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::GeneratedSummary;
+                    input.evidence_class = MemoryEvidenceClass::GeneratedSummary;
+                    input.fact_class = MemoryFactClass::GeneratedSummaryFact;
+                    input.lifetime_class = MemoryLifetimeClass::Unknown;
+                    input.ownership_class = MemoryOwnershipClass::ThreadEpisodicContext;
+                },
+                MemoryQualityAction::RouteToThreadEpisodic,
+                MemoryOwnershipClass::ThreadEpisodicContext,
+                &[
+                    MemoryQualityReasonCode::GeneratedSummaryNotDurableMemory,
+                    MemoryQualityReasonCode::RouteThreadEpisodic,
+                ],
+            ),
+        ];
+        for &(case, configure, action, ownership, reasons) in cases {
+            let mut input = base_input();
+            configure(&mut input);
+            eprintln!("quality gate case: {case}");
+            assert_decision(
+                MemoryQualityGate::decide(&input),
+                action,
+                ownership,
+                reasons,
+            );
+        }
+    }
+
+    #[test]
+    fn untrusted_or_unclassified_inputs_remain_quarantined() {
+        type QualityCase = (
+            &'static str,
+            fn(&mut MemoryQualityGateInput),
+            &'static [MemoryQualityReasonCode],
+        );
+        let cases: &[QualityCase] = &[
+            (
+                "quarantines_unknown_source_context",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::Unknown;
+                },
+                &[MemoryQualityReasonCode::UnknownSourceContext],
+            ),
+            (
+                "quarantines_unknown_fact_class",
+                |input| {
+                    input.fact_class = MemoryFactClass::Unknown;
+                },
+                &[MemoryQualityReasonCode::UnknownFactClass],
+            ),
+            (
+                "quarantines_unknown_lifetime_for_durable_memory",
+                |input| {
+                    input.lifetime_class = MemoryLifetimeClass::Unknown;
+                    input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
+                },
+                &[MemoryQualityReasonCode::UnknownLifetime],
+            ),
+            (
+                "quarantines_ownership_mismatch",
+                |input| {
+                    input.fact_class = MemoryFactClass::ProjectDecision;
+                    input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
+                },
+                &[MemoryQualityReasonCode::OwnershipMismatch],
+            ),
+            (
+                "quarantines_imported_content_without_source_policy",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::ImportedDocument;
+                },
+                &[MemoryQualityReasonCode::SourcePolicyMissing],
+            ),
+            (
+                "quarantines_when_no_positive_allow_rule_matches",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::DirectUserConversation;
+                    input.fact_class = MemoryFactClass::UserIdentity;
+                    input.lifetime_class = MemoryLifetimeClass::LongLived;
+                    input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
+                    input.evidence_class = MemoryEvidenceClass::AssistantInference;
+                },
+                &[MemoryQualityReasonCode::NoQualityAllowRule],
+            ),
+            (
+                "assistant_originated_self_description_does_not_reach_candidate_policy",
+                |input| {
+                    input.source_context_kind = MemorySourceContextKind::AssistantResponse;
+                    input.evidence_class = MemoryEvidenceClass::AssistantInference;
+                    input.fact_class = MemoryFactClass::AssistantSelfDescription;
+                    input.ownership_class = MemoryOwnershipClass::DurableAgentMemory;
+                },
+                &[MemoryQualityReasonCode::NoQualityAllowRule],
+            ),
+        ];
+        for &(case, configure, reasons) in cases {
+            let mut input = base_input();
+            configure(&mut input);
+            eprintln!("quality gate case: {case}");
+            assert_quarantine(MemoryQualityGate::decide(&input), reasons);
+        }
+    }
+
+    #[test]
+    fn user_owned_durable_facts_preserve_candidate_policy_and_reasons() {
+        type QualityCase = (
+            &'static str,
+            fn(&mut MemoryQualityGateInput),
+            MemoryOwnershipClass,
+            &'static [MemoryQualityReasonCode],
+            bool,
+        );
+        let cases: &[QualityCase] = &[
+            (
+                "allows_direct_user_identity_candidate",
+                |input| {
+                    input.fact_class = MemoryFactClass::UserIdentity;
+                    input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
+                },
+                MemoryOwnershipClass::DurableUserMemory,
+                &[
+                    MemoryQualityReasonCode::CandidatePolicyAllowed,
+                    MemoryQualityReasonCode::DurableUserIdentity,
+                    MemoryQualityReasonCode::NovelCandidate,
+                ],
+                true,
+            ),
+            (
+                "allows_direct_user_profile_candidate",
+                |input| {
+                    input.fact_class = MemoryFactClass::UserBiography;
+                    input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
+                },
+                MemoryOwnershipClass::DurableUserMemory,
+                &[
+                    MemoryQualityReasonCode::CandidatePolicyAllowed,
+                    MemoryQualityReasonCode::DurableUserProfile,
+                    MemoryQualityReasonCode::NovelCandidate,
+                ],
+                true,
+            ),
+            (
+                "allows_direct_user_preference_candidate",
+                |input| {
+                    input.fact_class = MemoryFactClass::CommunicationPreference;
+                    input.ownership_class = MemoryOwnershipClass::DurableUserMemory;
+                },
+                MemoryOwnershipClass::DurableUserMemory,
+                &[
+                    MemoryQualityReasonCode::CandidatePolicyAllowed,
+                    MemoryQualityReasonCode::DurableUserPreference,
+                    MemoryQualityReasonCode::NovelCandidate,
+                ],
+                true,
+            ),
+            (
+                "allows_recurring_instruction_for_user_or_workspace_candidate",
+                |input| {
+                    input.fact_class = MemoryFactClass::RecurringUserInstruction;
+                    input.ownership_class = MemoryOwnershipClass::DurableWorkspaceMemory;
+                },
+                MemoryOwnershipClass::DurableWorkspaceMemory,
+                &[
+                    MemoryQualityReasonCode::CandidatePolicyAllowed,
+                    MemoryQualityReasonCode::DurableRecurringInstruction,
+                    MemoryQualityReasonCode::NovelCandidate,
+                ],
+                true,
+            ),
+            (
+                "allows_project_decision_candidate",
+                |input| {
+                    input.fact_class = MemoryFactClass::ProjectDecision;
+                    input.lifetime_class = MemoryLifetimeClass::ProjectLifetime;
+                    input.ownership_class = MemoryOwnershipClass::DurableWorkspaceMemory;
+                },
+                MemoryOwnershipClass::DurableWorkspaceMemory,
+                &[
+                    MemoryQualityReasonCode::CandidatePolicyAllowed,
+                    MemoryQualityReasonCode::DurableProjectMemory,
+                    MemoryQualityReasonCode::NovelCandidate,
+                ],
+                true,
+            ),
+            (
+                "allows_user_confirmed_agent_memory_candidate",
+                |input| {
+                    input.fact_class = MemoryFactClass::AssistantSelfDescription;
+                    input.evidence_class = MemoryEvidenceClass::UserApproval;
+                    input.ownership_class = MemoryOwnershipClass::DurableAgentMemory;
+                },
+                MemoryOwnershipClass::DurableAgentMemory,
+                &[
+                    MemoryQualityReasonCode::CandidatePolicyAllowed,
+                    MemoryQualityReasonCode::UserConfirmedAgentMemory,
+                    MemoryQualityReasonCode::NovelCandidate,
+                ],
+                true,
+            ),
+        ];
+        for &(case, configure, ownership, reasons, auto_approve) in cases {
+            let mut input = base_input();
+            configure(&mut input);
+            eprintln!("quality gate case: {case}");
+            assert_candidate_policy(
+                MemoryQualityGate::decide(&input),
+                ownership,
+                reasons,
+                auto_approve,
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_relations_control_reasons_and_auto_approval() {
+        type QualityCase = (
+            &'static str,
+            fn(&mut MemoryQualityGateInput),
+            MemoryOwnershipClass,
+            &'static [MemoryQualityReasonCode],
+            bool,
+        );
+        let cases: &[QualityCase] = &[
+            (
+                "contradiction_can_reach_candidate_policy_but_cannot_auto_approve",
+                |input| {
+                    input.relation = MemoryWriteRelation::Contradiction;
+                },
+                MemoryOwnershipClass::DurableUserMemory,
+                &[
+                    MemoryQualityReasonCode::CandidatePolicyAllowed,
+                    MemoryQualityReasonCode::DurableUserIdentity,
+                    MemoryQualityReasonCode::ContradictsExistingMemory,
+                    MemoryQualityReasonCode::RequiresResolution,
+                ],
+                false,
+            ),
+            (
+                "compatible_update_reaches_candidate_policy_with_relation_reason",
+                |input| {
+                    input.relation = MemoryWriteRelation::CompatibleUpdate;
+                },
+                MemoryOwnershipClass::DurableUserMemory,
+                &[
+                    MemoryQualityReasonCode::CandidatePolicyAllowed,
+                    MemoryQualityReasonCode::DurableUserIdentity,
+                    MemoryQualityReasonCode::CompatibleUpdate,
+                ],
+                true,
+            ),
+        ];
+        for &(case, configure, ownership, reasons, auto_approve) in cases {
+            let mut input = base_input();
+            configure(&mut input);
+            eprintln!("quality gate case: {case}");
+            assert_candidate_policy(
+                MemoryQualityGate::decide(&input),
+                ownership,
+                reasons,
+                auto_approve,
+            );
+        }
     }
 }

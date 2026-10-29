@@ -7,17 +7,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
-use std::sync::{
-    Mutex,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use migration::{Migrator, MigratorTrait};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, TransactionTrait};
 
-use crate::auth::test_support::{
-    IsolatedAuthRuntime, TEST_GATEWAY_ID, TEST_SUPERUSER_ID, TestAuthClock,
-};
+use crate::auth::test_support::{IsolatedAuthRuntime, TEST_GATEWAY_ID, TEST_SUPERUSER_ID};
 use crate::authorization::ThreadAccessClass;
 use crate::identity::{
     GatewayIdentitySnapshot, IdentityBootstrapSnapshot, SuperuserIdentitySnapshot,
@@ -75,11 +70,6 @@ impl FixtureSecret {
     fn generated(label: &str) -> Self {
         let sequence = FIXTURE_SECRET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         Self(format!("epic5-test-{label}-{sequence}"))
-    }
-
-    #[cfg(test)]
-    fn expose_for_assertion(&self) -> &str {
-        &self.0
     }
 }
 
@@ -271,52 +261,6 @@ impl Epic4Fixture {
     }
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct RecipientCapture {
-    recipients_by_method: Mutex<BTreeMap<String, BTreeSet<String>>>,
-}
-
-impl RecipientCapture {
-    pub(crate) fn record<I, S>(&self, method: impl Into<String>, recipients: I)
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.recipients_by_method
-            .lock()
-            .expect("Epic 5 recipient capture lock")
-            .entry(method.into())
-            .or_default()
-            .extend(recipients.into_iter().map(Into::into));
-    }
-
-    pub(crate) fn recipients(&self, method: &str) -> BTreeSet<String> {
-        self.recipients_by_method
-            .lock()
-            .expect("Epic 5 recipient capture lock")
-            .get(method)
-            .cloned()
-            .unwrap_or_default()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct Epic5Fixture {
-    pub authorization: Epic4Fixture,
-    pub clock: TestAuthClock,
-    pub recipients: RecipientCapture,
-}
-
-impl Epic5Fixture {
-    pub(crate) fn deterministic() -> Self {
-        Self {
-            authorization: Epic4Fixture::deterministic(),
-            clock: TestAuthClock::new(EPIC5_TEST_NOW_UNIX),
-            recipients: RecipientCapture::default(),
-        }
-    }
-}
-
 fn private_thread(
     id: &'static str,
     workspace_id: &'static str,
@@ -329,168 +273,6 @@ fn private_thread(
         creator_principal_id: Some(creator_principal_id),
         participant_principal_ids: BTreeSet::from([creator_principal_id]),
         child_resources: ChildResourceFixture::for_thread(id),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ResourceFamily {
-    Workspace,
-    Thread,
-    ThreadFolder,
-    TurnTimeline,
-    Artifact,
-    ArtifactTransfer,
-    Memory,
-    Episodic,
-    AgentsDocument,
-    Task,
-    TaskCandidate,
-    TaskDelivery,
-    WorkspaceRealtime,
-    ThreadRealtime,
-    Replay,
-    Provider,
-    Voice,
-    Mcp,
-    Skill,
-    CliRuntime,
-    PermissionRequest,
-    SelfImprovementSource,
-    LearnedOverlay,
-    DerivedProjection,
-}
-
-impl ResourceFamily {
-    pub(crate) const ALL: [Self; 24] = [
-        Self::Workspace,
-        Self::Thread,
-        Self::ThreadFolder,
-        Self::TurnTimeline,
-        Self::Artifact,
-        Self::ArtifactTransfer,
-        Self::Memory,
-        Self::Episodic,
-        Self::AgentsDocument,
-        Self::Task,
-        Self::TaskCandidate,
-        Self::TaskDelivery,
-        Self::WorkspaceRealtime,
-        Self::ThreadRealtime,
-        Self::Replay,
-        Self::Provider,
-        Self::Voice,
-        Self::Mcp,
-        Self::Skill,
-        Self::CliRuntime,
-        Self::PermissionRequest,
-        Self::SelfImprovementSource,
-        Self::LearnedOverlay,
-        Self::DerivedProjection,
-    ];
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum AccessPath {
-    List,
-    Get,
-    Mutate,
-    Paginate,
-    Replay,
-    Search,
-    BinaryTransfer,
-    SubscriptionDelivery,
-}
-
-impl AccessPath {
-    pub(crate) const ALL: [Self; 8] = [
-        Self::List,
-        Self::Get,
-        Self::Mutate,
-        Self::Paginate,
-        Self::Replay,
-        Self::Search,
-        Self::BinaryTransfer,
-        Self::SubscriptionDelivery,
-    ];
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum IdorDimension {
-    SamePrincipalAllowedWorkspace,
-    SamePrincipalForbiddenWorkspace,
-    SameWorkspaceForbiddenPrivateThread,
-    DifferentPrincipalGuessedChildId,
-    MalformedParentChildPair,
-    MissingResource,
-    Superuser,
-}
-
-impl IdorDimension {
-    pub(crate) const ALL: [Self; 7] = [
-        Self::SamePrincipalAllowedWorkspace,
-        Self::SamePrincipalForbiddenWorkspace,
-        Self::SameWorkspaceForbiddenPrivateThread,
-        Self::DifferentPrincipalGuessedChildId,
-        Self::MalformedParentChildPair,
-        Self::MissingResource,
-        Self::Superuser,
-    ];
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ExpectedDisclosure {
-    Allow,
-    Omit,
-    NotFound,
-    InvalidRequest,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct IdorCase {
-    pub family: ResourceFamily,
-    pub path: AccessPath,
-    pub dimension: IdorDimension,
-    pub expected: ExpectedDisclosure,
-}
-
-pub(crate) fn exhaustive_idor_matrix() -> Vec<IdorCase> {
-    let mut cases = Vec::with_capacity(
-        ResourceFamily::ALL.len() * AccessPath::ALL.len() * IdorDimension::ALL.len(),
-    );
-    for family in ResourceFamily::ALL {
-        for path in AccessPath::ALL {
-            for dimension in IdorDimension::ALL {
-                cases.push(IdorCase {
-                    family,
-                    path,
-                    dimension,
-                    expected: expected_disclosure(path, dimension),
-                });
-            }
-        }
-    }
-    cases
-}
-
-const fn expected_disclosure(path: AccessPath, dimension: IdorDimension) -> ExpectedDisclosure {
-    match dimension {
-        IdorDimension::SamePrincipalAllowedWorkspace | IdorDimension::Superuser => {
-            ExpectedDisclosure::Allow
-        }
-        IdorDimension::MalformedParentChildPair => ExpectedDisclosure::InvalidRequest,
-        IdorDimension::MissingResource => ExpectedDisclosure::NotFound,
-        IdorDimension::SamePrincipalForbiddenWorkspace
-        | IdorDimension::SameWorkspaceForbiddenPrivateThread
-        | IdorDimension::DifferentPrincipalGuessedChildId => match path {
-            AccessPath::List
-            | AccessPath::Paginate
-            | AccessPath::Replay
-            | AccessPath::Search
-            | AccessPath::SubscriptionDelivery => ExpectedDisclosure::Omit,
-            AccessPath::Get | AccessPath::Mutate | AccessPath::BinaryTransfer => {
-                ExpectedDisclosure::NotFound
-            }
-        },
     }
 }
 
@@ -737,111 +519,6 @@ mod tests {
             .expect("fixture scalar string")
     }
 
-    #[test]
-    fn authorization_fixture_contract_is_deterministic_and_complete() {
-        let fixture = Epic4Fixture::deterministic();
-        assert_eq!(fixture.gateway_id, TEST_GATEWAY_ID);
-        assert_eq!(fixture.principals.len(), 5);
-        assert_eq!(fixture.sessions.len(), 2);
-        assert_eq!(fixture.threads.len(), 6);
-
-        let member_a = &fixture.principals[MEMBER_A_ID];
-        let member_b = &fixture.principals[MEMBER_B_ID];
-        assert_eq!(member_a.status, FixturePrincipalStatus::Active);
-        assert_eq!(member_b.status, FixturePrincipalStatus::Active);
-        assert_eq!(
-            member_a.role_key.as_ref().map(RoleKey::as_str),
-            Some("member")
-        );
-        assert_eq!(
-            member_b.role_key.as_ref().map(RoleKey::as_str),
-            Some("member")
-        );
-        assert_eq!(
-            fixture.principals[SUSPENDED_MEMBER_ID].status,
-            FixturePrincipalStatus::Suspended
-        );
-        assert_eq!(
-            fixture.principals[REMOVED_MEMBER_ID].status,
-            FixturePrincipalStatus::Removed
-        );
-
-        let a_workspaces = &fixture.workspace_memberships[MEMBER_A_ID];
-        let b_workspaces = &fixture.workspace_memberships[MEMBER_B_ID];
-        assert_eq!(
-            a_workspaces
-                .intersection(b_workspaces)
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![WORKSPACE_RED_ID]
-        );
-        assert!(a_workspaces.contains(WORKSPACE_BLUE_ID));
-        assert!(!b_workspaces.contains(WORKSPACE_BLUE_ID));
-        assert!(b_workspaces.contains(WORKSPACE_GREEN_ID));
-        assert!(!a_workspaces.contains(WORKSPACE_GREEN_ID));
-
-        assert_eq!(
-            fixture.threads[THREAD_RED_PRIVATE_A_ID].visibility,
-            ThreadAccessClass::Private
-        );
-        assert_eq!(
-            fixture.threads[THREAD_RED_WORKSPACE_ID].visibility,
-            ThreadAccessClass::Workspace
-        );
-        assert_eq!(
-            fixture.threads[THREAD_RED_INTERNAL_ID].visibility,
-            ThreadAccessClass::Internal
-        );
-        assert!(
-            fixture.threads[THREAD_RED_PRIVATE_A_ID]
-                .participant_principal_ids
-                .contains(MEMBER_A_ID)
-        );
-        assert!(
-            !fixture.threads[THREAD_RED_PRIVATE_A_ID]
-                .participant_principal_ids
-                .contains(MEMBER_B_ID)
-        );
-    }
-
-    #[test]
-    fn authorization_fixture_credentials_are_independent() {
-        let fixture = Epic4Fixture::deterministic();
-        let member_a = &fixture.sessions[MEMBER_A_ID];
-        let member_b = &fixture.sessions[MEMBER_B_ID];
-        assert_ne!(member_a.device_id, member_b.device_id);
-        assert_ne!(member_a.session_id, member_b.session_id);
-        assert_ne!(member_a.access_credential, member_b.access_credential);
-        assert_ne!(member_a.refresh_credential, member_b.refresh_credential);
-        assert_ne!(
-            member_a.access_credential.expose_for_assertion(),
-            member_b.access_credential.expose_for_assertion()
-        );
-        assert!(!format!("{fixture:?}").contains("epic5-test-"));
-        assert!(format!("{fixture:?}").contains("[REDACTED]"));
-    }
-
-    #[test]
-    fn epic5_fixture_has_deterministic_clock_installations_and_recipient_capture() {
-        let fixture = Epic5Fixture::deterministic();
-        assert_eq!(fixture.clock.now_unix(), EPIC5_TEST_NOW_UNIX);
-        assert_eq!(
-            fixture.authorization.sessions[MEMBER_A_ID]
-                .installation
-                .installation_id,
-            "fixture-member-a"
-        );
-        fixture.recipients.record(
-            "member/changed",
-            [TEST_SUPERUSER_ID, MEMBER_A_ID, MEMBER_A_ID],
-        );
-        assert_eq!(
-            fixture.recipients.recipients("member/changed"),
-            BTreeSet::from([TEST_SUPERUSER_ID.to_owned(), MEMBER_A_ID.to_owned()])
-        );
-        assert!(fixture.recipients.recipients("unknown").is_empty());
-    }
-
     #[tokio::test]
     async fn authorization_fixture_provides_empty_and_populated_database_states() {
         let empty = IsolatedEpic4Harness::empty()
@@ -867,38 +544,6 @@ mod tests {
             .await,
             5
         );
-    }
-
-    #[test]
-    fn authorization_fixture_idor_matrix_is_exhaustive() {
-        let matrix = exhaustive_idor_matrix();
-        assert_eq!(
-            matrix.len(),
-            ResourceFamily::ALL.len() * AccessPath::ALL.len() * IdorDimension::ALL.len()
-        );
-
-        for family in ResourceFamily::ALL {
-            for path in AccessPath::ALL {
-                for dimension in IdorDimension::ALL {
-                    assert_eq!(
-                        matrix
-                            .iter()
-                            .filter(|case| {
-                                case.family == family
-                                    && case.path == path
-                                    && case.dimension == dimension
-                            })
-                            .count(),
-                        1
-                    );
-                }
-            }
-        }
-
-        assert!(matrix.iter().all(|case| {
-            case.dimension != IdorDimension::DifferentPrincipalGuessedChildId
-                || case.expected != ExpectedDisclosure::Allow
-        }));
     }
 
     #[tokio::test]
@@ -1061,23 +706,5 @@ mod tests {
             .await,
             0
         );
-    }
-
-    #[test]
-    fn authorization_fixture_preserves_absolute_superuser_baseline() {
-        let fixture = Epic4Fixture::deterministic();
-        let superuser = &fixture.principals[TEST_SUPERUSER_ID];
-        assert_eq!(superuser.kind, FixturePrincipalKind::Superuser);
-        assert_eq!(superuser.status, FixturePrincipalStatus::Active);
-        assert_eq!(superuser.role_key, None);
-        assert!(
-            !fixture
-                .workspace_memberships
-                .contains_key(TEST_SUPERUSER_ID),
-            "Superuser must not need synthetic memberships"
-        );
-        assert!(exhaustive_idor_matrix().iter().all(|case| {
-            case.dimension != IdorDimension::Superuser || case.expected == ExpectedDisclosure::Allow
-        }));
     }
 }

@@ -6,6 +6,7 @@ pub(crate) mod model_install;
 pub(crate) mod runtime;
 pub(crate) mod session_buffer;
 pub(crate) mod session_store;
+mod silero;
 pub(crate) mod supervisor;
 pub(crate) mod transcription;
 pub(crate) mod vad;

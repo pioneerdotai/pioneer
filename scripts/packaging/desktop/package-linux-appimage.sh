@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-sha256_file() {
-  local path="$1"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$path" | awk '{print $1}'
-  else
-    shasum -a 256 "$path" | awk '{print $1}'
-  fi
-}
-
 usage() {
   cat <<'USAGE'
 Usage:
@@ -99,6 +90,7 @@ if [[ -z "$OUT_DIR" ]]; then
   OUT_DIR="$REPO_ROOT/dist"
 fi
 mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
 if [[ -z "$APPIMAGETOOL_BIN" ]]; then
   APPIMAGETOOL_BIN="appimagetool"
@@ -109,16 +101,9 @@ if [[ ! -x "$APPIMAGETOOL_BIN" ]] && ! command -v "$APPIMAGETOOL_BIN" >/dev/null
   exit 1
 fi
 
-if [[ "$SKIP_BUILD" != true ]]; then
-  cargo update -p cua-driver-sdk
-  cargo build --locked --release -p pioneer-desktop --target "$TARGET"
-  cargo build --locked --release -p pioneer-app-updater --target "$TARGET"
-  cargo build --locked --release -p pioneer-cli --features computer-use --target "$TARGET"
-  if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
-    python3 scripts/packaging/symbol-inputs.py export --target "$TARGET" "$PIONEER_SYMBOL_INPUTS_DIR" \
-      "target/$TARGET/release/pioneer-app" "target/$TARGET/release/pioneer" "target/$TARGET/release/pioneer-app-updater"
-  fi
-fi
+# Packaging always consumes explicit retained inputs. --skip-build remains a
+# compatible spelling; preparation is never implicit in either invocation mode.
+python3 scripts/packaging/desktop-inputs.py preflight --target "$TARGET"
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -145,15 +130,7 @@ fi
 GATEWAY_BUNDLE_DIR="$APPDIR/usr/bin/gateway"
 mkdir -p "$GATEWAY_BUNDLE_DIR"
 
-GATEWAY_ASSET_NAME="pioneer-gateway-linux-${ARCH}-computer-use-package.zip"
-GATEWAY_ASSET_PATH="$GATEWAY_BUNDLE_DIR/$GATEWAY_ASSET_NAME"
-python3 scripts/packaging/cua-driver.py --target "$TARGET" --binary "target/$TARGET/release/pioneer" --archive "$GATEWAY_ASSET_PATH"
-
-GATEWAY_SHA256="$(sha256_file "$GATEWAY_ASSET_PATH")"
-printf 'sha256:%s %s\n' "$GATEWAY_SHA256" "$GATEWAY_ASSET_NAME" > "$GATEWAY_BUNDLE_DIR/SHA256SUMS"
-
-cp "target/$TARGET/release/pioneer" "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
-chmod 0755 "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
+python3 scripts/packaging/desktop-inputs.py embed --target "$TARGET" --destination "$GATEWAY_BUNDLE_DIR"
 
 cat > "$APPDIR/AppRun" <<'APP_RUN'
 #!/bin/sh
@@ -177,10 +154,10 @@ cp "$APPDIR/pioneer.desktop" "$APPDIR/usr/share/applications/pioneer.desktop"
 cp "$LINUX_ICON_SOURCE" "$APPDIR/pioneer.png"
 cp "$APPDIR/pioneer.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/pioneer.png"
 ln -s "pioneer.png" "$APPDIR/.DirIcon"
-scripts/packaging/desktop/check-package-contents.sh linux-appdir "$APPDIR"
+scripts/packaging/desktop/check-package-contents.sh linux-appdir "$APPDIR" "$TARGET"
 
 APPIMAGE_NAME="pioneer-linux-${ARCH}.AppImage"
-strip --strip-debug "$APPDIR/usr/bin/pioneer-app" "$APPDIR/usr/bin/pioneer-app-updater" "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
+strip --strip-debug "$APPDIR/usr/bin/pioneer-app" "$APPDIR/usr/bin/pioneer-app-updater"
 if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
   python3 scripts/packaging/symbol-inputs.py record "$APPDIR/usr/bin/pioneer-app" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
   python3 scripts/packaging/symbol-inputs.py record "$APPDIR/usr/bin/pioneer-app-updater" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
@@ -197,5 +174,12 @@ else
 fi
 
 chmod 0755 "$APPIMAGE_PATH"
+# Inspect the built AppImage too; stage validation alone does not establish its contents.
+EXTRACT_DIR="$WORK_DIR/extracted"
+mkdir -p "$EXTRACT_DIR"
+(cd "$EXTRACT_DIR" && "$APPIMAGE_PATH" --appimage-extract >/dev/null)
+scripts/packaging/desktop/check-package-contents.sh linux-appdir "$EXTRACT_DIR/squashfs-root" "$TARGET"
+cmp "$APPDIR/usr/bin/pioneer-app" "$EXTRACT_DIR/squashfs-root/usr/bin/pioneer-app"
+cmp "$APPDIR/usr/bin/pioneer-app-updater" "$EXTRACT_DIR/squashfs-root/usr/bin/pioneer-app-updater"
 
 echo "Created: $APPIMAGE_PATH"

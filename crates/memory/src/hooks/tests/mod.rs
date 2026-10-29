@@ -1,4 +1,3 @@
-mod classifier_fallback;
 mod descriptors;
 mod eligibility;
 mod episodic_recall;

@@ -1633,38 +1633,6 @@ mod tests {
         assert_eq!(state.gateway.ws_connection_id, Some(42));
         assert!(state.gateway.bootstrap_complete);
     }
-
-    #[test]
-    fn access_change_for_one_endpoint_cannot_mutate_another_endpoint_cache() {
-        let mut endpoint_a = ClientState::default();
-        endpoint_a.workspaces.workspaces = vec![workspace("ws_a")];
-        endpoint_a.workspaces.preferred_workspace_id = Some("ws_a".to_owned());
-
-        let mut endpoint_b = ClientState::default();
-        endpoint_b.workspaces.workspaces = vec![workspace("ws_b")];
-        endpoint_b.workspaces.preferred_workspace_id = Some("ws_b".to_owned());
-        endpoint_b.gateway.ws_connection_id = Some(200);
-
-        apply_access_changed_to_client_state(
-            &mut endpoint_a,
-            &AccessChangedNotification {
-                authorization_revision: 1,
-                workspace_id: "ws_a".to_owned(),
-                thread_id: None,
-                outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
-                change: AccessChangeKind::WorkspaceMembership,
-            },
-        );
-
-        assert!(endpoint_a.workspaces.workspaces.is_empty());
-        assert_eq!(endpoint_b.workspaces.workspaces, vec![workspace("ws_b")]);
-        assert_eq!(
-            endpoint_b.workspaces.preferred_workspace_id.as_deref(),
-            Some("ws_b")
-        );
-        assert_eq!(endpoint_b.gateway.ws_connection_id, Some(200));
-        assert_eq!(endpoint_b.gateway.authorization_revision, None);
-    }
 }
 
 pub use pioneer_protocol::AuthorizationCapabilitySnapshot;

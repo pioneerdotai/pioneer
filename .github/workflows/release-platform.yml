@@ -1,0 +1,516 @@
+name: Release one platform
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: One validated six-target platform record from the release caller.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+  CARGO_PROFILE_RELEASE_STRIP: none
+  CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(fromJSON(inputs.platform).target, 'apple-darwin') && 'unpacked' || 'off' }}
+  PIONEER_BUNDLED_MODEL_CATALOG: ${{ github.workspace }}/release-model-catalog/catalog.json
+  PIONEER_SENTRY_ENVIRONMENT: production
+
+jobs:
+  prepare-cua:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: prepare-verified-prebuilt
+        run: python scripts/packaging/cua-driver.py prepare --target "${{ fromJSON(inputs.platform).target }}" --out cua-prepared
+      - uses: actions/upload-artifact@v6
+        with:
+          name: prepared-cua-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: cua-prepared/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+  build-gateway-default:
+    runs-on: ${{ fromJSON(inputs.platform).os }}
+    defaults:
+      run:
+        # Select the shell from workflow inputs before a runner is allocated.
+        # Native PowerShell avoids Git Bash converting CL=/EHsc to a path.
+        shell: ${{ contains(fromJSON(inputs.platform).target, 'windows') && 'pwsh' || 'bash' }}
+    env:
+      PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: pioneer-release-model-catalog
+          path: release-model-catalog
+      - name: validate-target-and-variant
+        run: python scripts/packaging/release-preflight.py --target "${{ fromJSON(inputs.platform).target }}" --variant "default"
+      - uses: ./.github/actions/release-build-setup
+        with:
+          target: ${{ fromJSON(inputs.platform).target }}
+          component: gateway
+          variant: default
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-gateway-${{ fromJSON(inputs.platform).target }}-default-v2
+          cache-workspace-crates: false
+      - name: compile-gateway
+        run: >-
+          python scripts/packaging/build-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
+          --variant "default"
+          --asset "${{ fromJSON(inputs.platform).asset }}"
+          --out release-gateway
+      - uses: actions/upload-artifact@v6
+        with:
+          name: symbol-inputs-gateway-${{ fromJSON(inputs.platform).target }}-default-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: release-gateway/symbol-inputs/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/upload-artifact@v6
+        with:
+          name: compiled-gateway-${{ fromJSON(inputs.platform).target }}-default-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: release-gateway/runtime/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+  build-gateway-computer-use:
+    runs-on: ${{ fromJSON(inputs.platform).os }}
+    defaults:
+      run:
+        # Select the shell from workflow inputs before a runner is allocated.
+        # Native PowerShell avoids Git Bash converting CL=/EHsc to a path.
+        shell: ${{ contains(fromJSON(inputs.platform).target, 'windows') && 'pwsh' || 'bash' }}
+    env:
+      PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: pioneer-release-model-catalog
+          path: release-model-catalog
+      - name: validate-target-and-variant
+        run: python scripts/packaging/release-preflight.py --target "${{ fromJSON(inputs.platform).target }}" --variant "computer-use"
+      - uses: ./.github/actions/release-build-setup
+        with:
+          target: ${{ fromJSON(inputs.platform).target }}
+          component: gateway
+          variant: computer-use
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-gateway-${{ fromJSON(inputs.platform).target }}-computer-use-v2
+          cache-workspace-crates: false
+      - name: compile-gateway
+        run: >-
+          python scripts/packaging/build-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
+          --variant "computer-use"
+          --asset "${{ fromJSON(inputs.platform).cu_asset }}"
+          --out release-gateway
+      - uses: actions/upload-artifact@v6
+        with:
+          name: symbol-inputs-gateway-${{ fromJSON(inputs.platform).target }}-computer-use-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: release-gateway/symbol-inputs/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/upload-artifact@v6
+        with:
+          name: compiled-gateway-${{ fromJSON(inputs.platform).target }}-computer-use-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: release-gateway/runtime/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+  build-desktop:
+    runs-on: ${{ fromJSON(inputs.platform).os }}
+    defaults:
+      run:
+        # Select the shell from workflow inputs before a runner is allocated.
+        # Native PowerShell avoids Git Bash converting CL=/EHsc to a path.
+        shell: ${{ contains(fromJSON(inputs.platform).target, 'windows') && 'pwsh' || 'bash' }}
+    env:
+      PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
+      PIONEER_DESKTOP_SENTRY_DSN: ${{ secrets.PIONEER_DESKTOP_SENTRY_DSN }}
+      PIONEER_APP_URL_SCHEME: pioneer
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: pioneer-release-model-catalog
+          path: release-model-catalog
+      - name: validate-target
+        run: python scripts/packaging/release-preflight.py --target "${{ fromJSON(inputs.platform).target }}"
+      - uses: ./.github/actions/release-build-setup
+        with:
+          target: ${{ fromJSON(inputs.platform).target }}
+          component: desktop
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-desktop-${{ fromJSON(inputs.platform).target }}-v2
+          cache-workspace-crates: false
+      - name: compile-desktop-and-updater
+        run: python scripts/packaging/build-desktop.py --target "${{ fromJSON(inputs.platform).target }}" --out release-desktop
+      - uses: actions/upload-artifact@v6
+        with:
+          name: symbol-inputs-desktop-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: release-desktop/symbol-inputs/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/upload-artifact@v6
+        with:
+          name: compiled-desktop-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: release-desktop/runtime/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+  package-gateway-default:
+    needs: build-gateway-default
+    runs-on: ${{ fromJSON(inputs.platform).os }}
+    env:
+      WINDOWS_SIGNING_REQUIRED: "false"
+      WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
+      WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+      WINDOWS_SIGNING_SUBJECT_NAME: ${{ secrets.WINDOWS_SIGNING_SUBJECT_NAME }}
+      WINDOWS_SIGNING_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_URL }}
+      WINDOWS_SIGNING_FILE_DIGEST: ${{ secrets.WINDOWS_SIGNING_FILE_DIGEST }}
+      WINDOWS_SIGNING_TIMESTAMP_DIGEST: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_DIGEST }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: pioneer-release-model-catalog
+          path: release-model-catalog
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: compiled-gateway-${{ fromJSON(inputs.platform).target }}-default
+          path: gateway-inputs
+      - name: package-ready-gateway
+        run: >-
+          python scripts/packaging/package-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
+          --variant default --asset "${{ fromJSON(inputs.platform).asset }}"
+          --inputs gateway-inputs --out gateway-final
+      - uses: actions/upload-artifact@v6
+        with:
+          name: symbol-mapping-gateway-${{ fromJSON(inputs.platform).target }}-default-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: gateway-final/symbols/
+          retention-days: 7
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v6
+        with:
+          name: gateway-assets-${{ fromJSON(inputs.platform).target }}-default-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: gateway-final/assets/
+          retention-days: 7
+          if-no-files-found: error
+
+  package-gateway-computer-use:
+    needs: [build-gateway-computer-use, prepare-cua]
+    runs-on: ${{ fromJSON(inputs.platform).os }}
+    env:
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
+      MACOS_DMG_SIGN_IDENTITY: ${{ secrets.MACOS_DMG_SIGN_IDENTITY }}
+      APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+      APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
+      APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+      APPLE_NOTARIZATION_KEY_BASE64: ${{ secrets.APPLE_NOTARIZATION_KEY_BASE64 }}
+      PIONEER_NOTARY_LOG_DIR: ${{ github.workspace }}/notary-logs
+      WINDOWS_SIGNING_REQUIRED: "false"
+      WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
+      WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+      WINDOWS_SIGNING_SUBJECT_NAME: ${{ secrets.WINDOWS_SIGNING_SUBJECT_NAME }}
+      WINDOWS_SIGNING_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_URL }}
+      WINDOWS_SIGNING_FILE_DIGEST: ${{ secrets.WINDOWS_SIGNING_FILE_DIGEST }}
+      WINDOWS_SIGNING_TIMESTAMP_DIGEST: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_DIGEST }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: pioneer-release-model-catalog
+          path: release-model-catalog
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: compiled-gateway-${{ fromJSON(inputs.platform).target }}-computer-use
+          path: gateway-inputs
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: prepared-cua-${{ fromJSON(inputs.platform).target }}
+          path: cua-prepared
+      - uses: ./.github/actions/download-release-input
+        if: runner.os == 'macOS'
+        with:
+          role: notary-gateway-${{ fromJSON(inputs.platform).target }}
+          path: notary-logs
+          optional: 'true'
+      - name: restore-retained-Mach-O-executable-modes
+        if: runner.os == 'macOS'
+        run: |
+          python - <<'PYMODES'
+          from pathlib import Path
+
+          # Actions artifact transfer preserves bytes, but resets file modes.
+          # Signed composition contains regular files only; restore Mach-O modes
+          # before checking/reusing that composition or producing app.zip.
+          magic = {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf'}
+          for path in Path('notary-logs').rglob('*'):
+              if path.is_symlink():
+                  raise ValueError('Retained notarization composition must not contain links')
+              if path.is_file():
+                  with path.open('rb') as source:
+                      if source.read(4) in magic:
+                          path.chmod(0o755)
+          PYMODES
+      - uses: ./.github/actions/macos-signing
+        if: runner.os == 'macOS'
+      - name: package-ready-gateway
+        run: >-
+          python scripts/packaging/package-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
+          --variant computer-use --asset "${{ fromJSON(inputs.platform).cu_asset }}"
+          --inputs gateway-inputs --prepared cua-prepared --out gateway-final
+      - uses: actions/upload-artifact@v6
+        with:
+          name: symbol-mapping-gateway-${{ fromJSON(inputs.platform).target }}-computer-use-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: gateway-final/symbols/
+          retention-days: 7
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v6
+        with:
+          name: gateway-assets-${{ fromJSON(inputs.platform).target }}-computer-use-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: gateway-final/assets/
+          retention-days: 7
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v6
+        with:
+          name: gateway-runtime-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: gateway-final/runtime/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+      - name: retain-notarization-reports
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v6
+        with:
+          name: notary-gateway-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: notary-logs/
+          retention-days: 7
+          if-no-files-found: warn
+      - name: cleanup-macos-signing-keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          security default-keychain -d user -s login.keychain-db || true
+          security delete-keychain "${RUNNER_TEMP}/pioneer-signing.keychain-db" || true
+
+  package-desktop:
+    needs: [build-desktop, package-gateway-computer-use]
+    runs-on: ${{ fromJSON(inputs.platform).os }}
+    env:
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
+      MACOS_DMG_SIGN_IDENTITY: ${{ secrets.MACOS_DMG_SIGN_IDENTITY }}
+      APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+      APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
+      APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+      APPLE_NOTARIZATION_KEY_BASE64: ${{ secrets.APPLE_NOTARIZATION_KEY_BASE64 }}
+      PIONEER_NOTARY_LOG_DIR: ${{ github.workspace }}/notary-logs
+      PIONEER_APP_URL_SCHEME: pioneer
+      PIONEER_GATEWAY_RUNTIME_DIR: ${{ github.workspace }}/gateway-runtime
+      PIONEER_SYMBOL_INPUTS_DIR: ${{ github.workspace }}/desktop-symbols
+      MACOS_SIGNING_REQUIRED: "true"
+      WINDOWS_SIGNING_REQUIRED: "false"
+      WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
+      WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+      WINDOWS_SIGNING_SUBJECT_NAME: ${{ secrets.WINDOWS_SIGNING_SUBJECT_NAME }}
+      WINDOWS_SIGNING_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_URL }}
+      WINDOWS_SIGNING_FILE_DIGEST: ${{ secrets.WINDOWS_SIGNING_FILE_DIGEST }}
+      WINDOWS_SIGNING_TIMESTAMP_DIGEST: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_DIGEST }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: pioneer-release-model-catalog
+          path: release-model-catalog
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: compiled-desktop-${{ fromJSON(inputs.platform).target }}
+          path: desktop-runtime
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: gateway-runtime-${{ fromJSON(inputs.platform).target }}
+          path: gateway-runtime
+      # Input restoration validates Gateway tickets too; configure TCP first.
+      - uses: ./.github/actions/macos-signing
+        if: runner.os == 'macOS'
+      - name: restore-exact-runtime-inputs
+        run: >-
+          python scripts/packaging/release-inputs.py --target "${{ fromJSON(inputs.platform).target }}"
+          --inputs desktop-runtime --gateway gateway-runtime
+      - uses: ./.github/actions/download-release-input
+        if: runner.os == 'macOS'
+        with:
+          role: notary-desktop-${{ fromJSON(inputs.platform).target }}
+          path: notary-logs
+          optional: 'true'
+      - name: restore-retained-Mach-O-executable-modes
+        if: runner.os == 'macOS'
+        run: |
+          python - <<'PYMODES'
+          from pathlib import Path
+
+          # Actions artifact transfer preserves bytes, but resets file modes.
+          # Signed composition contains regular files only; restore Mach-O modes
+          # before checking/reusing that composition or producing app.zip.
+          magic = {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf'}
+          for path in Path('notary-logs').rglob('*'):
+              if path.is_symlink():
+                  raise ValueError('Retained notarization composition must not contain links')
+              if path.is_file():
+                  with path.open('rb') as source:
+                      if source.read(4) in magic:
+                          path.chmod(0o755)
+          PYMODES
+      - name: install-linux-packaging-dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2t64 libgbm1 libssl3t64 libpipewire-0.3-0 libxkbcommon0 \
+            libxkbcommon-x11-0 libwayland-client0 libegl1 libfontconfig1 libfreetype6 \
+            libwebkit2gtk-4.1-0 libx11-6 libxi6 libxtst6 libxext6 libxcb-shape0 libxcb-xfixes0 libgl1
+      - name: setup-appimagetool
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${{ fromJSON(inputs.platform).appimagetool_arch }}.AppImage" -o appimagetool.AppImage
+          chmod +x appimagetool.AppImage
+          printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' \
+            '"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/appimagetool.AppImage" --appimage-extract-and-run "$@"' > appimagetool
+          chmod +x appimagetool
+      - name: package-linux-appimage
+        if: runner.os == 'Linux'
+        run: >-
+          scripts/packaging/desktop/package-linux-appimage.sh --target "${{ fromJSON(inputs.platform).target }}"
+          --skip-build --out-dir dist --appimagetool "$PWD/appimagetool"
+      - name: package-macos-dmg
+        if: runner.os == 'macOS'
+        run: >-
+          scripts/packaging/desktop/package-macos.sh --target "${{ fromJSON(inputs.platform).target }}"
+          --skip-build --out-dir dist
+      - name: setup-wix
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 4.0.5
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          wix extension add WixToolset.Bal.wixext/4.0.5
+      - name: package-windows-msi
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/packaging/desktop/package-windows-msi.ps1 -Target "${{ fromJSON(inputs.platform).target }}" -OutDir dist -SkipBuild
+      - uses: actions/upload-artifact@v6
+        with:
+          name: symbol-mapping-desktop-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: desktop-symbols/
+          retention-days: 7
+          if-no-files-found: error
+      - name: record-desktop-publication-provenance
+        env:
+          MANUAL_ASSET: ${{ fromJSON(inputs.platform).asset_name }}
+          UPDATE_ASSET: ${{ fromJSON(inputs.platform).update_asset_name }}
+        run: |
+          python - <<'PYRECEIPT'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          source = json.loads(Path('desktop-runtime/provenance.json').read_text())
+          gateway = json.loads(Path('gateway-runtime/provenance.json').read_text())
+          for name in {os.environ['MANUAL_ASSET'], os.environ['UPDATE_ASSET']}:
+              asset = Path('dist') / name
+              receipt = dict(schema_version=1, source=source, asset=name,
+                             sha256=hashlib.sha256(asset.read_bytes()).hexdigest(),
+                             gateway_asset=gateway['gateway_asset'], gateway_sha256=gateway['gateway_sha256'])
+              asset.with_name(asset.name + '.provenance.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          PYRECEIPT
+      - uses: actions/upload-artifact@v6
+        with:
+          name: desktop-assets-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: |
+            dist/${{ fromJSON(inputs.platform).asset_name }}
+            dist/${{ fromJSON(inputs.platform).update_asset_name }}
+            dist/${{ fromJSON(inputs.platform).asset_name }}.provenance.json
+            dist/${{ fromJSON(inputs.platform).update_asset_name }}.provenance.json
+          retention-days: 7
+          if-no-files-found: error
+      - name: retain-notarization-reports
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v6
+        with:
+          name: notary-desktop-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: notary-logs/
+          retention-days: 7
+          if-no-files-found: warn
+      - name: cleanup-macos-signing-keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          security default-keychain -d user -s login.keychain-db || true
+          security delete-keychain "${RUNNER_TEMP}/pioneer-signing.keychain-db" || true

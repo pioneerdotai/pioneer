@@ -40,8 +40,6 @@ pub mod mcp_server_installation;
 pub(crate) mod membership;
 pub(crate) mod native_cancellation_context;
 pub(crate) mod native_event_cleanup;
-#[cfg(test)]
-pub(crate) mod native_event_cleanup_baseline;
 pub mod native_terminal_effect_outbox;
 pub mod patch_history;
 pub mod policy;

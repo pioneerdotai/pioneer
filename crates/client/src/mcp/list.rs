@@ -256,28 +256,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_application_prunes_pending_and_clears_missing_selection() {
-        let mut servers = vec![server("id-old", "old")];
-        let mut pending = HashSet::from(["old".to_owned()]);
-        let mut selected = Some("id-old".to_owned());
-        let mut details = None;
-
-        let result = apply_mcp_snapshot(
-            &mut servers,
-            &mut pending,
-            &mut selected,
-            &mut details,
-            vec![server("id-new", "new")],
-        );
-
-        assert!(result.selected_was_present);
-        assert!(result.selected_removed);
-        assert_eq!(selected, None);
-        assert!(!is_mcp_pending(&pending, "old"));
-        assert_eq!(servers[0].id, "id-new");
-    }
-
-    #[test]
     fn snapshot_application_keeps_existing_selection() {
         let mut servers = Vec::new();
         let mut pending = HashSet::new();
@@ -311,12 +289,7 @@ mod tests {
         assert!(reduction.server_details.is_none());
         assert!(reduction.application.selected_removed);
         assert!(!reduction.pending_actions.contains("old"));
-    }
 
-    #[test]
-    fn list_refresh_failure_reduction_carries_display_error() {
-        let reduction = reduce_mcp_list_refresh_failure("load failed");
-
-        assert_eq!(reduction.error, "load failed");
+        assert!(reduction.application.selected_was_present);
     }
 }

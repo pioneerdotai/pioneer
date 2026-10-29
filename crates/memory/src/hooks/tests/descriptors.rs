@@ -84,85 +84,69 @@ fn memory_tool_bundle_hook_descriptor_is_stable_and_narrow() {
 }
 
 #[test]
-fn memory_deterministic_recall_hook_descriptor_is_stable_and_narrow() {
-    let hook = MemoryDeterministicRecallHook {
-        memory_provider: Arc::new(TestRecallMemoryProvider::with_recall(
-            MemoryRecallSnapshot::empty(),
-        )),
-    };
+fn memory_recall_catalog_descriptors_preserve_phase_and_read_only_capabilities() {
+    for (hook_id, phase, forbidden) in [
+        (
+            MEMORY_DETERMINISTIC_RECALL_HOOK_ID,
+            HookPhase::TurnPrePromptContext,
+            &[
+                "contribute_prompt_section",
+                "contribute_tool_bundle",
+                "write_domain_context",
+                "call_tools",
+            ][..],
+        ),
+        (
+            MEMORY_ACTIVE_RECALL_HOOK_ID,
+            HookPhase::TurnPostPreflightPromptContext,
+            &[
+                "contribute_prompt_section",
+                "contribute_tool_bundle",
+                "write_domain_context",
+                "call_tools",
+                "call_provider",
+            ][..],
+        ),
+    ] {
+        let runtime = HookRuntimeBuilder::new()
+            .install(package(
+                Arc::new(TestRecallMemoryProvider::with_recall(
+                    MemoryRecallSnapshot::empty(),
+                )),
+                None,
+                None,
+                None,
+                None,
+                Arc::new(TestToolBundleArtifactStore::new()),
+                MemoryLoopConfig::default(),
+            ))
+            .expect("memory hooks install")
+            .build();
+        let hook = runtime
+            .handlers()
+            .get_handler(&HookId::new(hook_id).expect("static hook id is valid"))
+            .expect("handler lookup succeeds")
+            .expect("recall hook is registered");
 
-    assert_eq!(hook.id().as_str(), MEMORY_DETERMINISTIC_RECALL_HOOK_ID);
-    assert_eq!(
-        hook.supported_phases(),
-        vec![HookPhase::TurnPrePromptContext]
-    );
-    let capabilities = hook.capabilities();
-    assert!(
-        capabilities.contains(&HookCapability::new("memory").expect("static capability is valid"))
-    );
-    assert!(capabilities.contains(
-        &HookCapability::new("read_domain_context").expect("static capability is valid")
-    ));
-    assert!(capabilities.contains(
-        &HookCapability::new("contribute_prompt_context").expect("static capability is valid")
-    ));
-    assert!(!capabilities.contains(
-        &HookCapability::new("contribute_prompt_section").expect("static capability is valid")
-    ));
-    assert!(!capabilities.contains(
-        &HookCapability::new("contribute_tool_bundle").expect("static capability is valid")
-    ));
-    assert!(!capabilities.contains(
-        &HookCapability::new("write_domain_context").expect("static capability is valid")
-    ));
-    assert!(
-        !capabilities
-            .contains(&HookCapability::new("call_tools").expect("static capability is valid"))
-    );
-}
-
-#[test]
-fn memory_active_recall_hook_descriptor_is_stable_and_read_only() {
-    let hook = ActiveMemoryRecallHook {
-        memory_provider: Arc::new(TestRecallMemoryProvider::with_recall(
-            MemoryRecallSnapshot::empty(),
-        )),
-        episodic_provider: None,
-        config: MemoryActiveRecallConfig::default(),
-    };
-
-    assert_eq!(hook.id().as_str(), MEMORY_ACTIVE_RECALL_HOOK_ID);
-    assert_eq!(
-        hook.supported_phases(),
-        vec![HookPhase::TurnPostPreflightPromptContext]
-    );
-    let capabilities = hook.capabilities();
-    assert!(
-        capabilities.contains(&HookCapability::new("memory").expect("static capability is valid"))
-    );
-    assert!(capabilities.contains(
-        &HookCapability::new("read_domain_context").expect("static capability is valid")
-    ));
-    assert!(capabilities.contains(
-        &HookCapability::new("contribute_prompt_context").expect("static capability is valid")
-    ));
-    assert!(!capabilities.contains(
-        &HookCapability::new("contribute_prompt_section").expect("static capability is valid")
-    ));
-    assert!(!capabilities.contains(
-        &HookCapability::new("contribute_tool_bundle").expect("static capability is valid")
-    ));
-    assert!(!capabilities.contains(
-        &HookCapability::new("write_domain_context").expect("static capability is valid")
-    ));
-    assert!(
-        !capabilities
-            .contains(&HookCapability::new("call_tools").expect("static capability is valid"))
-    );
-    assert!(
-        !capabilities
-            .contains(&HookCapability::new("call_provider").expect("static capability is valid"))
-    );
+        assert_eq!(hook.id().as_str(), hook_id);
+        assert_eq!(hook.supported_phases(), vec![phase], "{hook_id}");
+        let capabilities = hook.capabilities();
+        for required in ["memory", "read_domain_context", "contribute_prompt_context"] {
+            assert!(
+                capabilities
+                    .contains(&HookCapability::new(required).expect("static capability is valid")),
+                "{hook_id}: {required}"
+            );
+        }
+        for forbidden in forbidden {
+            assert!(
+                !capabilities.contains(
+                    &HookCapability::new(*forbidden).expect("static capability is valid")
+                ),
+                "{hook_id}: {forbidden}"
+            );
+        }
+    }
 }
 
 #[test]

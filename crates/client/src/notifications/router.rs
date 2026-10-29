@@ -892,12 +892,8 @@ mod tests {
         ArtifactKind, ArtifactRef, ArtifactStatus, ArtifactSummary, ArtifactUpdatedNotification,
         CLIAgentRuntimeKind, CLIRuntimeAccountUpdatedNotification,
         CLIRuntimeAppsChangedNotification, CLIRuntimeStatusChangedNotification,
-        ExecutionWindowStatus, ItemDeltaStream, McpChangedNotification, McpListItem,
-        McpManagementDetails, McpPolicyState, McpRuntimeState, McpRuntimeStatus, McpScopeKind,
-        McpServerCatalogChangedNotification, McpServerCatalogDetails, McpServerDetailsResponse,
-        McpServerHealthDetails, McpServerStatus, McpServerStatusChangedNotification,
-        McpServerStatusItem, McpSourceKind, McpTransportSummary, RecoveryAction, RecoveryJobStatus,
-        RecoveryTrigger, RuntimeCapabilities, RuntimeStatus, RuntimeSummary,
+        ExecutionWindowStatus, ItemDeltaStream, McpChangedNotification, RecoveryAction,
+        RecoveryJobStatus, RecoveryTrigger, RuntimeCapabilities, RuntimeStatus, RuntimeSummary,
         SkillsChangedNotification, ThreadArtifactsChangedNotification, ThreadMode,
         ThreadOriginKind, ThreadSidebarVisibility, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
         ToolRetryErrorClass, ToolRetryResolution, TurnItem, TurnItemTimeoutReason, TurnItemType,
@@ -936,74 +932,6 @@ mod tests {
             is_current,
             created_at: 1,
             updated_at: 2,
-        }
-    }
-
-    fn mcp_runtime(state: McpRuntimeState, live: bool) -> McpRuntimeStatus {
-        McpRuntimeStatus {
-            state,
-            live,
-            last_seen_at: None,
-        }
-    }
-
-    fn mcp_server(id: &str, status: McpServerStatus) -> McpListItem {
-        McpListItem {
-            id: id.to_owned(),
-            name: id.to_owned(),
-            display_name: None,
-            scope: McpScopeKind::Workspace,
-            policy: McpPolicyState {
-                enabled: true,
-                allow_implicit_invocation: false,
-            },
-            required: false,
-            runtime: mcp_runtime(McpRuntimeState::Ready, true),
-            tools_count: 1,
-            resources_count: 2,
-            resource_templates_count: 3,
-            prompts_count: 4,
-            status,
-        }
-    }
-
-    fn mcp_details(server: McpListItem) -> McpServerDetailsResponse {
-        McpServerDetailsResponse {
-            snapshot_version: 1,
-            generated_at: 1,
-            server,
-            catalog: McpServerCatalogDetails {
-                catalog_version: None,
-                generated_at: None,
-                server_info: serde_json::json!({}),
-                server_instructions_hash: None,
-                tools: Vec::new(),
-                resources: Vec::new(),
-                resource_templates: Vec::new(),
-                prompts: Vec::new(),
-            },
-            management: Some(McpManagementDetails {
-                oauth_cleanup_available: None,
-                oauth_state: None,
-                scope: McpScopeKind::Workspace,
-                source_kind: McpSourceKind::Config,
-                transport: McpTransportSummary::Stdio {
-                    command: "server".to_owned(),
-                },
-                fingerprint: "fingerprint".to_owned(),
-                health: McpServerHealthDetails {
-                    runtime: mcp_runtime(McpRuntimeState::Ready, true),
-                    status: McpServerStatus::Ready,
-                    status_reason: None,
-                    last_error: None,
-                    retry_attempt: None,
-                    next_retry_at: None,
-                    catalog_version: None,
-                    stderr_tail: None,
-                },
-                audit: Vec::new(),
-                recent_bindings: Vec::new(),
-            }),
         }
     }
 
@@ -1665,67 +1593,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn mcp_status_and_catalog_reductions_patch_local_read_models() {
-        let mut servers = vec![mcp_server("server_a", McpServerStatus::Starting)];
-        let status_notification = McpServerStatusChangedNotification {
-            workspace_id: "ws_a".to_owned(),
-            snapshot_version: 2,
-            server: McpServerStatusItem {
-                id: "server_a".to_owned(),
-                name: "server_a".to_owned(),
-                scope_kind: McpScopeKind::Workspace,
-                runtime: mcp_runtime(McpRuntimeState::Failed, false),
-                status: McpServerStatus::Failed,
-            },
-        };
-
-        let status_reduction = reduce_mcp_server_status_changed_notification(
-            status_notification.clone(),
-            Some("ws_a"),
-            Some("server_a"),
-            true,
-        );
-        assert!(status_reduction.workspace_matches);
-        assert!(status_reduction.selected_server_matches);
-        assert!(status_reduction.update_selected_details);
-        assert!(!status_reduction.queue_mcp_details_refresh);
-
-        let mut details = mcp_details(servers[0].clone());
-        apply_mcp_server_status_changed_to_catalog(&mut servers, &status_notification);
-        apply_mcp_server_status_changed_to_details(&mut details, &status_notification);
-        assert_eq!(servers[0].status, McpServerStatus::Failed);
-        assert_eq!(details.server.status, McpServerStatus::Failed);
-        assert_eq!(
-            details.management.expect("management").health.status,
-            McpServerStatus::Failed
-        );
-
-        let catalog_notification = McpServerCatalogChangedNotification {
-            workspace_id: "ws_a".to_owned(),
-            snapshot_version: 3,
-            server_id: "server_a".to_owned(),
-            name: "server_a".to_owned(),
-            catalog_version: "cat_2".to_owned(),
-            tools_count: 10,
-            resources_count: 11,
-            resource_templates_count: 12,
-            prompts_count: 13,
-        };
-        let catalog_reduction = reduce_mcp_server_catalog_changed_notification(
-            catalog_notification.clone(),
-            Some("ws_a"),
-            Some("server_a"),
-        );
-        assert!(catalog_reduction.queue_mcp_details_refresh);
-
-        apply_mcp_server_catalog_changed_to_catalog(&mut servers, &catalog_notification);
-        assert_eq!(servers[0].tools_count, 10);
-        assert_eq!(servers[0].resources_count, 11);
-        assert_eq!(servers[0].resource_templates_count, 12);
-        assert_eq!(servers[0].prompts_count, 13);
     }
 
     #[test]

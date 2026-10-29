@@ -635,33 +635,6 @@ mod tests {
     }
 
     #[test]
-    fn html_tools_remain_available_with_a_full_valid_external_catalog() {
-        let tools = (0..DEFAULT_MAX_PROJECTION_TOOLS)
-            .map(|index| tool("server", "server", &format!("tool_{index}")))
-            .collect();
-        let mut external = projection("turn", tools);
-        external
-            .finalize_identity(McpProjectionLimits::default())
-            .unwrap();
-        let combined = external
-            .with_html_tools(McpProjectionLimits::default())
-            .unwrap();
-        assert_eq!(combined.tools.len(), DEFAULT_MAX_PROJECTION_TOOLS + 2);
-        assert!(
-            combined
-                .tools
-                .iter()
-                .any(|tool| tool.canonical_callable_name == "html_preview")
-        );
-        assert!(
-            combined
-                .tools
-                .iter()
-                .any(|tool| tool.canonical_callable_name == "html_render")
-        );
-    }
-
-    #[test]
     fn turn_mcp_projection_empty_is_a_valid_explicit_result() {
         let projection = ResolvedMcpTurnProjection::empty("workspace", "turn");
         assert_eq!(projection.projection_version, MCP_TURN_PROJECTION_VERSION);

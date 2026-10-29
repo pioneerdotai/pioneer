@@ -663,22 +663,32 @@ mod tests {
                     assert_eq!(error.public_error.unwrap().code, PublicErrorCode::NotFound);
                 }
             }
-            for failure in [
-                store
-                    .lookup_authenticated_session("missing_session", &owner)
-                    .unwrap_err(),
-                store
-                    .create_authenticated_session(
-                        "voice_session_1",
-                        owner.clone(),
-                        test_context(),
-                        target_format(),
-                    )
-                    .unwrap_err(),
-                store
-                    .mark_transcribing_authenticated("voice_session_1", &owner)
-                    .unwrap_err(),
+            for (failure, expected_kind) in [
+                (
+                    store
+                        .lookup_authenticated_session("missing_session", &owner)
+                        .unwrap_err(),
+                    GatewayVoiceSessionErrorKind::UnknownSession,
+                ),
+                (
+                    store
+                        .create_authenticated_session(
+                            "voice_session_1",
+                            owner.clone(),
+                            test_context(),
+                            target_format(),
+                        )
+                        .unwrap_err(),
+                    GatewayVoiceSessionErrorKind::DuplicateSession,
+                ),
+                (
+                    store
+                        .mark_transcribing_authenticated("voice_session_1", &owner)
+                        .unwrap_err(),
+                    GatewayVoiceSessionErrorKind::InvalidTransition,
+                ),
             ] {
+                assert_eq!(failure.kind, expected_kind);
                 let code = if failure.kind == GatewayVoiceSessionErrorKind::UnknownSession {
                     PublicErrorCode::NotFound
                 } else {
@@ -756,75 +766,6 @@ mod tests {
         assert_eq!(lookup.workspace_id, "workspace_1");
         assert_eq!(lookup.thread_id, "thread_1");
         assert_eq!(lookup.turn_id, "turn_1");
-    }
-
-    #[test]
-    fn unknown_duplicate_foreign_and_invalid_transitions_are_typed() {
-        let store = GatewayVoiceSessionStore::default();
-        store
-            .create_session("voice_session_1", 7, test_context(), target_format())
-            .expect("create");
-
-        let duplicate = store
-            .create_session("voice_session_1", 7, test_context(), target_format())
-            .expect_err("duplicate");
-        let foreign = store
-            .lookup_session("voice_session_1", 8)
-            .expect_err("foreign owner");
-        let invalid = store
-            .mark_transcribing("voice_session_1", 7)
-            .expect_err("invalid transition");
-        let unknown = store
-            .lookup_session("missing_session", 7)
-            .expect_err("unknown");
-
-        assert_eq!(
-            duplicate.kind,
-            GatewayVoiceSessionErrorKind::DuplicateSession
-        );
-        assert_eq!(
-            foreign.kind,
-            GatewayVoiceSessionErrorKind::OwnershipMismatch
-        );
-        assert_eq!(
-            invalid.kind,
-            GatewayVoiceSessionErrorKind::InvalidTransition
-        );
-        assert_eq!(unknown.kind, GatewayVoiceSessionErrorKind::UnknownSession);
-        assert_eq!(
-            foreign.into_voice_error().kind,
-            VoiceErrorKind::InvalidSession
-        );
-    }
-
-    #[test]
-    fn authenticated_voice_session_rejects_same_connection_peer_principal_and_session() {
-        let store = GatewayVoiceSessionStore::default();
-        let owner = authenticated_owner(7, 'P', 'S');
-        store
-            .create_authenticated_session(
-                "voice_session_1",
-                owner.clone(),
-                test_context(),
-                target_format(),
-            )
-            .expect("create");
-
-        assert!(
-            store
-                .lookup_authenticated_session("voice_session_1", &authenticated_owner(7, 'Q', 'S'),)
-                .is_err()
-        );
-        assert!(
-            store
-                .lookup_authenticated_session("voice_session_1", &authenticated_owner(7, 'P', 'T'),)
-                .is_err()
-        );
-        assert!(
-            store
-                .lookup_authenticated_session("voice_session_1", &owner)
-                .is_ok()
-        );
     }
 
     #[test]

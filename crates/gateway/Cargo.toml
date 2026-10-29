@@ -79,7 +79,7 @@ hmac.workspace = true
 ring = "0.17.14"
 image.workspace = true
 fs4.workspace = true
-transcribe-rs.workspace = true
+transcribe-rs = { workspace = true, features = ["vad-silero"] }
 uuid.workspace = true
 zeroize.workspace = true
 tempfile.workspace = true

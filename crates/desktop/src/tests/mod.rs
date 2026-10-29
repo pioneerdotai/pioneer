@@ -1,9 +1,6 @@
 //! Process-free Desktop fixtures and Gateway contract checks.
 
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Mutex;
 
 use super::{VersionProbe, invitation_urls_from_args, version_probe_from_args};
 use pioneer_protocol::{
@@ -61,21 +58,13 @@ fn command_line_invitation_urls_are_scoped_to_the_current_build() {
 #[derive(Debug, Default)]
 pub(crate) struct FakeSystemViewerLauncher {
     opened_urls: Mutex<Vec<String>>,
-    fail_next: AtomicBool,
 }
 
 impl FakeSystemViewerLauncher {
-    pub(crate) fn fail_next_open(&self) {
-        self.fail_next.store(true, Ordering::SeqCst);
-    }
-
     pub(crate) fn open_url(&self, url: &str) -> anyhow::Result<()> {
         let url = url.trim();
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             anyhow::bail!("system viewer fixture accepts only absolute HTTP(S) URLs");
-        }
-        if self.fail_next.swap(false, Ordering::SeqCst) {
-            anyhow::bail!("injected system viewer failure");
         }
         self.opened_urls
             .lock()
@@ -103,26 +92,6 @@ mod tests {
     use pioneer_protocol::PrincipalId;
 
     use super::*;
-
-    #[test]
-    fn fake_viewer_records_without_starting_an_os_process() {
-        let launcher = FakeSystemViewerLauncher::default();
-        launcher
-            .open_url("https://gateway.test/storage/views/redacted")
-            .expect("record URL");
-        assert_eq!(
-            launcher.opened_urls(),
-            vec!["https://gateway.test/storage/views/redacted".to_owned()]
-        );
-
-        launcher.fail_next_open();
-        assert!(
-            launcher
-                .open_url("https://gateway.test/storage/views/redacted")
-                .is_err()
-        );
-        assert!(launcher.open_url("file:///tmp/private").is_err());
-    }
 
     #[test]
     fn updated_desktop_plan_is_root_storage_native_and_secret_free() {

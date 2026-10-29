@@ -463,26 +463,73 @@ mod tests {
 
     #[test]
     fn plan_rejects_wrong_schema() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let asset_path = write_asset(temp_dir.path(), b"asset");
-        let mut plan = valid_plan(asset_path.clone(), sha256_file(&asset_path).unwrap());
-        plan.schema_version = PLAN_SCHEMA_VERSION + 1;
+        type InvalidPlanCase = (
+            &'static str,
+            fn(&mut DesktopUpdatePlan),
+            PlanValidationErrorCode,
+        );
+        let cases: [InvalidPlanCase; 10] = [
+            (
+                "plan_rejects_wrong_schema",
+                |plan| plan.schema_version = PLAN_SCHEMA_VERSION + 1,
+                PlanValidationErrorCode::WrongSchema,
+            ),
+            (
+                "plan_rejects_wrong_product",
+                |plan| plan.product = "other".to_owned(),
+                PlanValidationErrorCode::WrongProduct,
+            ),
+            (
+                "plan_rejects_invalid_versions",
+                |plan| plan.target_version = "not-a-version".to_owned(),
+                PlanValidationErrorCode::InvalidVersion,
+            ),
+            (
+                "plan_rejects_non_upgrade_version",
+                |plan| plan.target_version = plan.current_version.clone(),
+                PlanValidationErrorCode::NonUpgradeVersion,
+            ),
+            (
+                "plan_rejects_wrong_os",
+                |plan| plan.os = other_os(),
+                PlanValidationErrorCode::WrongOs,
+            ),
+            (
+                "plan_rejects_wrong_arch",
+                |plan| plan.arch = other_arch(),
+                PlanValidationErrorCode::WrongArch,
+            ),
+            (
+                "plan_rejects_wrong_asset_kind",
+                |plan| plan.asset_kind = "unexpected_kind".to_owned(),
+                PlanValidationErrorCode::WrongAssetKind,
+            ),
+            (
+                "plan_rejects_relative_asset_path",
+                |plan| plan.asset_path = PathBuf::from("asset.bin"),
+                PlanValidationErrorCode::UnsafePath,
+            ),
+            (
+                "plan_rejects_asset_name_that_escapes_cache_root",
+                |plan| plan.asset_name = "../asset.bin".to_owned(),
+                PlanValidationErrorCode::UnsafePath,
+            ),
+            (
+                "plan_rejects_invalid_sha",
+                |plan| plan.asset_sha256 = "not-a-sha256".to_owned(),
+                PlanValidationErrorCode::InvalidSha256,
+            ),
+        ];
+        for (case, invalidate, expected) in cases {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let asset_path = write_asset(temp_dir.path(), b"asset");
+            let mut plan = valid_plan(asset_path.clone(), sha256_file(&asset_path).unwrap());
+            invalidate(&mut plan);
 
-        let error = validate_plan(plan).unwrap_err();
+            let error = validate_plan(plan).unwrap_err();
 
-        assert_eq!(error.code(), PlanValidationErrorCode::WrongSchema);
-    }
-
-    #[test]
-    fn plan_rejects_wrong_product() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let asset_path = write_asset(temp_dir.path(), b"asset");
-        let mut plan = valid_plan(asset_path.clone(), sha256_file(&asset_path).unwrap());
-        plan.product = "other".to_owned();
-
-        let error = validate_plan(plan).unwrap_err();
-
-        assert_eq!(error.code(), PlanValidationErrorCode::WrongProduct);
+            assert_eq!(error.code(), expected, "{case}");
+        }
     }
 
     #[test]
@@ -499,78 +546,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_rejects_invalid_versions() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let asset_path = write_asset(temp_dir.path(), b"asset");
-        let mut plan = valid_plan(asset_path.clone(), sha256_file(&asset_path).unwrap());
-        plan.target_version = "not-a-version".to_owned();
-
-        let error = validate_plan(plan).unwrap_err();
-
-        assert_eq!(error.code(), PlanValidationErrorCode::InvalidVersion);
-    }
-
-    #[test]
-    fn plan_rejects_non_upgrade_version() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let asset_path = write_asset(temp_dir.path(), b"asset");
-        let mut plan = valid_plan(asset_path.clone(), sha256_file(&asset_path).unwrap());
-        plan.target_version = plan.current_version.clone();
-
-        let error = validate_plan(plan).unwrap_err();
-
-        assert_eq!(error.code(), PlanValidationErrorCode::NonUpgradeVersion);
-    }
-
-    #[test]
-    fn plan_rejects_wrong_os() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let asset_path = write_asset(temp_dir.path(), b"asset");
-        let mut plan = valid_plan(asset_path.clone(), sha256_file(&asset_path).unwrap());
-        plan.os = other_os();
-
-        let error = validate_plan(plan).unwrap_err();
-
-        assert_eq!(error.code(), PlanValidationErrorCode::WrongOs);
-    }
-
-    #[test]
-    fn plan_rejects_wrong_arch() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let asset_path = write_asset(temp_dir.path(), b"asset");
-        let mut plan = valid_plan(asset_path.clone(), sha256_file(&asset_path).unwrap());
-        plan.arch = other_arch();
-
-        let error = validate_plan(plan).unwrap_err();
-
-        assert_eq!(error.code(), PlanValidationErrorCode::WrongArch);
-    }
-
-    #[test]
-    fn plan_rejects_wrong_asset_kind() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let asset_path = write_asset(temp_dir.path(), b"asset");
-        let mut plan = valid_plan(asset_path.clone(), sha256_file(&asset_path).unwrap());
-        plan.asset_kind = "unexpected_kind".to_owned();
-
-        let error = validate_plan(plan).unwrap_err();
-
-        assert_eq!(error.code(), PlanValidationErrorCode::WrongAssetKind);
-    }
-
-    #[test]
-    fn plan_rejects_relative_asset_path() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let asset_path = write_asset(temp_dir.path(), b"asset");
-        let mut plan = valid_plan(asset_path.clone(), sha256_file(&asset_path).unwrap());
-        plan.asset_path = PathBuf::from("asset.bin");
-
-        let error = validate_plan(plan).unwrap_err();
-
-        assert_eq!(error.code(), PlanValidationErrorCode::UnsafePath);
-    }
-
-    #[test]
     fn plan_rejects_partial_asset_path() {
         let temp_dir = tempfile::tempdir().unwrap();
         let asset_path = temp_dir.path().join("asset.bin.part");
@@ -580,29 +555,6 @@ mod tests {
         let error = validate_plan(plan).unwrap_err();
 
         assert_eq!(error.code(), PlanValidationErrorCode::UnsafePath);
-    }
-
-    #[test]
-    fn plan_rejects_asset_name_that_escapes_cache_root() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let asset_path = write_asset(temp_dir.path(), b"asset");
-        let mut plan = valid_plan(asset_path.clone(), sha256_file(&asset_path).unwrap());
-        plan.asset_name = "../asset.bin".to_owned();
-
-        let error = validate_plan(plan).unwrap_err();
-
-        assert_eq!(error.code(), PlanValidationErrorCode::UnsafePath);
-    }
-
-    #[test]
-    fn plan_rejects_invalid_sha() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let asset_path = write_asset(temp_dir.path(), b"asset");
-        let plan = valid_plan(asset_path, "not-a-sha256".to_owned());
-
-        let error = validate_plan(plan).unwrap_err();
-
-        assert_eq!(error.code(), PlanValidationErrorCode::InvalidSha256);
     }
 
     #[test]

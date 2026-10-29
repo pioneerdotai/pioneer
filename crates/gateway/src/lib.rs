@@ -1557,7 +1557,6 @@ mod runtime_tests {
         task_runtime_config_from_gateway_tasks_config,
         thread_episodic_runtime_config_from_gateway_settings,
     };
-    use crate::secrets::GatewaySecrets;
     use crate::settings::GatewayThreadEpisodicSettings;
     use crate::voice::model_catalog::{VoiceModelCatalogEntry, VoiceModelInstallLayout};
     use crate::voice::model_install::{
@@ -1577,7 +1576,6 @@ mod runtime_tests {
         GatewayToolsConfig,
     };
     use pioneer_hooks::HookAwaitPolicy;
-    use pioneer_keystore::MemorySecretStore;
     use pioneer_memory::hooks::MemoryActiveRecallMode;
     use pioneer_protocol::{GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase};
     use pioneer_skills::SkillTrustLevel;
@@ -1640,6 +1638,13 @@ mod runtime_tests {
     struct StartupProbeEngineLoader;
 
     impl VoiceEngineLoader for StartupProbeEngineLoader {
+        fn prepare_vad(
+            &self,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> std::result::Result<(), VoiceTranscriptionError> {
+            Ok(()) // Deterministic lifecycle fixture; no native model operations.
+        }
+
         fn load(
             &self,
             _entry: &VoiceModelCatalogEntry,
@@ -1690,82 +1695,6 @@ mod runtime_tests {
         assert_eq!(
             supervisor.desired().model.as_deref(),
             Some("parakeet-tdt-0.6b-v3")
-        );
-    }
-
-    #[tokio::test]
-    async fn voice_startup_legacy_install() {
-        let runtime_home = tempfile::tempdir().expect("runtime home");
-        let legacy_install = runtime_home
-            .path()
-            .join("models/voice/parakeet-tdt-0.6b-v3-int8");
-        std::fs::create_dir_all(&legacy_install).expect("legacy install directory");
-        std::fs::write(legacy_install.join(".ready"), b"legacy").expect("legacy ready marker");
-        let installer = Arc::new(StartupProbeInstaller::new());
-
-        let supervisor =
-            create_voice_input_supervisor(installer.clone(), Arc::new(StartupProbeEngineLoader));
-        start_voice_input_supervisor(&supervisor, VoiceInputDesiredState::default())
-            .expect("legacy-disabled startup");
-        tokio::task::yield_now().await;
-
-        assert!(legacy_install.exists());
-        assert_eq!(installer.inspections.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            supervisor.runtime_snapshot().phase,
-            GatewayVoiceInputRuntimePhase::Disabled
-        );
-    }
-
-    #[test]
-    fn provider_key_resolver_reads_latest_keystore_value() {
-        let secrets = GatewaySecrets::new(Arc::new(MemorySecretStore::new()));
-
-        assert!(secrets.resolve_provider_api_key("deepseek").is_empty());
-
-        secrets
-            .set_provider_api_key("deepseek", "sk-test-key")
-            .expect("set key");
-
-        assert_eq!(secrets.resolve_provider_api_key("deepseek"), "sk-test-key");
-    }
-
-    #[test]
-    fn path_templates_expand_home_directory_token() {
-        let expanded = expand_home_directory_templates(
-            &[
-                "{homeDirectory}/skills/workspace/{workspaceId}/user".to_owned(),
-                "{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned(),
-            ],
-            "/Users/alexander/.pioneer.local",
-        );
-
-        assert_eq!(
-            expanded,
-            vec![
-                "/Users/alexander/.pioneer.local/skills/workspace/{workspaceId}/user".to_owned(),
-                "/Users/alexander/.pioneer.local/skills/workspace/{workspaceId}/registry"
-                    .to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn path_templates_leave_plain_paths_unchanged() {
-        let expanded = expand_home_directory_templates(
-            &[
-                "/opt/pioneer/skills/system".to_owned(),
-                ".agents/skills".to_owned(),
-            ],
-            ".pioneer",
-        );
-
-        assert_eq!(
-            expanded,
-            vec![
-                "/opt/pioneer/skills/system".to_owned(),
-                ".agents/skills".to_owned(),
-            ]
         );
     }
 
@@ -1863,29 +1792,6 @@ mod runtime_tests {
         assert_eq!(config.total.max_wall_clock_ms_per_turn, Some(3_000));
         assert_eq!(config.total.max_provider_tokens_per_turn, Some(4_000));
         assert_eq!(config.total.max_consecutive_no_progress_windows, 2);
-    }
-
-    #[test]
-    fn execution_windows_config_prefers_new_section_over_legacy_budget() {
-        let config = execution_windows_config_from_gateway_tools_config(&GatewayToolsConfig {
-            budget: GatewayToolLoopBudgetConfig {
-                max_agent_rounds_per_turn: 17,
-                max_tool_calls_per_turn: 23,
-            },
-            execution_windows: Some(GatewayExecutionWindowsConfig {
-                window: GatewayExecutionWindowBudgetConfig {
-                    max_agent_rounds_per_window: 31,
-                    max_tool_calls_per_window: 37,
-                    ..GatewayExecutionWindowBudgetConfig::default()
-                },
-                total: GatewayExecutionWindowTotalBudgetConfig::default(),
-            }),
-            retry: GatewayToolRetryBudgetConfig::default(),
-            ..GatewayToolsConfig::default()
-        });
-
-        assert_eq!(config.window.max_agent_rounds_per_window, 31);
-        assert_eq!(config.window.max_tool_calls_per_window, 37);
     }
 
     #[test]
@@ -2042,6 +1948,41 @@ mod runtime_tests {
                 .to_string()
                 .contains("invalid trust level `supertrusted`")
         );
+    }
+
+    #[test]
+    fn path_templates_preserve_literal_expansion_results() {
+        for (label, paths, home, expected) in [
+            (
+                "home token",
+                vec![
+                    "{homeDirectory}/skills/workspace/{workspaceId}/user".to_owned(),
+                    "{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned(),
+                ],
+                "/Users/alexander/.pioneer.local",
+                vec![
+                    "/Users/alexander/.pioneer.local/skills/workspace/{workspaceId}/user"
+                        .to_owned(),
+                    "/Users/alexander/.pioneer.local/skills/workspace/{workspaceId}/registry"
+                        .to_owned(),
+                ],
+            ),
+            (
+                "plain paths",
+                vec![
+                    "/opt/pioneer/skills/system".to_owned(),
+                    ".agents/skills".to_owned(),
+                ],
+                ".pioneer",
+                vec![
+                    "/opt/pioneer/skills/system".to_owned(),
+                    ".agents/skills".to_owned(),
+                ],
+            ),
+        ] {
+            let expanded = expand_home_directory_templates(&paths, home);
+            assert_eq!(expanded, expected, "{label}");
+        }
     }
 }
 

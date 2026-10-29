@@ -206,7 +206,7 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
         &processor.native_terminal_effect_kick_running
     } else {
         processor.kick_native_turn_event_deliveries();
-        &processor.native_turn_event_delivery_kick_running
+        &processor.native_turn_event_delivery_workers.live.running
     };
     timeout(Duration::from_secs(10), async {
         loop {
@@ -249,7 +249,13 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
     observer.reads.lock().unwrap().clear();
     drop(held);
     timeout(Duration::from_secs(10), async {
-        while running.load(Ordering::Acquire) {
+        while running.load(Ordering::Acquire)
+            || (!terminal_effects
+                && !processor
+                    .native_turn_event_delivery_workers
+                    .tasks
+                    .is_empty())
+        {
             sleep(Duration::from_millis(10)).await;
         }
     })
@@ -354,8 +360,8 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
             .bind_hub(hub),
     );
     let mut events = Vec::new();
-    // End-of-pass neighboring events provide a completion marker for each real
-    // worker. Advance Tokio's clock only after both reached their existing sleep.
+    // Existing replay/lifecycle errors mark successive real recovery passes.
+    // Delivery now runs in the independent, coalesced consumer owners.
     for pass in 1..=3 {
         let mut completed = false;
         for _ in 0..1024 {
@@ -364,8 +370,7 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
             let projection_passes = events
                 .iter()
                 .filter(|event| {
-                    event.message.as_deref()
-                        == Some("native turn-event optional delivery worker failed")
+                    event.message.as_deref() == Some("turn event projection replay failed")
                 })
                 .count();
             let lifecycle_passes = events
@@ -390,6 +395,7 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
     lifecycle.abort();
     let _ = projection.await;
     let _ = lifecycle.await;
+    processor.shutdown_resilience_workers().await;
     events.extend(transport.fetch_and_clear_events());
     let diagnostics: Vec<_> = events
         .iter()

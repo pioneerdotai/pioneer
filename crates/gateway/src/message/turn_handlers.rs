@@ -13285,126 +13285,6 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_validation_rejects_missing_or_unknown_metadata() {
-        let missing =
-            validate_reasoning_effort_for_model("provider `openai`", "unknown-model", "high", None)
-                .expect_err("missing model metadata should reject selected effort");
-        assert!(missing.contains("metadata is unavailable"));
-
-        let model_without_reasoning = reasoning_test_model(None);
-        let absent = validate_reasoning_effort_for_model(
-            "provider `openai`",
-            "model-a",
-            "high",
-            Some(&model_without_reasoning),
-        )
-        .expect_err("missing reasoning capability should reject selected effort");
-        assert!(absent.contains("reasoning capability metadata is missing"));
-
-        let model_without_efforts =
-            reasoning_test_model(Some(reasoning_capabilities(Some(true), &[])));
-        let unknown = validate_reasoning_effort_for_model(
-            "provider `openai`",
-            "model-a",
-            "high",
-            Some(&model_without_efforts),
-        )
-        .expect_err("empty effort list should reject selected effort");
-        assert!(unknown.contains("supported reasoning efforts are unknown"));
-    }
-
-    #[test]
-    fn reasoning_effort_validation_rejects_unsupported_model_or_value() {
-        let unsupported_model =
-            reasoning_test_model(Some(reasoning_capabilities(Some(false), &["low", "high"])));
-        let error = validate_reasoning_effort_for_model(
-            "provider `openai`",
-            "model-a",
-            "high",
-            Some(&unsupported_model),
-        )
-        .expect_err("unsupported model should reject selected effort");
-        assert!(error.contains("is not supported"));
-
-        let unsupported_value =
-            reasoning_test_model(Some(reasoning_capabilities(Some(true), &["low", "medium"])));
-        let error = validate_reasoning_effort_for_model(
-            "provider `openai`",
-            "model-a",
-            "high",
-            Some(&unsupported_value),
-        )
-        .expect_err("unsupported value should reject selected effort");
-        assert!(error.contains("supported efforts: low, medium"));
-    }
-
-    #[test]
-    fn reasoning_effort_validation_error_includes_debuggable_context() {
-        let model =
-            reasoning_test_model(Some(reasoning_capabilities(Some(true), &["low", "medium"])));
-
-        let error = validate_reasoning_effort_for_model(
-            "provider `openai`",
-            "model-a",
-            "high",
-            Some(&model),
-        )
-        .expect_err("unsupported value should reject selected effort");
-
-        assert_eq!(
-            error,
-            "reasoning effort `high` is not supported by provider `openai` model `model-a`; supported efforts: low, medium; capability source: static_registry"
-        );
-    }
-
-    #[test]
-    fn reasoning_effort_validation_accepts_known_effort() {
-        let model = reasoning_test_model(Some(reasoning_capabilities(
-            Some(true),
-            &["low", "medium", "high"],
-        )));
-
-        validate_reasoning_effort_for_model("provider `openai`", "model-a", "medium", Some(&model))
-            .expect("known effort should pass validation");
-    }
-
-    #[test]
-    fn reasoning_effort_validation_accepts_known_aliases() {
-        let model = reasoning_test_model(Some(reasoning_capabilities(
-            Some(true),
-            &["low", "extra-high", "maximum"],
-        )));
-
-        validate_reasoning_effort_for_model("provider `openai`", "model-a", "xhigh", Some(&model))
-            .expect("canonical effort should match provider alias");
-        validate_reasoning_effort_for_model("provider `openai`", "model-a", "max", Some(&model))
-            .expect("canonical max should match provider alias");
-    }
-
-    #[test]
-    fn reasoning_effort_validation_rejects_unknown_provider_effort_values() {
-        let model = reasoning_test_model(Some(reasoning_capabilities(
-            Some(true),
-            &["low", "turbo-high"],
-        )));
-
-        validate_reasoning_effort_for_model("provider `openai`", "model-a", "low", Some(&model))
-            .expect("known effort should pass validation");
-        let error = validate_reasoning_effort_for_model(
-            "provider `openai`",
-            "model-a",
-            "turbo-high",
-            Some(&model),
-        )
-        .expect_err("unknown effort should be rejected even if metadata reports it");
-
-        assert_eq!(
-            error,
-            "reasoning effort `turbo-high` is not recognized by Pioneer for provider `openai` model `model-a`"
-        );
-    }
-
-    #[test]
     fn cli_reasoning_effort_validation_accepts_metadata_defined_values() {
         let mut model = reasoning_test_model(Some(reasoning_capabilities(
             Some(true),
@@ -13444,30 +13324,6 @@ mod tests {
         .expect_err("API providers require an implemented Pioneer effort mapping");
 
         assert!(error.contains("is not recognized by Pioneer"));
-    }
-
-    #[test]
-    fn reasoning_effort_validation_rejects_none_for_mandatory_reasoning() {
-        let mut model = reasoning_test_model(Some(reasoning_capabilities(
-            Some(true),
-            &["none", "low", "medium"],
-        )));
-        model
-            .capabilities
-            .reasoning
-            .as_mut()
-            .expect("reasoning capabilities")
-            .mandatory = Some(true);
-
-        let error = validate_reasoning_effort_for_model(
-            "provider `openrouter`",
-            "model-a",
-            "none",
-            Some(&model),
-        )
-        .expect_err("mandatory reasoning should reject none");
-
-        assert!(error.contains("supported efforts: low, medium"));
     }
 
     #[test]
@@ -13538,5 +13394,146 @@ mod tests {
                 .and_then(|reasoning| reasoning.supported),
             Some(true)
         );
+    }
+
+    #[test]
+    fn reasoning_validation_reports_missing_unsupported_and_mandatory_metadata() {
+        let mut mandatory = reasoning_test_model(Some(reasoning_capabilities(
+            Some(true),
+            &["none", "low", "medium"],
+        )));
+        mandatory
+            .capabilities
+            .reasoning
+            .as_mut()
+            .expect("reasoning capabilities")
+            .mandatory = Some(true);
+        for (backend, model_id, effort, model, message, expected) in [
+            (
+                "provider `openai`",
+                "unknown-model",
+                "high",
+                None,
+                "missing model metadata should reject selected effort",
+                "metadata is unavailable",
+            ),
+            (
+                "provider `openai`",
+                "model-a",
+                "high",
+                Some(reasoning_test_model(None)),
+                "missing reasoning capability should reject selected effort",
+                "reasoning capability metadata is missing",
+            ),
+            (
+                "provider `openai`",
+                "model-a",
+                "high",
+                Some(reasoning_test_model(Some(reasoning_capabilities(
+                    Some(true),
+                    &[],
+                )))),
+                "empty effort list should reject selected effort",
+                "supported reasoning efforts are unknown",
+            ),
+            (
+                "provider `openai`",
+                "model-a",
+                "high",
+                Some(reasoning_test_model(Some(reasoning_capabilities(
+                    Some(false),
+                    &["low", "high"],
+                )))),
+                "unsupported model should reject selected effort",
+                "is not supported",
+            ),
+            (
+                "provider `openai`",
+                "model-a",
+                "high",
+                Some(reasoning_test_model(Some(reasoning_capabilities(
+                    Some(true),
+                    &["low", "medium"],
+                )))),
+                "unsupported value should reject selected effort",
+                "supported efforts: low, medium",
+            ),
+            (
+                "provider `openrouter`",
+                "model-a",
+                "none",
+                Some(mandatory),
+                "mandatory reasoning should reject none",
+                "supported efforts: low, medium",
+            ),
+        ] {
+            let error =
+                validate_reasoning_effort_for_model(backend, model_id, effort, model.as_ref())
+                    .expect_err(message);
+            assert!(error.contains(expected));
+        }
+    }
+
+    #[test]
+    fn reasoning_validation_keeps_exact_context_and_unknown_effort_errors() {
+        let model = reasoning_test_model(Some(reasoning_capabilities(
+            Some(true),
+            &["low", "turbo-high"],
+        )));
+        validate_reasoning_effort_for_model("provider `openai`", "model-a", "low", Some(&model))
+            .expect("known effort should pass validation");
+        for (model, effort, message, expected) in [
+            (
+                reasoning_test_model(Some(reasoning_capabilities(Some(true), &["low", "medium"]))),
+                "high",
+                "unsupported value should reject selected effort",
+                "reasoning effort `high` is not supported by provider `openai` model `model-a`; supported efforts: low, medium; capability source: static_registry",
+            ),
+            (
+                model,
+                "turbo-high",
+                "unknown effort should be rejected even if metadata reports it",
+                "reasoning effort `turbo-high` is not recognized by Pioneer for provider `openai` model `model-a`",
+            ),
+        ] {
+            let error = validate_reasoning_effort_for_model(
+                "provider `openai`",
+                "model-a",
+                effort,
+                Some(&model),
+            )
+            .expect_err(message);
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
+    fn reasoning_validation_accepts_known_efforts_and_provider_aliases() {
+        for (options, effort, message) in [
+            (
+                &["low", "medium", "high"][..],
+                "medium",
+                "known effort should pass validation",
+            ),
+            (
+                &["low", "extra-high", "maximum"][..],
+                "xhigh",
+                "canonical effort should match provider alias",
+            ),
+            (
+                &["low", "extra-high", "maximum"][..],
+                "max",
+                "canonical max should match provider alias",
+            ),
+        ] {
+            let model = reasoning_test_model(Some(reasoning_capabilities(Some(true), options)));
+            validate_reasoning_effort_for_model(
+                "provider `openai`",
+                "model-a",
+                effort,
+                Some(&model),
+            )
+            .expect(message);
+        }
     }
 }

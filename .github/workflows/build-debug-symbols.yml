@@ -60,6 +60,42 @@ jobs:
               'x86_64-pc-windows-msvc': 'windows-latest',
               'aarch64-pc-windows-msvc': 'windows-11-arm',
             };
+            // New producers retain link inputs before signing and publish compact
+            // packaged mappings separately. Pick one latest completed mapping per
+            // target/variant; its copied inputs.json selects the EXACT compiler attempt.
+            const mappingPrefix = 'symbol-mapping-';
+            if (artifacts.some(row => row.name.startsWith(mappingPrefix))) {
+              if (products.length !== 2) throw new Error('Unexpected split-input producer');
+              const include = [];
+              const roles = Object.keys(platforms).flatMap(target => [
+                {target, product: 'gateway', variant: 'default'},
+                {target, product: 'gateway', variant: 'computer-use'},
+                {target, product: 'desktop', variant: ''}]);
+              for (const role of roles) {
+                const base = `${role.product}-${role.target}${role.variant ? '-' + role.variant : ''}`;
+                const prefix = `symbol-mapping-${base}-run-${run.id}-attempt-`;
+                const matches = artifacts.filter(row => row.name.startsWith(prefix)).map(row => {
+                  const suffix = row.name.slice(prefix.length);
+                  if (!/^[1-9][0-9]*$/.test(suffix)) throw new Error('Malformed symbol mapping attempt');
+                  return {...row, attempt: Number(suffix)};
+                }).filter(row => row.attempt <= run.run_attempt).sort((a,b) => b.attempt - a.attempt);
+                if (!matches.length || matches[0].expired ||
+                    matches.filter(row => row.attempt === matches[0].attempt).length !== 1) {
+                  throw new Error(`Missing, expired or ambiguous packaged mapping: ${base}`);
+                }
+                include.push({mapping_id: matches[0].id, name: `symbol-inputs-${base}`,
+                              target: role.target, os: platforms[role.target], variant: role.variant,
+                              product: role.product});
+              }
+              for (const row of include.filter(row => row.product === 'desktop')) {
+                row.gateway_mapping_id = include.find(peer => peer.product === 'gateway' &&
+                  peer.target === row.target && peer.variant === 'computer-use').mapping_id;
+              }
+              core.setOutput('matrix', JSON.stringify({include}));
+              core.setOutput('count', include.length);
+              core.setOutput('has_macos', include.some(row => row.os.startsWith('macos')));
+              return;
+            }
             const include = [];
             for (const artifact of artifacts) {
               const match = /^symbol-inputs-(desktop|gateway)-(.+?)(?:-(default|computer-use))?$/.exec(artifact.name);
@@ -140,6 +176,7 @@ jobs:
         with:
           python-version: '3.x'
       - name: download-exact-release-inputs
+        if: ${{ !matrix.mapping_id }}
         uses: actions/download-artifact@v7
         with:
           artifact-ids: ${{ matrix.artifact_id }}
@@ -147,6 +184,86 @@ jobs:
           github-token: ${{ github.token }}
           path: symbol-inputs
           merge-multiple: true
+      - name: download-exact-packaged-mapping
+        if: matrix.mapping_id
+        uses: actions/download-artifact@v7
+        with:
+          artifact-ids: ${{ matrix.mapping_id }}
+          run-id: ${{ needs.inputs.outputs.source_run_id }}
+          github-token: ${{ github.token }}
+          path: symbol-mapping
+          merge-multiple: true
+      - name: select-original-compile-artifact
+        if: matrix.mapping_id
+        id: original
+        uses: actions/github-script@v8
+        env:
+          PRODUCT: ${{ matrix.product }}
+        with:
+          script: |
+            const fs = require('fs');
+            const metadata = JSON.parse(fs.readFileSync('symbol-mapping/inputs.json', 'utf8'));
+            const run = process.env.SYMBOL_SOURCE_RUN_ID;
+            const variant = process.env.SYMBOL_VARIANT;
+            if (metadata.commit !== process.env.SYMBOL_SOURCE_SHA || String(metadata.run_id) !== run ||
+                metadata.target !== process.env.SYMBOL_TARGET ||
+                (metadata.variant || '') !== variant || !/^[1-9][0-9]*$/.test(String(metadata.run_attempt))) {
+              throw new Error('Packaged mapping does not bind an exact source/run/target/variant/compiler attempt');
+            }
+            const base = `${process.env.PRODUCT}-${metadata.target}${variant ? '-' + variant : ''}`;
+            const name = `symbol-inputs-${base}-run-${run}-attempt-${metadata.run_attempt}`;
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts,
+              {owner: context.repo.owner, repo: context.repo.repo, run_id: Number(run), per_page: 100});
+            const matches = artifacts.filter(row => row.name === name);
+            if (matches.length !== 1 || matches[0].expired) throw new Error(`Missing original link inputs: ${name}`);
+            core.setOutput('artifact_id', String(matches[0].id));
+      - name: download-original-link-inputs
+        if: matrix.mapping_id
+        uses: actions/download-artifact@v7
+        with:
+          artifact-ids: ${{ steps.original.outputs.artifact_id }}
+          run-id: ${{ needs.inputs.outputs.source_run_id }}
+          github-token: ${{ github.token }}
+          path: symbol-inputs
+          merge-multiple: true
+      - name: download-bootstrap-packaged-mapping
+        if: matrix.gateway_mapping_id
+        uses: actions/download-artifact@v7
+        with:
+          artifact-ids: ${{ matrix.gateway_mapping_id }}
+          run-id: ${{ needs.inputs.outputs.source_run_id }}
+          github-token: ${{ github.token }}
+          path: gateway-symbol-mapping
+          merge-multiple: true
+      - name: bind-packaged-bytes-to-original-link-inputs
+        if: matrix.mapping_id
+        shell: bash
+        run: |
+          python - <<'PYBIND'
+          import json
+          from pathlib import Path
+          import shutil
+
+          original = json.loads(Path('symbol-inputs/inputs.json').read_text())
+          packaged = json.loads(Path('symbol-mapping/inputs.json').read_text())
+          if original != packaged:
+              raise ValueError('Packaged mapping differs from the exact retained compiler inputs')
+          ledger = json.loads(Path('symbol-mapping/packaged.json').read_text())
+          gateway_dir = Path('gateway-symbol-mapping')
+          if gateway_dir.exists():
+              gateway = json.loads((gateway_dir / 'inputs.json').read_text())
+              signed = json.loads((gateway_dir / 'packaged.json').read_text())
+              if (any(gateway[key] != original[key] for key in ('commit', 'run_id', 'target', 'catalog_sha256'))
+                      or gateway.get('variant') != 'computer-use' or len(gateway['binaries']) != 1):
+                  raise ValueError('Desktop bootstrap mapping has different Gateway provenance')
+              own_modules = {(row['format'], row['module_id']) for row in original['binaries']}
+              bootstrap = [row for row in ledger if (row['format'], row['module_id']) not in own_modules]
+              expected = gateway['binaries'][0]
+              if (len(bootstrap) != 1 or bootstrap[0] not in signed
+                      or (bootstrap[0]['format'], bootstrap[0]['module_id']) != (expected['format'], expected['module_id'])):
+                  raise ValueError('Desktop bootstrap differs from the signed Gateway packaged mapping')
+          shutil.copy2('symbol-mapping/packaged.json', 'symbol-inputs/packaged.json')
+          PYBIND
       - name: download-pinned-dsymutil
         if: runner.os == 'macOS'
         uses: actions/download-artifact@v7

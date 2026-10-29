@@ -738,9 +738,10 @@ mod tests {
             "127.0.0.1:2333",
             "[::1]:2333",
         ] {
-            assert!(
-                normalize_rathole_remote_addr(value).is_ok(),
-                "{value} should be valid"
+            assert_eq!(
+                normalize_rathole_remote_addr(value).expect("valid relay endpoint"),
+                value,
+                "normalization must preserve valid endpoint {value}"
             );
         }
 

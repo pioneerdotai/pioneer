@@ -69,8 +69,6 @@ mod util;
 pub use repositories::native_event_cleanup::{
     NativeEventCleanupBootstrap, NativeEventCleanupMetrics,
 };
-#[cfg(test)]
-use repositories::native_event_cleanup_baseline::NativeEventCleanupOutcome;
 pub use repositories::projection_receipt_cleanup::ProjectionReceiptCleanupOutcome;
 
 pub use events::{
@@ -128,18 +126,18 @@ pub use repositories::agent_identity_catalog::{
     ensure_pioneer_for_workspace, sync_cli_runtime_identity_catalog,
 };
 pub use repositories::auth_session::{
-    AuthPersistenceInvariantReport, DeviceActivationFailureOutcome, NewActiveDeviceSessionRow,
-    NewPendingDeviceSessionRow, NewRefreshCredentialRow, PendingSessionIssuer,
-    PrincipalCredentialRevocation, activate_pending_auth_session, activate_pending_device,
-    advance_auth_session_refresh, auth_session_status_to_db, client_kind_to_db,
-    delete_refresh_for_session, device_status_to_db, expire_pending_auth_session,
-    expire_session_refresh_family, expire_stale_auth_sessions, expire_stale_pending_sessions,
-    insert_active_device_session, insert_pending_device_session, insert_refresh_credential,
-    list_pending_activation_locator_hashes, list_sessions_for_principal,
+    AuthPersistenceInvariantReport, AuthSessionLeaseRow, DeviceActivationFailureOutcome,
+    NewActiveDeviceSessionRow, NewPendingDeviceSessionRow, NewRefreshCredentialRow,
+    PendingSessionIssuer, PrincipalCredentialRevocation, activate_pending_auth_session,
+    activate_pending_device, advance_auth_session_refresh, auth_session_status_to_db,
+    client_kind_to_db, delete_refresh_for_session, device_status_to_db,
+    expire_pending_auth_session, expire_session_refresh_family, expire_stale_auth_sessions,
+    expire_stale_pending_sessions, insert_active_device_session, insert_pending_device_session,
+    insert_refresh_credential, list_pending_activation_locator_hashes, list_sessions_for_principal,
     load_active_device_by_installation, load_active_session_by_device, load_current_refresh,
     load_device, load_pending_local_session, load_pending_session_by_activation_locator_hash,
     load_pending_session_for_creator, load_session, load_session_by_activation_hash,
-    mark_device_revoked, mark_session_revoked, record_failed_device_activation,
+    load_session_lease, mark_device_revoked, mark_session_revoked, record_failed_device_activation,
     replace_current_refresh, revoke_principal_credentials, revoke_reason_to_db,
     revoke_session_family_for_refresh_reuse, scan_auth_persistence_invariants,
     touch_active_auth_session, touch_active_device,
@@ -212,9 +210,10 @@ pub use repositories::policy_generation::{
     ensure_code_policy_generation, list_authorization_changes_after,
 };
 pub use repositories::principal_avatar::{
-    NewPrincipalAvatarRow, PrincipalAvatarRevisionRow, PrincipalAvatarRow, delete_principal_avatar,
-    insert_principal_avatar, list_principal_avatar_revisions, load_principal_avatar,
-    load_principal_avatar_revision, replace_principal_avatar,
+    NewPrincipalAvatarRow, PrincipalAvatarRevisionRow, PrincipalAvatarRow, PrincipalProfileRow,
+    delete_principal_avatar, insert_principal_avatar, list_principal_avatar_revisions,
+    load_principal_avatar, load_principal_avatar_revision, load_principal_profile,
+    replace_principal_avatar,
 };
 pub use repositories::task::TaskRootAccessFilter;
 pub use repositories::task_actor_contract::{
@@ -5147,6 +5146,10 @@ impl CrudStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        // Local raw-SQL exception: SeaQuery 1.0's index hints only support
+        // MySQL, not SQLite INDEXED BY. Pin the existing run_id index so each
+        // run probes its own links instead of the task's entire run history.
+        // Keep both ownership predicates and the single global order/limit.
         let rows = self
             .connection
             .query_all_raw(Statement::from_sql_and_values(
@@ -5154,7 +5157,7 @@ impl CrudStore {
                 format!("SELECT t.thread_id, t.id AS turn_id, t.status, t.error \
                  FROM task_run r \
                  INNER JOIN task task_row ON task_row.id = r.task_id \
-                 INNER JOIN task_run_turn trt ON trt.run_id = r.id AND trt.task_id = r.task_id \
+                 INNER JOIN task_run_turn AS trt INDEXED BY idx_task_run_turn_run ON trt.run_id = r.id AND trt.task_id = r.task_id \
                  INNER JOIN \"turn\" t \
                     ON t.id = trt.turn_id AND t.thread_id = trt.thread_id \
                  WHERE t.turn_kind = 'conversation' \
@@ -8200,31 +8203,6 @@ impl CrudStore {
         filter: CliRuntimeNativeEventListFilter,
     ) -> Result<Vec<CliRuntimeNativeEventRecord>> {
         cli_runtime_binding::list_native_events(&self.connection, filter).await
-    }
-
-    #[cfg(test)]
-    pub async fn cleanup_native_events_baseline_quantum(
-        &self,
-        after_rowid: i64,
-    ) -> Result<NativeEventCleanupOutcome> {
-        self.run_background_database_quantum(|| async {
-            let page =
-                repositories::native_event_cleanup_baseline::prepare(&self.connection, after_rowid)
-                    .await?;
-            let mut outcome = NativeEventCleanupOutcome {
-                last_rowid: page.last().map(|row| row.source_rowid),
-                rows_scanned: page.len() as u64,
-                rows_deleted: 0,
-            };
-            if !page.is_empty() {
-                // One DELETE revalidates eligibility under the maintenance writer.
-                outcome.rows_deleted =
-                    repositories::native_event_cleanup_baseline::apply(&self.connection, &page)
-                        .await?;
-            }
-            Ok(outcome)
-        })
-        .await
     }
 
     /// One bounded, turn-addressed maintenance quantum. No source-table scan.
@@ -35542,6 +35520,7 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 #[cfg(test)]
 mod tests {
     mod saved_history_read;
+    mod task_child_discovery;
     mod task_webhook;
     mod thread_read_pages;
     mod unread_start;
@@ -45491,13 +45470,31 @@ mod tests {
             sequence += 1;
         }
 
-        let compacted = store
-            .with_maintenance_access()
-            .cleanup_native_events_baseline_quantum(0)
+        let initial = store
+            .list_cli_runtime_native_events(CliRuntimeNativeEventListFilter {
+                runtime_id: Some("codex".to_owned()),
+                thread_id: Some(thread_id.to_owned()),
+                ..Default::default()
+            })
             .await
-            .expect("compaction should succeed");
-        assert_eq!(compacted.rows_scanned, 9);
-        assert_eq!(compacted.rows_deleted, 6);
+            .expect("initial native events should list");
+        assert_eq!(initial.len(), 9);
+        let maintenance = store.with_maintenance_access();
+        let mut deleted = 0;
+        let mut finished = false;
+        for _ in 0..20 {
+            let metrics = maintenance
+                .cleanup_native_events_quantum()
+                .await
+                .expect("cleanup should succeed");
+            deleted += metrics.events_deleted;
+            if metrics.jobs_examined == 0 {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "cleanup should settle within the bounded fixture");
+        assert_eq!(deleted, 6);
 
         let remaining = store
             .list_cli_runtime_native_events(CliRuntimeNativeEventListFilter {
@@ -53619,6 +53616,22 @@ mod tests {
         assert_eq!(
             checkpoint.checkpoint_kind,
             TurnExecutionCheckpointKind::WindowExhausted
+        );
+        let stored_checkpoint = store
+            .database_connection()
+            .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT checkpoint_kind FROM turn_execution_checkpoint WHERE id = ?",
+                [checkpoint.id.clone().into()],
+            ))
+            .await
+            .expect("stored checkpoint kind should query")
+            .expect("stored checkpoint should exist");
+        assert_eq!(
+            stored_checkpoint
+                .try_get::<String>("", "checkpoint_kind")
+                .unwrap(),
+            "window_exhausted"
         );
 
         assert_eq!(

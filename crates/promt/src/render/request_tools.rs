@@ -78,6 +78,20 @@ mod tests {
                 computer_use_available && !pioneer_tools::computer_use_tool_specs().is_empty();
             assert_eq!(catalog.contains("- computer_use: "), cua_available);
             assert_eq!(catalog.contains("cua_type_text"), cua_available);
+            let domain_lines = catalog
+                .lines()
+                .filter(|line| line.starts_with("- "))
+                .collect::<Vec<_>>();
+            let expected = pioneer_tools::builtin_tool_domain_map()
+                .iter()
+                .filter(|(domain, _)| {
+                    *domain != pioneer_tools::BuiltinToolDomain::ComputerUse || cua_available
+                })
+                .map(|(domain, tool_names)| {
+                    format!("- {}: {}.", domain.as_str(), tool_names.join(", "))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(domain_lines, expected);
         }
     }
 

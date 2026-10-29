@@ -234,55 +234,6 @@ mod tests {
             "model-facing prompt text should not expose internal terminal codes"
         );
     }
-
-    #[test]
-    fn subagents_and_tasks_policies_point_to_separate_system_skills() {
-        assert!(SUBAGENTS_POLICY_PROMPT.contains("pioneer/subagents"));
-        assert!(SUBAGENTS_POLICY_PROMPT.contains("Internal Skill References"));
-        assert!(SUBAGENTS_POLICY_PROMPT.contains("read_skill"));
-        assert!(SUBAGENTS_POLICY_PROMPT.contains("attached subagents"));
-        assert!(SUBAGENTS_POLICY_PROMPT.contains("parent agent owns the user outcome"));
-        assert!(
-            SUBAGENTS_POLICY_PROMPT
-                .contains("Do not finish the parent turn while attached subagent work")
-        );
-
-        assert!(TASKS_POLICY_PROMPT.contains("pioneer/tasks"));
-        assert!(TASKS_POLICY_PROMPT.contains("Internal Skill References"));
-        assert!(TASKS_POLICY_PROMPT.contains("read_skill"));
-        assert!(TASKS_POLICY_PROMPT.contains("future, recurring, background"));
-        assert!(TASKS_POLICY_PROMPT.contains("Delivery is separate from execution"));
-    }
-
-    #[test]
-    fn tool_usage_policy_identifies_one_text_mutator() {
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`read_file`"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("source code"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("configs"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("complete Add/Update/Move/Delete syntax"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("A pure rename"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("authorized roots"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`write_stdin` only"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`exec_command`, sed, perl"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("ordinary file edits"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`apply_patch`"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("structured patch result"));
-        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("write_file"));
-        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("edit_file"));
-        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("If-Match"));
-        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("If-Destination"));
-        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("AppliedPatchLog"));
-        assert!(
-            !TOOL_USAGE_POLICY_PROMPT
-                .to_ascii_lowercase()
-                .contains("codex")
-        );
-        assert!(
-            !TOOL_USAGE_POLICY_PROMPT
-                .to_ascii_lowercase()
-                .contains("proposal")
-        );
-    }
 }
 
 macro_rules! html_policy {

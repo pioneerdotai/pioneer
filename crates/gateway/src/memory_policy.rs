@@ -487,6 +487,12 @@ mod tests {
             .expect("classifier request succeeds");
 
         assert_eq!(policy.reason_code, MemoryPolicyReasonCode::DefaultAllowRead);
+        assert_eq!(policy.recall, MemoryRecallPolicy::Allow);
+        assert_eq!(policy.prompt, MemoryPromptPolicy::Full);
+        assert_eq!(policy.read_tools, MemoryReadToolPolicy::Allow);
+        assert_eq!(policy.remember_tool, MemoryMutationToolPolicy::Allow);
+        assert_eq!(policy.forget_tool, MemoryMutationToolPolicy::Allow);
+        assert_eq!(policy.detected_language.as_deref(), Some("und"));
         let request = captured_request
             .lock()
             .expect("request lock poisoned")
@@ -505,37 +511,6 @@ mod tests {
         assert!(classifier_prompt.contains("No guardes esto."));
         assert!(classifier_prompt.contains("Do not search memory"));
         assert!(!classifier_prompt.contains("## Memory Recall"));
-    }
-
-    #[test]
-    fn parses_normal_default_allow_policy() {
-        let policy = parse_memory_turn_policy_response(
-            r#"{
-                "intent": "normal",
-                "recall": "allow",
-                "prompt": "full",
-                "readTools": "allow",
-                "rememberTool": "allow",
-                "forgetTool": "allow",
-                "postTurnExtraction": "disabled",
-                "activeMemory": "disabled",
-                "explicitRemember": false,
-                "explicitForget": false,
-                "forgetTargetHint": null,
-                "language": "und",
-                "confidence": 0.83,
-                "reasonCode": "default_allow_read"
-            }"#,
-        )
-        .expect("valid normal classifier policy");
-
-        assert_eq!(policy.recall, MemoryRecallPolicy::Allow);
-        assert_eq!(policy.prompt, MemoryPromptPolicy::Full);
-        assert_eq!(policy.read_tools, MemoryReadToolPolicy::Allow);
-        assert_eq!(policy.remember_tool, MemoryMutationToolPolicy::Allow);
-        assert_eq!(policy.forget_tool, MemoryMutationToolPolicy::Allow);
-        assert_eq!(policy.reason_code, MemoryPolicyReasonCode::DefaultAllowRead);
-        assert_eq!(policy.detected_language.as_deref(), Some("und"));
     }
 
     #[test]

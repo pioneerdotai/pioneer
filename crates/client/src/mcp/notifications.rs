@@ -293,10 +293,9 @@ mod tests {
         assert_eq!(servers[0].runtime.state, McpRuntimeState::Failed);
         assert_eq!(servers[0].status, McpServerStatus::Failed);
         assert_eq!(details.server.status, McpServerStatus::Failed);
-        assert_eq!(
-            details.management.expect("management").health.runtime.state,
-            McpRuntimeState::Failed
-        );
+        let management = details.management.expect("management");
+        assert_eq!(management.health.status, McpServerStatus::Failed);
+        assert_eq!(management.health.runtime.state, McpRuntimeState::Failed);
     }
 
     #[test]

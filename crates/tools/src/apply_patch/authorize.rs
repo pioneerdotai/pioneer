@@ -265,18 +265,6 @@ mod tests {
     }
 
     #[test]
-    fn full_access_and_supervised_authorization_share_exact_plan() {
-        let root = tempfile::tempdir().unwrap();
-        let first = prepared(root.path());
-        let second = prepared(root.path());
-        let left = authorize(first, &AllowAllSandbox, &FullAccessAuthorizer).unwrap();
-        let right = authorize(second, &AllowAllSandbox, &FullAccessAuthorizer).unwrap();
-        assert_eq!(left.prepared.fingerprint, right.prepared.fingerprint);
-        assert_eq!(left.intent.fingerprint, right.intent.fingerprint);
-        assert_eq!(left.receipt.mode, PermissionMode::FullAccess);
-    }
-
-    #[test]
     fn denial_occurs_after_preflight_without_mutating_disk() {
         let root = tempfile::tempdir().unwrap();
         let error =
@@ -301,6 +289,13 @@ mod tests {
             }
         }
         let root = tempfile::tempdir().unwrap();
+        let authorized = authorize(
+            prepared(root.path()),
+            &AllowAllSandbox,
+            &FullAccessAuthorizer,
+        )
+        .unwrap();
+        assert_eq!(authorized.receipt.mode, PermissionMode::FullAccess);
         let error = authorize(prepared(root.path()), &AllowAllSandbox, &WrongReceipt).unwrap_err();
         assert_eq!(error.code, PermissionErrorCode::ApprovalBinding);
     }

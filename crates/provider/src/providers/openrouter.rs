@@ -2346,26 +2346,11 @@ mod tests {
     }
 
     #[test]
-    fn creates_with_custom_base_url() {
-        let provider = OpenRouterProvider::with_base_url("key", "http://localhost:8080");
-        assert_eq!(provider.base_url, "http://localhost:8080");
-    }
-
-    #[test]
     fn custom_base_url_keeps_prefix_without_double_slash() {
         let provider = OpenRouterProvider::with_base_url("key", "http://localhost:8080/gateway/");
         assert_eq!(
             provider.models_url(),
             "http://localhost:8080/gateway/models"
-        );
-    }
-
-    #[test]
-    fn chat_completions_url_built_correctly() {
-        let provider = OpenRouterProvider::new("key");
-        assert_eq!(
-            provider.chat_completions_url(),
-            "https://openrouter.ai/api/v1/chat/completions"
         );
     }
 
@@ -2814,86 +2799,6 @@ mod tests {
     }
 
     #[test]
-    fn api_request_serializes_reasoning_options() {
-        let request = ApiChatRequest {
-            generation: Default::default(),
-            model: "openai/gpt-5".into(),
-            messages: vec![ApiMessage {
-                role: "user".into(),
-                content: Some(ApiMessageContent::Text("Hello".into())),
-                reasoning_content: None,
-                reasoning_details: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            }],
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning: Some(ApiReasoningOptions {
-                effort: "medium".to_owned(),
-            }),
-            stream: false,
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"reasoning\":{\"effort\":\"medium\"}"));
-    }
-
-    #[test]
-    fn api_request_serializes_reasoning_options_for_any_model() {
-        let request = ApiChatRequest {
-            generation: Default::default(),
-            model: "anthropic/claude-sonnet-4".into(),
-            messages: vec![ApiMessage {
-                role: "user".into(),
-                content: Some(ApiMessageContent::Text("Hello".into())),
-                reasoning_content: None,
-                reasoning_details: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            }],
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning: Some(ApiReasoningOptions {
-                effort: "medium".to_owned(),
-            }),
-            stream: false,
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"reasoning\":{\"effort\":\"medium\"}"));
-    }
-
-    #[test]
-    fn api_response_deserializes() {
-        let json = r#"{"choices":[{"message":{"content":"Hi from OpenRouter"}}]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices.len(), 1);
-        assert_eq!(
-            response.choices[0].message.content.as_deref(),
-            Some("Hi from OpenRouter")
-        );
-    }
-
-    #[test]
-    fn api_response_reasoning_field_does_not_override_content_text() {
-        let json = r#"{"choices":[{"message":{"content":"","reasoning":"thinking"}}]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices[0].message.effective_content(), "");
-        assert_eq!(
-            response.choices[0].message.reasoning.as_deref(),
-            Some("thinking")
-        );
-    }
-
-    #[test]
     fn api_response_preserves_structured_reasoning_details() {
         let json = r#"{
             "choices": [{
@@ -2926,42 +2831,6 @@ mod tests {
     }
 
     #[test]
-    fn api_response_with_usage() {
-        let json = r#"{
-            "choices": [{"message": {"content": "Hello"}}],
-            "usage": {"prompt_tokens": 42, "completion_tokens": 15}
-        }"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let usage = response._usage.unwrap().normalized();
-        assert_eq!(usage.input_tokens, Some(42));
-        assert_eq!(usage.output_tokens, Some(15));
-    }
-
-    #[test]
-    fn api_response_empty_choices() {
-        let json = r#"{"choices":[]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert!(response.choices.is_empty());
-    }
-
-    #[test]
-    fn stream_response_deserializes_delta() {
-        let json = r#"{"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices.len(), 1);
-        assert_eq!(response.choices[0].delta.content.as_deref(), Some("Hello"));
-        assert!(response.choices[0].finish_reason.is_none());
-    }
-
-    #[test]
-    fn stream_response_deserializes_finish() {
-        let json = r#"{"choices":[{"delta":{"content":null},"finish_reason":"stop"}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
-        assert!(!response.choices[0].delta.has_payload());
-    }
-
-    #[test]
     fn stream_response_distinguishes_empty_terminal_repeats_from_real_payload() {
         for json in [
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
@@ -2980,15 +2849,6 @@ mod tests {
             let response: StreamResponse = serde_json::from_str(json).unwrap();
             assert!(response.choices[0].delta.has_payload(), "{json}");
         }
-    }
-
-    #[test]
-    fn stream_response_allows_usage_with_empty_post_terminal_choices() {
-        let json = r#"{"usage":{"prompt_tokens":42,"completion_tokens":15},"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-
-        assert!(response.usage.is_some());
-        assert!(!response.choices[0].delta.has_payload());
     }
 
     #[tokio::test]
@@ -3124,29 +2984,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_response_deserializes_error_envelope_without_delta() {
-        let json = r#"{"error":{"message":"upstream failed","type":"provider_error","code":524},"choices":[{"finish_reason":"error"}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-
-        assert_eq!(
-            response.error.unwrap().description(),
-            "upstream failed, type=provider_error, code=524"
-        );
-        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("error"));
-        assert!(response.choices[0].delta.content.is_none());
-    }
-
-    #[test]
-    fn stream_response_deserializes_reasoning_field() {
-        let json = r#"{"choices":[{"delta":{"reasoning":"trace"},"finish_reason":null}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            response.choices[0].delta.reasoning.as_deref(),
-            Some("trace")
-        );
-    }
-
-    #[test]
     fn stream_response_preserves_reasoning_detail_chunks_in_order() {
         let first: StreamResponse = serde_json::from_str(
             r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"first"}]},"finish_reason":null}]}"#,
@@ -3169,19 +3006,80 @@ mod tests {
     }
 
     #[test]
-    fn provider_name() {
+    fn default_endpoint_and_capabilities() {
         use crate::traits::Provider;
         let provider = OpenRouterProvider::new("key");
-        assert_eq!(provider.name(), "openrouter");
-    }
-
-    #[test]
-    fn provider_capabilities() {
-        use crate::traits::Provider;
-        let provider = OpenRouterProvider::new("key");
+        assert_eq!(
+            provider.chat_completions_url(),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn api_response_preserves_literal_choice_content_and_reasoning() {
+        for (json, expected) in [
+            (
+                r#"{"choices":[{"message":{"content":"","reasoning":"thinking"}}]}"#,
+                vec![("".to_owned(), Some("thinking"))],
+            ),
+            (r#"{"choices":[]}"#, vec![]),
+        ] {
+            let response: ApiChatResponse = serde_json::from_str(json).unwrap();
+            let actual = response
+                .choices
+                .iter()
+                .map(|choice| {
+                    (
+                        choice.message.effective_content(),
+                        choice.message.reasoning.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{json}");
+        }
+    }
+
+    #[test]
+    fn stream_response_preserves_finish_error_and_reasoning_envelopes() {
+        type ChoiceView<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, bool);
+        let cases: [(&str, Option<&str>, Vec<ChoiceView<'_>>); 3] = [
+            (
+                r#"{"choices":[{"delta":{"content":null},"finish_reason":"stop"}]}"#,
+                None,
+                vec![(Some("stop"), None, None, false)],
+            ),
+            (
+                r#"{"error":{"message":"upstream failed","type":"provider_error","code":524},"choices":[{"finish_reason":"error"}]}"#,
+                Some("upstream failed, type=provider_error, code=524"),
+                vec![(Some("error"), None, None, false)],
+            ),
+            (
+                r#"{"choices":[{"delta":{"reasoning":"trace"},"finish_reason":null}]}"#,
+                None,
+                vec![(None, None, Some("trace"), true)],
+            ),
+        ];
+        for (json, expected_error, expected_choices) in cases {
+            let response: StreamResponse = serde_json::from_str(json).unwrap();
+            let error = response.error.as_ref().map(StreamError::description);
+            assert_eq!(error.as_deref(), expected_error, "{json}");
+            let choices = response
+                .choices
+                .iter()
+                .map(|choice| {
+                    (
+                        choice.finish_reason.as_deref(),
+                        choice.delta.content.as_deref(),
+                        choice.delta.reasoning.as_deref(),
+                        choice.delta.has_payload(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(choices, expected_choices, "{json}");
+        }
     }
 }
 

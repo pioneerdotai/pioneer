@@ -2543,13 +2543,6 @@ impl RecordingMemoryProvider {
         }
     }
 
-    fn ok() -> Self {
-        Self::new(
-            Ok(MemoryRecallSnapshot::empty()),
-            Ok(MemoryToolMaterialization::default()),
-        )
-    }
-
     fn recall_contexts(&self) -> Vec<MemoryTurnContext> {
         self.recall_contexts
             .lock()
@@ -4835,119 +4828,95 @@ async fn empty_no_tool_round_after_tool_result_preserves_context() {
     }));
 }
 
-#[tokio::test]
-async fn tool_schema_dump_no_tool_round_retries_without_schema_agent_message() {
-    let provider = Arc::new(SequencedTextProvider::new(vec![
-        TOOL_SCHEMA_DUMP_RESPONSE,
-        "done after schema dump recovery",
-    ]));
-    let registry = Arc::new(ProviderRegistry::with_provider(
-        "sequenced-text",
-        provider.clone(),
-    ));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+#[test]
+fn malformed_no_tool_text_retries_without_rejected_agent_message() {
+    for (
+        bad_response,
+        final_text,
+        thread_id,
+        turn_id,
+        expected_instruction,
+        completed_message_diagnostic,
+        request_count_diagnostic,
+        instruction_diagnostic,
+    ) in [
+        (
+            TOOL_SCHEMA_DUMP_RESPONSE,
+            "done after schema dump recovery",
+            "schema_dump_retry_thread",
+            "schema_dump_retry_turn",
+            "reproduced tool schemas or tool definitions",
+            "tool schema dumps must not create completed AgentMessage items",
+            "schema dump should be retried inside the same agent loop before final answer",
+            "retry request should include the schema-dump recovery instruction",
+        ),
+        (
+            RAW_TOOL_CALL_MARKUP_RESPONSE,
+            "done after raw tool-call recovery",
+            "raw_tool_markup_retry_thread",
+            "raw_tool_markup_retry_turn",
+            "raw tool-call markup",
+            "raw tool-call markup must not create completed AgentMessage items",
+            "raw tool-call markup should be retried inside the same agent loop before final answer",
+            "retry request should include the raw tool-call markup recovery instruction",
+        ),
+    ] {
+        let body = async {
+            let provider = Arc::new(SequencedTextProvider::new(vec![bad_response, final_text]));
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "sequenced-text",
+                provider.clone(),
+            ));
+            let manager = AgentManager::new(registry, test_tool_loop_config());
 
-    let observed = start_simple_turn(
-        &manager,
-        "schema_dump_retry_thread",
-        "workspace",
-        "schema_dump_retry_turn",
-        ThreadMode::Agent,
-        "sequenced-text",
-        "hello",
-    )
-    .await;
-    assert_turn_completed(&observed);
+            let observed = start_simple_turn(
+                &manager,
+                thread_id,
+                "workspace",
+                turn_id,
+                ThreadMode::Agent,
+                "sequenced-text",
+                "hello",
+            )
+            .await;
+            assert_turn_completed(&observed);
 
-    let completed_messages = observed
-        .iter()
-        .filter_map(|event| {
-            let AgentEvent::ItemCompleted(notification) = event else {
-                return None;
-            };
-            let TurnItem::AgentMessage { text, .. } = &notification.item else {
-                return None;
-            };
-            Some(text.clone())
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        completed_messages,
-        vec!["done after schema dump recovery".to_owned()],
-        "tool schema dumps must not create completed AgentMessage items"
-    );
+            let completed_messages = observed
+                .iter()
+                .filter_map(|event| {
+                    let AgentEvent::ItemCompleted(notification) = event else {
+                        return None;
+                    };
+                    let TurnItem::AgentMessage { text, .. } = &notification.item else {
+                        return None;
+                    };
+                    Some(text.clone())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                completed_messages,
+                vec![final_text.to_owned()],
+                "{completed_message_diagnostic}"
+            );
 
-    let requests = provider.snapshot_requests();
-    assert_eq!(
-        requests.len(),
-        2,
-        "schema dump should be retried inside the same agent loop before final answer"
-    );
-    assert!(
-        requests[1].messages.iter().any(|message| {
-            message
-                .content
-                .contains("reproduced tool schemas or tool definitions")
-        }),
-        "retry request should include the schema-dump recovery instruction"
-    );
-}
-
-#[tokio::test]
-async fn raw_tool_call_markup_no_tool_round_retries_without_raw_agent_message() {
-    let provider = Arc::new(SequencedTextProvider::new(vec![
-        RAW_TOOL_CALL_MARKUP_RESPONSE,
-        "done after raw tool-call recovery",
-    ]));
-    let registry = Arc::new(ProviderRegistry::with_provider(
-        "sequenced-text",
-        provider.clone(),
-    ));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-
-    let observed = start_simple_turn(
-        &manager,
-        "raw_tool_markup_retry_thread",
-        "workspace",
-        "raw_tool_markup_retry_turn",
-        ThreadMode::Agent,
-        "sequenced-text",
-        "hello",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let completed_messages = observed
-        .iter()
-        .filter_map(|event| {
-            let AgentEvent::ItemCompleted(notification) = event else {
-                return None;
-            };
-            let TurnItem::AgentMessage { text, .. } = &notification.item else {
-                return None;
-            };
-            Some(text.clone())
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        completed_messages,
-        vec!["done after raw tool-call recovery".to_owned()],
-        "raw tool-call markup must not create completed AgentMessage items"
-    );
-
-    let requests = provider.snapshot_requests();
-    assert_eq!(
-        requests.len(),
-        2,
-        "raw tool-call markup should be retried inside the same agent loop before final answer"
-    );
-    assert!(
-        requests[1]
-            .messages
-            .iter()
-            .any(|message| message.content.contains("raw tool-call markup")),
-        "retry request should include the raw tool-call markup recovery instruction"
-    );
+            let requests = provider.snapshot_requests();
+            assert_eq!(requests.len(), 2, "{request_count_diagnostic}");
+            assert!(
+                requests[1]
+                    .messages
+                    .iter()
+                    .any(|message| { message.content.contains(expected_instruction) }),
+                "{instruction_diagnostic}"
+            );
+        };
+        tokio::pin!(body);
+        let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed building the Runtime")
+            .block_on(body);
+    }
 }
 
 #[tokio::test]
@@ -5785,6 +5754,8 @@ async fn phase_07_agent_mode_calls_each_hook_phase_once() {
                 panic!("post-turn call should receive typed post-turn payload");
             };
             assert_eq!(payload.status, TurnPostTurnStatus::Succeeded);
+            assert!(payload.error.is_none());
+            assert!(payload.tool_events.is_empty());
             assert_eq!(
                 payload
                     .user_text
@@ -5881,42 +5852,6 @@ async fn phase_07_agent_mode_without_tool_calling_calls_each_hook_phase_once() {
         PHASE_07_HOOK_PHASES
     );
     assert_eq!(provider.snapshot_requests().len(), 1);
-}
-
-#[tokio::test]
-async fn phase_07_chat_mode_does_not_call_turn_hooks() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureStandardProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider(
-        "capture-standard",
-        provider.clone(),
-    ));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            calls.clone(),
-            Vec::new(),
-            HookFailurePolicy::BestEffort,
-            false,
-        )))
-        .await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase07_chat_hooks",
-        "ws_phase07_chat_hooks",
-        "turn_phase07_chat_hooks",
-        ThreadMode::Chat,
-        "capture-standard",
-        "phase 07 chat hook phases",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    assert!(snapshot_hook_calls(&calls).is_empty());
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].compiled_prompt.is_none());
 }
 
 #[tokio::test]
@@ -6171,57 +6106,6 @@ async fn phase_07_non_prompt_section_contributions_do_not_affect_agent_request()
             .iter()
             .any(|event| matches!(event, AgentEvent::SkillAuditEvents { .. }))
     );
-}
-
-#[tokio::test]
-async fn phase_12_post_turn_hook_runs_after_success_with_summary_input() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
-            calls.clone(),
-            HookPhase::TurnPostTurn,
-            HookAwaitPolicy::Blocking,
-            HookFailurePolicy::BestEffort,
-        )))
-        .await;
-
-    let observed = start_simple_turn_with_terminal_effects(
-        &manager,
-        "thr_phase12_success",
-        "ws_phase12_success",
-        "turn_phase12_success",
-        ThreadMode::Agent,
-        "capture",
-        "phase 12 user text",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let call = wait_for_hook_phase(&calls, HookPhase::TurnPostTurn).await;
-    let HookInputPayload::TurnPostTurn(payload) = call.payload else {
-        panic!("post-turn hook should receive typed post-turn payload");
-    };
-    assert_eq!(payload.status, TurnPostTurnStatus::Succeeded);
-    assert_eq!(
-        payload
-            .user_text
-            .as_ref()
-            .map(|preview| preview.text.as_str()),
-        Some("phase 12 user text")
-    );
-    assert_eq!(
-        payload
-            .assistant_text
-            .as_ref()
-            .map(|preview| preview.text.as_str()),
-        Some("done")
-    );
-    assert!(payload.error.is_none());
-    assert!(payload.tool_events.is_empty());
-    assert_eq!(provider.snapshot_requests().len(), 1);
 }
 
 #[tokio::test]
@@ -7898,65 +7782,6 @@ async fn phase_08_policy_hook_contribution_reaches_later_phase_policy_set() {
 }
 
 #[tokio::test]
-async fn phase_08_multiple_policy_contributions_merge_deterministically() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            calls.clone(),
-            vec![
-                policy_contribution("test", "mode", HookValue::Text("weak".to_owned()), 0),
-                policy_contribution("test", "mode", HookValue::Text("strong".to_owned()), 10),
-                policy_contribution("test", "allowed", HookValue::Bool(true), 5),
-            ],
-            HookFailurePolicy::BestEffort,
-            false,
-        )))
-        .await;
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase08_policy_merge",
-        "ws_phase08_policy_merge",
-        "turn_phase08_policy_merge",
-        ThreadMode::Agent,
-        "capture",
-        "phase 08 policy merge",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let calls = snapshot_hook_calls(&calls);
-    let pre_prompt_context = calls
-        .iter()
-        .find(|call| call.phase == HookPhase::TurnPrePromptContext)
-        .expect("pre-prompt-context hook called");
-    assert_eq!(
-        policy_value(&pre_prompt_context.policy_set, "test", "mode"),
-        Some(HookValue::Text("strong".to_owned()))
-    );
-    assert_eq!(
-        policy_value(&pre_prompt_context.policy_set, "test", "allowed"),
-        Some(HookValue::Bool(true))
-    );
-    let ordered_keys = pre_prompt_context
-        .policy_set
-        .entries
-        .keys()
-        .map(|key| (key.domain.as_str().to_owned(), key.key.as_str().to_owned()))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        ordered_keys,
-        vec![
-            ("test".to_owned(), "allowed".to_owned()),
-            ("test".to_owned(), "mode".to_owned())
-        ]
-    );
-    assert_eq!(provider.snapshot_requests().len(), 1);
-}
-
-#[tokio::test]
 async fn phase_08_best_effort_policy_hook_failure_does_not_mark_turn_failed() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = Arc::new(CaptureAgentProvider::default());
@@ -8035,39 +7860,6 @@ async fn phase_08_fallback_policy_hook_failure_returns_fallback_policy_and_conti
         Some(HookValue::Text("fallback".to_owned()))
     );
     assert_eq!(provider.snapshot_requests().len(), 1);
-}
-
-#[tokio::test]
-async fn phase_08_fail_closed_policy_hook_failure_fails_turn() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            calls.clone(),
-            Vec::new(),
-            HookFailurePolicy::FailClosed,
-            true,
-        )))
-        .await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase08_fail_closed_policy_failure",
-        "ws_phase08_fail_closed_policy_failure",
-        "turn_phase08_fail_closed_policy_failure",
-        ThreadMode::Agent,
-        "capture",
-        "phase 08 fail closed policy failure",
-    )
-    .await;
-    assert_turn_failed(&observed, "turn policy hook failed");
-
-    assert!(provider.snapshot_requests().is_empty());
-    let calls = snapshot_hook_calls(&calls);
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].phase, HookPhase::TurnPrePolicy);
 }
 
 #[tokio::test]
@@ -8435,56 +8227,6 @@ async fn phase_09_context_contribution_does_not_change_provider_prompt_yet() {
 }
 
 #[tokio::test]
-async fn phase_09_no_context_hooks_preserve_agent_request() {
-    let baseline_provider = Arc::new(CaptureAgentProvider::default());
-    let baseline_registry = Arc::new(ProviderRegistry::with_provider(
-        "capture",
-        baseline_provider.clone(),
-    ));
-    let baseline_manager = AgentManager::new(baseline_registry, test_tool_loop_config());
-
-    let baseline_observed = start_simple_turn(
-        &baseline_manager,
-        "thr_phase09_no_context_baseline",
-        "ws_phase09_no_context",
-        "turn_phase09_no_context_baseline",
-        ThreadMode::Agent,
-        "capture",
-        "phase 09 no context hooks",
-    )
-    .await;
-    assert_turn_completed(&baseline_observed);
-
-    let empty_provider = Arc::new(CaptureAgentProvider::default());
-    let empty_registry = Arc::new(ProviderRegistry::with_provider(
-        "capture",
-        empty_provider.clone(),
-    ));
-    let empty_manager = AgentManager::new(empty_registry, test_tool_loop_config());
-    empty_manager
-        .set_hook_runtime(Some(empty_hook_runtime()))
-        .await;
-
-    let empty_observed = start_simple_turn(
-        &empty_manager,
-        "thr_phase09_no_context_empty",
-        "ws_phase09_no_context",
-        "turn_phase09_no_context_empty",
-        ThreadMode::Agent,
-        "capture",
-        "phase 09 no context hooks",
-    )
-    .await;
-    assert_turn_completed(&empty_observed);
-
-    let baseline_requests = baseline_provider.snapshot_requests();
-    let empty_requests = empty_provider.snapshot_requests();
-    assert_eq!(baseline_requests.len(), 1);
-    assert_eq!(empty_requests.len(), 1);
-    assert_stable_requests_eq(&baseline_requests[0], &empty_requests[0]);
-}
-
-#[tokio::test]
 async fn phase_09_chat_mode_still_does_not_call_turn_hooks() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = Arc::new(CaptureStandardProvider::default());
@@ -8523,6 +8265,8 @@ async fn phase_09_chat_mode_still_does_not_call_turn_hooks() {
     let requests = provider.snapshot_requests();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].compiled_prompt.is_none());
+
+    assert!(requests[0].tools.is_none());
 }
 
 #[tokio::test]
@@ -9389,54 +9133,6 @@ async fn phase_10_hook_prompt_section_ordering_is_deterministic() {
 }
 
 #[tokio::test]
-async fn phase_10_hook_prompt_section_id_appears_in_prompt_manifest() {
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            Arc::new(std::sync::Mutex::new(Vec::new())),
-            vec![prompt_section_contribution(
-                "test.phase10.manifest",
-                "Manifest Hook Section",
-                "test",
-                10,
-                "manifest hook section content",
-            )],
-            HookFailurePolicy::BestEffort,
-            false,
-        )))
-        .await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase10_manifest_id",
-        "ws_phase10_manifest_id",
-        "turn_phase10_manifest_id",
-        ThreadMode::Agent,
-        "capture",
-        "phase 10 manifest id",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let manifest = observed
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
-            _ => None,
-        })
-        .next()
-        .expect("prompt manifest should be emitted");
-    assert!(
-        manifest
-            .section_ids
-            .iter()
-            .any(|section_id| section_id == "test.phase10.manifest")
-    );
-}
-
-#[tokio::test]
 async fn phase_10_hook_prompt_section_truncation_is_recorded_in_prompt_manifest() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
@@ -9490,6 +9186,13 @@ async fn phase_10_hook_prompt_section_truncation_is_recorded_in_prompt_manifest(
             && diagnostic.section_id.as_deref() == Some("test.phase10.truncated")
             && !diagnostic.message.contains("0123456789abcdef")
     }));
+
+    let source = manifest
+        .hook_sources
+        .iter()
+        .find(|source| source.section_id.as_deref() == Some("test.phase10.truncated"))
+        .expect("truncated hook source should be recorded");
+    assert_eq!(source.truncation, PromptManifestHookTruncation::Hook);
 }
 
 #[tokio::test]
@@ -9532,6 +9235,12 @@ async fn phase_11_hook_prompt_section_is_manifest_observable() {
         })
         .next()
         .expect("prompt manifest should be emitted");
+    assert!(
+        manifest
+            .section_ids
+            .iter()
+            .any(|id| id == "test.phase11.manifest_source")
+    );
     let source = manifest
         .hook_sources
         .iter()
@@ -9678,56 +9387,6 @@ async fn phase_11_sensitive_diagnostic_content_is_redacted() {
             "manifest must not contain sensitive diagnostic fragment `{secret}`"
         );
     }
-}
-
-#[tokio::test]
-async fn phase_11_hook_prompt_section_truncation_status_is_manifest_observable() {
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            Arc::new(std::sync::Mutex::new(Vec::new())),
-            vec![prompt_section_contribution_with_max_chars(
-                "test.phase11.truncated_source",
-                "Truncated Source Hook",
-                "test",
-                10,
-                "0123456789abcdef",
-                8,
-            )],
-            HookFailurePolicy::BestEffort,
-            false,
-        )))
-        .await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase11_truncated_source",
-        "ws_phase11_truncated_source",
-        "turn_phase11_truncated_source",
-        ThreadMode::Agent,
-        "capture",
-        "phase 11 truncated source",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let manifest = observed
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
-            _ => None,
-        })
-        .next()
-        .expect("prompt manifest should be emitted");
-    let source = manifest
-        .hook_sources
-        .iter()
-        .find(|source| source.section_id.as_deref() == Some("test.phase11.truncated_source"))
-        .expect("hook source should be recorded for truncated section");
-
-    assert_eq!(source.truncation, PromptManifestHookTruncation::Hook);
 }
 
 #[tokio::test]
@@ -9951,27 +9610,6 @@ async fn no_memory_provider_keeps_agent_request_unchanged() {
 }
 
 #[tokio::test]
-async fn memory_provider_is_optional_and_agent_turn_completes() {
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager =
-        AgentManager::new_with_mcp_and_memory(registry, test_tool_loop_config(), None, None);
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_memory_optional",
-        "ws_memory_optional",
-        "turn_memory_optional",
-        ThreadMode::Agent,
-        "capture",
-        "run without a memory provider",
-    )
-    .await;
-    assert_turn_completed(&observed);
-    assert_eq!(provider.snapshot_requests().len(), 1);
-}
-
-#[tokio::test]
 async fn memory_provider_recall_error_degrades_gracefully() {
     let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
         memory_read_preflight_response(),
@@ -10175,49 +9813,6 @@ async fn memory_provider_receives_task_runtime_context_for_task_turn() {
 }
 
 #[tokio::test]
-async fn chat_mode_does_not_call_memory_provider_by_default() {
-    let provider = Arc::new(CaptureStandardProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider(
-        "capture-standard",
-        provider.clone(),
-    ));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::ok());
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
-        MemoryTurnPolicy::explicit_remember(),
-    ));
-    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
-    manager
-        .set_memory_turn_policy_provider(Some(policy_trait_provider))
-        .await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_memory_chat",
-        "ws_memory_chat",
-        "turn_memory_chat",
-        ThreadMode::Chat,
-        "capture-standard",
-        "plain chat should not touch memory",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    assert!(memory_provider.recall_contexts().is_empty());
-    assert!(memory_provider.recall_requests().is_empty());
-    assert!(memory_provider.tool_contexts().is_empty());
-    assert!(policy_provider.contexts().is_empty());
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].tools.is_none());
-    assert!(requests[0].compiled_prompt.is_none());
-}
-
-#[tokio::test]
 async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_them() {
     let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
         memory_all_preflight_response(),
@@ -10345,135 +9940,6 @@ async fn pre_tool_materialization_hook_receives_local_non_memory_tool_bundle_nam
         .expect("provider request");
     let tools = request.tools.expect("agent request should include tools");
     assert!(tools.iter().any(|tool| tool.name == "memory_search"));
-}
-
-#[tokio::test]
-async fn phase_13_memory_tool_bundle_visibility_is_driven_by_hook_policy_set() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_all_preflight_response(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            calls.clone(),
-            Vec::new(),
-            HookFailurePolicy::BestEffort,
-            false,
-        )))
-        .await;
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot::empty()),
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
-        MemoryTurnPolicy::no_save(),
-    ));
-    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
-    manager
-        .set_memory_turn_policy_provider(Some(policy_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase13_tool_policy",
-        "ws_phase13_tool_policy",
-        "turn_phase13_tool_policy",
-        ThreadMode::Agent,
-        "capture",
-        "Speichere das nicht, aber nutze vorhandene Erinnerung.",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let calls = snapshot_hook_calls(&calls);
-    let pre_policy_index = calls
-        .iter()
-        .position(|call| call.phase == HookPhase::TurnPrePolicy)
-        .expect("pre-policy hook call exists");
-    let pre_tool_index = calls
-        .iter()
-        .position(|call| call.phase == HookPhase::TurnPreToolMaterialization)
-        .expect("pre-tool hook call exists");
-    assert!(
-        pre_policy_index < pre_tool_index,
-        "policy must run before tool materialization"
-    );
-    let policy = memory_turn_policy_from_hook_policy_set(&calls[pre_tool_index].policy_set)
-        .expect("memory policy exists at tool materialization")
-        .expect("memory policy decodes at tool materialization");
-    assert_eq!(
-        policy.reason_code,
-        super::MemoryPolicyReasonCode::MemoryNoSave
-    );
-    assert_eq!(
-        policy.remember_tool,
-        super::MemoryMutationToolPolicy::Disabled
-    );
-
-    assert_eq!(memory_provider.tool_contexts().len(), 1);
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let tools = requests[0]
-        .tools
-        .as_ref()
-        .expect("agent request should include tools");
-    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
-    assert!(tools.iter().any(|tool| tool.name == "memory_get"));
-    assert!(tools.iter().any(|tool| tool.name == "memory_forget"));
-    assert!(!tools.iter().any(|tool| tool.name == "memory_remember"));
-}
-
-#[tokio::test]
-async fn phase_13_without_memory_hook_subscription_exposes_no_memory_tools() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
-            calls.clone(),
-            HookPhase::TurnPreToolMaterialization,
-            HookAwaitPolicy::Blocking,
-            HookFailurePolicy::BestEffort,
-        )))
-        .await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase13_no_memory_hook",
-        "ws_phase13_no_memory_hook",
-        "turn_phase13_no_memory_hook",
-        ThreadMode::Agent,
-        "capture",
-        "no memory provider is installed",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let calls = wait_for_hook_calls(&calls, 1).await;
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].phase, HookPhase::TurnPreToolMaterialization);
-    assert!(
-        memory_turn_policy_from_hook_policy_set(&calls[0].policy_set).is_none(),
-        "memory policy should not exist without memory hooks"
-    );
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let tools = requests[0]
-        .tools
-        .as_ref()
-        .expect("agent request should include non-memory built-in tools");
-    assert!(!tools.iter().any(|tool| tool.name.starts_with("memory_")));
 }
 
 #[tokio::test]
@@ -11891,69 +11357,6 @@ async fn start_loop_budget_turn(
 }
 
 #[tokio::test]
-async fn tool_loop_provider_round_budget_requests_continuation_without_final_no_tools_round() {
-    let provider = Arc::new(LoopBudgetProvider::new(
-        LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
-        1,
-    ));
-    let mut config = test_tool_loop_config();
-    set_execution_window_budget(&mut config, 2, 16);
-    config.retry.max_recoverable_retry_rounds_per_episode = 16;
-    config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
-    let mut events = start_loop_budget_turn(
-        &manager,
-        "thr_loop_budget_rounds",
-        "turn_loop_budget_rounds",
-    )
-    .await;
-
-    let observed_events = recv_events_until_loop_budget_action(
-        &mut events,
-        ToolLoopBudgetLimitKind::AgentRounds,
-        ToolLoopBudgetAction::ContinueInNextWindow,
-    )
-    .await;
-    assert!(observed_events.iter().any(|event| matches!(
-        event,
-        AgentEvent::TurnToolLoopBudgetExceeded(notification)
-            if notification.limit_kind == ToolLoopBudgetLimitKind::AgentRounds
-                && notification.action == ToolLoopBudgetAction::ContinueInNextWindow
-                && notification.turn_id == "turn_loop_budget_rounds"
-    )));
-    assert!(
-        !observed_events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::TurnFailed { .. })),
-        "agent-round window exhaustion must not fail the turn"
-    );
-
-    let requests = provider.snapshot_requests();
-    assert!(
-        requests.len() >= 2,
-        "provider should receive the initial window requests before continuation"
-    );
-    assert!(
-        requests[0]
-            .tools
-            .as_ref()
-            .map(|tools| !tools.is_empty())
-            .unwrap_or(false)
-    );
-    assert!(
-        requests[1]
-            .tools
-            .as_ref()
-            .map(|tools| !tools.is_empty())
-            .unwrap_or(false)
-    );
-    assert!(
-        requests.iter().all(|request| request.tools.is_some()),
-        "window budget exhaustion must not send a fake final no-tools provider round"
-    );
-}
-
-#[tokio::test]
 async fn wall_clock_window_checkpoints_before_executing_the_next_tool_batch() {
     let provider = Arc::new(
         SequencedToolProvider::new(
@@ -12703,6 +12106,20 @@ async fn production_regression_repeated_failed_tools_continue_without_final_no_t
     assert!(
         requests.len() >= 2,
         "fixture should reach repeated provider rounds before continuation: {requests:?}"
+    );
+    assert!(
+        requests[0]
+            .tools
+            .as_ref()
+            .map(|tools| !tools.is_empty())
+            .unwrap_or(false)
+    );
+    assert!(
+        requests[1]
+            .tools
+            .as_ref()
+            .map(|tools| !tools.is_empty())
+            .unwrap_or(false)
     );
     assert!(
         requests.iter().all(|request| request.tools.is_some()),

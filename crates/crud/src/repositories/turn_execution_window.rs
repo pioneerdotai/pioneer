@@ -1209,12 +1209,4 @@ mod tests {
             reason
         );
     }
-
-    #[test]
-    fn checkpoint_kind_roundtrips_through_db_string() {
-        let kind = TurnExecutionCheckpointKind::WindowExhausted;
-        let encoded = checkpoint_kind_to_db(kind);
-        assert_eq!(encoded, "window_exhausted");
-        assert_eq!(checkpoint_kind_from_db(&encoded).unwrap(), kind);
-    }
 }

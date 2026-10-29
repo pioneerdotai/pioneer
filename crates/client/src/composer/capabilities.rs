@@ -1370,30 +1370,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_capability_matrix_covers_every_supported_policy_shape() {
-        assert_eq!(
-            COMPOSER_CAPABILITY_MATRIX
-                .iter()
-                .map(|case| case.id)
-                .collect::<Vec<_>>(),
-            vec![
-                "native",
-                "cli_neither",
-                "cli_skills_only",
-                "cli_mcp_only",
-                "cli_both",
-            ]
-        );
-        for case in COMPOSER_CAPABILITY_MATRIX {
-            assert_eq!(case.target.policy().supports_skills, case.supports_skills);
-            assert_eq!(
-                case.target.policy().supports_mcp_tools,
-                case.supports_mcp_tools
-            );
-        }
-    }
-
-    #[test]
     fn capability_picker_entry_points_are_visible_for_every_policy_shape() {
         for case in COMPOSER_CAPABILITY_MATRIX {
             assert_eq!(
@@ -1992,65 +1968,6 @@ mod tests {
     }
 
     #[test]
-    fn add_composer_capability_replaces_server_with_tool_for_same_mcp_server() {
-        let mut capabilities = vec![mcp_server_capability("resend")];
-
-        assert!(add_composer_capability(
-            &mut capabilities,
-            mcp_tool_capability("resend", "send_email"),
-        ));
-
-        assert_eq!(capabilities.len(), 1);
-        assert!(matches!(
-            capabilities[0].kind,
-            ComposerCapabilityKind::McpTool {
-                ref server_name,
-                ref raw_tool_name,
-                ..
-            } if server_name == "resend" && raw_tool_name == "send_email"
-        ));
-    }
-
-    #[test]
-    fn add_composer_capability_replaces_tools_with_server_for_same_mcp_server() {
-        let mut capabilities = vec![
-            mcp_tool_capability("resend", "send_email"),
-            mcp_tool_capability("browser", "open"),
-        ];
-
-        assert!(add_composer_capability(
-            &mut capabilities,
-            mcp_server_capability("resend"),
-        ));
-
-        assert_eq!(capabilities.len(), 2);
-        assert!(capabilities.iter().any(|capability| matches!(
-            capability.kind,
-            ComposerCapabilityKind::McpServer { ref name, .. } if name == "resend"
-        )));
-        assert!(capabilities.iter().any(|capability| matches!(
-            capability.kind,
-            ComposerCapabilityKind::McpTool {
-                ref server_name,
-                ref raw_tool_name,
-                ..
-            } if server_name == "browser" && raw_tool_name == "open"
-        )));
-    }
-
-    #[test]
-    fn add_composer_capability_skips_duplicate_key() {
-        let mut capabilities = vec![skill_capability("docs")];
-
-        assert!(!add_composer_capability(
-            &mut capabilities,
-            skill_capability("docs"),
-        ));
-
-        assert_eq!(capabilities.len(), 1);
-    }
-
-    #[test]
     fn remove_composer_capability_at_reports_bounds() {
         let mut capabilities = vec![skill_capability("docs"), skill_capability("imagegen")];
 
@@ -2160,36 +2077,6 @@ mod tests {
                     && capability.slug == "docs"
                     && capability.label == "owner/docs"
         ));
-    }
-
-    #[test]
-    fn capability_query_presence_uses_normalized_query() {
-        assert!(!has_capability_query(" \t\n "));
-        assert!(has_capability_query(" Docs "));
-    }
-
-    #[test]
-    fn installed_skill_rows_keep_system_browser_and_hide_required_system_skills() {
-        let mut installed = skill_item("tests/installed");
-        installed.display_name = "Installed".to_owned();
-        let mut uninstalled = skill_item("tests/uninstalled");
-        uninstalled.display_name = "Uninstalled".to_owned();
-        uninstalled.install.installed = false;
-        let mut browser = skill_item("browser");
-        browser.source_kind = "system".to_owned();
-        browser.display_name = "Browser".to_owned();
-        let mut memory = skill_item("memory");
-        memory.source_kind = "system".to_owned();
-        memory.policy.allow_implicit_invocation = true;
-        memory.policy.allow_implicit_invocation_editable = false;
-
-        let rows =
-            filter_installed_skill_capability_rows(&[uninstalled, memory, installed, browser], "");
-
-        assert_eq!(
-            rows.iter().map(|row| row.slug.as_str()).collect::<Vec<_>>(),
-            vec!["browser", "tests/installed"]
-        );
     }
 
     #[test]
@@ -2350,6 +2237,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key, "mcp-tool:workspace:browser:open");
         assert_eq!(rows[0].raw_tool_name.as_deref(), Some("open"));
+        assert_eq!(rows[0].server_name, "browser");
         assert!(rows[0].selectable);
 
         let capability = mcp_row_to_composer_capability(rows[0].clone());
@@ -2364,17 +2252,6 @@ mod tests {
         let rows = filter_mcp_tool_capability_rows(&details, "");
 
         assert!(rows.is_empty());
-    }
-
-    #[test]
-    fn mcp_tool_picker_response_reduction_returns_tool_rows() {
-        let details = mcp_details("browser", vec![mcp_tool("open", "Open page")]);
-
-        let reduction = reduce_composer_mcp_tool_picker_rows_response(details, "");
-
-        assert_eq!(reduction.rows.len(), 1);
-        assert_eq!(reduction.rows[0].server_name, "browser");
-        assert_eq!(reduction.rows[0].raw_tool_name.as_deref(), Some("open"));
     }
 
     #[test]
@@ -2616,6 +2493,48 @@ mod tests {
             &mut selected,
             Vec::new(),
         ));
+    }
+
+    #[test]
+    fn add_composer_capability_applies_replacement_and_idempotence_matrix() {
+        let cases = [
+            (
+                "tool replaces its whole server",
+                vec![mcp_server_capability("resend")],
+                mcp_tool_capability("resend", "send_email"),
+                true,
+                vec![mcp_tool_capability("resend", "send_email")],
+            ),
+            (
+                "server replaces its tool and preserves the other server",
+                vec![
+                    mcp_tool_capability("resend", "send_email"),
+                    mcp_tool_capability("browser", "open"),
+                ],
+                mcp_server_capability("resend"),
+                true,
+                vec![
+                    mcp_tool_capability("browser", "open"),
+                    mcp_server_capability("resend"),
+                ],
+            ),
+            (
+                "duplicate skill key leaves selection unchanged",
+                vec![skill_capability("docs")],
+                skill_capability("docs"),
+                false,
+                vec![skill_capability("docs")],
+            ),
+        ];
+
+        for (case, mut capabilities, incoming, expected_changed, expected) in cases {
+            assert_eq!(
+                add_composer_capability(&mut capabilities, incoming),
+                expected_changed,
+                "{case}"
+            );
+            assert_eq!(capabilities, expected, "{case}");
+        }
     }
 }
 

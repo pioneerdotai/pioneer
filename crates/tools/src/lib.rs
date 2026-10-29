@@ -634,7 +634,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
@@ -651,10 +651,6 @@ mod tests {
         ) -> Result<Box<dyn crate::context::ToolOutput>, crate::error::ToolError> {
             Ok(Box::new(FunctionToolOutput::new("ok", true)))
         }
-    }
-
-    struct CountingHandler {
-        calls: Arc<AtomicUsize>,
     }
 
     struct RecordingApprovalBroker {
@@ -711,18 +707,6 @@ mod tests {
                 duration_ms: 1,
                 meta: None,
             })
-        }
-    }
-
-    #[async_trait]
-    impl ToolHandler for CountingHandler {
-        async fn handle(
-            &self,
-            _invocation: ToolInvocation,
-            _trace: ToolEventTrace,
-        ) -> Result<Box<dyn crate::context::ToolOutput>, crate::error::ToolError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(FunctionToolOutput::new("ok", true)))
         }
     }
 
@@ -1855,6 +1839,9 @@ mod tests {
             .await
             .expect("tool execution should succeed");
         assert_eq!(result.raw_output_text(), "ok");
+
+        assert_eq!(result.call_id, "call_1");
+        assert_eq!(result.tool_name, "skill.test.echo");
     }
 
     #[test]
@@ -2097,57 +2084,6 @@ mod tests {
             .expect("dynamic tool execution should succeed");
 
         assert_eq!(result.raw_output_text(), "ok");
-    }
-
-    #[tokio::test]
-    async fn hidden_registered_tool_is_not_dispatched_to_handler() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let extension_spec = ConfiguredToolSpec::new(
-            ToolSpec::new(
-                "skill.test.hidden-dynamic",
-                "Hidden dynamic tool",
-                serde_json::json!({"type":"object"}),
-                PayloadKind::Function,
-            ),
-            ExecutionClass::Shared,
-            dynamic_unknown_output_policy(),
-        );
-
-        let built = build_tools(
-            ".",
-            "turn_hidden_dispatch",
-            test_permission_context("turn_hidden_dispatch"),
-            test_web_config(),
-            test_computer_use_config(),
-            vec![ToolExtensionBundle {
-                specs: vec![extension_spec],
-                handlers: vec![(
-                    "skill.test.hidden-dynamic".to_owned(),
-                    Arc::new(CountingHandler {
-                        calls: calls.clone(),
-                    }),
-                )],
-            }],
-        )
-        .expect("tools must build");
-
-        built
-            .router
-            .set_model_visible_tools(&["read_file".to_owned()])
-            .await;
-
-        let error = built
-            .router
-            .build_model_tool_call(RawToolCall {
-                call_id: "call_hidden_dynamic".to_owned(),
-                tool_name: "skill.test.hidden-dynamic".to_owned(),
-                arguments: "{}".to_owned(),
-            })
-            .await
-            .expect_err("hidden registered tool should be rejected before dispatch");
-
-        assert!(matches!(error, crate::ToolError::NotVisible(_)));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

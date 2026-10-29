@@ -1230,12 +1230,6 @@ mod tests {
     }
 
     #[test]
-    fn creates_with_custom_base_url() {
-        let provider = GlmProvider::with_base_url("key", "http://localhost:8080");
-        assert_eq!(provider.base_url, "http://localhost:8080");
-    }
-
-    #[test]
     fn custom_gateway_prefix_routes_chat_and_models_without_double_slashes() {
         let provider = GlmProvider::with_base_url("key", "http://localhost:8080/team/v4/");
         assert_eq!(
@@ -1245,15 +1239,6 @@ mod tests {
         assert_eq!(
             provider.models_url(),
             "http://localhost:8080/team/v4/models"
-        );
-    }
-
-    #[test]
-    fn chat_completions_url_built_correctly() {
-        let provider = GlmProvider::new("key");
-        assert_eq!(
-            provider.chat_completions_url(),
-            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
         );
     }
 
@@ -1287,17 +1272,19 @@ mod tests {
     }
 
     #[test]
-    fn provider_name() {
+    fn provider_defaults_preserve_identity_capabilities_and_chat_url() {
         let provider = GlmProvider::new("key");
-        assert_eq!(provider.name(), "glm");
-    }
 
-    #[test]
-    fn provider_capabilities() {
-        let provider = GlmProvider::new("key");
+        assert_eq!(provider.name(), "glm");
+
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(!caps.vision);
+
+        assert_eq!(
+            provider.chat_completions_url(),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
     }
 }
 

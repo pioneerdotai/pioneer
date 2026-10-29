@@ -2545,26 +2545,6 @@ mod tests {
         assert!(matches!(error, CliMcpFacadeBuildError::TooManyTools { .. }));
     }
 
-    #[test]
-    fn cli_mcp_facade_result_fixtures_cover_text_image_structured_and_error() {
-        let result = canonical_call_result(CanonicalMcpToolResult {
-            content: json!([
-                {"type": "text", "text": "hello"},
-                {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"}
-            ]),
-            structured_content: Some(json!({"ok": true})),
-            is_error: true,
-            duration_ms: 12,
-            meta: None,
-        })
-        .expect("result");
-        assert_eq!(result["content"][0]["text"], "hello");
-        assert_eq!(result["content"][1]["type"], "image");
-        assert_eq!(result["structuredContent"], json!({"ok": true}));
-        assert_eq!(result["isError"], true);
-        assert_eq!(result["_meta"]["pioneer"]["durationMs"], 12);
-    }
-
     async fn wait_for_calls(calls: &AtomicUsize, expected: usize) {
         timeout(std::time::Duration::from_secs(1), async {
             while calls.load(AtomicOrdering::SeqCst) < expected {

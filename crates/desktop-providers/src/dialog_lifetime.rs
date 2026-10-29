@@ -168,6 +168,10 @@ mod tests {
         cx.update(|window, cx| {
             assert_eq!(input.read(cx).value().as_ref(), "https://new.example/v1");
             assert_eq!(
+                form.read(cx).original(),
+                Some("https://old.example/private")
+            );
+            assert_eq!(
                 form.read(cx).mutation(cx),
                 (Some("https://new.example/v1".into()), false)
             );
@@ -179,6 +183,7 @@ mod tests {
             });
             assert!(input.read(cx).value().is_empty());
             assert_eq!(form.read(cx).mutation(cx), (None, false));
+            assert!(form.read(cx).original().is_none());
         });
     }
     #[gpui_kit::test]

@@ -142,15 +142,6 @@ struct VersionOutput {
     version: String,
     #[serde(default)]
     compiled_database_migrations: Option<Vec<String>>,
-    #[cfg(feature = "computer-use")]
-    #[serde(default)]
-    os: Option<String>,
-    #[cfg(feature = "computer-use")]
-    #[serde(default)]
-    arch: Option<String>,
-    #[cfg(feature = "computer-use")]
-    #[serde(default)]
-    computer_use: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1705,128 +1696,6 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
     Ok(())
 }
 
-// Used only by the legacy CU bridge. No live binary/payload, service, runtime
-// home, config or database is changed here. The package hash is compiled into
-// the checksum-authenticated compatibility executable, not read from the network.
-#[cfg(feature = "computer-use")]
-pub(crate) fn prepare_legacy_cu_package(directory: &Path, package: &[u8]) -> Result<PathBuf> {
-    if package.is_empty() || package.len() > 2 * 1024 * 1024 * 1024 {
-        bail!("invalid embedded CU package size");
-    }
-    let generation = directory.join(format!(
-        ".pioneer-cu-{}",
-        hex::encode(Sha256::digest(package))
-    ));
-    let binary_name = if cfg!(windows) {
-        "pioneer.exe"
-    } else {
-        "pioneer"
-    };
-    match fs::symlink_metadata(&generation) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => bail!("CU package generation must be a real directory"),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            let staging = tempfile::Builder::new()
-                .prefix(".pioneer-cu-prepare-")
-                .tempdir_in(directory)?;
-            let asset = staging.path().join("package.zip");
-            fs::write(&asset, package)?;
-            let candidate = staging.path().join(binary_name);
-            unpack_asset_to_binary(&asset, &candidate)?;
-            make_binary_executable(&candidate)?;
-            activate_cua_payload(staging.path())?;
-            fs::remove_dir_all(staging.path().join("cua.rollback"))?;
-            #[cfg(target_os = "macos")]
-            if staging.path().join("cua/bootstrap-libs").exists() {
-                fs::remove_dir_all(staging.path().join("cua/bootstrap-libs"))?;
-            }
-            fs::remove_file(asset)?;
-            // A single rename publishes a complete generation. On races never
-            // replace a published generation; validate the winner below.
-            if let Err(error) = fs::rename(staging.path(), &generation) {
-                if !generation.is_dir() {
-                    return Err(error).context("publish legacy CU package generation");
-                }
-            }
-        }
-        Err(error) => return Err(error.into()),
-    }
-    validate_legacy_cu_generation(&generation, package)?;
-    Ok(generation.join(binary_name))
-}
-
-// Kept immediately before command delegation by the bridge. File preparation
-// remains platform-neutral; this phase executes only the exact verified Gateway.
-#[cfg(feature = "computer-use")]
-pub(crate) fn probe_legacy_cu_package(gateway: &Path) -> Result<()> {
-    let version = query_binary_version_output(gateway)?;
-    if version.version != env!("CARGO_PKG_VERSION")
-        || version.os.as_deref() != Some(std::env::consts::OS)
-        || version.arch.as_deref() != Some(std::env::consts::ARCH)
-        || version.computer_use != Some(true)
-        || version.compiled_database_migrations.is_none()
-    {
-        bail!("embedded Gateway version/target/variant mismatch");
-    }
-    Ok(())
-}
-
-#[cfg(feature = "computer-use")]
-fn validate_legacy_cu_generation(generation: &Path, package: &[u8]) -> Result<()> {
-    if !fs::symlink_metadata(generation)?.is_dir() {
-        bail!("CU package generation must be a real directory");
-    }
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(package))?;
-    let mut expected = std::collections::BTreeSet::new();
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
-        let relative = entry.enclosed_name().context("invalid embedded CU path")?;
-        if entry.is_dir() {
-            continue;
-        }
-        expected.insert(relative.to_path_buf());
-        let mut path = generation.to_owned();
-        for component in relative.components() {
-            path.push(component.as_os_str());
-            if fs::symlink_metadata(&path)?.file_type().is_symlink() {
-                bail!("CU package generation contains a symlink");
-            }
-        }
-        let metadata = fs::symlink_metadata(&path)?;
-        if !metadata.is_file() || metadata.len() != entry.size() {
-            bail!("CU package generation member mismatch");
-        }
-        let mut digest = Sha256::new();
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let count = entry.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            digest.update(&buffer[..count]);
-        }
-        if sha256_file(&path)? != hex::encode(digest.finalize()) {
-            bail!("CU package generation hash mismatch");
-        }
-    }
-    let mut pending = vec![generation.to_owned()];
-    while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            if kind.is_dir() {
-                pending.push(entry.path());
-            } else if !kind.is_file() || !expected.remove(entry.path().strip_prefix(generation)?) {
-                bail!("unexpected CU package generation member");
-            }
-        }
-    }
-    if !expected.is_empty() {
-        bail!("incomplete CU package generation");
-    }
-    validate_cua_payload(&generation.join("cua"))
-}
-
 // Server installs do not require a CUA package. A transition from CU still
 // retires its managed payload in the same recovery unit as the executable.
 fn activate_install_companions(directory: &Path) -> Result<()> {
@@ -3062,19 +2931,6 @@ mod tests {
             // Exercise the archive boundary, including identity and completeness
             // failures, before using its staged output for activation/recovery.
             let manifest_bytes = fs::read(next.join("manifest.json")).unwrap();
-            #[cfg(not(windows))]
-            let archive_gateway = format!(
-                "#!/bin/sh\nprintf '%s\\n' '{}'\n",
-                serde_json::json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "os": std::env::consts::OS,
-                    "arch": std::env::consts::ARCH,
-                    "computer_use": true,
-                    "compiled_database_migrations": ["candidate-migration"]
-                })
-            )
-            .into_bytes();
-            #[cfg(windows)]
             let archive_gateway = b"candidate Gateway bytes".to_vec();
 
             for defect in ["manifest", "owner", "hash", "companion", "none"] {
@@ -3139,89 +2995,6 @@ mod tests {
                 let admission = tempfile::tempdir_in(directory).unwrap();
                 let candidate = admission.path().join("pioneer.next");
                 let result = super::unpack_asset_to_binary(&asset, &candidate);
-                let legacy = tempfile::tempdir_in(directory).unwrap();
-                let prior_binary = if cfg!(windows) {
-                    "pioneer.exe"
-                } else {
-                    "pioneer"
-                };
-                let prior = [
-                    (prior_binary, b"prior executable".as_slice()),
-                    ("settings.toml", b"prior settings".as_slice()),
-                    ("credentials", b"prior credential fixture".as_slice()),
-                    ("history.db", b"prior data fixture".as_slice()),
-                ];
-                for (name, bytes) in prior {
-                    fs::write(legacy.path().join(name), bytes).unwrap();
-                }
-                let package = fs::read(&asset).unwrap();
-                if defect != "none" {
-                    assert!(super::prepare_legacy_cu_package(legacy.path(), &package).is_err());
-                }
-                if defect == "none" {
-                    let prepared =
-                        super::prepare_legacy_cu_package(legacy.path(), &package).unwrap();
-                    let generation = prepared.parent().unwrap();
-                    assert!(generation.join("cua").is_dir());
-                    assert_eq!(
-                        super::prepare_legacy_cu_package(legacy.path(), &package).unwrap(),
-                        prepared
-                    );
-                    assert!(!legacy.path().join("cua").exists());
-                    assert!(!legacy.path().join("cua.rollback").exists());
-                    #[cfg(not(windows))]
-                    {
-                        super::probe_legacy_cu_package(&prepared).unwrap();
-                        for (field, value) in [
-                            ("version", serde_json::json!("wrong-version")),
-                            ("os", serde_json::json!("wrong-os")),
-                            ("arch", serde_json::json!("wrong-architecture")),
-                            ("computer_use", serde_json::json!(false)),
-                            ("compiled_database_migrations", serde_json::Value::Null),
-                        ] {
-                            let mut metadata = serde_json::json!({
-                                "version": env!("CARGO_PKG_VERSION"),
-                                "os": std::env::consts::OS,
-                                "arch": std::env::consts::ARCH,
-                                "computer_use": true,
-                                "compiled_database_migrations": ["candidate-migration"]
-                            });
-                            metadata[field] = value;
-                            fs::write(
-                                &prepared,
-                                format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", metadata),
-                            )
-                            .unwrap();
-                            assert!(
-                                super::probe_legacy_cu_package(&prepared).is_err(),
-                                "accepted {field}"
-                            );
-                        }
-                        fs::write(&prepared, &archive_gateway).unwrap();
-
-                        assert!(
-                            super::ensure_candidate_schema_compatible(
-                                &["unavailable-migration".into()],
-                                super::query_binary_version_output(&prepared)
-                                    .unwrap()
-                                    .compiled_database_migrations
-                                    .as_deref(),
-                            )
-                            .is_err()
-                        );
-                    }
-                    // Reuse must reject tampering before launching that executable.
-                    fs::write(&prepared, b"tampered Gateway").unwrap();
-                    assert!(super::prepare_legacy_cu_package(legacy.path(), &package).is_err());
-                    fs::write(&prepared, &archive_gateway).unwrap();
-                    super::make_binary_executable(&prepared).unwrap();
-                    fs::write(generation.join("unexpected.dll"), b"untrusted library").unwrap();
-                    assert!(super::prepare_legacy_cu_package(legacy.path(), &package).is_err());
-                }
-                for (name, bytes) in prior {
-                    assert_eq!(fs::read(legacy.path().join(name)).unwrap(), bytes);
-                }
-
                 if defect != "none" {
                     assert!(result.is_err(), "accepted corrupt {defect} archive");
                     assert!(!directory.join("cua.rollback").exists());
@@ -3800,50 +3573,6 @@ fi
 
     #[cfg(not(windows))]
     #[test]
-    fn unix_path_setup_updates_profile_without_creating_bash_profile() {
-        let _guard = env_lock().lock().expect("env lock poisoned");
-
-        let home = unique_temp_path("home-profile-no-bash-profile");
-        fs::create_dir_all(&home).expect("create temp home dir");
-        let bin_dir = home.join(".local").join("bin");
-        fs::create_dir_all(&bin_dir).expect("create bin dir");
-        let profile = home.join(".profile");
-        fs::write(&profile, "# test profile\n").expect("write .profile");
-
-        let old_home = std::env::var_os("HOME");
-        let old_path = std::env::var_os("PATH");
-        let old_shell = std::env::var_os("SHELL");
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::set_var("PATH", "/usr/bin:/bin");
-            std::env::set_var("SHELL", "/bin/bash");
-        }
-
-        let result =
-            ensure_unix_user_path_configured(&bin_dir).expect("path setup should not fail");
-
-        restore_env_var("HOME", old_home);
-        restore_env_var("PATH", old_path);
-        restore_env_var("SHELL", old_shell);
-
-        let profile_content = fs::read_to_string(&profile).expect("read .profile");
-        assert!(result.path_updated);
-        assert!(
-            result.warnings.is_empty(),
-            "warnings: {:#?}",
-            result.warnings
-        );
-        assert!(profile_content.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
-        assert!(
-            !home.join(".bash_profile").exists(),
-            "installer should not create .bash_profile and shadow .profile"
-        );
-
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[cfg(not(windows))]
-    #[test]
     fn unix_path_setup_updates_existing_bash_profile_for_bash() {
         let _guard = env_lock().lock().expect("env lock poisoned");
 
@@ -3883,49 +3612,6 @@ fi
         assert_eq!(
             fs::read_to_string(&profile).expect("read .profile"),
             "# profile\n"
-        );
-
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn unix_path_setup_updates_zprofile_for_zsh_without_creating_zshrc() {
-        let _guard = env_lock().lock().expect("env lock poisoned");
-
-        let home = unique_temp_path("home-zsh-zprofile");
-        fs::create_dir_all(&home).expect("create temp home dir");
-        let bin_dir = home.join(".local").join("bin");
-        fs::create_dir_all(&bin_dir).expect("create bin dir");
-
-        let old_home = std::env::var_os("HOME");
-        let old_path = std::env::var_os("PATH");
-        let old_shell = std::env::var_os("SHELL");
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::set_var("PATH", "/usr/bin:/bin");
-            std::env::set_var("SHELL", "/bin/zsh");
-        }
-
-        let result =
-            ensure_unix_user_path_configured(&bin_dir).expect("path setup should not fail");
-
-        restore_env_var("HOME", old_home);
-        restore_env_var("PATH", old_path);
-        restore_env_var("SHELL", old_shell);
-
-        let zprofile = home.join(".zprofile");
-        let zprofile_content = fs::read_to_string(&zprofile).expect("read .zprofile");
-        assert!(result.path_updated);
-        assert!(
-            result.warnings.is_empty(),
-            "warnings: {:#?}",
-            result.warnings
-        );
-        assert!(zprofile_content.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
-        assert!(
-            !home.join(".zshrc").exists(),
-            "installer should not create .zshrc as a side effect of PATH setup"
         );
 
         let _ = fs::remove_dir_all(&home);
@@ -4140,5 +3826,63 @@ fi
         .into_bytes();
         response.extend_from_slice(body);
         response
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_path_setup_updates_shell_profile_without_creating_shadow_file() {
+        let cases = [
+            (
+                "home-profile-no-bash-profile",
+                "/bin/bash",
+                &[(".profile", "# test profile\n")][..],
+                ".profile",
+                ".bash_profile",
+            ),
+            (
+                "home-zsh-zprofile",
+                "/bin/zsh",
+                &[][..],
+                ".zprofile",
+                ".zshrc",
+            ),
+        ];
+        for (prefix, shell, initial_files, target_name, absent_name) in cases {
+            let _guard = env_lock().lock().expect("env lock poisoned");
+            let home = unique_temp_path(prefix);
+            fs::create_dir_all(&home).expect("create temp home dir");
+            let bin_dir = home.join(".local").join("bin");
+            fs::create_dir_all(&bin_dir).expect("create bin dir");
+            for (name, content) in initial_files {
+                fs::write(home.join(name), content).expect("write initial profile");
+            }
+            let old_home = std::env::var_os("HOME");
+            let old_path = std::env::var_os("PATH");
+            let old_shell = std::env::var_os("SHELL");
+            unsafe {
+                std::env::set_var("HOME", &home);
+                std::env::set_var("PATH", "/usr/bin:/bin");
+                std::env::set_var("SHELL", shell);
+            }
+            let result =
+                ensure_unix_user_path_configured(&bin_dir).expect("path setup should not fail");
+            restore_env_var("HOME", old_home);
+            restore_env_var("PATH", old_path);
+            restore_env_var("SHELL", old_shell);
+            let profile_content =
+                fs::read_to_string(home.join(target_name)).expect("read target profile");
+            assert!(result.path_updated);
+            assert!(
+                result.warnings.is_empty(),
+                "warnings: {:#?}",
+                result.warnings
+            );
+            assert!(profile_content.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
+            assert!(
+                !home.join(absent_name).exists(),
+                "installer should not create {absent_name} for {shell}"
+            );
+            let _ = fs::remove_dir_all(&home);
+        }
     }
 }

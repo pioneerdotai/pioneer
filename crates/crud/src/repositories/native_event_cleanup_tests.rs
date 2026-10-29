@@ -1156,73 +1156,72 @@ async fn bootstrap_cursor_rolls_back_with_job_registration_failure() -> Result<(
 }
 
 #[tokio::test]
-async fn queued_cleanup_matches_baseline_retained_id_set() -> Result<()> {
-    let baseline = Fixture::open().await?;
-    let addressed = Fixture::open().await?;
-    for f in [&baseline, &addressed] {
-        f.turn("done", true).await?;
-        f.turn("active", false).await?;
-        for i in 0..160 {
-            f.event(
-                &format!("history-{i:03}"),
-                Some("done"),
-                "codex",
-                if i % 10 == 0 {
-                    "item/completed"
-                } else {
-                    "turn/completed"
-                },
-                128,
-            )
-            .await?;
-        }
-        f.event("active", Some("active"), "codex", "item/completed", 128)
-            .await?;
-        f.event("orphan", None, "codex", "item/completed", 128)
-            .await?;
-        f.event("wrong", Some("done"), "wrong", "item/completed", 128)
-            .await?;
-        f.event("oversized", Some("done"), "codex", "item/completed", 262145)
-            .await?;
+async fn queued_cleanup_keeps_exact_retained_ids_across_sparse_history() -> Result<()> {
+    let f = Fixture::open().await?;
+    f.turn("done", true).await?;
+    f.turn("active", false).await?;
+    for i in 0..160 {
+        f.event(
+            &format!("history-{i:03}"),
+            Some("done"),
+            "codex",
+            if i % 10 == 0 {
+                "item/completed"
+            } else {
+                "turn/completed"
+            },
+            128,
+        )
+        .await?;
     }
-    let mut cursor = 0;
+    f.event("active", Some("active"), "codex", "item/completed", 128)
+        .await?;
+    f.event("orphan", None, "codex", "item/completed", 128)
+        .await?;
+    f.event("wrong", Some("done"), "wrong", "item/completed", 128)
+        .await?;
+    f.event("oversized", Some("done"), "codex", "item/completed", 262145)
+        .await?;
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM cli_runtime_native_event")
+            .await?,
+        164
+    );
+    let maintenance = f.store.with_maintenance_access();
+    let mut deleted = 0;
     let mut finished = false;
     for _ in 0..20 {
-        let m = baseline
-            .store
-            .with_maintenance_access()
-            .cleanup_native_events_baseline_quantum(cursor)
-            .await?;
-        match m.last_rowid {
-            Some(next) => cursor = next,
-            None => {
-                finished = true;
-                break;
-            }
-        }
-    }
-    assert!(finished);
-    finished = false;
-    for now in 1..20 {
-        if run(&addressed.db, now).await?.jobs_examined == 0 {
+        let metrics = maintenance.cleanup_native_events_quantum().await?;
+        deleted += metrics.events_deleted;
+        if metrics.jobs_examined == 0 {
             finished = true;
             break;
         }
     }
-    assert!(finished);
-    async fn ids(f: &Fixture) -> Result<Vec<String>> {
-        let rows =
-            f.db.query_all_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT id FROM cli_runtime_native_event ORDER BY id",
-            ))
-            .await?;
-        Ok(rows
-            .iter()
-            .map(|row| row.try_get_by_index(0))
-            .collect::<Result<Vec<_>, _>>()?)
-    }
-    assert_eq!(ids(&baseline).await?, ids(&addressed).await?);
+    assert!(finished, "cleanup should settle within the bounded fixture");
+    assert_eq!(deleted, 16);
+    let rows =
+        f.db.query_all_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT id FROM cli_runtime_native_event ORDER BY id",
+        ))
+        .await?;
+    let retained = rows
+        .iter()
+        .map(|row| row.try_get_by_index(0))
+        .collect::<Result<Vec<String>, _>>()?;
+    let mut expected: Vec<String> = ["active", "orphan", "oversized", "wrong"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    expected.extend(
+        (0..160)
+            .filter(|i| i % 10 != 0)
+            .map(|i| format!("history-{i:03}")),
+    );
+    expected.sort();
+    assert_eq!(retained.len(), 148);
+    assert_eq!(retained, expected);
     Ok(())
 }
 
