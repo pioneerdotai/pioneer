@@ -39218,7 +39218,9 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
             provider.rounds()
         );
     }
-    let opened = recv_notification_by_method(&mut rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+    // Outbox delivery precedes child preflight and tool admission, just as it
+    // does for native Tasks. Use the same bounded child launch wait.
+    let opened = recv_native_task_permission_opened(&mut rx).await;
     let opened_request = opened
         .params
         .as_ref()
