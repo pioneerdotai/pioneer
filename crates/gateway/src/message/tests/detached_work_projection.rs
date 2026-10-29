@@ -88,6 +88,41 @@ async fn detached_parent_notifications_and_late_items_reads_preserve_authoritati
     let (_directory, mut harness) = detached_parent("owned_absence").await;
     let store = harness.processor.crud_store.clone();
     let now = super::super::now_timestamp_secs();
+    let thread = store
+        .get_thread_model(&harness.thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, mut occurrence) = store
+        .get_turn(&harness.thread_id, &harness.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // The task card belongs to its occurrence Turn in the presentation thread;
+    // the Composer parent remains a Conversation with DetachedTask ownership.
+    occurrence.id = "detached-run".into();
+    occurrence.turn_kind = TurnKind::TaskRun;
+    occurrence.origin = TurnOrigin::DetachedTask;
+    store
+        .materialize_native_agent_turn_event(
+            pioneer_crud::CanonicalTurnEventPayload::TurnStarted(
+                pioneer_crud::CanonicalTurnStartedEventPayload {
+                    thread: thread.clone(),
+                    sandbox_mode: SandboxMode::FullAccess,
+                    turn: occurrence.clone(),
+                    input: Vec::new(),
+                    actor: Some(pioneer_protocol::PersistedActorRef::Principal(
+                        authenticated_test_superuser().principal_id.clone(),
+                    )),
+                    reasoning_effort: None,
+                    work_owner: pioneer_crud::TurnWorkOwner::Turn,
+                },
+            ),
+            thread.updated_at,
+            None,
+        )
+        .await
+        .unwrap();
     let items = [
         TurnItem::SystemEvent {
             id: "parent-diagnostic".into(),
@@ -105,10 +140,10 @@ async fn detached_parent_notifications_and_late_items_reads_preserve_authoritati
         },
         TurnItem::Task {
             item: TaskTurnItem {
-                id: "parent-task".into(),
+                id: "detached-task-anchor".into(),
                 task_id: "detached-task".into(),
-                created_by_turn_id: None,
-                run_id: Some("detached-run".into()),
+                created_by_turn_id: Some(harness.turn_id.clone()),
+                run_id: Some(occurrence.id.clone()),
                 parent_task_id: None,
                 root_task_id: None,
                 title: "Detached execution".into(),
@@ -135,12 +170,17 @@ async fn detached_parent_notifications_and_late_items_reads_preserve_authoritati
     let mut tombstones = Vec::new();
     let mut changed_blocks = HashSet::new();
     for (offset, item) in items.iter().enumerate() {
+        let item_turn_id = if matches!(item, TurnItem::Task { .. }) {
+            &occurrence.id
+        } else {
+            &harness.turn_id
+        };
         store
             .materialize_item_completed(
                 ItemCompletedNotification {
                     workspace_id: harness.workspace_id.clone(),
                     thread_id: harness.thread_id.clone(),
-                    turn_id: harness.turn_id.clone(),
+                    turn_id: item_turn_id.clone(),
                     item: item.clone(),
                 },
                 now + offset as i64,
@@ -154,7 +194,7 @@ async fn detached_parent_notifications_and_late_items_reads_preserve_authoritati
                 .notify_semantic_timeline_item_changed(
                     &harness.workspace_id,
                     &harness.thread_id,
-                    &harness.turn_id,
+                    item_turn_id,
                     item,
                     Some("completed"),
                 )
@@ -206,7 +246,11 @@ async fn detached_parent_notifications_and_late_items_reads_preserve_authoritati
                             serde_json::from_value(packet["params"].clone()).unwrap();
                         assert!(!notification.changed_block_ids.contains(&work_id));
                         changed_blocks.extend(notification.changed_block_ids.iter().cloned());
-                        if !notification.turn_work_tombstones.is_empty() {
+                        if notification
+                            .turn_work_tombstones
+                            .iter()
+                            .any(|tombstone| tombstone.turn_id == harness.turn_id)
+                        {
                             tombstones.push(notification);
                         }
                     }
@@ -230,8 +274,8 @@ async fn detached_parent_notifications_and_late_items_reads_preserve_authoritati
     )));
     assert!(
         changed_blocks.contains(&pioneer_crud::detached_task_run_block_id(
-            &harness.turn_id,
-            "parent-task"
+            &occurrence.id,
+            "detached-task-anchor"
         ))
     );
     let latest = tombstones
@@ -272,10 +316,8 @@ async fn detached_parent_notifications_and_late_items_reads_preserve_authoritati
             .any(|b| b.block_id
                 == pioneer_crud::assistant_block_id(&harness.turn_id, "parent-final"))
     );
-    assert!(
-        page.blocks.iter().any(|b| b.block_id
-            == pioneer_crud::detached_task_run_block_id(&harness.turn_id, "parent-task"))
-    );
+    assert!(page.blocks.iter().any(|b| b.block_id
+        == pioneer_crud::detached_task_run_block_id(&occurrence.id, "detached-task-anchor")));
     assert!(page.blocks.iter().all(|b| b.block_id != work_id));
     let mut client = SemanticTimelineState::default();
     apply_thread_timeline_page(&mut client, page, TopLevelPageMergeMode::Reset);
