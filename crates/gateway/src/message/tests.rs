@@ -27481,15 +27481,16 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         "background root question",
     )
     .await;
+    // Keep the root above the unknown model's 128k fallback context even with
+    // UTF-16 estimation, so the summarizer barrier requires a provider call.
+    let history_answer = "🧪 ".repeat(180_000);
+    assert!(pioneer_compaction::text_tokens(&history_answer) > 128_000);
     root_conversation_compaction::answer(
         &history,
         history_thread,
         history_turn,
         history_at,
-        // Exceed the context budget with dense tokens, rather than megabytes
-        // of low-density text that require many incremental fragment fits.
-        // The spaces keep tokenizer pieces bounded as well.
-        &"🧪 ".repeat(60_000),
+        &history_answer,
     )
     .await;
     let pending = crud_store

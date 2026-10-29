@@ -5039,7 +5039,9 @@ async fn wait_backoff(store: &CrudStore) {
 }
 #[tokio::test]
 async fn compaction_runner_portions_cover_huge_source_once_and_reuse_committed_result() {
-    let f = fixture(&"漢字🌍".repeat(4000), vec![], true, true).await;
+    // Each repetition estimates one token; keep the source larger than several
+    // 4096-token requests even before their instructions and summary reserves.
+    let f = fixture(&"漢字🌍".repeat(12_000), vec![], true, true).await;
     assert!(matches!(
         f.runner.run(CancellationToken::new()).await.unwrap(),
         CompactionExit::Applied(_)
@@ -27785,15 +27787,21 @@ async fn partially_read_portable_context_survives_checkpoint_and_restart() {
         final_state.previous_checkpoint.as_deref(),
         Some(head.as_str())
     );
-    assert_eq!(
-        f.store
-            .compaction_checkpoint(&head)
-            .await
-            .unwrap()
-            .unwrap()
-            .coverage,
-        [first_source, next_source]
-    );
+    // A source completed before the final portion belongs to an ancestor.
+    // Require both sources exactly once across the persisted checkpoint chain.
+    let mut checkpoint_id = Some(head);
+    let mut coverage = Vec::new();
+    for _ in &inputs {
+        let Some(id) = checkpoint_id else { break };
+        let checkpoint = f.store.compaction_checkpoint(&id).await.unwrap().unwrap();
+        coverage.extend(checkpoint.coverage);
+        checkpoint_id = checkpoint.previous;
+    }
+    assert!(checkpoint_id.is_none(), "checkpoint chain must terminate");
+    coverage.sort();
+    let mut expected_coverage = vec![first_source, next_source];
+    expected_coverage.sort();
+    assert_eq!(coverage, expected_coverage);
     for (id, expected) in [("portable-large", first_raw), ("portable-next", next_raw)] {
         let stored: String = db
             .query_one_raw(Statement::from_sql_and_values(
