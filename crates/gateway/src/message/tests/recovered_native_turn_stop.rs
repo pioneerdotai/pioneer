@@ -2170,6 +2170,29 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                             .await
                             .unwrap()
                     );
+                    // The accepted canonical Stop fences even the first child,
+                    // whose Turn is still in_progress until ordered projection.
+                    assert!(
+                        store
+                            .native_cancellation_was_accepted(&first_turn)
+                            .await
+                            .unwrap()
+                    );
+                    let error = processor
+                        .guard_execution_side_effect(
+                            &first_turn,
+                            crate::authorization::ResourceAction::ProviderUse,
+                        )
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        error
+                            .downcast_ref::<crate::authorization::ExecutionTurnNotInProgress>()
+                            .unwrap()
+                            .status(),
+                        TurnStatus::Interrupted
+                    );
+                    assert!(processor.guard_execution_commit(&first_turn).await.is_err());
                     timeout(Duration::from_secs(10), async {
                         while provider_cancelled.load(Ordering::SeqCst) != children.len() as u64 {
                             tokio::task::yield_now().await;

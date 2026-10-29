@@ -12,6 +12,7 @@ mod model_history;
 mod projector;
 mod repositories;
 pub use repositories::provider_usage::ProviderUsageObservation;
+pub use repositories::turn::TurnExecutionBinding;
 mod task_delivery_lifecycle;
 mod task_delivery_recovery;
 mod task_event_context;
@@ -19053,6 +19054,22 @@ impl CrudStore {
             .collect()
     }
 
+    pub async fn get_turn_execution_binding(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<TurnExecutionBinding>> {
+        turn::find_turn_execution_binding(&self.connection, thread_id, turn_id).await
+    }
+
+    pub async fn get_turn_execution_status(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<TurnStatus>> {
+        turn::find_turn_execution_status(&self.connection, thread_id, turn_id).await
+    }
+
     pub async fn get_turn(&self, thread_id: &str, turn_id: &str) -> Result<Option<(String, Turn)>> {
         let Some(thread_model) = thread::find_thread_by_id(&self.connection, thread_id).await?
         else {
@@ -35188,6 +35205,7 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    mod authorization_reads;
     mod saved_history_read;
     mod task_webhook;
     mod thread_read_pages;
