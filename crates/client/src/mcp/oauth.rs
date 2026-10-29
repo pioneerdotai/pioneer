@@ -922,6 +922,20 @@ mod tests {
             released: AtomicUsize::new(0),
         });
         core.set_mcp_oauth_shell(browser.clone());
+        // Bound OAuth requests need the same live socket as the notification
+        // fixture. Keep setup transport events out of the dispatcher scenario.
+        core.transport_runtime().inject_test_event(
+            crate::transport::ws::GatewayWsEvent::Connected {
+                connection_id: 7,
+                endpoint_id: "endpoint".into(),
+                endpoint_name: "Synthetic".into(),
+                gateway_base_url: pioneer_protocol::GatewayBaseUrl::parse_presentation(
+                    "https://synthetic.invalid",
+                )
+                .unwrap(),
+            },
+        );
+        core.transport_runtime().drain_ws_events();
         core.start_gateway_event_dispatcher();
         core.start_mcp_operation_controller();
         let transport = Arc::new(CancelTransport(AtomicUsize::new(0)));

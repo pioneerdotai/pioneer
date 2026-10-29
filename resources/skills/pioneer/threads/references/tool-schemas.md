@@ -6,12 +6,12 @@ Use current callable schemas as the authority. Canonical names below are mapped 
 
 | Tool | Input | Continuation and result |
 | --- | --- | --- |
-| `threads_list` | Required `limit` (1–100); optional string/null `cursor` | `threads`, `nextCursor`, `eof`; immutable thread-ID order, including accessible internal/archived threads |
+| `threads_list` | Required `limit` (1–100); optional string/null `cursor` | `threads`, `nextCursor`, `eof`; creation order `created_at DESC, id DESC`, including accessible internal/archived threads |
 | `threads_history_read` | Required `threadId`, `limit` (1–100); optional `anchor:{turnId,itemId?}`, `direction:"older"` or `"newer"` (default older), string/null `cursor` | `events`, `nextCursor`, `eof`, `reverseCursor`, `reverseDirection`, `direction` in a saved snapshot |
 | `threads_children_list` | Required `threadId`, `recursive`, `limit` (1–100); optional string/null `cursor` | `threads`, `nextCursor`, `eof`; direct children or recursive descendants |
 | `threads_search` | Required nonblank `query`, `limit` (1–100); optional string/null `cursor` | `threads`, `nextCursor`, `eof`, `coverageIncomplete`, `warnings`, optional `pageFragment` |
 
-No maximum query length is imposed. Listing and children may return an empty nonterminal page. Repeat with the issued cursor, original limit, and original recursive setting when applicable. A changed listing source can invalidate the cursor; restart that listing rather than editing the cursor. Children cursors track traversed edges/returned metadata, not unrelated workspace activity.
+No maximum query length is imposed. Listing and children may return an empty nonterminal page. Repeat with the issued cursor, original limit, and original recursive setting when applicable. `threads_list` uses `created_at DESC, id DESC`, retaining the exact creation date and ID of the last examined candidate. It progresses through inaccessible candidates too. Unrelated edits/activity and deletion of a completed candidate do not invalidate that position. New threads before it appear on a fresh first page. Access is rechecked on each page. A changed, missing, or inaccessible card being continued as fragments fails safely; never splice source versions. Old-format, invalid, or incompatible list cursors require restarting with the original parameters. Children cursors track traversed edges/returned metadata, not unrelated workspace activity.
 
 Large list/children metadata uses JSON fragments (`encoding`, `version`, `offset`, `nextOffset`, `eof`, `text`); concatenate exact text by UTF-8 byte offsets and decode only at EOF. Titles are not shortened to fit a card.
 
