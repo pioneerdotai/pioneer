@@ -27280,7 +27280,20 @@ async fn durable_context_cursor_finishes_old_text_before_portable_next_source() 
     };
 
     for old_version in [None, Some(1_u32)] {
-        let f = fixture("unused", vec![], true, false).await;
+        // The remaining legacy payload and the next portable source must fit
+        // together; this test checks their cursor boundary, not fragmentation.
+        let f = fixture_with_canonical_payloads_observer_and_budget(
+            vec![canonical_agent_message_event_payload(
+                "fixture-agent-message",
+                "unused",
+            )],
+            vec![],
+            true,
+            false,
+            None,
+            ModelBudget::new(Some(8_192), None, None),
+        )
+        .await;
         let context_payload = |id: &str, opaque: &str| {
             let mut message = ChatMessage::assistant(format!("answer {id}"));
             message.provider_replay_state = Some(ProviderReplayState::for_model(

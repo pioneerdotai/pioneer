@@ -33674,7 +33674,19 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                     .to_string(),
                 )
                 .await;
-            let response = recv_response_by_id(&mut rx, &request_id).await;
+            let payload = recv_jsonrpc_payload_by_id(&mut rx, &request_id).await;
+            let response: JsonRpcResponse = match serde_json::from_str(&payload) {
+                Ok(response) => response,
+                Err(error) => {
+                    let progress = pioneer_entity::compaction_runner_state::Entity::find()
+                        .all(&crud_store.database_connection())
+                        .await
+                        .unwrap();
+                    panic!(
+                        "manual {runtime_id} child follow-up {followup_index} rejected: {error}; payload: {payload}; compaction: {progress:?}"
+                    );
+                }
+            };
             let accepted: TurnStartResponse = serde_json::from_value(response.result)
                 .expect("manual child follow-up must be accepted as a foreground turn");
             assert_eq!(accepted.turn.id, followup_turn_id);
@@ -80446,6 +80458,14 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
         .await;
     let tool_fixture = tempfile::tempdir().unwrap();
     let executions = tool_fixture.path().join("executions");
+    #[derive(Debug)]
+    struct ConfirmedContextOverflow;
+    impl std::fmt::Display for ConfirmedContextOverflow {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("provider context limit exceeded")
+        }
+    }
+    impl std::error::Error for ConfirmedContextOverflow {}
     struct OverflowProvider(std::sync::Mutex<Vec<ChatRequest>>, Vec<ProviderToolCall>);
     #[async_trait::async_trait]
     impl Provider for OverflowProvider {
@@ -80479,7 +80499,7 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
                     tool_calls: self.1.clone(),
                 });
             }
-            anyhow::bail!("provider error: maximum context length exceeded")
+            Err(anyhow::Error::new(ConfirmedContextOverflow))
         }
         async fn stream_chat(
             &self,
@@ -80487,6 +80507,16 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
         ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
         {
             anyhow::bail!("non-stream fixture")
+        }
+        fn classify_failure(
+            &self,
+            error: &anyhow::Error,
+        ) -> Option<pioneer_provider::ProviderFailureClassification> {
+            error.downcast_ref::<ConfirmedContextOverflow>().map(|_| {
+                pioneer_provider::ProviderFailureClassification::new(
+                    pioneer_protocol::ProviderFailureClass::ContextTooLarge,
+                )
+            })
         }
     }
     let calls = if with_tool {

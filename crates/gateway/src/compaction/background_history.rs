@@ -561,10 +561,10 @@ pub(crate) async fn prepare_completed_history_owned(
             .estimated_input_tokens
             .saturating_sub(message_total)
             .saturating_add(fixed_input_tokens);
-        let available = budget
-            .context
-            .saturating_sub(full.output_reserve)
-            .saturating_sub(fixed);
+        // The replacement summary shares the estimated-input allowance with
+        // fixed framing. Raw context room omits padding and input-only limits.
+        let available =
+            estimated_input_capacity(&budget, full.output_reserve, false).saturating_sub(fixed);
         let available = if current.transport == Transport::Codex {
             codex_history_budget.as_ref().map_or(available, |transfer| {
                 transfer.available_input_tokens(&budget, full.output_reserve, fixed)

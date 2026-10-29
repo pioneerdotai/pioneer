@@ -597,10 +597,8 @@ async fn prepare_native_projection_with_prepared(
         // Compaction changes the measured prefix; its replacement candidates
         // must use their local fixed framing, not reuse an old provider anchor.
         let fixed = full.fixed_input_tokens;
-        let available = budget
-            .context
-            .saturating_sub(full.output_reserve)
-            .saturating_sub(fixed);
+        let available =
+            estimated_input_capacity(&budget, full.output_reserve, recovery).saturating_sub(fixed);
         let goal = summarizer
             .model_budget()
             .summarizer_cap(u64::MAX)?
