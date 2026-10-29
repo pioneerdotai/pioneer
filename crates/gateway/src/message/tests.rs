@@ -4685,6 +4685,7 @@ impl Provider for PromptParityCaptureProvider {
             owned_by: Some("openai".to_owned()),
             limits: pioneer_protocol::ProviderModelLimits::default(),
             capabilities: pioneer_protocol::ProviderModelCapabilities {
+                chat: Some(true),
                 tool_calling: Some(true),
                 thinking: Some(true),
                 reasoning: Some(pioneer_protocol::ProviderModelReasoningCapabilities {

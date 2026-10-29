@@ -1258,6 +1258,13 @@ fn provider_model_from_gemini_model_entry(m: GeminiModelEntry) -> ProviderModelI
             },
         },
         capabilities: ProviderModelCapabilities {
+            // generateContent is also used by audio/image products. Its
+            // presence alone cannot prove text chat; source modalities must
+            // fill that gap. An explicit operation denial remains final.
+            chat_operation: m
+                .supported_generation_methods
+                .as_ref()
+                .map(|methods| methods.iter().any(|method| method == "generateContent")),
             streaming: Some(supports_streaming),
             thinking: m.thinking.flatten().or_else(|| {
                 reasoning_registry::reasoning_capabilities_for_model("gemini", &id)

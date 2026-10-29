@@ -309,6 +309,17 @@ struct ApiModelEntry {
     created: Option<i64>,
     #[serde(default)]
     owned_by: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_endpoints")]
+    supported_endpoints: Option<serde_json::Value>,
+    #[serde(default)]
+    capabilities: serde_json::Value,
+}
+
+// Preserve missing versus explicit null: only absence has the CAPI default.
+fn deserialize_present_endpoints<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+    Ok(Some(serde::Deserialize::deserialize(d)?))
 }
 
 // ── Implementation ──────────────────────────────────────────────────────────
@@ -944,7 +955,21 @@ impl crate::traits::Provider for CopilotProvider {
                 provider: "copilot".to_owned(),
                 owned_by: m.owned_by.or(Some("github".to_owned())),
                 limits: ProviderModelLimits::default(),
-                capabilities: ProviderModelCapabilities::default(),
+                capabilities: ProviderModelCapabilities {
+                    chat: match m.capabilities["type"].as_str() {
+                        Some("embeddings" | "completion") => Some(false),
+                        _ => match m.supported_endpoints.as_ref() {
+                            Some(endpoints) => crate::catalog::tool_support_from_marker_list(
+                                endpoints,
+                                "/chat/completions",
+                            ),
+                            None => {
+                                (m.capabilities["type"].as_str() == Some("chat")).then_some(true)
+                            }
+                        },
+                    },
+                    ..Default::default()
+                },
                 transcription: None,
                 pricing: None,
                 active: Some(true),

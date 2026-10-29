@@ -1537,6 +1537,9 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
             .map(|dt| dt.timestamp())
     });
     let mut capabilities = ProviderModelCapabilities::default();
+    // This API lists Claude models available to the Messages API, rather than
+    // a mixed inventory of unrelated inference operations.
+    capabilities.chat = Some(true);
     reasoning_registry::apply_reasoning_capabilities("anthropic", m.id.as_str(), &mut capabilities);
     if let Some(native) = m.capabilities.as_ref() {
         let mut facts = std::collections::BTreeMap::new();

@@ -166,6 +166,9 @@ struct OllamaModelDetails {
 
 fn apply_show_input(model: &mut ProviderModelInfo, response: OllamaShowResponse) {
     if let Some(capabilities) = response.capabilities {
+        // The existing /api/show read supplies this closed capability list.
+        // /api/tags membership alone says nothing about the /api/chat route.
+        model.capabilities.chat = Some(capabilities.iter().any(|v| v == "completion"));
         let vision = capabilities.iter().any(|v| v == "vision");
         model.capabilities.vision = Some(vision);
         // This native Chat renderer accepts text and images; audio products
@@ -896,6 +899,25 @@ impl crate::traits::Provider for OllamaProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn show_completion_proves_chat_without_inferring_it_from_vision_or_tools() {
+        for (capabilities, expected) in [
+            (serde_json::Value::Null, None),
+            (serde_json::json!(["embedding"]), Some(false)),
+            (serde_json::json!(["vision", "tools"]), Some(false)),
+            (serde_json::json!(["completion"]), Some(true)),
+        ] {
+            let mut model: ProviderModelInfo = serde_json::from_value(serde_json::json!({
+                "id":"local-model", "provider":"ollama", "limits":{}, "capabilities":{}
+            }))
+            .unwrap();
+            let response =
+                serde_json::from_value(serde_json::json!({"capabilities":capabilities})).unwrap();
+            apply_show_input(&mut model, response);
+            assert_eq!(model.capabilities.chat, expected);
+        }
+    }
+
     #[test]
     fn native_bodies_preserve_prepared_cap_independent_of_temperature() {
         let provider = OllamaProvider::new();

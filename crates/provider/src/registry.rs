@@ -349,6 +349,37 @@ impl AuthorityBoundProvider {
         }
     }
 
+    fn select_discovery(
+        &self,
+        purpose: crate::selection::ModelPurpose,
+        models: Vec<ProviderModelInfo>,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Vec<ProviderModelInfo> {
+        use crate::selection::ModelPurpose;
+        // Preserve the same full authority-local discovery snapshot as the raw
+        // chat path. Other purposes must never replace that snapshot.
+        if purpose == ModelPurpose::Chat {
+            self.remember_discovery(&models);
+        }
+        let fallback =
+            catalog.filter(|_| self.use_public_catalog && self.inner.name() != "vercel-ai-gateway");
+        let mut models = crate::selection::filter_models(
+            self.inner.name(),
+            self.inner.usage_api(),
+            &self.inner.capabilities(),
+            purpose,
+            models,
+            fallback,
+        );
+        if purpose == ModelPurpose::Chat
+            && self.inner.name() != "vercel-ai-gateway"
+            && let Some(catalog) = catalog
+        {
+            catalog.enrich_for_tool_scope(self.inner.name(), &mut models, self.use_public_catalog);
+        }
+        models
+    }
+
     fn remember_discovery(&self, models: &[ProviderModelInfo]) {
         // Keep raw media evidence before any catalog enrichment, in this same
         // authority instance. A refresh replaces both capability snapshots.
@@ -630,6 +661,21 @@ impl Provider for AuthorityBoundProvider {
     async fn list_transcription_models(&self) -> Result<Vec<ProviderModelInfo>> {
         self.ensure_not_revoked()?;
         self.public_result(self.inner.list_transcription_models().await)
+    }
+
+    async fn list_models_for_selection(
+        &self,
+        purpose: crate::selection::ModelPurpose,
+    ) -> Result<Vec<ProviderModelInfo>> {
+        use crate::selection::ModelPurpose;
+        self.ensure_not_revoked()?;
+        let models = self.public_result(match purpose {
+            ModelPurpose::Chat => self.inner.list_models().await,
+            ModelPurpose::Embeddings => self.inner.list_embedding_models().await,
+            ModelPurpose::Transcription => self.inner.list_transcription_models().await,
+        })?;
+        let catalog = crate::catalog::model_catalog().ok();
+        Ok(self.select_discovery(purpose, models, catalog.as_deref()))
     }
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
@@ -1471,6 +1517,110 @@ mod tests {
             error
                 .to_string()
                 .contains("does not support listing models")
+        );
+    }
+
+    #[test]
+    fn selection_fallback_is_scoped_and_non_chat_lists_preserve_chat_discovery() {
+        use crate::selection::ModelPurpose;
+        let catalog = crate::catalog::ModelCatalog::parse(
+            &serde_json::json!({"openai":{"fixture-native-model":{
+                "id":"fixture-native-model","name":"Fixture","provider":"openai",
+                "api":"openai-responses","baseUrl":"https://api.openai.com/v1",
+                "contextWindow":4096,"maxTokens":1024,"reasoning":false,"input":["text"],"cost":{},
+                "sourceMetadata":{"type":"chat","api":{"chat-completions":{}},
+                    "modalities":{"input":["text"],"output":["text"]}}
+            }}})
+            .to_string(),
+            &serde_json::json!({"openai":{"fixture-native-model":{
+                "contextWindow":{"kind":"source","expression":"fixture"},
+                "maxTokens":{"kind":"source","expression":"fixture"}
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let wrapper = |public| AuthorityBoundProvider {
+            inner: Arc::new(NativeListFixture("openai")),
+            authority_fingerprint: ProviderAuthorityFingerprint(format!("selection-{public}")),
+            revoked: Arc::new(AtomicBool::new(false)),
+            redact_endpoint_errors: false,
+            input_admission: Arc::new(Default::default()),
+            use_public_catalog: public,
+            discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
+        };
+        let public = wrapper(true);
+        let private = wrapper(false);
+        let mut model = crate::catalog::tool_tests::discovered("fixture-native-model", Some(false));
+        assert_eq!(
+            public
+                .select_discovery(ModelPurpose::Chat, vec![model.clone()], Some(&catalog))
+                .len(),
+            1
+        );
+        assert!(
+            private
+                .select_discovery(ModelPurpose::Chat, vec![model.clone()], Some(&catalog))
+                .is_empty()
+        );
+        // Partial operation evidence must not borrow modalities across authority.
+        model.capabilities.chat_operation = Some(true);
+        assert_eq!(
+            public
+                .select_discovery(ModelPurpose::Chat, vec![model.clone()], Some(&catalog))
+                .len(),
+            1
+        );
+        assert!(
+            private
+                .select_discovery(ModelPurpose::Chat, vec![model.clone()], Some(&catalog))
+                .is_empty()
+        );
+        model.capabilities.chat = Some(true);
+        assert_eq!(
+            private
+                .select_discovery(ModelPurpose::Chat, vec![model.clone()], None)
+                .len(),
+            1
+        );
+        model.capabilities.chat = Some(false);
+        assert!(
+            public
+                .select_discovery(ModelPurpose::Chat, vec![model.clone()], Some(&catalog))
+                .is_empty()
+        );
+        // A hidden row stays in the full raw snapshot used by execution.
+        assert_eq!(
+            public
+                .input_admission
+                .model(&model.id)
+                .unwrap()
+                .capabilities
+                .chat,
+            Some(false)
+        );
+        let mut vectors = model.clone();
+        vectors.id = "vectors".into();
+        vectors.capabilities.embeddings = Some(true);
+        public.select_discovery(ModelPurpose::Embeddings, vec![vectors], Some(&catalog));
+        assert!(public.input_admission.model("vectors").is_none());
+        assert!(public.input_admission.model(&model.id).is_some());
+        // Refresh replaces discovery and does not cache a prior classification.
+        model.capabilities.chat = Some(true);
+        assert_eq!(
+            public
+                .select_discovery(ModelPurpose::Chat, vec![model], None)
+                .len(),
+            1
+        );
+        assert_eq!(
+            private
+                .input_admission
+                .model("fixture-native-model")
+                .unwrap()
+                .capabilities
+                .chat,
+            Some(true)
         );
     }
 
@@ -3254,6 +3404,187 @@ mod tests {
                 &registry.get_or_create_for_workspace("ws_b", name).unwrap()
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn picker_discovery_uses_native_operation_contracts_and_preserves_raw_lists() {
+        use crate::selection::ModelPurpose;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let cases = [
+            (
+                "openai",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"text-embedding-fixture"},{"id":"chat-looking"},{"id":"image-looking"}]}"#,
+                vec![],
+                "/models",
+            ),
+            (
+                "anthropic",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"brand-new-private"}]}"#,
+                vec!["brand-new-private"],
+                "/models",
+            ),
+            (
+                "mistral",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"native","capabilities":{"completion_chat":true}},{"id":"no","capabilities":{"completion_chat":false}},{"id":"unknown","capabilities":{"completion_chat":null}},{"id":"malformed","capabilities":{"completion_chat":"true"}}]}"#,
+                vec!["native"],
+                "/models",
+            ),
+            (
+                "copilot",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"native","supported_endpoints":["/chat/completions"]},{"id":"default-chat","capabilities":{"type":"chat"}},{"id":"responses-only","capabilities":{"type":"chat"},"supported_endpoints":["/responses"]},{"id":"websocket-only","capabilities":{"type":"chat"},"supported_endpoints":["ws:/responses"]},{"id":"unknown"},{"id":"null","capabilities":{"type":"chat"},"supported_endpoints":null},{"id":"malformed","capabilities":{"type":"chat"},"supported_endpoints":[null]},{"id":"future","capabilities":{"type":"future"}},{"id":"bad-type","capabilities":{"type":true}},{"id":"negative","capabilities":{"type":"embeddings"},"supported_endpoints":["/chat/completions"]}]}"#,
+                vec!["native", "default-chat"],
+                "/models",
+            ),
+            (
+                "together",
+                ModelPurpose::Chat,
+                r#"[{"id":"native","type":"chat"},{"id":"vectors","type":"embedding"},{"id":"unknown","type":null},{"id":"future","type":"future-value"}]"#,
+                vec!["native"],
+                "/models",
+            ),
+            (
+                "venice",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"native","type":"text"},{"id":"vectors","type":"embedding"},{"id":"unknown","type":null},{"id":"future","type":"future-value"}]}"#,
+                vec!["native"],
+                "/models",
+            ),
+            (
+                "huggingface",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"private","owned_by":"huggingface"}]}"#,
+                vec![],
+                "/models",
+            ),
+            (
+                "gemini",
+                ModelPurpose::Chat,
+                r#"{"models":[{"name":"models/generate-only","supportedGenerationMethods":["generateContent"]},{"name":"models/vectors","supportedGenerationMethods":["embedContent"]},{"name":"models/unknown"}]}"#,
+                vec![],
+                "/models",
+            ),
+            (
+                "openrouter",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"native"},{"id":"vectors","architecture":{"input_modalities":["text"],"output_modalities":["embeddings"]}},{"id":"multi","architecture":{"input_modalities":["text"],"output_modalities":["text","embeddings"]}}]}"#,
+                vec!["native", "multi"],
+                "/models",
+            ),
+            (
+                "openrouter",
+                ModelPurpose::Embeddings,
+                r#"{"data":[{"id":"native"},{"id":"text","architecture":{"output_modalities":["text"]}},{"id":"multi","architecture":{"output_modalities":["text","embeddings"]}}]}"#,
+                vec!["native", "multi"],
+                "/models?output_modalities=embeddings",
+            ),
+        ];
+        for (name, purpose, body, expected, route) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/private/v1", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let count = socket.read(&mut buffer).await.unwrap();
+                        assert!(count > 0);
+                        request.extend_from_slice(&buffer[..count]);
+                    }
+                    assert!(
+                        String::from_utf8_lossy(&request)
+                            .lines()
+                            .next()
+                            .unwrap()
+                            .contains(route)
+                    );
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let registry =
+                ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+                    |_, _| Ok("fixture-key".into()),
+                    |_, _| Ok(None),
+                    move |_, _| Ok(Some(url.clone())),
+                    ProviderTimeoutPolicy::default(),
+                );
+            let provider = registry
+                .get_or_create_for_workspace("workspace", name)
+                .unwrap();
+            let selected = provider.list_models_for_selection(purpose).await.unwrap();
+            assert_eq!(
+                selected.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+                expected,
+                "{name}/{purpose:?}"
+            );
+            let raw = match purpose {
+                ModelPurpose::Embeddings => provider.list_embedding_models().await.unwrap(),
+                _ => provider.list_models().await.unwrap(),
+            };
+            if name == "gemini" {
+                assert_eq!(
+                    raw.iter()
+                        .map(|model| model.capabilities.chat_operation)
+                        .collect::<Vec<_>>(),
+                    vec![Some(true), Some(false), None]
+                );
+            }
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            let entries = if value.is_array() {
+                &value
+            } else {
+                &value[if name == "gemini" { "models" } else { "data" }]
+            };
+            let count = entries.as_array().unwrap().len();
+            assert_eq!(
+                raw.len(),
+                count,
+                "selection must not narrow raw execution discovery"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn picker_discovery_errors_remain_errors_with_endpoint_redaction() {
+        use crate::selection::ModelPurpose;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/private-picker/v1",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 4096];
+            socket.read(&mut buffer).await.unwrap();
+            let body = r#"{"error":{"message":"denied private-picker fixture-key"}}"#;
+            socket.write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let registry = ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok("fixture-key".into()),
+            |_, _| Ok(None),
+            move |_, _| Ok(Some(url.clone())),
+            ProviderTimeoutPolicy::default(),
+        );
+        let provider = registry
+            .get_or_create_for_workspace("workspace", "openai")
+            .unwrap();
+        let error = provider
+            .list_models_for_selection(ModelPurpose::Chat)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            provider.classify_failure(&error).unwrap().http_status,
+            Some(403)
+        );
+        assert!(!format!("{error:#}").contains("private-picker"));
+        assert!(!format!("{error:#}").contains("fixture-key"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

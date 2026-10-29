@@ -63,7 +63,12 @@ impl ComposerModelPickerPublication {
             .unwrap_or_default()
     }
     fn validate_effort(&mut self) {
-        if self.selected_reasoning_effort.is_some()
+        if self
+            .selector
+            .models()
+            .iter()
+            .any(|model| Some(model.id.as_str()) == self.selector.selected_model())
+            && self.selected_reasoning_effort.is_some()
             && !self.reasoning_rows().iter().any(|r| r.selected)
         {
             self.selected_reasoning_effort = None;
@@ -1398,6 +1403,59 @@ mod tests {
             &runtime_snapshot,
             &core.provider_runtime_snapshot("ws").unwrap()
         ));
+    }
+
+    #[test]
+    fn filtered_model_response_preserves_saved_effort_and_draft_until_user_changes_model() {
+        for ids in [vec![], vec!["one"]] {
+            let (core, rx) = fixture();
+            let draft = core.composer_snapshot("a").unwrap();
+            core.composer_intent(ComposerIntent::Domain {
+                thread_id: "a".into(),
+                draft_id: draft.draft_id(),
+                action: ComposerDomainAction::SetModelSelectionFromUser {
+                    provider: Some("provider".into()),
+                    model: Some("model".into()),
+                    capability_target: None,
+                },
+            });
+            core.composer_intent(ComposerIntent::Domain {
+                thread_id: "a".into(),
+                draft_id: draft.draft_id(),
+                action: ComposerDomainAction::SetReasoningEffortFromUser {
+                    effort: Some("high".into()),
+                },
+            });
+            let before = core.composer_snapshot("a").unwrap();
+            let identity = open(&core, false);
+            while let Ok(work) = rx.try_recv() {
+                let result = match &work.kind {
+                    RequestKind::Providers => providers(),
+                    RequestKind::Models(provider) => ModelPickerResult::Models(Ok(serde_json::from_value(serde_json::json!({
+                        "provider":provider, "models":ids.iter().map(|id| serde_json::json!({"id":id,"provider":provider,"limits":{},"capabilities":{}})).collect::<Vec<_>>()
+                    })).unwrap())),
+                };
+                core.complete_composer_model_picker(work, result);
+            }
+            let picker = core.composer_model_picker_snapshot("a").unwrap();
+            assert_eq!(
+                picker.selection().selected_reasoning_effort.as_deref(),
+                Some("high")
+            );
+            assert_eq!(picker.selector.selected_provider(), Some("provider"));
+            assert_eq!(picker.selector.selected_model(), Some("model"));
+            assert!(picker.reasoning_rows().is_empty());
+            assert!(Arc::ptr_eq(&before, &core.composer_snapshot("a").unwrap()));
+            if !ids.is_empty() {
+                core.composer_model_picker_intent(ComposerModelPickerIntent::SelectModel {
+                    identity,
+                    model: "one".into(),
+                });
+                let changed = core.composer_snapshot("a").unwrap();
+                assert_eq!(changed.domain().selected_model.as_deref(), Some("one"));
+                assert!(changed.domain().selected_reasoning_effort.is_none());
+            }
+        }
     }
 
     #[test]

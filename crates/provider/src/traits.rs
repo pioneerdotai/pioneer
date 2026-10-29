@@ -167,6 +167,28 @@ pub trait Provider: Send + Sync {
         )
     }
 
+    /// Purpose-filtered picker list. Raw discovery methods retain their existing
+    /// execution/catalog semantics. Registry wrappers add only scoped fallback.
+    async fn list_models_for_selection(
+        &self,
+        purpose: crate::selection::ModelPurpose,
+    ) -> Result<Vec<ProviderModelInfo>> {
+        use crate::selection::ModelPurpose;
+        let models = match purpose {
+            ModelPurpose::Chat => self.list_models().await?,
+            ModelPurpose::Embeddings => self.list_embedding_models().await?,
+            ModelPurpose::Transcription => self.list_transcription_models().await?,
+        };
+        Ok(crate::selection::filter_models(
+            self.name(),
+            self.usage_api(),
+            &self.capabilities(),
+            purpose,
+            models,
+            None,
+        ))
+    }
+
     /// Create embeddings for one or more input texts.
     /// Default implementation returns an error for providers that do not support embeddings.
     async fn embed(&self, _request: EmbeddingRequest) -> Result<EmbeddingResponse> {
