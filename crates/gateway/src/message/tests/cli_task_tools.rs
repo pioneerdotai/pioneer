@@ -3799,6 +3799,7 @@ impl pioneer_memory::ThreadEpisodicMemvidBackend for RecordingRecallSearchBacken
 #[test]
 fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_search() {
     run_standard_stack_message_test("active memory and explicit history search", async {
+        use crate::thread_episodic::ThreadEpisodicRecallService;
         use pioneer_crud::ThreadEpisodicWorkspaceActiveWriteSegmentRequest;
         use pioneer_hooks::*;
         let (_harness, processor, turn_id) =
