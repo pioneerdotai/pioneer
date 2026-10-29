@@ -1184,10 +1184,11 @@ impl HistoricalTaskFixture {
             serde_json::from_value(child["profiles"][0].clone()).unwrap();
         let db = self.processor.crud_store.database_connection();
         let now = pioneer_crud::utc_now();
+        let source_id = pioneer_crud::canonical_agent_id('N', "historical-grant-source");
         pioneer_crud::ensure_native_agent_config(
             &db,
             &pioneer_crud::NativeAgentConfigInput {
-                id: "historical-grant-source".into(),
+                id: source_id.clone(),
                 workspace_id: self.response.task.workspace_id.clone(),
                 system_key: None,
                 display_name: "Historical source".into(),
@@ -1206,7 +1207,7 @@ impl HistoricalTaskFixture {
                 id: identity.id.to_string(),
                 workspace_id: self.response.task.workspace_id.clone(),
                 source_kind: pioneer_crud::SOURCE_NATIVE_AGENT.into(),
-                source_id: "historical-grant-source".into(),
+                source_id,
                 source_revision: 3,
                 source_fingerprint: "generation-a".into(),
                 now,
