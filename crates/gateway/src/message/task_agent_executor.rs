@@ -13254,6 +13254,8 @@ mod tests {
                     item: pioneer_protocol::TurnItem::AgentMessage {
                         id: "saved-review-candidate".into(),
                         text: "already saved candidate".into(),
+                        markdown: None,
+                        markdown_version: None,
                         phase: Default::default(),
                     },
                 },
