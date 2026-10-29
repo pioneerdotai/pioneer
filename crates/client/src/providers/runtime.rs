@@ -248,6 +248,20 @@ impl ClientCore {
     ) -> anyhow::Result<CLIRuntimeListResponse> {
         self.read_provider_runtime_request(workspace, refresh, None)
     }
+    /// The Send consumer shares the normal runtime owner and forced-refresh
+    /// policy, with an individual deadline/cancel lifetime for its wait.
+    pub(crate) fn read_provider_runtimes_with_budget(
+        &self,
+        workspace: &str,
+        refresh: bool,
+        budget: &crate::rpc::RequestBudget,
+    ) -> anyhow::Result<CLIRuntimeListResponse> {
+        budget.notify_on_cancel(&self.send_readiness);
+        budget.check()?;
+        self.read_provider_runtime_request_with_wait(workspace, refresh, None, Some(budget), |_| {
+            unreachable!("budgeted consumer uses readiness signal")
+        })
+    }
     /// Preserves the explicit Gateway probe operation for existing typed callers.
     pub fn refresh_provider_runtimes(
         &self,
@@ -300,7 +314,7 @@ impl ClientCore {
         refresh: bool,
         probe: Option<Option<String>>,
     ) -> anyhow::Result<CLIRuntimeListResponse> {
-        self.read_provider_runtime_request_with_wait(workspace, refresh, probe, |receiver| {
+        self.read_provider_runtime_request_with_wait(workspace, refresh, probe, None, |receiver| {
             match receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
                 Err(_) => anyhow::bail!("provider_runtime_cancelled"),
@@ -314,7 +328,7 @@ impl ClientCore {
         workspace: &str,
         mut event: impl FnMut(),
     ) -> anyhow::Result<CLIRuntimeListResponse> {
-        self.read_provider_runtime_request_with_wait(workspace, true, None, |_| {
+        self.read_provider_runtime_request_with_wait(workspace, true, None, None, |_| {
             event();
             Ok(())
         })
@@ -325,6 +339,7 @@ impl ClientCore {
         workspace: &str,
         refresh: bool,
         probe: Option<Option<String>>,
+        budget: Option<&crate::rpc::RequestBudget>,
         mut wait: impl FnMut(&mpsc::Receiver<()>) -> anyhow::Result<()>,
     ) -> anyhow::Result<CLIRuntimeListResponse> {
         anyhow::ensure!(
@@ -362,6 +377,10 @@ impl ClientCore {
             scope.listeners.push(sender);
         }
         loop {
+            let sequence = self.send_readiness_sequence();
+            if let Some(budget) = budget {
+                budget.check()?;
+            }
             let current = self.provider_runtime_epoch();
             anyhow::ensure!(
                 !self.is_stopped()
@@ -421,7 +440,11 @@ impl ClientCore {
                     _ => anyhow::bail!("provider_runtime_unavailable"),
                 }
             }
-            wait(&receiver)?;
+            if let Some(budget) = budget {
+                self.wait_send_readiness(sequence, budget.deadline())?;
+            } else {
+                wait(&receiver)?;
+            }
         }
     }
     pub(crate) fn resume_provider_runtime_demand(&self) {
@@ -516,6 +539,7 @@ impl ClientCore {
         let revision = next.revision;
         let workspace_id = next.workspace_id.clone();
         scope.publication = Arc::new(next);
+        self.notify_send_readiness();
         scope.listeners.retain(|listener| {
             !matches!(
                 listener.try_send(()),
@@ -829,6 +853,7 @@ impl ClientCore {
             next.request = ProviderRuntimeRequestState::Cancelled;
             scope.publication = Arc::new(next);
         }
+        self.notify_send_readiness();
         owner.wake();
     }
     pub(crate) fn observe_provider_runtime_notification(&self, notification: &GatewayNotification) {
@@ -1213,7 +1238,7 @@ mod tests {
             let core = authorized_core();
             let mut waits = 0;
             let result =
-                core.read_provider_runtime_request_with_wait("workspace", true, None, |_| {
+                core.read_provider_runtime_request_with_wait("workspace", true, None, None, |_| {
                     waits += 1;
                     if waits <= replacements {
                         let old = request(&core, "workspace");
@@ -1255,6 +1280,7 @@ mod tests {
                 "workspace",
                 true,
                 probe.then_some(None),
+                None,
                 |_| {
                     waits += 1;
                     if probe {

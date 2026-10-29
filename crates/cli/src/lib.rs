@@ -1,4 +1,6 @@
 include!(concat!(env!("OUT_DIR"), "/pioneer-build-section.rs"));
+#[cfg(all(debug_assertions, feature = "computer-use"))]
+mod dev_runtime;
 mod diagnostics;
 mod installer;
 mod secrets;

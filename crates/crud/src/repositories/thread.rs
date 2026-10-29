@@ -625,15 +625,27 @@ pub async fn update_user_thread_management(
     }))
 }
 
+/// Exact storage sort key, independent of the public second-resolution dates.
+/// Keep SQLite's timestamp text intact: parsing/reformatting it can change the
+/// equality boundary (including fractional precision and timezone spelling).
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, sea_orm::FromQueryResult,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadReadPosition {
+    pub created_at: String,
+    pub id: String,
+}
+
 /// Raw observation candidates, including hidden and archived (Closed) threads.
-/// Authorization belongs to the caller. Advance by the last *candidate* ID,
+/// Authorization belongs to the caller. Advance by the last *candidate* key,
 /// including rows the caller cannot disclose; a filtered empty page is not EOF.
 pub async fn list_read_candidates_page<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
-    after_thread_id: Option<&str>,
+    after: Option<&ThreadReadPosition>,
     limit: u64,
-) -> Result<Vec<String>> {
+) -> Result<Vec<ThreadReadPosition>> {
     anyhow::ensure!(
         (1..=200).contains(&limit),
         "thread candidate page limit must be 1..=200"
@@ -641,14 +653,28 @@ pub async fn list_read_candidates_page<C: ConnectionTrait>(
     let mut query = thread::Entity::find()
         .select_only()
         .column(thread::Column::Id)
+        .column(thread::Column::CreatedAt)
         .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()));
-    if let Some(after) = after_thread_id {
-        query = query.filter(thread::Column::Id.gt(after.to_owned()));
+    if let Some(after) = after {
+        query = query
+            // Give the workspace/creation index an explicit range as well as
+            // the lexicographic tie-break predicate.
+            .filter(thread::Column::CreatedAt.lte(after.created_at.clone()))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(thread::Column::CreatedAt.lt(after.created_at.clone()))
+                    .add(
+                        sea_orm::Condition::all()
+                            .add(thread::Column::CreatedAt.eq(after.created_at.clone()))
+                            .add(thread::Column::Id.lt(after.id.clone())),
+                    ),
+            );
     }
     query
-        .order_by_asc(thread::Column::Id)
+        .order_by_desc(thread::Column::CreatedAt)
+        .order_by_desc(thread::Column::Id)
         .limit(limit)
-        .into_tuple::<String>()
+        .into_model::<ThreadReadPosition>()
         .all(db)
         .await
         .context("failed to list thread read candidates")

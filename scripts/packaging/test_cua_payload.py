@@ -47,7 +47,7 @@ def ready_inputs(root, target):
                "THIRD_PARTY_NOTICES.md": b"Third party notices fixture\n"}
     if windows:
         members["cua-driver-uia.exe"] = native_header(target) + b"signed-companion-fixture"
-    else:
+    elif "linux" in target:
         members.update({"wayland-helper/install.sh": b"#!/bin/sh\nexit 1\n",
                         "wayland-helper/README.md": b"Helper fixture\n",
                         "wayland-helper/winrects@cua/extension.js": b"// Helper fixture\n",
@@ -68,6 +68,68 @@ def ready_inputs(root, target):
 
 
 class CuaPayloadTests(unittest.TestCase):
+    def test_dev_runtime_tracks_current_source_and_revalidates_cached_inputs(self):
+        for target in ("x86_64-unknown-linux-gnu", "aarch64-pc-windows-msvc"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory).resolve()
+                binary, prepared, upstream = ready_inputs(home / "checkout-one", target)
+                runtime = home / ".pioneer.dev/gateway-runtime"
+                runtime.mkdir(parents=True)
+                selected = CUA["release"]()
+                declaration = hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()
+                cached = runtime / f"prepared-{target}-{declaration}"
+                prepared.rename(cached)
+                with patch.object(Path, "home", return_value=home), patch.dict(os.environ, PATH=""):
+                    first = CUA["dev"](target, binary, runtime)
+                    self.assertEqual(first.read_bytes(), binary.read_bytes())
+                    self.assertEqual(CUA["dev"](target, binary, runtime), first)
+                    for name, content in upstream.items():
+                        self.assertEqual((first.parent / "cua" / name).read_bytes(), content)
+                    binary.write_bytes(native_header(target) + b"current debug changes")
+                    refreshed = CUA["dev"](target, first, runtime)
+                    self.assertNotEqual(refreshed, first)
+                    self.assertEqual(refreshed.read_bytes(), native_header(target) + b"current debug changes")
+                    self.assertNotEqual(first.read_bytes(), refreshed.read_bytes())
+                    moved = home / "other-checkout/custom-target/debug" / binary.name
+                    moved.parent.mkdir(parents=True)
+                    moved.write_bytes(native_header(target) + b"other checkout changes")
+                    binary.unlink()
+                    switched = CUA["dev"](target, moved, runtime)
+                    self.assertEqual(switched.read_bytes(), moved.read_bytes())
+                    driver = cached / "runtime" / ("cua-driver.exe" if "windows" in target else "cua-driver")
+                    driver.write_bytes(native_header(target) + b"tampered cached driver")
+                    generations = set(runtime.iterdir())
+                    with self.assertRaisesRegex(ValueError, "Prepared CUA inputs do not match"):
+                        CUA["dev"](target, moved, runtime)
+                    self.assertEqual(set(runtime.iterdir()), generations)
+
+    def test_dev_runtime_rejects_foreign_roots_and_does_not_publish_partial_payload(self):
+        target = "x86_64-unknown-linux-gnu"
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            binary, prepared, _ = ready_inputs(home / "checkout", target)
+            runtime = home / ".pioneer.dev/gateway-runtime"
+            with patch.object(Path, "home", return_value=home):
+                foreign = home / "Pioneer/managed"
+                with self.assertRaisesRegex(ValueError, "isolated dev runtime"):
+                    CUA["dev"](target, binary, foreign)
+                self.assertFalse(foreign.exists())
+                runtime.mkdir(parents=True)
+                selected = CUA["release"]()
+                declaration = hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()
+                cached = runtime / f"prepared-{target}-{declaration}"
+                prepared.rename(cached)
+                # A self-consistent receipt cannot make a foreign-ABI driver
+                # into a valid payload for this Gateway's target.
+                driver = cached / "runtime/cua-driver"
+                driver.write_bytes(native_header("aarch64-unknown-linux-gnu"))
+                receipt = json.loads((cached / "prepared.json").read_text())
+                receipt["files"]["cua-driver"] = dict(sha256=hashlib.sha256(driver.read_bytes()).hexdigest(), bytes=driver.stat().st_size)
+                (cached / "prepared.json").write_text(json.dumps(receipt))
+                with self.assertRaisesRegex(ValueError, "architecture mismatch"):
+                    CUA["dev"](target, binary, runtime)
+                self.assertEqual(list(runtime.iterdir()), [cached])
+
     def test_macos_bundle_only_layout_and_gateway_permission_identity(self):
         for target in ("aarch64-apple-darwin", "x86_64-apple-darwin"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
@@ -112,6 +174,19 @@ class CuaPayloadTests(unittest.TestCase):
                 seal_inventory()
                 with self.assertRaisesRegex(ValueError, "bundle identity mismatch"):
                     CUA["validate_tree"](target, root)
+
+                info["CFBundleIdentifier"] = "ai.pioneer.gateway.dev"
+                info["CFBundleName"] = "Pioneer Gateway Dev"
+                (contents / "Info.plist").write_bytes(plistlib.dumps(info))
+                manifest["gateway_bundle_identifier"] = "ai.pioneer.gateway.dev"
+                seal_inventory()
+                CUA["validate_tree"](target, root, development=True)
+                with self.assertRaisesRegex(ValueError, "bundle identity mismatch"):
+                    CUA["validate_tree"](target, root)
+                manifest["gateway_bundle_identifier"] = "ai.pioneer.gateway"
+                seal_inventory()
+                with self.assertRaisesRegex(ValueError, "Dev Gateway CUA identity mismatch"):
+                    CUA["validate_tree"](target, root, development=True)
 
     def test_unsafe_zip_members_are_rejected_before_writing_files(self):
         with tempfile.TemporaryDirectory() as directory:
