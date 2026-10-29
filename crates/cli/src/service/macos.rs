@@ -16,11 +16,13 @@ const MACOS_LAUNCH_SERVICES_WARNING_CODE: &str =
 pub fn start_gateway_service(
     settings: &ServiceSettings,
     report: &mut GatewayServiceStartReport,
+    executable: &Path,
+    config_path: Option<&Path>,
 ) -> Result<Vec<GatewayServiceWarning>> {
     let service_label = settings.service_name.as_str();
     let (plist_path, domain, executable) = report.observe("service.definition.prepare", || {
         let plist_path = launch_agents_dir()?.join(format!("{service_label}.plist"));
-        let executable = super::current_executable_path()?;
+        let executable = executable.to_path_buf();
         let logs_dir = user_logs_dir()
             .context("failed to resolve user logs directory for launch agent")?
             .join("Logs")
@@ -42,6 +44,7 @@ pub fn start_gateway_service(
             &logs_dir,
             launchd_path.as_deref(),
             settings.macos_associated_bundle_identifier.as_str(),
+            config_path,
         );
         fs::write(&plist_path, plist_content).with_context(|| {
             format!(
@@ -321,6 +324,7 @@ fn render_launchd_plist(
     logs_dir: &Path,
     path_env: Option<&str>,
     associated_bundle_identifier: &str,
+    config_path: Option<&Path>,
 ) -> String {
     let service_label = xml_escape(service_label);
     let executable = xml_escape(&executable.display().to_string());
@@ -337,20 +341,25 @@ fn render_launchd_plist(
             </array>"
         )
     };
-    let environment_section = path_env
+    let mut environment_entries = path_env
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| {
             let escaped_path = xml_escape(value);
-            format!(
-                "<key>EnvironmentVariables</key>
-                <dict>
-                <key>PATH</key>
-                <string>{escaped_path}</string>
-                </dict>"
-            )
+            format!("<key>PATH</key><string>{escaped_path}</string>")
         })
         .unwrap_or_default();
+    if let Some(config_path) = config_path {
+        environment_entries.push_str(&format!(
+            "<key>PIONEER_CONFIG</key><string>{}</string>",
+            xml_escape(&config_path.display().to_string())
+        ));
+    }
+    let environment_section = if environment_entries.is_empty() {
+        String::new()
+    } else {
+        format!("<key>EnvironmentVariables</key><dict>{environment_entries}</dict>")
+    };
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -548,6 +557,7 @@ mod tests {
                 &root.join("logs"),
                 None,
                 "ai.pioneer.gateway",
+                None,
             );
             for (rows, expected) in [
                 ("\"ai.pioneer.gateway\" => disabled\n", "disabled\n"),
@@ -781,6 +791,7 @@ esac
             Path::new("/tmp/logs"),
             Some("/opt/homebrew/bin:/usr/bin:/bin"),
             "ai.pioneer.test",
+            Some(Path::new("/tmp/dev & checkout/config.toml")),
         );
 
         assert!(plist.contains("<key>EnvironmentVariables</key>"));
@@ -788,6 +799,8 @@ esac
         assert!(plist.contains("/opt/homebrew/bin:/usr/bin:/bin"));
         assert!(plist.contains("<key>AssociatedBundleIdentifiers</key>"));
         assert!(plist.contains("ai.pioneer.test"));
+        assert!(plist.contains("<key>PIONEER_CONFIG</key>"));
+        assert!(plist.contains("/tmp/dev &amp; checkout/config.toml"));
     }
 
     #[test]

@@ -13,6 +13,8 @@ const LINUX_LINGER_WARNING_CODE: &str = "linux_linger_enable_failed";
 pub fn start_gateway_service(
     settings: &ServiceSettings,
     report: &mut GatewayServiceStartReport,
+    executable: &Path,
+    config_path: Option<&Path>,
 ) -> Result<Vec<GatewayServiceWarning>> {
     let warnings = report.observe("service.persistence.prepare", || {
         ensure_persistent_user_service(settings)
@@ -23,7 +25,6 @@ pub fn start_gateway_service(
         let service_dir = service_path
             .parent()
             .context("failed to get systemd service directory")?;
-        let executable = super::current_executable_path()?;
 
         fs::create_dir_all(service_dir).with_context(|| {
             format!(
@@ -34,7 +35,7 @@ pub fn start_gateway_service(
 
         let service_path_env = super::resolve_service_path();
         let service_content =
-            render_linux_systemd_service(&executable, service_path_env.as_deref());
+            render_linux_systemd_service(executable, service_path_env.as_deref(), config_path);
         fs::write(&service_path, service_content).with_context(|| {
             format!(
                 "failed to write systemd service file at {}",
@@ -313,10 +314,14 @@ fn handle_persistence_setup_failure(
     bail!("{message}")
 }
 
-fn render_linux_systemd_service(executable: &Path, path_env: Option<&str>) -> String {
-    let exec = systemd_quote(&executable.display().to_string());
+fn render_linux_systemd_service(
+    executable: &Path,
+    path_env: Option<&str>,
+    config_path: Option<&Path>,
+) -> String {
+    let exec = systemd_quote(&executable.display().to_string().replace('%', "%%"));
     let mode_arg = systemd_quote(SERVICE_MODE_ARG);
-    let environment_section = path_env
+    let mut environment_section = path_env
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| {
@@ -325,6 +330,11 @@ fn render_linux_systemd_service(executable: &Path, path_env: Option<&str>) -> St
             format!("Environment={env}")
         })
         .unwrap_or_default();
+    if let Some(config_path) = config_path {
+        let config_env =
+            systemd_quote(&format!("PIONEER_CONFIG={}", config_path.display()).replace('%', "%%"));
+        environment_section.push_str(&format!("\nEnvironment={config_env}"));
+    }
 
     format!(
         r#"[Unit]
@@ -421,6 +431,17 @@ fn user_service_path(service_unit: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn service_definition_pins_source_paths_and_explicit_config() {
+        let unit = super::render_linux_systemd_service(
+            std::path::Path::new("/checkout % one/debug/pioneer"),
+            None,
+            Some(std::path::Path::new("/checkout % one/dev.toml")),
+        );
+        assert!(unit.contains("ExecStart=\"/checkout %% one/debug/pioneer\" \"gateway-service\""));
+        assert!(unit.contains("Environment=\"PIONEER_CONFIG=/checkout %% one/dev.toml\""));
+    }
+
     #[test]
     #[cfg(unix)]
     fn stop_refusal_or_manager_failure_preserves_the_definition_and_payload() {
