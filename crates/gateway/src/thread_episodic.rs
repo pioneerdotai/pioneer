@@ -22,6 +22,7 @@ use pioneer_crud::{
     ThreadEpisodicWorkspaceActiveWriteSegmentRequest, thread_episodic_item_uri,
 };
 use pioneer_memory::{
+    THREAD_EPISODIC_MEMVID_BATCH_BYTES, THREAD_EPISODIC_MEMVID_BATCH_ITEMS,
     ThreadEpisodicEmbeddingError, ThreadEpisodicEmbeddingProvider, ThreadEpisodicMemvidBackend,
     ThreadEpisodicMemvidEmbedder, ThreadEpisodicMemvidError, ThreadEpisodicMemvidFailureKind,
     ThreadEpisodicMemvidIndexEmbedding, ThreadEpisodicMemvidIndexOutput,
@@ -1447,9 +1448,31 @@ struct EpisodicDiscoveryRound {
     now_unix: i64,
 }
 
+struct PreparedEpisodicAttempt {
+    job: ThreadEpisodicIndexJobRecord,
+    resolved: ThreadEpisodicResolvedIndexRequest,
+    ownership: ThreadEpisodicWorkspaceOwnership,
+    started_at: Instant,
+}
+
+impl PreparedEpisodicAttempt {
+    fn prepared_bytes(&self) -> usize {
+        self.resolved
+            .request
+            .prepared_bytes()
+            .saturating_add(self.resolved.source_payload.len())
+            .saturating_add(
+                self.resolved
+                    .embedding_artifact_id
+                    .as_ref()
+                    .map_or(0, String::len),
+            )
+    }
+}
+
 struct OwnedEpisodicAttempt {
     job: ThreadEpisodicIndexJobRecord,
-    ownership: ThreadEpisodicWorkspaceOwnership,
+    ownership: Option<ThreadEpisodicWorkspaceOwnership>,
     mutation_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -1460,7 +1483,7 @@ pub(crate) struct ThreadEpisodicIndexExecutor {
     config: StdRwLock<ThreadEpisodicIndexExecutorConfig>,
     indexing_enabled: std::sync::atomic::AtomicBool,
     discovery_cursor: AsyncMutex<EpisodicDiscoveryRound>,
-    in_flight: StdMutex<Option<OwnedEpisodicAttempt>>,
+    in_flight: StdMutex<Vec<OwnedEpisodicAttempt>>,
     recovery_retry_at: StdMutex<Option<tokio::time::Instant>>,
     stopping: tokio_util::sync::CancellationToken,
     wake_notification: Arc<tokio::sync::Notify>,
@@ -1576,7 +1599,7 @@ impl ThreadEpisodicIndexExecutor {
             config: StdRwLock::new(ThreadEpisodicIndexExecutorConfig::default()),
             indexing_enabled: std::sync::atomic::AtomicBool::new(true),
             discovery_cursor: AsyncMutex::new(EpisodicDiscoveryRound::default()),
-            in_flight: StdMutex::new(None),
+            in_flight: StdMutex::new(Vec::new()),
             recovery_retry_at: StdMutex::new(None),
             stopping: tokio_util::sync::CancellationToken::new(),
             wake_notification,
@@ -1823,11 +1846,7 @@ impl ThreadEpisodicIndexExecutor {
         }
         // Release every async owner's clone before joining transitions. A
         // transition's cancellation cleanup may itself need this workspace.
-        let attempts = self
-            .in_flight
-            .lock()
-            .unwrap()
-            .take()
+        let attempts = std::mem::take(&mut *self.in_flight.lock().unwrap())
             .into_iter()
             .map(|attempt| {
                 let started = attempt
@@ -2232,9 +2251,10 @@ impl ThreadEpisodicIndexExecutor {
         }
         let config = self.config.read().map(|config| *config).unwrap_or_default();
         let mut round = self.discovery_cursor.lock().await;
-        // Acquiring this mutex proves a previous quantum is no longer polling.
-        // Its canceled intent is represented by actual job state, not memory.
-        drop(self.in_flight.lock().unwrap().take());
+        // A canceled quantum may have left a blocking writer. Retain every
+        // claim record while joining its actual ownership, even if this await
+        // is itself canceled. Durable Running recovery follows that join.
+        self.join_interrupted_attempts().await;
         let mut summary = ThreadEpisodicIndexExecutorRunSummary::default();
         let remaining = config.batch_limit;
         if round.through.is_none() {
@@ -2292,6 +2312,7 @@ impl ThreadEpisodicIndexExecutor {
                 != round.through.as_ref().map(|job| job.id.as_str());
         // Advancing before execution prevents replay of an unknown claim in
         // this quantum. Each poison candidate is isolated, including future creation.
+        let mut prepared: Vec<PreparedEpisodicAttempt> = Vec::new();
         for candidate in candidates {
             if self.stopping.is_cancelled()
                 || !self
@@ -2304,26 +2325,35 @@ impl ThreadEpisodicIndexExecutor {
             round.after = Some(candidate.clone());
             use futures_util::FutureExt;
             let result = std::panic::AssertUnwindSafe(async {
-                self.run_candidate(candidate.clone(), now_unix, config, &mut summary)
-                    .await
+                if prepared
+                    .first()
+                    .is_some_and(|item| item.job.workspace_id != candidate.workspace_id)
+                {
+                    self.flush_prepared(&mut prepared, now_unix, config, &mut summary)
+                        .await?;
+                }
+                self.run_candidate(
+                    candidate.clone(),
+                    now_unix,
+                    config,
+                    &mut summary,
+                    &mut prepared,
+                )
+                .await
             })
             .catch_unwind()
             .await;
-            // Only the active attempt is kept in memory. Running itself is the
-            // durable recovery obligation. A detached FS operation retains its
-            // own ownership clone, so another owner cannot settle it too early.
-            drop(self.in_flight.lock().unwrap().take());
+            // Retain every unconfirmed claim record. Release async clones for
+            // abandoned work so an unpersistable job cannot hold admission for
+            // healthy peers. A live blocking writer retains its own clone; the
+            // record survives until join_interrupted_attempts observes release.
+            for attempt in self.in_flight.lock().unwrap().iter_mut() {
+                if !prepared.iter().any(|item| item.job.id == attempt.job.id) {
+                    drop(attempt.ownership.take());
+                }
+            }
             if !matches!(&result, Ok(Ok(()))) {
-                let retry = tokio::time::Instant::now()
-                    + std::time::Duration::from_secs(config.retry_base_delay_secs.max(1) as u64);
-                let mut deadline = self.recovery_retry_at.lock().unwrap();
-                // One bounded recovery backoff survives unrelated wakes. New
-                // failures cannot keep moving an already scheduled retry away.
-                *deadline = Some(
-                    (*deadline)
-                        .filter(|at| *at > tokio::time::Instant::now())
-                        .map_or(retry, |at| at.min(retry)),
-                );
+                self.defer_recovery(config);
             }
             match result {
                 Ok(Ok(())) => {}
@@ -2345,6 +2375,25 @@ impl ThreadEpisodicIndexExecutor {
                 }
             }
         }
+        use futures_util::FutureExt;
+        let flush = std::panic::AssertUnwindSafe(self.flush_prepared(
+            &mut prepared,
+            now_unix,
+            config,
+            &mut summary,
+        ))
+        .catch_unwind()
+        .await;
+        if !matches!(&flush, Ok(Ok(()))) {
+            self.defer_recovery(config);
+            summary.storage_error = true;
+            summary.storage_errors.push(match flush {
+                Ok(Err(error)) => format!("{error:#}"),
+                _ => "batch_dispatch_unwind".to_owned(),
+            });
+        }
+        drop(prepared);
+        self.join_interrupted_attempts().await;
         #[cfg(test)]
         if let Some(observer) = self.quantum_observer.lock().unwrap().as_ref() {
             let _ = observer.try_send(summary.clone());
@@ -2362,12 +2411,47 @@ impl ThreadEpisodicIndexExecutor {
         Ok(summary)
     }
 
+    async fn join_interrupted_attempts(&self) {
+        let workspaces = {
+            let mut attempts = self.in_flight.lock().unwrap();
+            let mut workspaces = BTreeSet::new();
+            for attempt in attempts.iter_mut() {
+                workspaces.insert(attempt.job.workspace_id.clone());
+                // Drop only the async clone, keeping the record before any await.
+                drop(attempt.ownership.take());
+            }
+            workspaces
+        };
+        for workspace in workspaces {
+            let ownership = pioneer_memory::lock_thread_episodic_workspace(&workspace).await;
+            self.in_flight
+                .lock()
+                .unwrap()
+                .retain(|attempt| attempt.job.workspace_id != workspace);
+            drop(ownership);
+        }
+    }
+
+    fn defer_recovery(&self, config: ThreadEpisodicIndexExecutorConfig) {
+        let retry = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(config.retry_base_delay_secs.max(1) as u64);
+        let mut deadline = self.recovery_retry_at.lock().unwrap();
+        // One bounded recovery backoff survives unrelated wakes. New
+        // failures cannot keep moving an already scheduled retry away.
+        *deadline = Some(
+            (*deadline)
+                .filter(|at| *at > tokio::time::Instant::now())
+                .map_or(retry, |at| at.min(retry)),
+        );
+    }
+
     async fn run_candidate(
         &self,
         candidate: ThreadEpisodicIndexJobRecord,
         now_unix: i64,
         config: ThreadEpisodicIndexExecutorConfig,
         summary: &mut ThreadEpisodicIndexExecutorRunSummary,
+        prepared: &mut Vec<PreparedEpisodicAttempt>,
     ) -> Result<()> {
         let workspace = &candidate.workspace_id;
         if candidate.status == ThreadEpisodicIndexJobStatus::Running
@@ -2383,7 +2467,14 @@ impl ThreadEpisodicIndexExecutor {
                 .push("running_recovery_backoff".to_owned());
             return Ok(());
         }
-        let Some(ownership) = try_lock_thread_episodic_workspace(workspace).await else {
+        let ownership = match prepared
+            .first()
+            .filter(|item| &item.job.workspace_id == workspace)
+        {
+            Some(item) => Some(item.ownership.clone()),
+            None => try_lock_thread_episodic_workspace(workspace).await,
+        };
+        let Some(ownership) = ownership else {
             #[cfg(test)]
             self.blocked_notification.notify_one();
             summary
@@ -2541,9 +2632,9 @@ impl ThreadEpisodicIndexExecutor {
         prospective.attempt_count = candidate.attempt_count.saturating_add(1);
         prospective.updated_at = fixed_datetime_from_unix(now_unix);
         let mutation_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        *self.in_flight.lock().unwrap() = Some(OwnedEpisodicAttempt {
+        self.in_flight.lock().unwrap().push(OwnedEpisodicAttempt {
             job: prospective,
-            ownership: ownership.clone(),
+            ownership: Some(ownership.clone()),
             mutation_started: mutation_started.clone(),
         });
         #[cfg(test)]
@@ -2565,7 +2656,10 @@ impl ThreadEpisodicIndexExecutor {
         let job = match claim {
             Ok(Some(job)) => job,
             Ok(None) => {
-                drop(self.in_flight.lock().unwrap().take());
+                self.in_flight
+                    .lock()
+                    .unwrap()
+                    .retain(|attempt| attempt.job.id != candidate.id);
                 return Ok(());
             }
             Err(error) => {
@@ -2576,24 +2670,65 @@ impl ThreadEpisodicIndexExecutor {
                 return Err(error.context("episodic claim could not be confirmed"));
             }
         };
-        self.in_flight.lock().unwrap().as_mut().unwrap().job = job.clone();
+        self.in_flight.lock().unwrap().last_mut().unwrap().job = job.clone();
         summary.claimed += 1;
         #[cfg(test)]
         if let Some((started, release)) = self.after_claim_pause.lock().await.take() {
             let _ = started.send(());
             let _ = release.await;
         }
-        #[cfg(test)]
-        let job_id = job.id.clone();
-        let outcome = self
-            .process_claimed_job(job, now_unix, config, ownership)
-            .await;
-        if !matches!(
-            &outcome,
-            ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(_)
-        ) {
-            drop(self.in_flight.lock().unwrap().take());
+        let mut item = match self
+            .prepare_claimed_job(job.clone(), now_unix, config, ownership.clone())
+            .await
+        {
+            Ok(item) => item,
+            Err(outcome) => return self.account_outcome(&job.id, outcome, summary),
+        };
+        let bytes = prepared
+            .iter()
+            .fold(0usize, |n, item| n.saturating_add(item.prepared_bytes()));
+        let compatible = prepared.iter().all(|previous| {
+            previous
+                .resolved
+                .request
+                .batch_compatible(&item.resolved.request)
+        });
+        // Retries run singly, isolating any shared failure without a split/retry
+        // scheduler or an extra claim/attempt budget.
+        if !prepared.is_empty()
+            && (!compatible
+                || prepared.len() >= THREAD_EPISODIC_MEMVID_BATCH_ITEMS
+                || bytes.saturating_add(item.prepared_bytes()) > THREAD_EPISODIC_MEMVID_BATCH_BYTES
+                || job.attempt_count > 1)
+        {
+            self.flush_prepared(prepared, now_unix, config, summary)
+                .await?;
+            // Completion may rotate the active segment. Never dispatch a
+            // request prepared against the old catalog after that boundary.
+            item = match self
+                .prepare_claimed_job(job.clone(), now_unix, config, ownership)
+                .await
+            {
+                Ok(item) => item,
+                Err(outcome) => return self.account_outcome(&job.id, outcome, summary),
+            };
         }
+        let single = item.job.attempt_count > 1
+            || item.prepared_bytes() > THREAD_EPISODIC_MEMVID_BATCH_BYTES;
+        prepared.push(item);
+        if single || prepared.len() >= THREAD_EPISODIC_MEMVID_BATCH_ITEMS {
+            self.flush_prepared(prepared, now_unix, config, summary)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn account_outcome(
+        &self,
+        job_id: &str,
+        outcome: ThreadEpisodicIndexJobProcessOutcome,
+        summary: &mut ThreadEpisodicIndexExecutorRunSummary,
+    ) -> Result<()> {
         match outcome {
             ThreadEpisodicIndexJobProcessOutcome::Completed => summary.completed += 1,
             ThreadEpisodicIndexJobProcessOutcome::RetryableFailure
@@ -2612,11 +2747,16 @@ impl ThreadEpisodicIndexExecutor {
                 return Err(error);
             }
         }
+        self.in_flight
+            .lock()
+            .unwrap()
+            .retain(|attempt| attempt.job.id != job_id);
         #[cfg(test)]
-        self.panic_candidate_for_test(&job_id, "result");
+        self.panic_candidate_for_test(job_id, "result");
         Ok(())
     }
 
+    #[cfg(test)]
     async fn process_claimed_job(
         &self,
         job: ThreadEpisodicIndexJobRecord,
@@ -2624,99 +2764,234 @@ impl ThreadEpisodicIndexExecutor {
         config: ThreadEpisodicIndexExecutorConfig,
         ownership: ThreadEpisodicWorkspaceOwnership,
     ) -> ThreadEpisodicIndexJobProcessOutcome {
-        // No request from a replaced execution may reach provider or filesystem.
-        match self
-            .crud_store
-            .find_thread_episodic_index_job(&job.id)
+        let item = match self
+            .prepare_claimed_job(job, now_unix, config, ownership)
             .await
         {
-            Ok(Some(current))
-                if current.status == ThreadEpisodicIndexJobStatus::Running
-                    && current.attempt_count == job.attempt_count => {}
-            Ok(_) => return ThreadEpisodicIndexJobProcessOutcome::StaleAttempt,
-            Err(error) => return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error),
-        }
-        let attempt_started_at = Instant::now();
+            Ok(item) => item,
+            Err(outcome) => return outcome,
+        };
+        let result = self
+            .backend
+            .index_item_with_workspace_ownership(
+                item.resolved.request.clone(),
+                item.ownership.clone(),
+            )
+            .await;
+        self.finish_prepared(item, result, now_unix, config).await
+    }
+
+    async fn prepare_claimed_job(
+        &self,
+        job: ThreadEpisodicIndexJobRecord,
+        now_unix: i64,
+        config: ThreadEpisodicIndexExecutorConfig,
+        ownership: ThreadEpisodicWorkspaceOwnership,
+    ) -> std::result::Result<PreparedEpisodicAttempt, ThreadEpisodicIndexJobProcessOutcome> {
+        self.validate_dispatch_attempt(&job, None, now_unix).await?;
+        let started_at = Instant::now();
         let resolved = match self.payload_provider.resolve_index_request(&job).await {
             Ok(resolved) => resolved,
             Err(error) => {
-                if error.kind == ThreadEpisodicIndexResolutionFailureKind::SourceChanged {
-                    return self
-                        .reconcile_and_release_claim(&job, now_unix, config, attempt_started_at)
-                        .await;
-                }
-                return self
-                    .record_resolution_failure(&job, error, now_unix, config, attempt_started_at)
-                    .await;
+                return Err(
+                    if error.kind == ThreadEpisodicIndexResolutionFailureKind::SourceChanged {
+                        self.reconcile_and_release_claim(&job, now_unix, config, started_at)
+                            .await
+                    } else {
+                        self.record_resolution_failure(&job, error, now_unix, config, started_at)
+                            .await
+                    },
+                );
             }
         };
-
         #[cfg(test)]
         if self
             .readiness_read_failure
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
-            return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(anyhow::anyhow!(
-                "controlled readiness read failure before filesystem"
+            return Err(ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(
+                anyhow::anyhow!("controlled readiness read failure before filesystem"),
             ));
         }
+        self.validate_dispatch_attempt(&job, Some(&resolved), now_unix)
+            .await?;
+        if let Err(error) = resolved.request.validate_prepared() {
+            return Err(self
+                .record_backend_failure(&job, resolved, error, now_unix, config, started_at)
+                .await);
+        }
+        Ok(PreparedEpisodicAttempt {
+            job,
+            resolved,
+            ownership,
+            started_at,
+        })
+    }
 
-        if self.projection_runtime.is_some() {
+    async fn validate_dispatch_attempt(
+        &self,
+        job: &ThreadEpisodicIndexJobRecord,
+        resolved: Option<&ThreadEpisodicResolvedIndexRequest>,
+        now_unix: i64,
+    ) -> std::result::Result<(), ThreadEpisodicIndexJobProcessOutcome> {
+        use ThreadEpisodicIndexJobProcessOutcome as Outcome;
+        // Preparation of later peers may await providers. Recheck the exact
+        // attempt and projection immediately before dispatch too, outside DB capacity.
+        let current = self
+            .crud_store
+            .find_thread_episodic_index_job(&job.id)
+            .await
+            .map_err(Outcome::PersistenceFailure)?;
+        if !current.is_some_and(|current| {
+            current.status == ThreadEpisodicIndexJobStatus::Running
+                && current.attempt_count == job.attempt_count
+        }) {
+            return Err(Outcome::StaleAttempt);
+        }
+        if let Some(resolved) = resolved.filter(|_| self.projection_runtime.is_some()) {
             use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
-            let target = match resolved.request.embedding.as_ref() {
+            let target = match &resolved.request.embedding {
                 Some(embedding) => refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_identity(&embedding.identity),
                 None => Ok(refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only()),
-            };
-            match target {
-                Ok(target) => match refill::projection_accepts_index_target(
-                    &self.crud_store,
-                    &job.workspace_id,
-                    &target,
-                )
+            }.map_err(Outcome::PersistenceFailure)?;
+            if !refill::projection_accepts_index_target(
+                &self.crud_store,
+                &job.workspace_id,
+                &target,
+            )
+            .await
+            .map_err(Outcome::PersistenceFailure)?
+            {
+                let outcome = self
+                    .crud_store
+                    .requeue_thread_episodic_index_attempt(
+                        &job.id,
+                        job.attempt_count,
+                        now_unix,
+                        Some(pioneer_crud::THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
+                    )
+                    .await
+                    .map_err(Outcome::PersistenceFailure)?;
+                return Err(if outcome == ThreadEpisodicIndexAttemptOutcome::Applied {
+                    Outcome::Requeued
+                } else {
+                    Outcome::StaleAttempt
+                });
+            }
+        }
+        if self.stopping.is_cancelled() {
+            return Err(Outcome::PersistenceFailure(anyhow::anyhow!(
+                "episodic executor stopped before filesystem dispatch"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn flush_prepared(
+        &self,
+        prepared: &mut Vec<PreparedEpisodicAttempt>,
+        now_unix: i64,
+        config: ThreadEpisodicIndexExecutorConfig,
+        summary: &mut ThreadEpisodicIndexExecutorRunSummary,
+    ) -> Result<()> {
+        if prepared.is_empty() {
+            return Ok(());
+        }
+        if self.stopping.is_cancelled()
+            || !self
+                .indexing_enabled
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            anyhow::bail!("episodic dispatch stopped; claims retained for recovery");
+        }
+        let mut items = Vec::new();
+        let mut errors = Vec::new();
+        for item in std::mem::take(prepared) {
+            match self
+                .validate_dispatch_attempt(&item.job, Some(&item.resolved), now_unix)
                 .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return match self
-                            .crud_store
-                            .requeue_thread_episodic_index_attempt(
-                                &job.id,
-                                job.attempt_count,
-                                now_unix,
-                                Some(pioneer_crud::THREAD_EPISODIC_PROJECTION_CHANGED_ERROR),
-                            )
-                            .await
-                        {
-                            Ok(ThreadEpisodicIndexAttemptOutcome::Applied) => {
-                                ThreadEpisodicIndexJobProcessOutcome::Requeued
-                            }
-                            Ok(_) => ThreadEpisodicIndexJobProcessOutcome::StaleAttempt,
-                            Err(error) => {
-                                ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error)
-                            }
-                        };
+            {
+                Ok(()) => items.push(item),
+                Err(outcome) => {
+                    if let Err(error) = self.account_outcome(&item.job.id, outcome, summary) {
+                        errors.push(format!("{error:#}"));
                     }
-                    Err(error) => {
-                        return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error);
-                    }
-                },
-                Err(error) => {
-                    return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error);
                 }
             }
         }
-
-        if self.stopping.is_cancelled() {
-            return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(anyhow::anyhow!(
-                "episodic executor stopped before filesystem dispatch"
-            ));
+        if items.is_empty() {
+            if !errors.is_empty() {
+                anyhow::bail!("{}", errors.join("; "));
+            }
+            return Ok(());
         }
+        let count = items.len();
+        let requests = items
+            .iter()
+            .map(|item| item.resolved.request.clone())
+            .collect();
+        let mut results = if count == 1 {
+            vec![
+                self.backend
+                    .index_item_with_workspace_ownership(
+                        items[0].resolved.request.clone(),
+                        items[0].ownership.clone(),
+                    )
+                    .await,
+            ]
+        } else {
+            self.backend
+                .index_batch_with_workspace_ownership(requests, items[0].ownership.clone())
+                .await
+        };
+        if results.len() != count {
+            results = vec![
+                Err(ThreadEpisodicMemvidError::retryable(
+                    "invalid batch result count; outcome unknown"
+                ));
+                count
+            ];
+        }
+        for (item, result) in items.into_iter().zip(results) {
+            let id = item.job.id.clone();
+            use futures_util::FutureExt;
+            let outcome = std::panic::AssertUnwindSafe(async {
+                let outcome = self.finish_prepared(item, result, now_unix, config).await;
+                self.account_outcome(&id, outcome, summary)
+            })
+            .catch_unwind()
+            .await;
+            match outcome {
+                Ok(Ok(())) => {
+                    self.in_flight
+                        .lock()
+                        .unwrap()
+                        .retain(|attempt| attempt.job.id != id);
+                }
+                Ok(Err(error)) => errors.push(format!("{error:#}")),
+                Err(_) => errors.push("batch_completion_unwind".to_owned()),
+            }
+        }
+        if !errors.is_empty() {
+            anyhow::bail!("{}", errors.join("; "));
+        }
+        Ok(())
+    }
 
-        match self
-            .backend
-            .index_item_with_workspace_ownership(resolved.request.clone(), ownership.clone())
-            .await
-        {
+    async fn finish_prepared(
+        &self,
+        item: PreparedEpisodicAttempt,
+        result: std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>,
+        now_unix: i64,
+        config: ThreadEpisodicIndexExecutorConfig,
+    ) -> ThreadEpisodicIndexJobProcessOutcome {
+        let PreparedEpisodicAttempt {
+            job,
+            resolved,
+            ownership: _ownership,
+            started_at: attempt_started_at,
+        } = item;
+        match result {
             Ok(output) => {
                 self.complete_successful_index(
                     &job,
@@ -9082,8 +9357,8 @@ mod tests {
                 .in_flight
                 .lock()
                 .unwrap()
-                .as_ref()
-                .is_none_or(|attempt| attempt.job.id == c_job.id)
+                .iter()
+                .all(|attempt| attempt.job.id == c_job.id)
         );
         // The managed clock remains fixed after A/B/C's real execution. If
         // the first recovery deadline elapsed during FS work, this bounded probe
@@ -9285,7 +9560,7 @@ mod tests {
             executor.advance_managed_time_for_test(180).await;
             let completed = executor.wait_for_completed_job_for_test(&job.id).await;
             assert_eq!(completed.attempt_count, 2);
-            assert!(executor.in_flight.lock().unwrap().is_none());
+            assert!(executor.in_flight.lock().unwrap().is_empty());
             executor.shutdown().await;
         }
     }
@@ -9508,7 +9783,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(item.frame_id.is_some(), stage == "result");
-            assert!(executor.in_flight.lock().unwrap().is_none());
+            assert!(executor.in_flight.lock().unwrap().is_empty());
             assert!(try_lock_thread_episodic_workspace(&b).await.is_some());
             store
                 .database_connection()
@@ -9531,6 +9806,676 @@ mod tests {
                 );
             }
             executor.shutdown().await;
+        }
+    }
+
+    // Uses real native mutations; records only dispatch boundaries and injects
+    // a returned failure before dispatch or after a durable file result.
+    #[derive(Default)]
+    struct RecordingNativeBatchBackend {
+        native: MemvidThreadEpisodicBackend,
+        dispatches: AsyncMutex<Vec<Vec<ThreadEpisodicMemvidIndexRequest>>>,
+        failure: AsyncMutex<Option<bool>>,
+        after_commit: AsyncMutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+    }
+
+    #[async_trait]
+    impl ThreadEpisodicMemvidBackend for RecordingNativeBatchBackend {
+        fn capabilities(&self) -> pioneer_memory::ThreadEpisodicMemvidBackendCapabilities {
+            self.native.capabilities()
+        }
+        async fn index_item(
+            &self,
+            request: ThreadEpisodicMemvidIndexRequest,
+        ) -> std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>
+        {
+            self.native.index_item(request).await
+        }
+        async fn index_item_with_workspace_ownership(
+            &self,
+            request: ThreadEpisodicMemvidIndexRequest,
+            ownership: ThreadEpisodicWorkspaceOwnership,
+        ) -> std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>
+        {
+            self.dispatches.lock().await.push(vec![request.clone()]);
+            self.native
+                .index_item_with_workspace_ownership(request, ownership)
+                .await
+        }
+        async fn index_batch_with_workspace_ownership(
+            &self,
+            requests: Vec<ThreadEpisodicMemvidIndexRequest>,
+            ownership: ThreadEpisodicWorkspaceOwnership,
+        ) -> Vec<std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>>
+        {
+            self.dispatches.lock().await.push(requests.clone());
+            let count = requests.len();
+            let failure = self.failure.lock().await.take();
+            if failure == Some(false) {
+                return vec![
+                    Err(ThreadEpisodicMemvidError::retryable(
+                        "controlled file failure before publication"
+                    ));
+                    count
+                ];
+            }
+            let outputs = self
+                .native
+                .index_batch_with_workspace_ownership(requests, ownership)
+                .await;
+            if let Some((started, release)) = self.after_commit.lock().await.take() {
+                assert!(outputs.iter().all(std::result::Result::is_ok));
+                let _ = started.send(());
+                let _ = release.await;
+            }
+            if failure == Some(true) {
+                assert!(outputs.iter().all(std::result::Result::is_ok));
+                return vec![
+                    Err(ThreadEpisodicMemvidError::retryable(
+                        "controlled unknown outcome after file commit"
+                    ));
+                    count
+                ];
+            }
+            outputs
+        }
+        async fn search(
+            &self,
+            request: ThreadEpisodicMemvidSearchRequest,
+        ) -> std::result::Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>
+        {
+            self.native.search(request).await
+        }
+    }
+
+    fn recording_batch_executor(
+        store: Arc<CrudStore>,
+        root: &std::path::Path,
+        backend: Arc<RecordingNativeBatchBackend>,
+        limit: u64,
+    ) -> ThreadEpisodicIndexExecutor {
+        let executor = ThreadEpisodicIndexExecutor::new(
+            store.clone(),
+            backend,
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                store,
+                thread_episodic_storage_uri_from_path(root),
+            )),
+        );
+        executor.apply_config(ThreadEpisodicIndexExecutorConfig {
+            batch_limit: limit,
+            ..Default::default()
+        });
+        executor
+    }
+
+    #[tokio::test]
+    async fn native_executor_batches_within_existing_candidate_quantum_and_item_bound() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let backend = Arc::new(RecordingNativeBatchBackend::default());
+        let executor = recording_batch_executor(store.clone(), root.path(), backend.clone(), 10);
+        let now = chrono::Utc::now().timestamp() + 60;
+        let mut jobs = Vec::new();
+        for i in 0..11 {
+            jobs.push(
+                runner_source_job_for_test(
+                    &store,
+                    &workspace,
+                    &format!("batch_bound_{i}"),
+                    now - 20 + i,
+                )
+                .await,
+            );
+        }
+        let first = executor.run_once(now).await.unwrap();
+        assert_eq!(
+            (first.discovered, first.claimed, first.completed),
+            (10, 10, 10)
+        );
+        assert!(first.discovery_has_more);
+        let calls = backend.dispatches.lock().await.clone();
+        assert_eq!(calls.iter().map(Vec::len).collect::<Vec<_>>(), vec![8, 2]);
+        assert!(calls.iter().all(
+            |group| group.iter().map(|r| r.prepared_bytes()).sum::<usize>()
+                <= THREAD_EPISODIC_MEMVID_BATCH_BYTES
+        ));
+        let capsule = store
+            .find_thread_episodic_capsule(&calls[0][0].capsule_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(capsule.active_frame_count, 10);
+        assert_eq!(executor.run_once(now).await.unwrap().completed, 1);
+        for job in jobs {
+            let saved = store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.status, ThreadEpisodicIndexJobStatus::Completed);
+            assert_eq!(saved.attempt_count, 1);
+            let item = store
+                .find_thread_episodic_item(&job.index_item_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(item.frame_uri, saved.frame_uri);
+        }
+    }
+
+    struct BatchSizedPayloadProvider {
+        inner: StoreThreadEpisodicIndexPayloadProvider,
+        poison_job: Option<String>,
+        vector_job: Option<String>,
+        metadata_bytes: usize,
+    }
+    #[async_trait]
+    impl ThreadEpisodicIndexPayloadProvider for BatchSizedPayloadProvider {
+        async fn resolve_index_request(
+            &self,
+            job: &ThreadEpisodicIndexJobRecord,
+        ) -> std::result::Result<
+            ThreadEpisodicResolvedIndexRequest,
+            ThreadEpisodicIndexResolutionError,
+        > {
+            let mut resolved = self.inner.resolve_index_request(job).await?;
+            if self.metadata_bytes > 0 {
+                resolved
+                    .request
+                    .metadata
+                    .insert("batch_test_padding".into(), "x".repeat(self.metadata_bytes));
+            }
+            if self.vector_job.as_deref() == Some(job.id.as_str()) {
+                resolved.request.embedding = Some(
+                    ThreadEpisodicMemvidIndexEmbedding::new(
+                        pioneer_memory::ThreadEpisodicEmbeddingIdentity::new(
+                            "test",
+                            "prepared-batch-model",
+                            3,
+                            true,
+                        ),
+                        vec![1.0, 0.0, 0.0],
+                    )
+                    .unwrap(),
+                );
+            }
+            if self.poison_job.as_deref() == Some(job.id.as_str()) {
+                // Corrupt prepared data, bypassing the validating constructor.
+                resolved.request.embedding = Some(ThreadEpisodicMemvidIndexEmbedding {
+                    identity: pioneer_memory::ThreadEpisodicEmbeddingIdentity::new(
+                        "test", "invalid", 3, true,
+                    ),
+                    vector: vec![1.0],
+                });
+            }
+            Ok(resolved)
+        }
+    }
+
+    #[tokio::test]
+    async fn byte_bound_and_prevalidation_poison_preserve_healthy_native_progress() {
+        for case in 0..3 {
+            let poison = case == 2;
+            let (store, workspace) = setup_thread_episodic_store().await;
+            let root = TempDir::new().unwrap();
+            let backend = Arc::new(RecordingNativeBatchBackend::default());
+            let now = chrono::Utc::now().timestamp() + 60;
+            let mut jobs = Vec::new();
+            for i in 0..3 {
+                jobs.push(
+                    runner_source_job_for_test(
+                        &store,
+                        &workspace,
+                        &format!("byte_poison_{i}"),
+                        now - 3 + i,
+                    )
+                    .await,
+                );
+            }
+            if case == 1 {
+                // Real canonical JSON can be large while indexed text remains
+                // short after trimming. It must count toward the prepared bound.
+                for i in 0..3 {
+                    let name = format!("byte_poison_{i}");
+                    store
+                        .materialize_item_snapshot_updated(
+                            ItemUpdatedNotification {
+                                workspace_id: workspace.clone(),
+                                thread_id: name.clone(),
+                                turn_id: format!("{name}_turn"),
+                                item: TurnItem::UserMessage {
+                                    id: format!("{name}_item"),
+                                    text: format!(
+                                        "{}canonical source for {name}_item",
+                                        " ".repeat(140 * 1024)
+                                    ),
+                                    attachments: Vec::new(),
+                                },
+                            },
+                            now,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            let executor = ThreadEpisodicIndexExecutor::new(
+                store.clone(),
+                backend.clone(),
+                Arc::new(BatchSizedPayloadProvider {
+                    inner: StoreThreadEpisodicIndexPayloadProvider::new(
+                        store.clone(),
+                        thread_episodic_storage_uri_from_path(root.path()),
+                    ),
+                    poison_job: poison.then(|| jobs[1].id.clone()),
+                    vector_job: None,
+                    metadata_bytes: if case == 0 { 140 * 1024 } else { 0 },
+                }),
+            );
+            let result = executor.run_once(now).await.unwrap();
+            assert_eq!(result.claimed, 3);
+            assert_eq!(result.completed, if poison { 2 } else { 3 });
+            assert_eq!(result.failed_terminal, usize::from(poison));
+            let calls = backend.dispatches.lock().await.clone();
+            assert_eq!(
+                calls.iter().map(Vec::len).collect::<Vec<_>>(),
+                if poison { vec![2] } else { vec![1, 1, 1] }
+            );
+            if poison {
+                let failed = store
+                    .find_thread_episodic_index_job(&jobs[1].id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(failed.status, ThreadEpisodicIndexJobStatus::Canceled);
+                assert_eq!(failed.attempt_count, 1);
+            }
+            assert_eq!(executor.run_once(now + 3600).await.unwrap().claimed, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_separates_prepared_vector_identity_and_workspace_capsules() {
+        for different_workspace in [false, true] {
+            let (store, workspace) = setup_thread_episodic_store().await;
+            let other_workspace = format!("{workspace}_peer");
+            if different_workspace {
+                runner_workspace_for_test(&store, &other_workspace).await;
+            }
+            let root = TempDir::new().unwrap();
+            let backend = Arc::new(RecordingNativeBatchBackend::default());
+            let now = chrono::Utc::now().timestamp() + 60;
+            let first =
+                runner_source_job_for_test(&store, &workspace, "split_prepared_a", now - 2).await;
+            let second = runner_source_job_for_test(
+                &store,
+                if different_workspace {
+                    &other_workspace
+                } else {
+                    &workspace
+                },
+                "split_prepared_b",
+                now - 1,
+            )
+            .await;
+            let executor = ThreadEpisodicIndexExecutor::new(
+                store.clone(),
+                backend.clone(),
+                Arc::new(BatchSizedPayloadProvider {
+                    inner: StoreThreadEpisodicIndexPayloadProvider::new(
+                        store.clone(),
+                        thread_episodic_storage_uri_from_path(root.path()),
+                    ),
+                    poison_job: None,
+                    vector_job: (!different_workspace).then(|| second.id.clone()),
+                    metadata_bytes: 0,
+                }),
+            );
+            assert_eq!(executor.run_once(now).await.unwrap().completed, 2);
+            let calls = backend.dispatches.lock().await.clone();
+            assert_eq!(calls.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 1]);
+            assert_eq!(
+                calls[0][0].storage_uri != calls[1][0].storage_uri,
+                different_workspace
+            );
+            assert_eq!(calls[1][0].embedding.is_some(), !different_workspace);
+            for job in [first, second] {
+                let item = store
+                    .find_thread_episodic_item(&job.index_item_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(item.status, ThreadEpisodicItemStatus::Active);
+                let capsule = store
+                    .find_thread_episodic_capsule(item.capsule_id.as_deref().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let memvid = memvid_core::Memvid::open_read_only(
+                    capsule.storage_uri.strip_prefix("file://").unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    memvid
+                        .frame_by_uri(item.frame_uri.as_deref().unwrap())
+                        .unwrap()
+                        .id,
+                    item.frame_id.unwrap() as u64
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_file_failure_and_unknown_commit_never_ack_and_retry_singly() {
+        for published in [false, true] {
+            let (store, workspace) = setup_thread_episodic_store().await;
+            let root = TempDir::new().unwrap();
+            let backend = Arc::new(RecordingNativeBatchBackend::default());
+            *backend.failure.lock().await = Some(published);
+            let executor = recording_batch_executor(store.clone(), root.path(), backend.clone(), 3);
+            let now = chrono::Utc::now().timestamp() + 60;
+            let mut jobs = Vec::new();
+            for i in 0..3 {
+                jobs.push(
+                    runner_source_job_for_test(
+                        &store,
+                        &workspace,
+                        &format!("unknown_batch_{i}"),
+                        now - 3 + i,
+                    )
+                    .await,
+                );
+            }
+            let failed = executor.run_once(now).await.unwrap();
+            assert_eq!((failed.completed, failed.failed_retryable), (0, 3));
+            for job in &jobs {
+                assert_eq!(
+                    store
+                        .find_thread_episodic_index_job(&job.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    ThreadEpisodicIndexJobStatus::Failed
+                );
+                assert!(
+                    store
+                        .find_thread_episodic_item(&job.index_item_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .frame_id
+                        .is_none()
+                );
+            }
+            let call = backend.dispatches.lock().await[0][0].clone();
+            let path = call.storage_uri.strip_prefix("file://").unwrap();
+            assert_eq!(std::path::Path::new(path).exists(), published);
+            let retried = executor.run_once(now + 60).await.unwrap();
+            assert_eq!((retried.claimed, retried.completed), (3, 3));
+            assert_eq!(
+                backend
+                    .dispatches
+                    .lock()
+                    .await
+                    .iter()
+                    .map(Vec::len)
+                    .collect::<Vec<_>>(),
+                vec![3, 1, 1, 1]
+            );
+            let memvid = memvid_core::Memvid::open_read_only(path).unwrap();
+            assert_eq!(memvid.stats().unwrap().active_frame_count, 3);
+            for job in jobs {
+                let saved = store
+                    .find_thread_episodic_index_job(&job.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.attempt_count, 2);
+                assert_eq!(saved.status, ThreadEpisodicIndexJobStatus::Completed);
+                assert!(
+                    memvid
+                        .frame_by_uri(saved.frame_uri.as_deref().unwrap())
+                        .is_ok()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_db_completion_after_native_batch_commit_replays_only_unacked_job() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let backend = Arc::new(RecordingNativeBatchBackend::default());
+        let executor = recording_batch_executor(store.clone(), root.path(), backend.clone(), 3);
+        let now = chrono::Utc::now().timestamp() + 60;
+        let mut jobs = Vec::new();
+        for (i, name) in ["batch_ack_a", "batch_ack_b", "batch_ack_c"]
+            .into_iter()
+            .enumerate()
+        {
+            jobs.push(
+                runner_source_job_for_test(&store, &workspace, name, now - 3 + i as i64).await,
+            );
+        }
+        store.database_connection().execute_unprepared("CREATE TRIGGER reject_batch_ack_b BEFORE UPDATE ON thread_episodic_index_jobs WHEN OLD.thread_id = 'batch_ack_b' AND NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'controlled batch completion rollback'); END").await.unwrap();
+        let first = executor.run_once(now).await.unwrap();
+        assert_eq!((first.completed, first.failed_retryable), (2, 1));
+        let capsule_request = backend.dispatches.lock().await[0][0].clone();
+        let path = capsule_request.storage_uri.strip_prefix("file://").unwrap();
+        assert_eq!(
+            memvid_core::Memvid::open_read_only(path)
+                .unwrap()
+                .stats()
+                .unwrap()
+                .active_frame_count,
+            3
+        );
+        store
+            .database_connection()
+            .execute_unprepared("DROP TRIGGER reject_batch_ack_b")
+            .await
+            .unwrap();
+        assert_eq!(executor.run_once(now + 60).await.unwrap().completed, 1);
+        let memvid = memvid_core::Memvid::open_read_only(path).unwrap();
+        assert_eq!(memvid.stats().unwrap().active_frame_count, 3);
+        for (i, job) in jobs.into_iter().enumerate() {
+            let saved = store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.status, ThreadEpisodicIndexJobStatus::Completed);
+            assert_eq!(saved.attempt_count, if i == 1 { 2 } else { 1 });
+            let item = store
+                .find_thread_episodic_item(&job.index_item_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                memvid
+                    .frame_by_uri(item.frame_uri.as_deref().unwrap())
+                    .unwrap()
+                    .id,
+                item.frame_id.unwrap() as u64
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_batch_keeps_source_exclusion_and_stale_attempt_cas_per_job() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let backend = Arc::new(RecordingNativeBatchBackend::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *backend.after_commit.lock().await = Some((started_tx, release_rx));
+        let executor = Arc::new(recording_batch_executor(
+            store.clone(),
+            root.path(),
+            backend,
+            4,
+        ));
+        let now = chrono::Utc::now().timestamp() + 60;
+        let mut jobs = Vec::new();
+        for i in 0..4 {
+            jobs.push(
+                runner_source_job_for_test(
+                    &store,
+                    &workspace,
+                    &format!("batch_race_{i}"),
+                    now - 4 + i,
+                )
+                .await,
+            );
+        }
+        let work = tokio::spawn({
+            let executor = executor.clone();
+            async move { executor.run_once(now).await }
+        });
+        started_rx.await.unwrap();
+        assert_eq!(executor.in_flight.lock().unwrap().len(), 4);
+        store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: "batch_race_0".into(),
+                    turn_id: "batch_race_0_turn".into(),
+                    item: TurnItem::UserMessage {
+                        id: "batch_race_0_item".into(),
+                        text: "replacement source after shared file commit".into(),
+                        attachments: Vec::new(),
+                    },
+                },
+                now + 1,
+            )
+            .await
+            .unwrap();
+        store
+            .exclude_thread_episodic_item(
+                NewThreadEpisodicExclusionRecord {
+                    id: None,
+                    workspace_id: workspace.clone(),
+                    thread_id: "batch_race_1".into(),
+                    index_item_id: jobs[1].index_item_id.clone(),
+                    reason: ThreadEpisodicExclusionReason::UserRequested,
+                    created_by: "test".into(),
+                },
+                now + 1,
+            )
+            .await
+            .unwrap();
+        store
+            .requeue_thread_episodic_index_attempt(&jobs[2].id, 1, now + 1, None)
+            .await
+            .unwrap();
+        let newer = store
+            .claim_thread_episodic_index_job_if_due(&jobs[2].id, now + 1, 5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(newer.attempt_count, 2);
+        release_tx.send(()).unwrap();
+        assert_eq!(work.await.unwrap().unwrap().completed, 1);
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&jobs[2].id)
+                .await
+                .unwrap()
+                .unwrap(),
+            newer
+        );
+        assert_ne!(
+            store
+                .find_thread_episodic_index_job(&jobs[0].id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ThreadEpisodicIndexJobStatus::Completed
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_item(&jobs[1].index_item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ThreadEpisodicItemStatus::Excluded
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&jobs[3].id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ThreadEpisodicIndexJobStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_rotation_keeps_all_outputs_bound_to_committed_physical_capsule() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let backend = Arc::new(RecordingNativeBatchBackend::default());
+        let executor = recording_batch_executor(store.clone(), root.path(), backend.clone(), 9);
+        executor.apply_config(ThreadEpisodicIndexExecutorConfig {
+            batch_limit: 9,
+            near_capacity_percent: 0.0,
+            ..Default::default()
+        });
+        let now = chrono::Utc::now().timestamp() + 60;
+        let mut jobs = Vec::new();
+        for i in 0..9 {
+            jobs.push(
+                runner_source_job_for_test(
+                    &store,
+                    &workspace,
+                    &format!("batch_rotation_{i}"),
+                    now - 9 + i,
+                )
+                .await,
+            );
+        }
+        assert_eq!(executor.run_once(now).await.unwrap().completed, 9);
+        let calls = backend.dispatches.lock().await.clone();
+        assert_eq!(calls.iter().map(Vec::len).collect::<Vec<_>>(), vec![8, 1]);
+        assert_ne!(calls[0][0].capsule_id, calls[1][0].capsule_id);
+        assert_ne!(calls[0][0].storage_uri, calls[1][0].storage_uri);
+        for group in calls {
+            let memvid = memvid_core::Memvid::open_read_only(
+                group[0].storage_uri.strip_prefix("file://").unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                memvid.stats().unwrap().active_frame_count,
+                group.len() as u64
+            );
+            for request in group {
+                let item = store
+                    .find_thread_episodic_item(&request.index_item_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    item.capsule_id.as_deref(),
+                    Some(request.capsule_id.as_str())
+                );
+                assert_eq!(
+                    memvid
+                        .frame_by_uri(item.frame_uri.as_deref().unwrap())
+                        .unwrap()
+                        .id,
+                    item.frame_id.unwrap() as u64
+                );
+            }
         }
     }
 
@@ -9581,6 +10526,39 @@ mod tests {
             .await
             .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?
         }
+        async fn index_batch_with_workspace_ownership(
+            &self,
+            requests: Vec<ThreadEpisodicMemvidIndexRequest>,
+            ownership: ThreadEpisodicWorkspaceOwnership,
+        ) -> Vec<std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>>
+        {
+            let barrier = self.barrier.lock().await.take();
+            let Some((started, release)) = barrier else {
+                return self
+                    .native
+                    .index_batch_with_workspace_ownership(requests, ownership)
+                    .await;
+            };
+            let runtime = tokio::runtime::Handle::current();
+            let native = self.native.clone();
+            let count = requests.len();
+            pioneer_observability::work::spawn_blocking(move || {
+                let _ = started.send(());
+                if release.recv().is_err() {
+                    return vec![
+                        Err(ThreadEpisodicMemvidError::retryable(
+                            "blocking test release dropped"
+                        ));
+                        count
+                    ];
+                }
+                runtime.block_on(native.index_batch_with_workspace_ownership(requests, ownership))
+            })
+            .await
+            .unwrap_or_else(|error| {
+                vec![Err(ThreadEpisodicMemvidError::retryable(error.to_string())); count]
+            })
+        }
         async fn search(
             &self,
             request: ThreadEpisodicMemvidSearchRequest,
@@ -9618,6 +10596,89 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_quantum_and_canceled_join_keep_every_batch_claim_visible_to_shutdown() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let root = TempDir::new().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let backend = Arc::new(BlockingNativeRunnerBackend {
+            native: Arc::new(MemvidThreadEpisodicBackend::new()),
+            barrier: AsyncMutex::new(Some((started_tx, release_rx))),
+        });
+        let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
+            store.clone(),
+            backend,
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                store.clone(),
+                thread_episodic_storage_uri_from_path(root.path()),
+            )),
+        ));
+        let now = chrono::Utc::now().timestamp() + 60;
+        let mut jobs = Vec::new();
+        for i in 0..3 {
+            jobs.push(
+                runner_source_job_for_test(
+                    &store,
+                    &workspace,
+                    &format!("canceled_batch_join_{i}"),
+                    now - 3 + i,
+                )
+                .await,
+            );
+        }
+        let work = tokio::spawn({
+            let executor = executor.clone();
+            async move { executor.run_once(now).await }
+        });
+        started_rx.await.unwrap();
+        work.abort();
+        assert!(work.await.unwrap_err().is_cancelled());
+        assert_eq!(executor.in_flight.lock().unwrap().len(), 3);
+        {
+            let resumed = executor.run_once(now + 1);
+            tokio::pin!(resumed);
+            assert!(futures_util::poll!(resumed.as_mut()).is_pending());
+            let attempts = executor.in_flight.lock().unwrap();
+            assert_eq!(attempts.len(), 3);
+            assert!(attempts.iter().all(|attempt| attempt.ownership.is_none()));
+            // Dropping this future cancels the join itself.
+        }
+        let shutdown = executor.shutdown();
+        tokio::pin!(shutdown);
+        assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+        assert!(
+            try_lock_thread_episodic_workspace(&workspace)
+                .await
+                .is_none()
+        );
+        release_tx.send(()).unwrap();
+        shutdown.await;
+        for job in jobs {
+            let saved = store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.status, ThreadEpisodicIndexJobStatus::Running);
+            assert_eq!(saved.attempt_count, 1);
+            assert!(
+                store
+                    .find_thread_episodic_item(&job.index_item_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .frame_id
+                    .is_none()
+            );
+        }
+        assert!(
+            try_lock_thread_episodic_workspace(&workspace)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runner_shutdown_joins_blocking_write_and_rejects_subsequent_wakes() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
@@ -9642,8 +10703,21 @@ mod tests {
             executor.now_unix(),
         )
         .await;
+        let mut peers = Vec::new();
+        for i in 0..2 {
+            peers.push(
+                runner_source_job_for_test(
+                    &store,
+                    &workspace,
+                    &format!("blocking_shutdown_peer_{i}"),
+                    executor.now_unix(),
+                )
+                .await,
+            );
+        }
         executor.wake();
         started_rx.await.unwrap();
+        assert_eq!(executor.in_flight.lock().unwrap().len(), 3);
         let shutdown = executor.shutdown();
         tokio::pin!(shutdown);
         assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
@@ -9662,6 +10736,24 @@ mod tests {
             .unwrap();
         assert_eq!(settled.status, ThreadEpisodicIndexJobStatus::Running);
         assert_eq!(settled.attempt_count, 1);
+        for peer in peers {
+            let saved = store
+                .find_thread_episodic_index_job(&peer.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.status, ThreadEpisodicIndexJobStatus::Running);
+            assert_eq!(saved.attempt_count, 1);
+            assert!(
+                store
+                    .find_thread_episodic_item(&peer.index_item_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .frame_id
+                    .is_none()
+            );
+        }
         let source = store
             .find_thread_episodic_item(&job.index_item_id)
             .await
