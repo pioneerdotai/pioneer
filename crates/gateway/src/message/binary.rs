@@ -117,6 +117,9 @@ impl MessageProcessor {
             };
             record_binary_decision(registration, &decision);
             if !decision.is_allowed() {
+                if kind == BinaryIngressKind::VoiceChunk {
+                    self.reject_owned_voice_ingress(&context, payload);
+                }
                 return;
             }
 
@@ -339,12 +342,53 @@ impl MessageProcessor {
                     .await;
             }
             Err(error) => {
+                self.reject_owned_voice_ingress(request_context, payload);
                 warn!(
                     connection_id,
                     error_kind = ?error.kind,
                     error = %error.message,
                     "rejected malformed voice binary frame"
                 );
+            }
+        }
+    }
+
+    fn reject_owned_voice_ingress(&self, request_context: &RequestContext, payload: &[u8]) {
+        // Extract identity even when payload validation failed, then authenticate
+        // it. Late/foreign packets must never poison the owner's next recording.
+        // An unreadable header cannot be attributed; a missing packet is still
+        // detected by the final sequence/sample proof, including a missing tail.
+        #[derive(serde::Deserialize)]
+        struct Identity {
+            session_id: String,
+        }
+        if !payload.starts_with(VOICE_CHUNK_FRAME_MAGIC) {
+            return;
+        }
+        let Some(header_len) = payload
+            .get(4..8)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        else {
+            return;
+        };
+        let header_len = u32::from_be_bytes(header_len) as usize;
+        if header_len > 512 {
+            return;
+        }
+        let Some(header) = payload.get(8..8 + header_len) else {
+            return;
+        };
+        let Ok(identity) = serde_json::from_slice::<Identity>(header) else {
+            return;
+        };
+        let owner = AuthenticatedTransferOwner::from_request_context(request_context);
+        if let Ok(session) = self
+            .voice_sessions
+            .lookup_authenticated_session(&identity.session_id, &owner)
+        {
+            if !session.state.is_terminal_for_chunk_ingest() {
+                self.voice_session_buffers
+                    .reject_ingress(&session.session_id);
             }
         }
     }

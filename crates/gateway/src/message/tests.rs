@@ -16803,6 +16803,12 @@ fn owned_voice_ingress_case(
         )
         .await;
         let mut entered_rx = Some(entered_rx);
+        let last_sequence = match terminal {
+            "long_context" | "long_tail_error" | "buffered_long" => 200,
+            "closed_13" => 129,
+            "closed_17" => 169,
+            _ => 60,
+        };
         let initial_chunks = if early { 30 } else { 1 };
         for sequence in 0..initial_chunks {
             processor
@@ -16846,12 +16852,6 @@ fn owned_voice_ingress_case(
             );
             // Duplicate accepted sequence is ACKed without replay. Keep a full
             // second source span and a seven-sample tail behind native work.
-            let last_sequence = match terminal {
-                "long_context" | "long_tail_error" | "buffered_long" => 200,
-                "closed_13" => 129,
-                "closed_17" => 169,
-                _ => 60,
-            };
             for sequence in 29..=last_sequence {
                 let samples = if sequence == last_sequence
                     && !matches!(terminal, "closed_13" | "closed_17")
@@ -16990,7 +16990,9 @@ fn owned_voice_ingress_case(
         );
         let before_events = serde_json::to_value(&before.events).unwrap();
         let finalize = json!({"jsonrpc":"2.0","id":finalize_id,"method":"voice/session/finalize","params":{
-            "session_id":session.session_id,"context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":turn_id}
+            "session_id":session.session_id,"context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":turn_id},
+            "audio_integrity": {"next_sequence": if early { last_sequence + 1 } else { 1 },
+                "normalized_samples": if early { last_sequence * 1600 + if matches!(terminal, "closed_13" | "closed_17") { 1600 } else { 7 } } else { 960 }}
         }});
         let expected_startup_key = if terminal == "runtime_error" {
             None
@@ -17475,6 +17477,7 @@ fn owned_voice_ingress_case(
                     processor.clone().process_owned_request(peer_context, json!({
                         "jsonrpc":"2.0", "id":finalize_id, "method":"voice/session/finalize",
                         "params":{"session_id":next_session.session_id,
+                            "audio_integrity":{"next_sequence":40,"normalized_samples":64000},
                             "context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":next_turn}}
                     }).to_string()).await;
                     let (ack, result) = recv_response_and_notification_by_id_method(
@@ -17671,6 +17674,7 @@ async fn submit_test_voice_turn(
                 "method": "voice/session/finalize",
                 "params": {
                     "session_id": start_payload.session_id,
+                    "audio_integrity": {"next_sequence":1,"normalized_samples":960},
                     "context": {
                         "workspace_id": workspace_id,
                         "thread_id": thread_id,
@@ -18320,7 +18324,8 @@ async fn voice_session_transcript_starts_turn_and_preserves_authorized_context_a
         "method": "voice/session/finalize",
         "params": {
             "session_id": start_payload.session_id,
-            "context": voice_context
+            "context": voice_context,
+            "audio_integrity": {"next_sequence":1,"normalized_samples":960}
         }
     });
     processor
@@ -18540,6 +18545,7 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
         "method": "voice/session/finalize",
         "params": {
             "session_id": start_payload.session_id,
+            "audio_integrity": {"next_sequence":0,"normalized_samples":0},
             "context": {
                 "workspace_id": workspace_id,
                 "thread_id": thread.thread.id,
@@ -18594,6 +18600,223 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
         missing_turn.is_none(),
         "no-speech voice finalize must not create a transcript-only turn"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_new_session() {
+    for case in [
+        "missing_tail",
+        "preview_missing_tail",
+        "gap",
+        "malformed",
+        "legacy",
+        "late_old",
+    ] {
+        let (tx, mut rx) = mpsc::channel(32);
+        let sessions = Arc::new(SessionManager::new());
+        let connection_id = register_authenticated_test_connection(&sessions, tx).await;
+        let (workspaces, crud, workspace_id) = setup_workspace_manager().await;
+        let mut processor = MessageProcessor::new(
+            Arc::new(ThreadManager::new("o4-mini", "openai")),
+            test_provider(),
+            sessions,
+            workspaces,
+            crud.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )
+        .with_test_voice_transcript("controlled transcript");
+        let (preview_tx, mut preview_rx) = tokio::sync::mpsc::unbounded_channel();
+        if case == "preview_missing_tail" {
+            processor.voice_test_transcriber = Some(Arc::new(move |_| {
+                let text = "successful preliminary transcript".to_owned();
+                let _ = preview_tx.send(());
+                Ok(text)
+            }));
+        }
+        let thread = start_thread_for_artifact_test(
+            &processor,
+            connection_id,
+            &mut rx,
+            &workspace_id,
+            "thr_voice_integrity",
+        )
+        .await;
+        let turn_id = "turn_voice_integrity_0001";
+        let old_session = if case == "late_old" {
+            let old = start_test_voice_session(
+                &processor,
+                connection_id,
+                &mut rx,
+                &workspace_id,
+                &thread.thread.id,
+                "turn_voice_old_integrity",
+                &generate_test_request_id("voice", "old_start"),
+            )
+            .await;
+            let cancel_id = generate_test_request_id("voice", "old_cancel");
+            processor
+                .process_request_for_connection(
+                    connection_id,
+                    &json!({
+                        "jsonrpc":"2.0","id":cancel_id,"method":"voice/session/cancel",
+                        "params":{"session_id":old.session_id}
+                    })
+                    .to_string(),
+                )
+                .await;
+            let _ = recv_response_and_notification_by_id_method(
+                &mut rx,
+                &cancel_id,
+                events::VOICE_SESSION_RESULT,
+            )
+            .await;
+            Some(old)
+        } else {
+            None
+        };
+        let session = start_test_voice_session(
+            &processor,
+            connection_id,
+            &mut rx,
+            &workspace_id,
+            &thread.thread.id,
+            turn_id,
+            &generate_test_request_id("voice", "integrity_start"),
+        )
+        .await;
+        assert_eq!(session.audio_integrity_version, Some(1));
+        if let Some(old) = old_session {
+            let mut late = voice_test_frame(&old.session_id, 0, 7, 12000);
+            processor
+                .process_binary_frame_for_connection(connection_id, &late)
+                .await
+                .unwrap();
+            late.pop();
+            processor
+                .process_binary_frame_for_connection(connection_id, &late)
+                .await
+                .unwrap();
+        }
+        let packets = if case == "preview_missing_tail" {
+            31
+        } else {
+            1
+        };
+        for sequence in 0..packets {
+            processor
+                .process_binary_frame_for_connection(
+                    connection_id,
+                    &voice_test_frame(
+                        &session.session_id,
+                        sequence,
+                        if case == "preview_missing_tail" {
+                            1600
+                        } else {
+                            960
+                        },
+                        12000,
+                    ),
+                )
+                .await
+                .unwrap();
+            let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
+        }
+        if case == "preview_missing_tail" {
+            tokio::time::timeout(Duration::from_secs(5), preview_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                crud.get_turn(&thread.thread.id, turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let expected = match case {
+            "gap" => {
+                processor
+                    .process_binary_frame_for_connection(
+                        connection_id,
+                        &voice_test_frame(&session.session_id, 2, 7, 12000),
+                    )
+                    .await
+                    .unwrap();
+                let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
+                json!({"next_sequence":3,"normalized_samples":967})
+            }
+            "malformed" => {
+                let mut frame = voice_test_frame(&session.session_id, 1, 7, 12000);
+                frame.pop();
+                processor
+                    .process_binary_frame_for_connection(connection_id, &frame)
+                    .await
+                    .unwrap();
+                json!({"next_sequence":1,"normalized_samples":960})
+            }
+            "legacy" => JsonValue::Null,
+            "late_old" => json!({"next_sequence":1,"normalized_samples":960}),
+            "preview_missing_tail" => json!({"next_sequence":32,"normalized_samples":49607}),
+            _ => json!({"next_sequence":2,"normalized_samples":967}),
+        };
+        let request_id = generate_test_request_id("voice", "integrity_finalize");
+        let mut request = json!({"jsonrpc":"2.0","id":request_id,"method":"voice/session/finalize",
+            "params":{"session_id":session.session_id,"audio_integrity":expected,
+                "context":{"workspace_id":workspace_id,"thread_id":thread.thread.id,"turn_id":turn_id}}});
+        if case == "legacy" {
+            request["params"]
+                .as_object_mut()
+                .unwrap()
+                .remove("audio_integrity");
+        }
+        processor
+            .process_request_for_connection(connection_id, &request.to_string())
+            .await;
+        let (_ack, terminal) = recv_response_and_notification_by_id_method(
+            &mut rx,
+            &request_id,
+            events::VOICE_SESSION_RESULT,
+        )
+        .await;
+        let terminal: VoiceSessionResultNotification =
+            serde_json::from_value(terminal.params.unwrap()).unwrap();
+        assert_eq!(
+            terminal.outcome,
+            if case == "late_old" {
+                VoiceSessionOutcome::TurnStarted
+            } else {
+                VoiceSessionOutcome::Failed
+            },
+            "{case}"
+        );
+        assert_eq!(
+            crud.get_turn(&thread.thread.id, turn_id)
+                .await
+                .unwrap()
+                .is_some(),
+            case == "late_old",
+            "{case}"
+        );
+        assert!(
+            processor
+                .voice_sessions
+                .lookup_session(&session.session_id, connection_id)
+                .is_err()
+        );
+        while let Ok(Message::Text(payload)) = rx.try_recv() {
+            let value: JsonValue = serde_json::from_str(&payload).unwrap();
+            if case != "late_old" {
+                assert_ne!(value["method"], events::TURN_STARTED, "{case}");
+            }
+            assert_ne!(
+                value["method"],
+                events::VOICE_SESSION_RESULT,
+                "duplicate terminal: {case}"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

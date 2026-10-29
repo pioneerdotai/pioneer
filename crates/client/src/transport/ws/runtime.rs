@@ -84,6 +84,7 @@ const UPLOAD_CHUNK_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct GatewayWsCommandSender {
     command_tx: WsSender<GatewayWsCommand>,
+    voice_budget: Arc<super::voice_budget::VoiceTransportBudget>,
     next_connection_id: Arc<AtomicU64>,
     session_access: Arc<Mutex<Option<GatewayHttpAccess>>>,
     connection_generations: Arc<Mutex<GatewayConnectionGenerations>>,
