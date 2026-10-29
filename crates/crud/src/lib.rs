@@ -227,8 +227,8 @@ pub use repositories::task_completion_inbox::{
     mark_task_completion_inbox_read, mark_viewed_task_completion_inbox_read,
 };
 pub use repositories::thread::{
-    ThreadManagementChange, advance_thread_read_cursor, find_thread_read_cursor,
-    thread_read_cursor_from_model,
+    ThreadManagementChange, ThreadReadPosition, advance_thread_read_cursor,
+    find_thread_read_cursor, thread_read_cursor_from_model,
 };
 pub use repositories::turn::{
     NewTurnMessageRevision, PersistedTurnCollaboration, TURN_MESSAGE_GUARD_PAGE_BYTES,
@@ -23712,11 +23712,10 @@ impl CrudStore {
     pub async fn list_thread_read_candidates_page(
         &self,
         workspace_id: &str,
-        after_thread_id: Option<&str>,
+        after: Option<&ThreadReadPosition>,
         limit: u64,
-    ) -> Result<Vec<String>> {
-        thread::list_read_candidates_page(&self.connection, workspace_id, after_thread_id, limit)
-            .await
+    ) -> Result<Vec<ThreadReadPosition>> {
+        thread::list_read_candidates_page(&self.connection, workspace_id, after, limit).await
     }
 
     pub async fn list_threads_for_workspace(
