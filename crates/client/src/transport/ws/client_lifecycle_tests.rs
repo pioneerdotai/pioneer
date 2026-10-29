@@ -335,9 +335,14 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
     let phase = std::cell::Cell::new("starting fixture");
     timeout(Duration::from_secs(10), async {
         let mut f = Fixture::start().await;
-        phase.set("receiving first request");
-        let first = request(&f.commands, "synthetic/first");
-        assert_eq!(f.next_request().await["id"], first.id);
+        phase.set("completing warmup round trip");
+        let warmup = request(&f.commands, "synthetic/warmup");
+        assert_eq!(f.next_request().await["id"], warmup.id);
+        // Receiving bytes alone can precede the writer's flush. The monitor
+        // polls the writer before processing this reply, so completing the RPC
+        // keeps the gate below from catching the warmup's unfinished flush.
+        f.reply(&warmup.id).await;
+        assert!(receive(warmup.rx).await.is_ok());
         // The peer can respond before send/flush completes. Registration must
         // already exist, and response processing must not depend on writer exit.
         phase.set("receiving request with flush blocked");
@@ -359,6 +364,9 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
         assert_eq!(f.next_request().await["id"], flushed.id);
         f.reply(&flushed.id).await;
         assert!(receive(flushed.rx).await.is_ok());
+        phase.set("receiving first pending request");
+        let first = request(&f.commands, "synthetic/first");
+        assert_eq!(f.next_request().await["id"], first.id);
         phase.set("waiting for blocked write");
         f.gate.block();
         let blocked = request(&f.commands, "synthetic/blocked");
