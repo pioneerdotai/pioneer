@@ -19,7 +19,7 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 #[derive(Default)]
 struct GateState {
     blocked: bool,
-    flush_blocked: bool,
+    flush_blocked_after: Option<u64>,
     writes: u64,
     flushed_writes: u64,
     reported: bool,
@@ -43,7 +43,9 @@ impl WriteGate {
 
     fn block_flush(&self) {
         let mut state = self.state.lock().unwrap();
-        state.flush_blocked = true;
+        // The split sink may finish an earlier empty flush before it submits
+        // the next frame. Only stall a flush after new bytes reach the peer.
+        state.flush_blocked_after = Some(state.writes);
         state.reported = false;
     }
 
@@ -73,7 +75,7 @@ impl WriteGate {
     fn release(&self, failed: bool) {
         let mut state = self.state.lock().unwrap();
         state.blocked = false;
-        state.flush_blocked = false;
+        state.flush_blocked_after = None;
         state.failed = failed;
         if let Some(waker) = state.waker.take() {
             waker.wake();
@@ -154,7 +156,10 @@ impl AsyncWrite for GatedSocket {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         {
             let mut state = self.gate.state.lock().unwrap();
-            if state.flush_blocked {
+            if state
+                .flush_blocked_after
+                .is_some_and(|writes| state.writes > writes)
+            {
                 state.waker = Some(cx.waker().clone());
                 if !state.reported {
                     state.reported = true;
@@ -393,7 +398,7 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
         phase.set("receiving response while flush is blocked");
         f.reply(&fast.id).await;
         assert!(receive(fast.rx).await.is_ok());
-        assert!(f.gate.state.lock().unwrap().flush_blocked);
+        assert!(f.gate.state.lock().unwrap().flush_blocked_after.is_some());
         f.gate.release(false);
         // A peer reply can arrive while the writer still owns the previous
         // flush. Complete a round trip with the gate open before blocking the
