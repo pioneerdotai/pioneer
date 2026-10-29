@@ -2305,21 +2305,18 @@ impl MessageProcessor {
         })
         .await;
         if let Err(error) = task_created {
-            // A durable action may have committed before a notification/executor
-            // wake failed. Its outbox owns completion in that case.
-            let committed = match &request_actor {
-                pioneer_protocol::PersistedActorRef::AgentExecution(_) => !self
-                    .crud_store
-                    .list_tasks_created_by_turn(&thread.workspace_id, &thread.id, &turn_id)
-                    .await
-                    .map_err(|error| {
-                        TurnStartFailure::internal(format!(
-                            "failed to inspect accepted Task: {error:#}"
-                        ))
-                    })?
-                    .is_empty(),
-                _ => false,
-            };
+            // Task acceptance may precede a notification/executor wake failure.
+            // The action outbox or orphan-admission recovery owns completion.
+            let committed = !self
+                .crud_store
+                .list_tasks_created_by_turn(&thread.workspace_id, &thread.id, &turn_id)
+                .await
+                .map_err(|error| {
+                    TurnStartFailure::internal(format!(
+                        "failed to inspect accepted Task: {error:#}"
+                    ))
+                })?
+                .is_empty();
             if !committed {
                 self.mark_turn_blocked(
                     thread.id.clone(),
@@ -2367,6 +2364,22 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
     ) -> bool {
+        let current = match self.crud_store.get_turn(thread_id, turn_id).await {
+            Ok(Some(current))
+                if current.1.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask =>
+            {
+                current
+            }
+            _ => return false,
+        };
+        if current.1.status != TurnStatus::InProgress {
+            // Stop/refusal may win after Task acceptance. Confirm that saved
+            // outcome; completing admission must never overwrite it.
+            return self
+                .synchronize_projected_native_terminal_turn(&current.0, thread_id, turn_id)
+                .await
+                .unwrap_or(false);
+        }
         // Reuse the ordinary owner CAS after Gateway replacement. Until the
         // old lease expires the existing outbox retains the admission obligation.
         let owner = match self.crud_store.get_turn_execution(turn_id).await {

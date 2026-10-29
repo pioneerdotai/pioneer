@@ -5537,3 +5537,640 @@ async fn detached_threads_action_recovers_after_commit_without_recreating_or_dis
         .unwrap();
     assert_eq!(probe.main_calls.load(Ordering::SeqCst), 1);
 }
+
+// Keep these fault windows at the real Threads/RPC admission boundaries. The
+// Task bridge is deliberately unbound until assertions about admission finish.
+async fn create_detached_review_target(
+    processor: &Arc<MessageProcessor>,
+    tools: &pioneer_agent::TurnToolMaterialization,
+    options: &pioneer_protocol::AgentToolOptionsProjection,
+    label: &str,
+    call_id: &str,
+) -> (String, pioneer_protocol::AgentToolTargetOption) {
+    let option = options
+        .thread_creation_options
+        .iter()
+        .find(|o| o.label == label)
+        .unwrap();
+    let created = call(
+        tools,
+        "thread_create",
+        call_id,
+        json!({"optionId":option.id}),
+    )
+    .await;
+    let row = pioneer_crud::load_agent_action_outbox(
+        &processor.crud_store.database_connection(),
+        crate::authorization::action_id_for_call(call_id).as_str(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
+    let targets: Vec<pioneer_protocol::AgentToolTargetOption> =
+        serde_json::from_value(created["targetOptions"].clone()).unwrap();
+    (
+        payload["created_thread_id"].as_str().unwrap().to_owned(),
+        targets
+            .into_iter()
+            .find(|t| !options.target_options.iter().any(|old| old.id == t.id))
+            .unwrap(),
+    )
+}
+
+async fn expire_review_admission(processor: &Arc<MessageProcessor>, turn_id: &str) {
+    use sea_orm::{ActiveModelTrait, Set};
+    let db = processor.crud_store.database_connection();
+    let mut owner: pioneer_entity::turn_execution::ActiveModel =
+        pioneer_entity::turn_execution::Entity::find_by_id(turn_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    // Preserve the lease/heartbeat invariant while modeling a dead Gateway.
+    owner.heartbeat_at = Set(pioneer_crud::utc_now() - chrono::Duration::seconds(2));
+    owner.lease_until = Set(pioneer_crud::utc_now() - chrono::Duration::seconds(1));
+    owner.update(&db).await.unwrap();
+}
+
+#[tokio::test]
+async fn detached_admission_early_stop_preserves_live_source_graph_on_both_sides_of_task_commit() {
+    for accepted in [false, true] {
+        let probe = Arc::new(ChoiceRuntimeProbe::default());
+        let (processor, context, tools) = fixture_with_probe(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            false,
+            probe.clone(),
+        )
+        .await;
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let source = binding.adapter.lock().await.persistence_facts();
+        assert_eq!(source.execution_id, source.root_execution_id);
+        let (_, sibling_target) = create_detached_review_target(
+            &processor,
+            &tools,
+            &binding.options,
+            "Current collaboration",
+            "stop-sibling-thread",
+        )
+        .await;
+        call(
+            &tools,
+            "threads_turn_start",
+            "stop-sibling",
+            json!({"targetOptionId":sibling_target.id,
+            "input":[{"type":"text","text":"Other work in the source graph"}]}),
+        )
+        .await;
+        let db = processor.crud_store.database_connection();
+        let mut graph_before = pioneer_entity::agent_execution::Entity::find()
+            .filter(
+                pioneer_entity::agent_execution::Column::WorkGraphRootExecutionId
+                    .eq(source.root_execution_id.as_str()),
+            )
+            .all(&db)
+            .await
+            .unwrap();
+        graph_before.sort_by(|a, b| a.id.cmp(&b.id));
+        assert!(
+            graph_before.len() >= 2,
+            "the source has an unrelated live descendant"
+        );
+        assert!(
+            graph_before
+                .iter()
+                .all(|e| !matches!(e.status.as_str(), "cancelled" | "completed" | "failed"))
+        );
+        let (thread_id, target) = create_detached_review_target(
+            &processor,
+            &tools,
+            &binding.options,
+            "New delegated root",
+            "stop-detached-thread",
+        )
+        .await;
+        processor.arm_completed_history_preparation_barrier(if accepted {
+            "__detached_thread_after_task_commit__"
+        } else {
+            "__detached_composer_before_task_create__"
+        });
+        let start = invoke_with_mutation(
+            &tools,
+            "threads_turn_start",
+            "stop-detached",
+            json!({
+            "targetOptionId":target.id,"input":[{"type":"text","text":"Independent work"}]}),
+            None,
+        );
+        tokio::pin!(start);
+        tokio::select! {
+            _ = &mut start => panic!("admission must reach the commit window"),
+            _ = processor.wait_for_completed_history_preparation_barrier() => {},
+        }
+        let admission = processor
+            .crud_store
+            .get_thread_model(&thread_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .turns
+            .into_iter()
+            .find(|t| t.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask)
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(128);
+        let connection =
+            register_authenticated_test_connection(processor.session_manager.as_ref(), tx).await;
+        let request_id = generate_test_request_id("detached", "stop");
+        processor
+            .process_request_for_connection(
+                connection,
+                &json!({"jsonrpc":"2.0","id":request_id,
+            "method":"turn/cancel","params":{"thread_id":thread_id,"turn_id":admission.id}})
+                .to_string(),
+            )
+            .await;
+        let response = recv_response_by_id(&mut rx, &request_id).await;
+        let stopped: pioneer_protocol::TurnCancelResponse =
+            serde_json::from_value(response.result).unwrap();
+        assert_eq!(stopped.turn.status, TurnStatus::Interrupted);
+        processor.release_completed_history_preparation_barrier();
+        let result = start.await;
+        assert_eq!(result.is_ok(), accepted);
+        let tasks = processor
+            .crud_store
+            .list_tasks_created_by_turn(&context.workspace_id, &thread_id, &admission.id)
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), usize::from(accepted));
+        let receipt = pioneer_crud::load_agent_action_receipt(
+            &db,
+            crate::authorization::action_id_for_call("stop-detached").as_str(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.is_some(), accepted);
+        if accepted {
+            // The detached Task's KeepRunning policy survives admission Stop.
+            assert!(
+                !processor
+                    .crud_store
+                    .get_task(&tasks[0].id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .status
+                    .is_terminal()
+            );
+        }
+        let mut graph_after = pioneer_entity::agent_execution::Entity::find()
+            .filter(
+                pioneer_entity::agent_execution::Column::WorkGraphRootExecutionId
+                    .eq(source.root_execution_id.as_str()),
+            )
+            .all(&db)
+            .await
+            .unwrap();
+        graph_after.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            graph_after, graph_before,
+            "admission Stop must not mutate the source or its descendants"
+        );
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            processor
+                .crud_store
+                .get_turn(&thread_id, &admission.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::Interrupted
+        );
+        assert!(
+            processor
+                .crud_store
+                .get_turn_runtime_snapshot(&admission.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            pioneer_crud::load_agent_turn_response(&db, &admission.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            processor
+                .crud_store
+                .get_turn_work_projection(&admission.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn replaced_gateway_resolves_detached_admission_before_commit_and_after_user_task_acceptance()
+{
+    for (agent, accepted) in [(true, false), (false, false), (false, true)] {
+        let probe = Arc::new(ChoiceRuntimeProbe::default());
+        let (processor, context, tools) = fixture_with_probe(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            false,
+            probe.clone(),
+        )
+        .await;
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let (thread_id, target) = create_detached_review_target(
+            &processor,
+            &tools,
+            &binding.options,
+            "New delegated root",
+            "recovery-review-thread",
+        )
+        .await;
+        let turn_id;
+        processor.arm_completed_history_preparation_barrier(if accepted {
+            "__detached_thread_after_task_commit__"
+        } else {
+            "__detached_composer_before_task_create__"
+        });
+        if agent {
+            let start = invoke_with_mutation(
+                &tools,
+                "threads_turn_start",
+                "unaccepted-agent",
+                json!({"targetOptionId":target.id,"input":[{"type":"text","text":"Admission before commit"}]}),
+                None,
+            );
+            tokio::pin!(start);
+            tokio::select! {
+                _ = &mut start => panic!("admission must pause before commit"),
+                _ = processor.wait_for_completed_history_preparation_barrier() => {},
+            }
+            turn_id = processor
+                .crud_store
+                .get_thread_model(&thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .turns
+                .into_iter()
+                .find(|t| t.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask)
+                .unwrap()
+                .id;
+            // Drop the interrupted delivery before the Task/action transaction.
+        } else {
+            let (tx, _rx) = mpsc::channel(128);
+            let connection =
+                register_authenticated_test_connection(processor.session_manager.as_ref(), tx)
+                    .await;
+            turn_id = "recovery-user-admission".to_owned();
+            let request_id = generate_test_request_id("review", "user-admission");
+            let request = json!({"jsonrpc":"2.0","id":request_id,"method":"turn/start","params":{
+                "thread_id":thread_id,"turn_id":turn_id,"input":[{"type":"text","text":"User crash window"}],
+                "model":"gpt-5.4","model_provider":"openai","mode":"Agent"}}).to_string();
+            let start = processor.process_request_for_connection(connection, &request);
+            tokio::pin!(start);
+            tokio::select! {
+                _ = &mut start => panic!("user admission must pause at its commit window"),
+                _ = processor.wait_for_completed_history_preparation_barrier() => {},
+            }
+        }
+        expire_review_admission(&processor, &turn_id).await;
+        let replacement = restart_choice_processor(&processor);
+        for _ in 0..2 {
+            replacement
+                .recovery_coordinator
+                .run_ready_jobs(now_timestamp_secs(), 64)
+                .await
+                .unwrap();
+        }
+        let turn = replacement
+            .crud_store
+            .get_turn(&thread_id, &turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(
+            turn.status,
+            if accepted {
+                TurnStatus::Completed
+            } else {
+                TurnStatus::Failed
+            }
+        );
+        let execution = replacement
+            .crud_store
+            .get_turn_execution(&turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!execution.status.is_active());
+        let tasks = replacement
+            .crud_store
+            .list_tasks_created_by_turn(&context.workspace_id, &thread_id, &turn_id)
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), usize::from(accepted));
+        assert!(
+            replacement
+                .crud_store
+                .get_turn_runtime_snapshot(&turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            replacement
+                .crud_store
+                .get_turn_work_projection(&turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
+        if accepted {
+            replacement.bind_task_bridge().await;
+            replacement.start_task_event_listener().await;
+            replacement
+                .task_runtime
+                .process_due_once(now_timestamp_secs())
+                .await
+                .unwrap();
+            assert_eq!(
+                wait_for_task_status(
+                    replacement.crud_store.clone(),
+                    &tasks[0].id,
+                    TaskStatus::Completed
+                )
+                .await,
+                TaskStatus::Completed
+            );
+            replacement
+                .task_runtime
+                .process_due_once(now_timestamp_secs())
+                .await
+                .unwrap();
+            assert_eq!(probe.main_calls.load(Ordering::SeqCst), 1);
+            assert!(
+                replacement
+                    .crud_store
+                    .get_turn_runtime_snapshot(&turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        if agent {
+            assert!(
+                pioneer_crud::load_agent_action_receipt(
+                    &replacement.crud_store.database_connection(),
+                    crate::authorization::action_id_for_call("unaccepted-agent").as_str()
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_detached_admission_outbox_preserves_outcome_and_acks_even_after_retry_budget() {
+    use sea_orm::{ActiveModelTrait, Set};
+    for status in [
+        TurnStatus::Interrupted,
+        TurnStatus::Blocked,
+        TurnStatus::Failed,
+    ] {
+        let probe = Arc::new(ChoiceRuntimeProbe::default());
+        let (processor, context, tools) = fixture_with_probe(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            false,
+            probe.clone(),
+        )
+        .await;
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let source = binding.adapter.lock().await.persistence_facts();
+        let (thread_id, target) = create_detached_review_target(
+            &processor,
+            &tools,
+            &binding.options,
+            "New delegated root",
+            "terminal-review-thread",
+        )
+        .await;
+        processor
+            .arm_completed_history_preparation_barrier("__detached_thread_after_task_commit__");
+        {
+            let start = call(
+                &tools,
+                "threads_turn_start",
+                "terminal-review",
+                json!({"targetOptionId":target.id,
+                "input":[{"type":"text","text":"Accepted work with a terminal admission"}]}),
+            );
+            tokio::pin!(start);
+            tokio::select! {
+                _ = &mut start => panic!("must stop after the atomic Task/action commit"),
+                _ = processor.wait_for_completed_history_preparation_barrier() => {},
+            }
+        }
+        let db = processor.crud_store.database_connection();
+        let action_id = crate::authorization::action_id_for_call("terminal-review");
+        let row = pioneer_crud::load_agent_action_outbox(&db, action_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
+        let turn_id = payload["turn_id"].as_str().unwrap();
+        let (_, mut terminal) = processor
+            .crud_store
+            .get_turn(&thread_id, turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        terminal.status = status;
+        terminal.error = Some("Saved terminal admission outcome".into());
+        let event = if status == TurnStatus::Blocked {
+            pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(
+                pioneer_protocol::TurnBlockedNotification {
+                    workspace_id: context.workspace_id.clone(),
+                    thread_id: thread_id.clone(),
+                    turn: terminal.clone(),
+                    resume: None,
+                },
+            )
+        } else {
+            pioneer_crud::CanonicalTurnEventPayload::TurnFailed(
+                pioneer_protocol::TurnFailedNotification {
+                    workspace_id: context.workspace_id.clone(),
+                    thread_id: thread_id.clone(),
+                    turn: terminal.clone(),
+                },
+            )
+        };
+        processor
+            .crud_store
+            .materialize_native_agent_turn_event_owned(
+                event,
+                now_timestamp_secs(),
+                None,
+                processor.turn_execution_owner_id.as_ref(),
+            )
+            .await
+            .unwrap();
+        if status == TurnStatus::Blocked {
+            // Fail proof acquisition, not the proof itself. Keep a typed DB
+            // failure retryable even though the admission is already terminal.
+            db.execute_unprepared(
+                "ALTER TABLE agent_action_receipt RENAME TO unavailable_detached_receipt",
+            )
+            .await
+            .unwrap();
+            let batch =
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap();
+            assert!(batch.errors.is_empty(), "{:?}", batch.errors);
+            db.execute_unprepared(
+                "ALTER TABLE unavailable_detached_receipt RENAME TO agent_action_receipt",
+            )
+            .await
+            .unwrap();
+            let retry = pioneer_crud::load_agent_action_outbox(&db, action_id.as_str())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retry.status, "failed");
+            assert_eq!(
+                retry.last_error.as_deref(),
+                Some(pioneer_crud::AgentActionOutboxFailure::StorageUnavailable.safe_name())
+            );
+            assert!(retry.next_attempt_at.is_some());
+        }
+        for attempts in [0, pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS] {
+            let mut pending: pioneer_entity::agent_action_outbox::ActiveModel = row.clone().into();
+            pending.status = Set("failed".into());
+            pending.attempts = Set(attempts);
+            pending.last_error = Set((attempts > 0)
+                .then(|| pioneer_crud::AGENT_START_RECONCILIATION_REQUIRED.to_owned()));
+            pending.delivered_at = Set(None);
+            pending.next_attempt_at =
+                Set(Some(pioneer_crud::utc_now() - chrono::Duration::seconds(1)));
+            pending.update(&db).await.unwrap();
+            let batch =
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap();
+            assert!(batch.errors.is_empty(), "{:?}", batch.errors);
+            let delivered = pioneer_crud::load_agent_action_outbox(&db, action_id.as_str())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivered.status, "delivered");
+            assert!(delivered.next_attempt_at.is_none());
+            assert_eq!(
+                processor
+                    .crud_store
+                    .get_turn(&thread_id, turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                terminal
+            );
+            assert_eq!(
+                processor
+                    .crud_store
+                    .list_tasks_created_by_turn(&context.workspace_id, &thread_id, turn_id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        if status == TurnStatus::Interrupted {
+            let mut foreign = payload.clone();
+            // A real, accessible source Turn is still not this action's
+            // admission. A terminal outcome cannot bypass the binding proof.
+            foreign["turn_id"] = json!(context.turn_id);
+            for attempts in [0, pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS] {
+                let mut pending: pioneer_entity::agent_action_outbox::ActiveModel =
+                    row.clone().into();
+                pending.payload_json = Set(foreign.to_string());
+                pending.status = Set("pending".into());
+                pending.attempts = Set(attempts);
+                pending.last_error = Set(None);
+                pending.delivered_at = Set(None);
+                pending.next_attempt_at = Set(None);
+                pending.update(&db).await.unwrap();
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap();
+                let refused = pioneer_crud::load_agent_action_outbox(&db, action_id.as_str())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(refused.status, "failed");
+                assert_eq!(
+                    refused.last_error.as_deref(),
+                    Some(
+                        pioneer_crud::AgentActionOutboxFailure::InvalidDetachedBinding.safe_name()
+                    )
+                );
+                assert!(refused.next_attempt_at.is_none());
+                assert!(refused.delivered_at.is_none());
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    pioneer_crud::load_agent_action_outbox(&db, action_id.as_str())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    refused
+                );
+            }
+        }
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
+        assert_ne!(
+            pioneer_crud::load_agent_execution(&db, source.execution_id.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        assert!(
+            processor
+                .crud_store
+                .get_turn_runtime_snapshot(turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}

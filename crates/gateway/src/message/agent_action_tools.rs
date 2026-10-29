@@ -3201,6 +3201,20 @@ where
                     .await
                     .map(|_| false)
                 }
+                Ok(AgentActionOutboxDispatch::InvalidBinding) => {
+                    // A failed proof is terminal for this delivery, never a
+                    // successful ACK of somebody else's accepted work.
+                    pioneer_crud::mark_agent_action_outbox_failed_with_cause(
+                        database,
+                        &outbox_id,
+                        attempts,
+                        pioneer_crud::utc_now(),
+                        pioneer_crud::AgentActionOutboxFailure::InvalidDetachedBinding,
+                        true,
+                    )
+                    .await
+                    .map(|_| false)
+                }
                 Ok(AgentActionOutboxDispatch::Rejected(_))
                     if attempts == pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS =>
                 {
@@ -3284,6 +3298,7 @@ pub(super) enum AgentActionOutboxDispatch {
     AwaitingPermit,
     AwaitingRuntime,
     Rejected(pioneer_crud::AgentActionOutboxFailure),
+    InvalidBinding,
 }
 
 // Failure to obtain a proof is different from a proof denying the action.
@@ -3325,13 +3340,28 @@ async fn dispatch_agent_action_outbox_row(
     row: &pioneer_entity::agent_action_outbox::Model,
 ) -> anyhow::Result<AgentActionOutboxDispatch> {
     use pioneer_crud::AgentActionOutboxFailure as Failure;
-    let detached = serde_json::from_str::<serde_json::Value>(&row.payload_json)?
+    let payload: serde_json::Value = serde_json::from_str(&row.payload_json)?;
+    let detached = payload
         .get("execution_mode")
         .and_then(serde_json::Value::as_str)
         == Some("detached_task");
-    if !detached
-        && row.last_error.as_deref() == Some(pioneer_crud::AGENT_START_RECONCILIATION_REQUIRED)
-    {
+    if detached {
+        if payload.get("kind").and_then(serde_json::Value::as_str) != Some("start_agent") {
+            return Ok(AgentActionOutboxDispatch::InvalidBinding);
+        }
+        return match reconcile_detached_thread_start(processor, row, &payload).await {
+            Err(error)
+                if agent_start_has_storage_failure(&error)
+                    || error.downcast_ref::<Failure>()
+                        == Some(&Failure::PreparationUnavailable) =>
+            {
+                Err(error)
+            }
+            Err(_) => Ok(AgentActionOutboxDispatch::InvalidBinding),
+            result => result,
+        };
+    }
+    if row.last_error.as_deref() == Some(pioneer_crud::AGENT_START_RECONCILIATION_REQUIRED) {
         return match finalize_rejected_agent_start(processor, row, Failure::OutcomeUnknown).await? {
             AgentStartReconciliation::Finalized => {
                 Ok(AgentActionOutboxDispatch::Rejected(Failure::OutcomeUnknown))
@@ -3341,7 +3371,7 @@ async fn dispatch_agent_action_outbox_row(
         };
     }
     match dispatch_agent_action_outbox_row_inner(processor, row).await {
-        Err(error) if detached || agent_start_has_storage_failure(&error) => Err(error),
+        Err(error) if agent_start_has_storage_failure(&error) => Err(error),
         Err(error)
             if error.downcast_ref::<Failure>().is_some_and(|failure| {
                 matches!(
@@ -3711,6 +3741,24 @@ async fn reconcile_detached_thread_start(
     )
     .await?
     .context("detached start has no receipt")?;
+    let action = pioneer_crud::load_agent_action(
+        &processor.crud_store.database_connection(),
+        &row.action_id,
+    )
+    .await?
+    .context("detached start has no canonical action")?;
+    anyhow::ensure!(
+        action.id == row.action_id
+            && action.execution_id == row.owner_execution_id
+            && action.action_kind == "start_agent"
+            && action.status == "committed"
+            && receipt.action_id == action.id
+            && receipt.actor_kind == "agent_execution"
+            && receipt.actor_id.as_deref() == Some(row.owner_execution_id.as_str())
+            && receipt.decision == "allowed"
+            && receipt.response_json == action.response_json,
+        "detached start differs from its action/receipt binding"
+    );
     let response: serde_json::Value = serde_json::from_str(
         receipt
             .response_json
@@ -3719,6 +3767,19 @@ async fn reconcile_detached_thread_start(
     )?;
     anyhow::ensure!(
         response["taskCreation"]["taskId"].as_str() == Some(task_id)
+            && task.task.owner_kind == pioneer_protocol::TaskOwnerKind::Thread
+            && task.task.parent_task_id.is_none()
+            && contract.task_id == task_id
+            && contract.workspace_id == task.task.workspace_id
+            && contract.work_graph_root_execution_id.is_none()
+            && task
+                .task
+                .metadata
+                .as_ref()
+                .and_then(|m| m.composer_work.as_ref())
+                .is_some_and(
+                    |work| work.launch.thread_id == thread_id && work.launch.turn_id == turn_id
+                )
             && task.task.owner_id.as_deref() == Some(thread_id)
             && task.task.created_by_thread_id.as_deref() == Some(thread_id)
             && task.task.created_by_turn_id.as_deref() == Some(turn_id)
@@ -3728,29 +3789,40 @@ async fn reconcile_detached_thread_start(
             ),
         "detached action differs from its Task/creator binding"
     );
-    let (_, turn) = processor
+    let (workspace_id, turn) = processor
         .crud_store
         .get_turn(thread_id, turn_id)
         .await?
         .context("detached admission is unavailable")?;
     anyhow::ensure!(
-        turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask
+        workspace_id == task.task.workspace_id
+            && turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask
             && turn
                 .author
                 .as_ref()
                 .is_some_and(|author| author.actor == contract.creator),
         "invalid detached admission owner"
     );
-    if turn.status == pioneer_protocol::TurnStatus::Completed {
-        return Ok(AgentActionOutboxDispatch::Delivered);
-    }
-    anyhow::ensure!(
-        turn.status == pioneer_protocol::TurnStatus::InProgress,
-        "detached admission is not completable"
-    );
     processor
         .ensure_thread_loaded(thread_id, &task.task.workspace_id)
-        .await?;
+        .await
+        .context(pioneer_crud::AgentActionOutboxFailure::PreparationUnavailable)?;
+    if turn.status != pioneer_protocol::TurnStatus::InProgress {
+        // The action promised acceptance of this exact Task. Stop/refusal of
+        // admission does not undo that commit or change its canonical outcome.
+        anyhow::ensure!(
+            processor
+                .synchronize_projected_native_terminal_turn(
+                    &task.task.workspace_id,
+                    thread_id,
+                    turn_id
+                )
+                .await
+                .context(pioneer_crud::AgentActionOutboxFailure::PreparationUnavailable)?,
+            pioneer_crud::AgentActionOutboxFailure::PreparationUnavailable
+        );
+        return Ok(AgentActionOutboxDispatch::Delivered);
+    }
     let params = &task
         .task
         .metadata
@@ -3762,12 +3834,13 @@ async fn reconcile_detached_thread_start(
     let outcome = processor
         .thread_manager
         .rehydrate_committed_agent_turn(params, input)
-        .await?;
+        .await
+        .context(pioneer_crud::AgentActionOutboxFailure::PreparationUnavailable)?;
     anyhow::ensure!(
         processor
             .publish_detached_thread_admission(&outcome, &[])
             .await,
-        "detached admission delivery pending"
+        pioneer_crud::AgentActionOutboxFailure::PreparationUnavailable
     );
     Ok(AgentActionOutboxDispatch::Delivered)
 }

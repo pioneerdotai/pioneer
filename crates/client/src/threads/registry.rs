@@ -2746,6 +2746,7 @@ mod tests {
     use std::num::NonZeroUsize;
     fn composer_admission() -> Turn {
         let mut turn = running_turn("admission");
+        turn.work_owner = TurnWorkOwner::DetachedTask;
         turn.author = Some(TurnAuthorSnapshot {
             cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(PrincipalId::new("P".repeat(21)).unwrap()),
@@ -3372,6 +3373,7 @@ mod tests {
                 } else {
                     composer_admission()
                 };
+                turn.work_owner = TurnWorkOwner::Turn;
                 turn.turn_kind = TurnKind::Conversation;
                 turn.origin = TurnOrigin::User;
                 turn.mode = mode;

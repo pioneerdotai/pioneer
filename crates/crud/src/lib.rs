@@ -32879,6 +32879,27 @@ impl CrudStore {
         input: TaskCreationCommitInput,
         root: Option<frozen_lifetime::PreparedFrozenRoot>,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        // Prepare the bounded admission binding outside writer capacity. The
+        // status is revalidated inside the Task/action transaction below: Stop
+        // or recovery must win atomically against acceptance of new work.
+        let composer_admissions = input
+            .events
+            .iter()
+            .filter_map(|event| {
+                let TaskEventPayload::TaskCreated { task } = event else {
+                    return None;
+                };
+                let work = task.metadata.as_ref()?.composer_work.as_ref()?;
+                Some((
+                    task.workspace_id.clone(),
+                    task.owner_id.clone(),
+                    task.created_by_thread_id.clone(),
+                    task.created_by_turn_id.clone(),
+                    work.launch.thread_id.clone(),
+                    work.launch.turn_id.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
         let prepared_events = self
             .prepare_task_events_for_write(input.events.clone())
             .await?;
@@ -32888,6 +32909,47 @@ impl CrudStore {
             .await
             .context("failed to begin atomic Task creation transaction")?;
         let result = async {
+            for (workspace_id, owner_id, creator_thread, creator_turn, thread_id, turn_id) in
+                &composer_admissions
+            {
+                let (Some(creator_thread), Some(creator_turn)) = (creator_thread, creator_turn)
+                else {
+                    continue;
+                };
+                let Some(turn) =
+                    turn::find_turn_by_thread_and_id(&transaction, creator_thread, creator_turn)
+                        .await?
+                else {
+                    continue;
+                };
+                // Composer payloads also occur in historical/ordinary Task
+                // requests. Only a saved detached admission owns this fence.
+                if turn.work_owner != TurnWorkOwner::DetachedTask.as_db_str() {
+                    continue;
+                }
+                anyhow::ensure!(
+                    owner_id.as_ref() == Some(thread_id)
+                        && creator_thread == thread_id
+                        && creator_turn == turn_id,
+                    "invalid composer Task admission binding"
+                );
+                let execution = turn_execution::find(&transaction, turn_id)
+                    .await?
+                    .context("composer Task admission has no execution owner")?;
+                anyhow::ensure!(
+                    turn.work_owner == TurnWorkOwner::DetachedTask.as_db_str()
+                        && turn.status == "in_progress"
+                        && execution.workspace_id == *workspace_id
+                        && execution.thread_id == *thread_id
+                        && matches!(
+                            execution.status,
+                            TurnExecutionStatus::Queued
+                                | TurnExecutionStatus::Starting
+                                | TurnExecutionStatus::Running
+                        ),
+                    "composer Task admission was stopped or taken over before Task acceptance"
+                );
+            }
             let appended_events = self
                 .append_task_events_in_connection(
                     &transaction,

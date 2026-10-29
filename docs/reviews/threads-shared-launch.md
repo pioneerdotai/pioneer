@@ -6,6 +6,7 @@
 
 - Исходный commit при начале работы: `4f086cbe54e88ceb515d7d4ab4c3cf89ad7fa794`. После обычного `fetch origin main` local main и origin/main совпадали с ним.
 - Во время работы main обновился. Изменение перенесено обычным rebase на `7f226499d3fa8beac5dd15b3d241040e7a99016e` — актуальные local main и origin/main при подготовке передачи. Rebase прошёл без конфликтов. Вошедшее в main исправление доставки событий просмотрено отдельно; оно не является частью собственного patch.
+- Повторное ревью начато с проверенного `b9a932f576282c0e75f501be3eaf39abf0ecadf5`, рабочее дерево было чистым. База реализации остаётся `7f226499d3fa8beac5dd15b3d241040e7a99016e`; повторные исправления сделаны поверх reviewed HEAD без rebase/merge. На этом этапе фактические local main и origin/main — `dc90743137af9d220a3594c8fe6190bdbde7d999`; они только прочитаны, не интегрировались.
 - Ветка: `fix/threads-shared-launch`.
 - Worktree: `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-shared-launch`.
 - Основной checkout и соседние worktree этой работой не изменялись. Старые экспериментальные ветки Threads не читались как эталон и не интегрировались.
@@ -51,7 +52,7 @@ Durable agent entry не превращается в Fresh principal admission. 
 4. В одном runtime повторная доставка дополнительно использует уже существующий mutex execution binding и повторное чтение action/receipt/outbox. После потерянного ответа найденный action возвращает сохранённое подтверждение; `create_task` повторно не вызывается.
 5. Для нового detached outbox сохранены `execution_mode`, task/thread/turn IDs и fingerprint исходного launch request. Поле прямого `spawned_execution_id` и direct `dispatch` не используются. Outbox проверяет связь с Task/creator/admission и завершает admission; реальное выполнение, retry, Stop, terminal result и delivery принадлежат Task runtime.
 6. Если ответ TaskService теряется после commit, handler проверяет durable receipt перед ошибкой. Ошибка публикации не объявляется успешным выполнением модели: action подтверждает admission, Task status описывает результат работы.
-7. После restart используется существующий ownership CAS; до истечения чужого lease outbox сохраняет обязанность. Обычная orphan-turn recovery не создаёт provider restart/Blocked job для Task-owned admission без provider state. Никакого второго запуска модели из admission outbox нет.
+7. После restart используется существующий ownership CAS. До принятия Task admission завершается Failed, без provider restart/Blocked job. Для уже принятой пользовательской Task recovery завершает admission штатным canonical terminal event и его durable delivery. Для агентской Task сохраняется обязанность action outbox. Отсутствие provider state не служит причиной пропустить admission. Никакого второго запуска модели из admission outbox нет.
 8. Replay восстанавливает профиль и reasoning нового detached запуска из Task actor contract. Изменение/недоступность каталога и поздние настройки вызывающего агента не выбирают новую работу.
 
 Старые action/outbox без detached marker проходят прежний direct путь независимо от нынешнего типа треда. Новая Task вокруг них не создаётся. История и receipts не удаляются и не переписываются. При штатной compaction новых outbox сохраняются immutable стратегия и Task binding вместе с исходным replay fingerprint; прежняя compaction direct outbox сохранена.
@@ -83,7 +84,7 @@ Client state machine и semantic timeline используют этот приз
 
 Последовательно просмотрены вход → проверки → сохранение → выполнение → результат для общего запуска, Task/child ownership, authority/авторства, commit/replay и проекций. Найденные и исправленные проблемы: загрузчик authority ожидал direct response у admission; terminal finalizer мог финализировать автора; replay resolver искал только direct grant; orphan recovery могла заблокировать admission; public history теряла owner старых terminal payloads; compaction не знала нового Task binding. После исправлений просмотрены callers этих контрактов.
 
-Полный собственный patch просмотрен сначала относительно исходного commit, затем повторно после rebase относительно новой базы. Статически проверены оставшиеся Turn literals; 32 прочих Rust-файла содержат только необходимое добавление `work_owner: Default::default()` в существующие fixtures/конструкторы. Отдельно проверены все изменённые схемы, bundled Threads docs и новые тестовые блоки. Изменения Tasks/Subagents skills и policy blocks отсутствуют.
+Первичный статический аудит после rebase оказался неполным: внешнее ревью нашло три конструктора с shorthand-полями, ошибочную admission fixture и пропущенные окна cancellation/recovery. В повторном проходе рассмотрен итоговый patch относительно базы реализации, включая ранее принятые изменения. Лексический просмотр Rust-текста с балансировкой delimiters, comments/strings и учётом shorthand проверил 163 полных конструктора Turn, четыре расширенных update literals и отдельно более короткие update/pattern случаи; полных literals без owner не найдено. Это вспомогательная статическая проверка, не Rust type checking. В 34 Rust-файлах полный diff содержит только заполнение default owner. Все 30 изменённых существующих схем повторно сравнены как JSON после удаления добавленного optional owner/enum: иных изменений нет. Новый standalone enum, bundled Threads docs, protocol/client projections и тестовые блоки перечитаны. В этой итерации wire-схемы и skills не менялись. Изменения Tasks/Subagents skills и policy blocks отсутствуют.
 
 Кодовый аргумент отсутствия двойного запуска: общий detached executor создаёт только Task; agent adapter подтверждает action и возвращается до direct materialization; detached outbox выполняет только admission reconciliation. Foreground constructor/commit и существующие native/CLI activation helpers остаются общими нижними границами.
 
@@ -119,6 +120,65 @@ git -c core.hooksPath=/dev/null commit --amend --no-edit
 
 ```sh
 git -c core.hooksPath=/dev/null commit --amend --no-edit
+git status --porcelain=v1
+git rev-parse HEAD
+git log -1 --format='%H%n%s%n%P'
+git diff --check 7f226499d3fa8beac5dd15b3d241040e7a99016e HEAD
+git -C /Users/alexander/Code/pioneer/pioneer status --porcelain=v1
+```
+
+## Исправления пяти замечаний повторного ревью
+
+| Замечание | Исправление и затронутые файлы |
+| --- | --- |
+| 1. Stop отменял source graph | `message/agent_runtime.rs::cancel_root_agent_work_graph_for_turn` возвращает отсутствие foreground graph для сохранённого DetachedTask owner до fallback на автора. `turn_cancel` продолжает обычную canonical отмену только самого admission. Foreground root и TaskRun child сохраняют owner Turn и прежнюю отмену. Detached Task продолжает работать по существующему KeepRunning policy; её собственный Stop остаётся в Task lifecycle. |
+| 2. Пропущенные Turn constructors | В `crud/tests/self_improvement_canonical_history.rs`, `crud/tests/self_improvement_source_turn.rs`, `gateway/src/self_improvement/history.rs` добавлен default owner Turn. Это прежние исполняемые/исторические fixtures; текущий Collaborative тип не переклассифицирует их. Self-improvement logic не менялась. |
+| 3. Recovery commit windows | `resilience/recovery.rs::enqueue_claimed_turn_execution_recovery` после обычного owner CAS читает точную workspace/thread/creator-turn связь Task. Нет принятой Task — Failed admission с честным сообщением; одна принятая пользовательская Task с совпавшими owner, pinned launch, actor contract и независимым graph — Completed admission через существующий canonical projector/live delivery. У агентской Task завершение остаётся у action outbox. В `turn_handlers.rs` postcommit ошибка TaskService распознаётся по durable acceptance для обоих входов. |
+| 4. Terminal outbox reconciliation | `message/agent_action_tools.rs` проверяет canonical action/receipt/source, Task/creator, workspace, pinned launch и admission owner/author до подтверждения. Completed/Interrupted/Blocked/Failed согласуются через existing terminal synchronization и обычный delivered ACK, без изменения canonical исхода. Ошибки storage и гонки завершения/rehydration остаются retryable. Повреждённая привязка получает terminal failed через existing CRUD failure transition, без успешного ACK и без finalization исходного агента. |
+| 5. Client fixture semantics | В `client/src/threads/registry.rs` helper composer_admission выставляет DetachedTask. running_turn и composer_occurrence остаются Turn. Единственный foreground-потребитель composer_admission, использующий его author snapshot, явно возвращает Turn. Все остальные потребители просмотрены: admission/live/snapshot assertions сохранены. |
+
+Дополнительный необходимый fence находится в `CrudStore::commit_task_creation_once` (`crates/crud/src/lib.rs`), внутри существующей Task/action транзакции. Точная привязка готовится до writer; состояние saved DetachedTask admission и его turn_execution повторно читается внутри writer. Terminal admission либо Recovering owner не допускают новую Task. Поэтому:
+
+- Если Stop или replacement CAS выиграли раньше Task commit, дальнейшая попытка принятия откатывается целиком, включая action/receipt/outbox. Admission не исполняет модель и не остаётся InProgress после recovery.
+- Если Task commit выиграл раньше Stop/recovery, принятие и агентский receipt атомарны; recovery/outbox только завершают admission. Task не создаётся заново, её KeepRunning/Stop/result delivery остаются штатными.
+- Проверка применяется к сохранённому DetachedTask owner, а не к наличию composer_work, видимости, автору или типу треда. Ordinary/legacy Task requests с composer payload и owner Turn сохраняют своё поведение. Grants и авторизация TaskService не ослаблены.
+
+`complete_detached_thread_admission` теперь сначала читает сохранённый исход: уже terminal admission синхронизируется без перевода в Completed. При гонке завершения действующий canonical terminal fence сохраняет первый принятый исход. Временные ошибки после доказанной привязки получают существующий PreparationUnavailable, а не ложное решение о повреждении.
+
+В `crud/src/repositories/agent_domain.rs` добавлен только внутренний fixed diagnostic `outbox_detached_binding_rejected` для failed delivery. Existing immediate/exhausted discovery и claim учитывают этот terminal outcome и не выбирают его бесконечно, включая attempts=8. Исходные predicates существующих partial indexes сохранены; отдельный дополнительный фильтр не требует новых индексов, таблиц, миграций или poller. Старые direct receipts/outbox сохраняют прежнюю exhausted reconciliation. Повреждённые записи сохраняются, не удаляются и не подтверждаются успешной доставкой. Планы запросов и производительность не проверялись: EXPLAIN/benchmarks запрещены.
+
+### Новые регрессии — не запускались
+
+В существующем `message/tests/thread_launch_choices.rs` добавлены три содержательные matrices с прежними handlers, barriers и replacement fixture:
+
+- `detached_admission_early_stop_preserves_live_source_graph_on_both_sides_of_task_commit`: настоящий Threads invocation при живом source root и другом direct потомке; RPC turn/cancel до и после Task commit; исходный graph целиком неизменён, admission Interrupted, до commit Task/action не принимаются, после commit одна Task сохраняет KeepRunning; parent runtime/response/work и вызовы модели отсутствуют.
+- `replaced_gateway_resolves_detached_admission_before_commit_and_after_user_task_acceptance`: потеря вызывающей future до Task/action commit для агента и пользователя, а также после пользовательского Task commit; истечение persisted lease, replacement processor и два recovery прохода; точный Failed/Completed outcome, terminal execution вместо зависшего Recovering, ноль/одна Task, отсутствие модели/work у admission. Для принятой пользовательской Task затем проверяется один обычный child model call через Task bridge и отсутствие повторного выполнения после следующего scheduler прохода.
+- `terminal_detached_admission_outbox_preserves_outcome_and_acks_even_after_retry_budget`: сохранённые Interrupted/Blocked/Failed до обработки outbox; повтор с потерянным ACK и attempts=8; canonical outcome неизменён, одна Task, parent model не запускается, source не отменяется. На этой же границе проверяются временная недоступность receipt storage (retry сохраняется) и подмена turn binding реальным чужим source turn (terminal failed без delivered ACK, включая повтор после исчерпания бюджета).
+
+Предыдущие native/CLI MCP facade, TaskRun continuation, grants/configuration, replay/compaction и live/snapshot регрессии сохранены. Client admission matrices снова используют корректные fixtures; assertions свободного composer, отсутствия Work-блока и исторического direct owner не ослаблены. Сценарии прослежены статически до barriers и Task/action/recovery границ; фактическое достижение этих границ не подтверждено запуском.
+
+### Результат повторного самоаудита и ограничения
+
+После каждого замечания просмотрены его callers и пересечения с остальными исправлениями. Повторно прослежены оба входа через общий start_thread_turn/start_detached_thread_turn, atomic Task/action acceptance, Task child runtime и штатную delivery. В адаптерах не появилось второй последовательности создания detached работы; общий selector по ThreadOriginKind сохранён. Source author, responding execution и work_owner различаются на cancellation, completion, recovery и snapshot/history границах. Pinned identity/model/reasoning и immutable caps остаются в прежних Task/authority contracts; эти контракты не расширялись.
+
+Отдельно рассмотрены отказ до commit, ранний Stop, ownership takeover, сбой после commit, повтор outbox и уже terminal admission. Ни recovery, ни detached reconciliation не вызывают provider dispatch/create_task. Исторический direct replay по сохранённому outbox не использует новый selector. Native/CLI foreground activation и Tasks/Subagents protocol не изменялись. Дополнительные исправления ограничены перечисленными областями; новые public wire APIs, очереди, исполнители, лимиты, зависимости и DB priority отсутствуют.
+
+Полный итоговый diff рассмотрен относительно `7f226499d3fa8beac5dd15b3d241040e7a99016e`, а incremental diff — относительно `b9a932f576282c0e75f501be3eaf39abf0ecadf5`. Production/dev данные, установленные приложения/службы/конфиги/skills, main и соседние worktree не изменялись. Статическое ревью не подтверждает компилируемость и не заменяет тестирование; возможные type/runtime ошибки должны проверяться после отдельного разрешения пользователя. Это передача на повторное внешнее ревью, не окончательная приёмка.
+
+Команды этого этапа, включая чтение, Git и Python исключительно для статической обработки текста, добавлены в [точный журнал](threads-shared-launch.commands.jsonl) с phase `external-review-fixes`. Журнал является снимком; завершающие команды после него приведены ниже. Разрешённые formatting/whitespace проверки: cargo fmt --all, cargo fmt --all --check, git diff --check и git diff --check относительно базы реализации.
+
+Не запускались тесты, cargo check, компиляция, сборки, приложение, Gateway, CLI-агенты, миграции, генераторы, EXPLAIN и benchmarks. Компилируемость и прохождение тестов не подтверждены.
+
+Финальные `cargo fmt --all --check` и `git diff --check 7f226499d3fa8beac5dd15b3d241040e7a99016e` завершились с exit 0. Тесты остаются незапущенными.
+
+Завершающие shell-команды после снимка журнала (cwd — этот worktree):
+
+```sh
+git diff --check 7f226499d3fa8beac5dd15b3d241040e7a99016e
+git diff --numstat b9a932f576282c0e75f501be3eaf39abf0ecadf5
+git add -A
+git diff --cached --check
+git -c core.hooksPath=/dev/null commit -m 'fix: reconcile detached thread admission lifecycle'
 git status --porcelain=v1
 git rev-parse HEAD
 git log -1 --format='%H%n%s%n%P'

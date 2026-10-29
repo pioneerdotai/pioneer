@@ -146,6 +146,7 @@ fn turn_with_identity(turn_id: &str, turn_kind: TurnKind, origin: TurnOrigin) ->
     Turn {
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
+        work_owner: Default::default(),
         turn_kind,
         origin,
         mode: Default::default(),
