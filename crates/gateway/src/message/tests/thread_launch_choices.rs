@@ -5780,6 +5780,216 @@ async fn detached_admission_early_stop_preserves_live_source_graph_on_both_sides
 }
 
 #[tokio::test]
+async fn fresh_detached_rpc_completes_after_task_commit_when_authority_reload_fails() {
+    let probe = Arc::new(ChoiceRuntimeProbe::default());
+    let (processor, context, tools) = fixture_with_probe(
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        false,
+        probe.clone(),
+    )
+    .await;
+    let binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let (thread_id, _) = create_detached_review_target(
+        &processor,
+        &tools,
+        &binding.options,
+        "New delegated root",
+        "fresh-lease-thread",
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(128);
+    let connection =
+        register_authenticated_test_connection(processor.session_manager.as_ref(), tx).await;
+    let turn_id = "fresh-lease-admission";
+    let request_id = generate_test_request_id("fresh", "lease");
+    let request = json!({"jsonrpc":"2.0","id":request_id,"method":"turn/start","params":{
+        "thread_id":thread_id,"turn_id":turn_id,"input":[{"type":"text","text":"Accept this work once"}],
+        "model":"gpt-5.4","model_provider":"openai","mode":"Agent"}}).to_string();
+    processor.arm_completed_history_preparation_barrier("__detached_thread_after_task_commit__");
+    let start = processor.process_request_for_connection(connection, &request);
+    tokio::pin!(start);
+    tokio::select! {
+        _ = &mut start => panic!("RPC must pause after Task acceptance"),
+        _ = processor.wait_for_completed_history_preparation_barrier() => {},
+    }
+    let tasks = processor
+        .crud_store
+        .list_tasks_created_by_turn(&context.workspace_id, &thread_id, turn_id)
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    let owner = processor
+        .crud_store
+        .get_turn_execution(turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.owner_id, processor.turn_execution_owner_id.as_ref());
+    assert_eq!(owner.status, pioneer_crud::TurnExecutionStatus::Starting);
+    let saved_authority = processor
+        .crud_store
+        .get_turn_execution_authorization_context(turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // The accepted Task keeps its own pinned authority. Make only a new load
+    // of the parent envelope fail while this same Gateway still owns admission.
+    assert!(
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(turn_id, "{}")
+            .await
+            .unwrap()
+    );
+    assert!(
+        processor
+            .load_turn_execution_authorization_context(turn_id)
+            .await
+            .is_err()
+    );
+    processor.release_completed_history_preparation_barrier();
+    start.await;
+    let response = recv_response_by_id(&mut rx, &request_id).await;
+    let accepted: pioneer_protocol::TurnStartResponse =
+        serde_json::from_value(response.result).unwrap();
+    assert_eq!(accepted.turn.id, turn_id);
+    let (_, admission) = processor
+        .crud_store
+        .get_turn(&thread_id, turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admission.status, TurnStatus::Completed);
+    assert_eq!(
+        admission.work_owner,
+        pioneer_protocol::TurnWorkOwner::DetachedTask
+    );
+    let terminal = processor
+        .crud_store
+        .get_turn_execution(turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        terminal.status,
+        pioneer_crud::TurnExecutionStatus::Completed
+    );
+    assert_eq!(terminal.owner_id, owner.owner_id);
+    assert_eq!(terminal.owner_generation, owner.owner_generation);
+    assert!(
+        terminal.started_at.is_none(),
+        "admission must never activate a model"
+    );
+    // Exercise the same heartbeat operation as the live owner worker. No lease
+    // expiry, replacement Gateway or orphan recovery is needed to close admission.
+    processor
+        .crud_store
+        .heartbeat_turn_executions_owned_by(
+            processor.turn_execution_owner_id.as_ref(),
+            super::super::TURN_EXECUTION_OWNER_LEASE_SECONDS,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !processor
+            .crud_store
+            .get_turn_execution(turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .is_active()
+    );
+    assert!(
+        processor
+            .crud_store
+            .get_turn_runtime_snapshot(turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        processor
+            .crud_store
+            .get_turn_work_projection(turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        pioneer_crud::load_agent_turn_response(
+            &processor.crud_store.database_connection(),
+            turn_id
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
+    // Remove the injected read/parse fault before ordinary child authorization.
+    assert!(
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(turn_id, &saved_authority)
+            .await
+            .unwrap()
+    );
+    processor.bind_task_bridge().await;
+    processor.start_task_event_listener().await;
+    processor
+        .task_runtime
+        .process_due_once(now_timestamp_secs())
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_for_task_status(
+            processor.crud_store.clone(),
+            &tasks[0].id,
+            TaskStatus::Completed
+        )
+        .await,
+        TaskStatus::Completed
+    );
+    processor
+        .task_runtime
+        .process_due_once(now_timestamp_secs())
+        .await
+        .unwrap();
+    assert_eq!(probe.main_calls.load(Ordering::SeqCst), 1);
+    let remaining = processor
+        .crud_store
+        .list_tasks_created_by_turn(&context.workspace_id, &thread_id, turn_id)
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].id, tasks[0].id);
+    assert_eq!(
+        processor
+            .crud_store
+            .get_task(&tasks[0].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
+    assert!(
+        processor
+            .crud_store
+            .get_turn_runtime_snapshot(turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn replaced_gateway_resolves_detached_admission_before_commit_and_after_user_task_acceptance()
 {
     for (agent, accepted) in [(true, false), (false, false), (false, true)] {

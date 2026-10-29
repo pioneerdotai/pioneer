@@ -185,3 +185,36 @@ git log -1 --format='%H%n%s%n%P'
 git diff --check 7f226499d3fa8beac5dd15b3d241040e7a99016e HEAD
 git -C /Users/alexander/Code/pioneer/pioneer status --porcelain=v1
 ```
+
+## Повторное замечание: лишняя Fresh-регистрация после Task commit
+
+Этап начат с чистого `0f3c8c717f77f29d37e851d7aba37c20c58a4241` в той же ветке `fix/threads-shared-launch` и worktree `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-shared-launch`. База реализации — `7f226499d3fa8beac5dd15b3d241040e7a99016e`. Прочитаны применимые AGENTS.md, проверены HEAD, status и worktree list. Local main и origin/main при этом равны `1dda8c1662289a57d473271cbfd79b6f87991b23`; они не изменялись и не интегрировались.
+
+Предыдущая итерация не закрывала ошибку в живом Gateway: Fresh уже регистрировал execution lease до Task commit, но повторял регистрацию после принятия Task. Fallible загрузка authority могла вернуть RPC error без завершения admission, а heartbeat того же владельца препятствовал orphan takeover.
+
+Минимальная правка в `message/turn_handlers.rs::start_detached_thread_turn`: postcommit-регистрация выполняется только при Durable authority. Обязательная Fresh-регистрация до создания Task сохранена. Для Durable остаётся регистрация после атомарного Task/action commit, когда возможна проверка точного Task binding. Условие использует authority, а не Option agent, уже потреблённый через take(). Общий механизм запуска, авторизация, pinned launch/caps, независимость destination graph и существующий action outbox не менялись. Новые recovery API, очереди, pollers, таблицы и сканирование не добавлены.
+
+Добавлена незапущенная регрессия `fresh_detached_rpc_completes_after_task_commit_when_authority_reload_fails` в существующем `message/tests/thread_launch_choices.rs`. Реальный пользовательский RPC приостанавливается прежним barrier после Task commit. В изолированной fixture временно подставляется невалидный для authority envelope объект `{}` только в сохранённый контекст родительского admission; отдельная загрузка подтверждает условие ошибки повторной регистрации. До этого admission и Task были приняты с нормальной авторизацией; Task хранит свой pinned контекст. RPC продолжается в том же Gateway. Assertions требуют штатный RPC response, Completed admission/execution с прежними owner/generation, отсутствие model activation/runtime/response/work у родителя, отсутствие активного Starting даже после обычной операции owner heartbeat. Затем исходный контекст восстанавливается до штатной авторизации child; проверяются одна Task, один run и один model call после повторного прохода Task scheduler. Регрессия проверяет наблюдаемый результат, а не число вызовов helper. Новых production test API нет.
+
+Самоаудит: повторно прослежены Fresh RPC → precommit lease → Task commit → success response → canonical admission completion и Durable tool → Task/action commit → postcommit lease → подтверждение/outbox reconciliation. Fresh больше не получает ошибку из лишней регистрации после принятия Task; остальные существующие ошибки/finalization проходят прежние обработчики. Durable postcommit failure по-прежнему восстанавливается через принятый receipt/outbox. Heartbeat worker и глобальная orphan recovery не менялись. Detached-путь не вызывает parent model dispatch/create_task повторно и не отменяет source graph.
+
+Итоговый diff относительно базы реализации рассмотрен вместе с incremental diff к проверенному HEAD. Все пять предыдущих исправлений сохранены: work_owner guard отмены source graph, три shorthand-конструктора Turn, recovery окон до/после Task commit и атомарный fence, terminal outbox reconciliation, правильные клиентские admission/foreground fixtures. Их код, прежние тесты, history/live/snapshot проекции, схемы и bundled skills в этой итерации не менялись. Единственные Rust-изменения — условие регистрации в общем механизме и новая RPC/fault регрессия; остальные правки — этот отчёт и журнал команд.
+
+Точные shell-команды этого этапа сохраняются в журнале с phase `fresh-lease-review-fix`; завершающие команды после снимка перечисляются ниже. Разрешённые проверки ограничены cargo fmt и Git whitespace. Тесты, cargo check, компиляция, сборки, приложение, Gateway, CLI-агенты, миграции, генераторы, EXPLAIN и benchmarks не запускались. Компилируемость и прохождение регрессии не подтверждены. Production/dev данные и установленные копии skills не изменялись. Это передача на повторное внешнее ревью, не окончательная приёмка.
+
+Проверки этой итерации: `cargo fmt --all --check` и `git diff --check 7f226499d3fa8beac5dd15b3d241040e7a99016e` завершились с exit 0. Тесты не запускались.
+
+После снимка журнала выполняются завершающие команды в указанном worktree:
+
+```sh
+git diff --check 7f226499d3fa8beac5dd15b3d241040e7a99016e
+git diff --numstat 0f3c8c717f77f29d37e851d7aba37c20c58a4241
+git add -A
+git diff --cached --check
+git -c core.hooksPath=/dev/null commit -m 'fix: avoid duplicate fresh admission lease registration'
+git status --porcelain=v1
+git rev-parse HEAD
+git log -1 --format='%H%n%s%n%P'
+git diff --check 7f226499d3fa8beac5dd15b3d241040e7a99016e HEAD
+git -C /Users/alexander/Code/pioneer/pioneer status --porcelain=v1
+```

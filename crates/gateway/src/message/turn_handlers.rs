@@ -2336,11 +2336,15 @@ impl MessageProcessor {
                 &tokio_util::sync::CancellationToken::new(),
             )
             .await;
-        self.register_execution_lease(&turn_id)
-            .await
-            .map_err(|error| {
-                TurnStartFailure::internal(format!("failed to register admission: {error:#}"))
-            })?;
+        // Fresh admission already registered its lease before Task acceptance.
+        // Durable agent admission can only validate its binding after that commit.
+        if matches!(&authority, TurnExecutionAuthority::Durable { .. }) {
+            self.register_execution_lease(&turn_id)
+                .await
+                .map_err(|error| {
+                    TurnStartFailure::internal(format!("failed to register admission: {error:#}"))
+                })?;
+        }
         Ok((outcome, attachments))
     }
 
