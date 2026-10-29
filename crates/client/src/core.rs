@@ -16,6 +16,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{notifications::effects::ClientEffect, runtime::ClientRuntime};
 
+// Per-thread gates exercise the snapshot/predicate registration race without
+// changing production ownership or notification behavior.
+#[cfg(test)]
+std::thread_local! {
+    static IDENTITY_BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static SEND_READINESS_BEFORE_WAIT: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
 macro_rules! counter_type {
     ($name:ident) => {
         #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -1110,6 +1118,7 @@ pub struct ClientCore {
     pub(crate) gateway_transport_leases:
         Mutex<crate::gateway::session_controller::GatewayTransportLeases>,
     pub(crate) gateway_transport_ready: std::sync::Condvar,
+    pub(crate) send_readiness: Arc<(Mutex<u64>, std::sync::Condvar)>,
     gateway_task: Mutex<Option<std::thread::JoinHandle<()>>>,
     stopped: std::sync::atomic::AtomicBool,
     partitions: Mutex<ClientPartitions>,
@@ -1327,6 +1336,7 @@ impl ClientCore {
             session_transport: Mutex::default(),
             gateway_transport_leases: Mutex::default(),
             gateway_transport_ready: std::sync::Condvar::new(),
+            send_readiness: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
             gateway_session: Mutex::default(),
             gateway_task: Mutex::default(),
             stopped: std::sync::atomic::AtomicBool::new(false),
@@ -1512,6 +1522,7 @@ impl ClientCore {
         &self,
         owner: &crate::gateway::session_controller::GatewaySessionController,
     ) {
+        self.notify_send_readiness();
         let publication = owner.publication();
         if self
             .snapshot(&ClientScope::Session)
@@ -1648,6 +1659,62 @@ impl ClientCore {
         }
     }
 
+    /// Capture before reading the owner predicate. Never acquire another owner
+    /// lock while holding the signal lock; publishers may signal under theirs.
+    pub(crate) fn send_readiness_sequence(&self) -> u64 {
+        *self
+            .send_readiness
+            .0
+            .lock()
+            .expect("Send readiness poisoned")
+    }
+
+    pub(crate) fn notify_send_readiness(&self) {
+        let mut sequence = self
+            .send_readiness
+            .0
+            .lock()
+            .expect("Send readiness poisoned");
+        *sequence = sequence
+            .checked_add(1)
+            .expect("Send readiness sequence exhausted");
+        self.send_readiness.1.notify_all();
+    }
+
+    pub(crate) fn wait_send_readiness(
+        &self,
+        sequence: u64,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        SEND_READINESS_BEFORE_WAIT.with_borrow_mut(|hook| {
+            if let Some(hook) = hook.as_mut() {
+                hook();
+            }
+        });
+        let current = self
+            .send_readiness
+            .0
+            .lock()
+            .expect("Send readiness poisoned");
+        if *current == sequence && !self.is_stopped() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            anyhow::ensure!(!remaining.is_zero(), "Send deadline exceeded");
+            drop(
+                self.send_readiness
+                    .1
+                    .wait_timeout(current, remaining)
+                    .expect("Send readiness wait poisoned"),
+            );
+        }
+        anyhow::ensure!(!self.is_stopped(), "Client stopped");
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "Send deadline exceeded"
+        );
+        Ok(())
+    }
+
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -1656,6 +1723,7 @@ impl ClientCore {
         if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        self.cancel_composer_send_budgets();
         self.session_driver
             .lock()
             .expect("session driver poisoned")
@@ -2862,6 +2930,20 @@ impl ClientCore {
             }
             let effects = accepted_effects;
 
+            // Reconcile only accepted publications. A rejected or stale draft
+            // cannot cancel the budget of a newer Composer operation. This also
+            // covers the identity fence's direct commit_publications path.
+            for draft in &changed_drafts {
+                if let ClientScope::Composer { thread_id } = &draft.scope {
+                    self.reconcile_composer_send_budget(
+                        thread_id,
+                        draft
+                            .payload
+                            .downcast_ref::<crate::composer::store::ComposerPublication>(),
+                    );
+                }
+            }
+
             if changed_drafts.is_empty() && effects.is_empty() {
                 return Self::transition_without_publication(
                     &partitions,
@@ -3063,13 +3145,20 @@ impl ClientCore {
             }
             registry
         });
+        #[cfg(test)]
+        if let Some(hook) = IDENTITY_BEFORE_COMMIT.with_borrow_mut(Option::take) {
+            hook();
+        }
         let mut partitions = self.partitions.lock().expect("client partitions poisoned");
         if !evict_protected && partitions.publications
             .get(&ClientScope::Administration { workspace_id: None })
             .and_then(|snapshot| snapshot.payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>())
             .is_some_and(|current| current.as_ref() == projections)
         {
-            return self.commit_publications(&mut partitions, vec![], vec![]);
+            let transition = self.commit_publications(&mut partitions, vec![], vec![]);
+            drop(partitions);
+            self.notify_send_readiness();
+            return transition;
         }
         let authority = ClientMutationAuthority { _private: () };
         let next_revisions = |scope: &ClientScope| {
@@ -3214,6 +3303,9 @@ impl ClientCore {
         }
         let transition = self.commit_publications(&mut partitions, drafts, vec![]);
         drop(partitions);
+        // Runtime waiters read the committed Administration snapshot, not the
+        // identity owner mutex. Publish their predicate before signalling.
+        self.notify_send_readiness();
         if let Some(registry) = presentation_fence.as_mut() {
             registry.synchronize_publication_revisions(transition.changes().publications());
         }
@@ -3251,6 +3343,179 @@ impl ClientCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budgeted_runtime_read_rechecks_identity_snapshot_after_commit() {
+        use crate::{
+            gateway::identity_authorization::{
+                IdentityAuthorizationPublication, IdentityPublicationChange,
+            },
+            providers::runtime::ProviderRuntimeRequestState,
+            rpc::{JsonRpcRequestTransport, JsonRpcResponseSender, RequestBudget},
+            transport::ws::GatewayWsEvent,
+        };
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+
+        struct RuntimeReplies(mpsc::Sender<JsonRpcResponseSender>);
+        impl JsonRpcRequestTransport for RuntimeReplies {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                response: JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: pioneer_protocol::JsonRpcRequest =
+                    serde_json::from_str(&payload).unwrap();
+                assert_eq!(
+                    request.method,
+                    pioneer_protocol::constants::methods::CLI_RUNTIME_LIST
+                );
+                assert_eq!(
+                    request.params,
+                    Some(serde_json::json!({"workspace_id": "workspace"}))
+                );
+                self.0.send(response).map_err(|error| error.to_string())
+            }
+        }
+        struct Cleanup(Arc<ClientCore>, RequestBudget);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.1.cancel();
+                self.0.shutdown();
+            }
+        }
+        let core = crate::catalog_test_support::client();
+        let budget = RequestBudget::new(Instant::now() + Duration::from_secs(60));
+        let _cleanup = Cleanup(core.clone(), budget.clone());
+        let watchdog = Duration::from_secs(5);
+        let connected = |connection_id| GatewayWsEvent::Connected {
+            connection_id,
+            endpoint_id: "endpoint".into(),
+            endpoint_name: "Synthetic".into(),
+            gateway_base_url: pioneer_protocol::GatewayBaseUrl::parse_presentation(
+                "https://synthetic.invalid",
+            )
+            .unwrap(),
+        };
+        core.transport_runtime().inject_test_event(connected(7));
+        core.transport_runtime().drain_ws_events();
+        let (requests, request_rx) = mpsc::channel();
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(Arc::new(RuntimeReplies(requests)));
+        core.start_provider_runtime_controller();
+        let old_epoch = core.provider_runtime_epoch();
+        assert_eq!(old_epoch.2, Some(7));
+        let (checked, checked_rx) = mpsc::channel();
+        let (proceed, proceed_rx) = mpsc::channel();
+        let (finished, finished_rx) = mpsc::channel();
+        let waiter_core = core.clone();
+        let waiter_budget = budget.clone();
+        let waiter = std::thread::spawn(move || {
+            let predicate_core = waiter_core.clone();
+            let mut waits = 0;
+            SEND_READINESS_BEFORE_WAIT.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    waits += 1;
+                    if waits <= 2 {
+                        assert_eq!(predicate_core.provider_runtime_epoch(), old_epoch);
+                        assert_eq!(
+                            *predicate_core
+                                .provider_runtime_snapshot("workspace")
+                                .unwrap()
+                                .request(),
+                            ProviderRuntimeRequestState::Loading
+                        );
+                        checked.send(waits).unwrap();
+                        proceed_rx.recv_timeout(watchdog).unwrap();
+                    }
+                }))
+            });
+            let result =
+                waiter_core.read_provider_runtimes_with_budget("workspace", true, &waiter_budget);
+            SEND_READINESS_BEFORE_WAIT.with_borrow_mut(|hook| *hook = None);
+            finished.send(result).unwrap();
+        });
+        assert_eq!(checked_rx.recv_timeout(watchdog).unwrap(), 1);
+        let old_reply = request_rx.recv_timeout(watchdog).unwrap();
+        let loading = core.provider_runtime_snapshot("workspace").unwrap();
+        let scope = ClientScope::Administration { workspace_id: None };
+        let mut identity = (*core
+            .snapshot(&scope)
+            .unwrap()
+            .snapshot()
+            .payload::<IdentityAuthorizationPublication>()
+            .unwrap())
+        .clone();
+        identity.connection_id = Some(8); // connection only: authority generations/capabilities stay intact
+        core.transport_runtime().inject_test_event(connected(8));
+        core.transport_runtime().drain_ws_events();
+        let (before_commit, before_commit_rx) = mpsc::channel();
+        let (commit, commit_rx) = mpsc::channel();
+        let publisher_core = core.clone();
+        let publisher = std::thread::spawn(move || {
+            IDENTITY_BEFORE_COMMIT.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    before_commit.send(()).unwrap();
+                    commit_rx.recv_timeout(watchdog).unwrap();
+                }))
+            });
+            // Use the real publication owner with an immutable projection;
+            // only the connection changes, not the authorization policy.
+            publisher_core
+                .publish_identity_authorization(&identity, IdentityPublicationChange::Update)
+        });
+        before_commit_rx.recv_timeout(watchdog).unwrap();
+        // Consume a pre-commit signal and then read old Loading again. This is
+        // deliberately no rescue notification after the predicate is committed.
+        core.notify_send_readiness();
+        proceed.send(()).unwrap();
+        assert_eq!(checked_rx.recv_timeout(watchdog).unwrap(), 2);
+        commit.send(()).unwrap();
+        assert_eq!(
+            publisher.join().unwrap().outcome(),
+            ClientTransitionOutcome::Changed
+        );
+        assert_eq!(
+            core.provider_runtime_epoch(),
+            (old_epoch.0, old_epoch.1, Some(8))
+        );
+        let response = |revision, id| {
+            serde_json::json!({"revision": revision, "runtimes": [{
+                "runtime_id": id, "kind": "codex", "display_name": id, "enabled": true,
+                "status": {"state": "ready"}, "capabilities": pioneer_protocol::RuntimeCapabilities::default()
+            }]})
+        };
+        old_reply.send(Ok(response(99, "stale"))).unwrap();
+        // Registration follows the old predicate read and the identity commit.
+        // Only a correctly ordered identity signal can advance this real waiter.
+        proceed.send(()).unwrap();
+        let current_reply = request_rx.recv_timeout(watchdog).expect(
+            "identity commit must advance the budgeted runtime consumer before its deadline",
+        );
+        // The serial worker processed the old response before this new RPC.
+        // Its stale completion, and the new Loading intent, published no result.
+        assert!(Arc::ptr_eq(
+            &loading,
+            &core.provider_runtime_snapshot("workspace").unwrap()
+        ));
+        current_reply.send(Ok(response(1, "current"))).unwrap();
+        let result = finished_rx.recv_timeout(watchdog).unwrap().unwrap();
+        assert_eq!(result.revision, 1);
+        assert_eq!(result.runtimes.len(), 1);
+        assert_eq!(result.runtimes[0].runtime_id, "current");
+        assert!(
+            request_rx.try_recv().is_err(),
+            "one replacement request, no unrelated controller rescue"
+        );
+        waiter.join().unwrap();
+    }
 
     #[test]
     fn local_dispatch_publication_handoff_and_materialization_keep_causality() {
@@ -3357,7 +3622,7 @@ mod tests {
                     0,
                     &mut crate::rpc::PendingJsonRpcRequests::default(),
                     &mut HashMap::new(),
-                    &mut HashMap::new(),
+                    &mut crate::rpc::PendingJsonRpcRequests::default(),
                     &sender,
                 ),
                 Some(pioneer_protocol::GatewayNotification::ThreadUpdated(_))
