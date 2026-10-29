@@ -20,7 +20,7 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 struct GateState {
     blocked: bool,
     flush_blocked: bool,
-    flush_after_writes: Option<u64>,
+    block_flush_after_write: bool,
     writes: u64,
     flushed_writes: u64,
     reported: bool,
@@ -42,11 +42,9 @@ impl WriteGate {
         state.reported = false;
     }
 
-    fn block_flush(&self) {
+    fn block_flush_after_write(&self) {
         let mut state = self.state.lock().unwrap();
-        // Sink readiness may flush before accepting the next frame. Let that
-        // finish, then block flush only once the next bytes reach the socket.
-        state.flush_after_writes = Some(state.writes + 1);
+        state.block_flush_after_write = true;
         state.reported = false;
     }
 
@@ -77,7 +75,7 @@ impl WriteGate {
         let mut state = self.state.lock().unwrap();
         state.blocked = false;
         state.flush_blocked = false;
-        state.flush_after_writes = None;
+        state.block_flush_after_write = false;
         state.failed = failed;
         if let Some(waker) = state.waker.take() {
             waker.wake();
@@ -153,12 +151,9 @@ impl AsyncWrite for GatedSocket {
         {
             let mut state = self.gate.state.lock().unwrap();
             state.writes += 1;
-            if state
-                .flush_after_writes
-                .is_some_and(|target| state.writes >= target)
-            {
+            if state.block_flush_after_write {
+                state.block_flush_after_write = false;
                 state.flush_blocked = true;
-                state.flush_after_writes = None;
             }
         }
         result
@@ -194,6 +189,7 @@ struct Fixture {
     gate: Arc<WriteGate>,
     task: JoinHandle<String>,
     spec: GatewayWsConnectSpec,
+    receipt: SocketReceipt,
 }
 
 impl Fixture {
@@ -236,10 +232,20 @@ impl Fixture {
         let events = GatewayWsEventSender::from(events);
         let (commands, command_rx) = work_channel(Boundary::ClientRpc);
         let mut command_rx = ConnectionCommandReceiver(command_rx);
+        let receipt = SocketReceipt::new(7);
+        let monitor_receipt = receipt.clone();
         let (start, started) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             started.await.expect("start monitor fixture");
-            monitor_connection(stream, &mut active_spec, 7, &events, &mut command_rx.0).await
+            monitor_connection(
+                stream,
+                &mut active_spec,
+                7,
+                &events,
+                &mut command_rx.0,
+                monitor_receipt,
+            )
+            .await
         });
         (
             Self {
@@ -248,6 +254,7 @@ impl Fixture {
                 gate,
                 task,
                 spec,
+                receipt,
             },
             start,
         )
@@ -375,6 +382,13 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
     let phase = std::cell::Cell::new("starting fixture");
     timeout(Duration::from_secs(10), async {
         let mut f = Fixture::start().await;
+        // Consume the monitor's immediate heartbeat before arming a gate for
+        // application data, so a delayed first tick cannot own the blocked flush.
+        phase.set("receiving initial heartbeat");
+        let Message::Ping(payload) = f.peer.next().await.unwrap().unwrap() else {
+            panic!("expected initial heartbeat");
+        };
+        f.peer.send(Message::Pong(payload)).await.unwrap();
         phase.set("receiving first request");
         let first = request(&f.commands, "synthetic/first");
         assert_eq!(f.next_request().await["id"], first.id);
@@ -385,7 +399,9 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
         // The peer can respond before send/flush completes. Registration must
         // already exist, and response processing must not depend on writer exit.
         phase.set("receiving request with flush blocked");
-        f.gate.block_flush();
+        // Repeated flush polls for the first request may still be in flight.
+        // Block only after the next write has put its bytes on the socket.
+        f.gate.block_flush_after_write();
         let fast = request(&f.commands, "synthetic/fast");
         assert_eq!(f.next_request().await["id"], fast.id);
         phase.set("waiting for blocked flush");
@@ -506,7 +522,10 @@ async fn assert_teardown(termination: Termination) {
             upload_id: "artifact".into(),
             offset: 0,
             payload: vec![3, 4],
-            response_tx: artifact,
+            response_tx: JsonRpcResponseSender::new(
+                artifact,
+                std::time::Instant::now() + Duration::from_secs(30),
+            ),
         })
         .unwrap();
     assert_eq!(f.next_data().await, Message::Binary(vec![3, 4].into()));
@@ -629,6 +648,7 @@ fn dropping_unpolled_connection_completes_queued_waiters_with_retained_handles()
         events.into(),
         ConnectionCommandReceiver(command_rx),
         None,
+        Arc::default(),
     );
     let queued = request(&commands, "synthetic/queued-before-connect");
     let (skills_tx, skills_rx) = mpsc::channel();
@@ -646,7 +666,10 @@ fn dropping_unpolled_connection_completes_queued_waiters_with_retained_handles()
             upload_id: "artifact".into(),
             offset: 0,
             payload: vec![2],
-            response_tx: artifact_tx,
+            response_tx: JsonRpcResponseSender::new(
+                artifact_tx,
+                std::time::Instant::now() + Duration::from_secs(30),
+            ),
         })
         .unwrap();
     let (renewal_tx, renewal_rx) = mpsc::channel();
@@ -669,4 +692,162 @@ fn dropping_unpolled_connection_completes_queued_waiters_with_retained_handles()
     assert!(renewal_rx.recv().unwrap().is_err());
     assert!(!queued.response.is_active());
     assert!(!renewal.is_active());
+}
+
+#[tokio::test]
+async fn retired_socket_receipt_cannot_write_queued_request_or_new_socket_with_same_logical_id() {
+    timeout(Duration::from_secs(10), async {
+        let mut old = Fixture::start().await;
+        old.gate.block();
+        let written = request(&old.commands, "synthetic/claimed-before-retire");
+        old.gate.wait_entered().await;
+
+        let payload =
+            crate::rpc::build_json_rpc_request_payload("synthetic/old-scope", Value::Null).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let response =
+            JsonRpcResponseSender::new(tx, std::time::Instant::now() + Duration::from_secs(30));
+        old.receipt.bind_request(&response);
+        old.commands
+            .send(ConnectionRpcCommand::Request {
+                request_id: payload.request_id.clone(),
+                payload: payload.payload.clone(),
+                response_tx: response.clone(),
+            })
+            .unwrap();
+        // FIFO command processing plus an overflow proves the scoped frame is
+        // waiting behind the claimed write, rather than merely not admitted yet.
+        let overflow = request(&old.commands, "synthetic/overflow");
+        assert!(receive(overflow.rx).await.is_err());
+        old.receipt.retire();
+        old.gate.release(false);
+        assert_eq!(old.next_request().await["id"], written.id);
+        assert!(receive(rx).await.is_err());
+        let marker = request(&old.commands, "synthetic/old-marker");
+        assert_eq!(old.next_request().await["id"], marker.id);
+        old.peer.send(Message::Close(None)).await.unwrap();
+        old.task.await.unwrap();
+
+        let mut next = Fixture::start().await; // fixture deliberately reuses logical ID 7
+        let (tx, rx) = mpsc::channel();
+        let late =
+            JsonRpcResponseSender::new(tx, std::time::Instant::now() + Duration::from_secs(30));
+        old.receipt.bind_request(&late);
+        // This represents a command admitted after the old monitor's drain,
+        // before delayed core disconnect processing. It enters the real new monitor.
+        next.commands
+            .send(ConnectionRpcCommand::Request {
+                request_id: payload.request_id,
+                payload: payload.payload,
+                response_tx: late,
+            })
+            .unwrap();
+        assert!(receive(rx).await.is_err());
+        let marker = request(&next.commands, "synthetic/new-marker");
+        assert_eq!(next.next_request().await["id"], marker.id);
+        next.reply(&marker.id).await;
+        assert!(receive(marker.rx).await.is_ok());
+        next.peer.send(Message::Close(None)).await.unwrap();
+        next.task.await.unwrap();
+    })
+    .await
+    .expect("scope regression must complete");
+}
+
+#[tokio::test]
+async fn operation_cancel_retires_binary_chunk_before_write_without_closing_socket() {
+    timeout(Duration::from_secs(10), async {
+        let mut f = Fixture::start().await;
+        f.gate.block();
+        let claimed = request(&f.commands, "synthetic/claimed");
+        f.gate.wait_entered().await;
+        let budget =
+            crate::rpc::RequestBudget::new(std::time::Instant::now() + Duration::from_secs(30));
+        let (tx, rx) = mpsc::channel();
+        let chunk =
+            JsonRpcResponseSender::new(tx, std::time::Instant::now() + Duration::from_secs(30));
+        budget.register(&chunk).unwrap();
+        f.receipt.bind_request(&chunk);
+        f.commands
+            .send(ConnectionRpcCommand::ArtifactBinaryUploadChunk {
+                upload_id: "cancelled-artifact".into(),
+                offset: 0,
+                payload: vec![1, 2],
+                response_tx: chunk,
+            })
+            .unwrap();
+        let overflow = request(&f.commands, "synthetic/overflow");
+        assert!(receive(overflow.rx).await.is_err());
+        budget.cancel();
+        assert!(receive(rx).await.is_err());
+        f.gate.release(false);
+        assert_eq!(f.next_request().await["id"], claimed.id);
+        let marker = request(&f.commands, "synthetic/after-chunk-cancel");
+        assert_eq!(f.next_request().await["id"], marker.id);
+        f.reply(&marker.id).await;
+        assert!(receive(marker.rx).await.is_ok());
+        f.peer.send(Message::Close(None)).await.unwrap();
+        f.task.await.unwrap();
+    })
+    .await
+    .expect("binary cancellation regression must complete");
+}
+
+#[tokio::test]
+async fn subscription_retirement_fences_queued_json_and_artifact_on_live_socket() {
+    timeout(Duration::from_secs(10), async {
+        for artifact in [false, true] {
+            let mut f = Fixture::start().await;
+            f.gate.block();
+            let claimed = request(&f.commands, "synthetic/claimed");
+            f.gate.wait_entered().await;
+            let subscription = Arc::new(Mutex::new(true));
+            let (tx, rx) = mpsc::channel();
+            let queued =
+                JsonRpcResponseSender::new(tx, std::time::Instant::now() + Duration::from_secs(30));
+            f.receipt.bind_request(&queued);
+            queued.bind_subscription(subscription.clone());
+            let payload = crate::rpc::build_json_rpc_request_payload(
+                "synthetic/retired-subscription",
+                Value::Null,
+            )
+            .unwrap();
+            let command = if artifact {
+                ConnectionRpcCommand::ArtifactBinaryUploadChunk {
+                    upload_id: "retired-subscription-artifact".into(),
+                    offset: 0,
+                    payload: vec![1, 2],
+                    response_tx: queued,
+                }
+            } else {
+                ConnectionRpcCommand::Request {
+                    request_id: payload.request_id,
+                    payload: payload.payload,
+                    response_tx: queued,
+                }
+            };
+            f.commands.send(command).unwrap();
+            let overflow = request(&f.commands, "synthetic/overflow");
+            assert!(
+                receive(overflow.rx).await.is_err(),
+                "scoped frame reached bounded writer handoff"
+            );
+            *subscription.lock().unwrap() = false;
+            f.gate.release(false);
+            assert_eq!(f.next_request().await["id"], claimed.id);
+            assert!(receive(rx).await.is_err());
+            let marker = request(&f.commands, "synthetic/after-subscription-retire");
+            assert_eq!(
+                f.next_request().await["id"],
+                marker.id,
+                "no retired JSON or binary frame reaches peer"
+            );
+            f.reply(&marker.id).await;
+            assert!(receive(marker.rx).await.is_ok());
+            f.peer.send(Message::Close(None)).await.unwrap();
+            f.task.await.unwrap();
+        }
+    })
+    .await
+    .expect("subscription scope regression must complete");
 }

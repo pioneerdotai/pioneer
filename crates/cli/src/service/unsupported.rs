@@ -5,6 +5,8 @@ use super::{GatewayServiceStartReport, GatewayServiceWarning, ServiceSettings};
 pub fn start_gateway_service(
     _settings: &ServiceSettings,
     _report: &mut GatewayServiceStartReport,
+    _executable: &std::path::Path,
+    _config_path: Option<&std::path::Path>,
 ) -> Result<Vec<GatewayServiceWarning>> {
     bail!("`pioneer start` is not supported on this operating system");
 }
