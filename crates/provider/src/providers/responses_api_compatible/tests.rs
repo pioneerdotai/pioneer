@@ -2466,7 +2466,7 @@ async fn vercel_unknown_controls_leave_defaults_and_fallback_limits_are_not_nati
                 req.model = model.id;
                 req.max_tokens = Some(5000);
                 // 4096 in normalized storage is a conservative fallback, not evidence
-                // of a Vercel output ceiling. Explicit unknown controls still fail.
+                // of a Vercel output ceiling. Unknown effort still fails.
                 let prepared = provider
                     .prepare(req.clone(), &provider.capabilities())
                     .await
@@ -2483,12 +2483,17 @@ async fn vercel_unknown_controls_leave_defaults_and_fallback_limits_are_not_nati
                 );
                 req.reasoning = None;
                 req.temperature = Some(0.5);
-                assert!(
-                    provider
-                        .prepare(req, &provider.capabilities())
-                        .await
-                        .is_err()
-                );
+                let prepared = provider
+                    .prepare(req, &provider.capabilities())
+                    .await
+                    .unwrap();
+                for stream in [false, true] {
+                    let body = provider.render(&prepared, stream).unwrap();
+                    assert_eq!(body["temperature"], 0.5);
+                    assert!(body.get("reasoning").is_none());
+                    assert_eq!(body["max_output_tokens"], 5000);
+                    assert_eq!(body["stream"], stream);
+                }
             },
         ),
     )

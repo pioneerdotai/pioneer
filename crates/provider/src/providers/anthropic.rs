@@ -1732,7 +1732,7 @@ mod tests {
     fn source_temperature_denial_applies_in_every_thinking_state() {
         let catalog = crate::generation::test_source_temperature("anthropic", "claude-opus-4-5");
         let mut request = crate::generation::test_request("claude-opus-4-5");
-        request.temperature = Some(0.7);
+        request.temperature = Some(0.5);
         for stream in [false, true] {
             for selection in [
                 None,
@@ -1763,7 +1763,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-            assert_eq!(body["temperature"], 0.7);
+            assert_eq!(body["temperature"], 0.5);
         }
     }
 
