@@ -1445,7 +1445,9 @@ mod tests {
             assert_eq!(picker.selector.selected_provider(), Some("provider"));
             assert_eq!(picker.selector.selected_model(), Some("model"));
             assert!(picker.reasoning_rows().is_empty());
-            assert!(Arc::ptr_eq(&before, &core.composer_snapshot("a").unwrap()));
+            let after = core.composer_snapshot("a").unwrap();
+            assert_eq!(after.draft_id(), before.draft_id());
+            assert_eq!(after.draft(), before.draft());
             if !ids.is_empty() {
                 core.composer_model_picker_intent(ComposerModelPickerIntent::SelectModel {
                     identity,

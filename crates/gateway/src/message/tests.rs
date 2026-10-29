@@ -20002,6 +20002,13 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
     gateway_secrets
         .set_workspace_provider_base_url(MEMBER_WORKSPACE_ID, "vllm", &local_url)
         .unwrap();
+    // Keep vLLM URL-only availability coverage; use explicit operation facts for choices.
+    gateway_secrets
+        .set_workspace_provider_api_key(MEMBER_WORKSPACE_ID, "mistral", "member-test-secret")
+        .unwrap();
+    gateway_secrets
+        .set_workspace_provider_base_url(MEMBER_WORKSPACE_ID, "mistral", &local_url)
+        .unwrap();
     let model_server = tokio::spawn(async move {
         let (mut stream, _) = model_listener.accept().await.unwrap();
         let mut bytes = [0u8; 8192];
@@ -20011,7 +20018,8 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
             .next()
             .unwrap()
             .to_owned();
-        let body = r#"{"data":[{"id":"member-local-model"}]}"#;
+        let body =
+            r#"{"data":[{"id":"member-local-model","capabilities":{"completion_chat":true}}]}"#;
         stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         request
     });
@@ -20024,17 +20032,24 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
         .set_workspace_provider_base_url(MEMBER_WORKSPACE_ID, "ollama", &ollama_url)
         .unwrap();
     let ollama_server = tokio::spawn(async move {
-        let (mut stream, _) = ollama_listener.accept().await.unwrap();
-        let mut bytes = [0u8; 8192];
-        let count = stream.read(&mut bytes).await.unwrap();
-        let request = String::from_utf8_lossy(&bytes[..count])
-            .lines()
-            .next()
-            .unwrap()
-            .to_owned();
-        let body = r#"{"models":[{"name":"member-ollama-model"}]}"#;
-        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-        request
+        let mut requests = Vec::new();
+        for body in [
+            r#"{"models":[{"name":"member-ollama-model"}]}"#,
+            r#"{"capabilities":["completion"]}"#,
+        ] {
+            let (mut stream, _) = ollama_listener.accept().await.unwrap();
+            let mut bytes = [0u8; 8192];
+            let count = stream.read(&mut bytes).await.unwrap();
+            requests.push(
+                String::from_utf8_lossy(&bytes[..count])
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned(),
+            );
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+        requests
     });
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
         {
@@ -20274,7 +20289,7 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
             member_connection_id,
             &json!({
                 "jsonrpc":"2.0", "id":models_id, "method":"provider/models/list",
-                "params":{"workspace_id":MEMBER_WORKSPACE_ID,"provider":"vllm"}
+                "params":{"workspace_id":MEMBER_WORKSPACE_ID,"provider":"mistral"}
             })
             .to_string(),
         )
@@ -20314,7 +20329,10 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
     );
     assert_eq!(
         ollama_server.await.unwrap(),
-        "GET /member-ollama-private/api/tags HTTP/1.1"
+        vec![
+            "GET /member-ollama-private/api/tags HTTP/1.1",
+            "POST /member-ollama-private/api/show HTTP/1.1",
+        ]
     );
 
     let configure_id = generate_test_request_id("memberws", "urlconfigure");
