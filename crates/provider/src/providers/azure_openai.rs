@@ -3,7 +3,6 @@ use crate::{
         PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes, attachment_data_url,
         ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
     },
-    reasoning_registry,
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::parse_tool_calls,
     tools::stream::IncrementalSseDecoder,
@@ -1229,8 +1228,7 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             .data
             .into_iter()
             .map(|m| {
-                let mut capabilities = ProviderModelCapabilities::default();
-                apply_azure_openai_reasoning_capabilities(m.id.as_str(), &mut capabilities);
+                let capabilities = ProviderModelCapabilities::default();
 
                 ProviderModelInfo {
                     id: m.id.clone(),
@@ -1258,155 +1256,9 @@ impl crate::traits::Provider for AzureOpenAiProvider {
     }
 }
 
-fn apply_azure_openai_reasoning_capabilities(
-    model_or_deployment_id: &str,
-    capabilities: &mut ProviderModelCapabilities,
-) {
-    // Azure deployments can be arbitrary aliases. Until a deployment->base-model
-    // mapping exists, only ids that already match OpenAI base model ids are safe.
-    if let Some(mut reasoning) =
-        reasoning_registry::reasoning_capabilities_for_model("openai", model_or_deployment_id)
-    {
-        reasoning.effort_options.retain(|effort| {
-            crate::types::ReasoningEffort::from_str(effort).is_some_and(|effort| {
-                crate::generation::effort_supported_for_profile(
-                    "azure_openai",
-                    model_or_deployment_id,
-                    None,
-                    effort,
-                )
-            })
-        });
-        if reasoning
-            .default_effort
-            .as_ref()
-            .is_some_and(|default| !reasoning.effort_options.contains(default))
-        {
-            reasoning.default_effort = None;
-        }
-        capabilities.thinking = reasoning.supported;
-        capabilities.reasoning = Some(reasoning);
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn azure_discovery_filters_direct_vocabulary_using_actual_chat_profile() {
-        let mut capabilities = ProviderModelCapabilities::default();
-        apply_azure_openai_reasoning_capabilities("gpt-5.2", &mut capabilities);
-        let options = &capabilities.reasoning.as_ref().unwrap().effort_options;
-        assert!(!options.contains(&"xhigh".into()));
-        assert!(options.contains(&"high".into()));
-        for stream in [false, true] {
-            for (effort, valid) in [
-                (ReasoningEffort::High, true),
-                (ReasoningEffort::XHigh, false),
-            ] {
-                let mut request = crate::generation::test_request("gpt-5.2");
-                request.reasoning = Some(ReasoningConfig::Effort(effort));
-                let result = AzureOpenAiProvider::build_chat_request_with_catalog(
-                    &request,
-                    vec![],
-                    stream,
-                    None,
-                );
-                assert_eq!(result.is_ok(), valid);
-                if valid {
-                    let body = serde_json::to_value(result.unwrap()).unwrap();
-                    assert_eq!(body["reasoning_effort"], "high");
-                }
-            }
-        }
-    }
 
-    #[test]
-    fn azure_adapter_identity_enforces_platform_chat_effort_after_mapping() {
-        for model in ["gpt-5.6", "gpt-6-sol", "gpt-6-astra"] {
-            let catalog = crate::generation::test_catalog_model(
-                "azure-openai-responses",
-                model,
-                "gpt-5.4",
-                serde_json::json!({"thinkingLevelMap":{"max":"max"}}),
-            );
-            for snapshot in [None, Some(&catalog)] {
-                for stream in [false, true] {
-                    let mut request = crate::generation::test_request(model);
-                    request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::Max));
-                    assert!(
-                        AzureOpenAiProvider::build_chat_request_with_catalog(
-                            &request,
-                            vec![],
-                            stream,
-                            snapshot
-                        )
-                        .unwrap_err()
-                        .to_string()
-                        .contains("Responses")
-                    );
-                    request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
-                    let body = serde_json::to_value(
-                        AzureOpenAiProvider::build_chat_request_with_catalog(
-                            &request,
-                            vec![],
-                            stream,
-                            snapshot,
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
-                    assert_eq!(body["reasoning_effort"], "high");
-                    assert_eq!(body["max_completion_tokens"], 1024);
-                }
-            }
-        }
-        for model in ["o1-mini", "gpt-5.1", "gpt-5.2"] {
-            let mut request = crate::generation::test_request(model);
-            request.reasoning = Some(ReasoningConfig::Effort(if model == "o1-mini" {
-                ReasoningEffort::High
-            } else {
-                ReasoningEffort::XHigh
-            }));
-            for stream in [false, true] {
-                assert!(
-                    AzureOpenAiProvider::build_chat_request_with_catalog(
-                        &request,
-                        vec![],
-                        stream,
-                        None
-                    )
-                    .is_err()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn deployment_alias_does_not_invent_base_model_generation_contract() {
-        let request = crate::generation::test_request("production-deployment");
-        for stream in [false, true] {
-            assert!(
-                AzureOpenAiProvider::build_chat_request(&request, vec![], stream)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("known base model")
-            );
-            let mut known = request.clone();
-            known.model = "gpt-5.4".into();
-            known.reasoning = Some(ReasoningConfig::Disabled);
-            let body = serde_json::to_value(
-                AzureOpenAiProvider::build_chat_request(&known, vec![], stream).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(body["max_completion_tokens"], 1024);
-            assert_eq!(body["reasoning_effort"], "none");
-            assert!(body.get("max_tokens").is_none());
-            assert!(body.get("model").is_none()); // generation helper does not choose routing
-            known.temperature = Some(0.5);
-            known.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
-            assert!(AzureOpenAiProvider::build_chat_request(&known, vec![], stream).is_err());
-        }
-    }
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;
@@ -1522,42 +1374,83 @@ mod tests {
         }
     }
 
-    #[test]
-    fn deployment_routing_preserves_generation_controls_in_both_request_modes() {
-        let mut request = crate::generation::test_request("gpt-5.4");
-        request.reasoning = Some(ReasoningConfig::Disabled);
-        for version in ["v1", "2024-08-01-preview"] {
-            let provider = AzureOpenAiProvider::with_api_version(
-                "fixture-key",
-                "fixture-resource",
-                "production-deployment",
-                version,
-            );
-            for stream in [false, true] {
-                let body = serde_json::to_value(
-                    provider
-                        .build_deployment_chat_request(&request, vec![], stream)
-                        .unwrap(),
+    #[tokio::test]
+    async fn deployment_routing_preserves_confirmed_controls_for_arbitrary_model_in_both_modes() {
+        let id = "quartz-custom-788";
+        let mut request = crate::generation::test_request(id);
+        for stream in [false, true] {
+            let body = serde_json::to_value(
+                AzureOpenAiProvider::build_chat_request_with_catalog(
+                    &request,
+                    vec![],
+                    stream,
+                    None,
                 )
-                .unwrap();
-                if version == "v1" {
-                    assert_eq!(body["model"], "production-deployment");
-                } else {
-                    assert!(body.get("model").is_none());
-                    assert!(
-                        provider
-                            .chat_completions_url()
-                            .contains("/deployments/production-deployment/chat/completions")
-                    );
-                }
-                assert_eq!(body["max_completion_tokens"], 1024);
-                assert!(body.get("max_tokens").is_none());
-                assert_eq!(body["reasoning_effort"], "none");
-                assert_eq!(body["stream"], stream);
-                assert_eq!(body.get("stream_options").is_some(), stream);
-                assert!(body.get("temperature").is_none());
-            }
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(body.get("reasoning_effort").is_none());
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+            assert!(
+                AzureOpenAiProvider::build_chat_request_with_catalog(
+                    &request,
+                    vec![],
+                    stream,
+                    None
+                )
+                .is_err()
+            );
+            request.reasoning = None;
         }
+        let facts = [
+            ("effort.high".into(), Some(true)),
+            ("effort.none".into(), Some(true)),
+        ]
+        .into_iter()
+        .collect();
+        crate::generation::with_native_reasoning(
+            "azure_openai",
+            true,
+            [(id.into(), facts)].into_iter().collect(),
+            async {
+                for version in ["v1", "2024-08-01-preview"] {
+                    let provider = AzureOpenAiProvider::with_api_version(
+                        "fixture-key",
+                        "fixture-resource",
+                        "production-deployment",
+                        version,
+                    );
+                    for stream in [false, true] {
+                        for (selection, expected) in [
+                            (ReasoningConfig::Disabled, "none"),
+                            (ReasoningConfig::Effort(ReasoningEffort::High), "high"),
+                        ] {
+                            request.reasoning = Some(selection);
+                            let body = serde_json::to_value(
+                                provider
+                                    .build_deployment_chat_request(&request, vec![], stream)
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                            if version == "v1" {
+                                assert_eq!(body["model"], "production-deployment");
+                            } else {
+                                assert!(body.get("model").is_none());
+                                assert!(provider.chat_completions_url().contains(
+                                    "/deployments/production-deployment/chat/completions"
+                                ));
+                            }
+                            assert_eq!(body["max_completion_tokens"], 1024);
+                            assert!(body.get("max_tokens").is_none());
+                            assert_eq!(body["reasoning_effort"], expected);
+                            assert_eq!(body["stream"], stream);
+                            assert_eq!(body.get("stream_options").is_some(), stream);
+                        }
+                    }
+                }
+            },
+        )
+        .await;
     }
 
     #[test]
@@ -1631,31 +1524,6 @@ mod tests {
                 .validate_connection(true)
                 .is_err()
         );
-    }
-
-    #[test]
-    fn azure_openai_reasoning_uses_known_base_model_ids() {
-        let mut capabilities = ProviderModelCapabilities::default();
-        apply_azure_openai_reasoning_capabilities("gpt-5.4", &mut capabilities);
-
-        let reasoning = capabilities
-            .reasoning
-            .expect("known base model should have reasoning metadata");
-        assert_eq!(reasoning.supported, Some(true));
-        assert_eq!(
-            reasoning.effort_options,
-            vec!["none", "low", "medium", "high", "xhigh"]
-        );
-        assert_eq!(capabilities.thinking, Some(true));
-    }
-
-    #[test]
-    fn azure_openai_reasoning_leaves_unknown_deployment_alias_unset() {
-        let mut capabilities = ProviderModelCapabilities::default();
-        apply_azure_openai_reasoning_capabilities("prod-chat-deployment", &mut capabilities);
-
-        assert!(capabilities.reasoning.is_none());
-        assert!(capabilities.thinking.is_none());
     }
 
     #[test]

@@ -4699,7 +4699,7 @@ impl Provider for PromptParityCaptureProvider {
                     default_effort: Some("medium".to_owned()),
                     mandatory: Some(false),
                     supports_token_budget: None,
-                    source: Some(pioneer_protocol::ReasoningCapabilitySource::StaticRegistry),
+                    source: Some(pioneer_protocol::ReasoningCapabilitySource::ProviderMetadata),
                 }),
                 ..pioneer_protocol::ProviderModelCapabilities::default()
             },

@@ -1594,6 +1594,16 @@ mod tests {
             let model = catalog.model("nvidia", id).unwrap();
             assert_eq!(model.metadata["compat"]["supportsReasoningEffort"], false);
             let discovered = crate::generation::test_discovery(&catalog, "nvidia", id);
+            assert_eq!(
+                discovered
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .effort_options
+                    .contains(&"none".into()),
+                fresh
+            );
             for effort in ["high", "max"] {
                 assert!(
                     !discovered
@@ -1628,17 +1638,27 @@ mod tests {
                         prepared,
                         Some(&catalog),
                     );
-                    assert_eq!(result.is_ok(), reasoning.is_none());
-                    if reasoning.is_none() {
+                    // Fresh source metadata explicitly lists none. The saved
+                    // snapshot has no verified off control; high/max stay denied
+                    // by supportsReasoningEffort=false in both snapshots.
+                    let off = crate::generation::selected_off(reasoning);
+                    let supported = reasoning.is_none() || fresh && off;
+                    assert_eq!(result.is_ok(), supported);
+                    if supported {
                         let body = serde_json::to_value(result.unwrap()).unwrap();
                         assert!(body.get("reasoning_effort").is_none());
-                        assert!(body.get("thinking").is_none());
+                        if off {
+                            assert_eq!(body["thinking"]["type"], "disabled");
+                        } else {
+                            assert!(body.get("thinking").is_none());
+                        }
                         assert_eq!(body["max_tokens"], 1024);
+                        assert_eq!(body["stream"], stream);
                     } else {
                         let error = result.unwrap_err().to_string();
                         assert!(
                             error.contains(if crate::generation::selected_off(reasoning) {
-                                "no verified thinking off control"
+                                "no confirmed mapping for selected reasoning"
                             } else {
                                 "explicitly does not support"
                             })
@@ -1651,56 +1671,70 @@ mod tests {
 
     #[test]
     fn native_deepseek_source_profiles_preserve_caps_and_selected_controls() {
-        let catalog = crate::generation::test_catalog(true);
         let provider = ChatCompletionsApiCompatibleProvider::new(
             "deepseek",
             "https://example.test/v1",
             "",
             AuthStyle::Bearer,
         );
-        for id in ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-flash"] {
-            let model = catalog.model("deepseek", id).unwrap();
-            assert_ne!(model.metadata["compat"]["supportsReasoningEffort"], false);
-            let discovered = crate::generation::test_discovery(&catalog, "deepseek", id);
-            assert!(
-                discovered
-                    .capabilities
-                    .reasoning
-                    .as_ref()
-                    .unwrap()
-                    .effort_options
-                    .contains(&"high".into())
-            );
-            for reasoning in [
-                None,
-                Some(ReasoningConfig::Disabled),
-                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
-                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
-            ] {
-                let mut request = crate::generation::test_request(id);
-                request.reasoning = reasoning;
-                for stream in [false, true] {
-                    let body = serde_json::to_value(
-                        provider
-                            .build_chat_request_with_catalog(
-                                request.clone(),
-                                stream,
-                                prepared_for(&provider, &request.messages),
-                                Some(&catalog),
-                            )
-                            .unwrap(),
-                    )
-                    .unwrap();
-                    assert_eq!(body["max_tokens"], 1024);
-                    assert_eq!(body["stream"], stream);
-                    if reasoning.is_none() {
-                        assert!(body.get("thinking").is_none());
-                    } else if crate::generation::selected_off(reasoning) {
-                        assert_eq!(body["thinking"]["type"], "disabled");
-                        assert!(body.get("reasoning_effort").is_none());
-                    } else {
-                        assert_eq!(body["thinking"]["type"], "enabled");
-                        assert_eq!(body["reasoning_effort"], "high");
+        for fresh in [false, true] {
+            let catalog = crate::generation::test_catalog(fresh);
+            let ids: &[&str] = if fresh {
+                &["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-flash"]
+            } else {
+                &["deepseek-v4-flash", "deepseek-v4-pro"]
+            };
+            for &id in ids {
+                let model = catalog.model("deepseek", id).unwrap();
+                assert_ne!(model.metadata["compat"]["supportsReasoningEffort"], false);
+                let discovered = crate::generation::test_discovery(&catalog, "deepseek", id);
+                assert!(
+                    discovered
+                        .capabilities
+                        .reasoning
+                        .as_ref()
+                        .unwrap()
+                        .effort_options
+                        .contains(&"high".into())
+                );
+                for reasoning in [
+                    None,
+                    Some(ReasoningConfig::Disabled),
+                    Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                    Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                ] {
+                    let mut request = crate::generation::test_request(id);
+                    request.reasoning = reasoning;
+                    for stream in [false, true] {
+                        let result = provider.build_chat_request_with_catalog(
+                            request.clone(),
+                            stream,
+                            prepared_for(&provider, &request.messages),
+                            Some(&catalog),
+                        );
+                        // The saved snapshot has neither an off mapping nor the
+                        // fresh source's toggle metadata. A model name proves neither.
+                        if !fresh && crate::generation::selected_off(reasoning) {
+                            assert!(
+                                result
+                                    .unwrap_err()
+                                    .to_string()
+                                    .contains("no confirmed mapping for selected reasoning")
+                            );
+                            continue;
+                        }
+                        let body = serde_json::to_value(result.unwrap()).unwrap();
+                        assert_eq!(body["max_tokens"], 1024);
+                        assert_eq!(body["stream"], stream);
+                        if reasoning.is_none() {
+                            assert!(body.get("thinking").is_none());
+                        } else if crate::generation::selected_off(reasoning) {
+                            assert_eq!(body["thinking"]["type"], "disabled");
+                            assert!(body.get("reasoning_effort").is_none());
+                        } else {
+                            assert_eq!(body["thinking"]["type"], "enabled");
+                            assert_eq!(body["reasoning_effort"], "high");
+                        }
                     }
                 }
             }
@@ -1806,9 +1840,7 @@ mod tests {
                         Some(&catalog),
                     );
                     let off = crate::generation::selected_off(reasoning);
-                    let supported = reasoning.is_none()
-                        || (id == "toggle" && off)
-                        || (id == "instruct" && (off || reasoning.is_none()));
+                    let supported = reasoning.is_none() || (id == "toggle" && off);
                     if supported {
                         let body = serde_json::to_value(result.unwrap()).unwrap();
                         if id != "instruct" && reasoning.is_none() {
@@ -2067,7 +2099,7 @@ mod tests {
                 serde_json::json!({"thinking":{"type":"enabled"},"reasoning_effort":"high"}),
             ),
             (
-                "glm",
+                "zai-coding",
                 "glm-5.2",
                 serde_json::json!({"thinking":{"type":"enabled"},"reasoning_effort":"high"}),
             ),
@@ -3091,7 +3123,7 @@ mod tests {
         };
 
         let error = provider.build_chat_request(request, false).unwrap_err();
-        assert!(error.to_string().contains("no documented mapping"));
+        assert!(error.to_string().contains("no confirmed mapping"));
     }
 
     #[test]

@@ -290,21 +290,57 @@ impl ModelCatalog {
                 model,
                 self.model(provider, &model.id).filter(|_| use_tool_sources),
             );
-            let Some(entry) = self.model(provider, &model.id) else {
+            let Some(entry) = self.model(provider, &model.id).filter(|_| use_tool_sources) else {
                 continue;
             };
             let limits = self.limits(provider, &model.id);
             if limits.context_origin != OriginKind::Fallback {
-                model.limits.context_window = Some(limits.context_window);
+                model
+                    .limits
+                    .context_window
+                    .get_or_insert(limits.context_window);
             }
             if let Some(max_input) = limits.max_input {
-                model.limits.max_input_tokens = Some(max_input);
+                model.limits.max_input_tokens.get_or_insert(max_input);
             }
             if let Some(max_output) = limits.max_output {
-                model.limits.max_output_tokens = Some(max_output);
+                model.limits.max_output_tokens.get_or_insert(max_output);
             }
             if model.name.is_none() {
                 model.name = Some(entry.name.clone());
+            }
+            // Catalog token tariffs use USD per million tokens; discovery DTOs
+            // use USD per token. Preserve explicit native zero and unknowns.
+            let tariff = |key: &str| {
+                if entry
+                    .metadata
+                    .get("pricingUnits")
+                    .and_then(Value::as_str)
+                    .is_some_and(|units| units != "USD_per_million_tokens")
+                    || entry
+                        .metadata
+                        .get("pricingSource")
+                        .and_then(|source| source.get("unknownRateContract"))
+                        .is_some_and(|value| !value.is_null())
+                    || entry.cost.get("tiers").is_some_and(|tiers| {
+                        !tiers.is_null() && tiers.as_array().is_none_or(|tiers| !tiers.is_empty())
+                    })
+                {
+                    return None;
+                }
+                entry
+                    .cost
+                    .get(key)
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .map(|v| v / 1_000_000.0)
+            };
+            let input = tariff("input");
+            let output = tariff("output");
+            if input.is_some() || output.is_some() {
+                let pricing = model.pricing.get_or_insert_with(Default::default);
+                pricing.input_token = pricing.input_token.or(input);
+                pricing.output_token = pricing.output_token.or(output);
             }
             let effective = effective_input_model(provider, &model.id, Some(entry), Some(model))
                 .expect("catalog model");
@@ -362,115 +398,62 @@ impl ModelCatalog {
     }
 }
 
-/// Field priority: native facts > matching catalog keys > documented fallback.
-/// Actual adapter/mode restrictions always bound the result. A partial map
-/// overrides only present keys; omitted off cannot erase known mandatory.
+/// Resolve existing metadata per field: provider, then catalog, then unknown.
+/// The protocol mapper filters candidates without conferring model support.
 fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option<&CatalogModel>) {
     use pioneer_protocol::ReasoningCapabilitySource as Source;
-    if provider == "vercel-ai-gateway"
-        && model
-            .capabilities
-            .reasoning
-            .as_ref()
-            .is_some_and(|reasoning| {
-                matches!(reasoning.source.as_ref(), Some(Source::ProviderMetadata))
-            })
-    {
-        // Vercel discovery already applied the real Responses mapper to its
-        // authority-native model. A missing/stale public entry cannot erase or
-        // widen that validated enum after the discovery scope has ended.
-        return;
+    let catalog_present = entry.is_some();
+    let mut reasoning = model.capabilities.reasoning.clone().unwrap_or_default();
+    let mut native = reasoning.native.clone();
+    if let Some(supported) = reasoning.supported {
+        native
+            .entry("reasoning.supported".into())
+            .or_insert(Some(supported));
     }
-    // Discovery-only/private models have no public record. Preserve the same
-    // authority-scoped source facts used by runtime request validation.
-    let scoped = (provider == "vercel-ai-gateway")
-        .then(|| crate::generation::native_model(provider, &model.id))
-        .flatten();
-    let entry = scoped.as_ref().or(entry);
-    let fallback = crate::reasoning_registry::reasoning_capabilities_for_model(provider, &model.id);
-    let documented_off = fallback
-        .as_ref()
-        .is_some_and(|r| r.effort_options.iter().any(|e| e == "none"));
-    let native = model
-        .capabilities
-        .reasoning
-        .as_ref()
-        .map(|r| r.native.clone())
-        .unwrap_or_default();
-    let catalog_thinking = entry.map(|e| e.reasoning);
-    let catalog_off = entry
+    if reasoning.native.is_empty() && !reasoning.effort_options.is_empty() {
+        native.insert("effort.enum".into(), Some(true));
+        for effort in &reasoning.effort_options {
+            native.insert(format!("effort.{effort}"), Some(true));
+        }
+    }
+    if let Some(thinking) = model.capabilities.thinking {
+        native
+            .entry("thinking.supported".into())
+            .or_insert(Some(thinking));
+    }
+    let provider_support = native
+        .get("reasoning.supported")
+        .copied()
+        .flatten()
+        .or(reasoning.supported)
+        // Messages and Converse publish thinking modes separately from effort.
+        .or_else(|| {
+            (!matches!(provider, "anthropic" | "bedrock"))
+                .then_some(model.capabilities.thinking)
+                .flatten()
+        });
+    let catalog_thinking = entry.map(|entry| entry.reasoning);
+    let catalog_mandatory = entry
         .and_then(|e| e.metadata.get("thinkingLevelMap"))
-        .and_then(|m| m.get("off"));
+        .and_then(|map| map.get("off"))
+        .filter(|v| v.is_string() || v.is_null())
+        .map(Value::is_null);
     let entry = crate::generation::reasoning_model(provider, entry, &native);
-    if model.capabilities.reasoning.is_none()
-        && fallback.is_none()
-        && entry.as_ref().is_none_or(|e| {
-            !e.metadata.contains_key("thinkingLevelMap")
-                && e.metadata
-                    .get("sourceGeneration")
-                    .is_none_or(|s| s.get("reasoningOptions").is_none())
-        })
-    {
-        if let Some(entry) = entry {
-            model.capabilities.thinking.get_or_insert(entry.reasoning);
-        }
-        return;
-    }
-    let mut reasoning = model
-        .capabilities
-        .reasoning
-        .clone()
-        .or(fallback.clone())
-        .unwrap_or_default();
-    if let Some(fallback) = fallback {
-        for effort in fallback.effort_options {
-            if !reasoning.effort_options.contains(&effort) {
-                reasoning.effort_options.push(effort);
-            }
-        }
-        reasoning.default_effort = reasoning.default_effort.or(fallback.default_effort);
-        reasoning.mandatory = reasoning.mandatory.or(fallback.mandatory);
-        reasoning.supported = reasoning.supported.or(fallback.supported);
-    }
+    let mut candidates = Vec::new();
     if let Some(entry) = entry.as_ref() {
-        reasoning.supported = Some(entry.reasoning);
-        model.capabilities.thinking = native
-            .get("thinking.supported")
-            .copied()
-            .flatten()
-            // Keep the pre-existing discovery bool for adapters outside the
-            // native profiles changed here (for example OpenRouter).
-            .or_else(|| {
-                (!matches!(provider, "anthropic" | "gemini" | "bedrock"))
-                    .then_some(model.capabilities.thinking)
-                    .flatten()
-            })
-            .or(if provider == "openrouter" {
-                catalog_thinking
-            } else {
-                Some(entry.reasoning)
-            });
-        let source_efforts = entry
+        if let Some(options) = entry
             .metadata
             .get("sourceGeneration")
             .and_then(|s| s["reasoningOptions"].as_array())
-            .map(|options| {
+        {
+            candidates.extend(
                 options
                     .iter()
                     .filter(|o| o["type"] == "effort")
                     .flat_map(|o| o["values"].as_array().into_iter().flatten())
                     .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        // Source options supply positive candidates, not a native closed enum.
-        // Keep documented platform controls; explicit denials and the actual
-        // protocol mapper still filter the combined candidates below.
-        for effort in source_efforts {
-            if !reasoning.effort_options.contains(&effort) {
-                reasoning.effort_options.push(effort);
-            }
+                    .map(str::to_owned),
+            );
         }
         if let Some(map) = entry
             .metadata
@@ -479,45 +462,23 @@ fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option
         {
             for (key, value) in map {
                 let effort = if key == "off" { "none" } else { key };
-                reasoning.effort_options.retain(|e| e != effort);
+                candidates.retain(|e| e != effort);
                 if value.is_string() {
-                    reasoning.effort_options.push(effort.into());
-                }
-            }
-            // Native effort denials projected into this map do not establish
-            // mandatory thinking. Only the original catalog off fact can do so;
-            // a separately published native mandatory fact wins below.
-            if let Some(off) = catalog_off {
-                if provider != "vercel-ai-gateway" || off.is_string() {
-                    reasoning.mandatory = Some(off.is_null());
+                    candidates.push(effort.to_owned());
                 }
             }
         }
-        if entry
-            .metadata
-            .get("compat")
-            .is_some_and(|c| c["supportsReasoningEffort"] == false)
-        {
-            reasoning.effort_options.retain(|e| e == "none");
+    }
+    // A confirmed native enum (including an empty one) is closed. Partial
+    // facts override only their keys, leaving missing catalog fields available.
+    let closed = native.get("effort.enum").copied().flatten().is_some();
+    if !closed {
+        for effort in candidates {
+            if !reasoning.effort_options.contains(&effort) {
+                reasoning.effort_options.push(effort);
+            }
         }
-        // Catalog/mixed fields do not originate in StaticRegistry.
-        reasoning.source = Some(Source::Unknown);
     }
-    // Qualitative source enums do not describe the separate disabled mode.
-    // Fill that documented control only for bounded optional native profiles;
-    // explicit off vetoes and native mode denials still win below.
-    if documented_off
-        && entry.as_ref().is_none_or(|e| {
-            e.metadata
-                .get("thinkingLevelMap")
-                .is_none_or(|m| m.get("off") != Some(&Value::Null))
-        })
-        && !reasoning.effort_options.iter().any(|e| e == "none")
-    {
-        reasoning.effort_options.push("none".into());
-    }
-    // Restore native sublevels after catalog replacement. Native thinking and
-    // effort support are independent; mode denials are checked by the mapper.
     for (key, supported) in &native {
         let Some(level) = key
             .strip_prefix("effort.")
@@ -532,16 +493,46 @@ fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option
             }
         }
     }
-    if native.get("effort.supported") == Some(&Some(false)) {
-        reasoning.effort_options.retain(|e| e == "none");
+    if let Some(disabled) = native.get("thinking.types.disabled").copied().flatten() {
+        reasoning.effort_options.retain(|effort| effort != "none");
+        if disabled {
+            reasoning.effort_options.push("none".into());
+        }
     }
-    if provider == "gemini" && model.id.starts_with("gemini-2.5-") {
-        reasoning.effort_options.retain(|e| e == "none");
-        reasoning.default_effort = None;
-        reasoning.supports_token_budget = Some(false); // no numeric product control
+    if native.get("effort.enum") == Some(&Some(false)) {
+        reasoning.effort_options.clear();
+    } else if native.get("effort.supported") == Some(&Some(false)) {
+        // Messages/Converse disabled thinking is a separate control from effort.
+        // Its confirmation still comes from the native modes/catalog map.
+        reasoning.effort_options.retain(|effort| effort == "none");
     }
+    reasoning.supported = provider_support
+        .or_else(|| entry.as_ref().map(|e| e.reasoning))
+        .or_else(|| (!reasoning.effort_options.is_empty()).then_some(true));
+    reasoning.mandatory = native
+        .get("mandatory")
+        .copied()
+        .flatten()
+        .or(reasoning.mandatory)
+        .or_else(|| {
+            native
+                .get("thinking.types.disabled")
+                .copied()
+                .flatten()
+                .map(|disabled| !disabled)
+        })
+        .or_else(|| (native.get("effort.none") == Some(&Some(true))).then_some(false))
+        .or(catalog_mandatory);
+    reasoning.supports_token_budget = native
+        .get("supports_token_budget")
+        .copied()
+        .flatten()
+        .or(reasoning.supports_token_budget);
     if provider == "openrouter" {
         crate::providers::openrouter::preserve_native_reasoning(&mut reasoning);
+    }
+    if reasoning.supported == Some(false) {
+        reasoning.effort_options.clear();
     }
     reasoning.effort_options.retain(|e| {
         crate::ReasoningEffort::from_str(e).is_some_and(|e| {
@@ -561,32 +552,10 @@ fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option
             .unwrap_or(usize::MAX)
     });
     reasoning.effort_options.dedup();
-    if !native.iter().any(|(k, v)| {
-        k.strip_prefix("default_effort.")
-            .is_some_and(|e| crate::ReasoningEffort::from_str(e).is_some())
-            && *v == Some(true)
-    }) && reasoning
-        .default_effort
-        .as_ref()
-        .is_some_and(|e| !reasoning.effort_options.contains(e))
-    {
-        reasoning.default_effort = None;
-    }
-    if crate::generation::protocol_mandatory(provider, &model.id) {
-        reasoning.mandatory = Some(true);
-    }
-    if provider == "gemini" && native.get("thinking.supported") == Some(&Some(false))
-        || native.get("thinking.supported") == Some(&Some(false))
-            && native.get("effort.supported") == Some(&Some(false))
-    {
-        reasoning.supported = Some(false);
-    } else if provider != "openrouter" && native.values().any(|v| *v == Some(true)) {
-        reasoning.supported = Some(true);
-    }
-    if !native.is_empty() && reasoning.source == Some(Source::StaticRegistry) {
+    model.capabilities.thinking = model.capabilities.thinking.or(catalog_thinking);
+    if catalog_present || reasoning.source.is_none() && entry.is_some() {
         reasoning.source = Some(Source::Unknown);
     }
-    // Unknown remains absent rather than advertising reasoning from an ID.
     if reasoning != Default::default() {
         model.capabilities.reasoning = Some(reasoning);
     }
@@ -669,6 +638,153 @@ mod tests {
             include_str!("../tests/fixtures/catalog/provenance.json"),
         )
         .unwrap()
+    }
+
+    fn reasoning_catalog(map: Value) -> ModelCatalog {
+        let model = serde_json::json!({
+            "id":"aurora-unlisted-927", "name":"Aurora", "provider":"openai",
+            "api":"openai-responses", "baseUrl":"https://api.openai.com/v1",
+            "contextWindow":32000, "maxTokens":4000, "reasoning":true,
+            "input":["text"], "cost":{"input":2.0,"output":8.0},
+            "thinkingLevelMap":map
+        });
+        ModelCatalog::parse(
+            &serde_json::json!({"openai":{"aurora-unlisted-927":model}}).to_string(),
+            &serde_json::json!({"openai":{"aurora-unlisted-927":{
+                "contextWindow":{"kind":"source","expression":"provider context"},
+                "maxTokens":{"kind":"source","expression":"provider output"},
+                "inputLimit":{"value":24000,"origin":{"kind":"source","expression":"provider input"}}
+            }}}).to_string(),
+        ).unwrap()
+    }
+
+    #[test]
+    fn discovery_fills_missing_fields_preserving_native_false_zero_and_limits() {
+        let catalog =
+            reasoning_catalog(serde_json::json!({"off":"none","low":"low","high":"high"}));
+        let mut model = tool_tests::discovered("aurora-unlisted-927", None);
+        model.limits.context_window = Some(64000);
+        model.limits.max_output_tokens = Some(7000);
+        model.pricing = Some(pioneer_protocol::ProviderModelPricing {
+            input_token: Some(0.0),
+            ..Default::default()
+        });
+        model.capabilities.reasoning = Some(pioneer_protocol::ProviderModelReasoningCapabilities {
+            supported: Some(false),
+            mandatory: Some(false),
+            ..Default::default()
+        });
+        catalog.enrich("openai", std::slice::from_mut(&mut model));
+        assert_eq!(model.limits.context_window, Some(64000));
+        assert_eq!(model.limits.max_output_tokens, Some(7000));
+        assert_eq!(model.limits.max_input_tokens, Some(24000));
+        let pricing = model.pricing.unwrap();
+        assert_eq!(pricing.input_token, Some(0.0));
+        assert_eq!(pricing.output_token, Some(0.000008));
+        let reasoning = model.capabilities.reasoning.unwrap();
+        assert_eq!(reasoning.supported, Some(false));
+        assert_eq!(reasoning.mandatory, Some(false));
+        assert!(reasoning.effort_options.is_empty());
+    }
+
+    #[test]
+    fn unknown_catalog_tariffs_remain_unknown_and_explicit_zero_is_free() {
+        for (cost, expected) in [(Value::Null, None), (serde_json::json!(0), Some(0.0))] {
+            let mut catalog = reasoning_catalog(serde_json::json!({}));
+            catalog
+                .models
+                .get_mut("openai")
+                .unwrap()
+                .get_mut("aurora-unlisted-927")
+                .unwrap()
+                .cost = serde_json::json!({"input":cost,"output":null});
+            let mut model = tool_tests::discovered("aurora-unlisted-927", None);
+            catalog.enrich("openai", std::slice::from_mut(&mut model));
+            assert_eq!(model.pricing.as_ref().and_then(|p| p.input_token), expected);
+            assert_eq!(model.pricing.as_ref().and_then(|p| p.output_token), None);
+        }
+    }
+
+    #[test]
+    fn conditional_and_non_currency_catalog_prices_are_not_flat_token_tariffs() {
+        for metadata in [
+            serde_json::json!({"pricingUnits":"premium_requests"}),
+            serde_json::json!({"pricingSource":{"unknownRateContract":{"reason":"variable"}}}),
+            serde_json::json!({"tiers":[{"inputTokensAbove":1000,"input":4.0}]}),
+        ] {
+            let mut catalog = reasoning_catalog(serde_json::json!({}));
+            let entry = catalog
+                .models
+                .get_mut("openai")
+                .unwrap()
+                .get_mut("aurora-unlisted-927")
+                .unwrap();
+            if let Some(tiers) = metadata.get("tiers") {
+                entry.cost["tiers"] = tiers.clone();
+            } else {
+                entry
+                    .metadata
+                    .extend(serde_json::from_value::<BTreeMap<String, Value>>(metadata).unwrap());
+            }
+            let mut model = tool_tests::discovered("aurora-unlisted-927", None);
+            catalog.enrich("openai", std::slice::from_mut(&mut model));
+            assert!(model.pricing.is_none());
+        }
+    }
+
+    #[test]
+    fn partial_native_reasoning_fills_catalog_fields_but_closed_enums_stay_closed() {
+        let catalog = reasoning_catalog(serde_json::json!({"off":null,"low":"low","high":"high"}));
+        for closed in [false, true] {
+            let mut model = tool_tests::discovered("aurora-unlisted-927", None);
+            let mut native = BTreeMap::from([
+                ("effort.low".into(), Some(false)),
+                ("effort.medium".into(), Some(true)),
+            ]);
+            if closed {
+                native.insert("effort.enum".into(), Some(true));
+            }
+            model.capabilities.reasoning =
+                Some(pioneer_protocol::ProviderModelReasoningCapabilities {
+                    native,
+                    supported: Some(true),
+                    mandatory: Some(false),
+                    ..Default::default()
+                });
+            catalog.enrich("openai", std::slice::from_mut(&mut model));
+            let reasoning = model.capabilities.reasoning.unwrap();
+            assert_eq!(reasoning.mandatory, Some(false));
+            assert!(!reasoning.effort_options.iter().any(|e| e == "low"));
+            assert!(reasoning.effort_options.iter().any(|e| e == "medium"));
+            assert_eq!(
+                reasoning.effort_options.iter().any(|e| e == "high"),
+                !closed
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_updates_control_unlisted_model_choices_and_unknown_stays_unknown() {
+        for effort in ["low", "high"] {
+            let catalog = reasoning_catalog(serde_json::json!({(effort):effort}));
+            let mut models = vec![
+                tool_tests::discovered("aurora-unlisted-927", None),
+                tool_tests::discovered("another-unlisted-928", None),
+            ];
+            catalog.enrich("openai", &mut models);
+            assert_eq!(
+                models[0]
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .effort_options,
+                [effort]
+            );
+            assert!(models[1].capabilities.reasoning.is_none());
+            assert!(models[1].pricing.is_none());
+            assert!(models[1].limits.max_output_tokens.is_none());
+        }
     }
 
     #[test]

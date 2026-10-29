@@ -1154,18 +1154,31 @@ mod tests {
 
     #[test]
     fn glm_normal_and_streaming_bodies_preserve_default_explicit_off_and_effort() {
+        let catalog = crate::generation::test_catalog(true);
         let mut request = crate::generation::test_request("glm-5.2");
         for stream in [false, true] {
             request.reasoning = None;
             let body = serde_json::to_value(
-                GlmProvider::build_chat_request(&request, vec![], stream).unwrap(),
+                GlmProvider::build_chat_request_with_catalog(
+                    &request,
+                    vec![],
+                    stream,
+                    Some(&catalog),
+                )
+                .unwrap(),
             )
             .unwrap();
             assert_eq!(body["max_tokens"], 1024);
             assert!(body.get("thinking").is_none());
             request.reasoning = Some(crate::types::ReasoningConfig::Disabled);
             let body = serde_json::to_value(
-                GlmProvider::build_chat_request(&request, vec![], stream).unwrap(),
+                GlmProvider::build_chat_request_with_catalog(
+                    &request,
+                    vec![],
+                    stream,
+                    Some(&catalog),
+                )
+                .unwrap(),
             )
             .unwrap();
             assert_eq!(body["thinking"]["type"], "disabled");
@@ -1173,7 +1186,13 @@ mod tests {
                 crate::types::ReasoningEffort::Max,
             ));
             let body = serde_json::to_value(
-                GlmProvider::build_chat_request(&request, vec![], stream).unwrap(),
+                GlmProvider::build_chat_request_with_catalog(
+                    &request,
+                    vec![],
+                    stream,
+                    Some(&catalog),
+                )
+                .unwrap(),
             )
             .unwrap();
             assert_eq!(body["thinking"]["type"], "enabled");
@@ -1181,14 +1200,23 @@ mod tests {
         }
         request.model = "glm-5.3".into();
         request.reasoning = Some(crate::types::ReasoningConfig::Disabled);
-        assert!(GlmProvider::build_chat_request(&request, vec![], false).is_err());
+        assert!(
+            GlmProvider::build_chat_request_with_catalog(&request, vec![], false, Some(&catalog))
+                .is_err()
+        );
         request.model = "glm-5.9-unknown-family".into();
-        assert!(GlmProvider::build_chat_request(&request, vec![], false).is_err());
+        assert!(
+            GlmProvider::build_chat_request_with_catalog(&request, vec![], false, Some(&catalog))
+                .is_err()
+        );
         request.model = "glm-4.7".into();
         request.reasoning = Some(crate::types::ReasoningConfig::Effort(
             crate::types::ReasoningEffort::High,
         ));
-        assert!(GlmProvider::build_chat_request(&request, vec![], false).is_err());
+        assert!(
+            GlmProvider::build_chat_request_with_catalog(&request, vec![], false, Some(&catalog))
+                .is_err()
+        );
     }
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
