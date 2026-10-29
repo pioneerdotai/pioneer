@@ -10,6 +10,7 @@ impl GatewayWsClient {
             command_tx,
             voice_budget: Arc::default(),
             next_connection_id: Arc::new(AtomicU64::new(0)),
+            socket: Arc::default(),
             session_access: Arc::new(Mutex::new(None)),
             connection_generations: Arc::default(),
             #[cfg(test)]
@@ -18,7 +19,7 @@ impl GatewayWsClient {
 
         #[cfg(test)]
         let test_event_tx = Arc::new(Mutex::new(Some(event_tx.clone())));
-        spawn_worker(command_rx, event_tx);
+        spawn_worker(command_rx, event_tx, command_sender.socket.clone());
 
         Self {
             command_sender,
@@ -35,6 +36,21 @@ impl GatewayWsClient {
             .lock()
             .unwrap()
             .active = Some(super::super::event_connection_id(&event));
+        match &event {
+            GatewayWsEvent::Connected { connection_id, .. } => {
+                let mut socket = self.command_sender.socket.lock().unwrap();
+                if let Some(previous) = socket.take() {
+                    previous.retire();
+                }
+                *socket = Some(SocketReceipt::new(*connection_id));
+            }
+            GatewayWsEvent::Disconnected { .. } => {
+                if let Some(socket) = self.command_sender.socket.lock().unwrap().take() {
+                    socket.retire();
+                }
+            }
+            _ => {}
+        }
         self.test_event_tx
             .lock()
             .unwrap()

@@ -1,5 +1,48 @@
 mod client;
 mod command_sender;
+pub(crate) use command_sender::ConnectionRequestTransport;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectionScope {
+    connection: u64,
+    incarnation: u64,
+}
+#[derive(Clone)]
+pub(crate) struct SocketReceipt {
+    scope: ConnectionScope,
+    live: Arc<Mutex<bool>>,
+}
+impl SocketReceipt {
+    pub(crate) fn new(connection: u64) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self {
+            scope: ConnectionScope {
+                connection,
+                incarnation: NEXT
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                        next.checked_add(1)
+                    })
+                    .expect("socket incarnation exhausted"),
+            },
+            live: Arc::new(Mutex::new(true)),
+        }
+    }
+    pub(crate) fn bind_request(&self, response: &crate::rpc::JsonRpcResponseSender) {
+        response.bind_transport(self.live.clone());
+    }
+    pub(crate) fn retire(&self) {
+        *self.live.lock().unwrap() = false;
+    }
+    fn is_current(&self) -> bool {
+        *self.live.lock().unwrap()
+    }
+}
+pub(crate) struct SocketLifetime(pub(crate) SocketReceipt);
+impl Drop for SocketLifetime {
+    fn drop(&mut self) {
+        self.0.retire();
+    }
+}
 
 use crate::transport::http::{GatewayHttpAccess, GatewayHttpAuthorityError};
 use anyhow::{Context, Result, anyhow};
@@ -86,6 +129,7 @@ pub struct GatewayWsCommandSender {
     command_tx: WsSender<GatewayWsCommand>,
     voice_budget: Arc<super::voice_budget::VoiceTransportBudget>,
     next_connection_id: Arc<AtomicU64>,
+    socket: Arc<Mutex<Option<SocketReceipt>>>,
     session_access: Arc<Mutex<Option<GatewayHttpAccess>>>,
     connection_generations: Arc<Mutex<GatewayConnectionGenerations>>,
     #[cfg(test)]
