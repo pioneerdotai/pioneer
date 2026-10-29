@@ -11,16 +11,17 @@ const WINDOWS_LOGON_TASK_SCOPE_WARNING_CODE: &str = "windows_logon_task_login_se
 pub fn start_gateway_service(
     settings: &ServiceSettings,
     report: &mut GatewayServiceStartReport,
+    executable: &std::path::Path,
+    config_path: Option<&std::path::Path>,
 ) -> Result<Vec<GatewayServiceWarning>> {
     let task_name = settings.service_name.as_str();
     let script = report.observe("service.definition.prepare", || {
         let task_name_escaped = powershell_escape_single_quoted(task_name);
-        let executable = super::current_executable_path()?;
         let executable = powershell_escape_single_quoted(&executable.display().to_string());
         let service_path = super::resolve_service_path()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
-        let runner_script = render_gateway_runner_script(&executable, service_path.as_deref());
+        let runner_script = render_gateway_runner_script(&executable, service_path.as_deref(), config_path);
         let runner_script = powershell_escape_single_quoted(runner_script.as_str());
 
         Ok(format!(
@@ -183,13 +184,25 @@ fn powershell_escape_single_quoted(input: &str) -> String {
     input.replace('\'', "''")
 }
 
-fn render_gateway_runner_script(executable: &str, path_env: Option<&str>) -> String {
-    match path_env {
+fn render_gateway_runner_script(
+    executable: &str,
+    path_env: Option<&str>,
+    config_path: Option<&std::path::Path>,
+) -> String {
+    let runner = match path_env {
         Some(path_env) => {
             let path = powershell_escape_single_quoted(path_env);
             format!("$env:PATH = '{path}'; & '{executable}' '{SERVICE_MODE_ARG}'")
         }
         None => format!("& '{executable}' '{SERVICE_MODE_ARG}'"),
+    };
+    if let Some(config_path) = config_path {
+        format!(
+            "$env:PIONEER_CONFIG = '{}'; {runner}",
+            powershell_escape_single_quoted(&config_path.display().to_string())
+        )
+    } else {
+        runner
     }
 }
 
@@ -222,6 +235,19 @@ mod tests {
     use super::{WINDOWS_LOGON_TASK_SCOPE_WARNING_CODE, logon_task_scope_warnings};
     use crate::service::ServiceSettings;
     use pioneer_config::InstallManagedBy;
+
+    #[test]
+    fn logon_runner_pins_explicit_config_with_powershell_quoting() {
+        let runner = super::render_gateway_runner_script(
+            r"C:\dev checkout\pioneer.exe",
+            None,
+            Some(std::path::Path::new(r"C:\dev's checkout\config.toml")),
+        );
+        assert_eq!(
+            runner,
+            r"$env:PIONEER_CONFIG = 'C:\dev''s checkout\config.toml'; & 'C:\dev checkout\pioneer.exe' 'gateway-service'"
+        );
+    }
 
     #[test]
     fn logon_task_scope_warning_is_suppressed_for_desktop_managed_installs() {

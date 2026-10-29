@@ -10,7 +10,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::mpsc::{SendError, Sender};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 pub const JSON_RPC_REQUEST_FAILED_MESSAGE: &str = "JSON-RPC request failed";
@@ -142,6 +142,9 @@ struct RequestState {
     response: Option<Sender<JsonRpcResponseResult>>,
     deadline: Instant,
     write_started: bool,
+    transport_live: Option<Arc<Mutex<bool>>>,
+    subscription_live: Option<Arc<Mutex<bool>>>,
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
     registration: Option<PendingRegistration>,
 }
 
@@ -155,6 +158,10 @@ impl Drop for RequestState {
             };
             let _ = response.send(Err(error));
         }
+        // Final ownership has gone; no request lock is held during destruction.
+        if let Some(wake) = self.wake.take() {
+            wake();
+        }
     }
 }
 
@@ -166,9 +173,36 @@ impl JsonRpcResponseSender {
                 response: Some(response),
                 deadline,
                 write_started: false,
+                transport_live: None,
+                subscription_live: None,
+                wake: None,
                 registration: None,
             })),
         }
+    }
+
+    /// Complete the existing response lifetime and then wake its shared owner.
+    /// The callback runs once, after pending cleanup and response delivery.
+    pub(crate) fn new_with_wake(
+        response: Sender<JsonRpcResponseResult>,
+        deadline: Instant,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let sender = Self::new(response, deadline);
+        sender.state.lock().unwrap().wake = Some(wake);
+        sender
+    }
+
+    pub(crate) fn deadline(&self) -> Instant {
+        self.state.lock().unwrap().deadline
+    }
+
+    pub(crate) fn bind_transport(&self, live: Arc<Mutex<bool>>) {
+        self.state.lock().unwrap().transport_live = Some(live);
+    }
+
+    pub(crate) fn bind_subscription(&self, live: Arc<Mutex<bool>>) {
+        self.state.lock().unwrap().subscription_live = Some(live);
     }
 
     pub(crate) fn retire_on_drop(&self) -> impl Drop + use<> {
@@ -191,12 +225,13 @@ impl JsonRpcResponseSender {
         &self,
         response: Option<JsonRpcResponseResult>,
     ) -> Result<(), SendError<JsonRpcResponseResult>> {
-        let (sender, registration, expired) = {
+        let (sender, registration, expired, wake) = {
             let mut state = self.state.lock().unwrap();
             (
                 state.response.take(),
                 state.registration.take(),
                 Instant::now() >= state.deadline,
+                state.wake.take(),
             )
         };
         // insert holds state before registry; release state before acquiring
@@ -204,7 +239,7 @@ impl JsonRpcResponseSender {
         if let Some(registration) = registration {
             self.remove_registration(registration);
         }
-        match (sender, response) {
+        let result = match (sender, response) {
             (Some(sender), Some(response)) if !expired => sender.send(response),
             (Some(sender), Some(response)) => {
                 let _ = sender.send(Err(JsonRpcResponseError::DeadlineExceeded));
@@ -217,7 +252,11 @@ impl JsonRpcResponseSender {
             })),
             (None, Some(response)) => Err(SendError(response)),
             (None, None) => Ok(()),
+        };
+        if let Some(wake) = wake {
+            wake();
         }
+        result
     }
 
     fn remove_registration(&self, registration: PendingRegistration) {
@@ -233,6 +272,20 @@ impl JsonRpcResponseSender {
     }
 
     pub(crate) fn is_active(&self) -> bool {
+        let (transport, subscription) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.transport_live.clone(),
+                state.subscription_live.clone(),
+            )
+        };
+        let transport = transport.as_ref().map(|live| live.lock().unwrap());
+        let subscription = subscription.as_ref().map(|live| live.lock().unwrap());
+        if transport.as_ref().is_some_and(|live| !**live)
+            || subscription.as_ref().is_some_and(|live| !**live)
+        {
+            return false;
+        }
         let state = self.state.lock().unwrap();
         state.response.is_some() && Instant::now() < state.deadline
     }
@@ -240,13 +293,29 @@ impl JsonRpcResponseSender {
     /// Linearization point: after this claim, a write may reach the peer.
     /// Cancellation after the claim only retires the local waiter; it cannot roll back RPCs.
     pub(crate) fn try_start_write(&self) -> bool {
+        let (transport, subscription) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.transport_live.clone(),
+                state.subscription_live.clone(),
+            )
+        };
+        // Match receipt retirement ordering: physical socket, subscription, request.
+        // These guards cover only the synchronous claim, never the socket await.
+        let transport = transport.as_ref().map(|live| live.lock().unwrap());
+        let subscription = subscription.as_ref().map(|live| live.lock().unwrap());
         let mut state = self.state.lock().unwrap();
-        if state.response.is_none() || state.write_started {
+        if transport.as_ref().is_some_and(|live| !**live)
+            || subscription.as_ref().is_some_and(|live| !**live)
+            || Instant::now() >= state.deadline
+        {
+            drop(state);
+            drop(subscription);
+            drop(transport);
+            self.cancel();
             return false;
         }
-        if Instant::now() >= state.deadline {
-            drop(state);
-            self.cancel();
+        if state.response.is_none() || state.write_started {
             return false;
         }
         state.write_started = true;
@@ -270,6 +339,134 @@ pub trait JsonRpcRequestTransport {
         payload: String,
         response_tx: JsonRpcResponseSender,
     ) -> std::result::Result<(), String>;
+}
+
+/// One operation deadline and cancellation source; requests keep their own shorter caps.
+#[derive(Clone)]
+pub(crate) struct RequestBudget {
+    deadline: Instant,
+    state: Arc<Mutex<BudgetState>>,
+}
+#[derive(Default)]
+struct BudgetState {
+    cancelled: bool,
+    requests: Vec<Weak<Mutex<RequestState>>>,
+    readiness: Vec<Weak<(Mutex<u64>, Condvar)>>,
+}
+#[derive(Clone)]
+pub(crate) struct BudgetedTransport<T> {
+    pub(crate) transport: T,
+    pub(crate) budget: RequestBudget,
+}
+impl RequestBudget {
+    pub(crate) fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            state: Arc::default(),
+        }
+    }
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+    pub(crate) fn check(&self) -> Result<()> {
+        anyhow::ensure!(!self.state.lock().unwrap().cancelled, "operation cancelled");
+        anyhow::ensure!(
+            Instant::now() < self.deadline,
+            JsonRpcResponseError::DeadlineExceeded
+        );
+        Ok(())
+    }
+    pub(crate) fn cancel(&self) {
+        let (requests, readiness) = {
+            let mut state = self.state.lock().unwrap();
+            state.cancelled = true;
+            (
+                std::mem::take(&mut state.requests),
+                std::mem::take(&mut state.readiness),
+            )
+        };
+        for signal in readiness {
+            if let Some(signal) = signal.upgrade() {
+                Self::notify_readiness(&signal);
+            }
+        }
+        for request in requests {
+            if let Some(state) = request.upgrade() {
+                JsonRpcResponseSender { state }.cancel();
+            }
+        }
+    }
+    /// Register the existing sequence handshake while this consumer has no RPC
+    /// of its own (for example, while joining a shared subscription flight).
+    pub(crate) fn notify_on_cancel(&self, signal: &Arc<(Mutex<u64>, Condvar)>) {
+        let cancelled = {
+            let mut state = self.state.lock().unwrap();
+            if !state.cancelled {
+                state.readiness.retain(|signal| signal.strong_count() != 0);
+                let signal = Arc::downgrade(signal);
+                if !state
+                    .readiness
+                    .iter()
+                    .any(|registered| registered.ptr_eq(&signal))
+                {
+                    state.readiness.push(signal);
+                }
+            }
+            state.cancelled
+        };
+        // Registration racing with cancel either entered its drain or observes
+        // cancelled here. Never hold BudgetState while taking the signal lock.
+        if cancelled {
+            Self::notify_readiness(signal);
+        }
+    }
+
+    fn notify_readiness(signal: &Arc<(Mutex<u64>, Condvar)>) {
+        let (sequence, ready) = &**signal;
+        let mut sequence = sequence.lock().expect("send readiness poisoned");
+        *sequence = sequence
+            .checked_add(1)
+            .expect("send readiness sequence exhausted");
+        ready.notify_all();
+    }
+
+    pub(crate) fn bind<T>(&self, transport: T) -> BudgetedTransport<T> {
+        BudgetedTransport {
+            transport,
+            budget: self.clone(),
+        }
+    }
+    pub(crate) fn register(&self, response: &JsonRpcResponseSender) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        anyhow::ensure!(!state.cancelled, "operation cancelled");
+        anyhow::ensure!(
+            Instant::now() < self.deadline,
+            JsonRpcResponseError::DeadlineExceeded
+        );
+        {
+            let mut request = response.state.lock().unwrap();
+            request.deadline = request.deadline.min(self.deadline);
+        }
+        // Weak-count inspection cannot drop the last request owner (and invoke
+        // its terminal callback) while BudgetState is locked.
+        state.requests.retain(|request| request.strong_count() != 0);
+        state.requests.push(Arc::downgrade(&response.state));
+        Ok(())
+    }
+}
+impl<T: JsonRpcRequestTransport> JsonRpcRequestTransport for BudgetedTransport<T> {
+    fn send_json_rpc_request(
+        &self,
+        request_id: String,
+        payload: String,
+        response: JsonRpcResponseSender,
+    ) -> std::result::Result<(), String> {
+        self.budget
+            .register(&response)
+            .map_err(|error| error.to_string())?;
+        self.transport
+            .send_json_rpc_request(request_id, payload, response)
+    }
 }
 
 #[derive(Default)]
@@ -460,6 +657,7 @@ where
         let (response_tx, response_rx) = std::sync::mpsc::channel();
         let response_tx = JsonRpcResponseSender::new(response_tx, deadline);
         let _request_guard = response_tx.retire_on_drop();
+        let response_state = Arc::downgrade(&response_tx.state);
 
         transport
             .send_json_rpc_request(request.request_id, request.payload, response_tx)
@@ -473,6 +671,9 @@ where
                 anyhow::Error::msg(error)
             })?;
 
+        let deadline = response_state
+            .upgrade()
+            .map_or(deadline, |state| state.lock().unwrap().deadline);
         let _wait = pioneer_observability::live::WaitGuard::with_timeout(
             pioneer_observability::live::WaitKind::Reply,
             deadline.saturating_duration_since(Instant::now()),
@@ -851,7 +1052,15 @@ mod tests {
     #[test]
     fn rpc_cancel_response_race_completes_once_and_drop_retires_registration() {
         let (tx, rx) = mpsc::channel();
-        let response = JsonRpcResponseSender::new(tx, Instant::now() + RPC_REQUEST_TIMEOUT);
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_wakes = wakes.clone();
+        let response = JsonRpcResponseSender::new_with_wake(
+            tx,
+            Instant::now() + RPC_REQUEST_TIMEOUT,
+            Arc::new(move || {
+                observed_wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
         let mut pending = PendingJsonRpcRequests::default();
         pending.insert("racing", response.clone());
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -872,6 +1081,7 @@ mod tests {
         );
         assert!(rx.try_recv().is_err());
         assert!(pending.is_empty());
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let (tx, rx) = mpsc::channel();
         let response = JsonRpcResponseSender::new(tx, Instant::now() + RPC_REQUEST_TIMEOUT);
@@ -881,6 +1091,126 @@ mod tests {
         assert!(pending.is_empty());
         assert!(rx.recv().unwrap().is_err());
         assert!(response.send(Ok(json!("late"))).is_err());
+    }
+
+    #[test]
+    fn terminal_wake_follows_delivery_and_cleanup_once_for_reply_cancel_and_drop() {
+        for terminal in ["reply", "cancel", "drop"] {
+            let mut pending = PendingJsonRpcRequests::default();
+            let pending_weak = Arc::downgrade(&pending.pending);
+            let (tx, rx) = mpsc::channel();
+            let rx = Arc::new(Mutex::new(rx));
+            let (woke, wake_result) = mpsc::channel();
+            let state_weak: Arc<Mutex<Weak<Mutex<RequestState>>>> = Arc::default();
+            let observed_state = state_weak.clone();
+            let response = JsonRpcResponseSender::new_with_wake(
+                tx,
+                Instant::now() + RPC_REQUEST_TIMEOUT,
+                Arc::new(move || {
+                    if let Some(state) = observed_state.lock().unwrap().upgrade() {
+                        assert!(
+                            state.try_lock().is_ok(),
+                            "callback cannot run under request lock"
+                        );
+                    }
+                    if let Some(pending) = pending_weak.upgrade() {
+                        assert!(
+                            pending
+                                .try_lock()
+                                .expect("callback cannot run under pending lock")
+                                .is_empty()
+                        );
+                    }
+                    woke.send(
+                        rx.lock()
+                            .unwrap()
+                            .try_recv()
+                            .expect("delivery precedes wake"),
+                    )
+                    .unwrap();
+                }),
+            );
+            *state_weak.lock().unwrap() = Arc::downgrade(&response.state);
+            if terminal == "drop" {
+                drop(response);
+            } else {
+                pending.insert("shared-flight", response.clone());
+                if terminal == "reply" {
+                    response.send(Ok(json!("acknowledged"))).unwrap();
+                } else {
+                    response.cancel();
+                }
+                // A retained transport clone cannot wake its owner twice.
+                response.cancel();
+                assert!(response.send(Ok(json!("late"))).is_err());
+                drop(response);
+            }
+            let result = wake_result.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(result.is_ok(), terminal == "reply");
+            assert!(wake_result.try_recv().is_err());
+            assert!(pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn budget_cancel_signal_covers_registration_race_and_condvar_wait_without_rpc() {
+        for cancelled_before_registration in [false, true] {
+            let budget = RequestBudget::new(Instant::now() + RPC_REQUEST_TIMEOUT);
+            let signal = Arc::new((Mutex::new(0), Condvar::new()));
+            if cancelled_before_registration {
+                budget.cancel();
+            }
+            budget.notify_on_cancel(&signal);
+            if !cancelled_before_registration {
+                budget.notify_on_cancel(&signal); // the same owner is registered once
+                assert_eq!(Arc::strong_count(&signal), 1, "registration must be weak");
+                let wait_signal = signal.clone();
+                let wait_budget = budget.clone();
+                let (ready, registered) = mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    let mut sequence = wait_signal.0.lock().unwrap();
+                    assert_eq!(*sequence, 0);
+                    ready.send(()).unwrap();
+                    // Holding the sequence lock until wait releases it forces
+                    // cancellation to race at the predicate/register boundary.
+                    while *sequence == 0 {
+                        let (next, timeout) = wait_signal
+                            .1
+                            .wait_timeout(sequence, Duration::from_secs(1))
+                            .unwrap();
+                        sequence = next;
+                        assert!(
+                            !timeout.timed_out(),
+                            "cancel must wake a waiter with no private RPC"
+                        );
+                    }
+                    drop(sequence);
+                    assert!(wait_budget.check().is_err());
+                });
+                registered.recv_timeout(Duration::from_secs(1)).unwrap();
+                budget.cancel();
+                waiter.join().unwrap();
+            }
+            assert_eq!(
+                *signal.0.lock().unwrap(),
+                1,
+                "one notification or immediate late registration"
+            );
+            budget.cancel();
+            assert_eq!(
+                *signal.0.lock().unwrap(),
+                1,
+                "cancellation itself is idempotent"
+            );
+        }
+        // Cancelled before the sequence is locked: sequence comparison avoids
+        // sleeping even when notification was delivered before wait registration.
+        let budget = RequestBudget::new(Instant::now() + RPC_REQUEST_TIMEOUT);
+        let signal = Arc::new((Mutex::new(0), Condvar::new()));
+        let before = *signal.0.lock().unwrap();
+        budget.notify_on_cancel(&signal);
+        budget.cancel();
+        assert_ne!(*signal.0.lock().unwrap(), before);
     }
 
     #[derive(Debug, serde::Deserialize, PartialEq)]
@@ -1008,6 +1338,117 @@ mod tests {
                 value: "ok".to_owned()
             }
         );
+    }
+    #[test]
+    fn operation_budget_cancel_removes_pending_and_rejects_future_admission() {
+        struct HoldingTransport {
+            pending: Mutex<PendingJsonRpcRequests>,
+            admitted: mpsc::Sender<()>,
+        }
+        impl JsonRpcRequestTransport for HoldingTransport {
+            fn send_json_rpc_request(
+                &self,
+                id: String,
+                _: String,
+                response: JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                self.pending.lock().unwrap().insert(id, response);
+                self.admitted.send(()).unwrap();
+                Ok(())
+            }
+        }
+        let (admitted, ready) = mpsc::channel();
+        let transport = Arc::new(HoldingTransport {
+            pending: Mutex::default(),
+            admitted,
+        });
+        // Forward requests only; this fixture implements neither cancellation nor budgets.
+        struct Transport(Arc<HoldingTransport>);
+        impl JsonRpcRequestTransport for Transport {
+            fn send_json_rpc_request(
+                &self,
+                id: String,
+                payload: String,
+                response: JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                self.0.send_json_rpc_request(id, payload, response)
+            }
+        }
+        let budget = RequestBudget::new(Instant::now() + RPC_REQUEST_TIMEOUT);
+        let bound = budget.bind(Transport(transport.clone()));
+        let worker = std::thread::spawn(move || {
+            send_json_rpc_request_value(&bound, "synthetic/cancel", json!({}), RPC_REQUEST_TIMEOUT)
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        budget.cancel();
+        assert!(worker.join().unwrap().is_err());
+        assert!(transport.pending.lock().unwrap().is_empty());
+        assert!(
+            send_json_rpc_request_value(
+                &budget.bind(Transport(transport.clone())),
+                "synthetic/after-cancel",
+                json!({}),
+                RPC_REQUEST_TIMEOUT
+            )
+            .is_err()
+        );
+        assert!(
+            ready.try_recv().is_err(),
+            "cancelled operation must not reach transport admission"
+        );
+    }
+
+    #[test]
+    fn sequential_rpc_stages_share_the_operation_deadline() {
+        struct Stages {
+            first: std::sync::atomic::AtomicBool,
+            pending: Mutex<PendingJsonRpcRequests>,
+        }
+        impl JsonRpcRequestTransport for Stages {
+            fn send_json_rpc_request(
+                &self,
+                id: String,
+                _: String,
+                response: JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                if self.first.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(75));
+                    response.send(Ok(json!({"stage":1}))).unwrap();
+                } else {
+                    self.pending.lock().unwrap().insert(id, response);
+                }
+                Ok(())
+            }
+        }
+        let started = Instant::now();
+        let budget = RequestBudget::new(started + Duration::from_secs(1));
+        let transport = budget.bind(Stages {
+            first: std::sync::atomic::AtomicBool::new(true),
+            pending: Mutex::default(),
+        });
+        assert!(
+            send_json_rpc_request_value(
+                &transport,
+                "synthetic/prepare",
+                json!({}),
+                RPC_REQUEST_TIMEOUT
+            )
+            .is_ok()
+        );
+        assert!(
+            send_json_rpc_request_value(
+                &transport,
+                "synthetic/dispatch",
+                json!({}),
+                RPC_REQUEST_TIMEOUT
+            )
+            .is_err()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "second stage must consume remaining budget, not a fresh RPC cap"
+        );
+        assert!(transport.transport.pending.lock().unwrap().is_empty());
     }
 }
 
