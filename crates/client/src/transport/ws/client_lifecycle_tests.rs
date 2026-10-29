@@ -444,6 +444,13 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
     let phase = std::cell::Cell::new("starting fixture");
     timeout(Duration::from_secs(10), async {
         let mut f = Fixture::start().await;
+        // The interval's first tick is immediate. Complete that heartbeat before
+        // arming any gate, so a queued Ping cannot own the blocked flush.
+        phase.set("completing initial heartbeat");
+        let Message::Ping(payload) = f.peer.next().await.unwrap().unwrap() else {
+            panic!("initial heartbeat expected");
+        };
+        f.peer.send(Message::Pong(payload)).await.unwrap();
         phase.set("receiving first request");
         let first = request(&f.commands, "synthetic/first");
         assert_eq!(f.next_request().await["id"], first.id);
