@@ -78,14 +78,14 @@ def check_link_metadata(directory, metadata):
             raise ValueError(f"Final runtime has different producer {key}")
     originals = {row["filename"]: row for row in producer["binaries"]}
     for binary in metadata["binaries"]:
-        name = binary["filename"].replace("pioneer-bootstrap", "pioneer")
+        name = binary["filename"]
         original = originals.get(name)
         if original is None or any(binary[key] != original[key] for key in ("format", "module_id")):
             raise ValueError("Packaged runtime does not match the compiled module")
 
 
 def check_build(binary, data, metadata):
-    gateway = binary.name in ("pioneer", "pioneer.exe", "pioneer-bootstrap", "pioneer-bootstrap.exe")
+    gateway = binary.name in ("pioneer", "pioneer.exe")
     if gateway or binary.name in ("pioneer-app", "pioneer-app.exe"):
         build = NATIVE["build_manifest"](data)
         if (build["revision"] != metadata["commit"] or build["target"] != metadata["target"]
