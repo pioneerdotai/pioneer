@@ -975,6 +975,30 @@ impl ThreadManager {
             Vec::new(),
             TurnOrigin::User,
             true,
+            pioneer_protocol::TurnWorkOwner::Turn,
+        )
+        .await
+    }
+
+    /// Message admission for the shared detached thread launch. It owns no
+    /// foreground model work, regardless of its immutable author.
+    pub(crate) async fn detached_thread_turn_start(
+        &self,
+        connection_id: Option<ConnectionId>,
+        params: TurnStartParams,
+        profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+        author: Option<pioneer_protocol::TurnAuthorSnapshot>,
+        mentions: Vec<pioneer_protocol::TurnMention>,
+    ) -> Result<TurnStartOutcome> {
+        self.turn_start_for_actor_with_permission_profile_concurrency(
+            connection_id,
+            params,
+            Some(profile),
+            author,
+            mentions,
+            TurnOrigin::User,
+            true,
+            pioneer_protocol::TurnWorkOwner::DetachedTask,
         )
         .await
     }
@@ -1094,6 +1118,7 @@ impl ThreadManager {
             mentions,
             origin,
             false,
+            pioneer_protocol::TurnWorkOwner::Turn,
         )
         .await
     }
@@ -1107,6 +1132,7 @@ impl ThreadManager {
         mentions: Vec<pioneer_protocol::TurnMention>,
         origin: TurnOrigin,
         allow_concurrent_agent_child: bool,
+        work_owner: pioneer_protocol::TurnWorkOwner,
     ) -> Result<TurnStartOutcome> {
         pioneer_protocol::validate_turn_execution_envelope(&params)
             .map_err(|message| anyhow!(message))?;
@@ -1199,6 +1225,7 @@ impl ThreadManager {
         }
         entry.thread.reasoning_effort = requested_reasoning_effort;
         let turn = pioneer_protocol::Turn {
+            work_owner,
             id: turn_id,
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -1335,6 +1362,7 @@ impl ThreadManager {
 
         let permission_profile = pioneer_protocol::resolve_turn_permission_profile(None);
         let started_turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -1993,7 +2021,9 @@ impl ThreadManager {
 }
 
 fn turn_owns_foreground(turn: &Turn) -> bool {
-    turn.turn_kind == TurnKind::Conversation && turn.status == TurnStatus::InProgress
+    turn.turn_kind == TurnKind::Conversation
+        && turn.work_owner == pioneer_protocol::TurnWorkOwner::Turn
+        && turn.status == TurnStatus::InProgress
 }
 
 fn has_in_progress_conversation_turn(thread: &Thread) -> bool {
@@ -2532,6 +2562,7 @@ mod tests {
             agent_role: None,
             visibility: None,
             turns: vec![pioneer_protocol::Turn {
+                work_owner: Default::default(),
                 id: "turn_000000000000000099".to_owned(),
                 status: TurnStatus::Completed,
                 turn_kind: Default::default(),
@@ -2620,6 +2651,7 @@ mod tests {
             agent_role: None,
             visibility: None,
             turns: vec![pioneer_protocol::Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -2674,6 +2706,7 @@ mod tests {
                 entry.thread.turns = statuses
                     .iter()
                     .map(|status| pioneer_protocol::Turn {
+                        work_owner: Default::default(),
                         id: "turn_resume_loaded_conflict".into(),
                         status: *status,
                         turn_kind: Default::default(),
@@ -2741,6 +2774,7 @@ mod tests {
             agent_role: None,
             visibility: None,
             turns: vec![pioneer_protocol::Turn {
+                work_owner: Default::default(),
                 id: task_turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::TaskRun,

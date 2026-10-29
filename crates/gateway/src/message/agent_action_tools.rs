@@ -1774,10 +1774,64 @@ pub(crate) async fn resolve_tool_launch(
         }
         let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json)
             .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
-        if let Some(execution_id) = payload
+        let profile = if payload
+            .get("execution_mode")
+            .and_then(serde_json::Value::as_str)
+            == Some("detached_task")
+        {
+            let task_id = payload
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+            let contract = processor
+                .crud_store
+                .get_task_actor_contract(task_id)
+                .await
+                .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?
+                .ok_or_else(|| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+            if !matches!(&contract.creator, pioneer_protocol::PersistedActorRef::AgentExecution(id) if id == &facts.execution_id)
+            {
+                return Err(ToolError::execution_failed("agent_runtime_integrity_lost"));
+            }
+            let frozen: pioneer_protocol::TaskDerivedChildLaunchGrant = serde_json::from_str(
+                contract
+                    .derived_child_launch_grant_json
+                    .as_deref()
+                    .ok_or_else(|| ToolError::execution_failed("agent_runtime_integrity_lost"))?,
+            )
+            .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+            let pioneer_protocol::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
+                profile, ..
+            } = frozen;
+            // Inheritance was resolved when the action was accepted. A lost
+            // response never re-inherits a later caller configuration.
+            if !selection.use_default_reasoning && selection.reasoning.is_none() {
+                selection.reasoning = contract
+                    .launch
+                    .as_ref()
+                    .and_then(|launch| launch.execution.reasoning.clone());
+            }
+            Some(profile)
+        } else if let Some(execution_id) = payload
             .get("spawned_execution_id")
             .and_then(serde_json::Value::as_str)
         {
+            let grant = pioneer_crud::load_agent_execution_grant(&database, execution_id)
+                .await
+                .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?
+                .ok_or_else(|| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+            let grant: serde_json::Value = serde_json::from_str(&grant.grant_json)
+                .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
+            Some(
+                serde_json::from_value::<pioneer_protocol::AgentExecutionProfileProjection>(
+                    grant["profile"].clone(),
+                )
+                .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?,
+            )
+        } else {
+            None
+        };
+        if let Some(profile) = profile {
             let saved_request_fingerprint = payload
                 .get("launch_request_fingerprint")
                 .and_then(serde_json::Value::as_str)
@@ -1787,15 +1841,6 @@ pub(crate) async fn resolve_tool_launch(
                     "agent action idempotency key was reused with different input",
                 ));
             }
-            let grant = pioneer_crud::load_agent_execution_grant(&database, execution_id)
-                .await
-                .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?
-                .ok_or_else(|| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
-            let grant: serde_json::Value = serde_json::from_str(&grant.grant_json)
-                .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
-            let profile: pioneer_protocol::AgentExecutionProfileProjection =
-                serde_json::from_value(grant["profile"].clone())
-                    .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?;
             if !match &selection.profile {
                 pioneer_protocol::AgentToolProfileChoice::Model {
                     provider_id,
@@ -3280,7 +3325,13 @@ async fn dispatch_agent_action_outbox_row(
     row: &pioneer_entity::agent_action_outbox::Model,
 ) -> anyhow::Result<AgentActionOutboxDispatch> {
     use pioneer_crud::AgentActionOutboxFailure as Failure;
-    if row.last_error.as_deref() == Some(pioneer_crud::AGENT_START_RECONCILIATION_REQUIRED) {
+    let detached = serde_json::from_str::<serde_json::Value>(&row.payload_json)?
+        .get("execution_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("detached_task");
+    if !detached
+        && row.last_error.as_deref() == Some(pioneer_crud::AGENT_START_RECONCILIATION_REQUIRED)
+    {
         return match finalize_rejected_agent_start(processor, row, Failure::OutcomeUnknown).await? {
             AgentStartReconciliation::Finalized => {
                 Ok(AgentActionOutboxDispatch::Rejected(Failure::OutcomeUnknown))
@@ -3290,7 +3341,7 @@ async fn dispatch_agent_action_outbox_row(
         };
     }
     match dispatch_agent_action_outbox_row_inner(processor, row).await {
-        Err(error) if agent_start_has_storage_failure(&error) => Err(error),
+        Err(error) if detached || agent_start_has_storage_failure(&error) => Err(error),
         Err(error)
             if error.downcast_ref::<Failure>().is_some_and(|failure| {
                 matches!(
@@ -3624,6 +3675,103 @@ async fn finalize_rejected_agent_start(
     Ok(AgentStartReconciliation::Finalized)
 }
 
+/// Reconcile admission only. Task recovery/Stop/delivery stay with TaskService;
+/// a source Agent finishing cannot revoke this already accepted detached work.
+async fn reconcile_detached_thread_start(
+    processor: &Arc<MessageProcessor>,
+    row: &pioneer_entity::agent_action_outbox::Model,
+    payload: &serde_json::Value,
+) -> anyhow::Result<AgentActionOutboxDispatch> {
+    use anyhow::Context;
+    let task_id = payload
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .context("detached start has no Task")?;
+    let thread_id = payload
+        .get("thread_id")
+        .and_then(serde_json::Value::as_str)
+        .context("detached start has no thread")?;
+    let turn_id = payload
+        .get("turn_id")
+        .and_then(serde_json::Value::as_str)
+        .context("detached start has no turn")?;
+    let task = processor
+        .crud_store
+        .get_task(task_id)
+        .await?
+        .context("detached start Task is unavailable")?;
+    let contract = processor
+        .crud_store
+        .get_task_actor_contract(task_id)
+        .await?
+        .context("detached Task has no actor contract")?;
+    let receipt = pioneer_crud::load_agent_action_receipt(
+        &processor.crud_store.database_connection(),
+        &row.action_id,
+    )
+    .await?
+    .context("detached start has no receipt")?;
+    let response: serde_json::Value = serde_json::from_str(
+        receipt
+            .response_json
+            .as_deref()
+            .context("detached receipt has no result")?,
+    )?;
+    anyhow::ensure!(
+        response["taskCreation"]["taskId"].as_str() == Some(task_id)
+            && task.task.owner_id.as_deref() == Some(thread_id)
+            && task.task.created_by_thread_id.as_deref() == Some(thread_id)
+            && task.task.created_by_turn_id.as_deref() == Some(turn_id)
+            && matches!(&contract.creator, pioneer_protocol::PersistedActorRef::AgentExecution(id) if id.as_str() == row.owner_execution_id)
+            && task.task.lifecycle_policy.as_ref().is_some_and(
+                |policy| policy.attachment == pioneer_protocol::TaskAttachmentMode::Detached
+            ),
+        "detached action differs from its Task/creator binding"
+    );
+    let (_, turn) = processor
+        .crud_store
+        .get_turn(thread_id, turn_id)
+        .await?
+        .context("detached admission is unavailable")?;
+    anyhow::ensure!(
+        turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask
+            && turn
+                .author
+                .as_ref()
+                .is_some_and(|author| author.actor == contract.creator),
+        "invalid detached admission owner"
+    );
+    if turn.status == pioneer_protocol::TurnStatus::Completed {
+        return Ok(AgentActionOutboxDispatch::Delivered);
+    }
+    anyhow::ensure!(
+        turn.status == pioneer_protocol::TurnStatus::InProgress,
+        "detached admission is not completable"
+    );
+    processor
+        .ensure_thread_loaded(thread_id, &task.task.workspace_id)
+        .await?;
+    let params = &task
+        .task
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.composer_work.as_ref())
+        .context("detached Task has no pinned launch")?
+        .launch;
+    let input = processor.crud_store.get_turn_inputs(turn_id).await?;
+    let outcome = processor
+        .thread_manager
+        .rehydrate_committed_agent_turn(params, input)
+        .await?;
+    anyhow::ensure!(
+        processor
+            .publish_detached_thread_admission(&outcome, &[])
+            .await,
+        "detached admission delivery pending"
+    );
+    Ok(AgentActionOutboxDispatch::Delivered)
+}
+
 async fn dispatch_agent_action_outbox_row_inner(
     processor: &Arc<MessageProcessor>,
     row: &pioneer_entity::agent_action_outbox::Model,
@@ -3633,6 +3781,13 @@ async fn dispatch_agent_action_outbox_row_inner(
         serde_json::from_str(row.payload_json.as_str()).map_err(|_| Failure::InvalidStart)?;
     if payload.get("kind").and_then(serde_json::Value::as_str) != Some("start_agent") {
         return Ok(AgentActionOutboxDispatch::Delivered);
+    }
+    if payload
+        .get("execution_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("detached_task")
+    {
+        return reconcile_detached_thread_start(processor, row, &payload).await;
     }
     let execution_id = payload
         .get("spawned_execution_id")
@@ -4427,31 +4582,41 @@ impl ToolHandler for AgentActionToolHandler {
                                 "committed agent action has an invalid outbox: {error}"
                             ))
                         })?;
-                    let spawned_execution_id = payload
-                        .get("spawned_execution_id")
+                    if payload
+                        .get("execution_mode")
                         .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| {
-                            ToolError::execution_failed(
-                                "committed StartAgent action has no execution reference",
-                            )
-                        })?;
-                    let resource = pioneer_crud::load_agent_execution_resource_state(
-                        &database,
-                        spawned_execution_id,
-                    )
-                    .await
-                    .map_err(|error| {
-                        ToolError::execution_failed(format!(
-                            "failed to inspect committed StartAgent state: {error:#}"
-                        ))
-                    })?;
-                    if resource
-                        .as_ref()
-                        .is_some_and(|state| state.status == "queued")
+                        == Some("detached_task")
                     {
-                        AgentToolResultStatus::Queued
-                    } else {
+                        // The action already owns a Task. Never call create_task
+                        // again to reconstruct a lost tool response.
                         AgentToolResultStatus::Accepted
+                    } else {
+                        let spawned_execution_id = payload
+                            .get("spawned_execution_id")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                ToolError::execution_failed(
+                                    "committed StartAgent action has no execution reference",
+                                )
+                            })?;
+                        let resource = pioneer_crud::load_agent_execution_resource_state(
+                            &database,
+                            spawned_execution_id,
+                        )
+                        .await
+                        .map_err(|error| {
+                            ToolError::execution_failed(format!(
+                                "failed to inspect committed StartAgent state: {error:#}"
+                            ))
+                        })?;
+                        if resource
+                            .as_ref()
+                            .is_some_and(|state| state.status == "queued")
+                        {
+                            AgentToolResultStatus::Queued
+                        } else {
+                            AgentToolResultStatus::Accepted
+                        }
                     }
                 } else {
                     AgentToolResultStatus::Accepted
@@ -4662,6 +4827,58 @@ impl AgentActionToolHandler {
         let processor = self.processor.upgrade().ok_or_else(|| {
             ToolError::execution_failed("message processor is no longer available")
         })?;
+        // Reuse the execution binding's mutation lock through admission. A
+        // concurrent delivery must see the first receipt before it can prepare
+        // another parent message. Cross-process races remain fenced by the
+        // existing atomic Task/action transaction and immutable receipt.
+        let _commit_guard = self.adapter.lock().await;
+        if let Some(action) = pioneer_crud::load_agent_action(
+            &processor.crud_store.database_connection(),
+            plan.projection.action_id.as_str(),
+        )
+        .await
+        .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?
+        {
+            let database = processor.crud_store.database_connection();
+            let receipt = pioneer_crud::load_agent_action_receipt(&database, &action.id)
+                .await
+                .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?
+                .ok_or_else(|| ToolError::execution_failed("committed action has no receipt"))?;
+            let outbox = pioneer_crud::load_agent_action_outbox(&database, &action.id)
+                .await
+                .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?
+                .ok_or_else(|| ToolError::execution_failed("committed action has no outbox"))?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&outbox.payload_json).map_err(|_| {
+                    ToolError::execution_failed("committed action has an invalid outbox")
+                })?;
+            if action.status != "committed"
+                || receipt.id != plan.projection.receipt_id
+                || outbox.id != plan.projection.outbox_id
+                || payload
+                    .get("launch_request_fingerprint")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|fingerprint| {
+                        tool_launch_request_fingerprint(&requested_launch)
+                            .ok()
+                            .as_deref()
+                            != Some(fingerprint)
+                    })
+                || action.execution_id != plan.input.action.execution_id
+                || action.request_fingerprint != plan.input.request_fingerprint
+            {
+                return Err(ToolError::invalid_arguments(
+                    "agent action replay differs from its input",
+                ));
+            }
+            let safe = BoundAgentActionAdapter::safe_result(&plan.projection);
+            return Ok(Box::new(FunctionToolOutput::with_payload(
+                "thread work already committed",
+                true,
+                serde_json::to_value(&safe)
+                    .map_err(|_| ToolError::internal("failed to encode replay"))?,
+            )));
+        }
         validate_new_launch_model(
             &processor,
             &self.context,
@@ -4922,20 +5139,99 @@ impl AgentActionToolHandler {
                 .await
                 .map_err(|_| ToolError::execution_failed("agent_action_not_allowed"))?;
         }
-        let child_authority_revalidation = processor
-            .execution_leases
-            .revalidate_context(
-                processor.crud_store.as_ref(),
-                &child_authority,
-                crate::authorization::ResourceAction::AgentTurnStart,
-                authorization_revision,
-            )
-            .await
-            .map_err(|error| {
-                ToolError::execution_failed(format!(
-                    "child Agent authority is no longer current: {error:#}"
-                ))
-            })?;
+        let child_authority_revalidation = Arc::new(
+            processor
+                .execution_leases
+                .revalidate_context(
+                    processor.crud_store.as_ref(),
+                    &child_authority,
+                    crate::authorization::ResourceAction::AgentTurnStart,
+                    authorization_revision,
+                )
+                .await
+                .map_err(|error| {
+                    ToolError::execution_failed(format!(
+                        "child Agent authority is no longer current: {error:#}"
+                    ))
+                })?,
+        );
+        {
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&plan.input.outbox_payload_json)
+                    .map_err(|_| ToolError::internal("invalid planned StartAgent outbox"))?;
+            payload["launch_request_fingerprint"] =
+                serde_json::json!(tool_launch_request_fingerprint(&requested_launch)?);
+            plan.input.outbox_payload_json = payload.to_string();
+            let detached = super::turn_handlers::DetachedAgentThreadAdmission {
+                author: child.authored_turn.author.clone(),
+                security_snapshot: child_security_snapshot.clone(),
+                launch: start.launch.clone(),
+                identity: child.grant.identity.clone(),
+                profile: child.grant.profile.clone(),
+                grant: pioneer_tasks::TaskAgentAuthorizationGrantSeed {
+                    role_key: child.grant.envelope.role_key.clone(),
+                    policy_generation: child.grant.envelope.policy_generation,
+                    allowed_actions: child.grant.envelope.allowed_action_names(),
+                    fingerprint: child.grant.envelope.fingerprint.clone(),
+                    child_launch_grant: child.grant.child_launch_ceiling.clone(),
+                },
+                creator_work_graph_root_execution_id: parent_facts
+                    .root_execution_id
+                    .as_str()
+                    .to_owned(),
+                action: plan.input.clone(),
+            };
+            let result = processor
+                .start_thread_turn(
+                    None,
+                    child.authored_turn.author.actor.clone(),
+                    params.clone(),
+                    processor
+                        .thread_manager
+                        .thread_get(&thread_id)
+                        .await
+                        .ok_or_else(|| ToolError::execution_failed("Agent target is not loaded"))?,
+                    super::turn_handlers::TurnExecutionAuthority::Durable {
+                        context: child_authority.clone(),
+                        revalidation: child_authority_revalidation.clone(),
+                    },
+                    Some(detached),
+                )
+                .await;
+            let detached_committed = match result {
+                Ok(Some((outcome, attachments))) => {
+                    processor
+                        .publish_detached_thread_admission(&outcome, &attachments)
+                        .await;
+                    true
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    // TaskService may lose the response after its atomic durable
+                    // commit. Inspect that receipt before reporting a failed call.
+                    if pioneer_crud::load_agent_action_receipt(
+                        &processor.crud_store.database_connection(),
+                        plan.projection.action_id.as_str(),
+                    )
+                    .await
+                    .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?
+                    .is_none()
+                    {
+                        return Err(ToolError::execution_failed(error.to_string()));
+                    }
+                    true
+                }
+            };
+            if detached_committed {
+                let safe = BoundAgentActionAdapter::safe_result(&plan.projection);
+                return Ok(Box::new(FunctionToolOutput::with_payload(
+                    "thread work committed",
+                    true,
+                    serde_json::to_value(&safe)
+                        .map_err(|_| ToolError::internal("failed to encode thread result"))?,
+                )));
+            }
+        }
         let admission = child_authority
             .durable_turn_admission_after_revalidation(
                 thread_id.as_str(),

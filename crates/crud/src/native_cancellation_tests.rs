@@ -1376,6 +1376,7 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
         turns: Vec::new(),
     };
     let mut turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),

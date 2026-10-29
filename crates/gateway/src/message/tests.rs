@@ -462,6 +462,7 @@ async fn ensure_test_superuser_execution_turn(
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -3671,6 +3672,7 @@ async fn materialize_thread_episodic_ingest_turn(
             },
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::Completed,
                 turn_kind: TurnKind::Conversation,
@@ -9055,6 +9057,7 @@ async fn ensure_task_create_parent_turn_for_test(
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: parent_turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -9202,6 +9205,7 @@ async fn seed_completed_task_parent_with_inputs_at(
             },
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: parent_turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,
@@ -9231,6 +9235,7 @@ async fn seed_completed_task_parent_with_inputs_at(
                 workspace_id: workspace_id.to_owned(),
                 thread_id: parent_thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: parent_turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
@@ -9961,6 +9966,7 @@ async fn setup_progress_delta_harness(
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.clone(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -11972,6 +11978,7 @@ async fn long_russian_first_message_generates_parent_title_successfully() {
         turns: Vec::new(),
     };
     let seed_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_seed_russian_0000001".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12063,6 +12070,7 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
         turns: Vec::new(),
     };
     let seed_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_seed_singleflight_01".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12334,6 +12342,7 @@ async fn title_generation_retries_after_transient_failure() {
         turns: Vec::new(),
     };
     let seed_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_seed_retry_000000001".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12426,6 +12435,7 @@ async fn child_thread_scope_skips_auto_title_generation() {
         turns: Vec::new(),
     };
     let seed_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_seed_child_scope_00001".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12524,6 +12534,7 @@ async fn materialize_loaded_test_thread_for_durable_operation(
         .await
         .expect("test thread should be loaded before materialization");
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12751,6 +12762,14 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
     let started: pioneer_protocol::TurnStartResponse =
         serde_json::from_value(response.result).expect("turn/start response should decode");
     assert_eq!(started.turn.id, turn_id);
+    assert_eq!(
+        started.turn.work_owner,
+        pioneer_protocol::TurnWorkOwner::DetachedTask
+    );
+    assert!(matches!(
+        started.turn.author.as_ref().unwrap().actor,
+        pioneer_protocol::PersistedActorRef::Principal(_)
+    ));
 
     let persisted_parent = turn::Entity::find_by_id(turn_id)
         .one(&processor.crud_store.database_connection())
@@ -14816,6 +14835,7 @@ async fn materialize_artifact_api_thread(
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -23758,6 +23778,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         turns: Vec::new(),
     };
     let parent_turn = Turn {
+        work_owner: Default::default(),
         id: parent_turn_id.to_owned(),
         status: TurnStatus::Completed,
         turn_kind: Default::default(),
@@ -25473,6 +25494,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         turns: Vec::new(),
     };
     let parent_turn = Turn {
+        work_owner: Default::default(),
         id: parent_history_turn_id.to_owned(),
         status: TurnStatus::Completed,
         turn_kind: TurnKind::Conversation,
@@ -25621,6 +25643,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     );
 
     let late_parent_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_parent_recovered_after_start".to_owned(),
         status: TurnStatus::Completed,
         turn_kind: TurnKind::Conversation,
@@ -26857,6 +26880,7 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
         turns: Vec::new(),
     };
     let creation_turn = Turn {
+        work_owner: Default::default(),
         id: creation_turn_id.to_owned(),
         status: TurnStatus::Completed,
         turn_kind: Default::default(),
@@ -27276,6 +27300,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
                 workspace_id: workspace_id.clone(),
                 thread_id: parent_thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: creation_turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
@@ -27938,6 +27963,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         turns: Vec::new(),
     };
     let parent_turn = Turn {
+        work_owner: Default::default(),
         id: parent_turn_id.to_owned(),
         status: TurnStatus::Completed,
         turn_kind: TurnKind::Conversation,
@@ -28001,6 +28027,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
             &parent_thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: planned_turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,
@@ -28026,6 +28053,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
                 workspace_id: workspace_id.clone(),
                 thread_id: parent_thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: planned_turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
@@ -39815,6 +39843,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread_impl() 
         .await
         .expect("owner thread should be loaded");
     let occurrence_turn = Turn {
+        work_owner: Default::default(),
         id: run.id.clone(),
         status: TurnStatus::Completed,
         turn_kind: TurnKind::TaskRun,
@@ -40322,6 +40351,7 @@ async fn task_delivery_reuses_pre_child_occurrence_without_lineage() {
             &thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: run_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::TaskRun,
@@ -42278,6 +42308,7 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -42416,6 +42447,7 @@ async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
             &thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -42591,6 +42623,7 @@ async fn user_message_lifecycle_survives_permission_profile_audit_event() {
             &thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -42722,6 +42755,7 @@ async fn direct_durable_item_completed_ingestion_failure_does_not_block_commit()
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -44044,6 +44078,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -50121,6 +50156,7 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
     let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
 
     let turn = Turn {
+        work_owner: Default::default(),
         id: "turn_codex_ops_rename_seed".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -50996,6 +51032,7 @@ async fn cli_runtime_turn_start_blocker_reconciles_db_only_terminal_binding() {
                 workspace_id: workspace_id.clone(),
                 thread_id: thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::default(),
@@ -51665,6 +51702,7 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -54173,6 +54211,7 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: "turn_cli_stale_db_only".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -54385,6 +54424,7 @@ async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
                 workspace_id: workspace_id.clone(),
                 thread_id: thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::default(),
@@ -57881,6 +57921,7 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: "turn_non_cli_timeout".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -59019,6 +59060,7 @@ async fn materialize_cli_runtime_turn_with_execution(
         turns: Vec::new(),
     };
     let mut turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -65403,6 +65445,7 @@ async fn historical_task_snapshot_does_not_refresh_terminal_work_summary() {
                 workspace_id: harness.workspace_id.clone(),
                 thread_id: harness.thread_id.clone(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: harness.turn_id.clone(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::default(),
@@ -65531,6 +65574,7 @@ async fn detached_task_wrapper_diagnostics_do_not_persist_parent_work_group() {
         base,
     );
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::TaskRun,
@@ -66256,6 +66300,7 @@ async fn setup_live_semantic_timeline_harness_with_thread_id(
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.clone(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -67298,6 +67343,7 @@ fn semantic_fixture_thread(
 
 fn semantic_fixture_turn(turn_id: &str, status: TurnStatus) -> Turn {
     Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status,
         turn_kind: Default::default(),
@@ -67371,6 +67417,7 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
         serde_json::from_value(response.result).expect("thread/start result should decode");
 
     let turn = Turn {
+        work_owner: Default::default(),
         id: "turn_000000000000000099".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -75979,6 +76026,7 @@ fn phase_13_test_thread(
 
 fn phase_13_turn(turn_id: &str, status: TurnStatus) -> Turn {
     Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status,
         turn_kind: Default::default(),
@@ -76485,6 +76533,7 @@ async fn check_detached_composer_history_order(legacy: bool) {
             phase_13_test_thread(harness.workspace_id.as_str(), thread_id.as_str(), timestamp);
         let user_turn_id = format!("{thread_id}_user_{index}");
         let user_turn = Turn {
+            work_owner: Default::default(),
             id: user_turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
@@ -76533,6 +76582,7 @@ async fn check_detached_composer_history_order(legacy: bool) {
         // Its delivered AgentMessage is created later and must define the assistant history slot.
         let task_turn_id = format!("{thread_id}_task_{index}");
         let task_turn = Turn {
+            work_owner: Default::default(),
             id: task_turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,
@@ -77206,6 +77256,7 @@ async fn materialize_memory_tools_for_context(
                 &thread,
                 SandboxMode::FullAccess,
                 &Turn {
+                    work_owner: Default::default(),
                     id: context.turn_id.clone(),
                     status: TurnStatus::InProgress,
                     turn_kind: Default::default(),
@@ -78120,6 +78171,7 @@ async fn memory_provider_recall_calls_memory_service() {
             &thread_payload.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: recall_context.turn_id.clone(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),

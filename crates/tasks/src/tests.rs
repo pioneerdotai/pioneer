@@ -757,6 +757,7 @@ async fn persist_test_agent_turn(
         turns: Vec::new(),
     };
     let turn = pioneer_protocol::Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: pioneer_protocol::TurnStatus::InProgress,
         turn_kind: pioneer_protocol::TurnKind::Conversation,

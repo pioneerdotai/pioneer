@@ -6502,6 +6502,7 @@ mod tests {
                 &root_thread,
                 pioneer_protocol::SandboxMode::FullAccess,
                 &pioneer_protocol::Turn {
+                    work_owner: Default::default(),
                     id: parent_turn_id.to_owned(),
                     status: pioneer_protocol::TurnStatus::InProgress,
                     turn_kind: pioneer_protocol::TurnKind::Conversation,

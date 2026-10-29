@@ -46,6 +46,7 @@ fn epic6_turn_collaboration_fields_round_trip_on_the_canonical_turn() {
     let principal_id =
         PrincipalId::new("P00000000000000000001").expect("principal ID should be valid");
     let turn = Turn {
+        work_owner: Default::default(),
         id: "turn-message".to_owned(),
         status: TurnStatus::Completed,
         turn_kind: Default::default(),
@@ -80,6 +81,7 @@ fn epic6_turn_collaboration_fields_round_trip_on_the_canonical_turn() {
 #[test]
 fn epic6_pre_epic6_turn_decode_uses_chat_and_immutable_metadata_defaults() {
     let current = Turn {
+        work_owner: Default::default(),
         id: "turn-legacy".to_owned(),
         status: TurnStatus::Completed,
         turn_kind: Default::default(),
@@ -134,4 +136,30 @@ fn epic6_baseline_turn_id_remains_the_single_send_identity() {
     assert!(!object.contains_key("message_id"));
     assert!(!object.contains_key("source_message_id"));
     assert!(!object.contains_key("idempotency_key"));
+}
+
+#[test]
+fn legacy_turn_work_owner_defaults_to_foreground_without_reclassifying_authorship() {
+    let mut wire = serde_json::json!({
+        "id":"legacy-agent-turn", "status":"Completed", "mode":"Agent",
+        "author":{"actor":{"kind":"agent_execution","id":"E0000000000000000000A"},"display_name":"Agent","nickname":"agent"},
+        "permission_profile": pioneer_protocol::default_turn_permission_profile_snapshot(),
+    });
+    let historical: pioneer_protocol::Turn = serde_json::from_value(wire.clone()).unwrap();
+    assert!(
+        serde_json::to_value(&historical)
+            .unwrap()
+            .get("work_owner")
+            .is_none()
+    );
+    assert!(
+        !pioneer_protocol::ThreadComposerExecutionMode::DetachedTask
+            .is_detached_admission(&historical)
+    );
+    wire["work_owner"] = serde_json::json!("detached_task");
+    let admission: pioneer_protocol::Turn = serde_json::from_value(wire).unwrap();
+    assert!(
+        pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn
+            .is_detached_admission(&admission)
+    );
 }

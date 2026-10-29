@@ -1081,6 +1081,7 @@ mod tests {
         );
         let mut projection = ConversationViewState::default();
         projection.upsert_turn_snapshot_metadata(&Turn {
+            work_owner: Default::default(),
             id: "turn_a".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,

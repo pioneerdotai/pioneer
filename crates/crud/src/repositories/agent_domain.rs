@@ -5068,7 +5068,23 @@ fn compacted_agent_action_outbox_payload(
             spawned_execution_id.clone(),
         );
     }
-    if action.action_kind == "start_agent" {
+    if original
+        .get("execution_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("detached_task")
+    {
+        // Preserve the accepted execution strategy and Task binding. Replaying
+        // this action must never reinterpret it as a direct model launch.
+        for field in ["execution_mode", "task_id", "thread_id", "turn_id"] {
+            retained.insert(
+                field.to_owned(),
+                original
+                    .get(field)
+                    .context("detached action binding is missing")?
+                    .clone(),
+            );
+        }
+    } else if action.action_kind == "start_agent" {
         // Keep only the immutable binding required for terminal reconciliation;
         // input, launch parameters and the runtime dispatch payload are released.
         let turn_id = original
@@ -8601,6 +8617,43 @@ mod tests {
                 .contains("_pioneer_compacted"),
             false
         );
+        let detached_payload = serde_json::json!({
+            "action_id":"action-detached", "execution_id":"execution-detached", "kind":"start_agent",
+            "execution_mode":"detached_task", "task_id":"task-detached", "thread_id":"thread-detached", "turn_id":"turn-detached",
+            "launch_request_fingerprint":"b".repeat(64), "normalized":{"input":"z".repeat(4096)},
+        }).to_string();
+        insert_compaction_test_tuple(
+            &db,
+            "detached",
+            "delivered",
+            1,
+            utc_now() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS + 1),
+            Some(utc_now() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS + 1)),
+            serde_json::json!({"taskCreation":{"taskId":"task-detached"}}).to_string(),
+            detached_payload.clone(),
+        )
+        .await;
+        assert_eq!(
+            compact_terminal_agent_action_ledger(&db, utc_now(), 1)
+                .await
+                .unwrap()
+                .compacted_rows,
+            1
+        );
+        let detached = load_agent_action_outbox(&db, "action-detached")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(compacted_agent_action_value_matches(
+            Some(&detached.payload_json),
+            Some(&detached_payload),
+            AGENT_ACTION_OUTBOX_COMPACTION_FORMAT
+        ));
+        let retained: serde_json::Value = serde_json::from_str(&detached.payload_json).unwrap();
+        assert_eq!(retained["execution_mode"], "detached_task");
+        assert_eq!(retained["task_id"], "task-detached");
+        assert_eq!(retained["turn_id"], "turn-detached");
+        assert!(retained.get("dispatch").is_none());
     }
 
     async fn insert_compaction_test_tuple(

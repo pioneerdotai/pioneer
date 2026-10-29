@@ -222,6 +222,7 @@ impl Fixture {
             turns: vec![],
         };
         let mut turn = Turn {
+            work_owner: Default::default(),
             id: id.into(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),

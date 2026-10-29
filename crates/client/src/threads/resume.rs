@@ -1199,6 +1199,7 @@ mod tests {
             thread_id: "thread_b".to_owned(),
             workspace_id: "ws_a".to_owned(),
             turn: Turn {
+                work_owner: Default::default(),
                 id: "turn_a".to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,
@@ -1238,6 +1239,7 @@ mod tests {
             thread_id: "thread_a".to_owned(),
             workspace_id: "ws_a".to_owned(),
             turn: Turn {
+                work_owner: Default::default(),
                 id: "turn_a".to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,
@@ -1375,6 +1377,7 @@ mod tests {
             ),
         ] {
             let turn = Turn {
+                work_owner: Default::default(),
                 id: expected_turn_id.to_owned(),
                 status,
                 turn_kind: TurnKind::Conversation,
@@ -1454,6 +1457,7 @@ mod tests {
             thread_id: "thread_a".to_owned(),
             workspace_id: "ws_a".to_owned(),
             turn: Turn {
+                work_owner: Default::default(),
                 id: "turn_a".to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,
@@ -1533,6 +1537,7 @@ mod tests {
             thread_id: "thread_a".to_owned(),
             workspace_id: "ws_a".to_owned(),
             turn: Turn {
+                work_owner: Default::default(),
                 id: "turn_a".to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,

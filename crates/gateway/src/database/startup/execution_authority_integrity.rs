@@ -295,6 +295,7 @@ mod tests {
                     &thread,
                     SandboxMode::FullAccess,
                     &Turn {
+                        work_owner: Default::default(),
                         id: turn_id.to_owned(),
                         status: TurnStatus::InProgress,
                         turn_kind: Default::default(),

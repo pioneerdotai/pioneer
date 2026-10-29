@@ -2367,6 +2367,7 @@ mod tests {
         let now = fixed_test_datetime();
         let actor = PersistedActorRef::System;
         let message = Turn {
+            work_owner: Default::default(),
             id: "T00000000000000000001".to_owned(),
             status: TurnStatus::Completed,
             turn_kind: TurnKind::Conversation,

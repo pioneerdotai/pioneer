@@ -2932,6 +2932,7 @@ mod timeline_handler_unit_tests {
             role_label: None,
         };
         Turn {
+            work_owner: Default::default(),
             id: "turn".to_owned(),
             status: pioneer_protocol::TurnStatus::InProgress,
             turn_kind: pioneer_protocol::TurnKind::TaskRun,

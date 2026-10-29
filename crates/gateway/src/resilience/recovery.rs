@@ -1796,6 +1796,18 @@ impl RecoveryCoordinator {
         execution: &TurnExecutionRecord,
         now_unix: i64,
     ) -> Result<()> {
+        if self
+            .crud_store
+            .get_turn(&execution.thread_id, &execution.turn_id)
+            .await?
+            .is_some_and(|(_, turn)| {
+                turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask
+            })
+        {
+            // This is message admission, with no provider state to restart or
+            // block. The accepted Task and its action outbox own recovery.
+            return Ok(());
+        }
         if execution.executor_kind == TurnExecutorKind::CliRuntime
             && self
                 .crud_store
@@ -6648,6 +6660,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = pioneer_protocol::Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -9610,6 +9623,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = pioneer_protocol::Turn {
+            work_owner: Default::default(),
             id: "turn_terminal_backfill".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -9685,6 +9699,7 @@ mod tests {
                     workspace_id: thread.workspace_id.clone(),
                     thread_id: thread.id.clone(),
                     turn: pioneer_protocol::Turn {
+                        work_owner: Default::default(),
                         id: turn.id.clone(),
                         status: TurnStatus::Completed,
                         turn_kind: Default::default(),
@@ -9754,6 +9769,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = pioneer_protocol::Turn {
+            work_owner: Default::default(),
             id: "turn_timeout_liveness".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),

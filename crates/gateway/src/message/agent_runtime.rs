@@ -9692,6 +9692,11 @@ impl MessageProcessor {
         self.mcp_service
             .cancel_turn_mcp_invocations(turn.id.as_str());
         self.retire_execution_progress_state(turn.id.as_str()).await;
+        // Admission completes the handoff, never the AgentExecution that
+        // authored it. The Task owns the responding execution and resources.
+        if turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask {
+            return;
+        }
         let database = self.crud_store.database_connection();
         let responding_execution_id =
             match pioneer_crud::load_agent_turn_response(&database, turn.id.as_str()).await {

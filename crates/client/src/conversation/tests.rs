@@ -53,6 +53,7 @@ fn thread_snapshot_with_turn(turn: Turn) -> Thread {
 
 fn turn_snapshot(id: &str, status: TurnStatus, error: Option<String>) -> Turn {
     Turn {
+        work_owner: Default::default(),
         id: id.to_owned(),
         status,
         turn_kind: Default::default(),
@@ -77,6 +78,7 @@ fn apply_in_progress_turn(conversation: &mut Conversation) {
     conversation.apply(ConversationEvent::TurnStarted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -288,6 +290,7 @@ fn task_run_occurrence_does_not_claim_foreground_on_notification_or_reload() {
     let mut conversation = Conversation::new(THREAD_ID);
     let task_turn_id = "run_0000000000000000001";
     let task_turn = Turn {
+        work_owner: Default::default(),
         id: task_turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::TaskRun,
@@ -412,6 +415,7 @@ fn turn_started_projection_preserves_permission_profile() {
     conversation.apply(ConversationEvent::TurnStarted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -488,6 +492,7 @@ fn permission_audit_allow_once_projects_shared_projection_and_timeline_row() {
     conversation.apply(ConversationEvent::TurnStarted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -701,6 +706,7 @@ fn send_stays_blocked_until_terminal_event() {
     conversation.apply(ConversationEvent::TurnStarted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -723,6 +729,7 @@ fn send_stays_blocked_until_terminal_event() {
     conversation.apply(ConversationEvent::TurnCompleted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
@@ -1026,6 +1033,7 @@ fn send_unlocks_only_on_terminal_failed_or_cancelled() {
         conversation.apply(ConversationEvent::TurnFailed {
             thread_id: THREAD_ID.to_owned(),
             turn: Turn {
+                work_owner: Default::default(),
                 id: TURN_ID.to_owned(),
                 status: TurnStatus::Failed,
                 turn_kind: Default::default(),
@@ -1079,6 +1087,7 @@ fn send_unlocks_only_on_terminal_failed_or_cancelled() {
         conversation.apply(ConversationEvent::TurnFailed {
             thread_id: THREAD_ID.to_owned(),
             turn: Turn {
+                work_owner: Default::default(),
                 id: "turn_000000000000000002".to_owned(),
                 status: TurnStatus::Interrupted,
                 turn_kind: Default::default(),
@@ -1166,6 +1175,7 @@ fn cancel_request_locks_until_rejected_or_interrupted() {
     conversation.apply(ConversationEvent::TurnFailed {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::Interrupted,
             turn_kind: Default::default(),
@@ -1521,6 +1531,7 @@ fn conversation_codex_reasoning_summary_does_not_overwrite_agent_message_text() 
     conversation.apply(ConversationEvent::TurnCompleted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
@@ -1933,6 +1944,7 @@ fn terminal_turn_stamps_running_items_completed_at() {
     conversation.apply(ConversationEvent::TurnCompleted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
@@ -2265,6 +2277,7 @@ fn dynamic_tool_metadata_survives_live_completion() {
     conversation.apply(ConversationEvent::TurnStarted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -2432,6 +2445,7 @@ fn live_recovery_events_do_not_duplicate_terminal_failure() {
     conversation.apply(ConversationEvent::TurnStarted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -2476,6 +2490,7 @@ fn live_recovery_events_do_not_duplicate_terminal_failure() {
     });
     conversation.apply(ConversationEvent::TurnFailed { thread_id: THREAD_ID.to_owned(),
 turn: Turn {
+                    work_owner: Default::default(),
                     id: TURN_ID.to_owned(),
                     status: TurnStatus::Failed,
                     turn_kind: Default::default(),
@@ -2623,6 +2638,7 @@ fn foreign_thread_events_do_not_modify_local_projection() {
     conversation.apply(ConversationEvent::TurnStarted {
         thread_id: "thr_foreign".to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: "turn_foreign".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -2653,6 +2669,7 @@ fn duplicate_turn_completed_event_is_ignored_after_terminal_completion() {
     conversation.apply(ConversationEvent::TurnStarted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -2674,6 +2691,7 @@ fn duplicate_turn_completed_event_is_ignored_after_terminal_completion() {
     conversation.apply(ConversationEvent::TurnCompleted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
@@ -2698,6 +2716,7 @@ fn duplicate_turn_completed_event_is_ignored_after_terminal_completion() {
     conversation.apply(ConversationEvent::TurnCompleted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
@@ -2735,6 +2754,7 @@ fn turn_completed_finalizes_projection_even_when_flow_is_not_in_flight() {
     conversation.apply(ConversationEvent::TurnCompleted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
@@ -2989,6 +3009,7 @@ fn execution_window_events_project_runtime_rows_without_ending_turn() {
     conversation.apply(ConversationEvent::TurnCompleted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
@@ -3106,6 +3127,7 @@ fn turn_blocked_resume_metadata_projects_live() {
         can_resume_same_turn: true,
     };
     let blocked_turn = Turn {
+        work_owner: Default::default(),
         id: TURN_ID.to_owned(),
         status: TurnStatus::Blocked,
         turn_kind: Default::default(),
@@ -3172,6 +3194,7 @@ fn item_handlers_preserve_typed_items_and_reasoning_duration() {
     let handlers = super::handlers::TurnItemHandlerRegistry::default();
     projector.apply_turn_started(
         &Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -3267,6 +3290,7 @@ fn item_handlers_preserve_typed_items_and_reasoning_duration() {
     );
     projector.apply_turn_completed(
         &Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
@@ -3341,6 +3365,7 @@ fn reasoning_delta_survives_live_empty_completion() {
     conversation.apply(ConversationEvent::TurnStarted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -3389,6 +3414,7 @@ fn reasoning_delta_survives_live_empty_completion() {
     conversation.apply(ConversationEvent::TurnCompleted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
+            work_owner: Default::default(),
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
@@ -3436,4 +3462,64 @@ fn reasoning_delta_survives_live_empty_completion() {
         .expect("hydrated reasoning item should exist");
     assert!(reasoning_item.partial_text.contains("Reasoning chunk"));
     assert_eq!(reasoning_item.status, TimelineEntryStatus::Completed);
+}
+
+#[test]
+fn agent_admission_owner_controls_live_and_recovered_flow_independently_of_thread_kind() {
+    for kind in [
+        ThreadOriginKind::Collaborative,
+        ThreadOriginKind::TaskRun,
+        ThreadOriginKind::DirectMessage,
+        ThreadOriginKind::User,
+        ThreadOriginKind::System,
+    ] {
+        for owner in [
+            pioneer_protocol::TurnWorkOwner::Turn,
+            pioneer_protocol::TurnWorkOwner::DetachedTask,
+        ] {
+            let mut turn = turn_snapshot(TURN_ID, TurnStatus::InProgress, None);
+            turn.mode = ThreadMode::Agent;
+            turn.work_owner = owner;
+            turn.author = Some(pioneer_protocol::TurnAuthorSnapshot {
+                actor: pioneer_protocol::PersistedActorRef::AgentExecution(
+                    pioneer_protocol::AgentExecutionId::new("E0000000000000000000A").unwrap(),
+                ),
+                display_name: "Agent".into(),
+                nickname: "agent".into(),
+                avatar_revision: None,
+                cli_runtime_kind: None,
+                agent: None,
+            });
+            let mut snapshot = thread_snapshot_with_turn(turn.clone());
+            snapshot.origin_kind = kind;
+            let mut live = Conversation::new(THREAD_ID);
+            let mut empty = snapshot.clone();
+            empty.turns.clear();
+            live.sync_thread_snapshot(&empty);
+            live.apply(ConversationEvent::TurnStarted {
+                thread_id: THREAD_ID.into(),
+                turn: turn.clone(),
+            });
+            let mut recovered = Conversation::new(THREAD_ID);
+            recovered.sync_thread_snapshot(&snapshot);
+            let expected = (owner == pioneer_protocol::TurnWorkOwner::Turn).then_some(TURN_ID);
+            assert_eq!(live.in_flight_turn_id(), expected, "{kind:?}/{owner:?}");
+            assert_eq!(
+                recovered.in_flight_turn_id(),
+                expected,
+                "{kind:?}/{owner:?}"
+            );
+            assert_eq!(live.can_submit_message(), expected.is_none());
+            assert_eq!(recovered.can_submit_message(), expected.is_none());
+            turn.status = TurnStatus::Completed;
+            live.apply(ConversationEvent::TurnCompleted {
+                thread_id: THREAD_ID.into(),
+                turn: turn.clone(),
+            });
+            snapshot.turns = vec![turn];
+            recovered.sync_thread_snapshot(&snapshot);
+            assert!(live.can_submit_message());
+            assert!(recovered.can_submit_message());
+        }
+    }
 }

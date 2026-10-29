@@ -763,24 +763,17 @@ impl From<anyhow::Error> for CliRuntimeRecoveryStartFailure {
     }
 }
 
-struct ComposerDetachedStartedPhase {
-    launch: TurnStartParams,
-    outcome: crate::thread::TurnStartOutcome,
-    capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
-    profile_audit: pioneer_protocol::TurnPermissionAuditEvent,
-}
-
-struct ComposerDetachedMaterializedPhase {
-    launch: TurnStartParams,
-    outcome: crate::thread::TurnStartOutcome,
-    capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
-    security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
-}
-
-struct ComposerDetachedTaskCreatedPhase {
-    launch: TurnStartParams,
-    outcome: crate::thread::TurnStartOutcome,
-    capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
+/// Execution-bound facts already admitted by the canonical Threads adapter.
+/// These never become model-facing payload or a broader principal admission.
+pub(super) struct DetachedAgentThreadAdmission {
+    pub author: pioneer_protocol::TurnAuthorSnapshot,
+    pub security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
+    pub launch: pioneer_protocol::AgentLaunchSelection,
+    pub identity: pioneer_protocol::AgentIdentityProjection,
+    pub profile: pioneer_protocol::AgentExecutionProfileProjection,
+    pub grant: pioneer_tasks::TaskAgentAuthorizationGrantSeed,
+    pub creator_work_graph_root_execution_id: String,
+    pub action: pioneer_crud::AgentCommitInput,
 }
 
 fn task_creator_actor_id(actor: &pioneer_protocol::PersistedActorRef) -> Option<String> {
@@ -1526,19 +1519,18 @@ impl MessageProcessor {
                 &params.turn_id,
                 thread.origin_kind == pioneer_protocol::ThreadOriginKind::TaskRun,
             );
-            if thread.origin_kind.composer_execution_mode()
-                == pioneer_protocol::ThreadComposerExecutionMode::DetachedTask
-            {
-                self.composer_detached_task_start(
+            if self
+                .composer_detached_task_start(
                     connection_id,
-                    request_id,
+                    request_id.clone(),
                     request_actor.clone(),
-                    params,
-                    thread,
-                    execution_admission,
+                    params.clone(),
+                    thread.clone(),
+                    execution_admission.clone(),
                     TurnStartSuccessResponse::TurnStart,
                 )
-                .await;
+                .await
+            {
                 return;
             }
             let requested_reasoning_effort = requested_reasoning_effort(&params);
@@ -1694,884 +1686,718 @@ impl MessageProcessor {
         }
     }
 
-    /// Admit a collaborative Composer submission as a durable user message
-    /// followed by an immediate detached task. The message turn completes
-    /// synchronously; the task child owns all agent execution.
+    /// RPC/voice completion adapter. All detached admission and Task execution
+    /// below is shared with execution-bound Threads actions.
     pub(super) fn composer_detached_task_start<'a>(
         &'a self,
         connection_id: ConnectionId,
         request_id: RequestId,
         request_actor: pioneer_protocol::PersistedActorRef,
-        mut params: TurnStartParams,
+        params: TurnStartParams,
         thread: pioneer_protocol::Thread,
-        mut execution_admission: ExecutionAuthorizationAdmission,
+        execution_admission: ExecutionAuthorizationAdmission,
         success_response: TurnStartSuccessResponse,
-    ) -> MessageFuture<'a, ()> {
+    ) -> MessageFuture<'a, bool> {
         message_future(async move {
-            let admission_entry_point =
-                crate::authorization::ExecutionAdmissionEntryPoint::DetachedTask;
+            let thread_id = params.thread_id.clone();
             let turn_id = params.turn_id.clone();
-            pioneer_observability::turn_startup::delegated(&turn_id);
-            let _startup_create = pioneer_observability::turn_startup::stage(
-                &turn_id,
-                pioneer_observability::turn_startup::Stage::DelegationCreate,
-            );
-            // Keep Composer admission, durable materialization, detached Task
-            // creation, and finalization in separate heap-backed futures. Polling
-            // the complete lifecycle as one state machine stacks its large frame
-            // on top of the database projector and can exhaust a standard Tokio
-            // worker stack.
-            let started_phase =
-                message_future(scope_current_stage(Stage::ComposerPrepare, async {
-                    let normalized_capabilities = match self
-                        .normalize_turn_skill_capabilities(
-                            thread.workspace_id.as_str(),
-                            params.capabilities.as_slice(),
-                        )
-                        .await
-                    {
-                        Ok(normalized) => normalized,
-                        Err(message) => {
-                            self.send_turn_start_failure(
+            match self
+                .start_thread_turn(
+                    Some(connection_id),
+                    request_actor,
+                    params,
+                    thread,
+                    TurnExecutionAuthority::Fresh(execution_admission),
+                    None,
+                )
+                .await
+            {
+                Ok(Some((outcome, attachments))) => {
+                    let sent = match &success_response {
+                        TurnStartSuccessResponse::TurnStart => {
+                            self.finish_turn_start_success(
                                 connection_id,
-                                request_id.clone(),
-                                &success_response,
-                                thread.id.as_str(),
-                                turn_id.as_str(),
-                                message,
-                            )
-                            .await;
-                            return None;
-                        }
-                    };
-                    if execution_admission.uses_scoped_collaboration_policy()
-                        && let Err(message) = self
-                            .enforce_scoped_skill_capability_projection(
-                                thread.workspace_id.as_str(),
-                                normalized_capabilities.execution.as_slice(),
+                                request_id,
+                                &outcome,
+                                &attachments,
                             )
                             .await
-                    {
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            message,
-                        )
-                        .await;
-                        return None;
-                    }
-                    if let Err(error) =
-                        super::message_turn::normalize_turn_collaboration_params(&mut params)
-                    {
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            format!("invalid Turn collaboration metadata: {error}"),
-                        )
-                        .await;
-                        return None;
-                    }
-                    let resolved_permission_profile = execution_admission
-                        .uses_scoped_collaboration_policy()
-                        .then(|| {
-                            let requested = pioneer_protocol::resolve_turn_permission_profile(
-                                params.permission_profile.as_ref(),
-                            );
-                            execution_admission.cap_permission_profile(&requested)
-                        });
-                    if let Some(profile) = resolved_permission_profile.as_ref() {
-                        params.permission_profile =
-                            Some(pioneer_protocol::TurnPermissionProfileSelection {
-                                mode: profile.mode,
-                            });
-                    }
-                    // The detached Task must replay the exact presentation selected in the
-                    // Composer. Skill packs are expanded only at the execution boundary;
-                    // persisting the expanded capabilities here would make the child
-                    // message render every pack member as an individually selected skill.
-                    let launch = params.clone();
-                    params.capabilities = normalized_capabilities.execution.clone();
-                    if let Err(failure) = validate_root_agent_launch_capabilities(&params) {
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            failure,
-                        )
-                        .await;
-                        return None;
-                    }
-                    if let Err(error) = self
-                        .validate_turn_artifact_user_inputs(
-                            thread.workspace_id.as_str(),
-                            thread.id.as_str(),
-                            params.input.as_slice(),
-                        )
-                        .await
-                    {
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            format!("failed to validate artifact input: {error:#}"),
-                        )
-                        .await;
-                        return None;
-                    }
-                    let skill_catalog = match self
-                        .validate_turn_skill_capabilities(
-                            thread.workspace_id.as_str(),
-                            params.capabilities.as_slice(),
-                        )
-                        .await
-                    {
-                        Ok(catalog) => catalog,
-                        Err(message) => {
-                            self.send_turn_start_failure(
-                                connection_id,
-                                request_id.clone(),
-                                &success_response,
-                                thread.id.as_str(),
-                                turn_id.as_str(),
-                                message,
-                            )
-                            .await;
-                            return None;
                         }
+                        TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { session_id } => {
+                            self.finish_voice_session_finalize_accepted_turn_start_success(
+                                connection_id,
+                                &outcome,
+                                &attachments,
+                                session_id,
+                            )
+                            .await
+                        }
+                        TurnStartSuccessResponse::Task { .. }
+                        | TurnStartSuccessResponse::DurableAgent { .. } => false,
                     };
-                    let capability_attachments =
-            match super::agent_runtime::user_message_attachments_from_capabilities_and_catalog(
-                normalized_capabilities.presentation.as_slice(),
-                &skill_catalog,
-                &normalized_capabilities.pack_names,
-            ) {
-                Ok(attachments) => attachments,
+                    if !sent
+                        || !self
+                            .complete_detached_thread_admission(&thread_id, &turn_id)
+                            .await
+                    {
+                        self.mark_turn_blocked(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            "failed to complete thread admission after Task creation".to_owned(),
+                        )
+                        .await;
+                    }
+                }
+                Ok(None) => return false,
                 Err(error) => {
                     self.send_turn_start_failure(
                         connection_id,
-                        request_id.clone(),
+                        request_id,
                         &success_response,
-                        thread.id.as_str(),
-                        turn_id.as_str(),
-                        format!("failed to snapshot selected capability presentation: {error:#}"),
+                        &thread_id,
+                        &turn_id,
+                        error,
                     )
                     .await;
-                    return None;
                 }
-            };
+            }
+            true
+        })
+    }
 
-                    // Preserve the exact client launch for Task replay, but admit the
-                    // parent message with the canonical provider selected by its
-                    // execution backend. CLI clients intentionally omit `model_provider`,
-                    // so leaving the field empty here would keep the parent's previous
-                    // API provider even though the detached child runs in Codex/Claude.
-                    canonicalize_cli_runtime_model_provider(&mut params);
-                    let author = match super::message_turn::resolve_turn_author_snapshot(
-                        self.crud_store.as_ref(),
-                        &request_actor,
-                    )
-                    .await
-                    {
-                        Ok(author) => author,
-                        Err(error) => {
-                            self.send_turn_start_failure(
-                                connection_id,
-                                request_id.clone(),
-                                &success_response,
-                                thread.id.as_str(),
-                                turn_id.as_str(),
-                                format!("failed to resolve Turn author: {error:#}"),
-                            )
-                            .await;
-                            return None;
-                        }
-                    };
-                    let mentions = match super::message_turn::resolve_turn_collaboration_metadata(
-                        self.crud_store.as_ref(),
-                        &request_actor,
-                        &params,
-                    )
-                    .await
-                    {
-                        Ok(mentions) => mentions,
-                        Err(error) => {
-                            self.send_turn_start_failure(
-                                connection_id,
-                                request_id.clone(),
-                                &success_response,
-                                thread.id.as_str(),
-                                turn_id.as_str(),
-                                format!("invalid Turn collaboration metadata: {error}"),
-                            )
-                            .await;
-                            return None;
-                        }
-                    };
-                    let outcome_result = match resolved_permission_profile {
-                        Some(profile) => {
-                            self.thread_manager
-                                .turn_start_with_user_metadata_and_permission_profile(
-                                    connection_id,
-                                    params,
-                                    profile,
-                                    author,
-                                    mentions,
-                                )
-                                .await
-                        }
-                        None => {
-                            self.thread_manager
-                                .turn_start_with_user_metadata(
-                                    connection_id,
-                                    params,
-                                    author,
-                                    mentions,
-                                )
-                                .await
-                        }
-                    };
-                    let outcome = match outcome_result {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
-                            self.send_turn_start_failure(
-                                connection_id,
-                                request_id.clone(),
-                                &success_response,
-                                thread.id.as_str(),
-                                turn_id.as_str(),
-                                format!("failed to admit Composer message: {error:#}"),
-                            )
-                            .await;
-                            return None;
-                        }
-                    };
-                    let profile_audit = match self.turn_profile_selected_audit_event(&outcome) {
-                        Ok(event) => event,
-                        Err(error) => {
-                            self.thread_manager
-                                .rollback_turn_start(outcome.rollback_context.clone())
-                                .await;
-                            self.send_turn_start_failure(
-                                connection_id,
-                                request_id.clone(),
-                                &success_response,
-                                thread.id.as_str(),
-                                turn_id.as_str(),
-                                format!("failed to resolve Composer permission profile: {error:#}"),
-                            )
-                            .await;
-                            return None;
-                        }
-                    };
-                    Some(ComposerDetachedStartedPhase {
-                        launch,
-                        outcome,
-                        capability_attachments,
-                        profile_audit,
-                    })
-                }))
-                .await;
-            let Some(ComposerDetachedStartedPhase {
-                launch,
-                outcome,
-                capability_attachments,
-                profile_audit,
-            }) = started_phase
-            else {
-                return;
-            };
-            let materialized_phase =
-                message_future(scope_current_stage(Stage::ComposerMaterialize, async {
-                    // Capture the native Agent-skill allowance when the Task is
-                    // admitted. The message-only parent owns no runtime pins;
-                    // later executions may only narrow this saved skill set.
-                    let overlay = if !matches!(
-                        launch.execution_backend.as_ref(),
-                        Some(AgentExecutionBackend::CLIAgentRuntime { .. })
-                            | Some(AgentExecutionBackend::ACPAgentRuntime { .. })
-                    ) && self.native_api_provider_supports_agent_skill_overlay(
-                        &thread.workspace_id,
-                        &outcome.materialization.thread.model_provider,
-                    ) {
-                        if execution_admission.uses_scoped_collaboration_policy() {
-                            match self
-                                .load_agent_skill_overlay_for_scoped_turn(
-                                    execution_admission.initiating_principal_id(),
-                                    &thread.workspace_id,
-                                    &turn_id,
-                                )
-                                .await
-                            {
-                                Ok(overlay) => overlay,
-                                Err(error) => {
-                                    self.thread_manager
-                                        .rollback_turn_start(outcome.rollback_context.clone())
-                                        .await;
-                                    self.send_turn_start_failure(
-                                        connection_id,
-                                        request_id.clone(),
-                                        &success_response,
-                                        &thread.id,
-                                        &turn_id,
-                                        TurnStartFailure::unavailable(format!(
-                                            "Agent skill allowance is unavailable: {error:#}"
-                                        )),
-                                    )
-                                    .await;
-                                    return None;
-                                }
-                            }
-                        } else {
-                            self.load_agent_skill_overlay_for_new_native_turn(
-                                &thread.workspace_id,
-                                &turn_id,
-                            )
-                            .await
-                        }
-                    } else {
-                        Vec::new()
-                    };
-                    let grant_capabilities =
-                        crate::authorization::execution_grant_capabilities_with_agent_skills(
-                            outcome.materialization.capabilities.as_slice(),
-                            overlay.into_iter().map(|entry| entry.skill_id),
-                        );
-                    if let Err(message) = self
-                        .admit_composite_execution_request(
-                            &mut execution_admission,
-                            admission_entry_point,
-                            vec![crate::authorization::ResourceAction::TaskCreate],
-                            outcome.started_notification.workspace_id.as_str(),
-                            outcome.started_notification.thread_id.as_str(),
-                            outcome.materialization.thread.model_provider.as_str(),
-                            outcome.materialization.thread.model.as_str(),
-                            &launch,
-                            grant_capabilities.as_slice(),
-                        )
-                        .await
-                    {
-                        self.thread_manager
-                            .rollback_turn_start(outcome.rollback_context.clone())
-                            .await;
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            message,
-                        )
-                        .await;
-                        return None;
-                    }
-                    let security_snapshot = match self
-                        .resolve_turn_execution_security_snapshot(
-                            &launch,
-                            &outcome,
-                            None,
-                            ExecutionEnvelopeSource::Fresh(&execution_admission),
-                        )
-                        .await
-                    {
-                        Ok(snapshot) => snapshot,
-                        Err(failure) => {
-                            self.thread_manager
-                                .rollback_turn_start(outcome.rollback_context.clone())
-                                .await;
-                            self.send_turn_start_failure(
-                                connection_id,
-                                request_id.clone(),
-                                &success_response,
-                                thread.id.as_str(),
-                                turn_id.as_str(),
-                                failure,
-                            )
-                            .await;
-                            return None;
-                        }
-                    };
-                    let security_audit_events = self.turn_security_audit_events_for_turn(
-                        outcome.started_notification.workspace_id.as_str(),
-                        outcome.started_notification.thread_id.as_str(),
-                        outcome.started_notification.turn.id.as_str(),
-                        &security_snapshot,
-                    );
-                    if let Err(error) = persist_admitted_turn_start(
-                        self.crud_store.as_ref(),
-                        self.provider_registry.as_ref(),
-                        self.turn_execution_owner_id.as_ref(),
-                        &launch,
-                        &outcome.materialization,
-                        requested_reasoning_effort(&launch).as_deref(),
-                        pioneer_crud::TurnWorkOwner::DetachedTask,
-                        request_actor.clone(),
-                        profile_audit,
-                        ExecutionEnvelopeSource::Fresh(&execution_admission),
-                        None,
-                        &security_snapshot,
-                        security_audit_events,
-                        None,
-                        None,
-                    )
-                    .await
-                    {
-                        self.thread_manager
-                            .rollback_turn_start(outcome.rollback_context.clone())
-                            .await;
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            format!("failed to persist Composer message: {error:#}"),
-                        )
-                        .await;
-                        return None;
-                    }
-                    self.complete_runtime_draft_materialization(ExecutionEnvelopeSource::Fresh(
-                        &execution_admission,
-                    ))
-                    .await;
-                    if let Err(error) = self
-                        .register_execution_lease(outcome.started_notification.turn.id.as_str())
-                        .await
-                    {
-                        let message = format!("failed to register execution lease: {error:#}");
-                        self.mark_turn_blocked(
-                            thread.id.clone(),
-                            launch.turn_id.clone(),
-                            message.clone(),
-                        )
-                        .await;
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            TurnStartFailure::internal(message),
-                        )
-                        .await;
-                        return None;
-                    }
+    /// Shared choice and execution boundary for RPC and Threads-tool launches.
+    /// Foreground admission continues through the existing native/CLI adapters;
+    /// detached admission always runs the same message/Task lifecycle below.
+    pub(super) async fn start_thread_turn(
+        &self,
+        connection_id: Option<ConnectionId>,
+        actor: pioneer_protocol::PersistedActorRef,
+        params: TurnStartParams,
+        thread: pioneer_protocol::Thread,
+        authority: TurnExecutionAuthority,
+        agent: Option<DetachedAgentThreadAdmission>,
+    ) -> Result<
+        Option<(
+            crate::thread::TurnStartOutcome,
+            Vec<pioneer_protocol::UserMessageAttachment>,
+        )>,
+        TurnStartFailure,
+    > {
+        match (&actor, &authority, &agent) {
+            (
+                pioneer_protocol::PersistedActorRef::AgentExecution(_),
+                TurnExecutionAuthority::Durable { .. },
+                Some(agent),
+            ) if agent.author.actor == actor => {}
+            (
+                pioneer_protocol::PersistedActorRef::Principal(_)
+                | pioneer_protocol::PersistedActorRef::System,
+                TurnExecutionAuthority::Fresh(_),
+                None,
+            ) => {}
+            _ => {
+                return Err(TurnStartFailure::policy_denied(
+                    "thread launch actor differs from its admission",
+                ));
+            }
+        }
+        if thread.origin_kind.composer_execution_mode()
+            == pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn
+        {
+            return Ok(None);
+        }
+        message_future(self.start_detached_thread_turn(
+            connection_id,
+            actor,
+            params,
+            thread,
+            authority,
+            agent,
+        ))
+        .await
+        .map(Some)
+    }
 
-                    Some(ComposerDetachedMaterializedPhase {
-                        launch,
-                        outcome,
-                        capability_attachments,
-                        security_snapshot,
-                    })
-                }))
-                .await;
-            let Some(ComposerDetachedMaterializedPhase {
-                launch,
-                outcome,
-                capability_attachments,
-                security_snapshot,
-            }) = materialized_phase
-            else {
-                return;
-            };
-            // Materialization has released all DB capacity. Publish the exact
-            // committed user lifecycle before the Task service can start/fanout
-            // its occurrence; do not wait for the optional native outbox.
-            if let Err(error) = self
-                .emit_user_message_item_lifecycle_with_live_delivery(
-                    thread.workspace_id.as_str(),
-                    thread.id.as_str(),
-                    turn_id.as_str(),
-                    outcome.materialization.input.as_slice(),
-                    capability_attachments.as_slice(),
-                    true,
+    /// Common detached execution mechanism: admit the initiating message,
+    /// freeze the launch/authority, create an ordinary detached Task, then let
+    /// the existing Task runtime own execution, stop and result delivery.
+    pub(super) async fn start_detached_thread_turn(
+        &self,
+        connection_id: Option<ConnectionId>,
+        request_actor: pioneer_protocol::PersistedActorRef,
+        mut params: TurnStartParams,
+        thread: pioneer_protocol::Thread,
+        mut authority: TurnExecutionAuthority,
+        mut agent: Option<DetachedAgentThreadAdmission>,
+    ) -> Result<
+        (
+            crate::thread::TurnStartOutcome,
+            Vec<pioneer_protocol::UserMessageAttachment>,
+        ),
+        TurnStartFailure,
+    > {
+        let turn_id = params.turn_id.clone();
+        pioneer_observability::turn_startup::delegated(&turn_id);
+        let normalized = self
+            .normalize_turn_skill_capabilities(&thread.workspace_id, &params.capabilities)
+            .await
+            .map_err(TurnStartFailure::from)?;
+        if let TurnExecutionAuthority::Fresh(admission) = &authority {
+            if admission.uses_scoped_collaboration_policy() {
+                self.enforce_scoped_skill_capability_projection(
+                    &thread.workspace_id,
+                    &normalized.execution,
                 )
                 .await
+                .map_err(TurnStartFailure::from)?;
+                let requested = pioneer_protocol::resolve_turn_permission_profile(
+                    params.permission_profile.as_ref(),
+                );
+                params.permission_profile =
+                    Some(pioneer_protocol::TurnPermissionProfileSelection {
+                        mode: admission.cap_permission_profile(&requested).mode,
+                    });
+            }
+        }
+        super::message_turn::normalize_turn_collaboration_params(&mut params)
+            .map_err(|error| TurnStartFailure::invalid_input(error.to_string()))?;
+        let launch = params.clone();
+        params.capabilities = normalized.execution.clone();
+        validate_root_agent_launch_capabilities(&params)?;
+        self.validate_turn_artifact_user_inputs(&thread.workspace_id, &thread.id, &params.input)
+            .await
+            .map_err(|error| {
+                TurnStartFailure::invalid_input(format!("invalid artifact input: {error:#}"))
+            })?;
+        let catalog = self
+            .validate_turn_skill_capabilities(&thread.workspace_id, &params.capabilities)
+            .await
+            .map_err(TurnStartFailure::from)?;
+        let attachments =
+            super::agent_runtime::user_message_attachments_from_capabilities_and_catalog(
+                &normalized.presentation,
+                &catalog,
+                &normalized.pack_names,
+            )
+            .map_err(|error| {
+                TurnStartFailure::internal(format!("failed to snapshot capabilities: {error:#}"))
+            })?;
+        canonicalize_cli_runtime_model_provider(&mut params);
+        let author = match agent.as_ref() {
+            Some(agent) => Some(agent.author.clone()),
+            None => super::message_turn::resolve_turn_author_snapshot(
+                self.crud_store.as_ref(),
+                &request_actor,
+            )
+            .await
+            .map_err(|error| {
+                TurnStartFailure::internal(format!("failed to resolve author: {error:#}"))
+            })?,
+        };
+        let mentions = super::message_turn::resolve_turn_collaboration_metadata(
+            self.crud_store.as_ref(),
+            &request_actor,
+            &params,
+        )
+        .await
+        .map_err(|error| TurnStartFailure::invalid_input(error.to_string()))?;
+        let profile = agent
+            .as_ref()
+            .map(|agent| agent.security_snapshot.permission_profile.clone())
+            .unwrap_or_else(|| {
+                pioneer_protocol::resolve_turn_permission_profile(
+                    params.permission_profile.as_ref(),
+                )
+            });
+        // A process can die after parent materialization, before the atomic
+        // Task/action commit. Reuse that exact admission rather than appending
+        // a second message. Accepted actions are replayed before reaching here.
+        let saved = if agent.is_some() {
+            self.crud_store
+                .get_turn(&thread.id, &turn_id)
+                .await
+                .map_err(|error| {
+                    TurnStartFailure::internal(format!("failed to read admission: {error:#}"))
+                })?
+        } else {
+            None
+        };
+        let replay = saved.is_some();
+        let outcome = if let Some((_, saved)) = saved {
+            let input = self
+                .crud_store
+                .get_turn_inputs(&turn_id)
+                .await
+                .map_err(|error| {
+                    TurnStartFailure::internal(format!("failed to read admission input: {error:#}"))
+                })?;
+            if saved.work_owner != pioneer_protocol::TurnWorkOwner::DetachedTask
+                || saved.author != author
+                || input != params.input
             {
+                return Err(TurnStartFailure::conflict(
+                    "thread admission replay differs from persisted facts",
+                ));
+            }
+            self.thread_manager
+                .rehydrate_committed_agent_turn(&params, input)
+                .await
+        } else {
+            self.thread_manager
+                .detached_thread_turn_start(connection_id, params, profile, author, mentions)
+                .await
+        }
+        .map_err(|error| {
+            TurnStartFailure::conflict(format!("failed to admit thread message: {error:#}"))
+        })?;
+
+        let mut parent_committed = replay;
+        let materialized = message_future(async {
+            if let TurnExecutionAuthority::Fresh(admission) = &mut authority {
+                let overlay = if !matches!(
+                    launch.execution_backend.as_ref(),
+                    Some(AgentExecutionBackend::CLIAgentRuntime { .. })
+                        | Some(AgentExecutionBackend::ACPAgentRuntime { .. })
+                ) && self.native_api_provider_supports_agent_skill_overlay(
+                    &thread.workspace_id,
+                    &outcome.materialization.thread.model_provider,
+                ) {
+                    if admission.uses_scoped_collaboration_policy() {
+                        self.load_agent_skill_overlay_for_scoped_turn(
+                            admission.initiating_principal_id(),
+                            &thread.workspace_id,
+                            &turn_id,
+                        )
+                        .await
+                        .map_err(|error| {
+                            TurnStartFailure::unavailable(format!(
+                                "Agent skills unavailable: {error:#}"
+                            ))
+                        })?
+                    } else {
+                        self.load_agent_skill_overlay_for_new_native_turn(
+                            &thread.workspace_id,
+                            &turn_id,
+                        )
+                        .await
+                    }
+                } else {
+                    Vec::new()
+                };
+                let capabilities =
+                    crate::authorization::execution_grant_capabilities_with_agent_skills(
+                        &outcome.materialization.capabilities,
+                        overlay.into_iter().map(|entry| entry.skill_id),
+                    );
+                self.admit_composite_execution_request(
+                    admission,
+                    crate::authorization::ExecutionAdmissionEntryPoint::DetachedTask,
+                    vec![crate::authorization::ResourceAction::TaskCreate],
+                    &thread.workspace_id,
+                    &thread.id,
+                    &outcome.materialization.thread.model_provider,
+                    &outcome.materialization.thread.model,
+                    &launch,
+                    &capabilities,
+                )
+                .await?;
+            }
+            let security_snapshot = match agent.as_ref() {
+                Some(agent) => agent.security_snapshot.clone(),
+                None => {
+                    self.resolve_turn_execution_security_snapshot(
+                        &launch,
+                        &outcome,
+                        None,
+                        authority.source(),
+                    )
+                    .await?
+                }
+            };
+            if !replay {
+                let audit = self
+                    .turn_profile_selected_audit_event(&outcome)
+                    .map_err(|error| {
+                        TurnStartFailure::internal(format!(
+                            "failed to resolve profile audit: {error:#}"
+                        ))
+                    })?;
+                persist_admitted_turn_start(
+                    self.crud_store.as_ref(),
+                    self.provider_registry.as_ref(),
+                    self.turn_execution_owner_id.as_ref(),
+                    &launch,
+                    &outcome.materialization,
+                    requested_reasoning_effort(&launch).as_deref(),
+                    pioneer_crud::TurnWorkOwner::DetachedTask,
+                    request_actor.clone(),
+                    audit,
+                    authority.source(),
+                    None,
+                    &security_snapshot,
+                    self.turn_security_audit_events_for_turn(
+                        &thread.workspace_id,
+                        &thread.id,
+                        &turn_id,
+                        &security_snapshot,
+                    ),
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|error| {
+                    TurnStartFailure::internal(format!(
+                        "failed to persist thread admission: {error:#}"
+                    ))
+                })?;
+                parent_committed = true;
+                self.complete_runtime_draft_materialization(authority.source())
+                    .await;
+            }
+            if agent.is_none() {
+                self.register_execution_lease(&turn_id)
+                    .await
+                    .map_err(|error| {
+                        TurnStartFailure::internal(format!(
+                            "failed to register admission: {error:#}"
+                        ))
+                    })?;
+            }
+            Ok::<_, TurnStartFailure>(security_snapshot)
+        })
+        .await;
+        let security_snapshot = match materialized {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if parent_committed {
+                    self.mark_turn_blocked(thread.id.clone(), turn_id.clone(), error.to_string())
+                        .await;
+                } else {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                }
+                return Err(error);
+            }
+        };
+        // Release DB capacity before lifecycle publication and Task execution.
+        if let Err(error) = self
+            .emit_user_message_item_lifecycle_with_live_delivery(
+                &thread.workspace_id,
+                &thread.id,
+                &turn_id,
+                &outcome.materialization.input,
+                &attachments,
+                true,
+            )
+            .await
+        {
+            let failure =
+                TurnStartFailure::internal(format!("failed to publish admission: {error:#}"));
+            self.mark_turn_blocked(thread.id.clone(), turn_id.clone(), failure.to_string())
+                .await;
+            return Err(failure);
+        }
+        #[cfg(test)]
+        self.completed_history_preparation_barrier
+            .wait_if_armed(
+                "__detached_composer_before_task_create__",
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        let task_created = message_future(async {
+            let first_text = first_user_text(launch.input.as_slice());
+            let goal = first_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .unwrap_or("Composer task")
+                .to_owned();
+            let title = goal.chars().take(96).collect::<String>();
+            let permission_profile = outcome.materialization.turn.permission_profile.clone();
+            let task_model_provider = outcome.materialization.thread.model_provider.clone();
+            // Persist the Composer launch here; context preparation belongs to
+            // the durable child execution, not the connection-owned request.
+            let mut task_params = pioneer_protocol::TaskCreateParams {
+                workspace_id: thread.workspace_id.clone(),
+                owner_kind: pioneer_protocol::TaskOwnerKind::Thread,
+                owner_id: Some(thread.id.clone()),
+                created_by_thread_id: Some(thread.id.clone()),
+                created_by_turn_id: Some(launch.turn_id.clone()),
+                parent_task_id: None,
+                executor_kind: pioneer_protocol::TaskExecutorKind::Agent,
+                title,
+                goal: goal.clone(),
+                priority: 0,
+                trigger: pioneer_protocol::TaskTriggerInput {
+                    spec: pioneer_protocol::TaskTriggerSpec::Immediate,
+                },
+                launch: None,
+                agent_spec: Some(pioneer_protocol::TaskAgentSpecInput {
+                    agent_role: thread.agent_role.clone(),
+                    agent_nickname: thread.agent_nickname.clone(),
+                    model: Some(outcome.materialization.thread.model.clone()),
+                    model_provider: Some(task_model_provider.clone()),
+                    prompt: pioneer_protocol::TaskAgentPrompt {
+                        goal,
+                        instructions: Vec::new(),
+                        input: None,
+                        output_instructions: None,
+                    },
+                    context_policy: None,
+                    tool_policy: None,
+                    permission_cap: Some(pioneer_protocol::task_permission_cap_from_snapshot(
+                        &permission_profile,
+                    )),
+                    security_cap: Some(crate::turn_security::task_security_cap_from_snapshot(
+                        &security_snapshot,
+                    )),
+                    result_contract: None,
+                    review_policy: None,
+                    depth: 0,
+                    max_depth: 3,
+                }),
+                lifecycle_policy: Some(pioneer_protocol::TaskLifecyclePolicy {
+                    attachment: pioneer_protocol::TaskAttachmentMode::Detached,
+                    on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                    on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                    completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
+                }),
+                delivery_policy: Some(pioneer_protocol::TaskDeliveryPolicy {
+                    mode: pioneer_protocol::TaskDeliveryMode::Thread,
+                    thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+                    thread_id: Some(thread.id.clone()),
+                    webhook_url: None,
+                    include_result: true,
+                    format: pioneer_protocol::TaskDeliveryFormat::FullResult,
+                }),
+                retry_policy: None,
+                timeout_policy: None,
+                concurrency_policy: None,
+                metadata: Some(pioneer_protocol::TaskMetadata {
+                    labels: vec!["composer".to_owned()],
+                    data: None,
+                    finish_request: None,
+                    composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch.clone())),
+                }),
+            };
+
+            let task_execution_context = match &authority {
+                TurnExecutionAuthority::Durable { context, .. } => context.clone(),
+                TurnExecutionAuthority::Fresh(_) => {
+                    self.load_turn_execution_authorization_context(&turn_id)
+                        .await?
+                }
+            };
+            let authorization_context_json = task_execution_context.to_persisted_json()?;
+            let (execution_resources, task_resources) =
+                task_execution_context.admitted_resource_budgets()?;
+            let mut create_context = if let Some(agent) = agent.take() {
+                let mut action = agent.action;
+                let mut payload: serde_json::Value =
+                    serde_json::from_str(&action.outbox_payload_json)?;
+                // The Task/action transaction fills task_id. There is deliberately
+                // no direct execution/dispatch for the parent admission.
+                payload["execution_mode"] = json!("detached_task");
+                payload["thread_id"] = json!(thread.id);
+                payload["turn_id"] = json!(turn_id);
+                payload
+                    .as_object_mut()
+                    .context("invalid StartAgent outbox")?
+                    .remove("spawned_execution_id");
+                action.outbox_payload_json = payload.to_string();
+                action.resource = None;
+                pioneer_tasks::TaskCreateContext {
+                    actor_id: task_creator_actor_id(&request_actor),
+                    creator_presentation_snapshot: agent.author.agent.clone(),
+                    creator_work_graph_root_execution_id: Some(
+                        agent.creator_work_graph_root_execution_id,
+                    ),
+                    // Authorship records provenance; this independent destination
+                    // does not inherit the source's resource root or cancellation.
+                    launch_selection: Some(agent.launch),
+                    resolved_launch_identity: Some(agent.identity),
+                    resolved_launch_profile: Some(agent.profile),
+                    agent_authorization_grant: Some(agent.grant),
+                    agent_action_commit: Some(action),
+                    ..Default::default()
+                }
+            } else {
+                let (mut canonical_launch, resolved) =
+                    super::agent_action_tools::resolve_workspace_task_launch(
+                        self,
+                        &thread.workspace_id,
+                        &task_model_provider,
+                        &outcome.materialization.thread.model,
+                        launch.agent_launch.as_ref(),
+                        launch.execution_backend.as_ref(),
+                        &turn_id,
+                    )
+                    .await?;
+                super::agent_action_tools::pin_launch_selection_capabilities(
+                    &mut canonical_launch,
+                    &outcome.materialization.capabilities,
+                )?;
+                let (identity, profile) =
+                    resolved.context("detached launch has no resolved identity/profile")?;
+                let skill_ids = task_execution_context
+                    .granted_skill_ids()
+                    .iter()
+                    .map(|id| pioneer_protocol::SkillId::new(id.clone()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| anyhow::anyhow!("invalid granted Skill: {error:?}"))?;
+                let ceiling = super::agent_action_tools::current_workspace_child_launch_ceiling(
+                    self,
+                    &thread.workspace_id,
+                    &identity,
+                    &profile,
+                    &task_execution_context,
+                    true,
+                    skill_ids,
+                    task_execution_context
+                        .granted_mcp_server_capability_ids()
+                        .to_vec(),
+                    task_execution_context.permission_profile_cap().clone(),
+                )
+                .await?;
+                let grant = crate::authorization::derive_task_agent_authorization_grant_seed(
+                    identity.id.clone(),
+                    task_execution_context.root_thread_id(),
+                    "thread_agent",
+                    task_execution_context.policy_revision(),
+                    ceiling,
+                )
+                .map_err(|error| anyhow::anyhow!("invalid detached Agent grant: {error:?}"))?;
+                pioneer_tasks::TaskCreateContext {
+                    actor_id: task_creator_actor_id(&request_actor),
+                    launch_selection: Some(canonical_launch),
+                    resolved_launch_identity: Some(identity),
+                    resolved_launch_profile: Some(profile),
+                    agent_authorization_grant: Some(grant),
+                    ..Default::default()
+                }
+            };
+            task_params.launch = create_context.launch_selection.clone();
+            create_context.execution_admission = Some(pioneer_tasks::TaskExecutionAdmissionSeed {
+                workspace_id: task_execution_context.workspace_id().to_owned(),
+                root_thread_id: task_execution_context.root_thread_id().to_owned(),
+                initiating_principal_id: task_execution_context
+                    .initiating_principal_id()
+                    .to_string(),
+                authorization_context_json,
+                role_key: task_execution_context.role_key().to_owned(),
+                policy_fingerprint: task_execution_context.policy_fingerprint().to_owned(),
+                execution_resources,
+                task_resources,
+            });
+            self.validate_task_execution_admission_seed(
+                create_context
+                    .execution_admission
+                    .as_ref()
+                    .context("missing Task admission")?,
+            )
+            .await?;
+            self.task_runtime
+                .service()
+                .create_task(create_context, task_params)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+        .await;
+        if let Err(error) = task_created {
+            // A durable action may have committed before a notification/executor
+            // wake failed. Its outbox owns completion in that case.
+            let committed = match &request_actor {
+                pioneer_protocol::PersistedActorRef::AgentExecution(_) => !self
+                    .crud_store
+                    .list_tasks_created_by_turn(&thread.workspace_id, &thread.id, &turn_id)
+                    .await
+                    .map_err(|error| {
+                        TurnStartFailure::internal(format!(
+                            "failed to inspect accepted Task: {error:#}"
+                        ))
+                    })?
+                    .is_empty(),
+                _ => false,
+            };
+            if !committed {
                 self.mark_turn_blocked(
                     thread.id.clone(),
                     turn_id.clone(),
-                    format!("failed to publish Composer user message: {error:#}"),
+                    format!("failed to create detached Task: {error:#}"),
                 )
                 .await;
-                self.send_turn_start_failure(
-                    connection_id,
-                    request_id.clone(),
-                    &success_response,
-                    thread.id.as_str(),
-                    turn_id.as_str(),
-                    format!("failed to publish Composer user message: {error:#}"),
-                )
-                .await;
-                return;
+                return Err(TurnStartFailure::internal(format!(
+                    "failed to create detached thread Task: {error:#}"
+                )));
             }
-            #[cfg(test)]
-            self.completed_history_preparation_barrier
-                .wait_if_armed(
-                    "__detached_composer_before_task_create__",
-                    &tokio_util::sync::CancellationToken::new(),
-                )
-                .await;
-            let task_created_phase = message_future(async {
-                let first_text = first_user_text(launch.input.as_slice());
-                let goal = first_text
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                    .unwrap_or("Composer task")
-                    .to_owned();
-                let title = goal.chars().take(96).collect::<String>();
-                let permission_profile = outcome.materialization.turn.permission_profile.clone();
-                let task_model_provider = outcome.materialization.thread.model_provider.clone();
-                // Persist the Composer launch here; context preparation belongs to
-                // the durable child execution, not the connection-owned request.
-                let mut task_params = pioneer_protocol::TaskCreateParams {
-                    workspace_id: thread.workspace_id.clone(),
-                    owner_kind: pioneer_protocol::TaskOwnerKind::Thread,
-                    owner_id: Some(thread.id.clone()),
-                    created_by_thread_id: Some(thread.id.clone()),
-                    created_by_turn_id: Some(launch.turn_id.clone()),
-                    parent_task_id: None,
-                    executor_kind: pioneer_protocol::TaskExecutorKind::Agent,
-                    title,
-                    goal: goal.clone(),
-                    priority: 0,
-                    trigger: pioneer_protocol::TaskTriggerInput {
-                        spec: pioneer_protocol::TaskTriggerSpec::Immediate,
-                    },
-                    launch: None,
-                    agent_spec: Some(pioneer_protocol::TaskAgentSpecInput {
-                        agent_role: thread.agent_role.clone(),
-                        agent_nickname: thread.agent_nickname.clone(),
-                        model: Some(outcome.materialization.thread.model.clone()),
-                        model_provider: Some(task_model_provider.clone()),
-                        prompt: pioneer_protocol::TaskAgentPrompt {
-                            goal,
-                            instructions: Vec::new(),
-                            input: None,
-                            output_instructions: None,
-                        },
-                        context_policy: None,
-                        tool_policy: None,
-                        permission_cap: Some(pioneer_protocol::task_permission_cap_from_snapshot(
-                            &permission_profile,
-                        )),
-                        security_cap: Some(crate::turn_security::task_security_cap_from_snapshot(
-                            &security_snapshot,
-                        )),
-                        result_contract: None,
-                        review_policy: None,
-                        depth: 0,
-                        max_depth: 3,
-                    }),
-                    lifecycle_policy: Some(pioneer_protocol::TaskLifecyclePolicy {
-                        attachment: pioneer_protocol::TaskAttachmentMode::Detached,
-                        on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
-                        on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
-                        completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
-                    }),
-                    delivery_policy: Some(pioneer_protocol::TaskDeliveryPolicy {
-                        mode: pioneer_protocol::TaskDeliveryMode::Thread,
-                        thread_target: Some(
-                            pioneer_protocol::TaskDeliveryThreadTarget::OriginThread,
-                        ),
-                        thread_id: Some(thread.id.clone()),
-                        webhook_url: None,
-                        include_result: true,
-                        format: pioneer_protocol::TaskDeliveryFormat::FullResult,
-                    }),
-                    retry_policy: None,
-                    timeout_policy: None,
-                    concurrency_policy: None,
-                    metadata: Some(pioneer_protocol::TaskMetadata {
-                        labels: vec!["composer".to_owned()],
-                        data: None,
-                        finish_request: None,
-                        composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch.clone())),
-                    }),
-                };
-                let task_execution_context = match self
-                    .load_turn_execution_authorization_context(launch.turn_id.as_str())
-                    .await
-                {
-                    Ok(context) => context,
-                    Err(error) => {
-                        self.mark_turn_blocked(
-                            thread.id.clone(),
-                            launch.turn_id.clone(),
-                            format!("failed to load Composer execution admission: {error:#}"),
-                        )
-                        .await;
-                        return None;
-                    }
-                };
-                let authorization_context_json = match task_execution_context.to_persisted_json() {
-                    Ok(json) => json,
-                    Err(error) => {
-                        self.mark_turn_blocked(
-                            thread.id.clone(),
-                            launch.turn_id.clone(),
-                            format!("failed to persist Composer execution admission: {error:#}"),
-                        )
-                        .await;
-                        return None;
-                    }
-                };
-                let (execution_resources, task_resources) =
-                    match task_execution_context.admitted_resource_budgets() {
-                        Ok(resources) => resources,
-                        Err(error) => {
-                            self.mark_turn_blocked(
-                                thread.id.clone(),
-                                launch.turn_id.clone(),
-                                format!(
-                                    "Composer execution admission has no registered resource budgets: {error:#}"
-                                ),
-                            )
-                            .await;
-                            return None;
-                        }
-                    };
-                let (mut canonical_launch, resolved_launch) =
-                    match super::agent_action_tools::resolve_workspace_task_launch(
-                        self,
-                        thread.workspace_id.as_str(),
-                        task_model_provider.as_str(),
-                        outcome.materialization.thread.model.as_str(),
-                        launch.agent_launch.as_ref(),
-                        launch.execution_backend.as_ref(),
-                        launch.turn_id.as_str(),
-                    )
-                    .await
-                    {
-                        Ok(resolved) => resolved,
-                        Err(error) => {
-                            self.mark_turn_blocked(
-                                thread.id.clone(),
-                                launch.turn_id.clone(),
-                                format!("failed to resolve Composer Task launch: {error:#}"),
-                            )
-                            .await;
-                            return None;
-                        }
-                    };
-                if let Err(error) = super::agent_action_tools::pin_launch_selection_capabilities(
-                    &mut canonical_launch,
-                    outcome.materialization.capabilities.as_slice(),
-                ) {
-                    self.mark_turn_blocked(
-                        thread.id.clone(),
-                        launch.turn_id.clone(),
-                        format!("failed to freeze Composer Task capabilities: {error:#}"),
-                    )
-                    .await;
-                    return None;
-                }
-                task_params.launch = Some(canonical_launch.clone());
-                let agent_authorization_grant = match resolved_launch.as_ref() {
-                    Some((identity, profile)) => {
-                        let child_skill_ids = match task_execution_context
-                            .granted_skill_ids()
-                            .iter()
-                            .map(|id| pioneer_protocol::SkillId::new(id.clone()))
-                            .collect::<Result<Vec<_>, _>>()
-                        {
-                            Ok(ids) => ids,
-                            Err(error) => {
-                                self.mark_turn_blocked(
-                                    thread.id.clone(),
-                                    launch.turn_id.clone(),
-                                    format!(
-                                        "Composer child Skill grant is invalid: {error:?}"
-                                    ),
-                                )
-                                .await;
-                                return None;
-                            }
-                        };
-                        let child_launch_grant = match super::agent_action_tools::current_workspace_child_launch_ceiling(
-                            self,
-                            thread.workspace_id.as_str(),
-                            identity,
-                            profile,
-                            &task_execution_context,
-                            true,
-                            child_skill_ids,
-                            task_execution_context
-                                .granted_mcp_server_capability_ids()
-                                .to_vec(),
-                            task_execution_context.permission_profile_cap().clone(),
-                        )
-                        .await
-                        {
-                            Ok(grant) => grant,
-                            Err(error) => {
-                                self.mark_turn_blocked(
-                                    thread.id.clone(),
-                                    launch.turn_id.clone(),
-                                    format!(
-                                        "failed to freeze Composer child launch ceiling: {error:#}"
-                                    ),
-                                )
-                                .await;
-                                return None;
-                            }
-                        };
-                        match crate::authorization::derive_task_agent_authorization_grant_seed(
-                            identity.id.clone(),
-                            task_execution_context.root_thread_id(),
-                            "thread_agent",
-                            task_execution_context.policy_revision(),
-                            child_launch_grant,
-                        ) {
-                            Ok(grant) => Some(grant),
-                            Err(error) => {
-                                self.mark_turn_blocked(
-                                    thread.id.clone(),
-                                    launch.turn_id.clone(),
-                                    format!(
-                                        "failed to freeze Composer Agent authorization: {error:?}"
-                                    ),
-                                )
-                                .await;
-                                return None;
-                            }
-                        }
-                    }
-                    None => None,
-                };
-                let create_context = pioneer_tasks::TaskCreateContext {
-                    actor_id: task_creator_actor_id(&request_actor),
-                    launch_selection: Some(canonical_launch),
-                    resolved_launch_identity: resolved_launch
-                        .as_ref()
-                        .map(|(identity, _)| identity.clone()),
-                    resolved_launch_profile: resolved_launch.map(|(_, profile)| profile),
-                    agent_authorization_grant,
-                    execution_admission: Some(pioneer_tasks::TaskExecutionAdmissionSeed {
-                        workspace_id: task_execution_context.workspace_id().to_owned(),
-                        root_thread_id: task_execution_context.root_thread_id().to_owned(),
-                        initiating_principal_id: task_execution_context
-                            .initiating_principal_id()
-                            .to_string(),
-                        authorization_context_json,
-                        role_key: task_execution_context.role_key().to_owned(),
-                        policy_fingerprint: task_execution_context.policy_fingerprint().to_owned(),
-                        execution_resources,
-                        task_resources,
-                    }),
-                    ..Default::default()
-                };
-                if let Some(seed) = create_context.execution_admission.as_ref()
-                    && let Err(error) = self.validate_task_execution_admission_seed(seed).await
-                {
-                    self.mark_turn_blocked(
-                        thread.id.clone(),
-                        launch.turn_id.clone(),
-                        format!("Composer execution admission became stale: {error:#}"),
-                    )
-                    .await;
-                    return None;
-                }
-                if let Err(error) = self
-                    .task_runtime
-                    .service()
-                    .create_task(create_context, task_params)
-                    .await
-                {
-                    self.mark_turn_blocked(
-                        thread.id.clone(),
-                        launch.turn_id.clone(),
-                        format!("failed to create detached Composer task: {error:#}"),
-                    )
-                    .await;
-                    self.send_turn_start_failure(
-                        connection_id,
-                        request_id.clone(),
-                        &success_response,
-                        thread.id.as_str(),
-                        turn_id.as_str(),
-                        format!("failed to create detached Composer task: {error:#}"),
-                    )
-                    .await;
-                    return None;
-                }
-
-                Some(ComposerDetachedTaskCreatedPhase {
-                    launch,
-                    outcome,
-                    capability_attachments,
-                })
-            })
+        }
+        #[cfg(test)]
+        self.completed_history_preparation_barrier
+            .wait_if_armed(
+                "__detached_thread_after_task_commit__",
+                &tokio_util::sync::CancellationToken::new(),
+            )
             .await;
-            let Some(ComposerDetachedTaskCreatedPhase {
-                launch,
-                outcome,
-                capability_attachments,
-            }) = task_created_phase
-            else {
-                return;
-            };
+        self.register_execution_lease(&turn_id)
+            .await
+            .map_err(|error| {
+                TurnStartFailure::internal(format!("failed to register admission: {error:#}"))
+            })?;
+        Ok((outcome, attachments))
+    }
 
-            let success_sent = match &success_response {
-                TurnStartSuccessResponse::TurnStart => {
-                    self.finish_turn_start_success(
-                        connection_id,
-                        request_id,
-                        &outcome,
-                        capability_attachments.as_slice(),
+    pub(super) async fn publish_detached_thread_admission(
+        &self,
+        outcome: &crate::thread::TurnStartOutcome,
+        attachments: &[pioneer_protocol::UserMessageAttachment],
+    ) -> bool {
+        if !self.publish_turn_start_success(outcome, attachments).await {
+            return false;
+        }
+        self.complete_detached_thread_admission(
+            &outcome.started_notification.thread_id,
+            &outcome.started_notification.turn.id,
+        )
+        .await
+    }
+
+    pub(super) async fn complete_detached_thread_admission(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> bool {
+        // Reuse the ordinary owner CAS after Gateway replacement. Until the
+        // old lease expires the existing outbox retains the admission obligation.
+        let owner = match self.crud_store.get_turn_execution(turn_id).await {
+            Ok(owner) => owner,
+            Err(_) => return false,
+        };
+        if let Some(owner) = owner
+            && owner.owner_id != self.turn_execution_owner_id.as_ref()
+        {
+            let now = now_timestamp_secs();
+            if !matches!(
+                self.crud_store
+                    .claim_expired_turn_execution(
+                        &owner,
+                        self.turn_execution_owner_id.as_ref(),
+                        now,
+                        now.saturating_add(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
                     )
-                    .await
-                }
-                TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { session_id } => {
-                    self.finish_voice_session_finalize_accepted_turn_start_success(
-                        connection_id,
-                        &outcome,
-                        capability_attachments.as_slice(),
-                        session_id,
-                    )
-                    .await
-                }
-                TurnStartSuccessResponse::Task { .. }
-                | TurnStartSuccessResponse::DurableAgent { .. } => false,
-            };
-            if !success_sent {
-                self.mark_turn_blocked(
-                    thread.id.clone(),
-                    launch.turn_id.clone(),
-                    "failed to commit Composer turn start lifecycle".to_owned(),
-                )
-                .await;
-                return;
+                    .await,
+                Ok(Some(_))
+            ) {
+                return false;
             }
-            // This only acknowledges Composer admission. Recovery belongs to
-            // successful delivery from its hidden execution thread.
-            if !self
-                .complete_turn_with_title_recovery(
-                    thread.id.clone(),
-                    launch.turn_id.clone(),
-                    None,
-                    false,
-                )
-                .await
-            {
-                self.mark_turn_blocked(
-                    thread.id,
-                    launch.turn_id,
-                    "failed to durably complete Composer turn after task creation".to_owned(),
-                )
-                .await;
-            }
-        })
+        }
+        self.complete_turn_with_title_recovery(
+            thread_id.to_owned(),
+            turn_id.to_owned(),
+            None,
+            false,
+        )
+        .await
     }
 
     pub(super) async fn prepare_api_provider_turn_start(

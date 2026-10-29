@@ -5628,6 +5628,22 @@ fn ordinary_cli_delegated_root_dispatch_uses_cli_attempt_and_replays_without_nat
                     })
                     .unwrap()["id"]
                     .clone();
+                // This suite covers direct CLI receipts and their existing
+                // proof fences. Collaborative Task admission is covered below.
+                let created_row = pioneer_entity::agent_action_outbox::Entity::find_by_id(
+                    created["outboxId"].as_str().unwrap(),
+                )
+                .one(&processor.crud_store.database_connection())
+                .await
+                .unwrap()
+                .unwrap();
+                let created_payload: JsonValue =
+                    serde_json::from_str(&created_row.payload_json).unwrap();
+                super::thread_launch_choices::foreground_target_fixture(
+                    &processor,
+                    created_payload["created_thread_id"].as_str().unwrap(),
+                )
+                .await;
                 let started = facade.call("root-start", "root-start", "threads_turn_start", json!({
                 "targetOptionId":target, "input":[{"type":"text","text":"Ordinary CLI root execution"}],
             })).await;
@@ -5808,5 +5824,235 @@ fn ordinary_cli_delegated_root_dispatch_uses_cli_attempt_and_replays_without_nat
                 assert_eq!(harness.cli_session.turn_starts.lock().await.len(), 2);
             }
         }
+    });
+}
+
+#[test]
+fn cli_threads_collaborative_admission_uses_one_detached_task_and_normal_stop() {
+    run_standard_stack_message_test("CLI shared thread launch", async {
+        let (harness, processor, source_turn) =
+            start_threads_cli_fixture(CLIAgentRuntimeKind::Codex, &[]).await;
+        let facade = ThreadsFacade::new(&processor, &source_turn, CLIAgentRuntimeKind::Codex).await;
+        let options = facade
+            .call(
+                "shared-options",
+                "shared-options",
+                "threads_start_options",
+                json!({}),
+            )
+            .await;
+        let creation = options["threadCreationOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["label"] == "New delegated root")
+            .unwrap()["id"]
+            .clone();
+        let created = facade
+            .call(
+                "shared-create",
+                "shared-create",
+                "thread_create",
+                json!({"optionId":creation}),
+            )
+            .await;
+        let target = created["targetOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| {
+                !options["targetOptions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|old| old["id"] == target["id"])
+            })
+            .unwrap()["id"]
+            .clone();
+        harness
+            .cli_session
+            .set_next_native_turn_id("shared-detached-child")
+            .await;
+        let arguments = json!({"targetOptionId":target,"input":[{"type":"text","text":"Continue independently"}],
+            "launch":{"profile":{"kind":"model","providerId":format!("cli_runtime:{}", harness.runtime_id),"modelId":"threads-cli-choice"},"reasoning":{"effort":"high"}}});
+        let started = facade
+            .call(
+                "shared-start",
+                "shared-start",
+                "threads_turn_start",
+                arguments.clone(),
+            )
+            .await;
+        let db = processor.crud_store.database_connection();
+        let outbox = pioneer_entity::agent_action_outbox::Entity::find_by_id(
+            started["outboxId"].as_str().unwrap(),
+        )
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+        let payload: JsonValue = serde_json::from_str(&outbox.payload_json).unwrap();
+        assert_eq!(payload["execution_mode"], "detached_task");
+        assert!(payload.get("dispatch").is_none());
+        let task_id = payload["task_id"].as_str().unwrap();
+        let task = processor
+            .crud_store
+            .get_task(task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let launch = &task
+            .task
+            .metadata
+            .as_ref()
+            .unwrap()
+            .composer_work
+            .as_ref()
+            .unwrap()
+            .launch;
+        let child = wait_for_task_cli_child(&processor, &task.runs[0].id, None).await;
+        assert_ne!(child.thread_id, launch.thread_id);
+        assert_eq!(
+            processor
+                .crud_store
+                .get_thread_model(&launch.thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .origin_kind,
+            ThreadOriginKind::Collaborative
+        );
+        assert_eq!(
+            processor
+                .crud_store
+                .get_thread_model(&child.thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .origin_kind,
+            ThreadOriginKind::TaskRun
+        );
+        let (_, admission) = processor
+            .crud_store
+            .get_turn(&launch.thread_id, &launch.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            admission.work_owner,
+            pioneer_protocol::TurnWorkOwner::DetachedTask
+        );
+        assert_eq!(admission.status, TurnStatus::Completed);
+        assert!(matches!(
+            admission.author.as_ref().unwrap().actor,
+            pioneer_protocol::PersistedActorRef::AgentExecution(_)
+        ));
+        assert!(
+            processor
+                .crud_store
+                .get_turn_work_projection(&launch.turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let contract = processor
+            .crud_store
+            .get_task_actor_contract(task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(contract.work_graph_root_execution_id.is_none());
+        let starts = wait_for_cli_runtime_turn_starts(&harness.cli_session, 2).await;
+        assert_eq!(starts[1].model.as_deref(), Some("threads-cli-choice"));
+        assert_eq!(starts[1].effort.as_deref(), Some("high"));
+        let replay = ThreadsFacade::new(&processor, &source_turn, CLIAgentRuntimeKind::Codex)
+            .await
+            .call(
+                "shared-reconnected",
+                "shared-start",
+                "threads_turn_start",
+                arguments,
+            )
+            .await;
+        assert_eq!(started["receiptId"], replay["receiptId"]);
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+            .await
+            .unwrap();
+        assert_eq!(
+            processor
+                .crud_store
+                .list_tasks_created_by_turn(
+                    &task.task.workspace_id,
+                    &launch.thread_id,
+                    &launch.turn_id
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            wait_for_cli_runtime_turn_starts(&harness.cli_session, 2)
+                .await
+                .len(),
+            2
+        );
+        let child_facade =
+            ThreadsFacade::new(&processor, &child.turn_id, CLIAgentRuntimeKind::Codex).await;
+        let child_options = child_facade
+            .call(
+                "same-child-options",
+                "same-child-options",
+                "threads_start_options",
+                json!({}),
+            )
+            .await;
+        let same_child = child_options["targetOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| target["label"] == "Current thread")
+            .unwrap()["id"]
+            .clone();
+        let continued = child_facade.call("same-child-start", "same-child-start", "threads_turn_start", json!({"targetOptionId":same_child,"input":[{"type":"text","text":"Continue in this execution thread"}]})).await;
+        let continuation_outbox = pioneer_entity::agent_action_outbox::Entity::find_by_id(
+            continued["outboxId"].as_str().unwrap(),
+        )
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+        let continuation: JsonValue =
+            serde_json::from_str(&continuation_outbox.payload_json).unwrap();
+        assert!(continuation.get("task_id").is_none());
+        assert_eq!(continuation["dispatch"]["thread_id"], child.thread_id);
+        assert!(
+            processor
+                .crud_store
+                .list_tasks_created_by_turn(
+                    &task.task.workspace_id,
+                    &child.thread_id,
+                    &child.turn_id
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let request_id = generate_test_request_id("shared-stop", "task");
+        processor.process_request_for_connection(harness.connection_id, &json!({
+            "jsonrpc":"2.0", "id":request_id, "method":"task/cancel", "params":{"taskId":task_id,"reason":"Stop the detached work"}
+        }).to_string()).await;
+        assert_eq!(
+            wait_for_task_status(processor.crud_store.clone(), task_id, TaskStatus::Cancelled)
+                .await,
+            TaskStatus::Cancelled
+        );
+        let (_, parent) = processor
+            .crud_store
+            .get_turn(&launch.thread_id, &launch.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.status, TurnStatus::Completed);
     });
 }

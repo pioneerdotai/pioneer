@@ -568,6 +568,7 @@ mod tests {
             thread_id: "a".into(),
             workspace_id: "ws".into(),
             turn: Turn {
+                work_owner: Default::default(),
                 id: turn.into(),
                 status: TurnStatus::Interrupted,
                 turn_kind: Default::default(),

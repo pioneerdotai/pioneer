@@ -1225,6 +1225,7 @@ mod epic6_tests {
 
     fn completed_turn() -> Turn {
         Turn {
+            work_owner: Default::default(),
             id: "turn-message".to_owned(),
             status: TurnStatus::Completed,
             turn_kind: Default::default(),

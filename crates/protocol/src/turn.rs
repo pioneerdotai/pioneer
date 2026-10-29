@@ -2267,8 +2267,41 @@ pub struct TurnItemEvent {
     pub payload: TurnItemEventPayload,
 }
 
+/// Canonical work ownership, persisted at admission independently of authorship.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnWorkOwner {
+    #[default]
+    Turn,
+    DetachedTask,
+}
+
+impl TurnWorkOwner {
+    const fn is_turn(&self) -> bool {
+        matches!(self, Self::Turn)
+    }
+
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::DetachedTask => "detached_task",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "turn" => Ok(Self::Turn),
+            "detached_task" => Ok(Self::DetachedTask),
+            _ => Err("invalid Turn work owner"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
+    /// Immutable owner of the admitted work; absent historical wire values own their turn.
+    #[serde(default, skip_serializing_if = "TurnWorkOwner::is_turn")]
+    pub work_owner: TurnWorkOwner,
     pub id: String,
     pub status: TurnStatus,
     #[serde(default)]
