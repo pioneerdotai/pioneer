@@ -122,18 +122,18 @@ pub use repositories::agent_identity_catalog::{
     ensure_pioneer_for_workspace, sync_cli_runtime_identity_catalog,
 };
 pub use repositories::auth_session::{
-    AuthPersistenceInvariantReport, DeviceActivationFailureOutcome, NewActiveDeviceSessionRow,
-    NewPendingDeviceSessionRow, NewRefreshCredentialRow, PendingSessionIssuer,
-    PrincipalCredentialRevocation, activate_pending_auth_session, activate_pending_device,
-    advance_auth_session_refresh, auth_session_status_to_db, client_kind_to_db,
-    delete_refresh_for_session, device_status_to_db, expire_pending_auth_session,
-    expire_session_refresh_family, expire_stale_auth_sessions, expire_stale_pending_sessions,
-    insert_active_device_session, insert_pending_device_session, insert_refresh_credential,
-    list_pending_activation_locator_hashes, list_sessions_for_principal,
+    AuthPersistenceInvariantReport, AuthSessionLeaseRow, DeviceActivationFailureOutcome,
+    NewActiveDeviceSessionRow, NewPendingDeviceSessionRow, NewRefreshCredentialRow,
+    PendingSessionIssuer, PrincipalCredentialRevocation, activate_pending_auth_session,
+    activate_pending_device, advance_auth_session_refresh, auth_session_status_to_db,
+    client_kind_to_db, delete_refresh_for_session, device_status_to_db,
+    expire_pending_auth_session, expire_session_refresh_family, expire_stale_auth_sessions,
+    expire_stale_pending_sessions, insert_active_device_session, insert_pending_device_session,
+    insert_refresh_credential, list_pending_activation_locator_hashes, list_sessions_for_principal,
     load_active_device_by_installation, load_active_session_by_device, load_current_refresh,
     load_device, load_pending_local_session, load_pending_session_by_activation_locator_hash,
     load_pending_session_for_creator, load_session, load_session_by_activation_hash,
-    mark_device_revoked, mark_session_revoked, record_failed_device_activation,
+    load_session_lease, mark_device_revoked, mark_session_revoked, record_failed_device_activation,
     replace_current_refresh, revoke_principal_credentials, revoke_reason_to_db,
     revoke_session_family_for_refresh_reuse, scan_auth_persistence_invariants,
     touch_active_auth_session, touch_active_device,
@@ -206,9 +206,10 @@ pub use repositories::policy_generation::{
     ensure_code_policy_generation, list_authorization_changes_after,
 };
 pub use repositories::principal_avatar::{
-    NewPrincipalAvatarRow, PrincipalAvatarRevisionRow, PrincipalAvatarRow, delete_principal_avatar,
-    insert_principal_avatar, list_principal_avatar_revisions, load_principal_avatar,
-    load_principal_avatar_revision, replace_principal_avatar,
+    NewPrincipalAvatarRow, PrincipalAvatarRevisionRow, PrincipalAvatarRow, PrincipalProfileRow,
+    delete_principal_avatar, insert_principal_avatar, list_principal_avatar_revisions,
+    load_principal_avatar, load_principal_avatar_revision, load_principal_profile,
+    replace_principal_avatar,
 };
 pub use repositories::task::TaskRootAccessFilter;
 pub use repositories::task_actor_contract::{

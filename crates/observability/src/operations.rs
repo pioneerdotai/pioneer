@@ -726,10 +726,8 @@ impl GatewayOperationVariant {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayOperationStage {
     AuthRefreshDatabaseTransactionAcquire,
-    AuthMeSessionLoad,
-    AuthMeDeviceLoad,
-    AuthMePrincipalLoad,
-    AuthMeAvatarLoad,
+    AuthMeLeaseFactsLoad,
+    AuthMeProfileLoad,
     ResilienceReadModelRepair,
     ResilienceReadModelCheckpointLoad,
     ResilienceReadModelCheckpointReset,
@@ -799,10 +797,8 @@ impl GatewayOperationStage {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AuthRefreshDatabaseTransactionAcquire => "db.transaction.acquire",
-            Self::AuthMeSessionLoad => "session.load",
-            Self::AuthMeDeviceLoad => "device.load",
-            Self::AuthMePrincipalLoad => "principal.load",
-            Self::AuthMeAvatarLoad => "avatar.load",
+            Self::AuthMeLeaseFactsLoad => "lease_facts.load",
+            Self::AuthMeProfileLoad => "profile.load",
             Self::ResilienceReadModelRepair => "read_model.repair",
             Self::ResilienceReadModelCheckpointLoad => "read_model.checkpoint.load",
             Self::ResilienceReadModelCheckpointReset => "read_model.checkpoint.reset",
@@ -1386,8 +1382,8 @@ mod tests {
             "read_model.repair.repaired.count"
         );
         assert_eq!(
-            GatewayOperationStage::AuthMePrincipalLoad.as_str(),
-            "principal.load"
+            GatewayOperationStage::AuthMeProfileLoad.as_str(),
+            "profile.load"
         );
     }
 

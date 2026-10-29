@@ -15,7 +15,8 @@ use pioneer_protocol::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, Statement, sea_query::Expr,
+    QueryOrder, QuerySelect, Set, Statement,
+    sea_query::{Expr, JoinType},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,6 +415,79 @@ pub async fn load_active_device_by_installation<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to load active device by installation")
+}
+
+/// Current lease inputs, excluding credentials and principal presentation.
+/// Ownership is deliberately returned, not trusted through unenforced FKs.
+#[derive(Debug, sea_orm::FromQueryResult)]
+pub struct AuthSessionLeaseRow {
+    pub session_gateway_id: String,
+    pub session_principal_id: String,
+    pub session_device_id: String,
+    pub token_family_id: String,
+    pub session_status: String,
+    pub refresh_generation: i64,
+    pub refresh_expires_at: Option<DateTimeWithTimeZone>,
+    pub device_id: String,
+    pub device_gateway_id: String,
+    pub device_principal_id: String,
+    pub installation_id: Option<String>,
+    pub display_name: Option<String>,
+    pub client_kind: Option<String>,
+    pub device_status: String,
+    pub principal_id: String,
+    pub principal_gateway_id: String,
+    pub principal_kind: String,
+    pub principal_status: String,
+    pub role_key: Option<String>,
+}
+
+pub async fn load_session_lease<C: ConnectionTrait>(
+    db: &C,
+    id: &AuthSessionId,
+) -> Result<Option<AuthSessionLeaseRow>> {
+    // Missing related rows previously failed before status/expiry validation.
+    // INNER JOIN preserves that InvalidCredential result; the service still
+    // compares every ownership field with the authenticated context.
+    auth_session::Entity::find_by_id(id.to_string())
+        .select_only()
+        .column_as(auth_session::Column::GatewayId, "session_gateway_id")
+        .column_as(auth_session::Column::PrincipalId, "session_principal_id")
+        .column_as(auth_session::Column::DeviceId, "session_device_id")
+        .column(auth_session::Column::TokenFamilyId)
+        .column_as(auth_session::Column::Status, "session_status")
+        .column(auth_session::Column::RefreshGeneration)
+        .column(auth_session::Column::RefreshExpiresAt)
+        .column_as(device::Column::Id, "device_id")
+        .column_as(device::Column::GatewayId, "device_gateway_id")
+        .column_as(device::Column::PrincipalId, "device_principal_id")
+        .column(device::Column::InstallationId)
+        .column(device::Column::DisplayName)
+        .column(device::Column::ClientKind)
+        .column_as(device::Column::Status, "device_status")
+        .column_as(gateway_principal::Column::Id, "principal_id")
+        .column_as(gateway_principal::Column::GatewayId, "principal_gateway_id")
+        .column_as(gateway_principal::Column::Kind, "principal_kind")
+        .column_as(gateway_principal::Column::Status, "principal_status")
+        .column(gateway_principal::Column::RoleKey)
+        .join(
+            JoinType::InnerJoin,
+            auth_session::Entity::belongs_to(device::Entity)
+                .from(auth_session::Column::DeviceId)
+                .to(device::Column::Id)
+                .into(),
+        )
+        .join(
+            JoinType::InnerJoin,
+            auth_session::Entity::belongs_to(gateway_principal::Entity)
+                .from(auth_session::Column::PrincipalId)
+                .to(gateway_principal::Column::Id)
+                .into(),
+        )
+        .into_model::<AuthSessionLeaseRow>()
+        .one(db)
+        .await
+        .context("failed to load session lease facts")
 }
 
 pub async fn load_session<C: ConnectionTrait>(
