@@ -22,6 +22,73 @@ const TITLE_JOB_MAX_ATTEMPTS: u32 = 3;
 const TITLE_JOB_BASE_BACKOFF_MS: u64 = 200;
 const TITLE_JOB_MAX_JITTER_MS: u64 = 250;
 
+// Two bits per consumer: kicks publish pending before trying to own running.
+// SeqCst gives the release/recheck handshake one order across both bits.
+#[derive(Default)]
+pub(super) struct NativeTurnEventDeliveryWake {
+    pub(super) running: AtomicBool,
+    pending: AtomicBool,
+    #[cfg(test)]
+    pub(super) claim_barrier: super::compaction_background::CompletedHistoryPreparationBarrier,
+    #[cfg(test)]
+    pub(super) handoff_barrier: super::compaction_background::CompletedHistoryPreparationBarrier,
+}
+
+#[derive(Default)]
+pub(super) struct NativeTurnEventDeliveryWorkers {
+    pub(super) live: Arc<NativeTurnEventDeliveryWake>,
+    pub(super) episodic: Arc<NativeTurnEventDeliveryWake>,
+    pub(super) tasks: tokio_util::task::TaskTracker,
+    pub(super) shutdown: tokio_util::sync::CancellationToken,
+    // Admission and close are synchronous; shutdown cannot miss a late spawn.
+    pub(super) admission: std::sync::Mutex<()>,
+}
+
+struct NativeTurnEventDeliveryGuard {
+    wake: Arc<NativeTurnEventDeliveryWake>,
+    owned: bool,
+}
+
+impl NativeTurnEventDeliveryGuard {
+    fn acquire(wake: Arc<NativeTurnEventDeliveryWake>) -> Option<Self> {
+        wake.running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        Some(Self { wake, owned: true })
+    }
+
+    fn release(&mut self) {
+        // Disarm before publishing availability: Drop must never reset a
+        // replacement owner's running bit, including after a failed reacquire.
+        self.owned = false;
+        self.wake.running.store(false, Ordering::SeqCst);
+    }
+
+    fn reacquire_if_pending(&mut self) -> bool {
+        // A replacement may already be running. Do not consume its wake.
+        if !self.wake.pending.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.owned = self
+            .wake
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        self.owned
+    }
+}
+
+impl Drop for NativeTurnEventDeliveryGuard {
+    fn drop(&mut self) {
+        if self.owned {
+            // Panic/cancellation retains a wake for recovery. Durable claims
+            // remain leased; neither cancellation nor this bit ACKs an effect.
+            self.wake.pending.store(true, Ordering::SeqCst);
+            self.release();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct NativeTerminalEffectDispatchOutcome {
     pub count: u64,
@@ -3046,92 +3113,168 @@ impl MessageProcessor {
         Ok(())
     }
 
-    pub(super) async fn process_due_native_turn_event_deliveries(
+    async fn process_due_native_turn_event_deliveries_for_consumer(
         &self,
+        consumer: &'static str,
         now_unix: i64,
         limit: u64,
     ) -> Result<u64> {
-        let mut processed = 0_u64;
-        for consumer in [
-            pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER,
-            pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER,
-        ] {
-            let deliveries = self
-                .crud_store
-                .claim_due_turn_event_deliveries(consumer, now_unix, limit)
-                .await?;
-            let mut by_turn = std::collections::BTreeMap::<
-                String,
-                Vec<pioneer_crud::ClaimedTurnEventDeliveryRecord>,
-            >::new();
-            for delivery in deliveries {
-                by_turn
-                    .entry(delivery.event.turn_id.clone())
-                    .or_default()
-                    .push(delivery);
-            }
-            processed = processed.saturating_add(
-                by_turn
-                    .values()
-                    .map(|deliveries| deliveries.len() as u64)
-                    .sum::<u64>(),
-            );
-            futures_util::stream::iter(by_turn.into_values())
-                .for_each_concurrent(Some(16), |deliveries| async move {
-                    for delivery in deliveries {
-                        self.process_claimed_native_turn_event_delivery(delivery)
-                            .await;
-                    }
-                })
-                .await;
+        let deliveries = self
+            .crud_store
+            .claim_due_turn_event_deliveries(consumer, now_unix, limit)
+            .await?;
+        let processed = deliveries.len() as u64;
+        let mut by_turn = std::collections::BTreeMap::<
+            String,
+            Vec<pioneer_crud::ClaimedTurnEventDeliveryRecord>,
+        >::new();
+        for delivery in deliveries {
+            by_turn
+                .entry(delivery.event.turn_id.clone())
+                .or_default()
+                .push(delivery);
         }
+        let storage_failed = AtomicBool::new(false);
+        futures_util::stream::iter(by_turn.into_values())
+            .for_each_concurrent(Some(16), |deliveries| {
+                let storage_failed = &storage_failed;
+                async move {
+                    for delivery in deliveries {
+                        if self
+                            .process_claimed_native_turn_event_delivery(delivery)
+                            .await
+                            .is_err()
+                        {
+                            storage_failed.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+            .await;
+        anyhow::ensure!(
+            !storage_failed.load(Ordering::Relaxed),
+            "turn-event delivery acknowledgement/deferral storage failed"
+        );
         Ok(processed)
     }
 
-    /// Wake the optional outbox after the canonical transaction commits.
-    ///
-    /// The durable commit ACK never waits for websocket, artifact, or episodic
-    /// side effects. At the same time, delivery cannot depend solely on the
-    /// process-wide resilience worker: restored/test-owned processors and a
-    /// freshly admitted turn may not have reached that worker yet. Each kick
-    /// drains a bounded number of batches; the durable retry schedule remains
-    /// authoritative for failures and the periodic worker remains the restart
-    /// safety net.
+    /// Wake both existing consumers after commit, or from periodic recovery.
+    /// Each consumer owns a separate bounded drain; neither waits for the other.
     pub(super) fn kick_native_turn_event_deliveries(&self) {
-        if self
-            .native_turn_event_delivery_kick_running
-            .swap(true, Ordering::AcqRel)
-        {
+        self.kick_native_turn_event_delivery_consumer(
+            pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER,
+            self.native_turn_event_delivery_workers.live.clone(),
+        );
+        self.kick_native_turn_event_delivery_consumer(
+            pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER,
+            self.native_turn_event_delivery_workers.episodic.clone(),
+        );
+    }
+
+    fn kick_native_turn_event_delivery_consumer(
+        &self,
+        consumer: &'static str,
+        wake: Arc<NativeTurnEventDeliveryWake>,
+    ) {
+        let workers = &self.native_turn_event_delivery_workers;
+        let _admission = workers
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if workers.tasks.is_closed() || workers.shutdown.is_cancelled() {
             return;
         }
+        wake.pending.store(true, Ordering::SeqCst);
+        let Some(guard) = NativeTurnEventDeliveryGuard::acquire(wake.clone()) else {
+            return;
+        };
         let this = self.scoped_for_background_reconciliation();
-        tokio::spawn(async move {
-            struct KickGuard(Arc<AtomicBool>);
-
-            impl Drop for KickGuard {
-                fn drop(&mut self) {
-                    self.0.store(false, Ordering::Release);
-                }
+        let shutdown = workers.shutdown.clone();
+        // Construct the guard before spawning: even an unpolled cancelled task
+        // must release ownership. The processor lifecycle tracks and cancels it.
+        let future = async move {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {}
+                _ = this.drain_native_turn_event_delivery_consumer(consumer, wake, guard) => {}
             }
+        };
+        #[cfg(test)]
+        let future = {
+            use sentry::SentryFutureExt;
+            use tracing::instrument::WithSubscriber;
+            let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+            future
+                .with_subscriber(dispatch)
+                .bind_hub(sentry::Hub::current())
+        };
+        workers.tasks.spawn(future);
+    }
 
-            let _guard = KickGuard(this.native_turn_event_delivery_kick_running.clone());
+    async fn drain_native_turn_event_delivery_consumer(
+        &self,
+        consumer: &'static str,
+        wake: Arc<NativeTurnEventDeliveryWake>,
+        mut guard: NativeTurnEventDeliveryGuard,
+    ) {
+        #[cfg(test)]
+        let shutdown = &self.native_turn_event_delivery_workers.shutdown;
+        loop {
+            wake.pending.store(false, Ordering::SeqCst);
+            let mut exhausted = true;
             for _ in 0..128 {
-                match this
-                    .process_due_native_turn_event_deliveries(now_timestamp_secs(), 64)
-                    .await
-                {
-                    Ok(0) => break,
+                let result = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::EventDelivery,
+                    pioneer_observability::DatabaseOperationSite::NativeEventDelivery,
+                    super::retry_transient_storage_access(|| {
+                        self.process_due_native_turn_event_deliveries_for_consumer(
+                            consumer,
+                            now_timestamp_secs(),
+                            64,
+                        )
+                    }),
+                )
+                .await;
+                match result {
+                    Ok(0) => {
+                        exhausted = false;
+                        #[cfg(test)]
+                        wake.claim_barrier.wait_if_armed("empty", shutdown).await;
+                        break;
+                    }
                     Ok(_) => tokio::task::yield_now().await,
                     Err(error) => {
-                        warn!(
-                            error = %format!("{error:#}"),
-                            "post-commit native turn-event delivery kick failed"
-                        );
+                        exhausted = false;
+                        error!(consumer, error = %format!("{error:#}"), "native turn-event optional delivery worker failed");
+                        #[cfg(test)]
+                        wake.claim_barrier
+                            .wait_if_armed("storage_failed", shutdown)
+                            .await;
+                        // Claim/ACK/deferral errors cannot turn coalesced
+                        // wakes into a hot loop. No DB capacity is held.
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                         break;
                     }
                 }
             }
-        });
+            if exhausted {
+                // A nonempty last batch may have unblocked another
+                // causal head. Hand that runnable possibility to the
+                // next quantum, rather than waiting for periodic recovery.
+                wake.pending.store(true, Ordering::SeqCst);
+                #[cfg(test)]
+                wake.claim_barrier.wait_if_armed("quantum", shutdown).await;
+            }
+            guard.release();
+            #[cfg(test)]
+            wake.handoff_barrier
+                .wait_if_armed("released", shutdown)
+                .await;
+            if !guard.reacquire_if_pending() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Wake durable terminal work without lending handler latency to the
@@ -4372,7 +4515,7 @@ impl MessageProcessor {
     pub(super) async fn process_claimed_native_turn_event_delivery(
         &self,
         delivery: pioneer_crud::ClaimedTurnEventDeliveryRecord,
-    ) {
+    ) -> Result<()> {
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             self.deliver_native_turn_event(&delivery),
@@ -4398,6 +4541,7 @@ impl MessageProcessor {
                         error = %format!("{error:#}"),
                         "failed to acknowledge optional turn-event delivery"
                     );
+                    return Err(error);
                 }
             }
             Err(error) => {
@@ -4418,9 +4562,11 @@ impl MessageProcessor {
                         error = %format!("{mark_error:#}"),
                         "failed to record optional turn-event delivery failure"
                     );
+                    return Err(mark_error);
                 }
             }
         }
+        Ok(())
     }
 
     async fn deliver_native_turn_event(
