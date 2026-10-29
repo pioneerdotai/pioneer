@@ -4938,6 +4938,164 @@ impl ThreadsFacade {
 }
 
 #[test]
+fn cli_threads_read_errors_keep_safe_reasons_through_the_admitted_facade() {
+    run_standard_stack_message_test("Threads CLI safe read errors", async {
+        fn assert_read_error(response: &JsonValue, message: &str, reason: &str) {
+            assert!(response.get("error").is_none(), "{response}");
+            let result = &response["result"];
+            assert_eq!(result["isError"], true, "{response}");
+            // Exact public payloads exclude source IDs, raw arguments, paths,
+            // SQL and ToolError diagnostics from both MCP representations.
+            let expected = json!({"error":message});
+            assert_eq!(result["structuredContent"], expected);
+            assert_eq!(
+                result["content"],
+                json!([{"type":"text","text":expected.to_string()}])
+            );
+            assert_eq!(result["_meta"]["pioneer"]["reasonCode"], reason);
+            let wire = response.to_string();
+            for private in [
+                "private_token",
+                "/private/source.sqlite",
+                "secret-diagnostic",
+                "unavailable-private-source",
+                "private fragment title",
+                "old-workspace-revision",
+            ] {
+                assert!(!wire.contains(private), "private read diagnostic leaked");
+            }
+        }
+
+        let (harness, processor, turn) = start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let binding = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(&turn)
+            .await
+            .unwrap()
+            .unwrap();
+        let thread = binding.thread_id;
+        let facade = ThreadsFacade::new(&processor, &turn, CLIAgentRuntimeKind::Codex).await;
+        // Admission, immutable projection, exact native correlation and Gateway
+        // dispatch are the same path as the positive facade regression below.
+        let context = pioneer_agent::TurnToolContext {
+            workspace_id: harness.workspace_id.clone(),
+            thread_id: thread.clone(),
+            turn_id: turn.clone(),
+        };
+        let authority = processor.thread_read_authority(&context).await.unwrap();
+        let codec = processor.thread_read_cursor_codec().unwrap();
+        // An authentic pre-change cursor must not be interpreted using the new
+        // order, even when issued to this same principal/execution and limit.
+        let legacy_cursor = codec
+            .encode(
+                &json!({"revision":"old-workspace-revision","after":thread,"fragment":null}),
+                &authority.scope("list", "", false, 1),
+            )
+            .unwrap();
+        let incompatible =
+            "invalid or incompatible cursor; restart reading with the same resource and parameters";
+        for (item, cursor) in [
+            ("legacy-list", legacy_cursor),
+            (
+                "invalid-list",
+                "SELECT private_token FROM /private/source.sqlite; secret-diagnostic".into(),
+            ),
+        ] {
+            let response = facade
+                .call_response(
+                    item,
+                    item,
+                    "threads_list",
+                    json!({"limit":1,"cursor":cursor}),
+                )
+                .await;
+            assert_read_error(&response, incompatible, "read_cursor_incompatible");
+        }
+
+        // These arguments satisfy the frozen JSON schema. Unanchored newer
+        // history is rejected by the actual read handler's semantic validation,
+        // after admission rather than by JSON-RPC or a mock executor.
+        let invalid = facade
+            .call_response(
+                "invalid-history",
+                "invalid-history",
+                "threads_history_read",
+                json!({"threadId":thread,"limit":1,"direction":"newer"}),
+            )
+            .await;
+        assert_read_error(
+            &invalid,
+            "invalid read parameters",
+            "read_invalid_parameters",
+        );
+        for (item, name, arguments) in [
+            (
+                "unavailable-history",
+                "threads_history_read",
+                json!({"threadId":"unavailable-private-source","limit":1}),
+            ),
+            (
+                "unavailable-children",
+                "threads_children_list",
+                json!({"threadId":"unavailable-private-source","recursive":false,"limit":1}),
+            ),
+        ] {
+            let response = facade.call_response(item, item, name, arguments).await;
+            assert_read_error(
+                &response,
+                "source unavailable or access denied",
+                "read_source_unavailable",
+            );
+        }
+
+        processor
+            .crud_store
+            .update_thread_name(&thread, &"private fragment title 🌍\"\n".repeat(150_000))
+            .await
+            .unwrap();
+        let first = facade
+            .call(
+                "fragment-first",
+                "fragment-first",
+                "threads_list",
+                json!({"limit":1}),
+            )
+            .await;
+        assert_eq!(first["threads"][0]["threadId"], thread);
+        assert_eq!(first["threads"][0]["fragment"]["offset"], 0);
+        assert_eq!(first["threads"][0]["fragment"]["eof"], false);
+        let cursor = first["nextCursor"].as_str().unwrap();
+        processor
+            .crud_store
+            .update_thread_name(&thread, "changed private fragment title")
+            .await
+            .unwrap();
+        let changed = facade
+            .call_response(
+                "fragment-changed",
+                "fragment-changed",
+                "threads_list",
+                json!({"limit":1,"cursor":cursor}),
+            )
+            .await;
+        assert_read_error(
+            &changed,
+            "cursor is stale; restart reading from the first page",
+            "read_source_changed",
+        );
+
+        let malformed = facade
+            .facade
+            .handle_bytes(&facade.context, b"{")
+            .await
+            .unwrap();
+        let malformed: JsonValue = serde_json::from_slice(&malformed).unwrap();
+        assert_eq!(malformed["error"]["code"], -32700);
+        assert!(malformed.get("result").is_none());
+    });
+}
+
+#[test]
 fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_providers() {
     run_standard_stack_message_test("Threads CLI integration", async {
         for kind in [

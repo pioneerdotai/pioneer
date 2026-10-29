@@ -237,6 +237,72 @@ pub async fn find_turn_by_thread_and_id<C: ConnectionTrait>(
         .context("failed to query turn by thread and id")
 }
 
+/// Durable facts used by execution binding checks, without presentation or
+/// permission snapshots. Unknown authority enums must never become defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnExecutionBinding {
+    pub id: String,
+    pub turn_kind: TurnKind,
+    pub origin: pioneer_protocol::TurnOrigin,
+    pub work_owner: TurnWorkOwner,
+}
+
+pub async fn find_turn_execution_binding<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<TurnExecutionBinding>> {
+    let row = turn::Entity::find_by_id(turn_id.to_owned())
+        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
+        .select_only()
+        .columns([
+            turn::Column::Id,
+            turn::Column::Status,
+            turn::Column::TurnKind,
+            turn::Column::Origin,
+            turn::Column::WorkOwner,
+        ])
+        .into_tuple::<(String, String, String, String, String)>()
+        .one(db)
+        .await
+        .context("failed to query turn execution binding")?;
+    row.map(|(id, status, kind, origin, work_owner)| {
+        // Preserve the full Turn decoder's rejection of an unknown status even
+        // for ancestor bindings, whose liveness is not otherwise required.
+        crate::convention::turn_status_from_db(&status)
+            .context("unknown execution binding turn status")?;
+        Ok(TurnExecutionBinding {
+            id,
+            turn_kind: crate::convention::turn_kind_from_db(&kind)
+                .context("unknown execution binding turn kind")?,
+            origin: crate::convention::turn_origin_from_db(&origin)
+                .context("unknown execution binding turn origin")?,
+            work_owner: TurnWorkOwner::from_db_str(&work_owner).map_err(anyhow::Error::msg)?,
+        })
+    })
+    .transpose()
+}
+
+pub async fn find_turn_execution_status<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<TurnStatus>> {
+    let status = turn::Entity::find_by_id(turn_id.to_owned())
+        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
+        .select_only()
+        .column(turn::Column::Status)
+        .into_tuple::<String>()
+        .one(db)
+        .await
+        .context("failed to query turn execution status")?;
+    status
+        .map(|status| {
+            crate::convention::turn_status_from_db(&status).context("unknown execution turn status")
+        })
+        .transpose()
+}
+
 pub async fn find_turns_by_thread_and_ids<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
@@ -415,14 +481,21 @@ pub async fn find_turn_initiator<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
 ) -> Result<Option<PersistedActorRef>> {
-    let Some(turn) = find_turn_by_id(db, turn_id).await? else {
+    let Some((actor_kind, actor_id)) = turn::Entity::find_by_id(turn_id.to_owned())
+        .select_only()
+        .columns([
+            turn::Column::InitiatedByActorKind,
+            turn::Column::InitiatedByActorId,
+        ])
+        .into_tuple::<(Option<String>, Option<String>)>()
+        .one(db)
+        .await
+        .context("failed to query turn by id")?
+    else {
         return Ok(None);
     };
-    actor_ref_from_db(
-        turn.initiated_by_actor_kind.as_deref(),
-        turn.initiated_by_actor_id.as_deref(),
-    )
-    .with_context(|| format!("turn `{turn_id}` has an invalid persisted initiator pair"))
+    actor_ref_from_db(actor_kind.as_deref(), actor_id.as_deref())
+        .with_context(|| format!("turn `{turn_id}` has an invalid persisted initiator pair"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1036,9 +1109,14 @@ pub async fn find_turn_execution_authorization_context<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
 ) -> Result<Option<String>> {
-    Ok(find_turn_by_id(db, turn_id)
-        .await?
-        .and_then(|model| model.execution_authorization_context_json)
+    Ok(turn::Entity::find_by_id(turn_id.to_owned())
+        .select_only()
+        .column(turn::Column::ExecutionAuthorizationContextJson)
+        .into_tuple::<Option<String>>()
+        .one(db)
+        .await
+        .context("failed to query turn by id")?
+        .flatten()
         .filter(|json| !json.trim().is_empty()))
 }
 

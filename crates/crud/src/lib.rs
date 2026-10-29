@@ -12,6 +12,7 @@ mod model_history;
 mod projector;
 mod repositories;
 pub use repositories::provider_usage::ProviderUsageObservation;
+pub use repositories::turn::TurnExecutionBinding;
 mod task_delivery_lifecycle;
 mod task_delivery_recovery;
 mod task_event_context;
@@ -226,8 +227,8 @@ pub use repositories::task_completion_inbox::{
     mark_task_completion_inbox_read, mark_viewed_task_completion_inbox_read,
 };
 pub use repositories::thread::{
-    ThreadManagementChange, advance_thread_read_cursor, find_thread_read_cursor,
-    thread_read_cursor_from_model,
+    ThreadManagementChange, ThreadReadPosition, advance_thread_read_cursor,
+    find_thread_read_cursor, thread_read_cursor_from_model,
 };
 pub use repositories::turn::{
     NewTurnMessageRevision, PersistedTurnCollaboration, TURN_MESSAGE_GUARD_PAGE_BYTES,
@@ -5054,6 +5055,10 @@ impl CrudStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        // Local raw-SQL exception: SeaQuery 1.0's index hints only support
+        // MySQL, not SQLite INDEXED BY. Pin the existing run_id index so each
+        // run probes its own links instead of the task's entire run history.
+        // Keep both ownership predicates and the single global order/limit.
         let rows = self
             .connection
             .query_all_raw(Statement::from_sql_and_values(
@@ -5061,7 +5066,7 @@ impl CrudStore {
                 format!("SELECT t.thread_id, t.id AS turn_id, t.status, t.error \
                  FROM task_run r \
                  INNER JOIN task task_row ON task_row.id = r.task_id \
-                 INNER JOIN task_run_turn trt ON trt.run_id = r.id AND trt.task_id = r.task_id \
+                 INNER JOIN task_run_turn AS trt INDEXED BY idx_task_run_turn_run ON trt.run_id = r.id AND trt.task_id = r.task_id \
                  INNER JOIN \"turn\" t \
                     ON t.id = trt.turn_id AND t.thread_id = trt.thread_id \
                  WHERE t.turn_kind = 'conversation' \
@@ -19089,6 +19094,22 @@ impl CrudStore {
             .collect()
     }
 
+    pub async fn get_turn_execution_binding(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<TurnExecutionBinding>> {
+        turn::find_turn_execution_binding(&self.connection, thread_id, turn_id).await
+    }
+
+    pub async fn get_turn_execution_status(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<TurnStatus>> {
+        turn::find_turn_execution_status(&self.connection, thread_id, turn_id).await
+    }
+
     pub async fn get_turn(&self, thread_id: &str, turn_id: &str) -> Result<Option<(String, Turn)>> {
         let Some(thread_model) = thread::find_thread_by_id(&self.connection, thread_id).await?
         else {
@@ -23729,11 +23750,10 @@ impl CrudStore {
     pub async fn list_thread_read_candidates_page(
         &self,
         workspace_id: &str,
-        after_thread_id: Option<&str>,
+        after: Option<&ThreadReadPosition>,
         limit: u64,
-    ) -> Result<Vec<String>> {
-        thread::list_read_candidates_page(&self.connection, workspace_id, after_thread_id, limit)
-            .await
+    ) -> Result<Vec<ThreadReadPosition>> {
+        thread::list_read_candidates_page(&self.connection, workspace_id, after, limit).await
     }
 
     pub async fn list_threads_for_workspace(
@@ -35307,7 +35327,9 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    mod authorization_reads;
     mod saved_history_read;
+    mod task_child_discovery;
     mod task_webhook;
     mod thread_read_pages;
     mod unread_start;

@@ -1906,8 +1906,8 @@ impl ExecutionAuthorizationContext {
         )
         .await?
         .with_context(|| format!("execution turn `{turn_id}` no longer exists"))?;
-        let (_, turn) = store
-            .get_turn(scope.thread_id.as_str(), turn_id)
+        let turn = store
+            .get_turn_execution_binding(scope.thread_id.as_str(), turn_id)
             .await?
             .with_context(|| format!("execution turn `{turn_id}` disappeared during validation"))?;
         let initiator = pioneer_crud::find_turn_initiator(&store.database_connection(), turn_id)
@@ -2026,7 +2026,7 @@ impl ExecutionAuthorizationContext {
         &'a self,
         store: &'a CrudStore,
         scope: &'a pioneer_crud::TurnAuthorizationScope,
-        turn: &'a pioneer_protocol::Turn,
+        turn: &'a pioneer_crud::TurnExecutionBinding,
     ) -> BoxFuture<'a, Result<Option<String>>> {
         Box::pin(async move {
             // A Task occurrence uses the durable run id as its Turn id and may be
@@ -2126,7 +2126,7 @@ impl ExecutionAuthorizationContext {
         &'a self,
         store: &'a CrudStore,
         scope: &'a pioneer_crud::TurnAuthorizationScope,
-        turn: &'a pioneer_protocol::Turn,
+        turn: &'a pioneer_crud::TurnExecutionBinding,
         execution_id: &'a AgentExecutionId,
     ) -> BoxFuture<'a, Result<Option<String>>> {
         Box::pin(async move {

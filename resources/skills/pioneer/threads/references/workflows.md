@@ -40,7 +40,7 @@ A next page advances matching results over the searched accessible corpus. It is
 
 ## Browse And Follow A Child
 
-Call `threads_list` with `{"limit":50}` and follow nextCursor through eof. Select a thread and read its history. A childReference in that history can be opened directly using its threadId. Save the parent cursor before switching. To browse descendants separately:
+Call `threads_list` with `{"limit":50}` and follow nextCursor through eof, including empty nonterminal pages. The list starts with the newest creation dates, breaking ties by descending ID. Retain limit and the issued cursor; unrelated activity does not restart the walk. Start a fresh first page to see new threads before the current position. Finish any metadata fragments for the same card/version before decoding it. Select a thread and read its history. A childReference in that history can be opened directly using its threadId. Save the parent cursor before switching. To browse descendants separately:
 
 ```json
 {"threadId":"SELECTED_PARENT_THREAD","recursive":true,"limit":50}

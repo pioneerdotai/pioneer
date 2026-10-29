@@ -84,7 +84,12 @@ impl ClientCore {
         identity: ComposerOperationIdentity,
     ) -> anyhow::Result<super::store::ComposerOperationPlan> {
         self.prepare_composer_voice_capture_with(identity.clone(), |workspace_id| {
-            self.wait_composer_session_refresh(&identity)?;
+            self.wait_composer_session_refresh(
+                &identity,
+                &crate::rpc::RequestBudget::new(
+                    std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+                ),
+            )?;
             let authority = self.voice_session_authority();
             let sender = self.transport_runtime().ws_command_sender();
             let access = sender
@@ -293,7 +298,13 @@ impl ClientCore {
                     },
                 );
             }
-            self.refresh_thread_subscription(sender, &context.thread_id, &context.workspace_id)?;
+            self.ensure_thread_subscription(
+                &context.thread_id,
+                &context.workspace_id,
+                &crate::rpc::RequestBudget::new(
+                    std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+                ),
+            )?;
             anyhow::ensure!(
                 self.composer_operation_plan(&identity).is_some()
                     && self.voice_session_authority() == authority,
@@ -758,7 +769,7 @@ mod tests {
     use std::sync::Arc;
 
     fn fixture() -> (Arc<ClientCore>, ComposerOperationIdentity, Thread) {
-        let core = Arc::new(ClientCore::new());
+        let core = crate::catalog_test_support::settings_client();
         let thread = Thread {
             workspace_id: "workspace".into(),
             id: "thread".into(),
@@ -780,6 +791,13 @@ mod tests {
             turns: vec![],
         };
         core.upsert_thread(thread.clone());
+        connection(&core, 7);
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(Arc::new(SubscriptionTransport(thread.clone())));
         core.composer_intent(ComposerIntent::Open {
             thread_id: thread.id.clone(),
             defaults: Default::default(),
@@ -805,6 +823,30 @@ mod tests {
         (core, identity, thread)
     }
 
+    // The canonical subscription owner uses the runtime transport. This fixture
+    // only answers the real thread/start request; it never fabricates readiness.
+    struct SubscriptionTransport(Thread);
+    impl JsonRpcRequestTransport for SubscriptionTransport {
+        fn send_json_rpc_request(
+            &self,
+            _: String,
+            payload: String,
+            response: crate::rpc::JsonRpcResponseSender,
+        ) -> Result<(), String> {
+            let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(request["method"], "thread/start");
+            assert_eq!(request["params"]["thread_id"], self.0.id);
+            assert_eq!(request["params"]["workspace_id"], self.0.workspace_id);
+            response
+                .send(Ok(serde_json::to_value(ThreadStartResponse {
+                    thread: self.0.clone(),
+                    sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+                })
+                .unwrap()))
+                .map_err(|error| error.to_string())
+        }
+    }
+
     struct Transport<'a> {
         thread: Thread,
         calls: RefCell<Vec<serde_json::Value>>,
@@ -821,12 +863,8 @@ mod tests {
             let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
             self.calls.borrow_mut().push(request.clone());
             let result = match request["method"].as_str().unwrap() {
-                "thread/start" => serde_json::to_value(ThreadStartResponse {
-                    thread: self.thread.clone(),
-                    sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
-                })
-                .unwrap(),
                 "voice/session/start" => {
+                    assert_eq!(request["params"]["context"]["thread_id"], self.thread.id);
                     (self.on_start)();
                     serde_json::json!({ "session_id": "session", "status": "recording" })
                 }
@@ -863,6 +901,19 @@ mod tests {
         }
     }
     fn connection(core: &ClientCore, generation: u64) {
+        let event = crate::transport::ws::GatewayWsEvent::Connected {
+            connection_id: generation,
+            endpoint_id: "endpoint".into(),
+            endpoint_name: "Synthetic".into(),
+            gateway_base_url: GatewayBaseUrl::parse_presentation("https://example.test").unwrap(),
+        };
+        core.transport_runtime().inject_test_event(event.clone());
+        core.transport_runtime().drain_ws_events();
+        {
+            let mut session = core.gateway_session.lock().unwrap();
+            session.observe_transport(&event);
+            core.publish_gateway_session(&session);
+        }
         core.transport_runtime()
             .ws_command_sender()
             .set_http_session_access_for_test(Some(crate::transport::http::GatewayHttpAccess {
@@ -900,7 +951,12 @@ mod tests {
                 assert!(core.gateway_refresh_in_flight());
                 connection(&core, 8);
                 assert!(core.finish_gateway_refresh(refresh));
-                core.wait_composer_session_refresh(&identity)?;
+                core.wait_composer_session_refresh(
+                    &identity,
+                    &crate::rpc::RequestBudget::new(
+                        std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+                    ),
+                )?;
                 let authority = core.voice_session_authority();
                 command_sender::voice_status(
                     &transport,
@@ -1059,7 +1115,7 @@ mod tests {
                 );
                 assert!(current.draft().text.is_empty());
             }
-            assert_eq!(transport.inner.calls.borrow().len(), 3);
+            assert_eq!(transport.inner.calls.borrow().len(), 2);
         }
     }
 
@@ -1119,7 +1175,7 @@ mod tests {
                 replacement.borrow().as_ref().unwrap(),
                 &core.composer_snapshot("thread").unwrap()
             ));
-            assert_eq!(transport.inner.calls.borrow().len(), 3);
+            assert_eq!(transport.inner.calls.borrow().len(), 2);
         }
     }
 
@@ -1460,7 +1516,7 @@ mod tests {
             &before,
             &core.composer_snapshot("thread").unwrap()
         ));
-        assert_eq!(transport.calls.borrow().len(), 2);
+        assert_eq!(transport.calls.borrow().len(), 1);
         assert!(
             core.cancel_composer_voice_session_using(request.clone(), &transport)
                 .unwrap()
@@ -1477,7 +1533,7 @@ mod tests {
             &cancelled,
             &core.composer_snapshot("thread").unwrap()
         ));
-        assert_eq!(transport.calls.borrow().len(), 3);
+        assert_eq!(transport.calls.borrow().len(), 2);
     }
 
     #[test]
@@ -1530,7 +1586,7 @@ mod tests {
             ));
             assert_eq!(
                 transport.calls.borrow().len(),
-                if changed_authority { 2 } else { 3 }
+                if changed_authority { 1 } else { 2 }
             );
         }
     }
@@ -1590,7 +1646,7 @@ mod tests {
             core.start_composer_voice_session_using(start_request(identity.clone()), &transport)
                 .is_err()
         );
-        assert_eq!(transport.calls.borrow().len(), 2);
+        assert_eq!(transport.calls.borrow().len(), 1);
         let context = prepare(&core, &identity);
         let request = ComposerVoiceFinalizeRequest {
             operation: identity.clone(),
@@ -1601,9 +1657,9 @@ mod tests {
             core.finalize_composer_voice_session_using(request, &transport)
                 .is_err()
         );
-        assert_eq!(transport.calls.borrow().len(), 3);
+        assert_eq!(transport.calls.borrow().len(), 2);
         assert_eq!(
-            transport.calls.borrow()[2]["params"],
+            transport.calls.borrow()[1]["params"],
             serde_json::json!({ "session_id": "session", "context": context })
         );
         assert_eq!(
@@ -1818,9 +1874,9 @@ mod tests {
         let current = core.composer_snapshot("thread").unwrap();
         assert_ne!(current.draft_id(), identity.draft_id);
         assert!(current.operation().is_none());
-        assert_eq!(transport.calls.borrow().len(), 3);
+        assert_eq!(transport.calls.borrow().len(), 2);
         assert_eq!(
-            transport.calls.borrow()[2]["params"]["session_id"],
+            transport.calls.borrow()[1]["params"]["session_id"],
             "session"
         );
         assert!(!core.composer_voice_session_matches(&identity, "session"));
@@ -1832,7 +1888,7 @@ mod tests {
             &current,
             &core.composer_snapshot("thread").unwrap()
         ));
-        assert_eq!(transport.calls.borrow().len(), 3);
+        assert_eq!(transport.calls.borrow().len(), 2);
     }
 
     #[test]
@@ -1864,9 +1920,9 @@ mod tests {
             core.finalize_composer_voice_session_using(request, &transport)
                 .is_err()
         );
-        assert_eq!(transport.calls.borrow().len(), 4);
+        assert_eq!(transport.calls.borrow().len(), 3);
         assert_eq!(
-            transport.calls.borrow()[3]["params"]["session_id"],
+            transport.calls.borrow()[2]["params"]["session_id"],
             "session"
         );
         assert!(!core.complete_composer_operation(identity, ComposerOperationCompletion::Sent));

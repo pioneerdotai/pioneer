@@ -16,7 +16,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tracing::info;
 use zeroize::Zeroizing;
 
-use super::install::managed_gateway_install;
+use super::archive::ArchiveInstaller;
+use super::install::{ManagedGatewayInstall, managed_gateway_install};
 use super::status::is_configured_service_active;
 
 const DESKTOP_MANAGED_BY: &str = "desktop";
@@ -32,13 +33,6 @@ enum StartAttempt {
 enum DeviceCreateAttempt {
     Code(Zeroizing<String>),
     ProgramNotFound,
-}
-
-#[derive(Debug, Clone)]
-struct BundledGatewayBootstrap {
-    bootstrap_binary_path: PathBuf,
-    asset_path: PathBuf,
-    checksums_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,61 +103,21 @@ fn start_gateway_service_inner(
     let mut lifecycle_trace = lifecycle_trace;
     ensure_desktop_command_config_is_safe()?;
 
-    if let Some(command) = make_bundled_gateway_install_command("install", true)
-        && let Some(warnings) = try_start_with_launcher(
-            "gateway bundled installer",
-            command,
-            service_name,
-            listen_addr,
-            timings,
-            startup_trace,
-            lifecycle_trace.as_deref_mut(),
-        )?
-    {
-        return Ok(warnings);
-    }
-
-    if let Some(command) = make_managed_pioneer_start_command()
-        && let Some(warnings) = try_start_with_launcher(
-            "managed pioneer binary",
-            command,
-            service_name,
-            listen_addr,
-            timings,
-            startup_trace,
-            lifecycle_trace.as_deref_mut(),
-        )?
-    {
-        return Ok(warnings);
-    }
-
-    if let Some(command) = make_development_pioneer_start_command()
-        && let Some(warnings) = try_start_with_launcher(
-            "development cargo pioneer-dev",
-            command,
-            service_name,
-            listen_addr,
-            timings,
-            startup_trace,
-            lifecycle_trace.as_deref_mut(),
-        )?
-    {
-        return Ok(warnings);
-    }
-
-    if let Some(warnings) = try_start_with_launcher(
-        "configured pioneer command in PATH",
-        make_pioneer_start_command(),
+    let executable = std::env::current_exe().context("failed to resolve Desktop executable")?;
+    let (command, installer) =
+        prepare_gateway_start_command("install", true, &development_workspace_root(), &executable)?;
+    let result = try_start_with_launcher(
+        "Desktop Gateway command",
+        command,
         service_name,
         listen_addr,
         timings,
         startup_trace,
         lifecycle_trace.as_deref_mut(),
-    )? {
-        return Ok(warnings);
-    }
-
-    bail!("{}", t!("errors.gateway.start_command_failed_manual_help"))
+    )?;
+    // The release archive and extracted runtime must outlive the child.
+    drop(installer);
+    result.with_context(|| t!("errors.gateway.start_command_failed_manual_help").to_string())
 }
 
 pub(crate) fn update_gateway_service_from_desktop_binary(
@@ -196,78 +150,44 @@ fn update_gateway_service_from_desktop_binary_inner(
     let mut lifecycle_trace = lifecycle_trace;
     ensure_desktop_command_config_is_safe()?;
 
-    if let Some(command) = make_bundled_gateway_install_command("update", false)
-        && let Some(warnings) = try_start_with_launcher(
-            "gateway bundled installer",
-            command,
-            service_name,
-            listen_addr,
-            timings,
-            startup_trace,
-            lifecycle_trace.as_deref_mut(),
-        )?
-    {
-        return Ok(warnings);
-    }
-
-    if let Some(command) = make_managed_pioneer_start_command()
-        && let Some(warnings) = try_start_with_launcher(
-            "managed pioneer binary",
-            command,
-            service_name,
-            listen_addr,
-            timings,
-            startup_trace,
-            lifecycle_trace.as_deref_mut(),
-        )?
-    {
-        return Ok(warnings);
-    }
-
-    if let Some(command) = make_development_pioneer_start_command()
-        && let Some(warnings) = try_start_with_launcher(
-            "development cargo pioneer-dev",
-            command,
-            service_name,
-            listen_addr,
-            timings,
-            startup_trace,
-            lifecycle_trace.as_deref_mut(),
-        )?
-    {
-        return Ok(warnings);
-    }
-
-    if let Some(warnings) = try_start_with_launcher(
-        "configured pioneer command in PATH",
-        make_pioneer_start_command(),
+    let executable = std::env::current_exe().context("failed to resolve Desktop executable")?;
+    let (command, installer) =
+        prepare_gateway_start_command("update", false, &development_workspace_root(), &executable)?;
+    let result = try_start_with_launcher(
+        "Desktop Gateway command",
+        command,
         service_name,
         listen_addr,
         timings,
         startup_trace,
         lifecycle_trace.as_deref_mut(),
-    )? {
-        return Ok(warnings);
-    }
-
-    bail!("{}", t!("errors.gateway.start_command_failed_manual_help"))
+    )?;
+    drop(installer);
+    result.with_context(|| t!("errors.gateway.start_command_failed_manual_help").to_string())
 }
 
 pub(crate) fn create_local_pending_device_session() -> Result<Zeroizing<String>> {
     ensure_desktop_command_config_is_safe()?;
 
+    if let Some(command) =
+        make_development_pioneer_device_create_command(&development_workspace_root())?
+    {
+        return try_create_pending_device_session_with_launcher(
+            "development cargo Gateway",
+            command,
+        )?
+        .with_context(|| {
+            t!(
+                "errors.command.run_failed",
+                command_label = "cargo device create"
+            )
+            .to_string()
+        });
+    }
+
     if let Some(command) = make_managed_pioneer_device_create_command()
         && let Some(activation_code) =
             try_create_pending_device_session_with_launcher("managed pioneer binary", command)?
-    {
-        return Ok(activation_code);
-    }
-
-    if let Some(command) = make_development_pioneer_device_create_command()
-        && let Some(activation_code) = try_create_pending_device_session_with_launcher(
-            "development cargo pioneer-dev",
-            command,
-        )?
     {
         return Ok(activation_code);
     }
@@ -442,29 +362,21 @@ pub(crate) fn wait_for_gateway_service(listen_addr: &str, timings: &GatewayTimin
     )
 }
 
-fn make_pioneer_start_command() -> Command {
-    let mut command = Command::new(configured_pioneer_command_file_name());
-    command.arg("start");
-    command.arg("--json");
-    apply_desktop_command_env(&mut command);
-    command
-}
-
-fn make_managed_pioneer_start_command() -> Option<Command> {
-    let install = managed_gateway_install()?;
-    if !install.binary_path.is_file() {
-        return None;
+fn prepare_gateway_start_command(
+    subcommand: &'static str,
+    force_start: bool,
+    workspace_root: &Path,
+    executable: &Path,
+) -> Result<(Command, Option<ArchiveInstaller>)> {
+    // Debug must resolve its source checkout before inspecting release resources.
+    // A missing checkout is an error, never permission to select another binary.
+    if let Some(command) = make_development_pioneer_command("start", true, workspace_root)? {
+        return Ok((command, None));
     }
-
-    let mut command = Command::new(install.binary_path);
-    command.arg("start");
-    command.arg("--json");
-    apply_desktop_command_env(&mut command);
-    Some(command)
-}
-
-fn make_development_pioneer_start_command() -> Option<Command> {
-    make_development_pioneer_command("start", true)
+    let installer = prepare_bundled_gateway_installer(executable)?;
+    let command =
+        make_bundled_gateway_install_command_from_bundle(&installer, subcommand, force_start);
+    Ok((command, Some(installer)))
 }
 
 fn make_pioneer_device_create_command() -> Command {
@@ -480,38 +392,55 @@ fn make_managed_pioneer_device_create_command() -> Option<Command> {
         return None;
     }
 
-    let mut command = Command::new(install.binary_path);
+    let mut command = Command::new(&install.binary_path);
     command.args(["device", "create"]);
-    apply_desktop_command_env(&mut command);
+    apply_managed_pioneer_command_env(&mut command, &install);
     Some(command)
 }
 
-fn make_development_pioneer_device_create_command() -> Option<Command> {
-    let mut command = make_development_pioneer_command("device", false)?;
+fn make_development_pioneer_device_create_command(
+    workspace_root: &Path,
+) -> Result<Option<Command>> {
+    let Some(mut command) = make_development_pioneer_command("device", false, workspace_root)?
+    else {
+        return Ok(None);
+    };
     command.arg("create");
-    Some(command)
+    Ok(Some(command))
 }
 
 fn make_development_pioneer_command(
     subcommand: &'static str,
     json_output: bool,
-) -> Option<Command> {
+    workspace_root: &Path,
+) -> Result<Option<Command>> {
     if !cfg!(debug_assertions) {
-        return None;
+        return Ok(None);
     }
 
-    let workspace_root = development_workspace_root()?;
+    let manifest = workspace_root.join("Cargo.toml");
+    let metadata = std::fs::metadata(&manifest).with_context(|| {
+        t!(
+            "errors.command.run_failed",
+            command_label = format!("cargo run --manifest-path {}", manifest.display())
+        )
+        .to_string()
+    })?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{}: {}",
+        t!("errors.gateway.start_command_failed_manual_help"),
+        manifest.display()
+    );
     let mut command = Command::new("cargo");
     command.arg("run");
     command.arg("--quiet");
     command.arg("-p");
     command.arg("pioneer-cli");
     command.arg("--features");
-    command.arg("dev,computer-use");
+    command.arg("computer-use");
     #[cfg(target_os = "macos")]
     command.env("MACOSX_DEPLOYMENT_TARGET", "13.0");
-    command.arg("--bin");
-    command.arg("pioneer-dev");
     command.arg("--");
     command.arg(subcommand);
     if json_output {
@@ -519,39 +448,29 @@ fn make_development_pioneer_command(
     }
     command.current_dir(workspace_root);
     apply_desktop_command_env(&mut command);
-    Some(command)
+    // Development is standalone/manual ownership, including the saved-state
+    // path used by the next launch. Release installers remain Desktop-owned.
+    command.env("PIONEER_MANAGED_BY", "manual");
+    Ok(Some(command))
 }
 
-fn development_workspace_root() -> Option<PathBuf> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    path.join("Cargo.toml").is_file().then_some(path)
-}
-
-fn make_bundled_gateway_install_command(
-    subcommand: &'static str,
-    force_start: bool,
-) -> Option<Command> {
-    let bundle = bundled_gateway_bootstrap()?;
-    Some(make_bundled_gateway_install_command_from_bundle(
-        &bundle,
-        subcommand,
-        force_start,
-    ))
+fn development_workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn make_bundled_gateway_install_command_from_bundle(
-    bundle: &BundledGatewayBootstrap,
+    bundle: &ArchiveInstaller,
     subcommand: &'static str,
     force_start: bool,
 ) -> Command {
-    let mut command = Command::new(bundle.bootstrap_binary_path.as_os_str());
+    let mut command = Command::new(&bundle.binary_path);
     command.arg(subcommand);
     command.arg("--source");
     command.arg("local");
     command.arg("--asset");
-    command.arg(bundle.asset_path.as_os_str());
+    command.arg(&bundle.asset_path);
     command.arg("--checksums");
-    command.arg(bundle.checksums_path.as_os_str());
+    command.arg(&bundle.checksums_path);
     command.arg("--managed-by");
     command.arg(DESKTOP_MANAGED_BY);
     command.arg("--json");
@@ -563,26 +482,25 @@ fn make_bundled_gateway_install_command_from_bundle(
     command
 }
 
-fn bundled_gateway_bootstrap() -> Option<BundledGatewayBootstrap> {
-    let current_exe = std::env::current_exe().ok()?;
-    let bootstrap_dir = bundled_bootstrap_dir_for_executable(current_exe.as_path())?;
-
-    let bootstrap_binary_path = bootstrap_dir.join(bundled_gateway_bootstrap_binary_file_name());
-    let asset_path = bootstrap_dir.join(bundled_gateway_asset_file_name()?);
-    let checksums_path = bootstrap_dir.join("SHA256SUMS");
-
-    if !bootstrap_binary_path.is_file() || !asset_path.is_file() || !checksums_path.is_file() {
-        return None;
-    }
-
-    Some(BundledGatewayBootstrap {
-        bootstrap_binary_path,
-        asset_path,
-        checksums_path,
+fn prepare_bundled_gateway_installer(executable: &Path) -> Result<ArchiveInstaller> {
+    let result = (|| -> Result<ArchiveInstaller> {
+        let directory = bundled_gateway_dir_for_executable(executable)
+            .context("failed to resolve embedded Gateway directory")?;
+        let asset_name =
+            bundled_gateway_asset_file_name().context("unsupported embedded Gateway platform")?;
+        ArchiveInstaller::prepare(&directory, &asset_name)
+    })()
+    .context("failed to prepare embedded Gateway archive installer");
+    result.inspect_err(|error| {
+        info!(
+            launcher = "gateway archive installer",
+            error = %format!("{error:#}"),
+            message = %t!("logs.gateway.launcher_failed")
+        );
     })
 }
 
-fn bundled_bootstrap_dir_for_executable(current_exe: &Path) -> Option<PathBuf> {
+fn bundled_gateway_dir_for_executable(current_exe: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let macos_dir = current_exe.parent()?;
@@ -593,14 +511,6 @@ fn bundled_bootstrap_dir_for_executable(current_exe: &Path) -> Option<PathBuf> {
     #[cfg(not(target_os = "macos"))]
     {
         Some(current_exe.parent()?.join("gateway"))
-    }
-}
-
-fn bundled_gateway_bootstrap_binary_file_name() -> &'static str {
-    if cfg!(windows) {
-        "pioneer-bootstrap.exe"
-    } else {
-        "pioneer-bootstrap"
     }
 }
 
@@ -640,6 +550,19 @@ fn gateway_arch_label() -> &'static str {
     }
 }
 
+fn apply_managed_pioneer_command_env(command: &mut Command, install: &ManagedGatewayInstall) {
+    apply_desktop_command_env(command);
+    if cfg!(debug_assertions)
+        && matches!(
+            install.managed_by,
+            pioneer_config::InstallManagedBy::Manual | pioneer_config::InstallManagedBy::Unknown
+        )
+        && AppConfig::load().is_ok_and(|config| config.validate_development_context().is_ok())
+    {
+        command.env("PIONEER_MANAGED_BY", "manual");
+    }
+}
+
 fn apply_desktop_command_env(command: &mut Command) {
     command.env("PIONEER_MANAGED_BY", DESKTOP_MANAGED_BY);
     if let Some(config_path) = desktop_command_config_path() {
@@ -648,6 +571,7 @@ fn apply_desktop_command_env(command: &mut Command) {
 }
 
 fn ensure_desktop_command_config_is_safe() -> Result<()> {
+    AppConfig::load().context("failed to load Gateway command configuration")?;
     let Some(config_path) = desktop_command_config_path() else {
         return Ok(());
     };
@@ -669,12 +593,7 @@ fn desktop_command_config_path() -> Option<PathBuf> {
                 .unwrap_or(explicit),
         );
     }
-    cfg!(debug_assertions).then(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("config")
-            .join("local.toml")
-    })
+    None
 }
 
 fn absolutize_config_path(path: &Path, current_dir: &Path) -> PathBuf {
@@ -1016,12 +935,101 @@ fn output_details(output: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(debug_assertions)]
+    fn development_launch_and_saved_identity_keep_manual_ownership() {
+        use pioneer_config::{
+            InstallManagedBy, InstallState, load_install_state, save_install_state,
+        };
+        const FIXTURE: &str = "PIONEER_TEST_DEVELOPMENT_OWNER_ROOT";
+        if let Some(root) = std::env::var_os(FIXTURE) {
+            let root = std::path::PathBuf::from(root);
+            let (first, _) = super::prepare_gateway_start_command(
+                "install",
+                true,
+                &super::development_workspace_root(),
+                &std::env::current_exe().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                command_env(&first, OsStr::new("PIONEER_MANAGED_BY")).as_deref(),
+                Some("manual")
+            );
+            let binary = root.join("debug").join(if cfg!(windows) {
+                "pioneer-dev.exe"
+            } else {
+                "pioneer-dev"
+            });
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            std::fs::write(&binary, b"development CLI fixture").unwrap();
+            let state_path = root.join("install-state.toml");
+            save_install_state(
+                &state_path,
+                &InstallState {
+                    version: InstallState::CURRENT_VERSION,
+                    managed_by: InstallManagedBy::Manual,
+                    installed_version: "dev".to_owned(),
+                    install_root: binary.parent().map(|path| path.to_path_buf()),
+                    binary_path: binary.clone(),
+                    updated_at_unix: 42,
+                },
+            )
+            .unwrap();
+            let saved = load_install_state(&state_path).unwrap().unwrap();
+            let mut install = super::ManagedGatewayInstall {
+                managed_by: saved.managed_by,
+                installed_version: saved.installed_version,
+                binary_path: saved.binary_path,
+            };
+            let mut repeat = std::process::Command::new(&install.binary_path);
+            super::apply_managed_pioneer_command_env(&mut repeat, &install);
+            assert_eq!(
+                command_env(&repeat, OsStr::new("PIONEER_MANAGED_BY")).as_deref(),
+                Some("manual")
+            );
+            // Managed owners keep their identity. A relocated manual dev build
+            // uses the same isolated contour, including a prepared CU binary.
+            install.managed_by = InstallManagedBy::Desktop;
+            let mut managed = std::process::Command::new(&install.binary_path);
+            super::apply_managed_pioneer_command_env(&mut managed, &install);
+            assert_eq!(
+                command_env(&managed, OsStr::new("PIONEER_MANAGED_BY")).as_deref(),
+                Some("desktop")
+            );
+            install.managed_by = InstallManagedBy::Manual;
+            install.binary_path = root.join("unrelated-pioneer-dev");
+            std::fs::write(&install.binary_path, b"unrelated CLI fixture").unwrap();
+            let mut unrelated = std::process::Command::new(&install.binary_path);
+            super::apply_managed_pioneer_command_env(&mut unrelated, &install);
+            assert_eq!(
+                command_env(&unrelated, OsStr::new("PIONEER_MANAGED_BY")).as_deref(),
+                Some("manual")
+            );
+            return;
+        }
+        // Construct commands and round-trip state only: no cargo/dev CLI runs.
+        let root = tempfile::tempdir().unwrap();
+        let name = format!(
+            "{}::development_launch_and_saved_identity_keep_manual_ownership",
+            module_path!().split_once("::").unwrap().1
+        );
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name])
+            .env(FIXTURE, root.path())
+            .env("CARGO_TARGET_DIR", root.path())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated development-ownership regression failed"
+        );
+    }
+
     use super::{
-        BundledGatewayBootstrap, DESKTOP_MANAGED_BY, DeviceCreateAttempt, absolutize_config_path,
+        DESKTOP_MANAGED_BY, DeviceCreateAttempt, absolutize_config_path,
         desktop_command_config_path, desktop_startup_stage_for_gateway_timing,
-        make_bundled_gateway_install_command_from_bundle, make_pioneer_device_create_command,
-        make_pioneer_start_command, parse_install_command_output, parse_install_warnings_json,
-        try_create_pending_device_session_with_command,
+        make_pioneer_device_create_command, parse_install_command_output,
+        parse_install_warnings_json, try_create_pending_device_session_with_command,
     };
     use std::ffi::OsStr;
     use std::path::PathBuf;
@@ -1039,13 +1047,75 @@ mod tests {
     }
 
     #[test]
-    fn start_commands_use_desktop_managed_context() {
-        let pioneer_command = make_pioneer_start_command();
-        assert_eq!(command_args(&pioneer_command), vec!["start", "--json"]);
-        assert_eq!(
-            command_env(&pioneer_command, OsStr::new("PIONEER_MANAGED_BY")),
-            Some(DESKTOP_MANAGED_BY.to_owned())
-        );
+    #[cfg(any(debug_assertions, not(target_os = "macos")))]
+    fn desktop_command_selection_never_falls_back_from_debug_to_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let executable = root.join("Desktop.app/Contents/MacOS/pioneer-app");
+        let resources = super::bundled_gateway_dir_for_executable(&executable).unwrap();
+        std::fs::create_dir_all(&resources).unwrap();
+        let asset_name = super::bundled_gateway_asset_file_name().unwrap();
+        #[cfg(not(target_os = "macos"))]
+        super::super::archive::tests::prepared_fixture(&resources, &asset_name);
+        #[cfg(target_os = "macos")]
+        // Debug must not even inspect release archive contents. Native signing
+        // is outside this file-only selection regression.
+        std::fs::write(
+            resources.join(&asset_name),
+            b"release resources must not be consumed",
+        )
+        .unwrap();
+        let workspace = root.join("checkout");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        for (subcommand, force_start) in [("install", true), ("update", false)] {
+            let (command, installer) = super::prepare_gateway_start_command(
+                subcommand,
+                force_start,
+                &workspace,
+                &executable,
+            )
+            .unwrap();
+            if cfg!(debug_assertions) {
+                assert!(installer.is_none());
+                assert_eq!(command.get_program(), OsStr::new("cargo"));
+                assert_eq!(command.get_current_dir(), Some(workspace.as_path()));
+                assert_eq!(
+                    command_env(&command, OsStr::new("PIONEER_MANAGED_BY")).as_deref(),
+                    Some("manual")
+                );
+            } else {
+                let installer = installer.expect("release must retain the verified archive");
+                assert_eq!(command.get_program(), installer.binary_path.as_os_str());
+                assert!(installer.asset_path.is_file());
+                assert!(command_args(&command).iter().any(|arg| arg == subcommand));
+            }
+        }
+        let device = super::make_development_pioneer_device_create_command(&workspace).unwrap();
+        assert_eq!(device.is_some(), cfg!(debug_assertions));
+        if let Some(command) = device {
+            assert_eq!(command.get_program(), OsStr::new("cargo"));
+            assert_eq!(command.get_current_dir(), Some(workspace.as_path()));
+            assert!(command_args(&command).ends_with(&["device".into(), "create".into()]));
+        }
+        std::fs::remove_file(workspace.join("Cargo.toml")).unwrap();
+        if cfg!(debug_assertions) {
+            for (subcommand, force_start) in [("install", true), ("update", false)] {
+                let error = super::prepare_gateway_start_command(
+                    subcommand,
+                    force_start,
+                    &workspace,
+                    &executable,
+                )
+                .err()
+                .expect("missing source must fail before any archive/managed/PATH fallback");
+                assert!(
+                    format!("{error:#}")
+                        .contains(&workspace.join("Cargo.toml").display().to_string())
+                );
+            }
+            assert!(super::make_development_pioneer_device_create_command(&workspace).is_err());
+        }
     }
 
     #[test]
@@ -1112,29 +1182,6 @@ mod tests {
         assert!(!rendered.contains("secret-stdout"));
         assert!(!rendered.contains("secret-stderr"));
         assert!(rendered.contains("exit status"));
-    }
-
-    #[test]
-    fn bundled_installer_command_uses_assets_and_desktop_context() {
-        let bundle = BundledGatewayBootstrap {
-            bootstrap_binary_path: PathBuf::from("/tmp/pioneer-bootstrap"),
-            asset_path: PathBuf::from("/tmp/pioneer-gateway-linux-x86_64-computer-use-package.zip"),
-            checksums_path: PathBuf::from("/tmp/SHA256SUMS"),
-        };
-        let expected_asset_path = bundle.asset_path.to_string_lossy().into_owned();
-        let expected_checksums_path = bundle.checksums_path.to_string_lossy().into_owned();
-        let command = make_bundled_gateway_install_command_from_bundle(&bundle, "install", true);
-
-        assert_eq!(
-            command_env(&command, OsStr::new("PIONEER_MANAGED_BY")),
-            Some(DESKTOP_MANAGED_BY.to_owned())
-        );
-
-        let args = command_args(&command).join(" ");
-        assert!(args.contains("install"));
-        assert!(args.contains("--json"));
-        assert!(args.contains(expected_asset_path.as_str()));
-        assert!(args.contains(expected_checksums_path.as_str()));
     }
 
     #[test]
