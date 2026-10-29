@@ -3982,6 +3982,7 @@ struct PromptParityCaptureProvider {
 
 struct HangingChildProvider {
     child_main_calls: AtomicUsize,
+    hang_any_compiled_request: bool,
 }
 
 struct ConcurrentComposerHistoryProvider {
@@ -4405,7 +4406,15 @@ impl HangingChildProvider {
     fn new() -> Self {
         Self {
             child_main_calls: AtomicUsize::new(0),
+            hang_any_compiled_request: false,
         }
+    }
+
+    fn including_composer(mut self) -> Self {
+        // Composer carries the original input instead of the rendered Task
+        // prompt, so identify its main call by the compiled prompt boundary.
+        self.hang_any_compiled_request = true;
+        self
     }
 
     fn child_main_call_count(&self) -> usize {
@@ -4731,7 +4740,8 @@ impl Provider for HangingChildProvider {
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         let preflight = is_turn_preflight_request(&request);
-        let child_main = is_child_task_main_request(&request);
+        let child_main = is_child_task_main_request(&request)
+            || (self.hang_any_compiled_request && request.compiled_prompt.is_some());
         if preflight {
             return Ok(test_turn_preflight_response());
         }
@@ -15077,11 +15087,14 @@ async fn detached_composer_live_ordering_impl() {
     sessions
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
+    let provider = Arc::new(PreflightCaptureProvider::new(
+        r#"<task_result>{"summary":"detached result","data":{}}</task_result>"#,
+    ));
     let processor = Arc::new(MessageProcessor::new(
         threads.clone(),
         Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",
-            Arc::new(CaptureSummaryProvider::new("detached result")),
+            provider.clone(),
         )),
         sessions,
         workspaces,
@@ -15128,6 +15141,84 @@ async fn detached_composer_live_ordering_impl() {
         .await
         .unwrap();
 
+    // Both requests fit the Turn envelope. The latter is small in raw UTF-8
+    // but exceeds the Task budget after JSON escaping. Neither may be accepted.
+    for oversized_text in ["x".repeat(524_288), "Ж\\\"\u{0001}".repeat(60_000)] {
+        let rejected_id = generate_test_request_id("composer", "oversized");
+        processor
+            .process_request_for_connection(
+                connection,
+                &json!({
+                    "jsonrpc":"2.0", "id":rejected_id, "method":"turn/start", "params":{
+                        "thread_id":parent, "turn_id":turn_id,
+                        "input":[{"type":"text", "text":oversized_text}],
+                        "model":"test-model", "model_provider":"openai", "mode":"Agent"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let mut messages = Vec::new();
+        while let Ok(Message::Text(text)) = rx.try_recv() {
+            messages.push(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+        }
+        let error: JsonRpcErrorResponse = serde_json::from_value(
+            messages
+                .iter()
+                .find(|value| value["id"] == rejected_id)
+                .expect("oversized admission must return a response")
+                .clone(),
+        )
+        .expect("oversized admission must return an error");
+        assert_public_error(
+            &error,
+            PublicErrorCode::InvalidInput,
+            PublicErrorStage::Admission,
+        );
+        assert!(
+            messages.iter().all(|value| {
+                value["params"]["turn_id"] != turn_id
+                    || (value["method"] != events::ITEM_STARTED
+                        && value["method"] != events::ITEM_COMPLETED)
+            }),
+            "oversized input must not publish a user message"
+        );
+        assert!(store.get_turn(parent, turn_id).await.unwrap().is_none());
+        assert!(
+            store
+                .get_turn_item_events(parent, turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            processor
+                .task_runtime
+                .service()
+                .list_tasks(TaskListParams {
+                    workspace_id: workspace.clone(),
+                    owner_kind: Some(TaskOwnerKind::Thread),
+                    owner_id: Some(parent.into()),
+                    limit: Some(10),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
+        assert!(provider.snapshot_requests().is_empty());
+    }
+    // Reuse the rejected Turn id below: early failure must also roll back the
+    // in-memory admission, allowing a corrected request to be accepted.
+    let artifact = ingest_user_test_artifact_for_thread(
+        &processor,
+        &workspace,
+        Some(parent),
+        "large-composer-context.txt",
+    )
+    .await;
+
     // An already-owned optional outbox worker cannot deliver during admission.
     // The controlled barrier pauses after live publication, before Task creation.
     for owner in [
@@ -15137,16 +15228,30 @@ async fn detached_composer_live_ordering_impl() {
         owner.running.store(true, Ordering::SeqCst);
     }
     processor.arm_completed_history_preparation_barrier("__detached_composer_before_task_create__");
-    // Keep the full message longer than the Task title without depending on
-    // whitespace that the existing UserMessage materialization normalizes.
-    let full_text = ["Full Composer message"; 12].join(" ");
+    // About 270 KB of UTF-8, with escaping: one launch fits, three full-text
+    // copies exceed the unchanged 512 KiB Task create budget.
+    let full_text = format!(
+        "Full Composer message {}END",
+        "Composer payload Ж\\\" segment ".repeat(9_000)
+    );
+    let exact_input = vec![
+        UserInput::Text {
+            text: full_text.clone(),
+            text_elements: Vec::new(),
+        },
+        UserInput::Artifact {
+            artifact_id: artifact.artifact_id.clone(),
+            version_id: artifact.version_id.clone(),
+        },
+    ];
     let request_id = generate_test_request_id("composer", "live-order");
     let request = json!({"jsonrpc":"2.0", "id":request_id, "method":"turn/start", "params":{
-        "thread_id":parent, "turn_id":turn_id, "input":[{"type":"text", "text":full_text}],
+        "thread_id":parent, "turn_id":turn_id, "input":exact_input,
         "model":"test-model", "model_provider":"openai", "mode":"Agent"
     }})
     .to_string();
     let request_processor = processor.clone();
+    let retry_request = request.clone();
     let request_task = tokio::spawn(async move {
         request_processor
             .process_request_for_connection(connection, &request)
@@ -15281,6 +15386,353 @@ async fn detached_composer_live_ordering_impl() {
         })
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(user_ids.len(), 1);
+    let tasks = processor
+        .task_runtime
+        .service()
+        .list_tasks(TaskListParams {
+            workspace_id: workspace.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent.into()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .tasks;
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0];
+    assert_eq!(task.goal, task.title);
+    assert!(task.goal.chars().count() <= 96);
+    let saved = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(saved.agent_spec.as_ref().unwrap().prompt.goal, task.title);
+    let launch = &task
+        .metadata
+        .as_ref()
+        .unwrap()
+        .composer_work
+        .as_ref()
+        .unwrap()
+        .launch;
+    assert_eq!(launch.input, exact_input);
+    assert_eq!(launch.thread_id, parent);
+    assert_eq!(launch.turn_id, turn_id);
+    assert_eq!(
+        wait_for_task_status(store.clone(), &task.id, TaskStatus::Completed).await,
+        TaskStatus::Completed
+    );
+    let lineage = wait_for_child_lineage_for_run(store.clone(), &saved.runs[0].id).await;
+    assert_eq!(
+        store.get_turn_inputs(&lineage.child_turn_id).await.unwrap(),
+        exact_input
+    );
+    let requests = provider.snapshot_requests();
+    let main = requests
+        .iter()
+        .find(|request| !is_turn_preflight_request(request))
+        .expect("large Composer input must reach the recording provider");
+    let user = main.messages.last().unwrap();
+    assert_eq!(user.content, full_text);
+    assert!(matches!(user.content_parts.as_slice(),
+        [pioneer_provider::MessageContentPart::File { file }]
+            if file.name.as_deref() == Some("large-composer-context.txt")));
+
+    // Simulate a lost admission response by retrying the exact logical Turn.
+    // The existing admission guard may replay or refuse; it must never create
+    // another Task/child or replace the saved original input.
+    processor
+        .process_request_for_connection(connection, &retry_request)
+        .await;
+    let tasks_after = processor
+        .task_runtime
+        .service()
+        .list_tasks(TaskListParams {
+            workspace_id: workspace.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent.into()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .tasks;
+    assert_eq!(tasks_after.len(), 1);
+    assert_eq!(tasks_after[0].id, task.id);
+    let saved_after = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(saved_after.runs.len(), saved.runs.len());
+    assert_eq!(
+        store.get_turn_inputs(&lineage.child_turn_id).await.unwrap(),
+        exact_input
+    );
+    assert_eq!(saved_after.task.metadata, saved.task.metadata);
+    assert_eq!(store.get_turn_inputs(turn_id).await.unwrap(), exact_input);
+    assert_eq!(
+        store
+            .list_task_run_turns(&saved.runs[0].id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_composer_durable_size_admission(&processor, connection, &mut rx, &saved_after).await;
+}
+
+// Calibrate at the real TaskService boundary using the already-created Composer
+// task as the fixture. No second Task/Trigger/AgentSpec constructor or artificial
+// reserve is needed: preparation serializes the actual normalized contract.
+async fn assert_composer_durable_size_admission(
+    processor: &Arc<MessageProcessor>,
+    connection: ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    prototype: &pioneer_protocol::TaskGetResponse,
+) {
+    let task = &prototype.task;
+    let workspace = &task.workspace_id;
+    let parent = task.created_by_thread_id.as_deref().unwrap();
+    let turn_id = "detached-size-admission";
+    assert_eq!(
+        turn_id.len(),
+        task.created_by_turn_id.as_ref().unwrap().len()
+    );
+    let mut params = test_task_create_params(workspace, parent, turn_id, &task.title, 3);
+    // The durable spec round-trips to its input type; reset only the input depth
+    // which ordinary Composer admission supplies before service normalization.
+    let mut spec: TaskAgentSpecInput = serde_json::from_value(
+        serde_json::to_value(prototype.agent_spec.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+    spec.depth = 0;
+    params.agent_spec = Some(spec);
+    params.launch = processor
+        .crud_store
+        .get_task_actor_contract(&task.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .launch;
+    params.lifecycle_policy = task.lifecycle_policy.clone();
+    params.delivery_policy = task.delivery_policy.clone();
+    params.retry_policy = None;
+    params.metadata = task.metadata.clone();
+    params
+        .metadata
+        .as_mut()
+        .unwrap()
+        .composer_work
+        .as_mut()
+        .unwrap()
+        .launch
+        .turn_id = turn_id.into();
+    let text = match &params
+        .metadata
+        .as_ref()
+        .unwrap()
+        .composer_work
+        .as_ref()
+        .unwrap()
+        .launch
+        .input[0]
+    {
+        UserInput::Text { text, .. } => text.clone(),
+        _ => panic!("Composer fixture must start with text"),
+    };
+    let with_padding = |padding: usize| {
+        let mut candidate = params.clone();
+        let launch = &mut candidate
+            .metadata
+            .as_mut()
+            .unwrap()
+            .composer_work
+            .as_mut()
+            .unwrap()
+            .launch;
+        let UserInput::Text {
+            text: input_text, ..
+        } = &mut launch.input[0]
+        else {
+            unreachable!()
+        };
+        *input_text = format!("{text}{}", "x".repeat(padding));
+        candidate
+    };
+    let service = processor.task_runtime.service();
+    assert!(service.prepare_composer_task(params.clone()).is_ok());
+    let mut allowed = 0;
+    let mut rejected = 524_288 - serde_json::to_vec(&params).unwrap().len();
+    let request_at_limit = with_padding(rejected);
+    assert_eq!(
+        serde_json::to_vec(&request_at_limit).unwrap().len(),
+        524_288
+    );
+    let error = service
+        .prepare_composer_task(request_at_limit)
+        .err()
+        .expect("a Composer DTO at its input limit must exceed the expanded durable contract");
+    assert!(
+        error.to_string().contains("durable task contract"),
+        "{error:#}"
+    );
+    // Find the adjacent accepted/rejected normalized sizes, without writes.
+    // Generated IDs are fixed-length ASCII; timestamps have the same width.
+    while rejected - allowed > 1 {
+        let middle = allowed + (rejected - allowed) / 2;
+        match service.prepare_composer_task(with_padding(middle)) {
+            Ok(_) => allowed = middle,
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("durable task contract"),
+                    "{error:#}"
+                );
+                rejected = middle;
+            }
+        }
+    }
+    let rejected_params = with_padding(rejected);
+    assert!(serde_json::to_vec(&rejected_params).unwrap().len() <= 524_288);
+    let request_id = generate_test_request_id("composer", "durable-limit");
+    let rejected_launch = &rejected_params
+        .metadata
+        .as_ref()
+        .unwrap()
+        .composer_work
+        .as_ref()
+        .unwrap()
+        .launch;
+    processor
+        .process_request_for_connection(
+            connection,
+            &json!({
+                "jsonrpc":"2.0", "id":request_id, "method":"turn/start", "params":rejected_launch,
+            })
+            .to_string(),
+        )
+        .await;
+    let mut notifications = Vec::new();
+    while let Ok(Message::Text(text)) = rx.try_recv() {
+        notifications.push(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+    }
+    let error: JsonRpcErrorResponse = serde_json::from_value(
+        notifications
+            .iter()
+            .find(|value| value["id"] == request_id)
+            .unwrap()
+            .clone(),
+    )
+    .expect("durable-only overflow must return an error before accepting the message");
+    assert_public_error(
+        &error,
+        PublicErrorCode::InvalidInput,
+        PublicErrorStage::Admission,
+    );
+    assert!(
+        notifications
+            .iter()
+            .all(|value| value["params"]["turn_id"] != turn_id
+                || (value["method"] != events::ITEM_STARTED
+                    && value["method"] != events::ITEM_COMPLETED))
+    );
+    assert!(
+        processor
+            .crud_store
+            .get_turn(parent, turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        processor
+            .crud_store
+            .get_turn_item_events(parent, turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let tasks = service
+        .list_tasks(TaskListParams {
+            workspace_id: workspace.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent.into()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .tasks;
+    assert_eq!(
+        tasks.len(),
+        1,
+        "durable-only overflow must not create a Task/run/child"
+    );
+    assert_eq!(tasks[0].id, task.id);
+
+    // A one-ASCII-byte correction reaches the nearest admitted durable size and
+    // reuses the same Turn id, proving rollback and the unchanged effective limit.
+    let accepted_params = with_padding(allowed);
+    let accepted_launch = &accepted_params
+        .metadata
+        .as_ref()
+        .unwrap()
+        .composer_work
+        .as_ref()
+        .unwrap()
+        .launch;
+    let corrected_id = generate_test_request_id("composer", "durable-corrected");
+    processor
+        .process_request_for_connection(
+            connection,
+            &json!({
+                "jsonrpc":"2.0", "id":corrected_id, "method":"turn/start", "params":accepted_launch,
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(rx, &corrected_id).await;
+    assert!(
+        processor
+            .crud_store
+            .get_turn(parent, turn_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        processor
+            .crud_store
+            .get_turn_item_events(parent, turn_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        processor.crud_store.get_turn_inputs(turn_id).await.unwrap(),
+        accepted_launch.input
+    );
+    let tasks = service
+        .list_tasks(TaskListParams {
+            workspace_id: workspace.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent.into()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .tasks;
+    assert_eq!(tasks.len(), 2);
+    let corrected = tasks
+        .iter()
+        .find(|task| task.created_by_turn_id.as_deref() == Some(turn_id))
+        .unwrap();
+    assert_eq!(
+        processor
+            .crud_store
+            .get_task(&corrected.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -25428,7 +25880,12 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     attachment: TaskAttachmentMode,
     stop_before_prompt: bool,
 ) {
-    let initial_provider = Arc::new(HangingChildProvider::new());
+    let composer_recovery = attachment == TaskAttachmentMode::Detached && !stop_before_prompt;
+    let initial_provider = Arc::new(if composer_recovery {
+        HangingChildProvider::new().including_composer()
+    } else {
+        HangingChildProvider::new()
+    });
     let initial_provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         initial_provider.clone(),
@@ -25528,6 +25985,69 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         on_parent_failure: TaskParentTerminalAction::KeepRunning,
         completion: TaskCompletionBehavior::CompleteOnTerminalRun,
     });
+    // Cover Composer recovery in the existing detached recovery scenario.
+    // Its short Task objective must never replace the full original input.
+    let composer_text = composer_recovery.then(|| {
+        format!(
+            "Exact Composer recovery request {}END",
+            "Composer payload Ж\\\" segment ".repeat(9_000)
+        )
+    });
+    if let Some(text) = composer_text.as_ref() {
+        let launch: TurnStartParams = serde_json::from_value(json!({
+            "thread_id": parent_thread_id, "turn_id": source_turn_id,
+            "input": [{"type":"text", "text":text}],
+            "model":"test-model", "model_provider":"openai", "mode":"Agent"
+        }))
+        .unwrap();
+        let source_turn = Turn {
+            id: source_turn_id.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            mode: ThreadMode::Agent,
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: default_test_permission_profile(),
+        };
+        crud_store
+            .materialize_turn_start(
+                &parent_thread,
+                SandboxMode::FullAccess,
+                &source_turn,
+                &launch.input,
+                pioneer_protocol::PersistedActorRef::Principal(
+                    authenticated_test_superuser().principal_id.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        crud_store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: parent_thread_id.to_owned(),
+                    turn: Turn {
+                        status: TurnStatus::Completed,
+                        ..source_turn
+                    },
+                },
+                created_at.saturating_add(1),
+            )
+            .await
+            .unwrap();
+        task_params.metadata = Some(pioneer_protocol::TaskMetadata {
+            labels: vec!["composer".to_owned()],
+            data: None,
+            finish_request: None,
+            composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch)),
+        });
+    }
     let response = create_task_for_test(&initial_processor, task_params)
         .await
         .expect("task_create should start hidden child task");
@@ -25566,6 +26086,19 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         initial_provider.child_main_call_count() > 0,
         "initial child task provider should be hanging in the main child request"
     );
+    let original_input = crud_store
+        .get_turn_inputs(&lineage.child_turn_id)
+        .await
+        .unwrap();
+    if let Some(text) = composer_text.as_ref() {
+        assert_eq!(
+            original_input,
+            vec![UserInput::Text {
+                text: text.clone(),
+                text_elements: Vec::new(),
+            }]
+        );
+    }
     let saved_manifest = crud_store
         .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
         .await
@@ -26032,7 +26565,13 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .expect("recovered hidden child task should call preflight");
     let child_main_pos = requests
         .iter()
-        .position(is_child_task_main_request)
+        .position(|request| {
+            if composer_recovery {
+                !is_turn_preflight_request(request) && request.compiled_prompt.is_some()
+            } else {
+                is_child_task_main_request(request)
+            }
+        })
         .expect("recovered hidden child task should call main provider after prompt compile");
     assert!(
         preflight_pos < child_main_pos,
@@ -26077,6 +26616,34 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
             .all(|message| { message.content != "LATE PARENT MESSAGE MUST NOT ENTER RECOVERY" }),
         "recovery must not reread parent messages that arrived after the child start snapshot"
     );
+    if let Some(text) = composer_text.as_ref() {
+        assert!(
+            recovered_main_request
+                .messages
+                .iter()
+                .any(|message| &message.content == text),
+            "recovery must send the entire Composer request, not its short Task goal"
+        );
+        assert_eq!(
+            crud_store
+                .get_turn_inputs(&lineage.child_turn_id)
+                .await
+                .unwrap(),
+            original_input
+        );
+        assert_eq!(
+            crud_store.list_task_run_turns(&run.id).await.unwrap().len(),
+            1,
+            "recovery must retain the same child Turn"
+        );
+        let saved = crud_store
+            .get_task(&response.task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.runs.len(), 1, "recovery must retain the same run");
+        assert_eq!(saved.task.metadata, response.task.metadata);
+    }
 }
 
 #[test]
