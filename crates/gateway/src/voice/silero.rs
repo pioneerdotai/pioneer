@@ -37,9 +37,13 @@ struct SileroV4Session {
 impl SileroV4Session {
     fn new(path: &Path) -> Result<Self> {
         let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(1)?
-            .with_inter_threads(1)?
+            // Drop the recoverable builder before converting errors to anyhow.
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(ort::Error::from)?
+            .with_intra_threads(1)
+            .map_err(ort::Error::from)?
+            .with_inter_threads(1)
+            .map_err(ort::Error::from)?
             .commit_from_file(path)?;
         Ok(Self {
             session,
