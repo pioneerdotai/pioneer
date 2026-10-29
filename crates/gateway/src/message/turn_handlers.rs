@@ -65,10 +65,18 @@ impl TurnStartFailure {
     }
 
     fn with_task_cause(mut self, cause: pioneer_tasks::TaskStartCause) -> Self {
-        self.task_failure = Some(pioneer_tasks::TaskStartFailure::new(
-            pioneer_tasks::TaskStartStage::CliAdmission,
-            cause,
-        ));
+        self.task_failure.get_or_insert_with(|| {
+            pioneer_tasks::TaskStartFailure::new(pioneer_tasks::TaskStartStage::CliAdmission, cause)
+        });
+        self
+    }
+
+    fn with_task_error(
+        mut self,
+        stage: pioneer_tasks::TaskStartStage,
+        error: anyhow::Error,
+    ) -> Self {
+        self.task_failure = Some(pioneer_tasks::TaskStartFailure::from_error(stage, error));
         self
     }
 
@@ -87,9 +95,7 @@ impl TurnStartFailure {
         stage: pioneer_tasks::TaskStartStage,
         error: anyhow::Error,
     ) -> Self {
-        let mut failure = Self::internal(format!("{error:#}"));
-        failure.task_failure = Some(pioneer_tasks::TaskStartFailure::from_error(stage, error));
-        failure
+        Self::internal(format!("{error:#}")).with_task_error(stage, error)
     }
 
     fn into_task_failure(
@@ -98,10 +104,16 @@ impl TurnStartFailure {
         pioneer_protocol::PublicError,
         pioneer_tasks::TaskStartFailure,
     ) {
-        let public_error = crate::public_error::build_public_error(
-            self.public_code,
-            pioneer_protocol::PublicErrorStage::Admission,
-        );
+        let public_error = self
+            .task_failure
+            .as_ref()
+            .and_then(|failure| failure.public_error().cloned())
+            .unwrap_or_else(|| {
+                crate::public_error::build_public_error(
+                    self.public_code,
+                    pioneer_protocol::PublicErrorStage::Admission,
+                )
+            });
         let failure = self
             .task_failure
             .unwrap_or_else(|| {
@@ -112,7 +124,61 @@ impl TurnStartFailure {
             })
             .with_public_error(public_error.clone())
             .report();
-        (public_error, failure)
+        (
+            failure
+                .public_error()
+                .expect("attached public error")
+                .clone(),
+            failure,
+        )
+    }
+
+    fn cli_mcp_rejection(
+        rejection: crate::cli_mcp_client_validation::CliMcpClientValidationRejection,
+    ) -> Self {
+        use crate::cli_mcp_client_validation::CliMcpClientValidationRejectionCode as Code;
+        use pioneer_tasks::{TaskStartCause as Cause, TaskStartReason as Reason};
+        let (cause, reason) = match rejection.code {
+            Code::ProviderSwitchRace => (Cause::Refusal, Reason::ProviderAuthorityUnavailable),
+            Code::StaleRuntimeSnapshot => (Cause::Refusal, Reason::RuntimeNotReady),
+            Code::RuntimeMcpUnsupported => (Cause::Refusal, Reason::RuntimeNotReady),
+            Code::CrossWorkspaceProjection => (Cause::Policy, Reason::CapabilityProjectionInvalid),
+            Code::ExplicitCapabilityUnresolved => {
+                (Cause::Validation, Reason::CapabilityProjectionInvalid)
+            }
+        };
+        Self::internal(rejection.to_string())
+            .with_task_cause(cause)
+            .with_task_reason(reason)
+    }
+
+    fn cli_mcp_materialization(
+        error: pioneer_agent::AgentMcpMaterializationError,
+        code: &str,
+    ) -> Self {
+        use pioneer_agent::AgentMcpMaterializationFailureReason as Reason;
+        use pioneer_tasks::{TaskStartCause as Cause, TaskStartReason as SafeReason};
+        let (cause, reason) = match error.reason {
+            Reason::ExplicitCapabilityRejected | Reason::ProjectionInvalid => {
+                (Cause::Validation, SafeReason::CapabilityProjectionInvalid)
+            }
+            Reason::RequiredInstallationUnavailable => {
+                (Cause::Refusal, SafeReason::LaunchSourceUnavailable)
+            }
+            Reason::ProviderUnavailable => {
+                (Cause::Refusal, SafeReason::ProviderAuthorityUnavailable)
+            }
+            // This enum proves uncertainty, not its underlying root cause.
+            Reason::ResolutionUncertain => (
+                Cause::Unclassified,
+                SafeReason::CapabilityResolutionUncertain,
+            ),
+        };
+        Self::internal(format!(
+            "{code}: combined MCP and skill preflight failed: {error}"
+        ))
+        .with_task_cause(cause)
+        .with_task_reason(reason)
     }
 
     fn into_public_error(self) -> pioneer_protocol::PublicError {
@@ -4277,9 +4343,7 @@ impl MessageProcessor {
                         error.rejected_capabilities.as_slice(),
                     )
                     .await;
-                    return Err(TurnStartFailure::internal(format!(
-                        "{code}: combined MCP and skill preflight failed: {error}"
-                    )));
+                    return Err(TurnStartFailure::cli_mcp_materialization(error, code));
                 }
             };
             let combined_preflight_input =
@@ -4353,7 +4417,11 @@ impl MessageProcessor {
                                 "CLI runtime skill preflight failed"
                             );
                         }
-                        return Err(TurnStartFailure::policy_denied(failure_reason));
+                        return Err(TurnStartFailure::policy_denied(failure_reason)
+                            .with_task_error(
+                                pioneer_tasks::TaskStartStage::CliAdmission,
+                                error.context("failed to resolve CLI runtime skills"),
+                            ));
                     }
                 };
                 if let Err(error) =
@@ -4370,7 +4438,11 @@ impl MessageProcessor {
                         elapsed_ms = preflight_started.elapsed().as_millis(),
                         "CLI runtime skill preflight rejected Pioneer-only required system skill"
                     );
-                    return Err(TurnStartFailure::invalid_input(error.to_string()));
+                    return Err(TurnStartFailure::invalid_input(error.to_string())
+                        .with_task_cause(pioneer_tasks::TaskStartCause::Validation)
+                        .with_task_reason(
+                            pioneer_tasks::TaskStartReason::CapabilityProjectionInvalid,
+                        ));
                 }
                 if let Err(error) =
                     crate::cli_runtime::skills::ensure_cli_runtime_skill_invocation_eligible(
@@ -4395,7 +4467,11 @@ impl MessageProcessor {
                             "CLI runtime skill preflight rejected unsupported native invocation"
                         );
                     }
-                    return Err(TurnStartFailure::internal(error.to_string()));
+                    return Err(TurnStartFailure::internal(error.to_string())
+                        .with_task_cause(pioneer_tasks::TaskStartCause::Refusal)
+                        .with_task_reason(
+                            pioneer_tasks::TaskStartReason::CapabilityProjectionInvalid,
+                        ));
                 }
                 let resolved_skill_bindings =
                     crate::cli_runtime::skills::cli_runtime_turn_skill_bindings(&resolved);
@@ -4428,7 +4504,10 @@ impl MessageProcessor {
                                 "CLI runtime skill preflight planning failed"
                             );
                         }
-                        return Err(TurnStartFailure::internal(failure_reason));
+                        return Err(TurnStartFailure::internal_typed(
+                            pioneer_tasks::TaskStartStage::CliAdmission,
+                            error.context("failed to plan CLI runtime skills"),
+                        ));
                     }
                 };
                 (plans, resolved_skill_bindings)
@@ -4470,9 +4549,10 @@ impl MessageProcessor {
                     let runtime_snapshot_current = self
                         .load_cli_runtime_instances()
                         .map_err(|error| {
-                            TurnStartFailure::internal(format!(
-                                "failed to revalidate CLI runtime configuration: {error:#}"
-                            ))
+                            TurnStartFailure::internal_typed(
+                                pioneer_tasks::TaskStartStage::CliAdmission,
+                                error.context("failed to revalidate CLI runtime configuration"),
+                            )
                         })?
                         .iter()
                         .any(|current| current == runtime_config);
@@ -4510,9 +4590,6 @@ impl MessageProcessor {
                         let code = diagnostic
                             .map(|diagnostic| diagnostic.code.as_str())
                             .unwrap_or_else(|| rejection.code.as_str());
-                        let message = diagnostic
-                            .map(|diagnostic| diagnostic.message.as_str())
-                            .unwrap_or(rejection.message);
                         warn!(
                             event = "combined_cli_preflight",
                             runtime_id,
@@ -4522,7 +4599,7 @@ impl MessageProcessor {
                             rejection_reason = ?rejection.reason,
                             "combined MCP and skill preflight rejected the client MCP claim"
                         );
-                        return Err(TurnStartFailure::internal(format!("{code}: {message}")));
+                        return Err(TurnStartFailure::cli_mcp_rejection(rejection));
                     }
                     if !readiness.supported {
                         let diagnostic = readiness
@@ -4581,16 +4658,19 @@ impl MessageProcessor {
             if !self
                 .load_cli_runtime_instances()
                 .map_err(|error| {
-                    TurnStartFailure::internal(format!(
-                        "failed to revalidate CLI runtime configuration: {error:#}"
-                    ))
+                    TurnStartFailure::internal_typed(
+                        pioneer_tasks::TaskStartStage::CliAdmission,
+                        error.context("failed to revalidate CLI runtime configuration"),
+                    )
                 })?
                 .iter()
                 .any(|current| current == runtime_config)
             {
                 return Err(TurnStartFailure::invalid_input(
                     "CLI runtime configuration changed during preparation; submit again",
-                ));
+                )
+                .with_task_cause(pioneer_tasks::TaskStartCause::Refusal)
+                .with_task_reason(pioneer_tasks::TaskStartReason::RuntimeNotReady));
             }
             Ok(PreparedCliRuntimeCombinedPreflight {
                 plan,
@@ -4823,7 +4903,7 @@ impl MessageProcessor {
                 )
                 .await
             {
-                send_turn_start_failure!(rejection.to_string());
+                send_turn_start_failure!(TurnStartFailure::cli_mcp_rejection(rejection));
                 return None;
             }
             if let Some(input_kind) = params
@@ -9180,7 +9260,9 @@ impl MessageProcessor {
                 success_response,
                 thread_id,
                 turn_id,
-                cli_runtime_execution_disabled_message(),
+                TurnStartFailure::internal(cli_runtime_execution_disabled_message())
+                    .with_task_cause(pioneer_tasks::TaskStartCause::Refusal)
+                    .with_task_reason(pioneer_tasks::TaskStartReason::LaunchSourceUnavailable),
             )
             .await;
             return None;
@@ -9195,7 +9277,10 @@ impl MessageProcessor {
                     success_response,
                     thread_id,
                     turn_id,
-                    format!("failed to load CLI runtime config: {error:#}"),
+                    TurnStartFailure::internal_typed(
+                        pioneer_tasks::TaskStartStage::CliAdmission,
+                        error.context("failed to load CLI runtime config"),
+                    ),
                 )
                 .await;
                 return None;
@@ -9208,7 +9293,9 @@ impl MessageProcessor {
                 success_response,
                 thread_id,
                 turn_id,
-                cli_runtime_execution_disabled_message(),
+                TurnStartFailure::internal(cli_runtime_execution_disabled_message())
+                    .with_task_cause(pioneer_tasks::TaskStartCause::Refusal)
+                    .with_task_reason(pioneer_tasks::TaskStartReason::LaunchSourceUnavailable),
             )
             .await;
             return None;
@@ -9224,7 +9311,9 @@ impl MessageProcessor {
                 success_response,
                 thread_id,
                 turn_id,
-                format!("unknown CLI runtime `{runtime_id}`"),
+                TurnStartFailure::internal(format!("unknown CLI runtime `{runtime_id}`"))
+                    .with_task_cause(pioneer_tasks::TaskStartCause::Refusal)
+                    .with_task_reason(pioneer_tasks::TaskStartReason::LaunchSourceUnavailable),
             )
             .await;
             return None;
@@ -9236,7 +9325,9 @@ impl MessageProcessor {
                 success_response,
                 thread_id,
                 turn_id,
-                format!("CLI runtime `{runtime_id}` is disabled"),
+                TurnStartFailure::internal(format!("CLI runtime `{runtime_id}` is disabled"))
+                    .with_task_cause(pioneer_tasks::TaskStartCause::Refusal)
+                    .with_task_reason(pioneer_tasks::TaskStartReason::RuntimeNotReady),
             )
             .await;
             return None;
@@ -9248,11 +9339,13 @@ impl MessageProcessor {
                 success_response,
                 thread_id,
                 turn_id,
-                format!(
+                TurnStartFailure::internal(format!(
                     "CLI runtime `{runtime_id}` is configured as `{}` but request asked for `{}`",
                     cli_runtime_config_kind_label(runtime.kind),
                     cli_runtime_protocol_kind_label(runtime_kind)
-                ),
+                ))
+                .with_task_cause(pioneer_tasks::TaskStartCause::Validation)
+                .with_task_reason(pioneer_tasks::TaskStartReason::CapabilityProjectionInvalid),
             )
             .await;
             return None;
@@ -12763,21 +12856,203 @@ mod tests {
     use super::*;
 
     #[test]
+    fn backend_and_changed_config_refusals_reach_task_completion_without_dispatch() {
+        use super::super::tests::{
+            cli_runtime_turn_start_request_with_capabilities,
+            seed_cli_runtime_skill_preflight_thread, setup_cli_runtime_skill_preflight_harness,
+        };
+        use pioneer_tasks::{
+            TaskStartCause, TaskStartFailure, TaskStartReason, TaskStartReporting, TaskStartStage,
+        };
+        for case in [
+            "manager",
+            "missing",
+            "disabled",
+            "kind",
+            "changed",
+            "config_error",
+        ] {
+            let (_, events) = crate::public_error::test_support::capture_events(|| {
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                    let mut harness = setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
+                    let thread_id = "backend-admission-thread";
+                    let turn_id = "backend-admission-turn";
+                    seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
+                    let security = pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access("/tmp", 1);
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    let response = TurnStartSuccessResponse::Task {
+                        permission_profile: security.permission_profile.clone(), execution_security_snapshot: security,
+                        continuation_thread_id: thread_id.to_owned(), context_thread_id: thread_id.to_owned(),
+                        task_run_id: "backend-admission-run".to_owned(), execution_id: "backend-admission-execution".to_owned(),
+                        agent_author: None, agent_turn_response: pioneer_crud::AgentTurnResponseInput {
+                            turn_id: turn_id.to_owned(), execution_id: "backend-admission-execution".to_owned(),
+                            presentation_snapshot_id: "backend-admission-presentation".to_owned(), now: pioneer_crud::utc_now(),
+                        }, admitted_outcome: None,
+                        completion: Arc::new(std::sync::Mutex::new(Some(sender))),
+                    };
+                    let request_id = RequestId::new("B".repeat(21)).unwrap();
+                    let config = crate::isolated_test_app_config().unwrap();
+                    let settings_name = crate::settings::normalize_settings_file_name(&config.gateway.settings_file_name).unwrap();
+                    let settings_path = harness.runtime_home.join(&settings_name);
+                    let mut settings = crate::settings::load_or_create_gateway_settings(&settings_path, config.gateway.settings_version, &settings_name).unwrap();
+                    let mut runtimes = settings.effective_cli_runtime_settings(&config.gateway);
+                    let expected_reason = match case {
+                        "manager" => { harness.processor.cli_runtime_manager = None; Some(TaskStartReason::LaunchSourceUnavailable) }
+                        "missing" => Some(TaskStartReason::LaunchSourceUnavailable),
+                        "disabled" => {
+                            runtimes.instances.iter_mut().find(|runtime| runtime.id == harness.runtime_id).unwrap().enabled = false;
+                            settings.set_cli_runtime_settings_for_tests(runtimes.clone()).unwrap();
+                            crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
+                            Some(TaskStartReason::RuntimeNotReady)
+                        }
+                        "kind" => Some(TaskStartReason::CapabilityProjectionInvalid),
+                        "changed" => Some(TaskStartReason::RuntimeNotReady),
+                        "config_error" => {
+                            std::fs::write(&settings_path, b"{ invalid PRIVATE config payload").unwrap(); None
+                        }
+                        _ => unreachable!(),
+                    };
+                    let runtime_id = if case == "missing" { "absent-runtime" } else { &harness.runtime_id };
+                    let runtime_kind = if case == "kind" { CLIAgentRuntimeKind::Claude } else { CLIAgentRuntimeKind::Codex };
+                    let backend = harness.processor.validate_cli_runtime_turn_start_backend(
+                        harness.connection_id, request_id.clone(), runtime_id, runtime_kind, &response, thread_id, turn_id,
+                    ).await;
+                    if case == "changed" {
+                        // Capture the accepted backend, then change its config
+                        // before the remaining preparation phase revalidates it.
+                        let backend = backend.expect("initial backend admission");
+                        runtimes.instances.iter_mut().find(|runtime| runtime.id == harness.runtime_id).unwrap().display_name.push_str(" changed");
+                        settings.set_cli_runtime_settings_for_tests(runtimes).unwrap();
+                        crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
+                        let request: serde_json::Value = serde_json::from_str(&cli_runtime_turn_start_request_with_capabilities(
+                            request_id.as_str(), thread_id, turn_id, &harness.runtime_id, CLIAgentRuntimeKind::Codex, Vec::new(),
+                        )).unwrap();
+                        let params: TurnStartParams = serde_json::from_value(request["params"].clone()).unwrap();
+                        let thread = harness.processor.thread_manager.thread_get(thread_id).await.unwrap();
+                        let failure = harness.processor.prepare_cli_runtime_combined_preflight(
+                            &thread, &params, &harness.runtime_id, CLIAgentRuntimeKind::Codex, &backend,
+                            crate::cli_runtime::skills::partition_cli_runtime_capabilities(&[]).unwrap(), Vec::new(), false, true,
+                        ).await.err().expect("changed config must refuse preparation");
+                        harness.processor.send_turn_start_failure(harness.connection_id, request_id, &response, thread_id, turn_id, failure).await;
+                    } else {
+                        assert!(backend.is_none(), "{case}");
+                    }
+                    let mut error = receiver.await.unwrap().err().unwrap();
+                    let failure = error.downcast_ref::<TaskStartFailure>().unwrap();
+                    assert_eq!(failure.reporting(), TaskStartReporting::Reported);
+                    assert_eq!(failure.descriptor().stage, TaskStartStage::CliAdmission);
+                    assert_eq!(failure.descriptor().reason, expected_reason);
+                    assert_eq!(failure.descriptor().cause, match case {
+                        "kind" => TaskStartCause::Validation, "config_error" => TaskStartCause::Unclassified, _ => TaskStartCause::Refusal,
+                    });
+                    let public = failure.public_error().unwrap().clone();
+                    assert_eq!(public.code, if case == "changed" { pioneer_protocol::PublicErrorCode::InvalidInput } else { pioneer_protocol::PublicErrorCode::Internal });
+                    assert_eq!(failure.descriptor().correlation_id.as_deref(), Some(public.correlation_id.as_str()));
+                    let descriptor = TaskStartFailure::report_for_scheduler(&mut error);
+                    assert_eq!(TaskStartFailure::report_for_scheduler(&mut error), descriptor);
+                    let saved = descriptor.task_error(Some("backend-admission-run".to_owned()));
+                    let Some(pioneer_protocol::TaskValue::Object(details)) = &saved.details else { panic!("durable safe details"); };
+                    assert_eq!(details.get("stage"), Some(&pioneer_protocol::TaskValue::from("cli_admission")));
+                    assert_eq!(details.get("cause"), Some(&pioneer_protocol::TaskValue::from(match case {
+                        "kind" => "validation", "config_error" => "unclassified", _ => "refusal",
+                    })));
+                    let reason = match case {
+                        "manager" | "missing" => Some("launch_source_unavailable"),
+                        "disabled" | "changed" => Some("runtime_not_ready"),
+                        "kind" => Some("capability_projection_invalid"), _ => None,
+                    };
+                    assert_eq!(details.get("reason"), reason.map(pioneer_protocol::TaskValue::from).as_ref());
+                    let encoded = serde_json::to_string(&saved).unwrap();
+                    assert!(encoded.contains(&public.correlation_id));
+                    assert!(!encoded.contains("PRIVATE"));
+                    assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+                    assert!(harness.crud_store.get_turn(thread_id, turn_id).await.unwrap().is_none());
+                    if case != "config_error" {
+                        // Flush refusal breadcrumbs; this is a test checkpoint,
+                        // not an additional report for the refused launch.
+                        tracing::error!("backend refusal breadcrumb checkpoint");
+                    }
+                });
+            });
+            assert_eq!(events.len(), 1, "{case}");
+            if case != "config_error" {
+                assert_eq!(
+                    events[0]
+                        .breadcrumbs
+                        .values
+                        .iter()
+                        .filter(|breadcrumb| breadcrumb.message.as_deref()
+                            == Some("Task preparation or launch refused"))
+                        .count(),
+                    1,
+                    "{case}"
+                );
+            }
+            assert!(!serde_json::to_string(&events).unwrap().contains("PRIVATE"));
+        }
+    }
+
+    #[test]
+    fn authoritative_mcp_rejection_retains_the_branch_in_task_error() {
+        use crate::cli_mcp_client_validation::{
+            CliMcpClientTarget, CliMcpClientValidationEvidence, validate_cli_mcp_client_request,
+        };
+        let rejection = validate_cli_mcp_client_request(CliMcpClientValidationEvidence {
+            target: CliMcpClientTarget::Codex,
+            has_mcp_projection: true,
+            provider_claim_matches: true,
+            runtime_snapshot_current: true,
+            runtime_supports_mcp_tools: true,
+            projection_workspace_matches: false,
+            explicit_capabilities_resolved: true,
+        })
+        .unwrap_err();
+        let (_, failure) = TurnStartFailure::cli_mcp_rejection(rejection).into_task_failure();
+        let error = failure.descriptor().task_error(Some("run".to_owned()));
+        assert_eq!(error.class, pioneer_protocol::TaskErrorClass::Policy);
+        let Some(pioneer_protocol::TaskValue::Object(details)) = error.details else {
+            panic!("safe descriptor");
+        };
+        assert_eq!(
+            details.get("stage"),
+            Some(&pioneer_protocol::TaskValue::from("cli_admission"))
+        );
+        assert_eq!(
+            details.get("cause"),
+            Some(&pioneer_protocol::TaskValue::from("policy"))
+        );
+        assert_eq!(
+            details.get("reason"),
+            Some(&pioneer_protocol::TaskValue::from(
+                "capability_projection_invalid"
+            ))
+        );
+    }
+
+    #[test]
     fn task_admission_reason_survives_public_projection_without_raw_diagnostic() {
-        let failure = TurnStartFailure::invalid_input("PRIVATE runtime routing payload")
-            .with_task_reason(pioneer_tasks::TaskStartReason::RuntimeNotReady);
+        let failure = TurnStartFailure::cli_mcp_materialization(
+            pioneer_agent::AgentMcpMaterializationError {
+                reason: pioneer_agent::AgentMcpMaterializationFailureReason::ResolutionUncertain,
+                message: "PRIVATE runtime routing payload".to_owned(),
+                diagnostics: Vec::new(),
+                accepted_capabilities: Vec::new(),
+                rejected_capabilities: Vec::new(),
+            },
+            "cli_runtime.mcp.resolution_uncertain",
+        );
         let ((public, failure), events) =
             crate::public_error::test_support::capture_events(|| failure.into_task_failure());
         assert_eq!(
             failure.descriptor().reason,
-            Some(pioneer_tasks::TaskStartReason::RuntimeNotReady)
+            Some(pioneer_tasks::TaskStartReason::CapabilityResolutionUncertain)
         );
         assert_eq!(
             failure.descriptor().cause,
             pioneer_tasks::TaskStartCause::Unclassified
         );
         let encoded = serde_json::to_string(&failure.descriptor().task_error(None)).unwrap();
-        assert!(encoded.contains("runtime_not_ready"));
+        assert!(encoded.contains("capability_resolution_uncertain"));
         assert!(encoded.contains(&public.correlation_id));
         assert!(!encoded.contains("PRIVATE"));
         assert!(!serde_json::to_string(&events).unwrap().contains("PRIVATE"));

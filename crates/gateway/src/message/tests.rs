@@ -776,10 +776,10 @@ async fn wait_for_episodic_ingestor_item(
 }
 
 #[derive(Default)]
-struct RecordingCliRuntimeSession {
+pub(super) struct RecordingCliRuntimeSession {
     thread_starts: TokioMutex<Vec<CLIAgentRuntimeThreadOpenParams>>,
     thread_resumes: TokioMutex<Vec<(String, CLIAgentRuntimeThreadOpenParams)>>,
-    turn_starts: TokioMutex<Vec<CLIAgentRuntimeTurnStartParams>>,
+    pub(super) turn_starts: TokioMutex<Vec<CLIAgentRuntimeTurnStartParams>>,
     turn_start_pause: TokioMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     next_turn_start_error: TokioMutex<Option<String>>,
     provider_history: TokioMutex<HashMap<String, Vec<String>>>,
@@ -2083,19 +2083,19 @@ fn skill_pack_turn_normalization_is_authoritative_ordered_and_fail_closed() {
         });
 }
 
-struct CliRuntimeSkillPreflightHarness {
+pub(super) struct CliRuntimeSkillPreflightHarness {
     _temp: tempfile::TempDir,
     rx: mpsc::Receiver<Message>,
-    connection_id: ConnectionId,
+    pub(super) connection_id: ConnectionId,
     thread_manager: Arc<ThreadManager>,
-    crud_store: Arc<CrudStore>,
+    pub(super) crud_store: Arc<CrudStore>,
     workspace_id: String,
-    cli_session: Arc<RecordingCliRuntimeSession>,
+    pub(super) cli_session: Arc<RecordingCliRuntimeSession>,
     cli_manager: Arc<CLIAgentRuntimeManager>,
-    processor: MessageProcessor,
-    runtime_id: String,
+    pub(super) processor: MessageProcessor,
+    pub(super) runtime_id: String,
     runtime_kind: CLIAgentRuntimeKind,
-    runtime_home: std::path::PathBuf,
+    pub(super) runtime_home: std::path::PathBuf,
     native_home: std::path::PathBuf,
     system_root: std::path::PathBuf,
     user_root: std::path::PathBuf,
@@ -2103,7 +2103,7 @@ struct CliRuntimeSkillPreflightHarness {
     event_log: Arc<TokioMutex<Vec<String>>>,
 }
 
-async fn setup_cli_runtime_skill_preflight_harness(
+pub(super) async fn setup_cli_runtime_skill_preflight_harness(
     runtime_kind: CLIAgentRuntimeKind,
     native_home_is_file: bool,
 ) -> CliRuntimeSkillPreflightHarness {
@@ -2224,7 +2224,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
     harness
 }
 
-fn cli_runtime_turn_start_request_with_capabilities(
+pub(super) fn cli_runtime_turn_start_request_with_capabilities(
     request_id: &str,
     thread_id: &str,
     turn_id: &str,
@@ -2335,7 +2335,7 @@ fn write_test_skill_with_declared_name(
     skill_dir
 }
 
-async fn seed_cli_runtime_skill_preflight_thread(
+pub(super) async fn seed_cli_runtime_skill_preflight_thread(
     harness: &CliRuntimeSkillPreflightHarness,
     thread_id: &str,
 ) {

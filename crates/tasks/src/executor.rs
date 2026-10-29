@@ -84,6 +84,13 @@ impl TaskExecutionHandle {
         self.run_id.as_str()
     }
 
+    /// Pin before dispatch so a late startup failure cannot adopt a resumed
+    /// attempt at terminal preparation time.
+    pub async fn pin_agent_attempt(&self, execution_id: &str) -> TaskRuntimeResult<()> {
+        self.pinned_agent_attempt_generation(execution_id).await?;
+        Ok(())
+    }
+
     /// Reclassifies durable executor-lifecycle writes independently from the
     /// scheduler or reconciler which created this handle. Those producers do
     /// maintenance discovery, but once a run is handed to its executor its
@@ -332,6 +339,49 @@ impl TaskExecutionHandle {
         .await
     }
 
+    /// Close a reserved revision and its run in the same terminal transaction.
+    pub async fn block_run_with_revision(
+        &self,
+        revision: TaskRunTurn,
+        error: TaskError,
+        blocked_at: i64,
+    ) -> TaskRuntimeResult<()> {
+        self.commit_terminal_run_with_revision(
+            TaskEventPayload::RunBlocked {
+                task_id: self.task_id.clone(),
+                run_id: self.run_id.clone(),
+                error: Some(error),
+                blocked_at,
+            },
+            Some(revision),
+        )
+        .await
+    }
+
+    /// Keep ordinary failure/retry policy while closing the exact revision in
+    /// the same batch. Cancellation has its own terminal domain transition.
+    pub async fn fail_run_with_revision(
+        &self,
+        revision: TaskRunTurn,
+        error: TaskError,
+        completed_at: i64,
+    ) -> TaskRuntimeResult<()> {
+        anyhow::ensure!(
+            !task_error_is_cancellation(Some(&error)),
+            "revision failure cannot carry cancellation"
+        );
+        self.commit_terminal_run_with_revision(
+            TaskEventPayload::RunFailed {
+                task_id: self.task_id.clone(),
+                run_id: self.run_id.clone(),
+                error: Some(error),
+                completed_at,
+            },
+            Some(revision),
+        )
+        .await
+    }
+
     pub async fn cancel_run(
         &self,
         reason: Option<String>,
@@ -347,13 +397,28 @@ impl TaskExecutionHandle {
     }
 
     async fn commit_terminal_run(&self, terminal: TaskEventPayload) -> TaskRuntimeResult<()> {
-        let prepared = self
+        self.commit_terminal_run_with_revision(terminal, None).await
+    }
+
+    async fn commit_terminal_run_with_revision(
+        &self,
+        terminal: TaskEventPayload,
+        revision: Option<TaskRunTurn>,
+    ) -> TaskRuntimeResult<()> {
+        let mut prepared = self
             .store
             .prepare_task_terminal_transition(terminal)
             .await
             .context(TerminalCommitPhase::Preparation)?
             .with_pinned_agent_attempt(self.agent_attempt_generation.get().copied().flatten())
             .context(TerminalCommitPhase::AttemptFence)?;
+        if let Some(revision) = revision {
+            prepared = self
+                .store
+                .prepare_task_terminal_with_revision(prepared, revision)
+                .await
+                .context(TerminalCommitPhase::Preparation)?;
+        }
         #[cfg(test)]
         if let Some(barrier) = self.terminal_preparation_barrier.as_ref() {
             barrier.wait().await;

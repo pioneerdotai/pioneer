@@ -42,6 +42,17 @@ use tokio::time::{Duration, sleep};
 
 const TASK_EXECUTION_HEARTBEAT_SECONDS: u64 = 30;
 
+// Local control-flow context, never a launch-failure descriptor. Anyhow keeps
+// the original prepare/commit/join error available for typed downcasts.
+#[derive(Debug)]
+struct RevisionCompletionFailure;
+
+impl std::fmt::Display for RevisionCompletionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("revision completion failed")
+    }
+}
+
 fn task_agent_liveness_timeouts(task: &Task) -> (i64, i64) {
     let defaults = pioneer_config::GatewayProviderStreamItemTimeoutConfig::default();
     let configured = task.timeout_policy.as_ref();
@@ -2977,50 +2988,60 @@ impl TaskAgentExecutor {
             run.task_id.clone(),
             run.id.clone(),
         );
-        let authority_processor = Arc::clone(&processor);
-        let authority_task_response = task_response.clone();
-        let root_still_has_authority = message_fresh_task(async move {
-            Self::root_collaboration_still_has_task_authority(
-                &authority_processor,
-                &authority_task_response,
-            )
-            .await
-        })
-        .await
-        .context("task revision authority revalidation task did not finish")??;
-        if !root_still_has_authority {
-            self.block_revision_dispatch_turn(
-                &processor,
-                child_runtime,
-                handle,
-                task_error(
-                    "task_root_access_revoked",
-                    "task continuation was blocked after root-thread access was revoked".to_owned(),
-                    TaskErrorClass::Policy,
-                    Some(run.id.clone()),
-                ),
-            )
-            .await?;
-            return message_future(task_revise_response_from_store(&processor, response)).await;
-        }
-        let lock_processor = Arc::clone(&processor);
-        let lock_task = task_response.task.clone();
-        let lock_run = run.clone();
-        let lock_handle = handle.clone();
-        let lock_outcome = message_fresh_task(async move {
-            Self::acquire_write_locks_owned(lock_processor, lock_task, lock_run, lock_handle).await
-        })
-        .await
-        .context("task revision write-lock phase did not finish")??;
-        match lock_outcome {
-            TaskExecutorStartOutcome::Started => {}
-            TaskExecutorStartOutcome::Queued | TaskExecutorStartOutcome::Rejected => {
-                return message_future(task_revise_response_from_store(&processor, response)).await;
-            }
-        }
         let revision_executor = Arc::clone(self);
         let revision_processor = Arc::clone(&processor);
-        message_fresh_task(async move {
+        let failed_child = child_runtime.clone();
+        let failed_handle = handle.clone();
+        let failed_run_id = run.id.clone();
+        let dispatched = message_fresh_task(async move {
+            // The snapshot/handle above are authoritative for all remaining
+            // admission phases, including ordinary authority and lock errors.
+            handle.pin_agent_attempt(&execution.id).await?;
+            let authority_processor = Arc::clone(&revision_processor);
+            let authority_task_response = task_response.clone();
+            let root_still_has_authority = message_fresh_task(async move {
+                Self::root_collaboration_still_has_task_authority(
+                    &authority_processor,
+                    &authority_task_response,
+                )
+                .await
+            })
+            .await
+            .context("task revision authority revalidation task did not finish")??;
+            if !root_still_has_authority {
+                return Ok(Some((
+                    TaskRunTurnStatus::Blocked,
+                    task_error(
+                        "task_root_access_revoked",
+                        "task continuation was blocked after root-thread access was revoked"
+                            .to_owned(),
+                        TaskErrorClass::Policy,
+                        Some(run.id.clone()),
+                    ),
+                )));
+            }
+            // The generic helper terminalizes Reject without a revision and
+            // returns Started. Here the decision must retain revision ownership
+            // and stop dispatch before any provider/action binding is prepared.
+            match revision_processor
+                .critical_task_service()
+                .acquire_write_locks_for_run(&run.id, now_timestamp_secs())
+                .await?
+            {
+                WriteLockDecision::NoLocksRequired | WriteLockDecision::Acquired(_) => {}
+                WriteLockDecision::Queued => return Ok(None),
+                WriteLockDecision::Rejected => {
+                    return Ok(Some((
+                        TaskRunTurnStatus::Failed,
+                        task_error(
+                            "write_lock_conflict",
+                            "write scope conflicts with another active task run".to_owned(),
+                            TaskErrorClass::Policy,
+                            Some(run.id.clone()),
+                        ),
+                    )));
+                }
+            }
             revision_executor
                 .dispatch_existing_revision_turn(
                     &revision_processor,
@@ -3032,9 +3053,67 @@ impl TaskAgentExecutor {
                     handle,
                 )
                 .await
+                .map(|()| None)
         })
         .await
-        .context("existing task revision turn task did not finish")??;
+        .context("task revision admission/dispatch task did not finish")
+        .and_then(|outcome| outcome);
+        match dispatched {
+            Ok(Some((status, error))) => {
+                let processor = Arc::clone(&processor);
+                message_fresh_task(async move {
+                    Self::finish_revision_dispatch_turn_owned(
+                        processor,
+                        failed_child,
+                        failed_handle,
+                        error,
+                        status,
+                    )
+                    .await
+                })
+                .await
+                .context("task revision admission completion task did not finish")??;
+            }
+            Err(mut error) => {
+                // An explicit terminal branch already attempted completion.
+                // Its rollback must not trigger a second transition with a
+                // newly classified storage/start error in place of that outcome.
+                if error.downcast_ref::<RevisionCompletionFailure>().is_some() {
+                    return Err(error);
+                }
+                // A late preparation path may already have committed this outcome.
+                // Cancellation/success also own their terminal state exclusively.
+                if !processor
+                    .crud_store
+                    .get_task_run(&failed_run_id)
+                    .await?
+                    .is_some_and(|run| run.status.is_terminal())
+                {
+                    let descriptor =
+                        pioneer_tasks::TaskStartFailure::report_for_scheduler(&mut error);
+                    let closed = self
+                        .block_revision_dispatch_turn(
+                            &processor,
+                            failed_child,
+                            failed_handle,
+                            descriptor.task_error(Some(failed_run_id)),
+                        )
+                        .await;
+                    if let Err(transition_error) = closed
+                        && transition_error
+                            .downcast_ref::<pioneer_crud::TaskTerminalConflict>()
+                            .is_none()
+                    {
+                        return Err(transition_error);
+                    }
+                    // A competing terminal/revision transition owns the winner.
+                    // Keep the original report instead of reporting the rejected
+                    // stale write as another launch failure.
+                }
+                return Err(error);
+            }
+            Ok(None) => {}
+        }
         message_future(task_revise_response_from_store(&processor, response)).await
     }
 
@@ -3059,7 +3138,8 @@ impl TaskAgentExecutor {
             match turn.status {
                 TurnStatus::Completed => {
                     self.complete_child_turn(processor, child_runtime, handle)
-                        .await?;
+                        .await
+                        .context(RevisionCompletionFailure)?;
                 }
                 TurnStatus::Failed | TurnStatus::Interrupted => {
                     let error_message = turn
@@ -3074,14 +3154,16 @@ impl TaskAgentExecutor {
                         target_status,
                         handle,
                     )
-                    .await?;
+                    .await
+                    .context(RevisionCompletionFailure)?;
                 }
                 TurnStatus::Blocked => {
                     let error_message = turn
                         .error
                         .unwrap_or_else(|| "revision child turn blocked".to_owned());
                     self.block_child_turn(child_runtime, error_message.as_str(), handle)
-                        .await?;
+                        .await
+                        .context(RevisionCompletionFailure)?;
                 }
                 TurnStatus::InProgress => {
                     revalidate_existing_task_child_execution_authorization(
@@ -3338,6 +3420,12 @@ impl TaskAgentExecutor {
                     None,
                 )
                 .await
+                .map_err(|error| {
+                    pioneer_tasks::TaskStartFailure::from_error(
+                        pioneer_tasks::TaskStartStage::CliPreparation,
+                        error,
+                    )
+                })
                 .context("failed to prepare revision CLI runtime turn")?;
             processor
                 .activate_prepared_task_cli_runtime_turn(prepared)
@@ -6533,6 +6621,13 @@ impl TaskAgentExecutor {
         let block_reason = error
             .recovery_public_message()
             .unwrap_or_else(|| reason.to_owned());
+        if child_runtime.task_run_turn.kind == TaskRunTurnKind::Revision
+            && child_runtime.task_run_turn.status == TaskRunTurnStatus::InProgress
+        {
+            return self
+                .block_revision_dispatch_turn(&processor, child_runtime, handle, error)
+                .await;
+        }
         handle
             .record_task_run_turn_blocked(
                 blocked_task_run_turn(&child_runtime.task_run_turn, blocked_at),
@@ -6555,33 +6650,59 @@ impl TaskAgentExecutor {
     ) -> Result<()> {
         let processor = Arc::clone(processor);
         message_fresh_task(async move {
-            Self::block_revision_dispatch_turn_owned(processor, child_runtime, handle, error).await
+            Self::finish_revision_dispatch_turn_owned(
+                processor,
+                child_runtime,
+                handle,
+                error,
+                TaskRunTurnStatus::Blocked,
+            )
+            .await
         })
         .await
-        .context("task revision block transition task did not finish")?
+        .context("task revision block transition task did not finish")
+        .and_then(|outcome| outcome)
+        .context(RevisionCompletionFailure)
     }
 
-    async fn block_revision_dispatch_turn_owned(
+    async fn finish_revision_dispatch_turn_owned(
         processor: Arc<MessageProcessor>,
         child_runtime: TaskRunChildRuntime,
         handle: TaskExecutionHandle,
         mut error: TaskError,
+        status: TaskRunTurnStatus,
     ) -> Result<()> {
-        let blocked_at = now_timestamp_secs();
+        let completed_at = now_timestamp_secs();
         error.details = Some(revision_dispatch_error_details(
             &child_runtime.task_run_turn,
+            error.details.take(),
         ));
         let message = error.message.clone();
-        handle
-            .record_task_run_turn_blocked(
-                blocked_task_run_turn(&child_runtime.task_run_turn, blocked_at),
-                Some(error.clone()),
-                blocked_at,
-            )
-            .await?;
-        handle.block_run(Some(error), blocked_at).await?;
-        mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, message.as_str())
-            .await?;
+        match status {
+            TaskRunTurnStatus::Blocked => {
+                handle
+                    .block_run_with_revision(
+                        child_runtime.task_run_turn.clone(),
+                        error,
+                        completed_at,
+                    )
+                    .await?;
+                mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, &message)
+                    .await?;
+            }
+            TaskRunTurnStatus::Failed => {
+                handle
+                    .fail_run_with_revision(
+                        child_runtime.task_run_turn.clone(),
+                        error,
+                        completed_at,
+                    )
+                    .await?;
+                mark_task_run_occurrence_turn_failed(&processor, &child_runtime.lineage, &message)
+                    .await?;
+            }
+            _ => bail!("unsupported revision dispatch terminal outcome"),
+        }
         Ok(())
     }
 }
@@ -9099,8 +9220,11 @@ fn blocked_task_run_turn(task_run_turn: &TaskRunTurn, completed_at: i64) -> Task
     blocked
 }
 
-fn revision_dispatch_error_details(task_run_turn: &TaskRunTurn) -> TaskValue {
-    TaskValue::Object(BTreeMap::from([
+fn revision_dispatch_error_details(
+    task_run_turn: &TaskRunTurn,
+    original: Option<TaskValue>,
+) -> TaskValue {
+    let mut fields = BTreeMap::from([
         (
             "taskRunTurnId".to_owned(),
             TaskValue::String(task_run_turn.id.clone()),
@@ -9129,7 +9253,19 @@ fn revision_dispatch_error_details(task_run_turn: &TaskRunTurn) -> TaskValue {
                 .map(TaskValue::String)
                 .unwrap_or(TaskValue::Null),
         ),
-    ]))
+    ]);
+    match original {
+        Some(TaskValue::Object(original))
+            if original.keys().all(|key| !fields.contains_key(key)) =>
+        {
+            fields.extend(original);
+        }
+        Some(original) => {
+            fields.insert("originalDetails".to_owned(), original);
+        }
+        None => {}
+    }
+    TaskValue::Object(fields)
 }
 
 async fn record_task_run_turn_failure(
@@ -11466,6 +11602,35 @@ mod tests {
             created_at: 1,
             started_at: Some(1),
             completed_at: Some(2),
+        }
+    }
+
+    #[test]
+    fn revision_metadata_preserves_non_object_and_colliding_original_details() {
+        let turn = test_task_run_turn();
+        for original in [
+            TaskValue::String("existing safe detail".to_owned()),
+            TaskValue::Object(BTreeMap::from([
+                (
+                    "taskRunTurnId".to_owned(),
+                    TaskValue::from("existing service field"),
+                ),
+                (
+                    "originalDetails".to_owned(),
+                    TaskValue::from("existing nested detail"),
+                ),
+            ])),
+        ] {
+            let TaskValue::Object(details) =
+                revision_dispatch_error_details(&turn, Some(original.clone()))
+            else {
+                panic!("revision details");
+            };
+            assert_eq!(details.get("originalDetails"), Some(&original));
+            assert_eq!(
+                details.get("taskRunTurnId"),
+                Some(&TaskValue::from(turn.id.clone()))
+            );
         }
     }
 
