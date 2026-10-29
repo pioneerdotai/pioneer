@@ -10,7 +10,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, Statement,
 };
 
 use crate::convention::{

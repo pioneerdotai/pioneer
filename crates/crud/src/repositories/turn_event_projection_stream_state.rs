@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use pioneer_entity::turn_event_projection_stream_state;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait, Set,
+};
 
 pub const STREAM_STATUS_HEALTHY: &str = "healthy";
 pub const STREAM_STATUS_QUARANTINED: &str = "quarantined";
