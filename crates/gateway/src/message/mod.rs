@@ -690,7 +690,7 @@ pub struct MessageProcessor {
     thread_title_publication_attempted: Arc<tokio::sync::Notify>,
     timeout_supervisor: Arc<TimeoutSupervisor>,
     recovery_coordinator: Arc<RecoveryCoordinator>,
-    native_turn_event_delivery_kick_running: Arc<AtomicBool>,
+    native_turn_event_delivery_workers: Arc<agent_runtime::NativeTurnEventDeliveryWorkers>,
     native_terminal_effect_kick_running: Arc<AtomicBool>,
     native_terminal_effect_kick_pending: Arc<AtomicBool>,
     native_lifecycle_readiness: Arc<native_health::NativeLifecycleReadinessState>,
@@ -1356,7 +1356,7 @@ impl MessageProcessor {
             thread_title_publication_attempted: Arc::new(tokio::sync::Notify::new()),
             timeout_supervisor,
             recovery_coordinator,
-            native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
+            native_turn_event_delivery_workers: Arc::new(Default::default()),
             native_terminal_effect_kick_running: Arc::new(AtomicBool::new(false)),
             native_terminal_effect_kick_pending: Arc::new(AtomicBool::new(false)),
             native_lifecycle_readiness: Arc::new(
@@ -2568,20 +2568,16 @@ impl MessageProcessor {
                     Err(_) => {}
                 }
 
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::EventDelivery,
-                    pioneer_observability::DatabaseOperationSite::NativeEventDelivery,
-                    retry_transient_storage_access(|| {
-                        this.process_due_native_turn_event_deliveries(now, 64)
-                    }),
-                )
-                .await
-                {
-                    error!(
-                        error = %format!("{error:#}"),
-                        "native turn-event optional delivery worker failed"
-                    );
-                }
+                #[cfg(test)]
+                this.completed_history_preparation_barrier
+                    .wait_if_armed(
+                        "__event_delivery_recovery_before_kick__",
+                        &this.cli_history_shutdown,
+                    )
+                    .await;
+                // Periodic recovery shares the same consumer owners as commit
+                // kicks; a slow episodic effect cannot hold the next LIVE batch.
+                this.kick_native_turn_event_deliveries();
             })
             .catch_unwind()
             .await;
@@ -3324,6 +3320,16 @@ impl MessageProcessor {
 
     pub(crate) async fn shutdown_resilience_workers(&self) {
         self.cli_history_shutdown.cancel();
+        {
+            let workers = &self.native_turn_event_delivery_workers;
+            let _admission = workers
+                .admission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            workers.shutdown.cancel();
+            workers.tasks.close();
+        }
+        self.native_turn_event_delivery_workers.tasks.wait().await;
         for worker in [
             &self.resilience_worker,
             &self.task_event_listener_worker,
@@ -5026,7 +5032,7 @@ impl MessageProcessor {
             thread_title_publication_attempted: Arc::new(tokio::sync::Notify::new()),
             timeout_supervisor,
             recovery_coordinator,
-            native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
+            native_turn_event_delivery_workers: Arc::new(Default::default()),
             native_terminal_effect_kick_running: Arc::new(AtomicBool::new(false)),
             native_terminal_effect_kick_pending: Arc::new(AtomicBool::new(false)),
             native_lifecycle_readiness: Arc::new(

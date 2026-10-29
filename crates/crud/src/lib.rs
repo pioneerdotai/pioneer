@@ -5055,6 +5055,10 @@ impl CrudStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        // Local raw-SQL exception: SeaQuery 1.0's index hints only support
+        // MySQL, not SQLite INDEXED BY. Pin the existing run_id index so each
+        // run probes its own links instead of the task's entire run history.
+        // Keep both ownership predicates and the single global order/limit.
         let rows = self
             .connection
             .query_all_raw(Statement::from_sql_and_values(
@@ -5062,7 +5066,7 @@ impl CrudStore {
                 format!("SELECT t.thread_id, t.id AS turn_id, t.status, t.error \
                  FROM task_run r \
                  INNER JOIN task task_row ON task_row.id = r.task_id \
-                 INNER JOIN task_run_turn trt ON trt.run_id = r.id AND trt.task_id = r.task_id \
+                 INNER JOIN task_run_turn AS trt INDEXED BY idx_task_run_turn_run ON trt.run_id = r.id AND trt.task_id = r.task_id \
                  INNER JOIN \"turn\" t \
                     ON t.id = trt.turn_id AND t.thread_id = trt.thread_id \
                  WHERE t.turn_kind = 'conversation' \
@@ -35207,6 +35211,7 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 mod tests {
     mod authorization_reads;
     mod saved_history_read;
+    mod task_child_discovery;
     mod task_webhook;
     mod thread_read_pages;
     mod unread_start;
