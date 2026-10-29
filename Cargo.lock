@@ -10794,6 +10794,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "winresource",
  "zeroize",
+ "zip 8.6.0",
 ]
 
 [[package]]
