@@ -197,15 +197,28 @@ pub(crate) fn execute(
     }
 }
 
-pub(crate) fn default_user_command_bin_dir_label() -> &'static str {
+pub(crate) fn user_command_bin_dir_label() -> String {
     #[cfg(target_os = "windows")]
     {
-        return r"%LOCALAPPDATA%\Pioneer\bin";
+        if let Some(install) = managed_gateway_install()
+            && let Some(directory) = install.binary_path.parent()
+        {
+            return directory.display().to_string();
+        }
+        if let Ok(config) = pioneer_config::AppConfig::load()
+            && let (Ok(root), Ok(managed)) = (
+                config.install_root_directory_name(),
+                config.install_managed_directory_name(),
+            )
+        {
+            return format!(r"%LOCALAPPDATA%\{root}\{managed}\bin");
+        }
+        return r"%LOCALAPPDATA%\Pioneer\managed\bin".to_owned();
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        "~/.local/bin"
+        "~/.local/bin".to_owned()
     }
 }
 
@@ -220,7 +233,7 @@ pub(crate) fn warning_notification_messages(
                 return Some(
                     t!(
                         "gateway.notification.path_update_skipped",
-                        bin_dir = default_user_command_bin_dir_label()
+                        bin_dir = user_command_bin_dir_label()
                     )
                     .to_string(),
                 );

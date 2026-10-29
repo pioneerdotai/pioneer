@@ -20,6 +20,8 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 struct GateState {
     blocked: bool,
     flush_blocked: bool,
+    writes: u64,
+    flushed_writes: u64,
     reported: bool,
     failed: bool,
     waker: Option<Waker>,
@@ -29,6 +31,7 @@ struct GateState {
 struct WriteGate {
     state: Mutex<GateState>,
     entered: tokio::sync::Notify,
+    flushed: tokio::sync::Notify,
 }
 
 impl WriteGate {
@@ -51,6 +54,19 @@ impl WriteGate {
                 return;
             }
             entered.await;
+        }
+    }
+
+    async fn wait_flushed(&self) {
+        loop {
+            let flushed = self.flushed.notified();
+            {
+                let state = self.state.lock().unwrap();
+                if state.writes > 0 && state.flushed_writes == state.writes {
+                    return;
+                }
+            }
+            flushed.await;
         }
     }
 
@@ -127,7 +143,13 @@ impl AsyncWrite for GatedSocket {
                 return Poll::Pending;
             }
         }
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(count)) = &result
+            && *count > 0
+        {
+            self.gate.state.lock().unwrap().writes += 1;
+        }
+        result
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         {
@@ -141,7 +163,13 @@ impl AsyncWrite for GatedSocket {
                 return Poll::Pending;
             }
         }
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let result = Pin::new(&mut self.inner).poll_flush(cx);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            let mut state = self.gate.state.lock().unwrap();
+            state.flushed_writes = state.writes;
+            self.gate.flushed.notify_one();
+        }
+        result
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
@@ -335,14 +363,13 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
     let phase = std::cell::Cell::new("starting fixture");
     timeout(Duration::from_secs(10), async {
         let mut f = Fixture::start().await;
-        phase.set("completing warmup round trip");
-        let warmup = request(&f.commands, "synthetic/warmup");
-        assert_eq!(f.next_request().await["id"], warmup.id);
-        // Receiving bytes alone can precede the writer's flush. The monitor
-        // polls the writer before processing this reply, so completing the RPC
-        // keeps the gate below from catching the warmup's unfinished flush.
-        f.reply(&warmup.id).await;
-        assert!(receive(warmup.rx).await.is_ok());
+        phase.set("receiving first request");
+        let first = request(&f.commands, "synthetic/first");
+        assert_eq!(f.next_request().await["id"], first.id);
+        // Receiving bytes does not establish completion of their flush. Arm
+        // the next gate only after the preceding write has actually flushed.
+        phase.set("waiting for first request flush");
+        f.gate.wait_flushed().await;
         // The peer can respond before send/flush completes. Registration must
         // already exist, and response processing must not depend on writer exit.
         phase.set("receiving request with flush blocked");
@@ -364,9 +391,8 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
         assert_eq!(f.next_request().await["id"], flushed.id);
         f.reply(&flushed.id).await;
         assert!(receive(flushed.rx).await.is_ok());
-        phase.set("receiving first pending request");
-        let first = request(&f.commands, "synthetic/first");
-        assert_eq!(f.next_request().await["id"], first.id);
+        phase.set("waiting for round trip flush");
+        f.gate.wait_flushed().await;
         phase.set("waiting for blocked write");
         f.gate.block();
         let blocked = request(&f.commands, "synthetic/blocked");

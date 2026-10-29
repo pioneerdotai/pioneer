@@ -130,7 +130,7 @@ Release compilation and packaging are separate entrypoints. `build-gateway.py`
 and `build-desktop.py` retain compact runtime inputs and separate original link
 inputs. `cua-driver.py prepare` obtains the verified prebuilt runtime;
 `package-gateway.py` signs and creates the final Gateway asset from ready inputs.
-Desktop packagers consume that same full ZIP, bootstrap and checksums through
+Desktop packagers consume that same full ZIP, checksums and provenance through
 `release-inputs.py` and `PIONEER_GATEWAY_RUNTIME_DIR`. They require prepared inputs
 in every mode; `--skip-build` remains accepted and never triggers a nested build.
 The release workflow supplies the shared model catalog and run/commit/target
@@ -143,27 +143,7 @@ CUA 0.38.0 runtime. Install the complete CU archive; copying only `pioneer` cann
 the driver. The installer keeps the executable and `bin/cua` together and retains
 recovery files when schema compatibility is unknown.
 
-**Computer-use installations below 0.66.0 require a manual upgrade, including
-installations managed only through Desktop.** Fully quit Desktop first. Upgrade
-the Gateway on its host with the appropriate command:
-
-macOS / Linux:
-
-```bash
-curl -fsSL https://getpioneer.dev/install.sh | bash -s -- --computer-use
-```
-
-Windows PowerShell:
-
-```powershell
-$env:PIONEER_INSTALL_COMPUTER_USE="1"; iwr -useb https://getpioneer.dev/install.ps1 | iex
-```
-
-Then update Desktop separately from [GitHub Releases](https://github.com/pioneerdotai/pioneer/releases):
-on macOS open the appropriate DMG and replace the application; on Windows install
-the matching MSI; on Linux replace the matching AppImage and give it executable
-permission. Keep existing data and settings; no deletion or reset is required.
-Subsequent Gateway updates use the complete `-computer-use-package.zip` asset
+Gateway updates use the complete `-computer-use-package.zip` asset
 through `pioneer update` or `pioneer self-update`.
 
 Server/default installations retain their normal update procedure and do not
