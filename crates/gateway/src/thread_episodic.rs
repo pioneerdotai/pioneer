@@ -11368,18 +11368,22 @@ mod tests {
         unrelated.rollback().await.unwrap();
         old_work.abort();
         assert!(old_work.await.unwrap_err().is_cancelled());
-        // A canceled manual quantum retains its attempt for shutdown or the
-        // next quantum. Resume the executor so it drops the abandoned async
-        // ownership before waiting for the replacement's admission barrier.
-        assert_eq!(
-            executor_a
-                .run_once(chrono::Utc::now().timestamp())
-                .await
-                .unwrap()
-                .claimed,
-            0
+        // Recovery releases the abandoned async ownership, then joins the
+        // workspace. The queued reset may acquire it first and pause at its
+        // provider, so recovery must run alongside the rest of this scenario.
+        let recovery = tokio::spawn({
+            let executor = executor_a.clone();
+            async move { executor.run_once(chrono::Utc::now().timestamp()).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), reset_started_rx)
+            .await
+            .expect("reset did not acquire the abandoned workspace")
+            .unwrap();
+        let executor_b = ThreadEpisodicIndexExecutor::new(
+            store.clone(),
+            Arc::new(MemvidThreadEpisodicBackend::new()),
+            executor_a.payload_provider.clone(),
         );
-        reset_started_rx.await.unwrap();
         // The transition owns this workspace, but canonical source/job writes
         // remain available. Ordinary indexing cannot claim the new durable job.
         let during = seed_pending_thread_episodic_item(
@@ -11412,8 +11416,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // Another workspace must still execute, even when all the earlier due
-        // jobs belong to the workspace whose transition currently owns it.
+        // An independent executor must still index another workspace while
+        // this transition owns the workspace that has the earlier due jobs.
         use sea_orm::{EntityTrait, Set};
         let other_workspace = "ownership_other_workspace";
         let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().into();
@@ -11445,7 +11449,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            executor_a
+            executor_b
                 .run_once(chrono::Utc::now().timestamp())
                 .await
                 .unwrap()
@@ -11473,7 +11477,7 @@ mod tests {
         assert_eq!(
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                executor_a.run_once(chrono::Utc::now().timestamp())
+                executor_b.run_once(chrono::Utc::now().timestamp())
             )
             .await
             .unwrap()
@@ -11492,6 +11496,12 @@ mod tests {
         );
         release_tx.send(()).unwrap();
         let result = reset.await.unwrap().unwrap();
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(5), recovery)
+            .await
+            .expect("executor recovery did not finish after reset")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.claimed, 0);
         assert_eq!(result.completed_jobs, 3);
         assert_eq!(model_b.calls(), 3);
         for source in [&ready, &extra, &during] {
