@@ -143,28 +143,7 @@ CUA 0.38.0 runtime. Install the complete CU archive; copying only `pioneer` cann
 the driver. The installer keeps the executable and `bin/cua` together and retains
 recovery files when schema compatibility is unknown.
 
-**Existing computer-use installations require a manual upgrade to the single-runtime
-layout, including installations managed only through Desktop.** This follows the
-[0.66.0 release upgrade model](https://github.com/pioneerdotai/pioneer/releases/tag/0.66.0).
-Fully quit Desktop first. Upgrade the Gateway on its host with the current installer:
-
-macOS / Linux:
-
-```bash
-curl -fsSL https://getpioneer.dev/install.sh | bash -s -- --computer-use
-```
-
-Windows PowerShell:
-
-```powershell
-$env:PIONEER_INSTALL_COMPUTER_USE="1"; iwr -useb https://getpioneer.dev/install.ps1 | iex
-```
-
-Then update Desktop separately from [GitHub Releases](https://github.com/pioneerdotai/pioneer/releases):
-on macOS open the appropriate DMG and replace the application; on Windows install
-the matching MSI; on Linux replace the matching AppImage and give it executable
-permission. Keep existing data and settings; no deletion or reset is required.
-Subsequent Gateway updates use the complete `-computer-use-package.zip` asset
+Gateway updates use the complete `-computer-use-package.zip` asset
 through `pioneer update` or `pioneer self-update`.
 
 Server/default installations retain their normal update procedure and do not
