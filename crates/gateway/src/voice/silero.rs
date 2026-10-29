@@ -39,11 +39,11 @@ impl SileroV4Session {
         let session = Session::builder()?
             // Drop the recoverable builder before converting errors to anyhow.
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(ort::Error::from)?
+            .map_err(ort::Error::<()>::from)?
             .with_intra_threads(1)
-            .map_err(ort::Error::from)?
+            .map_err(ort::Error::<()>::from)?
             .with_inter_threads(1)
-            .map_err(ort::Error::from)?
+            .map_err(ort::Error::<()>::from)?
             .commit_from_file(path)?;
         Ok(Self {
             session,
