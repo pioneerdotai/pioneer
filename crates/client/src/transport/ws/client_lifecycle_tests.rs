@@ -332,16 +332,21 @@ async fn ready_inbound_does_not_starve_outgoing_request_admission() {
 
 #[tokio::test]
 async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
+    let phase = std::cell::Cell::new("starting fixture");
     timeout(Duration::from_secs(10), async {
         let mut f = Fixture::start().await;
+        phase.set("receiving first request");
         let first = request(&f.commands, "synthetic/first");
         assert_eq!(f.next_request().await["id"], first.id);
         // The peer can respond before send/flush completes. Registration must
         // already exist, and response processing must not depend on writer exit.
+        phase.set("receiving request with flush blocked");
         f.gate.block_flush();
         let fast = request(&f.commands, "synthetic/fast");
         assert_eq!(f.next_request().await["id"], fast.id);
+        phase.set("waiting for blocked flush");
         f.gate.wait_entered().await;
+        phase.set("receiving response while flush is blocked");
         f.reply(&fast.id).await;
         assert!(receive(fast.rx).await.is_ok());
         assert!(f.gate.state.lock().unwrap().flush_blocked);
@@ -349,14 +354,17 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
         // A peer reply can arrive while the writer still owns the previous
         // flush. Complete a round trip with the gate open before blocking the
         // next write, so that write owns the writer and leaves the handoff free.
+        phase.set("completing round trip after flush release");
         let flushed = request(&f.commands, "synthetic/after-flush");
         assert_eq!(f.next_request().await["id"], flushed.id);
         f.reply(&flushed.id).await;
         assert!(receive(flushed.rx).await.is_ok());
+        phase.set("waiting for blocked write");
         f.gate.block();
         let blocked = request(&f.commands, "synthetic/blocked");
         f.gate.wait_entered().await;
 
+        phase.set("filling writer handoff");
         let (admitted, admitted_rx) = mpsc::channel();
         let transport = QueueTransport {
             commands: f.commands.clone(),
@@ -378,13 +386,16 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
         );
 
         // A ready response must complete while poll_write remains blocked.
+        phase.set("receiving response while write is blocked");
         f.reply(&first.id).await;
         assert_eq!(receive(first.rx).await.unwrap(), json!({"ok":true}));
         assert!(f.gate.state.lock().unwrap().blocked);
+        phase.set("waiting for queued request timeout");
         assert_eq!(
             timed.await.unwrap().unwrap_err().to_string(),
             crate::rpc::request_timeout_message("synthetic/timeout")
         );
+        phase.set("receiving blocked request after write release");
         f.reply(&timed_id).await; // late response cannot recreate observation
         f.gate.release(false);
         assert_eq!(f.next_request().await["id"], blocked.id);
@@ -407,15 +418,17 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
             })
             .unwrap();
         assert!(receive(rx).await.is_err());
+        phase.set("receiving marker after retired frames");
         let marker = request(&f.commands, "synthetic/marker");
         assert_eq!(f.next_request().await["id"], marker.id);
         f.reply(&marker.id).await;
         assert!(receive(marker.rx).await.is_ok());
+        phase.set("closing connection");
         f.peer.send(Message::Close(None)).await.unwrap();
         assert_eq!(f.task.await.unwrap(), WEBSOCKET_CLOSED_BY_PEER_MESSAGE);
     })
     .await
-    .expect("monitor regression timed out");
+    .unwrap_or_else(|_| panic!("monitor regression timed out while {}", phase.get()));
 }
 
 #[derive(Clone, Copy, Debug)]
