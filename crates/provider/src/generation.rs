@@ -632,6 +632,15 @@ fn responses_fields_with_model(
             ReasoningConfig::Disabled => "none",
             ReasoningConfig::Effort(effort) => effort.as_str(),
         };
+        // A catalog mapping for another API is not a Responses contract.
+        // A selected control advertised by this authority remains authoritative.
+        ensure!(
+            model.api == "openai-responses"
+                || native.get(&format!("effort.{selected}")) == Some(&Some(true))
+                || selected_off(request.reasoning)
+                    && native.get("thinking.types.disabled") == Some(&Some(true)),
+            "catalog model uses a different API profile; unverified Responses effort contract"
+        );
         ensure!(
             !denies("reasoning.supported")
                 && (toggle_off || !denies("effort.supported") && !denies("effort.enum"))
@@ -936,7 +945,9 @@ fn chat_fields_with_model(
                 );
             }
             ensure!(
-                compat.is_none_or(|c| c["supportsReasoningEffort"] != false) && mapped.is_some(),
+                (provider == "ollama" && off
+                    || compat.is_none_or(|c| c["supportsReasoningEffort"] != false))
+                    && mapped.is_some(),
                 "{provider}/{} has no documented mapping for selected reasoning `{effort}`",
                 request.model
             );
