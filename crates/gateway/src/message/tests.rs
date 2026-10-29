@@ -15404,7 +15404,7 @@ async fn detached_composer_live_ordering_impl() {
     assert_eq!(task.goal, task.title);
     assert!(task.goal.chars().count() <= 96);
     let saved = store.get_task(&task.id).await.unwrap().unwrap();
-    assert_eq!(saved.agent_spec.as_ref().unwrap().prompt.goal, task.title);
+    assert_eq!(saved.agent_specs.first().unwrap().prompt.goal, task.title);
     let launch = &task
         .metadata
         .as_ref()
@@ -15497,7 +15497,7 @@ async fn assert_composer_durable_size_admission(
     // The durable spec round-trips to its input type; reset only the input depth
     // which ordinary Composer admission supplies before service normalization.
     let mut spec: TaskAgentSpecInput = serde_json::from_value(
-        serde_json::to_value(prototype.agent_spec.as_ref().unwrap()).unwrap(),
+        serde_json::to_value(prototype.agent_specs.first().unwrap()).unwrap(),
     )
     .unwrap();
     spec.depth = 0;
@@ -25994,7 +25994,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         )
     });
     if let Some(text) = composer_text.as_ref() {
-        let launch: TurnStartParams = serde_json::from_value(json!({
+        let launch: pioneer_protocol::TurnStartParams = serde_json::from_value(json!({
             "thread_id": parent_thread_id, "turn_id": source_turn_id,
             "input": [{"type":"text", "text":text}],
             "model":"test-model", "model_provider":"openai", "mode":"Agent"
