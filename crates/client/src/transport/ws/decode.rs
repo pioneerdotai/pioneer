@@ -22,10 +22,7 @@ pub fn process_text_payload(
         String,
         Sender<std::result::Result<SkillsUploadChunkAckNotification, String>>,
     >,
-    pending_artifact_upload_chunks: &mut HashMap<
-        String,
-        Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
-    >,
+    pending_artifact_upload_chunks: &mut PendingJsonRpcRequests,
     event_tx: &super::client::GatewayWsEventSender,
 ) -> Option<GatewayNotification> {
     let value = match serde_json::from_str::<JsonValue>(payload) {
@@ -68,7 +65,7 @@ pub fn process_text_payload(
     {
         let key = upload_ack_key(ack.upload_id.as_str(), ack.offset);
         if let Some(response_tx) = pending_artifact_upload_chunks.remove(&key) {
-            let _ = response_tx.send(Ok(ack.clone()));
+            let _ = response_tx.send(Ok(serde_json::to_value(&ack).expect("artifact chunk ACK")));
         }
     }
 
@@ -101,13 +98,10 @@ pub fn fail_pending_upload_chunks(
 }
 
 pub fn fail_pending_artifact_upload_chunks(
-    pending_upload_chunks: &mut HashMap<
-        String,
-        Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
-    >,
+    pending_upload_chunks: &mut PendingJsonRpcRequests,
     error: &str,
 ) {
-    fail_pending_transfer_chunks(pending_upload_chunks, error);
+    pending_upload_chunks.fail_all(error);
 }
 
 #[cfg(test)]
@@ -126,7 +120,7 @@ mod tests {
         let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let payload = json!({
             "jsonrpc": "2.0",
             "method": "item/tool.started",
@@ -166,7 +160,7 @@ mod tests {
         let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let payload = json!({
             "jsonrpc": "2.0",
             "method": events::ITEM_COMPLETED,
@@ -229,7 +223,7 @@ mod tests {
         let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let payload = json!({
             "jsonrpc": "2.0",
             "method": "thread/updated",
@@ -282,7 +276,7 @@ mod tests {
         let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let payload = json!({
             "jsonrpc": "2.0",
             "method": events::WORKSPACE_CHANGED,
@@ -331,7 +325,7 @@ mod tests {
         let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let payload = json!({
             "jsonrpc": "2.0",
             "method": events::ACCESS_CHANGED,
@@ -376,9 +370,15 @@ mod tests {
         let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-        pending_artifact_upload_chunks.insert(upload_ack_key("artifact_upload_1", 0), ack_tx);
+        pending_artifact_upload_chunks.insert(
+            upload_ack_key("artifact_upload_1", 0),
+            crate::rpc::JsonRpcResponseSender::new(
+                ack_tx,
+                std::time::Instant::now() + Duration::from_secs(1),
+            ),
+        );
         let payload = json!({
             "jsonrpc": "2.0",
             "method": events::ARTIFACT_UPLOAD_CHUNK_ACK,
@@ -406,6 +406,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("expected artifact ack")
             .expect("ack should be ok");
+        let ack: ArtifactUploadChunkAckNotification = serde_json::from_value(ack).unwrap();
         assert_eq!(ack.workspace_id, "ws_1");
         assert_eq!(ack.upload_id, "artifact_upload_1");
         assert!(pending_artifact_upload_chunks.is_empty());
@@ -415,7 +416,7 @@ mod tests {
     fn decode_routes_json_rpc_response_to_pending_request() {
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let (response_tx, response_rx) = std::sync::mpsc::channel();
         pending_requests.insert(
             "req_1".to_owned(),

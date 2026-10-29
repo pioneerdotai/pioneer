@@ -3234,6 +3234,19 @@ impl TurnMcpValidatedExecution for McpService {
             };
             let result = match outcome {
                 Ok(result) => result,
+                Err(error) if native_family == Some(crate::turn_mcp::native_tools::NativeToolFamily::Threads)
+                    && crate::message::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(&validated.binding.raw_tool_name.as_str())
+                    && !matches!(error, pioneer_tools::ToolError::Cancelled(_)) => {
+                    let (message, reason) = crate::message::thread_read_tools::public_read_error(&error);
+                    let payload = json!({"error": message});
+                    return Ok(CanonicalMcpToolResult {
+                        content: json!([{"type":"text", "text":payload.to_string()}]),
+                        structured_content: Some(payload),
+                        is_error: true,
+                        duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        meta: Some(json!({"pioneer":{"reasonCode":reason}})),
+                    });
+                }
                 Err(error) if native_tasks && validated.binding.raw_tool_name != "threads_start_options"
                     && !matches!(error, pioneer_tools::ToolError::Cancelled(_)) => {
                     return Ok(canonical_task_error_result(error, started.elapsed()));
