@@ -4,7 +4,8 @@ use pioneer_memory::hooks::{
     MemoryEpisodicRecallCapabilities, MemoryEpisodicRecallResponse,
 };
 
-/// Production recall uses the same authorized indexed search as threads_search.
+/// Optional recall adapter sharing the authorized indexed search of threads_search.
+/// Not installed in the production Memory hook runtime.
 pub(crate) struct ThreadEpisodicMemoryRecallProvider {
     processor: std::sync::Weak<crate::message::MessageProcessor>,
 }
