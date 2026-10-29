@@ -2182,12 +2182,14 @@ mod tests {
                 receiver,
             )
             .unwrap();
-        // Preload four seconds before starting the real processor. At the 3 s
-        // tick there is still backlog; the next 3 s tick will never arrive.
+        // Preload four seconds and a seven-sample tail before starting the real
+        // processor. At the 3 s tick there is still backlog; the next 3 s tick
+        // will never arrive. Commit must retain the incomplete VAD frame.
         for sequence in 0..40 {
-            let pcm: Vec<_> = std::iter::repeat_n(12000_i16, 1600)
-                .flat_map(i16::to_le_bytes)
-                .collect();
+            let pcm: Vec<_> =
+                std::iter::repeat_n(12000_i16, if sequence == 39 { 1607 } else { 1600 })
+                    .flat_map(i16::to_le_bytes)
+                    .collect();
             store
                 .append_chunk(
                     VoiceChunkFrameHeader {
@@ -2207,7 +2209,7 @@ mod tests {
         let (entered, receive) = std::sync::mpsc::channel();
         let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
             entered.send(buffer.speech_samples()).unwrap();
-            Ok(if buffer.speech_samples() < 64000 {
+            Ok(if buffer.speech_samples() < 64007 {
                 "ранняя ошибка"
             } else {
                 "исправлено"
@@ -2221,15 +2223,15 @@ mod tests {
             // still owned by the processor and must reach the final call.
             let _completion = store.finish_processing("session").unwrap();
             let result = worker.join().unwrap().unwrap();
-            assert_eq!(before_commit.unwrap(), 63840);
+            assert_eq!(before_commit.unwrap(), 64000);
             let GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. } = result else {
                 panic!("contextual transcript expected");
             };
-            assert_eq!(receive.try_recv().unwrap(), 64000);
+            assert_eq!(receive.try_recv().unwrap(), 64007);
             assert!(receive.try_recv().is_err());
             assert_eq!(transcript.text, "исправлено");
-            assert_eq!(transcript.diagnostics.speech_samples, 64000);
-            assert_eq!(transcript.diagnostics.total_samples, 64000);
+            assert_eq!(transcript.diagnostics.speech_samples, 64007);
+            assert_eq!(transcript.diagnostics.total_samples, 64007);
         });
     }
 
