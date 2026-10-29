@@ -1,5 +1,6 @@
 //! WebSocket client worker.
 
+use super::runtime::{SocketLifetime, SocketReceipt};
 use super::{
     GatewayWsConnectSpec, GatewayWsEvent,
     decode::{
@@ -18,10 +19,8 @@ use super::{
 use crate::rpc::{JsonRpcResponseSender, PendingJsonRpcRequests};
 use anyhow::{Context as _, Result};
 use futures_util::{SinkExt, StreamExt, future::Either};
-use pioneer_protocol::{
-    ArtifactUploadChunkAckNotification, AuthSecretString, GatewayNotification,
-    SkillsUploadChunkAckNotification,
-};
+use pioneer_protocol::{AuthSecretString, GatewayNotification, SkillsUploadChunkAckNotification};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, sync::mpsc::Sender, thread};
 use tokio::{
@@ -183,10 +182,11 @@ pub enum GatewayWsCommand {
         response_tx: Sender<std::result::Result<SkillsUploadChunkAckNotification, String>>,
     },
     ArtifactBinaryUploadChunk {
+        expected_connection: Option<u64>,
         upload_id: String,
         offset: u64,
         payload: Vec<u8>,
-        response_tx: Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
+        response_tx: JsonRpcResponseSender,
     },
     VoiceBinaryChunk {
         expected_connection: Option<u64>,
@@ -221,7 +221,7 @@ enum ConnectionRpcCommand {
         upload_id: String,
         offset: u64,
         payload: Vec<u8>,
-        response_tx: Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
+        response_tx: JsonRpcResponseSender,
     },
     VoiceBinaryChunk {
         payload: Vec<u8>,
@@ -238,7 +238,7 @@ impl ConnectionRpcCommand {
                 let _ = response_tx.send(Err(reason.to_owned()));
             }
             Self::ArtifactBinaryUploadChunk { response_tx, .. } => {
-                let _ = response_tx.send(Err(reason.to_owned()));
+                let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(reason)));
             }
             Self::VoiceBinaryChunk { .. } => {}
         }
@@ -281,9 +281,10 @@ struct ActiveConnectionTask {
     rpc_tx: WsSender<ConnectionRpcCommand>,
 }
 
-pub fn spawn_worker(
+pub(crate) fn spawn_worker(
     command_rx: UnboundedReceiver<WorkItem<GatewayWsCommand>>,
     event_tx: GatewayWsEventSender,
+    socket: Arc<Mutex<Option<SocketReceipt>>>,
 ) {
     let worker_work = pioneer_observability::work::WorkCarrier::child(
         Boundary::StdThread,
@@ -300,7 +301,7 @@ pub fn spawn_worker(
         _runtime_observer.block_on(
             &runtime,
             worker_work.scope(async move {
-                run_worker(command_rx, event_tx).await;
+                run_worker(command_rx, event_tx, socket).await;
             }),
         );
     });
@@ -309,6 +310,7 @@ pub fn spawn_worker(
 async fn run_worker(
     mut command_rx: UnboundedReceiver<WorkItem<GatewayWsCommand>>,
     event_tx: GatewayWsEventSender,
+    socket: Arc<Mutex<Option<SocketReceipt>>>,
 ) {
     let mut connection_task: Option<ActiveConnectionTask> = None;
 
@@ -325,7 +327,12 @@ async fn run_worker(
             ExecutorRole::ClientWs,
         );
         let proceed = carrier
-            .scope(handle_command(command, &mut connection_task, &event_tx))
+            .scope(handle_command(
+                command,
+                &mut connection_task,
+                &event_tx,
+                &socket,
+            ))
             .await;
         if let Some(queue) = queue.as_mut() {
             queue.processed();
@@ -340,6 +347,7 @@ async fn handle_command(
     command: GatewayWsCommand,
     connection_task: &mut Option<ActiveConnectionTask>,
     event_tx: &GatewayWsEventSender,
+    socket: &Arc<Mutex<Option<SocketReceipt>>>,
 ) -> bool {
     match command {
         GatewayWsCommand::Connect {
@@ -364,6 +372,7 @@ async fn handle_command(
                         event_tx.clone(),
                         ConnectionCommandReceiver(rpc_rx),
                         None,
+                        socket.clone(),
                     ),
                 )),
                 rpc_tx,
@@ -397,6 +406,7 @@ async fn handle_command(
                                 event_tx.clone(),
                                 ConnectionCommandReceiver(rpc_rx),
                                 Some(stream),
+                                socket.clone(),
                             ),
                         )),
                         rpc_tx,
@@ -506,16 +516,25 @@ async fn handle_command(
             }
         }
         GatewayWsCommand::ArtifactBinaryUploadChunk {
+            expected_connection,
             upload_id,
             offset,
             payload,
             response_tx,
         } => {
             let Some(connection_task) = connection_task.as_mut() else {
-                let _ = response_tx.send(Err("websocket is not connected".to_owned()));
+                let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                    "websocket is not connected",
+                )));
                 return true;
             };
 
+            if !response_tx.is_active()
+                || expected_connection.is_some_and(|id| id != connection_task.connection_id)
+            {
+                response_tx.cancel();
+                return true;
+            }
             let fallback_tx = response_tx.clone();
             if connection_task
                 .rpc_tx
@@ -527,8 +546,9 @@ async fn handle_command(
                 })
                 .is_err()
             {
-                let _ =
-                    fallback_tx.send(Err("websocket connection task is unavailable".to_owned()));
+                let _ = fallback_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                    "websocket connection task is unavailable",
+                )));
             }
         }
         GatewayWsCommand::VoiceBinaryChunk {
@@ -579,6 +599,7 @@ async fn run_connection_task(
     event_tx: GatewayWsEventSender,
     mut rpc_rx: ConnectionCommandReceiver,
     mut established_stream: Option<GatewayWebSocket>,
+    socket: Arc<Mutex<Option<SocketReceipt>>>,
 ) {
     let mut has_connected = false;
     let mut attempt: u32 = 0;
@@ -610,15 +631,24 @@ async fn run_connection_task(
                 attempt = 0;
                 backoff = spec.timings.reconnect_initial;
 
+                let receipt = SocketReceipt::new(connection_id);
+                *socket.lock().unwrap() = Some(receipt.clone());
+                let _lifetime = SocketLifetime(receipt.clone());
                 if let Some(sender) = initial_result_tx.take() {
                     let _ = sender.send(Ok(()));
                 }
 
                 let _ = event_tx.send(connected_event(connection_id, &spec));
 
-                let reason =
-                    monitor_connection(stream, &mut spec, connection_id, &event_tx, &mut rpc_rx.0)
-                        .await;
+                let reason = monitor_connection(
+                    stream,
+                    &mut spec,
+                    connection_id,
+                    &event_tx,
+                    &mut rpc_rx.0,
+                    receipt,
+                )
+                .await;
 
                 let _ = event_tx.send(disconnected_event(connection_id, &spec, reason.clone()));
 
@@ -791,8 +821,7 @@ struct ConnectionWaiters {
     requests: PendingJsonRpcRequests,
     renewal: Option<PendingAccessRenewal>,
     uploads: HashMap<String, Sender<std::result::Result<SkillsUploadChunkAckNotification, String>>>,
-    artifact_uploads:
-        HashMap<String, Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>>,
+    artifact_uploads: PendingJsonRpcRequests,
 }
 
 impl ConnectionWaiters {
@@ -821,6 +850,7 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     connection_id: u64,
     event_tx: &GatewayWsEventSender,
     rpc_rx: &mut UnboundedReceiver<WorkItem<ConnectionRpcCommand>>,
+    receipt: SocketReceipt,
 ) -> String {
     let (writer, mut reader) = stream.split();
     let (data_tx, data_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
@@ -835,9 +865,10 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
         requests: PendingJsonRpcRequests::default(),
         renewal: None,
         uploads: HashMap::new(),
-        artifact_uploads: HashMap::new(),
+        artifact_uploads: PendingJsonRpcRequests::default(),
     };
 
+    let _lifetime = SocketLifetime(receipt.clone());
     let mut prefer_commands = false;
     let disconnect_reason = loop {
         let renewal_deadline = waiters.renewal.as_ref().map_or_else(
@@ -1017,11 +1048,12 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                         }
                     }
                     Some(ConnectionRpcCommand::ArtifactBinaryUploadChunk { upload_id, offset, payload, response_tx }) => {
+                        if !response_tx.is_active() { response_tx.cancel(); return None; }
                         let ack_key = upload_ack_key(upload_id.as_str(), offset);
-                        waiters.artifact_uploads.insert(ack_key.clone(), response_tx);
-                        if data_tx.try_send(WriterFrame::new(Message::Binary(payload.into()), None)).is_err() {
+                        waiters.artifact_uploads.insert(ack_key.clone(), response_tx.clone());
+                        if data_tx.try_send(WriterFrame::new(Message::Binary(payload.into()), Some(response_tx))).is_err() {
                             if let Some(response_tx) = waiters.artifact_uploads.remove(&ack_key) {
-                                let _ = response_tx.send(Err("websocket writer handoff full or closed".to_owned()));
+                                let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport("websocket writer handoff full or closed")));
                             }
                         }
                     }
@@ -1042,6 +1074,7 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
             }
         }
     };
+    receipt.retire();
     waiters.fail_all(&disconnect_reason);
     fail_queued_connection_commands(rpc_rx, &disconnect_reason);
     disconnect_reason
@@ -1078,7 +1111,15 @@ mod tests {
         let events = GatewayWsEventSender::from(events);
         let (commands, mut command_rx) = work_channel(Boundary::ClientRpc);
         let task = tokio::spawn(async move {
-            monitor_connection(stream, &mut spec, 7, &events, &mut command_rx).await;
+            monitor_connection(
+                stream,
+                &mut spec,
+                7,
+                &events,
+                &mut command_rx,
+                SocketReceipt::new(7),
+            )
+            .await;
             spec
         });
         let request = crate::rpc::build_json_rpc_request_payload(
@@ -1183,7 +1224,7 @@ mod tests {
         let server = TestWsServer::start(gateway_base_url.clone());
         let (command_tx, command_rx) = work_channel(Boundary::ClientCommand);
         let (event_tx, event_rx) = mpsc::channel();
-        spawn_worker(command_rx, event_tx.into());
+        spawn_worker(command_rx, event_tx.into(), Arc::default());
 
         let (initial_tx, initial_rx) = mpsc::channel();
         command_tx

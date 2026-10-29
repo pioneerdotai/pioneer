@@ -1110,6 +1110,7 @@ pub struct ClientCore {
     pub(crate) gateway_transport_leases:
         Mutex<crate::gateway::session_controller::GatewayTransportLeases>,
     pub(crate) gateway_transport_ready: std::sync::Condvar,
+    pub(crate) send_readiness: Arc<(Mutex<u64>, std::sync::Condvar)>,
     gateway_task: Mutex<Option<std::thread::JoinHandle<()>>>,
     stopped: std::sync::atomic::AtomicBool,
     partitions: Mutex<ClientPartitions>,
@@ -1327,6 +1328,7 @@ impl ClientCore {
             session_transport: Mutex::default(),
             gateway_transport_leases: Mutex::default(),
             gateway_transport_ready: std::sync::Condvar::new(),
+            send_readiness: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
             gateway_session: Mutex::default(),
             gateway_task: Mutex::default(),
             stopped: std::sync::atomic::AtomicBool::new(false),
@@ -1512,6 +1514,7 @@ impl ClientCore {
         &self,
         owner: &crate::gateway::session_controller::GatewaySessionController,
     ) {
+        self.notify_send_readiness();
         let publication = owner.publication();
         if self
             .snapshot(&ClientScope::Session)
@@ -1648,6 +1651,56 @@ impl ClientCore {
         }
     }
 
+    /// Capture before reading the owner predicate. Never acquire another owner
+    /// lock while holding the signal lock; publishers may signal under theirs.
+    pub(crate) fn send_readiness_sequence(&self) -> u64 {
+        *self
+            .send_readiness
+            .0
+            .lock()
+            .expect("Send readiness poisoned")
+    }
+
+    pub(crate) fn notify_send_readiness(&self) {
+        let mut sequence = self
+            .send_readiness
+            .0
+            .lock()
+            .expect("Send readiness poisoned");
+        *sequence = sequence
+            .checked_add(1)
+            .expect("Send readiness sequence exhausted");
+        self.send_readiness.1.notify_all();
+    }
+
+    pub(crate) fn wait_send_readiness(
+        &self,
+        sequence: u64,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<()> {
+        let current = self
+            .send_readiness
+            .0
+            .lock()
+            .expect("Send readiness poisoned");
+        if *current == sequence && !self.is_stopped() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            anyhow::ensure!(!remaining.is_zero(), "Send deadline exceeded");
+            drop(
+                self.send_readiness
+                    .1
+                    .wait_timeout(current, remaining)
+                    .expect("Send readiness wait poisoned"),
+            );
+        }
+        anyhow::ensure!(!self.is_stopped(), "Client stopped");
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "Send deadline exceeded"
+        );
+        Ok(())
+    }
+
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -1656,6 +1709,7 @@ impl ClientCore {
         if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        self.cancel_composer_send_budgets();
         self.session_driver
             .lock()
             .expect("session driver poisoned")
@@ -2862,6 +2916,20 @@ impl ClientCore {
             }
             let effects = accepted_effects;
 
+            // Reconcile only accepted publications. A rejected or stale draft
+            // cannot cancel the budget of a newer Composer operation. This also
+            // covers the identity fence's direct commit_publications path.
+            for draft in &changed_drafts {
+                if let ClientScope::Composer { thread_id } = &draft.scope {
+                    self.reconcile_composer_send_budget(
+                        thread_id,
+                        draft
+                            .payload
+                            .downcast_ref::<crate::composer::store::ComposerPublication>(),
+                    );
+                }
+            }
+
             if changed_drafts.is_empty() && effects.is_empty() {
                 return Self::transition_without_publication(
                     &partitions,
@@ -2956,6 +3024,7 @@ impl ClientCore {
         if change == IdentityPublicationChange::Update {
             self.resume_settings_demand(projections);
         }
+        self.notify_send_readiness();
         let evict_protected = change != IdentityPublicationChange::Update;
         let reset_session = change == IdentityPublicationChange::ResetSession;
         let mut composer_publications = Vec::new();
@@ -3357,7 +3426,7 @@ mod tests {
                     0,
                     &mut crate::rpc::PendingJsonRpcRequests::default(),
                     &mut HashMap::new(),
-                    &mut HashMap::new(),
+                    &mut crate::rpc::PendingJsonRpcRequests::default(),
                     &sender,
                 ),
                 Some(pioneer_protocol::GatewayNotification::ThreadUpdated(_))
