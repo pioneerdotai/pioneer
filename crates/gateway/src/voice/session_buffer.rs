@@ -805,7 +805,10 @@ mod tests {
                     );
                 } else {
                     assert_eq!(
-                        result.unwrap_err().kind,
+                        result
+                            .err()
+                            .expect("incomplete audio must be rejected")
+                            .kind,
                         VoiceChunkIngestErrorKind::IncompleteAudio,
                         "{case} incremental={incremental}"
                     );
@@ -920,7 +923,11 @@ mod tests {
                 .already_buffered
         );
         assert_eq!(
-            store.finish_processing("session").unwrap_err().kind,
+            store
+                .finish_processing("session")
+                .err()
+                .expect("sequence gap must prevent close")
+                .kind,
             VoiceChunkIngestErrorKind::IncompleteAudio
         );
         assert!(token.is_cancelled());

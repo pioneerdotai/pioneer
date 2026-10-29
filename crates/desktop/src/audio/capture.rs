@@ -1067,7 +1067,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                DesktopNativeSamples::I8,
+                |samples| DesktopNativeSamples::I8(samples),
             ),
             SampleFormat::I16 => build_stream::<i16>(
                 &device,
@@ -1075,7 +1075,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                DesktopNativeSamples::I16,
+                |samples| DesktopNativeSamples::I16(samples),
             ),
             SampleFormat::I32 => build_stream::<i32>(
                 &device,
@@ -1083,7 +1083,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                DesktopNativeSamples::I32,
+                |samples| DesktopNativeSamples::I32(samples),
             ),
             SampleFormat::U8 => build_stream::<u8>(
                 &device,
@@ -1091,7 +1091,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                DesktopNativeSamples::U8,
+                |samples| DesktopNativeSamples::U8(samples),
             ),
             SampleFormat::U16 => build_stream::<u16>(
                 &device,
@@ -1099,7 +1099,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                DesktopNativeSamples::U16,
+                |samples| DesktopNativeSamples::U16(samples),
             ),
             SampleFormat::U32 => build_stream::<u32>(
                 &device,
@@ -1107,7 +1107,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                DesktopNativeSamples::U32,
+                |samples| DesktopNativeSamples::U32(samples),
             ),
             SampleFormat::F32 => build_stream::<f32>(
                 &device,
@@ -1115,7 +1115,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                DesktopNativeSamples::F32,
+                |samples| DesktopNativeSamples::F32(samples),
             ),
             SampleFormat::F64 => build_stream::<f64>(
                 &device,
@@ -1123,7 +1123,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                DesktopNativeSamples::F64,
+                |samples| DesktopNativeSamples::F64(samples),
             ),
             other => {
                 let sample_format = other.to_string();
