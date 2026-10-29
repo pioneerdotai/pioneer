@@ -310,6 +310,21 @@ fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
                     .any(|old| old["id"] == target["id"])
             })
             .unwrap();
+        let created_row = pioneer_entity::agent_action_outbox::Entity::find_by_id(
+            created["outboxId"].as_str().unwrap(),
+        )
+        .one(&processor.crud_store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+        let created_payload: JsonValue = serde_json::from_str(&created_row.payload_json).unwrap();
+        // This regression owns committed foreground CLI dispatch. The
+        // Collaborative Task path has its own facade/lifecycle regression.
+        super::thread_launch_choices::foreground_target_fixture(
+            &processor,
+            created_payload["created_thread_id"].as_str().unwrap(),
+        )
+        .await;
         let arguments = json!({
             "targetOptionId": target["id"],
             "input": [{"type":"text", "text":"First command in the delegated CLI root"}]
@@ -5873,8 +5888,15 @@ fn cli_threads_collaborative_admission_uses_one_detached_task_and_normal_stop() 
             .cli_session
             .set_next_native_turn_id("shared-detached-child")
             .await;
+        let identity = options["identities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|identity| identity["sourceKind"] == "cli_runtime_instance")
+            .unwrap()["id"]
+            .clone();
         let arguments = json!({"targetOptionId":target,"input":[{"type":"text","text":"Continue independently"}],
-            "launch":{"profile":{"kind":"model","providerId":format!("cli_runtime:{}", harness.runtime_id),"modelId":"threads-cli-choice"},"reasoning":{"effort":"high"}}});
+            "launch":{"identity":{"kind":"exact","id":identity},"profile":{"kind":"model","providerId":format!("cli_runtime:{}", harness.runtime_id),"modelId":"threads-cli-choice"},"reasoning":{"effort":"high"}}});
         let started = facade
             .call(
                 "shared-start",
@@ -5962,6 +5984,7 @@ fn cli_threads_collaborative_admission_uses_one_detached_task_and_normal_stop() 
             .unwrap()
             .unwrap();
         assert!(contract.work_graph_root_execution_id.is_none());
+        assert_eq!(contract.resolved_identity_id.as_deref(), identity.as_str());
         let starts = wait_for_cli_runtime_turn_starts(&harness.cli_session, 2).await;
         assert_eq!(starts[1].model.as_deref(), Some("threads-cli-choice"));
         assert_eq!(starts[1].effort.as_deref(), Some("high"));

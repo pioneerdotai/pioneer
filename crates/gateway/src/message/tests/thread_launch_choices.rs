@@ -5569,8 +5569,22 @@ async fn create_detached_review_target(
     let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
     let targets: Vec<pioneer_protocol::AgentToolTargetOption> =
         serde_json::from_value(created["targetOptions"].clone()).unwrap();
+    let thread_id = payload["created_thread_id"].as_str().unwrap();
+    // Thread creation commits storage; RPC admission also needs the loaded
+    // thread, just as it would after the client opens that conversation.
+    let workspace = processor
+        .crud_store
+        .get_thread_model(thread_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .workspace_id;
+    processor
+        .ensure_thread_loaded(thread_id, &workspace)
+        .await
+        .unwrap();
     (
-        payload["created_thread_id"].as_str().unwrap().to_owned(),
+        thread_id.to_owned(),
         targets
             .into_iter()
             .find(|t| !options.target_options.iter().any(|old| old.id == t.id))

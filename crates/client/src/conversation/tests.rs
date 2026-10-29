@@ -3518,6 +3518,14 @@ fn agent_admission_owner_controls_live_and_recovered_flow_independently_of_threa
             });
             snapshot.turns = vec![turn];
             recovered.sync_thread_snapshot(&snapshot);
+            // Foreground completion releases the composer on the next tick;
+            // a detached admission never enters that completion phase.
+            if owner == pioneer_protocol::TurnWorkOwner::Turn {
+                assert!(!live.can_submit_message());
+                assert!(live.tick());
+            } else {
+                assert!(!live.tick());
+            }
             assert!(live.can_submit_message());
             assert!(recovered.can_submit_message());
         }
