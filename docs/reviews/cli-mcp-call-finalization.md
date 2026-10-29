@@ -252,3 +252,28 @@ git log -1 --format='%H%n%P%n%s'
 - После commit: `git status --porcelain=v1`, `git log -1 --format='%H%n%P%n%s'`.
 
 Commit создаётся с `git -c core.hooksPath=/dev/null commit -m 'fix: use existing protocol event constant path'`. Merge, push и deploy не выполнялись. Тесты, mock-сценарии, `cargo check`, компиляция, сборки, приложение, Gateway, CLI-агенты, миграции и генераторы **не запускались**; компилируемость и прохождение тестов **не подтверждены**. Передача на внешнее ревью, не окончательная приёмка.
+
+## PR #228 CI repair, 29 October 2026
+
+Starting head: `f8f4a40a9c95da4ecd98db01b5f4dc7524917fca`, clean worktree on `fix/cli-mcp-call-finalization`. The monitor paused future launches before the repair. Remote Linux shard 1, job `123452008323` in run `40859916686`, reported two failures:
+
+- `claude_mcp_timeline_parallel_success_error_and_replay_is_idempotent` indexed an empty canonical completion list. Managed native completion now records delivery separately. The adapter test retains parallel success/error, native replay and generation checks, and verifies that neither native result emits another canonical outcome.
+- `cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_providers` received `internal` on `create-reconnected`. A fresh facade correctly recovered the existing mutation receipt, but its response timing or receipt metadata could differ from the first response. Payload-derived event idempotency then treated its completion as new and rejected the already terminal item.
+
+The finalization path now recognizes an accepted canonical completion for the same verified call through the existing canonical item index. It compares workspace/thread/turn/item, callable, native correlation, generation, manifest, schema fingerprints and redacted argument fingerprint before entering the writer. Inside the existing transaction it revalidates the binding, native owner, execution owner and latest attempt, then fences the accepted event by its ID and exact stored payload bytes. A match returns without changing the original outcome, delivery metadata or pending projection claim. Changed or absent evidence fails closed through the existing path. No operation, queue, storage system, event key or recovery worker was added.
+
+The existing Threads integration scenario remains the primary proof for reconnecting Codex, Claude and OpenCode facades. It still checks the original receipt and that replay creates only one child/message/start; it additionally checks an unchanged canonical item and exactly one completion after reconnecting. No new test case or production test hook was added. The Claude edits are confined to its `#[cfg(test)]` module; its production prefix has the same SHA-256 as the pre-edit copy. Production repair was handled separately from the test-only `test-audit` workflow.
+
+Static review covered both failing owners, Gateway validation/execution and result preparation, canonical event indexing and payload-derived idempotency, the writer fences and deferred projection path. JSON decoding stays outside the writer. The existing observation sequence fence, validation refusal handling, progress replay ordering, Task delivery gate, authorization and output policies remain in place.
+
+Commands/checks for this repair:
+
+- Read root/CRUD `AGENTS.md`, scoped instruction inventory, `pioneer-system-tasks` references, `test-audit` and its project/audit references, Gateway Cargo boundaries and CI workflow.
+- `gh pr view 228 --repo pioneerdotai/pioneer --json state,headRefOid,baseRefOid,mergeable,mergeStateStatus,statusCheckRollup`.
+- `gh run view 40859916686 --repo pioneerdotai/pioneer --job 123452008323 --log-failed` could not read logs while the workflow remained active. `gh api repos/pioneerdotai/pioneer/actions/jobs/123452008323/logs` retrieved the completed job log instead; `rg` identified both actual failures.
+- `git -c core.hooksPath=/dev/null fetch origin main fix/cli-mcp-call-finalization`, branch/status/head reads, static `rg`/`sed` reads and complete `git diff` review.
+- `cargo fmt -p pioneer-crud -p pioneer-gateway --check`: the first pass requested formatting of the edited expressions; those changes were applied directly, then the check was repeated.
+- `git diff --check`, `git diff --cached --check`, and `git merge-tree --write-tree HEAD origin/main` against freshly fetched main.
+- Commit and push use `-c core.hooksPath=/dev/null` and an English `fix(crud): ...` subject, without CI-skip markers. Remote head and worktree state are checked after push; the same monitor is rescheduled for +15 minutes and its trigger is read back.
+
+Local tests, mock scenarios, compilation, builds, application/Gateway/CLI execution, migrations and generators were not run. The repaired tests and compilation are unverified locally; remote CI must verify the new head. No GREEN is claimed for this repair.

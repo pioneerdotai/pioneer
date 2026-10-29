@@ -5040,11 +5040,57 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 .call("create", "create", "thread_create", create_args.clone())
                 .await;
             assert_eq!(created["status"], "accepted");
+            let create_item_id = match kind {
+                CLIAgentRuntimeKind::Codex => "create",
+                CLIAgentRuntimeKind::Claude => "toolu_create",
+                CLIAgentRuntimeKind::OpenCode => "assistant:tool:create",
+            };
+            let original_completion = processor
+                .crud_store
+                .get_turn_item(&turn, create_item_id)
+                .await
+                .unwrap()
+                .unwrap();
             let replay = ThreadsFacade::new(&processor, &turn, kind)
                 .await
                 .call("create-reconnected", "create", "thread_create", create_args)
                 .await;
             assert_eq!(replay["receiptId"], created["receiptId"]);
+            assert_eq!(
+                processor
+                    .crud_store
+                    .get_turn_item(&turn, create_item_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                original_completion,
+                "reconnecting must preserve the original canonical execution outcome"
+            );
+            let caller = processor
+                .crud_store
+                .get_cli_runtime_turn_binding(&turn)
+                .await
+                .unwrap()
+                .unwrap();
+            let events = processor
+                .crud_store
+                .get_turn_item_events(&caller.thread_id, &turn)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                events
+                    .events
+                    .iter()
+                    .filter(|event| matches!(
+                        &event.payload,
+                        pioneer_protocol::TurnItemEventPayload::ItemCompleted { item, .. }
+                            if item.item_id() == create_item_id
+                    ))
+                    .count(),
+                1,
+                "receipt replay must not append a second completion"
+            );
             let target = created["targetOptions"]
                 .as_array()
                 .unwrap()

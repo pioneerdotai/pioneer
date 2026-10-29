@@ -14,12 +14,11 @@ const DB_ID_LEN: usize = 21;
 
 /// The existing canonical item index is written in the acceptance transaction,
 /// independently of the projection watermark. No payload decoding is needed.
-pub(crate) async fn has_accepted_item_completion<C: ConnectionTrait>(
-    db: &C,
+fn accepted_item_completions(
     turn_id: &str,
     item_id: &str,
     before_sequence: Option<i64>,
-) -> Result<bool> {
+) -> sea_orm::Select<turn_event::Entity> {
     let ids = compaction_event_revision::Entity::find()
         .select_only()
         .column(compaction_event_revision::Column::SourceId)
@@ -36,13 +35,33 @@ pub(crate) async fn has_accepted_item_completion<C: ConnectionTrait>(
     if let Some(sequence) = before_sequence {
         query = query.filter(turn_event::Column::Sequence.lt(sequence));
     }
-    Ok(query
+    query
+}
+
+pub(crate) async fn has_accepted_item_completion<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+    before_sequence: Option<i64>,
+) -> Result<bool> {
+    Ok(accepted_item_completions(turn_id, item_id, before_sequence)
         .select_only()
         .column(turn_event::Column::Id)
         .into_tuple::<String>()
         .one(db)
         .await?
         .is_some())
+}
+
+pub(crate) async fn find_accepted_item_completion<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+) -> Result<Option<turn_event::Model>> {
+    Ok(accepted_item_completions(turn_id, item_id, None)
+        .order_by_desc(turn_event::Column::Sequence)
+        .one(db)
+        .await?)
 }
 
 /// CPU-only representation of an append. Serialization, idempotency-key

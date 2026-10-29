@@ -13,21 +13,24 @@ pub struct CliMcpCallIdentity {
     pub execution_owner: Option<(String, u64)>,
 }
 
+fn cli_mcp_item_metadata(item: &TurnItem) -> Option<&pioneer_protocol::ToolMetadata> {
+    let TurnItem::DynamicToolCall { storage, .. } = item else {
+        return None;
+    };
+    match storage {
+        ToolStoragePayload::Summary(summary) => Some(&summary.metadata),
+        ToolStoragePayload::Metadata { metadata } => Some(metadata),
+        _ => None,
+    }
+}
+
 /// Recognizes host-enriched MCP lifecycle items, not tool names or arguments.
 pub fn is_managed_cli_mcp_item(item: &TurnItem) -> bool {
-    let TurnItem::DynamicToolCall {
-        id,
-        tool_name,
-        storage,
-        ..
-    } = item
-    else {
+    let TurnItem::DynamicToolCall { id, tool_name, .. } = item else {
         return false;
     };
-    let metadata = match storage {
-        ToolStoragePayload::Summary(summary) => &summary.metadata,
-        ToolStoragePayload::Metadata { metadata } => metadata,
-        _ => return false,
+    let Some(metadata) = cli_mcp_item_metadata(item) else {
+        return false;
     };
     metadata
         .get("canonicalCallableName")
@@ -73,6 +76,55 @@ impl CrudStore {
             created_at,
         )
         .await?;
+        // A durable tool receipt can replay after the facade ledger is lost.
+        // Its response/duration may differ, while the original canonical
+        // execution fact must remain unchanged. Decode outside the writer and
+        // carry the immutable event bytes back as a commit-time fence.
+        let accepted = turn_event::find_accepted_item_completion(
+            &self.connection,
+            &notification.turn_id,
+            &identity.native_item_id,
+        )
+        .await?;
+        let confirmed_replay = if let Some(event) = accepted {
+            let payload: TurnEventPayload = serde_json::from_str(&event.payload)?;
+            match payload {
+                TurnEventPayload::ItemCompleted(saved)
+                    if saved.workspace_id == notification.workspace_id
+                        && saved.thread_id == notification.thread_id
+                        && saved.turn_id == notification.turn_id
+                        && saved.item.item_id() == notification.item.item_id()
+                        && is_managed_cli_mcp_item(&saved.item) =>
+                {
+                    let saved_metadata = cli_mcp_item_metadata(&saved.item)
+                        .expect("managed MCP completion metadata");
+                    let incoming_metadata = cli_mcp_item_metadata(&notification.item)
+                        .context("CLI MCP completion metadata is missing")?;
+                    [
+                        "canonicalCallableName",
+                        "providerCallId",
+                        "sessionGeneration",
+                        "manifestHash",
+                        "invocationCorrelationId",
+                        "responseDelivery",
+                        "serverInstallationId",
+                        "canonicalSchemaFingerprint",
+                        "providerSchemaFingerprint",
+                        "arguments",
+                    ]
+                    .iter()
+                    .all(|key| {
+                        saved_metadata
+                            .get(key)
+                            .is_some_and(|value| Some(value) == incoming_metadata.get(key))
+                    })
+                    .then_some(event)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         self.run_serialized_write(|| async {
             let prepared = prepared.clone();
             let transaction = self.connection.begin().await?;
@@ -134,6 +186,22 @@ impl CrudStore {
                     latest.id == owner.attempt.id && turn.thread_id == notification.thread_id,
                     "CLI MCP completion execution is no longer current"
                 );
+                if let Some(confirmed) = &confirmed_replay {
+                    let current = turn_event::find_accepted_item_completion(
+                        &transaction,
+                        &notification.turn_id,
+                        &identity.native_item_id,
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        current
+                            .is_some_and(|event| event.id == confirmed.id
+                                && event.payload == confirmed.payload),
+                        "CLI MCP canonical completion changed during replay"
+                    );
+                    transaction.rollback().await?;
+                    return Ok(());
+                }
                 if let Some(item) = turn::find_turn_item(
                     &transaction,
                     &notification.turn_id,

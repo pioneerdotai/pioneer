@@ -5036,22 +5036,22 @@ done
         assert_eq!(id, "call-a");
         assert_eq!(tool_name, "mcp_server_tool_a");
         assert_eq!(*status, ToolCallStatus::InProgress);
-        let AgentDurableEvent::ItemCompleted { notification } = &projected_terminal.durable[0]
-        else {
-            panic!("expected projected MCP terminal");
+        assert!(
+            projected_terminal.durable.is_empty(),
+            "native delivery must not create another canonical MCP outcome"
+        );
+        let RuntimeEvent::ItemCompleted(success_terminal) = &completed[0] else {
+            panic!("expected received MCP terminal");
         };
-        let TurnItem::DynamicToolCall {
-            id,
-            status,
-            success,
-            ..
-        } = &notification.item
-        else {
-            panic!("expected terminal canonical dynamic tool item");
-        };
-        assert_eq!(id, "call-a");
-        assert_eq!(*status, ToolCallStatus::Completed);
-        assert_eq!(*success, Some(true));
+        assert_eq!(success_terminal.native_item_id, "call-a");
+        assert_eq!(
+            success_terminal.metadata.as_ref().unwrap()["status"],
+            json!("completed")
+        );
+        assert_eq!(
+            success_terminal.metadata.as_ref().unwrap()["success"],
+            json!(true)
+        );
 
         let error_terminal = completed
             .iter()
@@ -5063,6 +5063,15 @@ done
         assert_eq!(
             error_terminal.metadata.as_ref().unwrap()["status"],
             json!("failed")
+        );
+        assert!(
+            project_cli_runtime_event(
+                &projector_context,
+                &RuntimeEvent::ItemCompleted(error_terminal.clone()),
+            )
+            .durable
+            .is_empty(),
+            "native error delivery must not replace the confirmed MCP outcome"
         );
 
         assert!(
