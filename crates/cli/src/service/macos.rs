@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,18 +10,17 @@ use pioneer_config::InstallManagedBy;
 use super::{GatewayServiceStartReport, GatewayServiceWarning, SERVICE_MODE_ARG, ServiceSettings};
 
 const MACOS_LAUNCH_AGENT_SCOPE_WARNING_CODE: &str = "macos_launch_agent_login_session_scoped";
+const MACOS_LAUNCH_SERVICES_WARNING_CODE: &str =
+    "macos_gateway_launch_services_registration_failed";
 
 pub fn start_gateway_service(
     settings: &ServiceSettings,
     report: &mut GatewayServiceStartReport,
 ) -> Result<Vec<GatewayServiceWarning>> {
     let service_label = settings.service_name.as_str();
-    let (plist_path, domain) = report.observe("service.definition.prepare", || {
+    let (plist_path, domain, executable) = report.observe("service.definition.prepare", || {
         let plist_path = launch_agents_dir()?.join(format!("{service_label}.plist"));
-        let executable =
-            env::current_exe().context("failed to determine current executable path")?;
-        let launchd_executable = launchd_executable_path(settings, &executable)
-            .context("failed to prepare macOS launchd executable path")?;
+        let executable = super::current_executable_path()?;
         let logs_dir = user_logs_dir()
             .context("failed to resolve user logs directory for launch agent")?
             .join("Logs")
@@ -40,7 +38,7 @@ pub fn start_gateway_service(
         let launchd_path = super::resolve_service_path();
         let plist_content = render_launchd_plist(
             service_label,
-            &launchd_executable,
+            &executable,
             &logs_dir,
             launchd_path.as_deref(),
             settings.macos_associated_bundle_identifier.as_str(),
@@ -52,10 +50,24 @@ pub fn start_gateway_service(
             )
         })?;
 
-        Ok((plist_path, launchctl_domain()?))
+        Ok((plist_path, launchctl_domain()?, executable))
     })?;
     let service_target = format!("{domain}/{service_label}");
     let plist_path_string = path_to_str(&plist_path)?.to_owned();
+    let mut warnings = launch_agent_scope_warnings(settings);
+
+    // Launch Services supplies the background item's application name. Register
+    // the Gateway's own signed bundle before launchd registers that item.
+    if let Some(bundle) = gateway_app_bundle(&executable) {
+        if let Err(error) = report.observe("service.application.register", || {
+            register_gateway_application(bundle)
+        }) {
+            warnings.push(GatewayServiceWarning::new(
+                MACOS_LAUNCH_SERVICES_WARNING_CODE,
+                format!("failed to register Pioneer Gateway with Launch Services: {error:#}"),
+            ));
+        }
+    }
 
     report.observe("service.previous.remove", || {
         remove_legacy_services(domain.as_str(), settings.legacy_service_names.as_slice())?;
@@ -76,52 +88,231 @@ pub fn start_gateway_service(
         service = service_label,
         "gateway launch agent is running and will auto-start at user login"
     );
-    Ok(launch_agent_scope_warnings(settings))
+    Ok(warnings)
 }
 
 pub fn stop_gateway_service(settings: &ServiceSettings) -> Result<()> {
-    let service_label = settings.service_name.as_str();
+    let label = settings.service_name.as_str();
     let domain = launchctl_domain()?;
-    let plist_path = launch_agents_dir()?.join(format!("{service_label}.plist"));
-    let service_target = format!("{domain}/{service_label}");
-
-    let mut stopped = false;
+    let plist_path = launch_agents_dir()?.join(format!("{label}.plist"));
+    let target = format!("{domain}/{label}");
+    let registered = listed_service_activity(label)?.is_some();
+    if registered {
+        run_launchctl(&["bootout", &target])?;
+        // bootout removes the job, preventing KeepAlive from restarting it.
+        // Observe completion before removing files or admitting activation.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while listed_service_activity(label)?.is_some() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "Gateway launch job has not stopped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    if registered || plist_path.exists() {
+        run_launchctl(&["disable", &target])?;
+    }
     if plist_path.exists() {
-        let plist_path_str = path_to_str(&plist_path)?;
-        stopped |= run_launchctl(&["bootout", domain.as_str(), plist_path_str.as_ref()]).is_ok();
+        fs::remove_file(&plist_path).context("failed to remove Gateway LaunchAgent definition")?;
     }
-
-    stopped |= run_launchctl(&["bootout", &service_target]).is_ok();
-    let _ = run_launchctl(&["disable", &service_target]);
-
-    if plist_path.exists() {
-        fs::remove_file(&plist_path).with_context(|| {
-            format!(
-                "failed to remove launchd service file at {}",
-                plist_path.display()
-            )
-        })?;
-    }
-
-    if stopped {
-        info!(service = service_label, "gateway service is stopped");
-    } else {
-        info!(service = service_label, "gateway service is not running");
-    }
-
+    info!(service = label, "gateway service is stopped");
     Ok(())
 }
 
 pub fn is_gateway_service_active(settings: &ServiceSettings) -> Result<bool> {
-    let service_label = settings.service_name.as_str();
-    let target = format!("{}/{}", launchctl_domain()?, service_label);
+    Ok(listed_service_activity(&settings.service_name)?.unwrap_or(false))
+}
 
+fn listed_service_activity(label: &str) -> Result<Option<bool>> {
+    let domain = launchctl_domain()?;
+    // Query the managed GUI domain explicitly. Caller-local list/managername
+    // describe a different bootstrap when the same user connects over SSH.
     let output = Command::new("launchctl")
-        .args(["print", target.as_str()])
-        .output()
-        .with_context(|| format!("failed to run launchctl print {target}"))?;
+        .args(["print", &domain])
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "failed to inspect Gateway GUI domain: {}",
+        output_details(&output)
+    );
+    gui_domain_service_activity(std::str::from_utf8(&output.stdout)?, &domain, label)
+}
 
-    Ok(output.status.success())
+fn gui_domain_service_activity(text: &str, domain: &str, label: &str) -> Result<Option<bool>> {
+    // launchctl print is native diagnostic output, not a stable serialization
+    // API (launchctl(1)). Accept only a complete, identified domain and one
+    // complete PID/status/label service table. Format drift fails closed.
+    let mut lines = text.trim().lines();
+    anyhow::ensure!(
+        lines
+            .next()
+            .is_some_and(|line| line.trim() == format!("{domain} = {{"))
+            && text.trim_end().ends_with('}'),
+        "unrecognized launchctl GUI domain output"
+    );
+    let mut table = false;
+    let mut found_table = false;
+    let mut closed_table = false;
+    let mut activity = None;
+    let mut depth = 1usize;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        anyhow::ensure!(depth > 0, "trailing launchctl domain output");
+        if line == "}" {
+            if table && depth == 2 {
+                table = false;
+                closed_table = true;
+            }
+            depth -= 1;
+            continue;
+        }
+        if line.ends_with(" = {") {
+            anyhow::ensure!(!table, "nested launchctl service row");
+            if depth == 1 && line == "services = {" {
+                anyhow::ensure!(!found_table, "ambiguous launchctl services table");
+                found_table = true;
+                table = true;
+            }
+            depth += 1;
+            continue;
+        }
+        if !table {
+            continue;
+        }
+        let (pid, rest) = line
+            .split_once(char::is_whitespace)
+            .context("invalid launchctl service row")?;
+        let (status, name) = rest
+            .trim_start()
+            .split_once(char::is_whitespace)
+            .context("invalid launchctl service row")?;
+        anyhow::ensure!(
+            !status.is_empty() && !name.trim().is_empty(),
+            "invalid launchctl service row"
+        );
+        let pid = if pid == "-" {
+            0
+        } else {
+            pid.parse::<u32>()
+                .context("invalid launchctl service PID")?
+        };
+        if name.trim() == label {
+            anyhow::ensure!(
+                activity.is_none(),
+                "duplicate launchctl Gateway registration"
+            );
+            activity = Some(pid > 0);
+        }
+    }
+    anyhow::ensure!(
+        found_table && closed_table && !table && depth == 0,
+        "incomplete launchctl GUI services table"
+    );
+    Ok(activity)
+}
+
+pub(super) struct RegistrationSnapshot {
+    definition: super::ServiceDefinitionBackup,
+    disabled: bool,
+}
+
+impl RegistrationSnapshot {
+    pub(super) fn is_registered(&self) -> bool {
+        self.definition.is_registered()
+    }
+}
+
+pub(super) fn capture_registration(settings: &ServiceSettings) -> Result<RegistrationSnapshot> {
+    let definition = super::ServiceDefinitionBackup::capture(
+        launch_agents_dir()?.join(format!("{}.plist", settings.service_name)),
+    )?;
+    let disabled = if definition.is_registered() {
+        let output = Command::new("launchctl")
+            .args(["print-disabled", &launchctl_domain()?])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to snapshot launchd enablement: {}",
+            output_details(&output)
+        );
+        disabled_service_override(std::str::from_utf8(&output.stdout)?, &settings.service_name)
+            .context("failed to parse launchd enablement snapshot")?
+    } else {
+        false
+    };
+    Ok(RegistrationSnapshot {
+        definition,
+        disabled,
+    })
+}
+
+fn disabled_service_override(text: &str, label: &str) -> Result<bool> {
+    let mut lines = text.trim().lines();
+    anyhow::ensure!(
+        lines
+            .next()
+            .is_some_and(|line| line.trim() == "disabled services = {"),
+        "unrecognized launchctl disabled services output"
+    );
+    let mut closed = false;
+    let mut target = None;
+    for line in lines.map(str::trim).filter(|line| !line.is_empty()) {
+        anyhow::ensure!(!closed, "trailing launchctl disabled services output");
+        if line == "}" {
+            closed = true;
+            continue;
+        }
+        let (name, value) = line
+            .split_once("=>")
+            .context("invalid launchctl disabled service row")?;
+        let name = name
+            .trim()
+            .strip_prefix('"')
+            .and_then(|name| name.strip_suffix('"'))
+            .filter(|name| !name.is_empty() && !name.contains('"'))
+            .context("invalid launchctl disabled service label")?;
+        // Supported macOS reports words, not the older boolean format. Unknown
+        // policy must never be mistaken for permission to enable this service.
+        let disabled = match value.trim().strip_suffix(';').unwrap_or(value.trim()) {
+            "disabled" => true,
+            "enabled" => false,
+            _ => bail!("unrecognized launchctl disabled service policy"),
+        };
+        if name == label {
+            anyhow::ensure!(
+                target.is_none(),
+                "duplicate launchctl disabled service target"
+            );
+            target = Some(disabled);
+        }
+    }
+    anyhow::ensure!(closed, "incomplete launchctl disabled services output");
+    // Only a complete valid table can establish the absence of an override.
+    Ok(target.unwrap_or(false))
+}
+
+pub(super) fn restore_registration(
+    settings: &ServiceSettings,
+    snapshot: &RegistrationSnapshot,
+) -> Result<()> {
+    snapshot.definition.restore()?;
+    if !snapshot.is_registered() {
+        return Ok(());
+    }
+    let target = format!("{}/{}", launchctl_domain()?, settings.service_name);
+    // Do not bootstrap an inactive RunAtLoad/KeepAlive agent: that would start it.
+    run_launchctl(&[
+        if snapshot.disabled {
+            "disable"
+        } else {
+            "enable"
+        },
+        &target,
+    ])
 }
 
 fn render_launchd_plist(
@@ -189,20 +380,31 @@ fn render_launchd_plist(
     )
 }
 
-fn launchd_executable_path(_settings: &ServiceSettings, executable: &Path) -> Result<PathBuf> {
-    // This signed application is the Gateway itself, not the Desktop app. The
-    // driver is its direct child; AssociatedBundleIdentifiers is only UI metadata.
-    let bundle_executable = executable
-        .parent()
-        .context("gateway executable has no parent directory")?
-        .join("cua/Pioneer Gateway.app/Contents/MacOS/pioneer");
-    if cfg!(feature = "computer-use") && bundle_executable.is_file() {
-        Ok(bundle_executable)
+fn gateway_app_bundle(executable: &Path) -> Option<&Path> {
+    if cfg!(feature = "computer-use")
+        && executable.ends_with("Pioneer Gateway.app/Contents/MacOS/pioneer")
+    {
+        executable.ancestors().nth(3)
     } else {
-        // Developer/non-packaged Gateways still run other services. CUA readiness
-        // must reject a missing responsible application rather than borrow UI grants.
-        Ok(executable.to_path_buf())
+        None
     }
+}
+
+fn register_gateway_application(bundle: &Path) -> Result<()> {
+    let output = Command::new(
+        "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+    )
+    .arg("-f")
+    .arg(bundle)
+    .output()
+    .context("failed to run Launch Services registration tool")?;
+    if !output.status.success() {
+        bail!(
+            "Launch Services registration failed: {}",
+            output_details(&output)
+        );
+    }
+    Ok(())
 }
 
 fn remove_legacy_services(domain: &str, legacy_service_names: &[String]) -> Result<()> {
@@ -329,6 +531,241 @@ fn output_details(output: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registration_recovery_preserves_autostart_policy_and_rejects_unknown_capture() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::{fs, process::Command};
+        const FIXTURE: &str = "PIONEER_TEST_REGISTRATION_POLICY_ROOT";
+        if let Some(root) = std::env::var_os(FIXTURE) {
+            let root = std::path::PathBuf::from(root);
+            let mut settings = test_settings(InstallManagedBy::Script);
+            settings.service_name = "ai.pioneer.gateway".to_owned();
+            let definition = root.join("home/Library/LaunchAgents/ai.pioneer.gateway.plist");
+            fs::create_dir_all(definition.parent().unwrap()).unwrap();
+            let original = render_launchd_plist(
+                &settings.service_name,
+                &root.join("managed/bin/pioneer"),
+                &root.join("logs"),
+                None,
+                "ai.pioneer.gateway",
+            );
+            for (rows, expected) in [
+                ("\"ai.pioneer.gateway\" => disabled\n", "disabled\n"),
+                ("\"ai.pioneer.gateway\" => enabled\n", "enabled\n"),
+                // A similarly named service is not an override for our target.
+                ("\"ai.pioneer.gateway.other\" => disabled\n", "enabled\n"),
+                ("", "enabled\n"),
+            ] {
+                fs::write(&definition, &original).unwrap();
+                fs::write(root.join("loaded"), b"registered with no process").unwrap();
+                fs::write(
+                    root.join("policy.txt"),
+                    format!("disabled services = {{\n{rows}}}\n"),
+                )
+                .unwrap();
+                let snapshot = super::capture_registration(&settings).unwrap();
+                super::stop_gateway_service(&settings).unwrap();
+                assert!(!definition.exists());
+                assert_eq!(
+                    fs::read_to_string(root.join("policy-result")).unwrap(),
+                    "disabled\n"
+                );
+                // Actual filesystem failure before any candidate start. This
+                // owner test restores the native snapshot, not run_install.
+                let blocked = root.join("blocked-state");
+                fs::write(&blocked, b"not a directory").unwrap();
+                assert!(fs::write(blocked.join("state.toml"), b"candidate state").is_err());
+                fs::write(&definition, b"candidate definition").unwrap();
+                super::restore_registration(&settings, &snapshot).unwrap();
+                assert_eq!(fs::read(&definition).unwrap(), original.as_bytes());
+                assert_eq!(
+                    fs::read_to_string(root.join("policy-result")).unwrap(),
+                    expected
+                );
+                assert!(
+                    !root.join("loaded").exists(),
+                    "passive recovery loaded the job"
+                );
+                assert!(!super::is_gateway_service_active(&settings).unwrap());
+            }
+
+            fs::remove_file(root.join("mutations")).unwrap();
+            fs::write(root.join("loaded"), b"registered with no process").unwrap();
+            let previous_policy = fs::read(root.join("policy-result")).unwrap();
+            for invalid in [
+                "disabled services = {\n\"ai.pioneer.gateway\" => unknown\n}\n",
+                "disabled services = {\n\"ai.pioneer.gateway\" => disabled\n",
+                "unrecognized provider output\n",
+                "disabled services = {\n\"ai.pioneer.gateway\" => enabled\n}\ntrailing\n",
+                "disabled services = {\n\"ai.pioneer.gateway\" => enabled\n\"ai.pioneer.gateway\" => disabled\n}\n",
+            ] {
+                fs::write(root.join("policy.txt"), invalid).unwrap();
+                assert!(super::capture_registration(&settings).is_err());
+                assert_eq!(fs::read(&definition).unwrap(), original.as_bytes());
+                assert_eq!(
+                    fs::read(root.join("policy-result")).unwrap(),
+                    previous_policy
+                );
+                assert!(root.join("loaded").exists());
+                assert!(!root.join("mutations").exists());
+            }
+            fs::write(root.join("provider-error"), b"unavailable").unwrap();
+            let error = super::capture_registration(&settings)
+                .err()
+                .expect("provider failure");
+            assert!(format!("{error:#}").contains("fixture policy provider unavailable"));
+            assert_eq!(fs::read(&definition).unwrap(), original.as_bytes());
+            assert_eq!(
+                fs::read(root.join("policy-result")).unwrap(),
+                previous_policy
+            );
+            assert!(root.join("loaded").exists());
+            assert!(!root.join("mutations").exists());
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        fs::create_dir(root.join("commands")).unwrap();
+        let id = root.join("commands/id");
+        fs::write(&id, "#!/bin/sh\nprintf '501\\n'\n").unwrap();
+        fs::set_permissions(&id, fs::Permissions::from_mode(0o755)).unwrap();
+        let launchctl = root.join("commands/launchctl");
+        fs::write(
+            &launchctl,
+            r#"#!/bin/sh
+case "$1" in
+  print-disabled)
+    [ "$2" = gui/501 ] || exit 91
+    if [ -f "$PIONEER_TEST_REGISTRATION_POLICY_ROOT/provider-error" ]; then
+      printf 'fixture policy provider unavailable\n' >&2; exit 1
+    fi
+    /bin/cat "$PIONEER_TEST_REGISTRATION_POLICY_ROOT/policy.txt"
+    exit $?
+    ;;
+  print)
+    [ "$2" = gui/501 ] || exit 91
+    printf 'gui/501 = {\nservices = {\n'
+    if [ -f "$PIONEER_TEST_REGISTRATION_POLICY_ROOT/loaded" ]; then
+      printf '0 - ai.pioneer.gateway\n'
+    fi
+    printf '}\n}\n'
+    ;;
+  bootout)
+    [ "$2" = gui/501/ai.pioneer.gateway ] || exit 91
+    printf 'bootout\n' >> "$PIONEER_TEST_REGISTRATION_POLICY_ROOT/mutations"
+    /bin/rm "$PIONEER_TEST_REGISTRATION_POLICY_ROOT/loaded"
+    ;;
+  enable|disable)
+    [ "$2" = gui/501/ai.pioneer.gateway ] || exit 91
+    printf '%s\n' "$1" >> "$PIONEER_TEST_REGISTRATION_POLICY_ROOT/mutations"
+    printf '%sd\n' "$1" > "$PIONEER_TEST_REGISTRATION_POLICY_ROOT/policy-result"
+    ;;
+  *) exit 92 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755)).unwrap();
+        let name = format!(
+            "{}::registration_recovery_preserves_autostart_policy_and_rejects_unknown_capture",
+            module_path!().split_once("::").unwrap().1
+        );
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name])
+            .env(FIXTURE, root)
+            .env("HOME", root.join("home"))
+            .env("PATH", root.join("commands"))
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated registration policy regression failed"
+        );
+    }
+
+    #[test]
+    fn gui_target_observation_works_from_background_and_rejects_provider_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::{fs, process::Command};
+        const FIXTURE: &str = "PIONEER_TEST_GUI_OBSERVATION_ROOT";
+        if let Some(root) = std::env::var_os(FIXTURE) {
+            let root = std::path::PathBuf::from(root);
+            let mut settings = test_settings(pioneer_config::InstallManagedBy::Manual);
+            settings.service_name = "ai.pioneer.gateway".to_owned();
+            // The caller's unscoped list is empty and managername is Background.
+            // Only the scoped GUI domain contains these independently supplied
+            // native PID rows. Exercise the actual command boundary, not just a parser.
+            for (rows, expected) in [
+                ("0 - ai.pioneer.gateway\n", Some(false)),
+                ("912 0 ai.pioneer.gateway\n", Some(true)),
+                ("513 0 ai.pioneer.other\n", None),
+            ] {
+                fs::write(
+                    root.join("domain.txt"),
+                    format!("gui/501 = {{\nservices = {{\n{rows}}}\n}}\n"),
+                )
+                .unwrap();
+                assert_eq!(
+                    super::listed_service_activity(&settings.service_name).unwrap(),
+                    expected
+                );
+            }
+            for malformed in [
+                "user/501 = {\nservices = {\n912 0 ai.pioneer.gateway\n}\n}\n",
+                "gui/501 = {\nservices = {\n912 0 ai.pioneer.gateway\n}\n",
+                "gui/501 = {\nservices = {\nnot-a-pid 0 ai.pioneer.gateway\n}\n}\n",
+            ] {
+                fs::write(root.join("domain.txt"), malformed).unwrap();
+                assert!(super::listed_service_activity(&settings.service_name).is_err());
+            }
+            fs::write(root.join("error"), b"provider unavailable").unwrap();
+            let error = super::listed_service_activity(&settings.service_name).unwrap_err();
+            assert!(format!("{error:#}").contains("fixture provider unavailable"));
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        fs::create_dir(root.join("commands")).unwrap();
+        let id = root.join("commands/id");
+        fs::write(&id, "#!/bin/sh\nprintf '501\\n'\n").unwrap();
+        fs::set_permissions(&id, fs::Permissions::from_mode(0o755)).unwrap();
+        let launchctl = root.join("commands/launchctl");
+        fs::write(
+            &launchctl,
+            r#"#!/bin/sh
+case "$1" in
+  managername) printf 'Background\n'; exit 0 ;;
+  list) printf 'PID\tStatus\tLabel\n'; exit 0 ;;
+  print)
+    [ "$2" = gui/501 ] || exit 91
+    if [ -f "$PIONEER_TEST_GUI_OBSERVATION_ROOT/error" ]; then
+      printf 'fixture provider unavailable\n' >&2; exit 1
+    fi
+    /bin/cat "$PIONEER_TEST_GUI_OBSERVATION_ROOT/domain.txt"
+    exit $?
+    ;;
+  *) exit 92 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755)).unwrap();
+        let name = format!(
+            "{}::gui_target_observation_works_from_background_and_rejects_provider_failure",
+            module_path!().split_once("::").unwrap().1
+        );
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name])
+            .env(FIXTURE, root)
+            .env("PATH", root.join("commands"))
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated GUI domain observation regression failed"
+        );
+    }
+
     use super::{
         MACOS_LAUNCH_AGENT_SCOPE_WARNING_CODE, launch_agent_scope_warnings, render_launchd_plist,
     };

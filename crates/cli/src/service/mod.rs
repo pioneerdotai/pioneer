@@ -89,6 +89,89 @@ impl GatewayServiceWarning {
     }
 }
 
+// An operation-local snapshot of this service's registration. Restoring it
+// never activates the Gateway; the installer separately restores prior activity.
+pub(crate) struct GatewayServiceRegistration {
+    settings: ServiceSettings,
+    snapshot: platform::RegistrationSnapshot,
+}
+
+impl GatewayServiceRegistration {
+    pub(crate) fn capture(config: &AppConfig) -> Result<Self> {
+        let settings = load_service_settings_from_config(config)?;
+        let snapshot = platform::capture_registration(&settings)?;
+        Ok(Self { settings, snapshot })
+    }
+
+    pub(crate) fn is_registered(&self) -> bool {
+        self.snapshot.is_registered()
+    }
+
+    pub(crate) fn restore(&self) -> Result<()> {
+        platform::restore_registration(&self.settings, &self.snapshot)
+    }
+
+    pub(crate) fn is_active(&self) -> Result<bool> {
+        platform::is_gateway_service_active(&self.settings)
+    }
+
+    pub(crate) fn stop(&self) -> Result<()> {
+        platform::stop_gateway_service(&self.settings)
+    }
+}
+
+// LaunchAgent/systemd definitions are restored as bytes at their original path.
+// Keep the absent case explicit so recovery never invents a registration.
+pub(super) struct ServiceDefinitionBackup {
+    path: PathBuf,
+    contents: Option<(Vec<u8>, std::fs::Permissions)>,
+}
+
+impl ServiceDefinitionBackup {
+    pub(super) fn capture(path: PathBuf) -> Result<Self> {
+        let contents = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.is_file() && metadata.len() <= 1024 * 1024,
+                    "invalid Gateway service definition"
+                );
+                Some((std::fs::read(&path)?, metadata.permissions()))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("service definition metadata unavailable"),
+        };
+        Ok(Self { path, contents })
+    }
+
+    pub(super) fn is_registered(&self) -> bool {
+        self.contents.is_some()
+    }
+
+    pub(super) fn restore(&self) -> Result<()> {
+        if let Some((bytes, permissions)) = &self.contents {
+            let parent = self
+                .path
+                .parent()
+                .context("service definition has no parent")?;
+            std::fs::create_dir_all(parent)?;
+            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+            use std::io::Write;
+            temporary.write_all(bytes)?;
+            temporary.as_file().set_permissions(permissions.clone())?;
+            temporary.persist(&self.path).map_err(|error| error.error)?;
+        } else {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).context("failed to restore absent service definition");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn run_gateway_service() -> Result<()> {
     let startup = pioneer_observability::GatewayStartupTrace::start();
     let runtime_stage = startup.stage(pioneer_observability::GatewayStartupStage::RuntimeBuild);
@@ -109,9 +192,12 @@ pub fn start_gateway_service() -> Result<GatewayServiceStartReport> {
     let settings = report.observe("service.settings.load", || {
         load_service_settings_from_config(&config)
     })?;
+    // Validate ownership before changing the service registration. In particular,
+    // an extracted installer must never become the persistent service executable.
+    let state = install_state_from_current_context(&config)?;
     report.warnings = platform::start_gateway_service(&settings, &mut report)?;
     report.observe("service.state.persist", || {
-        save_install_state_from_current_context(&config)
+        save_install_state(&config.install_state_path()?, &state)
     })?;
     Ok(report)
 }
@@ -119,8 +205,9 @@ pub fn start_gateway_service() -> Result<GatewayServiceStartReport> {
 pub fn stop_gateway_service() -> Result<()> {
     let config = AppConfig::load().context("failed to load app config")?;
     let settings = load_service_settings_from_config(&config)?;
-    platform::stop_gateway_service(&settings)?;
-    save_install_state_from_current_context(&config)
+    // Stopping changes service state, not the installed package identity. This
+    // command may also be issued by a temporary installer during replacement.
+    platform::stop_gateway_service(&settings)
 }
 
 pub fn create_device() -> Result<pioneer_protocol::AuthDeviceCreateResponse> {
@@ -227,26 +314,74 @@ fn load_service_settings_from_config(config: &AppConfig) -> Result<ServiceSettin
             .macos_associated_bundle_identifier
             .trim()
             .to_owned(),
-        managed_by: install_managed_by_from_env().unwrap_or(InstallManagedBy::Manual),
+        managed_by: install_managed_by_from_env()
+            .or(load_install_state(&config.install_state_path()?)?.map(|state| state.managed_by))
+            .unwrap_or(InstallManagedBy::Manual),
     })
 }
 
-fn save_install_state_from_current_context(config: &AppConfig) -> Result<()> {
-    let install_state_path = config.install_state_path()?;
-    let current_exe = std::env::current_exe().context("failed to determine current executable")?;
-    let install_root = current_exe.parent().map(PathBuf::from);
-    let managed_by = install_managed_by_from_env().unwrap_or(InstallManagedBy::Manual);
+pub(super) fn current_executable_path() -> Result<PathBuf> {
+    let path = std::env::current_exe().context("failed to determine current executable path")?;
+    crate::installer::canonical_install_path(&path)
+        .context("failed to resolve current executable path")
+}
 
-    let state = InstallState {
+fn install_state_from_current_context(config: &AppConfig) -> Result<InstallState> {
+    let current_exe = current_executable_path()?;
+    let previous = load_install_state(&config.install_state_path()?)?;
+    let configured_root = crate::installer::install_root_path(config)?;
+    let matches_managed_root = |root: &std::path::Path| -> Result<bool> {
+        let expected = crate::installer::installed_binary_path(config, root)?;
+        Ok(crate::installer::canonical_install_path(&expected)
+            .is_ok_and(|path| path == current_exe))
+    };
+    let previous_root = previous
+        .as_ref()
+        .and_then(|state| state.install_root.as_ref());
+    let install_root = if let Some(root) = previous_root
+        && matches_managed_root(root)?
+    {
+        Some(
+            crate::installer::canonical_install_path(root)
+                .context("failed to resolve install root")?,
+        )
+    } else if matches_managed_root(&configured_root)? {
+        Some(
+            crate::installer::canonical_install_path(&configured_root)
+                .context("failed to resolve install root")?,
+        )
+    } else {
+        let same_manual_binary = previous.as_ref().is_some_and(|state| {
+            matches!(
+                state.managed_by,
+                InstallManagedBy::Manual | InstallManagedBy::Unknown
+            ) && crate::installer::canonical_install_path(&state.binary_path)
+                .is_ok_and(|path| path == current_exe)
+        });
+        anyhow::ensure!(
+            install_managed_by_from_env().is_none_or(|owner| {
+                matches!(owner, InstallManagedBy::Manual | InstallManagedBy::Unknown)
+            }) && (previous.is_none() || same_manual_binary),
+            "start must run from the installed Gateway executable; installation unchanged"
+        );
+        // Preserve standalone developer/manual use without borrowing a managed
+        // package's identity or overwriting its install-state.
+        previous_root
+            .cloned()
+            .or_else(|| current_exe.parent().map(PathBuf::from))
+    };
+    let managed_by = install_managed_by_from_env()
+        .or_else(|| previous.as_ref().map(|state| state.managed_by.clone()))
+        .unwrap_or(InstallManagedBy::Manual);
+
+    Ok(InstallState {
         version: InstallState::CURRENT_VERSION,
         managed_by,
         installed_version: env!("CARGO_PKG_VERSION").to_owned(),
         install_root,
         binary_path: current_exe,
         updated_at_unix: unix_timestamp_secs()?,
-    };
-
-    save_install_state(&install_state_path, &state)
+    })
 }
 
 fn install_managed_by_from_env() -> Option<InstallManagedBy> {
