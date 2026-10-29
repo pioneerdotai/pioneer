@@ -20,6 +20,7 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 struct GateState {
     blocked: bool,
     flush_blocked: bool,
+    block_flush_on_write: bool,
     reported: bool,
     failed: bool,
     waker: Option<Waker>,
@@ -40,7 +41,9 @@ impl WriteGate {
 
     fn block_flush(&self) {
         let mut state = self.state.lock().unwrap();
-        state.flush_blocked = true;
+        // Arm the next frame so an unfinished flush of the previous frame
+        // cannot block the request whose response this test needs to send.
+        state.block_flush_on_write = true;
         state.reported = false;
     }
 
@@ -58,6 +61,7 @@ impl WriteGate {
         let mut state = self.state.lock().unwrap();
         state.blocked = false;
         state.flush_blocked = false;
+        state.block_flush_on_write = false;
         state.failed = failed;
         if let Some(waker) = state.waker.take() {
             waker.wake();
@@ -117,6 +121,10 @@ impl AsyncWrite for GatedSocket {
             let mut state = self.gate.state.lock().unwrap();
             if state.failed {
                 return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+            if state.block_flush_on_write {
+                state.block_flush_on_write = false;
+                state.flush_blocked = true;
             }
             if state.blocked {
                 state.waker = Some(cx.waker().clone());

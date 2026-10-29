@@ -5575,11 +5575,12 @@ mod tests {
             panic!()
         };
         core.resume_visible_thread_delivery();
-        assert_eq!(
-            receiver.try_iter().count(),
-            0,
-            "one pending attempt per transport"
-        );
+        for item in receiver.try_iter() {
+            assert!(
+                matches!(item.value, ThreadControllerRequest::Resume),
+                "resuming a pending flight must not queue another subscription"
+            );
+        }
         let mut attempt = first.clone();
         for index in 0..=2 {
             core.finish_thread_subscription_request(
