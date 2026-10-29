@@ -20,14 +20,13 @@ def fixture(binary, archive, target):
     # Invalid executable on Windows; explicit non-ready executable on Unix.
     driver = b"CUA unavailable in installer fixture\n" if windows else b"#!/bin/sh\nexit 1\n"
     members = {
+        executable: (binary.read_bytes(), 0o755),
         "cua/" + daemon: (driver, 0o755),
         "cua/LICENSE.cua-driver.md": (b"Synthetic installer fixture; no upstream binary.\n", 0o644),
         "cua/THIRD_PARTY_NOTICES.md": (b"Synthetic installer fixture.\n", 0o644),
     }
     if windows:
         members["cua/cua-driver-uia.exe"] = (driver, 0o755)
-    if not macos:
-        members[executable] = (binary.read_bytes(), 0o755)
     if macos:
         app = "cua/Pioneer Gateway.app/Contents/"
         members[app + "MacOS/pioneer"] = (binary.read_bytes(), 0o755)

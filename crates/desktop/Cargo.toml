@@ -53,10 +53,6 @@ image.workspace = true
 cpal.workspace = true
 webbrowser.workspace = true
 url.workspace = true
-sha2.workspace = true
-hex.workspace = true
-tempfile.workspace = true
-zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
@@ -74,6 +70,8 @@ pioneer-client = { workspace = true, features = ["test-support"] }
 # Syntax-aware ownership and Render checks use the already locked parser.
 syn = { version = "=2.0.119", features = ["full", "visit"] }
 gpui-kit = { workspace = true, features = ["test-support"] }
+hex.workspace = true
+tempfile.workspace = true
 tokio-tungstenite.workspace = true
 
 [package.metadata.i18n]

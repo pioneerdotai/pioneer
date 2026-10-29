@@ -56,26 +56,30 @@ def package(args):
             runtime = args.out / "runtime"
             runtime.mkdir()
             shutil.copy2(archive, runtime / archive.name)
-            # Record the executable actually delivered inside the final archive.
-            # Desktop receives only that archive and its hash-bound metadata.
-            entry = ("cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
-                     if "apple-darwin" in args.target else name)
+            bootstrap = runtime / ("pioneer-bootstrap" + suffix)
+            # Only copy known root members from the validated final archive.
             with zipfile.ZipFile(archive) as complete:
-                binary.write_bytes(complete.read(entry))
-            data = binary.read_bytes()
-            if (RUNTIME["NATIVE"]["identity"](data) !=
-                    (metadata["binaries"][0]["format"], metadata["binaries"][0]["module_id"])
-                    or RUNTIME["NATIVE"]["build_manifest"](data) !=
-                    RUNTIME["NATIVE"]["build_manifest"]((args.inputs / name).read_bytes())):
-                raise ValueError("Packaged Gateway differs from the retained compiler module/build")
-            RUNTIME["check_build"](binary, data, metadata)
+                bootstrap.write_bytes(complete.read(name))
+                for entry in complete.infolist():
+                    if ("/" not in entry.filename and entry.filename.startswith("libonnxruntime")
+                            and entry.filename.endswith(".dylib")):
+                        (runtime / entry.filename).write_bytes(complete.read(entry))
+            bootstrap.chmod(0o755)
             (runtime / "SHA256SUMS").write_text(
                 f"sha256:{RUNTIME['digest'](archive)} {archive.name}\n")
             shutil.copy2(args.inputs / "inputs.json", runtime / "inputs.json")
-            RUNTIME["write"](runtime, args.target, args.variant, [],
+            RUNTIME["write"](runtime, args.target, args.variant, [bootstrap],
                              stage="gateway-final", source=metadata,
                              gateway_asset=archive.name, gateway_sha256=RUNTIME["digest"](archive))
-            packaged_binary = binary
+            packaged_binary = bootstrap
+            if "apple-darwin" in args.target:
+                # App signing can give its main a distinct envelope from the
+                # standalone bootstrap. Both must map to the retained module.
+                nested = work / "app-gateway"
+                with zipfile.ZipFile(archive) as complete:
+                    nested.write_bytes(complete.read("cua/Pioneer Gateway.app/Contents/MacOS/pioneer"))
+                subprocess.run([sys.executable, str(SYMBOLS), "record", str(nested),
+                                str(symbols / "packaged.json")], check=True)
         else:
             if archive.suffix == ".gz":
                 with binary.open("rb") as source, gzip.open(archive, "wb", compresslevel=9) as destination:

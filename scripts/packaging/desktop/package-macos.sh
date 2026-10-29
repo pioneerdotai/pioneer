@@ -462,6 +462,9 @@ if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
   python3 scripts/packaging/symbol-inputs.py record "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
   python3 scripts/packaging/symbol-inputs.py record "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
 fi
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
 
 # Apple's DMG submission also issues a ticket for the signed contained app.
 # Staple that same source app before creating the auto-update ZIP.

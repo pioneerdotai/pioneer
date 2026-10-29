@@ -16,7 +16,7 @@ CUA = runpy.run_path(str(Path(__file__).with_name("cua-driver.py")))
 
 def gateway(directory, target):
     suffix = ".exe" if "windows" in target else ""
-    metadata = RUNTIME["read"](directory, target, "computer-use", [])
+    metadata = RUNTIME["read"](directory, target, "computer-use", ["pioneer-bootstrap" + suffix])
     asset = RUNTIME["asset_name"](target, "computer-use")
     if (metadata.get("stage") != "gateway-final" or metadata.get("gateway_asset") != asset
             or metadata.get("gateway_sha256") != RUNTIME["digest"](directory / asset)):
@@ -27,20 +27,23 @@ def gateway(directory, target):
     if (directory / "SHA256SUMS").read_text() != expected:
         raise ValueError("Gateway runtime checksums differ from final package")
     with zipfile.ZipFile(directory / asset) as archive:
-        entry = ("cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
-                 if "apple-darwin" in target else "pioneer" + suffix)
-        data = archive.read(entry)
-        originals = metadata["source"]["binaries"]
-        if (len(originals) != 1 or originals[0]["filename"] != "pioneer" + suffix
-                or RUNTIME["NATIVE"]["identity"](data) !=
-                (originals[0]["format"], originals[0]["module_id"])):
-            raise ValueError("Archived Gateway differs from the approved compiler module")
-        RUNTIME["check_build"](Path("pioneer" + suffix), data, metadata)
+        if archive.read("pioneer" + suffix) != (directory / ("pioneer-bootstrap" + suffix)).read_bytes():
+            raise ValueError("Desktop bootstrap differs from the approved Gateway root binary")
+        libraries = {entry.filename for entry in archive.infolist()
+                     if "/" not in entry.filename and entry.filename.startswith("libonnxruntime")
+                     and entry.filename.endswith(".dylib")}
+        if libraries != {path.name for path in directory.glob("libonnxruntime*.dylib")}:
+            raise ValueError("Desktop bootstrap ONNX inventory differs from Gateway package")
+        for name in libraries:
+            if archive.read(name) != (directory / name).read_bytes():
+                raise ValueError("Desktop bootstrap ONNX bytes differ from Gateway package")
     return metadata
 
 
 def bundle_files(directory, target):
-    return [RUNTIME["asset_name"](target, "computer-use"), "SHA256SUMS", "provenance.json"]
+    suffix = ".exe" if "windows" in target else ""
+    return [RUNTIME["asset_name"](target, "computer-use"), "pioneer-bootstrap" + suffix,
+            "SHA256SUMS", "provenance.json", *sorted(p.name for p in directory.glob("libonnxruntime*.dylib"))]
 
 
 def verify_bundle(approved, destination, target):
@@ -99,6 +102,7 @@ def main():
             raise ValueError("Gateway destination must be empty")
         for name in bundle_files(args.runtime, args.target):
             shutil.copy2(args.runtime / name, args.destination / name)
+        (args.destination / ("pioneer-bootstrap.exe" if "windows" in args.target else "pioneer-bootstrap")).chmod(0o755)
         verify_bundle(args.runtime, args.destination, args.target)
     elif args.mode == "verify":
         verify_bundle(args.runtime, args.destination, args.target)

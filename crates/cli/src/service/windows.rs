@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use std::env;
 use std::process::{Command, Output};
 use tracing::info;
 
@@ -15,7 +16,8 @@ pub fn start_gateway_service(
     let task_name = settings.service_name.as_str();
     let script = report.observe("service.definition.prepare", || {
         let task_name_escaped = powershell_escape_single_quoted(task_name);
-        let executable = super::current_executable_path()?;
+        let executable =
+            env::current_exe().context("failed to determine current executable path")?;
         let executable = powershell_escape_single_quoted(&executable.display().to_string());
         let service_path = super::resolve_service_path()
             .map(|value| value.trim().to_owned())
@@ -55,114 +57,53 @@ pub fn start_gateway_service(
 }
 
 pub fn stop_gateway_service(settings: &ServiceSettings) -> Result<()> {
-    let query = root_task_query(&settings.service_name);
+    let task_name = settings.service_name.as_str();
+    let task_name_escaped = powershell_escape_single_quoted(task_name);
     let script = format!(
-        r#"$ErrorActionPreference = 'Stop'
-        $task = {query}
-        if ($task.Count -eq 0) {{ exit 0 }}
-        Stop-ScheduledTask -InputObject $task[0] -ErrorAction Stop | Out-Null
-        $deadline = [DateTime]::UtcNow.AddSeconds(10)
-        do {{
-            $task = {query}
-            if ($task.Count -eq 0) {{ exit 0 }}
-            if ($task[0].State -in @('Ready', 'Disabled')) {{ break }}
-            if ([DateTime]::UtcNow -ge $deadline) {{ throw 'Gateway task has not stopped' }}
-            Start-Sleep -Milliseconds 100
-        }} while ($true)
-        Unregister-ScheduledTask -InputObject $task[0] -Confirm:$false -ErrorAction Stop | Out-Null"#
+        r#"$task = Get-ScheduledTask -TaskName '{task_name_escaped}' -ErrorAction SilentlyContinue
+        if ($null -eq $task) {{
+            Write-Output 'not_found'
+            exit 0
+        }}
+        Stop-ScheduledTask -TaskName '{task_name_escaped}' -ErrorAction SilentlyContinue | Out-Null
+        Unregister-ScheduledTask -TaskName '{task_name_escaped}' -Confirm:$false | Out-Null
+        Write-Output 'stopped'"#
     );
+
     let output = run_powershell(&script)?;
-    anyhow::ensure!(
-        output.status.success(),
-        "failed to stop/remove Windows Gateway task: {}",
-        output_details(&output)
-    );
-    info!(
-        service = settings.service_name.as_str(),
-        "gateway service is stopped"
-    );
+    if !output.status.success() {
+        bail!(
+            "failed to stop/remove Windows logon task `{task_name}`: {}",
+            output_details(&output)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("stopped") {
+        info!(service = task_name, "gateway service is stopped");
+    } else {
+        info!(service = task_name, "gateway service is not running");
+    }
+
     Ok(())
 }
 
 pub fn is_gateway_service_active(settings: &ServiceSettings) -> Result<bool> {
-    let query = root_task_query(&settings.service_name);
-    let output = run_powershell(&format!(
-        r#"$ErrorActionPreference = 'Stop'
-        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-        $task = {query}
-        if ($task.Count -eq 0) {{ Write-Output 'false' }} else {{
-            if ($task[0].State -notin @('Running', 'Queued', 'Ready', 'Disabled')) {{ throw 'Unknown Gateway task state' }}
-            ($task[0].State -eq 'Running') | ConvertTo-Json -Compress
-        }}"#
-    ))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "failed to inspect Windows Gateway task: {}",
-        output_details(&output)
-    );
-    serde_json::from_slice(&output.stdout).context("invalid Gateway task activity")
-}
-
-fn root_task_query(name: &str) -> String {
-    let name = powershell_escape_single_quoted(name);
-    // Wildcard enumeration has an empty-result contract; retain a strict root
-    // path/name filter so no same-named task in a subfolder can be captured.
-    format!(
-        r"@(Get-ScheduledTask -TaskPath '\*' -ErrorAction Stop | Where-Object {{ $_.TaskPath -eq '\' -and $_.TaskName -eq '{name}' }})"
-    )
-}
-
-pub(super) struct RegistrationSnapshot {
-    xml: Option<String>,
-}
-
-impl RegistrationSnapshot {
-    pub(super) fn is_registered(&self) -> bool {
-        self.xml.is_some()
-    }
-}
-
-pub(super) fn capture_registration(settings: &ServiceSettings) -> Result<RegistrationSnapshot> {
-    let name = powershell_escape_single_quoted(&settings.service_name);
-    let query = root_task_query(&settings.service_name);
+    let task_name = settings.service_name.as_str();
+    let task_name_escaped = powershell_escape_single_quoted(task_name);
     let script = format!(
-        r#"$ErrorActionPreference = 'Stop'
-        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-        $task = {query}
-        if ($task.Count -eq 0) {{ Write-Output 'null' }} else {{
-            Export-ScheduledTask -TaskName '{name}' -TaskPath '\' -ErrorAction Stop | ConvertTo-Json -Compress
-        }}"#
+        r#"$task = Get-ScheduledTask -TaskName '{task_name_escaped}' -ErrorAction SilentlyContinue
+        if ($null -eq $task) {{
+            exit 1
+        }}
+        if ($task.State -eq 'Running') {{
+            exit 0
+        }}
+        exit 2"#
     );
-    let output = run_powershell(&script)?;
-    anyhow::ensure!(
-        output.status.success(),
-        "failed to snapshot Gateway task: {}",
-        output_details(&output)
-    );
-    let xml = serde_json::from_slice(&output.stdout).context("invalid Gateway task snapshot")?;
-    Ok(RegistrationSnapshot { xml })
-}
 
-pub(super) fn restore_registration(
-    settings: &ServiceSettings,
-    snapshot: &RegistrationSnapshot,
-) -> Result<()> {
-    let Some(xml) = &snapshot.xml else {
-        return Ok(());
-    };
-    let name = powershell_escape_single_quoted(&settings.service_name);
-    let xml = powershell_escape_single_quoted(xml);
-    let output = run_powershell(&format!(
-        r#"$ErrorActionPreference = 'Stop'
-        Register-ScheduledTask -TaskName '{name}' -TaskPath '\' -Xml '{xml}' -Force -ErrorAction Stop | Out-Null"#
-    ))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "failed to restore Gateway task: {}",
-        output_details(&output)
-    );
-    // Register only; no Start-ScheduledTask for an originally inactive task.
-    Ok(())
+    let output = run_powershell(&script)?;
+    Ok(output.status.success())
 }
 
 fn run_powershell(script: &str) -> Result<Output> {

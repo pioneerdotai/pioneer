@@ -87,6 +87,10 @@ jobs:
                               target: role.target, os: platforms[role.target], variant: role.variant,
                               product: role.product});
               }
+              for (const row of include.filter(row => row.product === 'desktop')) {
+                row.gateway_mapping_id = include.find(peer => peer.product === 'gateway' &&
+                  peer.target === row.target && peer.variant === 'computer-use').mapping_id;
+              }
               core.setOutput('matrix', JSON.stringify({include}));
               core.setOutput('count', include.length);
               core.setOutput('has_macos', include.some(row => row.os.startsWith('macos')));
@@ -222,6 +226,15 @@ jobs:
           github-token: ${{ github.token }}
           path: symbol-inputs
           merge-multiple: true
+      - name: download-bootstrap-packaged-mapping
+        if: matrix.gateway_mapping_id
+        uses: actions/download-artifact@v7
+        with:
+          artifact-ids: ${{ matrix.gateway_mapping_id }}
+          run-id: ${{ needs.inputs.outputs.source_run_id }}
+          github-token: ${{ github.token }}
+          path: gateway-symbol-mapping
+          merge-multiple: true
       - name: bind-packaged-bytes-to-original-link-inputs
         if: matrix.mapping_id
         shell: bash
@@ -236,10 +249,19 @@ jobs:
           if original != packaged:
               raise ValueError('Packaged mapping differs from the exact retained compiler inputs')
           ledger = json.loads(Path('symbol-mapping/packaged.json').read_text())
-          modules = {(row['format'], row['module_id']) for row in original['binaries']}
-          if (not ledger or any((row['format'], row['module_id']) not in modules for row in ledger)
-                  or {(row['format'], row['module_id']) for row in ledger} != modules):
-              raise ValueError('Packaged module inventory differs from original link inputs')
+          gateway_dir = Path('gateway-symbol-mapping')
+          if gateway_dir.exists():
+              gateway = json.loads((gateway_dir / 'inputs.json').read_text())
+              signed = json.loads((gateway_dir / 'packaged.json').read_text())
+              if (any(gateway[key] != original[key] for key in ('commit', 'run_id', 'target', 'catalog_sha256'))
+                      or gateway.get('variant') != 'computer-use' or len(gateway['binaries']) != 1):
+                  raise ValueError('Desktop bootstrap mapping has different Gateway provenance')
+              own_modules = {(row['format'], row['module_id']) for row in original['binaries']}
+              bootstrap = [row for row in ledger if (row['format'], row['module_id']) not in own_modules]
+              expected = gateway['binaries'][0]
+              if (len(bootstrap) != 1 or bootstrap[0] not in signed
+                      or (bootstrap[0]['format'], bootstrap[0]['module_id']) != (expected['format'], expected['module_id'])):
+                  raise ValueError('Desktop bootstrap differs from the signed Gateway packaged mapping')
           shutil.copy2('symbol-mapping/packaged.json', 'symbol-inputs/packaged.json')
           PYBIND
       - name: download-pinned-dsymutil

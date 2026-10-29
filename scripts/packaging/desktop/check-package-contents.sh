@@ -57,9 +57,9 @@ case "$mode" in
     require_path "$target"
     require_zip_entry "$target" '^Pioneer\.app/Contents/MacOS/pioneer-app$'
     require_zip_entry "$target" '^Pioneer\.app/Contents/MacOS/pioneer-app-updater$'
+    require_zip_entry "$target" '^Pioneer\.app/Contents/Resources/gateway/pioneer-bootstrap$'
     require_zip_entry "$target" '^Pioneer\.app/Contents/Resources/gateway/pioneer-gateway-macos-.*-computer-use-package\.zip$'
     require_zip_entry "$target" '^Pioneer\.app/Contents/Resources/gateway/SHA256SUMS$'
-    require_zip_entry "$target" '^Pioneer\.app/Contents/Resources/gateway/provenance\.json$'
     gateway_asset="$(mktemp -t pioneer-gateway)"
     trap 'rm -f "$gateway_asset"' EXIT
     gateway_entry="$(unzip -Z1 "$target" | grep -E '^Pioneer\.app/Contents/Resources/gateway/pioneer-gateway-macos-.*-computer-use-package\.zip$')"
@@ -71,8 +71,8 @@ case "$mode" in
   linux-appdir)
     require_path "$target/usr/bin/pioneer-app"
     require_path "$target/usr/bin/pioneer-app-updater"
+    require_path "$target/usr/bin/gateway/pioneer-bootstrap"
     require_path "$target/usr/bin/gateway/SHA256SUMS"
-    require_path "$target/usr/bin/gateway/provenance.json"
     if ! compgen -G "$target/usr/bin/gateway/pioneer-gateway-linux-*-computer-use-package.zip" >/dev/null; then
       echo "missing bundled Linux gateway asset in $target/usr/bin/gateway" >&2
       exit 1
@@ -86,8 +86,8 @@ case "$mode" in
     if command -v cygpath >/dev/null 2>&1; then target="$(cygpath -u "$target")"; fi
     require_path "$target/pioneer-app.exe"
     require_path "$target/pioneer-app-updater.exe"
+    require_path "$target/gateway/pioneer-bootstrap.exe"
     require_path "$target/gateway/SHA256SUMS"
-    require_path "$target/gateway/provenance.json"
     if ! compgen -G "$target/gateway/pioneer-gateway-windows-*-computer-use-package.zip" >/dev/null; then
       echo "missing bundled Windows gateway asset in $target/gateway" >&2
       exit 1

@@ -4,7 +4,6 @@ import io
 import json
 import os
 from pathlib import Path
-import plistlib
 import runpy
 import stat
 import struct
@@ -25,10 +24,6 @@ def native_header(target):
         struct.pack_into("<I", data, 60, 64)
         data[64:68] = b"PE\0\0"
         struct.pack_into("<H", data, 68, 0xAA64 if target.startswith("aarch64") else 0x8664)
-    elif "apple-darwin" in target:
-        data = bytearray(64)
-        data[:4] = b"\xcf\xfa\xed\xfe"
-        struct.pack_into("<I", data, 4, 0x100000C if target.startswith("aarch64") else 0x1000007)
     else:
         data = bytearray(64)
         data[:6] = b"\x7fELF\x02\x01"
@@ -68,51 +63,6 @@ def ready_inputs(root, target):
 
 
 class CuaPayloadTests(unittest.TestCase):
-    def test_macos_bundle_only_layout_and_gateway_permission_identity(self):
-        for target in ("aarch64-apple-darwin", "x86_64-apple-darwin"):
-            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                contents = root / "cua/Pioneer Gateway.app/Contents"
-                gateway = contents / "MacOS/pioneer"
-                daemon = contents / "Helpers/cua-driver"
-                for path in (gateway, daemon):
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(native_header(target))
-                info = dict(CFBundleIdentifier="ai.pioneer.gateway", CFBundleName="Pioneer Gateway",
-                            CFBundleExecutable="pioneer")
-                (contents / "Info.plist").write_bytes(plistlib.dumps(info))
-                if target == "x86_64-apple-darwin":
-                    (gateway.parent / "libonnxruntime.dylib").write_bytes(native_header(target))
-                for name in ("LICENSE.cua-driver.md", "THIRD_PARTY_NOTICES.md"):
-                    (root / "cua" / name).write_text("Package notices fixture\n")
-                selected = CUA["release"]()
-                manifest = dict(schema_version=1, repository=selected["repository"],
-                    revision=selected["revision"], version=selected["version"], release_tag=selected["tag"],
-                    target=target, permission_owner="gateway", daemon="Pioneer Gateway.app/Contents/Helpers/cua-driver",
-                    upstream_asset=selected["assets"][CUA["TARGETS"][target]],
-                    sha256=hashlib.sha256(daemon.read_bytes()).hexdigest())
-
-                def seal_inventory():
-                    manifest["files"] = CUA["file_inventory"](root, ("cua/manifest.json",))
-                    (root / "cua/manifest.json").write_text(json.dumps(manifest))
-
-                seal_inventory()
-                # Architecture/layout validation deliberately does not claim to
-                # validate signatures with this synthetic package.
-                CUA["validate_tree"](target, root)
-
-                (root / "pioneer").write_bytes(native_header(target))
-                seal_inventory()
-                with self.assertRaisesRegex(ValueError, "outside the selected runtime layout"):
-                    CUA["validate_tree"](target, root)
-                (root / "pioneer").unlink()
-
-                info["CFBundleIdentifier"] = "ai.pioneer.macos"
-                (contents / "Info.plist").write_bytes(plistlib.dumps(info))
-                seal_inventory()
-                with self.assertRaisesRegex(ValueError, "bundle identity mismatch"):
-                    CUA["validate_tree"](target, root)
-
     def test_unsafe_zip_members_are_rejected_before_writing_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

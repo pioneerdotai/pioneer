@@ -130,7 +130,7 @@ Release compilation and packaging are separate entrypoints. `build-gateway.py`
 and `build-desktop.py` retain compact runtime inputs and separate original link
 inputs. `cua-driver.py prepare` obtains the verified prebuilt runtime;
 `package-gateway.py` signs and creates the final Gateway asset from ready inputs.
-Desktop packagers consume that same full ZIP, checksums and provenance through
+Desktop packagers consume that same full ZIP, bootstrap and checksums through
 `release-inputs.py` and `PIONEER_GATEWAY_RUNTIME_DIR`. They require prepared inputs
 in every mode; `--skip-build` remains accepted and never triggers a nested build.
 The release workflow supplies the shared model catalog and run/commit/target
@@ -143,10 +143,9 @@ CUA 0.38.0 runtime. Install the complete CU archive; copying only `pioneer` cann
 the driver. The installer keeps the executable and `bin/cua` together and retains
 recovery files when schema compatibility is unknown.
 
-**Existing computer-use installations require a manual upgrade to the single-runtime
-layout, including installations managed only through Desktop.** This follows the
-[0.66.0 release upgrade model](https://github.com/pioneerdotai/pioneer/releases/tag/0.66.0).
-Fully quit Desktop first. Upgrade the Gateway on its host with the current installer:
+**Computer-use installations below 0.66.0 require a manual upgrade, including
+installations managed only through Desktop.** Fully quit Desktop first. Upgrade
+the Gateway on its host with the appropriate command:
 
 macOS / Linux:
 

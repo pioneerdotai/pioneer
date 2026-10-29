@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import shutil
+import zipfile
 
 from test_collect_symbols import pe, embedded
 from test_cua_payload import ready_inputs
@@ -138,34 +139,22 @@ class RuntimeInputTests(unittest.TestCase):
         approved.mkdir()
         asset = "pioneer-gateway-windows-x86_64-computer-use-package.zip"
         CUA["package"](TARGET, gateway_binary, prepared, approved / asset)
+        with zipfile.ZipFile(approved / asset) as archive:
+            (approved / "pioneer-bootstrap.exe").write_bytes(archive.read("pioneer.exe"))
         archive_hash = hashlib.sha256((approved / asset).read_bytes()).hexdigest()
         (approved / "SHA256SUMS").write_text(f"sha256:{archive_hash} {asset}\n")
         shutil.copy2(link, approved / "inputs.json")
-        RUNTIME["write"](approved, TARGET, "computer-use", [],
+        RUNTIME["write"](approved, TARGET, "computer-use", [approved / "pioneer-bootstrap.exe"],
             source=source, stage="gateway-final", gateway_asset=asset, gateway_sha256=archive_hash)
         destination = self.root / "desktop/gateway"
         with patch("sys.argv", ["desktop-inputs.py", "embed", "--target", TARGET,
                                "--runtime", str(approved), "--destination", str(destination)]):
             DESKTOP["main"]()
         self.assertEqual((destination / asset).read_bytes(), (approved / asset).read_bytes())
-        self.assertEqual({path.name for path in destination.iterdir()},
-                         {asset, "SHA256SUMS", "provenance.json"})
+        self.assertEqual((destination / "pioneer-bootstrap.exe").read_bytes(), bytes(body))
         (destination / asset).write_bytes((destination / asset).read_bytes() + b"changed delivery")
         with self.assertRaisesRegex(ValueError, "changed approved Gateway payload"):
             DESKTOP["verify_bundle"](approved, destination, TARGET)
-
-        # A self-consistent transport receipt must still reject a replacement
-        # executable that does not map to the retained compiler's module.
-        body[0x224:0x234] = bytes([99]) * 16
-        gateway_binary.write_bytes(body)
-        (approved / asset).unlink()
-        CUA["package"](TARGET, gateway_binary, prepared, approved / asset)
-        archive_hash = hashlib.sha256((approved / asset).read_bytes()).hexdigest()
-        (approved / "SHA256SUMS").write_text(f"sha256:{archive_hash} {asset}\n")
-        RUNTIME["write"](approved, TARGET, "computer-use", [],
-            source=source, stage="gateway-final", gateway_asset=asset, gateway_sha256=archive_hash)
-        with self.assertRaisesRegex(ValueError, "approved compiler module"):
-            DESKTOP["gateway"](approved, TARGET)
 
 
 if __name__ == "__main__":

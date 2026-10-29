@@ -162,6 +162,9 @@ if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
   python3 scripts/packaging/symbol-inputs.py record "$APPDIR/usr/bin/pioneer-app" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
   python3 scripts/packaging/symbol-inputs.py record "$APPDIR/usr/bin/pioneer-app-updater" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
 fi
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
 APPIMAGE_PATH="$OUT_DIR/$APPIMAGE_NAME"
 
 if [[ -x "$APPIMAGETOOL_BIN" ]]; then

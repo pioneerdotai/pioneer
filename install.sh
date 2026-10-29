@@ -47,9 +47,6 @@ fail() {
 
 cleanup() {
   if [[ -n "${WORK_DIR:-}" ]]; then
-    # Restore owner access only while disposing operation-owned staging; an
-    # archive may legitimately preserve read-only directories or files.
-    chmod -R u+rwX "$WORK_DIR" 2>/dev/null || true
     rm -rf "$WORK_DIR"
   fi
 }
@@ -191,119 +188,51 @@ sha256_file() {
   fi
 }
 
-run_package_installer() {
+run_bootstrap_installer() {
   local asset_file="$1"
   local checksums_file="$2"
   local work_dir="$3"
-  local os="$4"
-  local arch="$5"
 
-  local executable="pioneer"
-  local gateway_bundle=""
-  if [[ "$os" == "macos" && "$COMPUTER_USE" -eq 1 ]]; then
-    executable="cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
-    gateway_bundle="${work_dir}/payload/cua/Pioneer Gateway.app"
-  fi
-  local installer_bin="${work_dir}/payload/${executable}"
-  PIONEER_ASSET_FILE="$asset_file" PIONEER_INSTALLER_BIN="$installer_bin" \
-    PIONEER_EXTRACT_DIR="${work_dir}/payload" PIONEER_TARGET_OS="$os" PIONEER_TARGET_ARCH="$arch" python3 <<'PY'
-import gzip
+  local installer_bin="${work_dir}/pioneer-installer"
+  case "$asset_file" in
+    *.zip)
+      PIONEER_ASSET_FILE="$asset_file" PIONEER_INSTALLER_BIN="$installer_bin" python3 <<'PY'
 import os
 import pathlib
-import stat
 import zipfile
 
 asset = pathlib.Path(os.environ["PIONEER_ASSET_FILE"])
 installer = pathlib.Path(os.environ["PIONEER_INSTALLER_BIN"])
-destination = pathlib.Path(os.environ["PIONEER_EXTRACT_DIR"])
-destination.mkdir()
-max_file = 512 * 1024 * 1024
-if asset.suffix == ".zip":
-    with zipfile.ZipFile(asset) as archive:
-        seen, files, directories, total = set(), [], [], 0
-        devices = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
-        for entry in archive.infolist():
-            name = entry.orig_filename[:-1] if entry.is_dir() else entry.orig_filename
-            member = pathlib.PurePosixPath(name)
-            mode = entry.external_attr >> 16
-            kind = stat.S_IFMT(mode)
-            if (not name or member.is_absolute() or member.as_posix() != name
-                    or any(part in (".", "..") or part.endswith((".", " "))
-                           or part.split(".")[0].upper() in devices for part in member.parts)
-                    or any(char in name for char in ("\\", ":"))
-                    or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in name)
-                    or kind not in (0, stat.S_IFREG, stat.S_IFDIR)
-                    or (kind != 0 and kind != (stat.S_IFDIR if entry.is_dir() else stat.S_IFREG))
-                    or mode & 0o7022
-                    or name.casefold() in seen):
-                raise SystemExit(f"Unsafe or duplicate archive member: {entry.filename!r}")
-            seen.add(name.casefold())
-            total += entry.file_size
-            if (entry.file_size < 0 or entry.file_size > max_file
-                    or total > 2 * 1024 * 1024 * 1024 or len(seen) > 10000
-                    or (entry.is_dir() and entry.file_size != 0)):
-                raise SystemExit("Gateway archive exceeds extraction budget")
-            if not entry.is_dir():
-                files.append((entry, member, mode))
-            else:
-                directories.append((member, mode))
-        # Reject parent/file collisions before creating anything from the archive.
-        filenames = {member.as_posix().casefold() for _, member, _ in files}
-        paths = [member for _, member, _ in files] + [member for member, _ in directories]
-        if any(parent.as_posix().casefold() in filenames
-               for member in paths for parent in member.parents if parent.parts):
-            raise SystemExit("Archive member conflicts with a parent file")
-        for member, _ in directories:
-            (destination / member).mkdir(parents=True, exist_ok=True)
-        for entry, member, mode in files:
-            output = destination / member
-            output.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(entry) as source, output.open("xb") as target:
-                written = 0
-                while chunk := source.read(min(1024 * 1024, entry.file_size - written + 1)):
-                    written += len(chunk)
-                    if written > entry.file_size or written > max_file:
-                        raise SystemExit("Archive member exceeds declared size")
-                    target.write(chunk)
-            if written != entry.file_size:
-                raise SystemExit("Archive member size mismatch")
-            output.chmod(mode & 0o777)
-        for member, mode in sorted(directories, key=lambda row: len(row[0].parts), reverse=True):
-            (destination / member).chmod(mode & 0o777)
-elif asset.suffix == ".gz":
-    with gzip.open(asset, "rb") as source, installer.open("xb") as target:
-        total = 0
-        while chunk := source.read(1024 * 1024):
-            total += len(chunk)
-            if total > max_file:
-                raise SystemExit("Gateway executable exceeds extraction budget")
-            target.write(chunk)
-else:
-    raise SystemExit("Gateway installation requires a .gz server archive or complete ZIP archive")
-if not installer.is_file():
-    raise SystemExit(f"{asset} does not contain {installer.relative_to(destination)}")
-# Check the selected native target before executing any extracted code.
-with installer.open("rb") as source:
-    header = source.read(4096)
-arm = os.environ["PIONEER_TARGET_ARCH"] == "aarch64"
-if os.environ["PIONEER_TARGET_OS"] == "linux":
-    valid = (len(header) >= 20 and header[:6] == b"\x7fELF\x02\x01"
-             and int.from_bytes(header[18:20], "little") == (183 if arm else 62))
-else:
-    order = "little" if header[:4] == b"\xcf\xfa\xed\xfe" else "big"
-    valid = (len(header) >= 8 and header[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf")
-             and int.from_bytes(header[4:8], order) == (0x100000C if arm else 0x1000007))
-if not valid:
-    raise SystemExit("Gateway executable does not match this OS and architecture")
+work_dir = installer.parent
+
+found = False
+with zipfile.ZipFile(asset) as archive:
+    for entry in archive.infolist():
+        member = pathlib.PurePosixPath(entry.filename)
+        if len(member.parts) != 1:
+            continue
+        name = member.name
+        if not name:
+            continue
+        if name == "pioneer":
+            installer.write_bytes(archive.read(entry))
+            found = True
+        elif name.startswith("libonnxruntime") and name.endswith(".dylib"):
+            (work_dir / name).write_bytes(archive.read(entry))
+
+if not found:
+    raise SystemExit(f"{asset} does not contain pioneer")
 PY
-  if [[ -n "$gateway_bundle" ]]; then
-    need_cmd codesign
-    codesign --verify --deep --strict "$gateway_bundle"
-  elif [[ "$asset_file" == *.gz ]]; then
-    # Gzip carries no Unix file mode; ZIP permissions were preserved above.
-    chmod 0755 "$installer_bin"
-  fi
-  [[ -x "$installer_bin" ]] || fail "Gateway installer executable is not executable: $installer_bin"
+      ;;
+    *.gz)
+      need_cmd gunzip
+      gunzip -c "$asset_file" > "$installer_bin"
+      ;;
+    *)
+      fail "Gateway installation requires a .gz server archive or a complete ZIP archive"
+      ;;
+  esac
+  chmod 0755 "$installer_bin"
 
   local args=(
     install
@@ -342,11 +271,6 @@ main() {
     [[ -f "$asset_file" ]] || fail "local asset file does not exist: $asset_file"
     [[ -f "$checksums_file" ]] || fail "local checksums file does not exist: $checksums_file"
     asset_name="$(basename "$asset_file")"
-    mkdir "${WORK_DIR}/inputs"
-    cp "$asset_file" "${WORK_DIR}/inputs/${asset_name}"
-    cp "$checksums_file" "${WORK_DIR}/inputs/SHA256SUMS"
-    asset_file="${WORK_DIR}/inputs/${asset_name}"
-    checksums_file="${WORK_DIR}/inputs/SHA256SUMS"
     tag="local-bundle"
   else
     local asset_suffix="" asset_ext="gz"
@@ -370,7 +294,7 @@ main() {
   actual="$(sha256_file "$asset_file")"
   [[ "$expected" == "$actual" ]] || fail "checksum mismatch for ${asset_name}"
 
-  run_package_installer "$asset_file" "$checksums_file" "$WORK_DIR" "$os" "$arch"
+  run_bootstrap_installer "$asset_file" "$checksums_file" "$WORK_DIR"
 }
 
 main "$@"

@@ -189,7 +189,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Windows staging validation failed" }
     if ($env:PIONEER_SYMBOL_INPUTS_DIR) {
         $ledger = Join-Path $env:PIONEER_SYMBOL_INPUTS_DIR "packaged.json"
-        foreach ($binary in @((Join-Path $stageDir "pioneer-app.exe"), $helperStagePath)) {
+        foreach ($binary in @((Join-Path $stageDir "pioneer-app.exe"), (Join-Path $gatewayStageDir "pioneer-bootstrap.exe"), $helperStagePath)) {
             python scripts/packaging/symbol-inputs.py record $binary $ledger
             if ($LASTEXITCODE -ne 0) { throw "Packaged module inventory failed" }
         }
@@ -223,6 +223,9 @@ try {
           <File Id="DesktopUpdaterFile" Source="`$(var.StageDir)\\pioneer-app-updater.exe" KeyPath="yes" />
         </Component>
         <Directory Id="GatewayBundleDir" Name="gateway">
+          <Component Id="GatewayBootstrapComponent" Guid="*">
+            <File Id="GatewayBootstrapFile" Source="`$(var.StageDir)\\gateway\\pioneer-bootstrap.exe" KeyPath="yes" />
+          </Component>
           <Component Id="GatewayAssetComponent" Guid="*">
             <File Id="GatewayAssetFile" Source="`$(var.StageDir)\\gateway\\$gatewayAssetName" KeyPath="yes" />
           </Component>
@@ -239,6 +242,7 @@ try {
     <Feature Id="MainFeature" Title="Pioneer" Level="1">
       <ComponentRef Id="DesktopExeComponent" />
       <ComponentRef Id="DesktopUpdaterComponent" />
+      <ComponentRef Id="GatewayBootstrapComponent" />
       <ComponentRef Id="GatewayAssetComponent" />
       <ComponentRef Id="GatewayChecksumsComponent" />
       <ComponentRef Id="GatewayProvenanceComponent" />
