@@ -20,6 +20,7 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 struct GateState {
     blocked: bool,
     flush_blocked: bool,
+    flush_after_writes: u64,
     writes: u64,
     flushed_writes: u64,
     reported: bool,
@@ -44,6 +45,7 @@ impl WriteGate {
     fn block_flush(&self) {
         let mut state = self.state.lock().unwrap();
         state.flush_blocked = true;
+        state.flush_after_writes = state.writes;
         state.reported = false;
     }
 
@@ -154,7 +156,10 @@ impl AsyncWrite for GatedSocket {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         {
             let mut state = self.gate.state.lock().unwrap();
-            if state.flush_blocked {
+            // The reader can flush the preceding frame before the writer's
+            // send future completes. Let that send finish; block only after
+            // the next frame has reached the underlying socket.
+            if state.flush_blocked && state.writes > state.flush_after_writes {
                 state.waker = Some(cx.waker().clone());
                 if !state.reported {
                     state.reported = true;
@@ -366,8 +371,8 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
         phase.set("receiving first request");
         let first = request(&f.commands, "synthetic/first");
         assert_eq!(f.next_request().await["id"], first.id);
-        // Receiving bytes does not establish completion of their flush. Arm
-        // the next gate only after the preceding write has actually flushed.
+        // Receiving bytes does not establish completion of their flush. Wait
+        // for the socket flush before arming the gate for the next frame.
         phase.set("waiting for first request flush");
         f.gate.wait_flushed().await;
         // The peer can respond before send/flush completes. Registration must
