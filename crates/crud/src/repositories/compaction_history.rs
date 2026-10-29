@@ -1289,7 +1289,8 @@ async fn compaction_task_basis_snapshot_inner(
     let mut bytes = Vec::new();
     bytes.try_reserve(history_bytes)?;
     while bytes.len() < history_bytes {
-        let count = SOURCE_PAGE_BYTES.min(history_bytes - bytes.len());
+        // Native legacy/raw reads share the driver's 64 KiB byte quantum.
+        let count = (64 * 1024).min(history_bytes - bytes.len());
         let query = task_run_turn::Entity::find()
             .select_only()
             .join(

@@ -1550,9 +1550,9 @@ async fn utf8_metadata_bytecode_does_not_fetch_overflow_payload_before_admission
             .query_all_raw(explained)
             .await
             .unwrap();
-        let function_row = bytecode
+        let function_index = bytecode
             .iter()
-            .find(|r| {
+            .position(|r| {
                 let op: String = r.try_get("", "opcode").unwrap();
                 op == "Function"
                     && r.try_get::<Option<String>>("", "p4")
@@ -1560,9 +1560,12 @@ async fn utf8_metadata_bytecode_does_not_fetch_overflow_payload_before_admission
                         .is_some_and(|p| p.starts_with(function))
             })
             .expect("byte-length function in bytecode");
-        let argument: i64 = function_row.try_get("", "p2").unwrap();
-        let column = bytecode
+        let argument: i64 = bytecode[function_index].try_get("", "p2").unwrap();
+        // CASE and its header subquery reuse temporary registers. Inspect the
+        // last column write before this function, not an earlier register use.
+        let column = bytecode[..function_index]
             .iter()
+            .rev()
             .find(|r| {
                 r.try_get::<String>("", "opcode").unwrap() == "Column"
                     && r.try_get::<i64>("", "p3").unwrap() == argument
