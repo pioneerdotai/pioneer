@@ -20,6 +20,7 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 struct GateState {
     blocked: bool,
     flush_blocked: bool,
+    block_flush_after_write: bool,
     reported: bool,
     failed: bool,
     waker: Option<Waker>,
@@ -40,7 +41,9 @@ impl WriteGate {
 
     fn block_flush(&self) {
         let mut state = self.state.lock().unwrap();
-        state.flush_blocked = true;
+        // Let an outstanding flush finish before blocking the next frame's
+        // flush. Seeing a frame at the peer does not mean its flush has ended.
+        state.block_flush_after_write = true;
         state.reported = false;
     }
 
@@ -58,6 +61,7 @@ impl WriteGate {
         let mut state = self.state.lock().unwrap();
         state.blocked = false;
         state.flush_blocked = false;
+        state.block_flush_after_write = false;
         state.failed = failed;
         if let Some(waker) = state.waker.take() {
             waker.wake();
@@ -127,7 +131,15 @@ impl AsyncWrite for GatedSocket {
                 return Poll::Pending;
             }
         }
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(result, Poll::Ready(Ok(written)) if written > 0) {
+            let mut state = self.gate.state.lock().unwrap();
+            if state.block_flush_after_write {
+                state.block_flush_after_write = false;
+                state.flush_blocked = true;
+            }
+        }
+        result
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         {
