@@ -10,9 +10,10 @@ use super::{
     silero::create_voice_detector,
     supervisor::VoiceInputSupervisor,
     transcription::{
-        PreparedSpeechBuffer, VoiceSpeechHypothesis, VoiceSpeechTranscriber, VoiceTranscript,
-        VoiceTranscriptionDiagnostics, VoiceTranscriptionError, VoiceTranscriptionNoSpeech,
-        VoiceTranscriptionNoSpeechReason, VoiceTranscriptionStrategy,
+        DecodingCompletion, PreparedSpeechBuffer, VoiceNativeSession, VoiceSpeechHypothesis,
+        VoiceSpeechTranscriber, VoiceTranscript, VoiceTranscriptionDiagnostics,
+        VoiceTranscriptionError, VoiceTranscriptionNoSpeech, VoiceTranscriptionNoSpeechReason,
+        VoiceTranscriptionStrategy,
     },
     vad::{
         SmoothedVadFrame, SmoothedVoiceVad, VOICE_VAD_FRAME_SAMPLES, VadInterval,
@@ -83,11 +84,52 @@ pub(crate) struct SessionSpeechTranscriber {
 }
 
 impl VoiceSpeechTranscriber for SessionSpeechTranscriber {
+    fn transcribe_prepared_hypothesis(
+        &self,
+        buffer: &PreparedSpeechBuffer,
+        real_pcm_samples: usize,
+    ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        #[cfg(test)]
+        if self.fake.is_some() {
+            return self.transcribe_hypothesis(buffer);
+        }
+        self.supervisor.transcribe_prepared_for_session(
+            buffer,
+            real_pcm_samples,
+            self.generation,
+            &self.cancellation,
+        )
+    }
+
+    fn begin_native_session(
+        &self,
+    ) -> Result<Option<Box<dyn VoiceNativeSession>>, VoiceTranscriptionError> {
+        #[cfg(test)]
+        if self.fake.is_some() {
+            return Ok(None);
+        }
+        let state = self.supervisor.native_session_operation(
+            self.generation,
+            &self.cancellation,
+            |engine| engine.begin_native_session(),
+        )?;
+        Ok(state.map(|state| {
+            Box::new(SessionNativeTranscriber {
+                supervisor: self.supervisor.clone(),
+                generation: self.generation,
+                cancellation: self.cancellation.clone(),
+                state: Some(state),
+            }) as Box<dyn VoiceNativeSession>
+        }))
+    }
+
     fn transcribe_speech(
         &self,
         buffer: &PreparedSpeechBuffer,
     ) -> Result<String, VoiceTranscriptionError> {
-        self.transcribe_hypothesis(buffer).map(|result| result.text)
+        self.transcribe_hypothesis(buffer)?
+            .ensure_complete()
+            .map(|result| result.text)
     }
 
     fn transcribe_hypothesis(
@@ -106,6 +148,66 @@ impl VoiceSpeechTranscriber for SessionSpeechTranscriber {
         }
         self.supervisor
             .transcribe_for_session(buffer, self.generation, &self.cancellation)
+    }
+}
+
+struct SessionNativeTranscriber {
+    supervisor: Arc<VoiceInputSupervisor>,
+    generation: u64,
+    cancellation: CancellationToken,
+    state: Option<super::runtime::NativeVoiceEngineSession>,
+}
+
+impl SessionNativeTranscriber {
+    fn closed_error() -> VoiceTranscriptionError {
+        super::transcription::transcription_error(
+            super::transcription::VoiceTranscriptionErrorKind::RuntimeFailure,
+            "native voice segment is closed",
+        )
+    }
+}
+
+impl VoiceNativeSession for SessionNativeTranscriber {
+    fn feed(&mut self, samples: &[f32]) -> Result<(), VoiceTranscriptionError> {
+        let state = self.state.as_mut().ok_or_else(Self::closed_error)?;
+        let result = self.supervisor.native_session_operation(
+            self.generation,
+            &self.cancellation,
+            |engine| engine.feed_native_session(state, samples),
+        );
+        if result.is_err() {
+            self.state = None;
+        }
+        result
+    }
+
+    fn hypothesis(&mut self) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        let state = self.state.as_mut().ok_or_else(Self::closed_error)?;
+        let result = self.supervisor.native_session_operation(
+            self.generation,
+            &self.cancellation,
+            |engine| engine.native_hypothesis(state),
+        );
+        if result.is_err() {
+            self.state = None;
+        }
+        result
+    }
+
+    fn finish(&mut self) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        let state = self.state.take().ok_or_else(Self::closed_error)?;
+        let result = self.supervisor.native_session_operation(
+            self.generation,
+            &self.cancellation,
+            |engine| engine.finish_native_session(state),
+        )?;
+        if result.completion != DecodingCompletion::Normal {
+            return Err(super::transcription::transcription_error(
+                super::transcription::VoiceTranscriptionErrorKind::RuntimeFailure,
+                "native voice segment did not reach normal completion",
+            ));
+        }
+        result.ensure_complete()
     }
 }
 
@@ -316,8 +418,10 @@ fn process_buffered<D: VoiceActivityDetector>(
         // for the engine lock and immediately before entering native inference.
         ensure_active(cancellation)?;
         let text = transcriber
-            .transcribe_speech(&buffer)
+            .transcribe_prepared_hypothesis(&buffer, speech_samples)
+            .and_then(VoiceSpeechHypothesis::ensure_complete)
             .map_err(|error| error.into_voice_error())?
+            .text
             .trim()
             .to_owned();
         ensure_active(cancellation)?;
@@ -356,6 +460,10 @@ fn process<D: VoiceActivityDetector>(
 ) -> Result<GatewayVoiceSessionPipelineOutcome, VoiceError> {
     ensure_active(cancellation)?;
     let mut state = IncrementalSpeech::new(is_moonshine_base, detector)?;
+    state.native = transcriber
+        .begin_native_session()
+        .map_err(|error| error.into_voice_error())?;
+    state.native_enabled = state.native.is_some();
     loop {
         ensure_active(cancellation)?;
         let Some(chunk) = store
@@ -673,6 +781,8 @@ impl AudioTimeline {
 }
 
 struct IncrementalSpeech<D> {
+    native: Option<Box<dyn VoiceNativeSession>>,
+    native_enabled: bool,
     is_moonshine_base: bool,
     vad: SmoothedVoiceVad<D>,
     pending: Vec<f32>,
@@ -704,6 +814,8 @@ struct IncrementalSpeech<D> {
 impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
     fn new(is_moonshine_base: bool, detector: D) -> Result<Self, VoiceError> {
         Ok(Self {
+            native: None,
+            native_enabled: false,
             is_moonshine_base,
             vad: SmoothedVoiceVad::new(detector, VoiceVadConfig::default())
                 .map_err(|_| worker_error("failed to initialize voice VAD"))?,
@@ -767,6 +879,17 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         cancellation: &CancellationToken,
         transcriber: &impl VoiceSpeechTranscriber,
     ) -> Result<(), VoiceError> {
+        if self.native_enabled {
+            // The native acoustic segment has no projected/committed prefix.
+            // Keep the existing endpoint lifetime; no one-shot partition probes.
+            if !store.processing_skip_preview(id) {
+                self.refresh(store, id, cancellation, transcriber)?;
+            }
+            if self.full_hypothesis.text.len() > MAX_PAUSE_TEXT_BYTES {
+                self.flush(store, id, cancellation, transcriber)?;
+            }
+            return Ok(());
+        }
         if self.speech.len() > PAUSE_WINDOW_SAMPLES && !self.pause_projection_deferred {
             // The same ownership projection as a full window, with a fixed
             // source fence. At most whole + two partition probes + left probe;
@@ -856,6 +979,19 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
             let room = MAX_SPEECH_WINDOW_SAMPLES - self.speech.len();
             let until_refresh = self.next_refresh_samples - self.speech.len();
             let take = samples.len().min(room).min(until_refresh);
+            if self.native_enabled {
+                if self.native.is_none() {
+                    self.native = transcriber
+                        .begin_native_session()
+                        .map_err(|error| error.into_voice_error())?;
+                }
+                self.native
+                    .as_mut()
+                    .ok_or_else(|| worker_error("native voice capability disappeared"))?
+                    .feed(&samples[..take])
+                    .map_err(|error| error.into_voice_error())?;
+                ensure_active(cancellation)?;
+            }
             self.timeline
                 .append(self.speech_samples, source, source + take, &intervals);
             debug_assert_eq!(self.timeline.source_at(self.speech_samples), Some(source));
@@ -889,6 +1025,19 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         transcriber: &impl VoiceSpeechTranscriber,
     ) -> Result<(), VoiceError> {
         if !self.candidate_current || self.decoded_samples != self.speech.len() {
+            if self.native_enabled {
+                self.full_hypothesis = self
+                    .native
+                    .as_mut()
+                    .ok_or_else(|| worker_error("native voice segment is missing"))?
+                    .hypothesis()
+                    .map_err(|error| error.into_voice_error())?;
+                ensure_active(cancellation)?;
+                self.hypothesis = self.full_hypothesis.text.clone();
+                self.decoded_samples = self.speech.len();
+                self.candidate_current = true;
+                return Ok(());
+            }
             let full = self.decode(&self.speech, store, id, cancellation, transcriber)?;
             let start = if let Some(prefix) = &self.held_prefix {
                 // If native timing also validates this exact prefix, prefer it.
@@ -932,6 +1081,11 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         cancellation: &CancellationToken,
         transcriber: &impl VoiceSpeechTranscriber,
     ) -> Result<(), VoiceError> {
+        if self.native_enabled {
+            // Resource boundary: finalize the entire bounded native segment,
+            // then start a fresh disjoint segment on the next accepted PCM.
+            return self.flush(store, id, cancellation, transcriber);
+        }
         let earliest = self.context_samples + MIN_ADVANCE_SAMPLES;
         let latest = self.speech.len() - REFRESH_SAMPLES;
         let preferred_cut = self.preferred_boundary(earliest, latest);
@@ -1105,7 +1259,18 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         }
         // Reuse only an identical completed span. A changed tail MUST succeed;
         // an error cannot publish earlier successful previews as a partial turn.
-        self.refresh(store, id, cancellation, transcriber)?;
+        if self.native_enabled {
+            self.full_hypothesis = self
+                .native
+                .take()
+                .ok_or_else(|| worker_error("native voice segment is missing"))?
+                .finish()
+                .and_then(VoiceSpeechHypothesis::ensure_complete)
+                .map_err(|error| error.into_voice_error())?;
+            ensure_active(cancellation)?;
+        } else {
+            self.refresh(store, id, cancellation, transcriber)?;
+        }
         append_text(
             &mut self.text,
             &self.full_hypothesis.text[self.owned_text_start..],
@@ -1156,10 +1321,13 @@ impl<D: VoiceActivityDetector> IncrementalSpeech<D> {
         // A call already in progress at Commit keeps its original startup scope.
         let key = store.processing_startup_key(id);
         let mut raw = pioneer_observability::turn_startup::scope_sync(key, || {
-            transcriber.transcribe_hypothesis(&buffer)
+            transcriber.transcribe_prepared_hypothesis(&buffer, source.len())
         })
         .map_err(|error| error.into_voice_error())?;
         ensure_active(cancellation)?;
+        raw = raw
+            .ensure_complete()
+            .map_err(|error| error.into_voice_error())?;
         raw.text = raw.text.trim().to_owned();
         if raw
             .segments
@@ -1636,6 +1804,7 @@ impl VoiceSignalStats {
 
 #[cfg(test)]
 mod tests {
+    include!("engine_sessions_tests.rs");
     use super::super::transcription::TestSpeechTranscriber;
     use super::*;
     use pioneer_protocol::{VoiceAudioEncoding, VoiceChunkFrameHeader};
@@ -2394,7 +2563,11 @@ mod tests {
                         })
                         .collect()
                 });
-                Ok(VoiceSpeechHypothesis { text, segments })
+                Ok(VoiceSpeechHypothesis {
+                    text,
+                    segments,
+                    ..Default::default()
+                })
             });
             let result = closed_input(&audio, packet_samples, false, &fake).unwrap();
             let GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. } = result else {
@@ -2686,7 +2859,11 @@ mod tests {
                     }]),
                 };
                 captured.lock().unwrap().push(samples);
-                Ok(VoiceSpeechHypothesis { text, segments })
+                Ok(VoiceSpeechHypothesis {
+                    text,
+                    segments,
+                    ..Default::default()
+                })
             });
             let result = closed_input(&audio, 317, false, &fake).unwrap();
             let GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. } = result else {
@@ -2850,6 +3027,7 @@ mod tests {
                                     })
                                     .collect(),
                                 ),
+                                ..Default::default()
                             }),
                             LEFT_CONTEXT_SAMPLES => {
                                 Ok(VoiceSpeechHypothesis::text_only(String::new()))
@@ -2873,7 +3051,11 @@ mod tests {
                                         text: text.clone(),
                                     }]),
                                 };
-                                Ok(VoiceSpeechHypothesis { text, segments })
+                                Ok(VoiceSpeechHypothesis {
+                                    text,
+                                    segments,
+                                    ..Default::default()
+                                })
                             }
                             _ => panic!(
                                 "timed progress must not add partition/recovery calls: {count}"
@@ -2932,6 +3114,7 @@ mod tests {
                             })
                             .collect(),
                         ),
+                        ..Default::default()
                     });
                 }
                 168000 => "начало да",
@@ -2959,7 +3142,11 @@ mod tests {
                     text: text.clone(),
                 }]
             });
-            Ok(VoiceSpeechHypothesis { text, segments })
+            Ok(VoiceSpeechHypothesis {
+                text,
+                segments,
+                ..Default::default()
+            })
         }
         // Speech energy stays constant even across the timestamp gap. Varying
         // signs makes the exact source-order assertions meaningful as well.
@@ -3270,6 +3457,7 @@ mod tests {
                         },
                     }]),
                     text,
+                    ..Default::default()
                 })
             });
             let result = closed_input(&audio, 317, false, &fake).unwrap();
@@ -3306,6 +3494,7 @@ mod tests {
                         text: "хвост".to_owned(),
                     },
                 ]),
+                ..Default::default()
             })
         });
         let mut state = IncrementalSpeech::new(false, test_detector()).unwrap();
@@ -3356,6 +3545,7 @@ mod tests {
                         text: "речи".to_owned(),
                     },
                 ]),
+                ..Default::default()
             })
         });
         let store = open_store();
@@ -4502,6 +4692,7 @@ mod tests {
                         })
                         .collect(),
                     ),
+                    ..Default::default()
                 }
             } else {
                 VoiceSpeechHypothesis::text_only(
@@ -4683,6 +4874,7 @@ mod tests {
                     end,
                     text: "да".to_owned(),
                 }]),
+                ..Default::default()
             };
             assert!(timed_boundaries(&hypothesis, 16000).is_none());
         }
@@ -4700,6 +4892,7 @@ mod tests {
                     text: "да".to_owned(),
                 },
             ]),
+            ..Default::default()
         };
         assert!(timed_boundaries(&hypothesis, 16000).is_none());
         assert!(!is_text_boundary("да tail", 1));
@@ -4726,6 +4919,7 @@ mod tests {
                         })
                         .collect(),
                     ),
+                    ..Default::default()
                 }
             } else {
                 assert_eq!(buffer.speech_samples(), 24000); // no partition probes

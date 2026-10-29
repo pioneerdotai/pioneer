@@ -20,7 +20,11 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-const HOST_BUNDLE_ID: &str = "ai.pioneer.gateway";
+const HOST_BUNDLE_ID: &str = if cfg!(debug_assertions) {
+    pioneer_config::DEV_GATEWAY_BUNDLE_ID
+} else {
+    "ai.pioneer.gateway"
+};
 const MAX_OWNERS: usize = 32;
 const QUEUE_CAPACITY: usize = 16;
 const CALL_DEADLINE: Duration = Duration::from_secs(120);
@@ -676,6 +680,8 @@ fn verify_packaged_driver(executable_dir: &Path, binary: &Path) -> Result<(), To
         || manifest["permission_owner"] != "gateway"
         || manifest["target"].as_str() != Some(packaged_target()?)
         || manifest["daemon"].as_str() != Some(relative.as_str())
+        || (cfg!(debug_assertions)
+            && manifest["gateway_bundle_identifier"].as_str() != Some(HOST_BUNDLE_ID))
     {
         return Err(unavailable(
             "Gateway CUA payload identity or layout is invalid",
