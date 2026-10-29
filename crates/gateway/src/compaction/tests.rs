@@ -1,6 +1,8 @@
 use super::*;
 #[path = "checkpoint_input_alias_tests.rs"]
 mod checkpoint_input_alias_tests;
+#[path = "estimation_tests.rs"]
+mod estimation_tests;
 #[path = "frozen_preparation_tests.rs"]
 mod frozen_preparation_tests;
 #[path = "html_preview_retention_tests.rs"]
@@ -1968,11 +1970,20 @@ async fn turn_started_and_edited_payload_projection_matches_history_without_even
 
 #[derive(Clone, Copy)]
 enum Reply {
+    Overflow,
     Invalid,
     Success,
     Transient,
     Hang,
 }
+#[derive(Debug)]
+struct ConfirmedInputOverflow;
+impl std::fmt::Display for ConfirmedInputOverflow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("fixture confirmed input overflow")
+    }
+}
+impl std::error::Error for ConfirmedInputOverflow {}
 struct ProviderFixture {
     replies: Mutex<VecDeque<Reply>>,
     calls: Mutex<Vec<ChatRequest>>,
@@ -2041,6 +2052,7 @@ impl Provider for ProviderFixture {
             .unwrap_or(Reply::Success);
         let invalid = matches!(reply, Reply::Invalid);
         match reply {
+            Reply::Overflow => return Err(anyhow::Error::new(ConfirmedInputOverflow)),
             Reply::Transient => anyhow::bail!("synthetic rate limit"),
             Reply::Hang => std::future::pending::<()>().await,
             Reply::Success | Reply::Invalid => {}
@@ -2065,13 +2077,18 @@ impl Provider for ProviderFixture {
     ) -> Result<futures_util::stream::BoxStream<'static, Result<StreamChunk>>> {
         anyhow::bail!("not used")
     }
-    fn classify_failure(&self, _: &anyhow::Error) -> Option<ProviderFailureClassification> {
+    fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+        let overflow = error.downcast_ref::<ConfirmedInputOverflow>().is_some();
         Some(ProviderFailureClassification {
             is_network_error: false,
             error_reason: None,
             request_id: None,
-            class: ProviderFailureClass::RateLimit,
-            http_status: Some(429),
+            class: if overflow {
+                ProviderFailureClass::ContextTooLarge
+            } else {
+                ProviderFailureClass::RateLimit
+            },
+            http_status: Some(if overflow { 400 } else { 429 }),
             provider_code: None,
             retry_after_ms: Some(12_000),
         })
@@ -2424,8 +2441,10 @@ fn native_preflight_counts_the_projected_history_that_will_be_sent() {
         NativeRequestProjection::full(request(legacy), vec![], measuring.clone(), false).unwrap();
     let new = NativeRequestProjection::full(request(projected), vec![], measuring, false).unwrap();
     assert!(old.estimated_input_tokens > new.estimated_input_tokens);
-    let context = pioneer_compaction::padded_input(new.estimated_input_tokens)
+    let required = pioneer_compaction::padded_input(new.estimated_input_tokens)
         .saturating_add(new.output_reserve);
+    // Leave the shared budget's 1% framing headroom in this exact-fit setup.
+    let context = (u128::from(required) * 100).div_ceil(99) as u64;
     let selected = ModelBudget::new(Some(context), None, Some(128));
     let old = super::background_history::completed_history_request_projection(
         old.request,
@@ -2965,7 +2984,11 @@ async fn commentary_reference_only_excerpt_uses_the_current_budgeted_projection(
         excerpts[0].text
     );
     assert!(!portion.completed.contains(&reference));
-    assert!(f.runner.fits(&portion.request).unwrap());
+    assert!(f.runner.summarizer.model_budget().fits(
+        f.runner.summarizer.input_tokens(&portion.request).unwrap(),
+        portion.request.output_cap,
+        false
+    ));
 }
 
 #[tokio::test]
@@ -4453,6 +4476,25 @@ async fn fixture_with_canonical_payloads_and_observer(
     observer_fails: bool,
     database_observer: Option<Arc<HistoryReadObserver>>,
 ) -> Fixture {
+    fixture_with_canonical_payloads_observer_and_budget(
+        payloads,
+        replies,
+        target_fits,
+        observer_fails,
+        database_observer,
+        ModelBudget::new(Some(4096), None, None),
+    )
+    .await
+}
+
+async fn fixture_with_canonical_payloads_observer_and_budget(
+    payloads: Vec<String>,
+    replies: Vec<Reply>,
+    target_fits: bool,
+    observer_fails: bool,
+    database_observer: Option<Arc<HistoryReadObserver>>,
+    budget: ModelBudget,
+) -> Fixture {
     assert!(!payloads.is_empty());
     super::load_test_catalog();
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
@@ -4530,7 +4572,6 @@ async fn fixture_with_canonical_payloads_and_observer(
         .compaction_admit("ws", "thread", &snapshot)
         .await
         .unwrap();
-    let budget = ModelBudget::new(Some(4096), None, None);
     store
         .compaction_prepare_runner(
             "operation",
@@ -18826,11 +18867,13 @@ impl Summarizer for CleanupGateSummarizer {
 
 #[tokio::test]
 async fn service_cleanup_precedes_publication_backoff_and_stop_reconciliation() {
-    for scenario in 0..4 {
+    for scenario in 0..5 {
         let mut f = fixture(
             "completed history",
             vec![if scenario == 2 {
                 Reply::Hang
+            } else if scenario == 4 {
+                Reply::Overflow
             } else if scenario == 3 {
                 Reply::Invalid
             } else {
@@ -18858,7 +18901,7 @@ async fn service_cleanup_precedes_publication_backoff_and_stop_reconciliation() 
             f.clock.advance(pioneer_compaction::ATTEMPT_MILLIS);
         }
         cleanup.wait_cleanup(1).await;
-        if scenario == 1 {
+        if scenario == 1 || scenario == 4 {
             cancel.cancel();
             // Cancellation drops drive's cleanup future. run must reacquire
             // the same resource owner and finish cleanup before returning.
@@ -24486,8 +24529,9 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         normalized_projection.estimated_input_tokens < duplicated_projection.estimated_input_tokens
     );
     let reserve = 1;
-    let threshold =
+    let required =
         pioneer_compaction::padded_input(normalized_projection.estimated_input_tokens) + reserve;
+    let threshold = (u128::from(required) * 100).div_ceil(99) as u64;
     let budget = ModelBudget::new(Some(threshold), None, Some(reserve));
     assert!(
         pioneer_agent::compaction::request::NativeRequestProjection::full(

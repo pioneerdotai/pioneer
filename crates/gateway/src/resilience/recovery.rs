@@ -5947,6 +5947,302 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn primary_chat_requires_provider_owned_overflow_before_durable_compaction() {
+        use pioneer_protocol::AgentDurableEvent;
+        use pioneer_provider::{
+            ChatRequest, ChatResponse, Provider, ProviderFailureClassification, StreamChunk,
+        };
+
+        struct Rejected {
+            message: &'static str,
+            classification: Option<ProviderFailureClassification>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Rejected {
+            fn name(&self) -> &str {
+                "overflow-fixture"
+            }
+            fn classify_failure(&self, _: &anyhow::Error) -> Option<ProviderFailureClassification> {
+                self.classification.clone()
+            }
+            async fn chat(&self, _: ChatRequest) -> Result<ChatResponse> {
+                anyhow::bail!(self.message)
+            }
+            async fn stream_chat(
+                &self,
+                _: ChatRequest,
+            ) -> Result<futures_util::stream::BoxStream<'static, Result<StreamChunk>>> {
+                anyhow::bail!(self.message)
+            }
+        }
+
+        let (store, coordinator) = setup_coordinator().await;
+        let misleading = "maximum context length exceeded";
+        let cases = [
+            (
+                misleading,
+                None,
+                None,
+                ProviderFailureClass::Unknown,
+                RecoveryAction::MarkFailed,
+            ),
+            (
+                "API error (413 Payload Too Large): context length exceeded",
+                None,
+                None,
+                ProviderFailureClass::Unknown,
+                RecoveryAction::MarkFailed,
+            ),
+            (
+                "context length exceeded: 503 tokens requested",
+                Some(ProviderFailureClass::ContextTooLarge),
+                None,
+                ProviderFailureClass::ContextTooLarge,
+                RecoveryAction::CompactHistory,
+            ),
+            (
+                "API error (401 Unauthorized): context length exceeded",
+                Some(ProviderFailureClass::ContextTooLarge),
+                None,
+                ProviderFailureClass::ContextTooLarge,
+                RecoveryAction::CompactHistory,
+            ),
+            (
+                "API error (401 Unauthorized): context length exceeded",
+                None,
+                None,
+                ProviderFailureClass::Unknown,
+                RecoveryAction::MarkFailed,
+            ),
+            (
+                "opaque rejection",
+                Some(ProviderFailureClass::PromptTooLong),
+                Some(413),
+                ProviderFailureClass::PromptTooLong,
+                RecoveryAction::CompactHistory,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::Unknown),
+                None,
+                ProviderFailureClass::Unknown,
+                RecoveryAction::MarkFailed,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::AuthExpired),
+                Some(401),
+                ProviderFailureClass::AuthExpired,
+                RecoveryAction::RefreshProviderAuth,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::RateLimit),
+                Some(429),
+                ProviderFailureClass::RateLimit,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::Provider5xx),
+                Some(503),
+                ProviderFailureClass::Provider5xx,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::ContextTooLarge),
+                Some(401),
+                ProviderFailureClass::AuthExpired,
+                RecoveryAction::RefreshProviderAuth,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::ContextTooLarge),
+                Some(403),
+                ProviderFailureClass::AuthOrPermission,
+                RecoveryAction::RefreshProviderAuth,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::ContextTooLarge),
+                Some(408),
+                ProviderFailureClass::NetworkTransient,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::ContextTooLarge),
+                Some(425),
+                ProviderFailureClass::NetworkTransient,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::ContextTooLarge),
+                Some(429),
+                ProviderFailureClass::RateLimit,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::PromptTooLong),
+                Some(503),
+                ProviderFailureClass::Provider5xx,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                "connection reset by peer",
+                None,
+                None,
+                ProviderFailureClass::NetworkTransient,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                "API error (429 Too Many Requests): rate limit",
+                None,
+                None,
+                ProviderFailureClass::RateLimit,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                "API error (503 Service Unavailable): unavailable",
+                None,
+                None,
+                ProviderFailureClass::Provider5xx,
+                RecoveryAction::RetryWithBackoff,
+            ),
+        ];
+        for redacted in [false, true] {
+            for (index, (message, typed_class, status, expected_class, expected_action)) in
+                cases.iter().copied().enumerate()
+            {
+                // Use the real scoped registry, including custom-endpoint error
+                // redaction. Its fallback must not masquerade as typed evidence.
+                let registry = Arc::new(
+                    ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+                        |_, _| Ok(String::new()),
+                        |_, _| Ok(None),
+                        move |_, _| Ok(redacted.then(|| "https://fixture.invalid/private".into())),
+                        pioneer_provider::ProviderTimeoutPolicy::default(),
+                    ),
+                );
+                registry
+                    .insert(
+                        "overflow-fixture",
+                        Arc::new(Rejected {
+                            message,
+                            classification: typed_class.map(|class| {
+                                let mut classification = ProviderFailureClassification::new(class);
+                                classification.http_status = status;
+                                classification
+                            }),
+                        }),
+                    )
+                    .unwrap();
+                let manager = AgentManager::new(registry, test_tool_loop_config());
+                let thread = format!("thr_overflow_{redacted}_{index}");
+                let turn = format!("turn_overflow_{redacted}_{index}");
+                manager.ensure_thread(&thread, "ws_overflow").await.unwrap();
+                let mut receiver = manager.take_durable_receiver(&thread).await.unwrap();
+                manager
+                    .start_turn_with_hook_context_permission_profile_and_security_snapshot(
+                        &thread,
+                        &turn,
+                        ThreadMode::Chat,
+                        pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                        "fixture",
+                        "overflow-fixture",
+                        HashMap::new(),
+                        pioneer_skills::SkillCatalogSnapshot {
+                            version: 1,
+                            generated_at_unix: 0,
+                            skills: Vec::new(),
+                        },
+                        vec![UserInput::Text {
+                            text: "hello".into(),
+                            text_elements: Vec::new(),
+                        }],
+                        Vec::new(),
+                        Vec::new(),
+                        HashMap::new(),
+                        Vec::new(),
+                        pioneer_protocol::default_turn_permission_profile_snapshot(),
+                        TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                            std::env::temp_dir().display().to_string(),
+                            1,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                let candidate = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let event = receiver.recv().await.expect("primary failure event");
+                        // This fixture collects the agent output; the recovery
+                        // job below is persisted by the real coordinator/store.
+                        receiver.acknowledge_last(Ok(()));
+                        match event {
+                            AgentDurableEvent::ProviderFailureDetected {
+                                turn_id,
+                                item_id,
+                                item_type,
+                                failure,
+                                ..
+                            } => {
+                                break ProviderFailureCandidate {
+                                    turn_id,
+                                    item_id,
+                                    item_type,
+                                    failure,
+                                };
+                            }
+                            AgentDurableEvent::TurnFailed { .. }
+                            | AgentDurableEvent::TurnCompleted { .. } => {
+                                panic!("expected provider failure")
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .expect("primary failure must reach durable admission");
+                assert_eq!(
+                    candidate.failure.class, expected_class,
+                    "redacted={redacted}, case={index}"
+                );
+                if typed_class == Some(ProviderFailureClass::ContextTooLarge) && status.is_none() {
+                    assert_eq!(candidate.failure.http_status, None);
+                }
+                let job = coordinator
+                    .enqueue_provider_failure_job(&candidate, 1_700_000_000)
+                    .await
+                    .unwrap()
+                    .into_job();
+                let persisted = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+                assert_eq!(persisted.error_class, Some(expected_class));
+                assert_eq!(persisted.action, expected_action);
+                let plan = coordinator.build_attempt_plan(&persisted, 1).await.unwrap();
+                assert_eq!(
+                    plan.compact_history,
+                    expected_action == RecoveryAction::CompactHistory
+                );
+                assert_eq!(
+                    plan.refresh_provider_auth,
+                    expected_action == RecoveryAction::RefreshProviderAuth
+                );
+                assert_eq!(
+                    plan.terminal_reason.is_some(),
+                    expected_action == RecoveryAction::MarkFailed
+                );
+                if expected_action == RecoveryAction::CompactHistory {
+                    assert_eq!(persisted.max_attempts, 1);
+                }
+                manager.remove_thread(&thread).await;
+            }
+        }
+    }
+
     fn test_tool_loop_config() -> ToolLoopConfig {
         ToolLoopConfig {
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),

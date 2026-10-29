@@ -224,6 +224,13 @@ impl VercelAiGatewayProvider {
         .await
     }
     async fn send(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        self.send_for_operation(builder, false).await
+    }
+    async fn send_for_operation(
+        &self,
+        builder: reqwest::RequestBuilder,
+        embedding: bool,
+    ) -> Result<reqwest::Response> {
         let response = crate::http::non_stream_request(builder.bearer_auth(&self.key), self.policy)
             .send()
             .await
@@ -249,7 +256,9 @@ impl VercelAiGatewayProvider {
             crate::http::read_response_text_bounded(response, 16 * 1024, "provider_error_body")
                 .await
                 .unwrap_or_default();
-        let class = if matches!(status, 408 | 425) {
+        let class = if embedding {
+            super::embedding::classify_input_failure(status, &body)
+        } else if matches!(status, 408 | 425) {
             pioneer_protocol::ProviderFailureClass::NetworkTransient
         } else {
             crate::failure::classify_provider_failure_class(
@@ -592,10 +601,11 @@ impl Provider for VercelAiGatewayProvider {
         let count = request.input.len();
         let body = json!({"model":request.model,"input":request.input,"encoding_format":"float"});
         let response = self
-            .send(
+            .send_for_operation(
                 self.client
                     .post(format!("{}/embeddings", self.root))
                     .json(&body),
+                true,
             )
             .await?;
         let request_id = crate::usage::native_id(
@@ -687,6 +697,34 @@ mod tests {
             requests
         });
         (root, task)
+    }
+
+    #[tokio::test]
+    async fn embedding_http_classification_prioritizes_status_and_structured_codes() {
+        for &(status, body, expected) in super::super::embedding::HTTP_FAILURE_CASES {
+            let (root, task) = server(vec![(status, body)]).await;
+            let provider = VercelAiGatewayProvider::with_base_url("fixture-key", root);
+            provider
+                .apply_snapshot(
+                    &json!({"catalog_status":"complete","data":[{
+                        "id":"private/embed","type":"embedding",
+                        "modalities":{"input":["text"],"output":["embedding"]}
+                    }]}),
+                    true,
+                )
+                .await
+                .unwrap();
+            let error = provider
+                .embed(EmbeddingRequest::new("private/embed", vec!["one".into()]))
+                .await
+                .unwrap_err();
+            let facts = provider.classify_failure(&error).unwrap();
+            assert_eq!(facts.class, expected, "{status} {body}");
+            assert_eq!(facts.http_status, Some(status));
+            let requests = task.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("POST /v1/embeddings "));
+        }
     }
 
     #[tokio::test]

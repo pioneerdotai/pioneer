@@ -212,7 +212,7 @@ impl Error for RedactedEndpointError {
     }
 }
 
-fn endpoint_error_status(error: &anyhow::Error) -> Option<u16> {
+fn typed_endpoint_error_status(error: &anyhow::Error) -> Option<u16> {
     if let Some(status) = error.downcast_ref::<crate::types::ProviderHttpErrorBodyTooLarge>() {
         return Some(status.status);
     }
@@ -222,6 +222,13 @@ fn endpoint_error_status(error: &anyhow::Error) -> Option<u16> {
         {
             return Some(status.as_u16());
         }
+    }
+    None
+}
+
+fn endpoint_error_status(error: &anyhow::Error) -> Option<u16> {
+    if let Some(status) = typed_endpoint_error_status(error) {
+        return Some(status);
     }
     // The supported adapters format non-success responses as `API error
     // (429 Too Many Requests): ...`. Parse only that fixed prefix, never an
@@ -271,6 +278,15 @@ fn redacted_endpoint_error(
     } else if class == ProviderFailureClass::Unknown && is_network {
         class = ProviderFailureClass::NetworkTransient;
     }
+    // Redaction must not turn a legacy Display guess into provider-owned
+    // overflow evidence. Preserve transient fallback and explicit adapter
+    // classifications; only the latter may authorize history reduction.
+    if matches!(
+        class,
+        ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+    ) {
+        class = ProviderFailureClass::Unknown;
+    }
     let mut classification =
         adapter_classification.unwrap_or_else(|| ProviderFailureClassification::new(class));
     // Preserve the old custom-endpoint reqwest fallback even when the adapter
@@ -278,7 +294,18 @@ fn redacted_endpoint_error(
     if classification.class == ProviderFailureClass::Unknown && classification.is_network_error {
         classification.class = ProviderFailureClass::NetworkTransient;
     }
-    classification.http_status = classification.http_status.or(status);
+    // A confirmed overflow class must not acquire contradictory HTTP authority
+    // from a Display prefix. Only typed transport evidence can fill its status.
+    classification.http_status = classification.http_status.or_else(|| {
+        if matches!(
+            classification.class,
+            ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+        ) {
+            typed_endpoint_error_status(&error)
+        } else {
+            status
+        }
+    });
     // `retry-after` is useful for recovery. Retain only the numeric interval.
     classification.retry_after_ms = classification
         .retry_after_ms

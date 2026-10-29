@@ -83106,11 +83106,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
             .count(),
         2
     );
-    let available = std::cmp::min(
-        baseline.context_tokens.unwrap().saturating_sub(reserve),
-        baseline.input_limit.unwrap_or(u64::MAX),
-    );
-    let raw_boundary = (available as u128 * 100 / 105).min(u64::MAX as u128) as u64;
+    let raw_boundary = crate::compaction::estimated_input_capacity(&budget, reserve, false);
     let fitting_fixed = raw_boundary.saturating_sub(estimate);
     assert!(budget.fits(estimate + fitting_fixed, reserve, false));
     assert!(!budget.fits(duplicated_estimate + fitting_fixed, reserve, false));
@@ -84568,7 +84564,10 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
 
     let context = fitting.context_tokens.unwrap();
     let reserve = fitting.output_reserve.unwrap();
-    let fixed = (context - reserve) * 100 / 105 - 6_000;
+    let model_budget =
+        pioneer_compaction::ModelBudget::new(Some(context), fitting.input_limit, None);
+    let fixed = crate::compaction::estimated_input_capacity(&model_budget, reserve, false)
+        .saturating_sub(6_000);
     let mut compacted = HistoryCheckDiagnostic::default();
     let outcome = crate::compaction::prepare_completed_history_owned(
         &harness.processor,

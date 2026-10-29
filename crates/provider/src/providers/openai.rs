@@ -1642,15 +1642,7 @@ impl crate::traits::Provider for OpenAiProvider {
                 )
                 .await
                 {
-                    let class = crate::failure::classify_provider_failure_class(
-                        &body.to_ascii_lowercase(),
-                        ProviderFailureStage::Connect,
-                        Some(status),
-                        None,
-                    );
-                    if class == ProviderFailureClass::ContextTooLarge {
-                        failure.0.class = class;
-                    }
+                    failure.0.class = super::embedding::classify_input_failure(status, &body);
                 }
             }
             return Err(failure.into());
@@ -2025,7 +2017,7 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("budget"));
             let error = provider
-                .embed(EmbeddingRequest::new(model, vec![" a".repeat(8193)]))
+                .embed(EmbeddingRequest::new(model, vec!["abcd".repeat(8193)]))
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains("token budget"));

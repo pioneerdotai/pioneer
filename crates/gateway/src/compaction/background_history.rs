@@ -653,15 +653,26 @@ pub(crate) async fn prepare_completed_history_owned(
             &full.request.messages,
         ))?));
         let manifest = super::admission::history_manifest(&full.request.messages, &layout, &plan)?;
+        let native_projection =
+            NativeRequestProjection::new(full.request, indexes, media, budget.clone(), false)?;
+        // Retained CLI history/media and their indices are immutable for this
+        // operation. Prepare the empty-summary frame once; correction candidates
+        // scan only their new summary, not all retained history or local images.
+        let cli_input = if let Some(runtime) = cli {
+            let base = native_projection.evaluate("")?;
+            let (tokens, _, _) = crate::cli_runtime::context::completed_cli_history_budget(
+                &base.request.messages,
+                workspace,
+                cwd.as_deref(),
+                runtime,
+            )?;
+            Some((tokens, base.output_reserve))
+        } else {
+            None
+        };
         let projection = BackgroundHistoryTarget {
-            projection: NativeRequestProjection::new(
-                full.request,
-                indexes,
-                media,
-                budget.clone(),
-                false,
-            )?,
-            cli: cli.map(|runtime| (workspace.to_owned(), cwd, runtime)),
+            projection: native_projection,
+            cli_input,
             budget,
             fixed_input_tokens,
         };
@@ -777,6 +788,7 @@ pub(crate) async fn prepare_completed_history_owned(
             diagnostic.code = match reason {
                 FailureKind::Transient => "provider_retries_exhausted",
                 FailureKind::Permanent => "compaction_permanent_failure",
+                FailureKind::InputOverflow => "input_overflow",
                 FailureKind::InvalidCompletion => "invalid_completion",
                 FailureKind::InsufficientEffect => "insufficient_effect",
                 FailureKind::Deadline => "operation_deadline",
@@ -824,27 +836,25 @@ fn apply_cli_budget(
 
 struct BackgroundHistoryTarget {
     projection: NativeRequestProjection,
-    cli: Option<(
-        String,
-        Option<String>,
-        pioneer_protocol::CLIAgentRuntimeKind,
-    )>,
+    cli_input: Option<(u64, u64)>,
     budget: ModelBudget,
     fixed_input_tokens: u64,
 }
 #[async_trait::async_trait]
 impl CompactionTarget for BackgroundHistoryTarget {
     async fn fits(&self, summary: &str) -> Result<bool> {
-        let mut evaluated = self.projection.evaluate(summary)?;
-        if let Some((workspace, cwd, runtime)) = &self.cli {
-            apply_cli_budget(
-                &mut evaluated,
-                workspace,
-                cwd.as_deref(),
-                *runtime,
-                &self.budget,
-            )?;
+        if let Some((base, output_reserve)) = self.cli_input {
+            // Summary appears in portable-message JSON inside a CLI text JSON
+            // field. Exclude its two escaped quotes: the base already has them.
+            let added = super::summary_component_units(&summary)?.saturating_sub(4);
+            let input = super::PortionSizing::new(base).with(added);
+            return Ok(self.budget.fits(
+                input.saturating_add(self.fixed_input_tokens),
+                output_reserve,
+                false,
+            ));
         }
+        let evaluated = self.projection.evaluate(summary)?;
         Ok(self.budget.fits(
             evaluated
                 .estimated_input_tokens

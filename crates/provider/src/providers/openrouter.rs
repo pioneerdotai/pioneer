@@ -1047,7 +1047,19 @@ impl OpenRouterProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
+        Self::api_error_for_operation(response, false).await
+    }
+
+    async fn api_error_for_operation(
+        response: reqwest::Response,
+        embedding: bool,
+    ) -> anyhow::Error {
         let facts = ResponseFailureFacts::capture(&response);
+        // HTTP 413 is sufficient payload evidence even if its body cannot
+        // fit the bounded reader. Preserve safe header facts and drop transport.
+        if embedding && facts.http_status == Some(413) {
+            return OpenRouterFailure::http("", 413, facts.retry_after_ms, facts.request_id).into();
+        }
         let body = match crate::http::read_response_text_bounded(
             response,
             16 * 1024,
@@ -1058,13 +1070,13 @@ impl OpenRouterProvider {
             Ok(body) => body,
             Err(error) => return facts.failure(error, ProviderFailureStage::Connect),
         };
-        OpenRouterFailure::http(
-            &body,
-            facts.http_status.expect("non-success response"),
-            facts.retry_after_ms,
-            facts.request_id,
-        )
-        .into()
+        let status = facts.http_status.expect("non-success response");
+        let mut failure =
+            OpenRouterFailure::http(&body, status, facts.retry_after_ms, facts.request_id);
+        if embedding {
+            failure.classification.class = super::embedding::classify_input_failure(status, &body);
+        }
+        failure.into()
     }
 
     async fn list_model_entries(
@@ -1718,7 +1730,7 @@ impl crate::traits::Provider for OpenRouterProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
+            return Err(Self::api_error_for_operation(response, true).await);
         }
 
         let response = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
@@ -2084,7 +2096,7 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("budget"));
             let error = provider
-                .embed(EmbeddingRequest::new(model, vec![" a".repeat(8193)]))
+                .embed(EmbeddingRequest::new(model, vec!["abcd".repeat(8193)]))
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains("token budget"));

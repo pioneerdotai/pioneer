@@ -5889,6 +5889,75 @@ done
     }
 
     #[test]
+    fn claude_literal_data_image_url_participates_in_model_input_admission() {
+        use crate::cli_runtime::context::{
+            CLIRuntimeContextBuildInput, compile_cli_runtime_delivery_plan,
+            validate_cli_runtime_turn_input_frame,
+        };
+        use pioneer_cli_agent_runtime::input::{
+            CLIRuntimeTurnInputItem, CLIRuntimeTurnInputMapping,
+        };
+        use pioneer_protocol::CLIAgentRuntimeKind;
+        let root = tempfile::tempdir().unwrap();
+        let plan = compile_cli_runtime_delivery_plan(
+            root.path(),
+            CLIRuntimeContextBuildInput {
+                workspace_id: "workspace",
+                thread_id: "thread",
+                initiating_thread_id: "thread",
+                turn_id: "turn",
+                runtime_id: "claude",
+                runtime_label: "Claude CLI",
+                runtime_kind: CLIAgentRuntimeKind::Claude,
+                model: Some("fixture"),
+                cwd: Some(root.path().to_str().unwrap()),
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+                history: None,
+                selected_skill_names: &[],
+                selected_capabilities: None,
+            },
+        )
+        .unwrap();
+        let mapping = |length| CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::Image {
+                url: format!("data:image/png;base64,{}", "A".repeat(length)),
+            }],
+            diagnostics: vec![],
+        };
+        let large = mapping(8192);
+        let delivered =
+            claude_prompt_from_input(serde_json::to_value(&large.input).unwrap()).unwrap();
+        let text = delivered[0]["text"].as_str().unwrap();
+        assert_eq!(delivered[0]["type"], "text");
+        if let CLIRuntimeTurnInputItem::Image { url } = &large.input[0] {
+            assert!(text.contains(url));
+        } else {
+            panic!("fixture image missing");
+        }
+        let cap = pioneer_compaction::text_tokens(&plan.provider_instructions.text) + 512;
+        assert!(pioneer_compaction::text_tokens(text) > 512);
+        validate_cli_runtime_turn_input_frame(
+            &mapping(16),
+            &plan,
+            Some(cap),
+            CLIAgentRuntimeKind::Claude,
+        )
+        .unwrap();
+        // Actual payload fits the independent hard byte limit; its literal
+        // model text still exceeds the selected input budget.
+        validate_cli_runtime_turn_input_frame(&large, &plan, None, CLIAgentRuntimeKind::Claude)
+            .unwrap();
+        let error = validate_cli_runtime_turn_input_frame(
+            &large,
+            &plan,
+            Some(cap),
+            CLIAgentRuntimeKind::Claude,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("approximately"));
+    }
+
+    #[test]
     fn claude_provider_frame_limit_counts_materialized_base64_image() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let image_path = temp_dir.path().join("oversized.png");
