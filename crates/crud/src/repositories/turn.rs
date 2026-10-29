@@ -237,6 +237,38 @@ pub async fn find_turn_by_thread_and_id<C: ConnectionTrait>(
         .context("failed to query turn by thread and id")
 }
 
+/// Immutable Work ownership, with authoritative Turn/thread/workspace scope.
+pub async fn find_turn_work_owner<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<TurnWorkOwner>> {
+    let owner = turn::Entity::find_by_id(turn_id.to_owned())
+        .select_only()
+        .column(turn::Column::WorkOwner)
+        .filter(turn::Column::ThreadId.eq(thread_id))
+        .filter(
+            turn::Column::ThreadId.in_subquery(
+                pioneer_entity::thread::Entity::find_by_id(thread_id.to_owned())
+                    .select_only()
+                    .column(pioneer_entity::thread::Column::Id)
+                    .filter(pioneer_entity::thread::Column::WorkspaceId.eq(workspace_id))
+                    .into_query(),
+            ),
+        )
+        .into_tuple::<String>()
+        .one(db)
+        .await?;
+    owner
+        .map(|owner| match owner.as_str() {
+            "turn" => Ok(TurnWorkOwner::Turn),
+            "detached_task" => Ok(TurnWorkOwner::DetachedTask),
+            _ => anyhow::bail!("unknown Turn Work owner"),
+        })
+        .transpose()
+}
+
 pub async fn find_turns_by_thread_and_ids<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
