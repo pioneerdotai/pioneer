@@ -192,22 +192,20 @@ impl MessageProcessor {
         method: &str,
         payload: &T,
     ) -> usize {
-        let candidate_connection_ids = self.session_manager.connection_ids().await;
-        let initially_authorized_connection_ids = self
-            .authorized_task_user_notification_recipients(
-                workspace_id,
-                recipient_principal_id,
-                candidate_connection_ids,
-            )
-            .await;
-        if initially_authorized_connection_ids.is_empty() {
+        let Ok(recipient_principal_id) =
+            pioneer_protocol::PrincipalId::new(recipient_principal_id.trim())
+        else {
             return 0;
-        }
+        };
+        let candidate_connection_ids = self
+            .session_manager
+            .connection_ids_for_principal(&recipient_principal_id)
+            .await;
         let serialization_connection_ids = self
             .authorized_task_user_notification_recipients(
                 workspace_id,
-                recipient_principal_id,
-                initially_authorized_connection_ids,
+                recipient_principal_id.as_str(),
+                candidate_connection_ids,
             )
             .await;
         if serialization_connection_ids.is_empty() {
@@ -219,7 +217,7 @@ impl MessageProcessor {
         let connection_ids = self
             .authorized_task_user_notification_recipients(
                 workspace_id,
-                recipient_principal_id,
+                recipient_principal_id.as_str(),
                 serialization_connection_ids,
             )
             .await;
@@ -1279,16 +1277,44 @@ impl MessageProcessor {
         payload: &T,
         subscribers: Vec<crate::thread::ThreadSubscriber>,
     ) {
+        // Keep the original identity as scope across both current membership
+        // lookups. A lookup by connection ID alone can return a new subscriber.
+        let identities = subscribers
+            .into_iter()
+            .map(|subscriber| (subscriber.connection_id, subscriber.identity))
+            .collect::<HashMap<_, _>>();
+        let serialization_subscribers = self
+            .thread_manager
+            .subscribed_connections_for_candidates(thread_id, identities.keys().copied().collect())
+            .await
+            .into_iter()
+            .filter(|subscriber| {
+                identities.get(&subscriber.connection_id) == Some(&subscriber.identity)
+            })
+            .collect();
+        let serialization_connection_ids = self
+            .authorized_thread_notification_recipients(thread_id, serialization_subscribers)
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let subscribers = self
+            .thread_manager
+            .subscribed_connections_for_candidates(thread_id, serialization_connection_ids)
+            .await
+            .into_iter()
+            .filter(|subscriber| {
+                identities.get(&subscriber.connection_id) == Some(&subscriber.identity)
+            })
+            .collect();
         let connection_ids = self
             .authorized_thread_notification_recipients(thread_id, subscribers)
             .await;
-        self.send_notification_to_reauthorized_thread_connections(
-            thread_id,
-            method,
-            payload,
-            connection_ids,
-        )
-        .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
     }
 
     pub(crate) async fn send_notification_to_removed_thread_subscribers<T: Serialize>(
@@ -1421,40 +1447,6 @@ impl MessageProcessor {
         recipients
     }
 
-    pub(super) async fn send_notification_to_reauthorized_thread_connections<T: Serialize>(
-        &self,
-        thread_id: &str,
-        method: &str,
-        payload: &T,
-        initially_authorized_connection_ids: Vec<ConnectionId>,
-    ) {
-        if initially_authorized_connection_ids.is_empty() {
-            return;
-        }
-        let serialization_subscribers = self
-            .thread_manager
-            .subscribed_connections_for_candidates(thread_id, initially_authorized_connection_ids)
-            .await;
-        let serialization_connection_ids = self
-            .authorized_thread_notification_recipients(thread_id, serialization_subscribers)
-            .await;
-        if serialization_connection_ids.is_empty() {
-            return;
-        }
-        let Some(serialized) = self.serialize_notification(method, payload) else {
-            return;
-        };
-        let subscribers = self
-            .thread_manager
-            .subscribed_connections_for_candidates(thread_id, serialization_connection_ids)
-            .await;
-        let connection_ids = self
-            .authorized_thread_notification_recipients(thread_id, subscribers)
-            .await;
-        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
-            .await;
-    }
-
     pub(super) async fn send_thread_scoped_notification_to_connections<T: Serialize>(
         &self,
         thread_id: &str,
@@ -1462,14 +1454,8 @@ impl MessageProcessor {
         payload: &T,
         candidate_connection_ids: Vec<ConnectionId>,
     ) {
-        let initially_authorized_connection_ids = self
-            .authorized_thread_connection_recipients(thread_id, candidate_connection_ids)
-            .await;
-        if initially_authorized_connection_ids.is_empty() {
-            return;
-        }
         let serialization_connection_ids = self
-            .authorized_thread_connection_recipients(thread_id, initially_authorized_connection_ids)
+            .authorized_thread_connection_recipients(thread_id, candidate_connection_ids)
             .await;
         if serialization_connection_ids.is_empty() {
             return;
