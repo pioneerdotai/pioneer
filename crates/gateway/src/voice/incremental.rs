@@ -4416,7 +4416,7 @@ mod tests {
                 Ok(0.9)
             }
         }
-        for count in [1, 511, 512, 513, 1024, 1615] {
+        for count in [1usize, 511, 512, 513, 1024, 1615] {
             let audio: Vec<i16> = (0..count).map(|ix| 8000 + ix as i16).collect();
             let expected: Vec<_> = audio
                 .iter()
