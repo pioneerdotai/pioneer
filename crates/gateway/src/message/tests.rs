@@ -33671,8 +33671,8 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 .connection_context(connection)
                 .await
                 .expect("manual child connection context must remain available");
-            Arc::clone(&processor)
-                .process_owned_request(
+            let (_, admission_events) = crate::public_error::test_support::capture_events_async(
+                Arc::clone(&processor).process_owned_request(
                     context,
                     json!({
                         "jsonrpc": "2.0",
@@ -33696,8 +33696,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         }
                     })
                     .to_string(),
-                )
-                .await;
+                ),
+            )
+            .await;
             let payload = recv_jsonrpc_payload_by_id(&mut rx, &request_id).await;
             let response: JsonRpcResponse = match serde_json::from_str(&payload) {
                 Ok(response) => response,
@@ -33707,7 +33708,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         .await
                         .unwrap();
                     panic!(
-                        "manual {runtime_id} child follow-up {followup_index} rejected: {error}; payload: {payload}; compaction: {progress:?}"
+                        "manual {runtime_id} child follow-up {followup_index} rejected: {error}; payload: {payload}; compaction: {progress:?}; admission_reports: {admission_events:#?}"
                     );
                 }
             };
