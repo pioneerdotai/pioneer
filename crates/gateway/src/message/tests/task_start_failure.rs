@@ -1809,7 +1809,12 @@ async fn assert_persisted_late_cli_failure(
     let TaskValue::String(saved_correlation) = &details["correlation_id"] else {
         panic!("correlation")
     };
-    assert!(uuid::Uuid::parse_str(saved_correlation).is_ok());
+    assert_eq!(saved_correlation.len(), 21);
+    assert!(
+        saved_correlation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric())
+    );
     if let Some(correlation) = correlation {
         assert_eq!(saved_correlation, correlation);
     }
@@ -3366,9 +3371,9 @@ fn revision_internal_completion_failure_is_not_reclassified_or_completed_twice()
             assert_eq!(
                 error.message,
                 if diagnostic_read {
-                    "revision awaits explicit resume"
+                    "child_turn_blocked"
                 } else {
-                    "revision child task thread is missing"
+                    "child_thread_missing"
                 }
             );
             assert!(error.recovery_diagnostic.is_none());
