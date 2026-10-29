@@ -386,7 +386,7 @@ fn validate_architecture(path: &Path) -> Result<()> {
     Ok(())
 }
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{ArchiveInstaller, extract_archive, installer_member};
     use std::fs::{self, File};
     use std::io::Write;
@@ -500,9 +500,11 @@ mod tests {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn prepared_fixture(directory: &Path) -> String {
+    pub(in crate::gateway::control) fn prepared_fixture(
+        directory: &Path,
+        asset_name: &str,
+    ) -> String {
         use sha2::{Digest, Sha256};
-        let asset_name = "gateway.zip";
         let mut native = vec![0u8; 128];
         let arm = cfg!(target_arch = "aarch64");
         if cfg!(windows) {
@@ -572,7 +574,7 @@ mod tests {
     #[test]
     fn prepared_installer_accepts_crlf_and_owns_snapshot_until_drop() {
         let inputs = tempfile::tempdir().unwrap();
-        let asset_name = prepared_fixture(inputs.path());
+        let asset_name = prepared_fixture(inputs.path(), "gateway.zip");
         let checksums = inputs.path().join("SHA256SUMS");
         fs::write(
             &checksums,
@@ -601,7 +603,7 @@ mod tests {
     #[test]
     fn package_with_matching_checksum_but_different_provenance_is_rejected() {
         let inputs = tempfile::tempdir().unwrap();
-        let asset_name = prepared_fixture(inputs.path());
+        let asset_name = prepared_fixture(inputs.path(), "gateway.zip");
         let metadata_path = inputs.path().join("provenance.json");
         let mut metadata: serde_json::Value =
             serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();

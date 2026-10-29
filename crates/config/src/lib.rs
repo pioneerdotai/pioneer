@@ -6,6 +6,8 @@ use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 
 const DEFAULT_CONFIG_TOML: &str = include_str!("../../../config/default.toml");
+const DEV_CONFIG_TOML: &str = include_str!("../../../config/dev.toml");
+pub const DEV_GATEWAY_BUNDLE_ID: &str = "ai.pioneer.gateway.dev";
 
 // Bootstrap constant: this file may override AppConfig values, so we need its name
 // before AppConfig is available.
@@ -3046,7 +3048,79 @@ impl InstallState {
 
 impl AppConfig {
     pub fn load() -> Result<Self, ConfigError> {
-        load_config_from_sources(DEFAULT_CONFIG_TOML, config_override_candidates())
+        load_profile_config(
+            cfg!(debug_assertions),
+            workspace_local_config_path(),
+            user_override_config_path(),
+            std::env::var_os("PIONEER_CONFIG").map(PathBuf::from),
+        )
+    }
+
+    /// Debug commands share one isolated contour, including commands issued by
+    /// Desktop and a service manager without the developer's shell environment.
+    /// Validate before creating a home, preparing CUA or touching a registration.
+    pub fn validate_development_context(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.home_directory == ".pioneer.dev"
+                && self.gateway.service_name == "com.pioneer.gateway.dev"
+                && self.install.unix_root_directory_name == "pioneer-dev"
+                && self.install.macos_root_directory_name == "PioneerDev"
+                && self.install.windows_root_directory_name == "PioneerDev"
+                && self.install.managed_directory_name == "managed-dev"
+                && self.install.macos_associated_bundle_identifier == DEV_GATEWAY_BUNDLE_ID
+                && self.gateway.remote_access.service_name == "pioneer_gateway_dev"
+                && !self
+                    .gateway
+                    .legacy_service_names
+                    .iter()
+                    .any(|name| name.trim().eq_ignore_ascii_case("com.pioneer.gateway")),
+            "debug Gateway requires the isolated dev home, service, install root and Gateway identity"
+        );
+        let listen: std::net::SocketAddr = self
+            .gateway
+            .listen_addr
+            .parse()
+            .context("invalid dev Gateway listen address")?;
+        let remote: std::net::SocketAddr = self
+            .gateway
+            .remote_access
+            .local_addr
+            .parse()
+            .context("invalid dev remote-access local address")?;
+        anyhow::ensure!(
+            listen.port() != 0
+                && listen.port() != 17878
+                && remote.ip().is_loopback()
+                && remote.port() == listen.port()
+                && self.desktop.mcp_oauth.callback_port.get() != 37643,
+            "dev Gateway, remote access and Desktop callback must use ports separate from prod"
+        );
+        let home = self.runtime_home_dir()?;
+        for (value, field) in [
+            (&self.install_state_file_name, "install_state_file_name"),
+            (
+                &self.gateway.settings_file_name,
+                "gateway.settings_file_name",
+            ),
+            (
+                &self.gateway.database.file_name,
+                "gateway.database.file_name",
+            ),
+        ] {
+            let file = normalize_runtime_file_name(value, field)?;
+            ensure_development_path(&home.join(file))?;
+        }
+        let remote_dir = Path::new(&self.gateway.remote_access.runtime_dir);
+        anyhow::ensure!(
+            !remote_dir.as_os_str().is_empty()
+                && remote_dir
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_))),
+            "dev remote-access runtime must stay inside the dev home"
+        );
+        ensure_development_path(&home.join(remote_dir))?;
+        ensure_development_path(&home.join("gateway-runtime"))?;
+        Ok(())
     }
 
     pub fn runtime_home_dir(&self) -> Result<PathBuf> {
@@ -3303,13 +3377,71 @@ pub fn save_install_state(path: &Path, state: &InstallState) -> Result<()> {
     Ok(())
 }
 
-fn config_override_candidates() -> Vec<PathBuf> {
-    ordered_config_overrides(
-        cfg!(debug_assertions),
-        workspace_local_config_path(),
-        user_override_config_path(),
-        std::env::var_os("PIONEER_CONFIG").map(PathBuf::from),
-    )
+/// Reject directory aliases before any dev write. In particular .pioneer.dev
+/// must never be a link to the production home. Missing paths are safe to create.
+pub fn ensure_development_path(path: &Path) -> Result<()> {
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    anyhow::ensure!(
+                        metadata.file_attributes() & 0x400 == 0,
+                        "dev path must not traverse a reparse point: {}",
+                        ancestor.display()
+                    );
+                }
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "dev path must not traverse a symbolic link: {}",
+                    ancestor.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("cannot inspect dev path"),
+        }
+    }
+    Ok(())
+}
+
+fn load_profile_config(
+    debug: bool,
+    workspace: PathBuf,
+    user: Option<PathBuf>,
+    explicit: Option<PathBuf>,
+) -> Result<AppConfig, ConfigError> {
+    let explicit_required = explicit.is_some();
+    let paths = ordered_config_overrides(debug, workspace.clone(), user, explicit);
+    let mut builder =
+        Config::builder().add_source(File::from_str(DEFAULT_CONFIG_TOML, FileFormat::Toml));
+    if debug {
+        // Versioned defaults must not replace safe developer network settings.
+        // The Gateway association is distinct from Desktop's local bundle ID;
+        // reassert only that association before user and explicit overrides.
+        builder = builder
+            .add_source(File::from_str(DEV_CONFIG_TOML, FileFormat::Toml))
+            .add_source(File::from(workspace.as_path()).required(false))
+            .add_source(File::from_str(
+                &format!(
+                    "[install]\nmacos_associated_bundle_identifier = {DEV_GATEWAY_BUNDLE_ID:?}\n"
+                ),
+                FileFormat::Toml,
+            ));
+    }
+    for (index, path) in paths.iter().enumerate().skip(usize::from(debug)) {
+        builder = builder.add_source(
+            File::from(path.as_path()).required(explicit_required && index + 1 == paths.len()),
+        );
+    }
+    let mut config: AppConfig = builder.build()?.try_deserialize()?;
+    migrate_gateway_preflight_model_from_legacy_overrides(&mut config, &paths);
+    if debug {
+        config
+            .validate_development_context()
+            .map_err(|error| ConfigError::Message(format!("{error:#}")))?;
+    }
+    Ok(config)
 }
 
 fn ordered_config_overrides(
@@ -3328,6 +3460,7 @@ fn ordered_config_overrides(
     candidates
 }
 
+#[cfg(test)]
 fn load_config_from_sources(
     default_config_toml: &str,
     override_paths: Vec<PathBuf>,
@@ -3423,6 +3556,182 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn debug_profile_has_a_versioned_contour_without_local_config() {
+        let missing = unique_temp_file_path("absent-local-config");
+        let config = super::load_profile_config(true, missing.clone(), None, None).unwrap();
+        assert_eq!(config.home_directory, ".pioneer.dev");
+        assert_eq!(config.gateway.service_name, "com.pioneer.gateway.dev");
+        assert_eq!(config.gateway.listen_addr, "0.0.0.0:18778");
+        assert_eq!(config.gateway.remote_access.local_addr, "127.0.0.1:18778");
+        assert_eq!(
+            config.gateway.remote_access.service_name,
+            "pioneer_gateway_dev"
+        );
+        assert_eq!(
+            config.install.macos_associated_bundle_identifier,
+            "ai.pioneer.gateway.dev"
+        );
+        assert_eq!(config.install.managed_directory_name, "managed-dev");
+        assert_eq!(config.desktop.mcp_oauth.callback_port.get(), 37644);
+        let production = super::load_profile_config(false, missing, None, None).unwrap();
+        assert_eq!(production.home_directory, ".pioneer");
+        assert_eq!(production.gateway.service_name, "com.pioneer.gateway");
+        assert_eq!(production.gateway.listen_addr, "0.0.0.0:17878");
+        assert_eq!(
+            production.install.macos_associated_bundle_identifier,
+            "ai.pioneer.gateway"
+        );
+    }
+
+    #[test]
+    fn debug_profile_preserves_settings_precedence_and_owns_gateway_identity() {
+        let workspace = unique_temp_file_path("dev-workspace");
+        let user = unique_temp_file_path("dev-user");
+        let explicit = unique_temp_file_path("dev-explicit");
+        write_file(
+            &workspace,
+            "[install]\nmacos_associated_bundle_identifier = 'ai.pioneer.macos.dev'\n[gateway]\nkeepawake = true\noutbound_queue_capacity = 7\nlisten_addr = '127.0.0.1:18779'\n[gateway.remote_access]\nlocal_addr = '127.0.0.1:18779'\n",
+        );
+        write_file(
+            &user,
+            "[gateway]\noutbound_queue_capacity = 8\nlisten_addr = '127.0.0.1:18780'\n[gateway.remote_access]\nlocal_addr = '127.0.0.1:18780'\n",
+        );
+        write_file(
+            &explicit,
+            "[gateway]\noutbound_queue_capacity = 9\nlisten_addr = '127.0.0.1:18781'\n[gateway.remote_access]\nlocal_addr = '127.0.0.1:18781'\n",
+        );
+        for (user_path, selected, expected, port) in [
+            (None, None, 7, 18779),
+            (Some(user.clone()), None, 8, 18780),
+            (Some(user.clone()), Some(explicit.clone()), 9, 18781),
+        ] {
+            let config =
+                super::load_profile_config(true, workspace.clone(), user_path, selected).unwrap();
+            assert!(config.gateway.keepawake);
+            assert_eq!(config.gateway.outbound_queue_capacity, expected);
+            assert_eq!(
+                config.install.macos_associated_bundle_identifier,
+                "ai.pioneer.gateway.dev"
+            );
+            assert_eq!(config.gateway.listen_addr, format!("127.0.0.1:{port}"));
+            assert_eq!(
+                config.gateway.remote_access.local_addr,
+                format!("127.0.0.1:{port}")
+            );
+        }
+        for path in [workspace, user, explicit] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn debug_profile_accepts_nested_relative_files_and_rejects_escapes() {
+        let explicit = unique_temp_file_path("dev-nested-paths");
+        write_file(
+            &explicit,
+            "install_state_file_name = 'state/install-state.toml'\n[gateway]\nsettings_file_name = 'settings/gateway.toml'\n[gateway.database]\nfile_name = 'data/gateway.db'\n",
+        );
+        let config = super::load_profile_config(
+            true,
+            unique_temp_file_path("missing-local"),
+            None,
+            Some(explicit.clone()),
+        )
+        .unwrap();
+        let home = config.runtime_home_dir().unwrap();
+        assert_eq!(
+            config.install_state_path().unwrap(),
+            home.join("state/install-state.toml")
+        );
+        assert_eq!(config.gateway.settings_file_name, "settings/gateway.toml");
+        assert_eq!(config.gateway.database.file_name, "data/gateway.db");
+        for field in [
+            "install_state_file_name",
+            "gateway.settings_file_name",
+            "gateway.database.file_name",
+        ] {
+            for path in ["../.pioneer/foreign.toml", "/absolute/foreign.toml"] {
+                let contents = match field.split_once('.') {
+                    Some((section, key)) => format!("[{section}]\n{key} = {path:?}\n"),
+                    None => format!("{field} = {path:?}\n"),
+                };
+                write_file(&explicit, &contents);
+                let error = super::load_profile_config(
+                    true,
+                    unique_temp_file_path("missing-local"),
+                    None,
+                    Some(explicit.clone()),
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains(field), "{field}: {error}");
+            }
+        }
+        fs::remove_file(explicit).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn nested_dev_file_rejects_an_intermediate_alias_to_production() {
+        let root = unique_temp_file_path("dev-nested-alias");
+        fs::create_dir_all(root.join(".pioneer.dev")).unwrap();
+        fs::create_dir(root.join(".pioneer")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let production = root.join(".pioneer/gateway.db");
+        fs::write(&production, b"production fixture remains untouched").unwrap();
+        std::os::unix::fs::symlink(root.join(".pioneer"), root.join(".pioneer.dev/data")).unwrap();
+        let error =
+            super::ensure_development_path(&root.join(".pioneer.dev/data/gateway.db")).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(
+            fs::read(production).unwrap(),
+            b"production fixture remains untouched"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn debug_profile_rejects_explicit_production_overlap() {
+        let explicit = unique_temp_file_path("dev-prod-overlap");
+        for contents in [
+            "home_directory = '.pioneer'",
+            "[gateway]\nservice_name = 'com.pioneer.gateway'",
+            "[gateway]\nlegacy_service_names = ['com.pioneer.gateway']",
+            "[gateway]\nlegacy_service_names = ['COM.PIONEER.GATEWAY']",
+            "[gateway]\nlegacy_service_names = ['CoM.PiOnEeR.GaTeWaY']",
+            "[gateway]\nlegacy_service_names = ['  COM.PIONEER.GATEWAY  ']",
+            "[gateway]\nlegacy_service_names = ['  CoM.PiOnEeR.GaTeWaY  ']",
+            "[install]\nmacos_root_directory_name = 'Pioneer'",
+            "[install]\nmacos_associated_bundle_identifier = 'ai.pioneer.gateway'",
+            "[gateway]\nlisten_addr = '0.0.0.0:17878'",
+            "[gateway.remote_access]\nservice_name = 'pioneer_gateway'",
+            "[gateway.remote_access]\nlocal_addr = '127.0.0.1:17878'",
+            "[gateway.database]\nfile_name = '../.pioneer/gateway.db'",
+            "[desktop.mcp_oauth]\ncallback_port = 37643",
+        ] {
+            write_file(&explicit, contents);
+            let error = super::load_profile_config(
+                true,
+                unique_temp_file_path("missing-local"),
+                None,
+                Some(explicit.clone()),
+            )
+            .unwrap_err();
+            let text = error.to_string();
+            if contents.contains("legacy_service_names") {
+                assert!(
+                    text.contains("debug Gateway requires the isolated dev home, service, install root and Gateway identity"),
+                    "legacy prod overlap must fail dev validation: {contents}: {text}"
+                );
+            }
+            assert!(
+                text.contains("dev") || text.contains("gateway.database.file_name"),
+                "{contents}: {text}"
+            );
+        }
+        fs::remove_file(explicit).unwrap();
+    }
 
     #[test]
     fn install_state_roundtrip() {
