@@ -2001,8 +2001,17 @@ mod tests {
 
     #[test]
     fn build_request_rejects_unsupported_reasoning_effort() {
-        let request = ChatRequest {
-            model: "gemini-3-flash-preview".into(),
+        let id = "quartz-thinking-wire-788";
+        let catalog = crate::generation::test_catalog_model(
+            "gemini",
+            id,
+            "gemini-3-flash-preview",
+            serde_json::json!({"reasoning":true,
+                "compat":{"supportsReasoningEffort":true},
+                "thinkingLevelMap":{"high":"HIGH","xhigh":"XHIGH"}}),
+        );
+        let mut request = ChatRequest {
+            model: id.into(),
             messages: vec![ChatMessage::user("Hello")],
             temperature: None,
             max_tokens: None,
@@ -2013,10 +2022,24 @@ mod tests {
             compiled_prompt: None,
         };
 
-        let err = GeminiProvider::build_request_result(&request)
+        let prepared = prepare_messages_for_provider(
+            "gemini",
+            &GeminiProvider::new("fixture").capabilities(),
+            &request.messages,
+        )
+        .unwrap();
+        // Even a catalog mapping cannot add an invalid ThinkingLevel to the wire.
+        let err = GeminiProvider::build_request_with_catalog(&request, &prepared, Some(&catalog))
             .expect_err("xhigh should not be serialized for Gemini thinkingConfig");
 
         assert!(err.to_string().to_ascii_lowercase().contains("xhigh"));
+        request.reasoning = Some(ReasoningConfig::effort(ReasoningEffort::High));
+        let body = GeminiProvider::build_request_with_catalog(&request, &prepared, Some(&catalog))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(body).unwrap()["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
     }
 
     #[test]
