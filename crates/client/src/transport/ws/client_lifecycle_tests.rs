@@ -20,6 +20,7 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 struct GateState {
     blocked: bool,
     flush_blocked: bool,
+    block_flush_after_write: bool,
     writes: u64,
     flushed_writes: u64,
     reported: bool,
@@ -41,9 +42,9 @@ impl WriteGate {
         state.reported = false;
     }
 
-    fn block_flush(&self) {
+    fn block_flush_after_write(&self) {
         let mut state = self.state.lock().unwrap();
-        state.flush_blocked = true;
+        state.block_flush_after_write = true;
         state.reported = false;
     }
 
@@ -74,6 +75,7 @@ impl WriteGate {
         let mut state = self.state.lock().unwrap();
         state.blocked = false;
         state.flush_blocked = false;
+        state.block_flush_after_write = false;
         state.failed = failed;
         if let Some(waker) = state.waker.take() {
             waker.wake();
@@ -147,7 +149,12 @@ impl AsyncWrite for GatedSocket {
         if let Poll::Ready(Ok(count)) = &result
             && *count > 0
         {
-            self.gate.state.lock().unwrap().writes += 1;
+            let mut state = self.gate.state.lock().unwrap();
+            state.writes += 1;
+            if state.block_flush_after_write {
+                state.block_flush_after_write = false;
+                state.flush_blocked = true;
+            }
         }
         result
     }
@@ -444,11 +451,11 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
     let phase = std::cell::Cell::new("starting fixture");
     timeout(Duration::from_secs(10), async {
         let mut f = Fixture::start().await;
-        // The interval's first tick is immediate. Complete that heartbeat before
-        // arming any gate, so a queued Ping cannot own the blocked flush.
-        phase.set("completing initial heartbeat");
+        // Consume the monitor's immediate heartbeat before arming a gate for
+        // application data, so a delayed first tick cannot own the blocked flush.
+        phase.set("receiving initial heartbeat");
         let Message::Ping(payload) = f.peer.next().await.unwrap().unwrap() else {
-            panic!("initial heartbeat expected");
+            panic!("expected initial heartbeat");
         };
         f.peer.send(Message::Pong(payload)).await.unwrap();
         phase.set("receiving first request");
@@ -461,7 +468,9 @@ async fn blocked_write_keeps_reader_live_and_timeout_retires_queued_frame() {
         // The peer can respond before send/flush completes. Registration must
         // already exist, and response processing must not depend on writer exit.
         phase.set("receiving request with flush blocked");
-        f.gate.block_flush();
+        // Repeated flush polls for the first request may still be in flight.
+        // Block only after the next write has put its bytes on the socket.
+        f.gate.block_flush_after_write();
         let fast = request(&f.commands, "synthetic/fast");
         assert_eq!(f.next_request().await["id"], fast.id);
         phase.set("waiting for blocked flush");

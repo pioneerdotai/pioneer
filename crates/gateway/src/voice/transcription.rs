@@ -7,6 +7,7 @@ use pioneer_config::GatewayVoiceTranscriptionStrategy;
 use pioneer_protocol::{VoiceError, VoiceErrorKind};
 #[cfg(test)]
 use std::sync::Arc;
+pub(crate) use transcribe_rs::DecodingCompletion;
 
 // Private one-shot result, retaining only timing actually supplied by the SDK.
 // No confidence, fabricated word times, or persistent decoder state.
@@ -14,6 +15,9 @@ use std::sync::Arc;
 pub(crate) struct VoiceSpeechHypothesis {
     pub(crate) text: String,
     pub(crate) segments: Option<Vec<transcribe_rs::TranscriptionSegment>>,
+    pub(crate) completion: DecodingCompletion,
+    // A decode over non-final acoustic memory remains tentative even at EOS.
+    pub(crate) tentative: bool,
 }
 
 impl VoiceSpeechHypothesis {
@@ -21,7 +25,27 @@ impl VoiceSpeechHypothesis {
         Self {
             text,
             segments: None,
+            completion: DecodingCompletion::Unknown,
+            tentative: false,
         }
+    }
+
+    pub(crate) fn ensure_complete(self) -> Result<Self, VoiceTranscriptionError> {
+        if self.tentative
+            || matches!(
+                self.completion,
+                DecodingCompletion::BudgetExhausted | DecodingCompletion::RepetitionGuard
+            )
+        {
+            return Err(transcription_error(
+                VoiceTranscriptionErrorKind::RuntimeFailure,
+                format!(
+                    "voice decode did not complete: {:?}, tentative={}",
+                    self.completion, self.tentative
+                ),
+            ));
+        }
+        Ok(self)
     }
 }
 
@@ -30,8 +54,27 @@ impl From<transcribe_rs::TranscriptionResult> for VoiceSpeechHypothesis {
         Self {
             text: result.text,
             segments: result.segments,
+            completion: DecodingCompletion::Unknown,
+            tentative: false,
         }
     }
+}
+
+impl From<transcribe_rs::CompletedTranscription> for VoiceSpeechHypothesis {
+    fn from(output: transcribe_rs::CompletedTranscription) -> Self {
+        Self {
+            completion: output.completion,
+            ..output.result.into()
+        }
+    }
+}
+
+/// One bounded acoustic segment, owned exclusively by its recording worker.
+/// No native call runs asynchronously behind these synchronous operations.
+pub(crate) trait VoiceNativeSession: Send {
+    fn feed(&mut self, samples: &[f32]) -> Result<(), VoiceTranscriptionError>;
+    fn hypothesis(&mut self) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError>;
+    fn finish(&mut self) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -241,6 +284,22 @@ impl VoiceSpeechTranscriber for TestSpeechTranscriber {
 }
 
 pub(crate) trait VoiceSpeechTranscriber: Send {
+    /// Real prepared PCM excludes adapter-only padding. Source samples before
+    /// VAD are deliberately not a decoder-budget input.
+    fn transcribe_prepared_hypothesis(
+        &self,
+        buffer: &PreparedSpeechBuffer,
+        _real_pcm_samples: usize,
+    ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        self.transcribe_hypothesis(buffer)
+    }
+
+    fn begin_native_session(
+        &self,
+    ) -> Result<Option<Box<dyn VoiceNativeSession>>, VoiceTranscriptionError> {
+        Ok(None)
+    }
+
     fn transcribe_speech(
         &self,
         buffer: &PreparedSpeechBuffer,
@@ -256,6 +315,19 @@ pub(crate) trait VoiceSpeechTranscriber: Send {
 }
 
 impl VoiceSpeechTranscriber for Box<dyn VoiceSpeechTranscriber> {
+    fn transcribe_prepared_hypothesis(
+        &self,
+        buffer: &PreparedSpeechBuffer,
+        real_pcm_samples: usize,
+    ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        self.as_ref()
+            .transcribe_prepared_hypothesis(buffer, real_pcm_samples)
+    }
+    fn begin_native_session(
+        &self,
+    ) -> Result<Option<Box<dyn VoiceNativeSession>>, VoiceTranscriptionError> {
+        self.as_ref().begin_native_session()
+    }
     fn transcribe_speech(
         &self,
         buffer: &PreparedSpeechBuffer,
@@ -309,7 +381,10 @@ where
         }));
     }
 
-    let raw_text = transcriber.transcribe_speech(&buffer)?;
+    let raw_text = transcriber
+        .transcribe_hypothesis(&buffer)?
+        .ensure_complete()?
+        .text;
     let text = raw_text.trim().to_owned();
     if text.is_empty() {
         return Ok(Err(VoiceTranscriptionNoSpeech {

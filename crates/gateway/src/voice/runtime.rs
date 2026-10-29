@@ -13,6 +13,7 @@ use transcribe_rs::onnx::cohere::{CohereModel, CohereParams};
 use transcribe_rs::onnx::gigaam::{GigaAMModel, GigaAMParams};
 use transcribe_rs::onnx::moonshine::{
     MoonshineModel, MoonshineParams, MoonshineStreamingParams, MoonshineVariant, StreamingModel,
+    StreamingSession,
 };
 use transcribe_rs::onnx::parakeet::{ParakeetModel, ParakeetParams, TimestampGranularity};
 use transcribe_rs::onnx::sense_voice::{SenseVoiceModel, SenseVoiceParams};
@@ -34,9 +35,96 @@ pub(crate) enum LoadedVoiceEngine {
     TestStub(super::transcription::TestVoiceSpeechTranscriber),
     #[cfg(test)]
     TestHypothesis(VoiceSpeechHypothesis),
+    #[cfg(test)]
+    TestNative {
+        one_shot: super::transcription::TestVoiceSpeechTranscriber,
+        begin: std::sync::Arc<
+            dyn Fn() -> Box<dyn super::transcription::VoiceNativeSession> + Send + Sync,
+        >,
+    },
+}
+
+pub(crate) enum NativeVoiceEngineSession {
+    Moonshine(StreamingSession),
+    #[cfg(test)]
+    Test(Box<dyn super::transcription::VoiceNativeSession>),
 }
 
 impl LoadedVoiceEngine {
+    pub(crate) fn begin_native_session(
+        &self,
+    ) -> Result<Option<NativeVoiceEngineSession>, VoiceTranscriptionError> {
+        match self {
+            Self::MoonshineStreaming(model) => model
+                .begin_session()
+                .map(|session| Some(NativeVoiceEngineSession::Moonshine(session)))
+                .map_err(native_session_error),
+            #[cfg(test)]
+            Self::TestNative { begin, .. } => Ok(Some(NativeVoiceEngineSession::Test(begin()))),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn feed_native_session(
+        &mut self,
+        session: &mut NativeVoiceEngineSession,
+        samples: &[f32],
+    ) -> Result<(), VoiceTranscriptionError> {
+        match (self, session) {
+            (Self::MoonshineStreaming(model), NativeVoiceEngineSession::Moonshine(session)) => {
+                model
+                    .feed_session(session, samples)
+                    .map_err(native_session_error)
+            }
+            #[cfg(test)]
+            (Self::TestNative { .. }, NativeVoiceEngineSession::Test(session)) => {
+                session.feed(samples)
+            }
+            _ => Err(native_session_error("native session backend changed")),
+        }
+    }
+
+    pub(crate) fn native_hypothesis(
+        &mut self,
+        session: &mut NativeVoiceEngineSession,
+    ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        let mut hypothesis: VoiceSpeechHypothesis = match (self, session) {
+            (Self::MoonshineStreaming(model), NativeVoiceEngineSession::Moonshine(session)) => {
+                model
+                    .session_hypothesis(session)
+                    .map(Into::into)
+                    .map_err(native_session_error)
+            }
+            #[cfg(test)]
+            (Self::TestNative { .. }, NativeVoiceEngineSession::Test(session)) => {
+                session.hypothesis()
+            }
+            _ => Err(native_session_error("native session backend changed")),
+        }?;
+        hypothesis.tentative = true;
+        Ok(hypothesis)
+    }
+
+    pub(crate) fn finish_native_session(
+        &mut self,
+        session: NativeVoiceEngineSession,
+    ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        let hypothesis: VoiceSpeechHypothesis = match (self, session) {
+            (Self::MoonshineStreaming(model), NativeVoiceEngineSession::Moonshine(mut session)) => {
+                model
+                    .finish_session(&mut session)
+                    .map(Into::into)
+                    .map_err(native_session_error)
+            }
+            #[cfg(test)]
+            (Self::TestNative { .. }, NativeVoiceEngineSession::Test(mut session)) => {
+                session.finish()
+            }
+            _ => Err(native_session_error("native session backend changed")),
+        }?;
+        Ok(hypothesis)
+    }
+
     pub(crate) fn load(
         entry: &VoiceModelCatalogEntry,
         layout: &VoiceModelInstallLayout,
@@ -84,7 +172,23 @@ impl LoadedVoiceEngine {
         buffer: &PreparedSpeechBuffer,
         cancellation: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<Option<VoiceSpeechHypothesis>, VoiceTranscriptionError> {
-        let input = PreparedVoiceEngineInput::from_buffer(buffer)?;
+        self.transcribe_prepared_hypothesis(buffer, buffer.speech_samples(), cancellation)
+    }
+
+    pub(crate) fn transcribe_prepared_hypothesis(
+        &mut self,
+        buffer: &PreparedSpeechBuffer,
+        real_pcm_samples: usize,
+        cancellation: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Option<VoiceSpeechHypothesis>, VoiceTranscriptionError> {
+        let mut input = PreparedVoiceEngineInput::from_buffer(buffer)?;
+        if real_pcm_samples == 0 || real_pcm_samples > input.samples.len() {
+            return Err(transcription_error(
+                VoiceTranscriptionErrorKind::UnsupportedAudioFormat,
+                "invalid real prepared PCM sample count",
+            ));
+        }
+        input.real_pcm_samples = real_pcm_samples;
         // Preparing a full buffered recording can take time. Recheck after that
         // allocation/validation, directly before entering the selected adapter.
         // None is cancellation, distinct from an actual engine failure.
@@ -106,6 +210,10 @@ impl LoadedVoiceEngine {
             }
             #[cfg(test)]
             Self::TestHypothesis(hypothesis) => Ok(hypothesis.clone()),
+            #[cfg(test)]
+            Self::TestNative { one_shot, .. } => {
+                one_shot(buffer).map(VoiceSpeechHypothesis::text_only)
+            }
         }
         .map(Some)
     }
@@ -120,6 +228,13 @@ impl LoadedVoiceEngine {
         let text = text.into();
         Self::TestStub(std::sync::Arc::new(move |_| Ok(text.clone())))
     }
+}
+
+fn native_session_error(error: impl std::fmt::Display) -> VoiceTranscriptionError {
+    transcription_error(
+        VoiceTranscriptionErrorKind::RuntimeFailure,
+        format!("native voice session failed: {error}"),
+    )
 }
 
 fn runtime_engine_for_model_id(model_id: &str) -> Option<LocalTranscriptionEngine> {
@@ -264,7 +379,7 @@ fn transcribe_cohere(
     input: &PreparedVoiceEngineInput,
 ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
     match catch_unwind(AssertUnwindSafe(|| {
-        model.transcribe_with(input.samples.as_slice(), &cohere_params())
+        model.transcribe_with_completion(input.samples.as_slice(), &cohere_params())
     })) {
         Ok(Ok(result)) => Ok(result.into()),
         Ok(Err(error)) => Err(transcription_error(
@@ -327,7 +442,7 @@ fn transcribe_canary(
     input: &PreparedVoiceEngineInput,
 ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
     match catch_unwind(AssertUnwindSafe(|| {
-        model.transcribe_with(input.samples.as_slice(), &canary_params())
+        model.transcribe_with_completion(input.samples.as_slice(), &canary_params())
     })) {
         Ok(Ok(result)) => Ok(result.into()),
         Ok(Err(error)) => Err(transcription_error(
@@ -491,9 +606,12 @@ fn transcribe_moonshine_streaming(
     input: &PreparedVoiceEngineInput,
 ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
     match catch_unwind(AssertUnwindSafe(|| {
-        model.transcribe_with(
+        model.transcribe_with_completion(
             input.samples.as_slice(),
-            &MoonshineStreamingParams::default(),
+            &MoonshineStreamingParams {
+                max_length: Some(duration_token_budget(input.real_pcm_samples, 6.5)),
+                ..Default::default()
+            },
         )
     })) {
         Ok(Ok(result)) => Ok(result.into()),
@@ -546,7 +664,16 @@ fn transcribe_moonshine_base(
     input: &PreparedVoiceEngineInput,
 ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
     match catch_unwind(AssertUnwindSafe(|| {
-        model.transcribe_with(input.samples.as_slice(), &MoonshineParams::default())
+        model.transcribe_with_completion(
+            input.samples.as_slice(),
+            &MoonshineParams {
+                max_length: Some(duration_token_budget(
+                    input.real_pcm_samples,
+                    MoonshineVariant::Base.token_rate() as f64,
+                )),
+                ..Default::default()
+            },
+        )
     })) {
         Ok(Ok(result)) => Ok(result.into()),
         Ok(Err(error)) => Err(transcription_error(
@@ -630,6 +757,12 @@ struct PreparedVoiceEngineInput {
     #[cfg(test)]
     channels: u16,
     samples: Vec<f32>,
+    real_pcm_samples: usize,
+}
+
+fn duration_token_budget(real_pcm_samples: usize, tokens_per_second: f64) -> usize {
+    (real_pcm_samples as f64 / VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ as f64 * tokens_per_second).ceil()
+        as usize
 }
 
 impl PreparedVoiceEngineInput {
@@ -663,6 +796,7 @@ impl PreparedVoiceEngineInput {
             sample_rate_hz: buffer.sample_rate_hz,
             #[cfg(test)]
             channels: PREPARED_AUDIO_CHANNELS,
+            real_pcm_samples: samples.len(),
             samples,
         })
     }
@@ -703,6 +837,35 @@ mod tests {
     use super::super::vad::VoiceSpeechSegment;
     use super::*;
     use pioneer_config::AppConfig;
+
+    #[test]
+    fn duration_budget_counts_prepared_pcm_excluding_source_gaps_and_native_padding() {
+        // One second of prepared speech may come from a much longer source and
+        // may have native-only padding. Neither may inflate generation budget.
+        assert_eq!(duration_token_budget(16000, 6.0), 6);
+        assert_eq!(duration_token_budget(16001, 6.0), 7);
+        assert_eq!(duration_token_budget(16000, 6.5), 7);
+        let buffer = PreparedSpeechBuffer {
+            sample_rate_hz: 16000,
+            total_samples: 60 * 16000,
+            segments: vec![segment(&vec![0.5; 32000])],
+        };
+        let mut engine = LoadedVoiceEngine::test_stub();
+        assert!(
+            engine
+                .transcribe_prepared_hypothesis(&buffer, 16000, None)
+                .is_ok()
+        );
+        for invalid in [0, 32001] {
+            assert_eq!(
+                engine
+                    .transcribe_prepared_hypothesis(&buffer, invalid, None)
+                    .unwrap_err()
+                    .kind,
+                VoiceTranscriptionErrorKind::UnsupportedAudioFormat
+            );
+        }
+    }
 
     #[test]
     fn pre_cancelled_call_returns_none_and_engine_remains_usable() {

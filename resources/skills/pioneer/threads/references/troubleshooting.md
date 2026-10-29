@@ -14,6 +14,8 @@ Keep history, list, children, search, model/options, and result-reader cursors s
 
 Source edits/deletion, changed authorization, or stale authenticated tokens can invalidate continuation. Restart the relevant read within current access when appropriate. Do not splice text from different source versions or claim an uninterrupted complete read after invalidation.
 
+For `threads_list`, unrelated metadata/activity does not invalidate continuation, and deleting a completed candidate does not require finding that row again. New threads before the creation-time position appear when starting a fresh list. A fragmented card remains tied to its own source and version. Native and CLI reads preserve these safe reasons: `invalid or incompatible cursor; restart reading with the same resource and parameters`, `cursor is stale; restart reading from the first page`, `invalid read parameters` (or the explicit limit range), and `source unavailable or access denied`. Restart incompatible/old-format cursors or changed-source fragments when appropriate; do not infer whether an unavailable source exists. JSON-RPC protocol errors remain protocol errors.
+
 ## Incomplete Search Coverage Or Missing Index
 
 Inspect `coverageIncomplete` and `warnings`. Index/semantic unavailability can reduce coverage; unindexed history remains history. Empty matches do not prove absence. Use an accessible known source or threads_list plus selective history reading when the user's request requires it. Do not describe nextCursor as scanning leftover files, impose an artificial corpus limit, or claim a fixed ANN order.
