@@ -334,7 +334,7 @@ async fn detached_parent_notifications_and_late_items_reads_preserve_authoritati
         "anchor":{"kind":"newest"}, "limit":10});
     let page = rpc(&mut harness, "turn/work/page", page_params).await;
     assert!(page.get("error").is_none(), "{page}");
-    assert!(page["result"]["work"].is_null());
+    assert_eq!(page["result"]["work"], JsonValue::Null);
     assert_eq!(
         page["result"]["sourceHighWatermark"],
         stream.projected_through_sequence
