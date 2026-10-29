@@ -96,6 +96,51 @@ impl Drop for StopInbound {
     }
 }
 
+/// Synchronously refill the REAL bounded mailbox when its retired request
+/// completes. Unlike a producer task, this never leaves an accidental empty
+/// slot that could rescue a biased ingress loop. No frame reaches the writer.
+struct ReadyCancels {
+    receipt: SocketReceipt,
+    active: AtomicBool,
+    completed: AtomicBool,
+}
+impl ReadyCancels {
+    fn queue(self: &Arc<Self>) {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let (tx, _rx) = mpsc::channel();
+        let response = JsonRpcResponseSender::new_with_wake(
+            tx,
+            std::time::Instant::now() + Duration::from_secs(30),
+            Arc::new(move || {
+                if let Some(source) = weak.upgrade() {
+                    source.completed.store(true, Ordering::Release);
+                    source.queue();
+                }
+            }),
+        );
+        let request = crate::rpc::build_json_rpc_request_payload(
+            pioneer_protocol::constants::methods::TURN_CANCEL,
+            Value::Null,
+        )
+        .unwrap();
+        self.receipt
+            .admit_cancel(request.request_id, request.payload, response.clone())
+            .unwrap();
+        // Retirement after admission, before dequeue, exercises the canonical
+        // cleanup branch that emits no frame and needs no inbound response.
+        response.bind_subscription(Arc::new(Mutex::new(false)));
+    }
+}
+struct StopCancels(Arc<ReadyCancels>);
+impl Drop for StopCancels {
+    fn drop(&mut self) {
+        self.0.active.store(false, Ordering::Release);
+    }
+}
+
 struct GatedSocket {
     inner: DuplexStream,
     gate: Arc<WriteGate>,
@@ -225,7 +270,7 @@ impl Fixture {
         let events = GatewayWsEventSender::from(events);
         let (commands, command_rx) = work_channel(Boundary::ClientRpc);
         let mut command_rx = ConnectionCommandReceiver(command_rx);
-        let receipt = SocketReceipt::new(7);
+        let (receipt, cancels) = SocketReceipt::new(7);
         let monitor_receipt = receipt.clone();
         let (start, started) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
@@ -237,6 +282,7 @@ impl Fixture {
                 &events,
                 &mut command_rx.0,
                 monitor_receipt,
+                cancels,
             )
             .await
         });
@@ -308,6 +354,241 @@ fn request(commands: &WsSender<ConnectionRpcCommand>, method: &str) -> Request {
     }
 }
 
+fn cancel_request(receipt: &SocketReceipt) -> Request {
+    let request = crate::rpc::build_json_rpc_request_payload(
+        pioneer_protocol::constants::methods::TURN_CANCEL,
+        json!({"thread_id":"control-thread", "turn_id":"control-turn"}),
+    )
+    .unwrap();
+    let (tx, rx) = mpsc::channel();
+    let response =
+        JsonRpcResponseSender::new(tx, std::time::Instant::now() + Duration::from_secs(30));
+    // The real physical socket admission, not another queue/scheduler fixture.
+    receipt
+        .admit_cancel(
+            request.request_id.clone(),
+            request.payload,
+            response.clone(),
+        )
+        .unwrap();
+    Request {
+        id: request.request_id,
+        response,
+        rx,
+    }
+}
+
+struct ReceiptTransport {
+    receipt: SocketReceipt,
+    admitted: Arc<tokio::sync::Notify>,
+}
+impl JsonRpcRequestTransport for ReceiptTransport {
+    fn send_json_rpc_request(
+        &self,
+        id: String,
+        payload: String,
+        response: JsonRpcResponseSender,
+    ) -> std::result::Result<(), String> {
+        self.receipt.admit_cancel(id, payload, response)?;
+        self.admitted.notify_one();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn cancel_bypasses_ordinary_backlog_without_displacing_pong_or_reader() {
+    timeout(Duration::from_secs(10), async {
+        let mut f = Fixture::start().await;
+        let first = request(&f.commands, "synthetic/first");
+        assert_eq!(f.next_request().await["id"], first.id);
+        f.gate.wait_flushed().await;
+        f.gate.block();
+        let blocked = request(&f.commands, "synthetic/claimed");
+        f.gate.wait_entered().await;
+        let queued = request(&f.commands, "synthetic/queued");
+        let overflow = request(&f.commands, "synthetic/overflow");
+        assert!(receive(overflow.rx).await.is_err());
+        let cancel = cancel_request(&f.receipt);
+        let (rejected, rejected_rx) = mpsc::channel();
+        let rejected = JsonRpcResponseSender::new(
+            rejected,
+            std::time::Instant::now() + Duration::from_secs(30),
+        );
+        assert!(
+            f.receipt
+                .admit_cancel("extra".into(), "{}".into(), rejected.clone())
+                .is_err()
+        );
+        assert!(receive(rejected_rx).await.is_err());
+        assert!(!rejected.is_active());
+        // Processing the response establishes reader progress through the Ping
+        // while poll_write is still blocked. Pong owns the transport reserve.
+        f.peer.send(Message::Ping(vec![9].into())).await.unwrap();
+        f.reply(&first.id).await;
+        assert!(receive(first.rx).await.is_ok());
+        assert!(f.gate.state.lock().unwrap().blocked);
+        f.gate.release(false);
+        let mut ids = Vec::new();
+        let mut pong_before_cancel = false;
+        while ids.len() < 3 {
+            match f.peer.next().await.unwrap().unwrap() {
+                Message::Pong(payload) => {
+                    assert_eq!(payload.as_ref(), &[9]);
+                    assert!(ids.len() <= 1);
+                    pong_before_cancel = true;
+                }
+                Message::Ping(payload) => f.peer.send(Message::Pong(payload)).await.unwrap(),
+                Message::Text(payload) => {
+                    let value: Value = serde_json::from_str(&payload).unwrap();
+                    if value["id"] == cancel.id {
+                        assert!(pong_before_cancel);
+                    }
+                    ids.push(value["id"].as_str().unwrap().to_owned());
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        assert_eq!(
+            ids,
+            vec![blocked.id.clone(), cancel.id.clone(), queued.id.clone()]
+        );
+        f.reply(&cancel.id).await;
+        assert!(receive(cancel.rx).await.is_ok());
+        let next = cancel_request(&f.receipt); // response completion frees its slot
+        assert_eq!(f.next_request().await["id"], next.id);
+        f.peer.send(Message::Close(None)).await.unwrap();
+        f.task.await.unwrap();
+        assert!(receive(next.rx).await.is_err());
+        assert!(!next.response.is_active());
+    })
+    .await
+    .expect("bounded Cancel/reader/Pong progress");
+}
+
+#[tokio::test]
+async fn renewal_keeps_its_reserve_with_full_data_handoff_and_pending_cancel() {
+    timeout(Duration::from_secs(10), async {
+        let mut f = Fixture::start().await;
+        let first = request(&f.commands, "synthetic/ready");
+        assert_eq!(f.next_request().await["id"], first.id);
+        f.gate.wait_flushed().await;
+        f.gate.block();
+        let blocked = request(&f.commands, "synthetic/claimed");
+        f.gate.wait_entered().await;
+        let queued = request(&f.commands, "synthetic/queued");
+        let overflow = request(&f.commands, "synthetic/overflow");
+        assert!(receive(overflow.rx).await.is_err());
+        let cancel = cancel_request(&f.receipt);
+        let mut next = f.spec.clone();
+        next.auth_token = Some(AuthSecretString::new("renewed-synthetic-access"));
+        next.session.as_mut().unwrap().access_expires_at_unix += 600;
+        let expires = next.session.as_ref().unwrap().access_expires_at_unix;
+        let (tx, rx) = mpsc::channel();
+        let renewal = JsonRpcResponseSender::new(tx, std::time::Instant::now() + Duration::from_secs(30));
+        f.commands.send(ConnectionRpcCommand::RenewAccess {
+            spec: next, refresh_generation: 2, deadline: Instant::now() + Duration::from_secs(30), response_tx: renewal.clone(),
+        }).unwrap();
+        // FIFO command marker proves renewal admission while data is still full.
+        let marker = request(&f.commands, "synthetic/after-renewal-admission");
+        assert!(receive(marker.rx).await.is_err());
+        f.gate.release(false);
+        assert_eq!(f.next_request().await["id"], blocked.id);
+        let renewed = f.next_request().await;
+        assert_eq!(renewed["method"], pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW);
+        assert_eq!(f.next_request().await["id"], cancel.id);
+        assert_eq!(f.next_request().await["id"], queued.id);
+        f.peer.send(Message::Text(json!({"jsonrpc":"2.0","id":renewed["id"],"result":{"access_expires_at_unix":expires}}).to_string().into())).await.unwrap();
+        assert!(receive(rx).await.is_ok());
+        assert!(!renewal.is_active());
+        f.peer.send(Message::Close(None)).await.unwrap();
+        f.task.await.unwrap();
+        assert!(receive(cancel.rx).await.is_err());
+    }).await.expect("renewal cannot share the full ordinary or Cancel handoff");
+}
+
+#[tokio::test]
+async fn unpolled_socket_owner_completes_retained_cancel_and_closes_admission() {
+    let (f, _start) = Fixture::paused(None).await;
+    let cancel = cancel_request(&f.receipt);
+    f.task.abort();
+    let _ = f.task.await;
+    assert!(receive(cancel.rx).await.is_err());
+    assert!(!cancel.response.is_active());
+    let (tx, rx) = mpsc::channel();
+    let retained =
+        JsonRpcResponseSender::new(tx, std::time::Instant::now() + Duration::from_secs(30));
+    assert!(
+        f.receipt
+            .admit_cancel("late".into(), "{}".into(), retained.clone())
+            .is_err()
+    );
+    assert!(receive(rx).await.is_err());
+}
+
+#[tokio::test]
+async fn queued_expired_cancel_never_writes_or_rebinds_to_replacement_socket() {
+    timeout(Duration::from_secs(10), async {
+        let mut f = Fixture::start().await;
+        let ready = request(&f.commands, "synthetic/ready");
+        assert_eq!(f.next_request().await["id"], ready.id);
+        f.gate.wait_flushed().await;
+        f.gate.block();
+        let blocked = request(&f.commands, "synthetic/blocked");
+        f.gate.wait_entered().await;
+        let admitted = Arc::new(tokio::sync::Notify::new());
+        let transport = ReceiptTransport {
+            receipt: f.receipt.clone(),
+            admitted: admitted.clone(),
+        };
+        // The canonical synchronous waiter owns timeout and exact pending
+        // cleanup. Its timeout, not a sleep, establishes retirement before write.
+        let expired = pioneer_observability::work::spawn_blocking(move || {
+            crate::rpc::send_json_rpc_request_value(
+                &transport,
+                pioneer_protocol::constants::methods::TURN_CANCEL,
+                json!({"thread_id":"control-thread", "turn_id":"control-turn"}),
+                Duration::from_secs(1),
+            )
+        });
+        admitted.notified().await;
+        f.reply(&ready.id).await;
+        assert!(receive(ready.rx).await.is_ok());
+        assert_eq!(
+            expired.await.unwrap().unwrap_err().to_string(),
+            crate::rpc::request_timeout_message(pioneer_protocol::constants::methods::TURN_CANCEL)
+        );
+        f.gate.release(false);
+        assert_eq!(f.next_request().await["id"], blocked.id);
+        let marker = request(&f.commands, "synthetic/marker");
+        assert_eq!(
+            f.next_request().await["id"],
+            marker.id,
+            "expired Cancel must not appear before marker"
+        );
+        f.task.abort();
+        let _ = f.task.await;
+        let mut replacement = Fixture::start().await; // actual new socket, same logical ID 7
+        let (tx, rx) = mpsc::channel();
+        let retained =
+            JsonRpcResponseSender::new(tx, std::time::Instant::now() + Duration::from_secs(30));
+        assert!(
+            f.receipt
+                .admit_cancel("old".into(), "{}".into(), retained.clone())
+                .is_err()
+        );
+        assert!(receive(rx).await.is_err());
+        assert!(!retained.is_active());
+        let current = cancel_request(&replacement.receipt);
+        assert_eq!(replacement.next_request().await["id"], current.id);
+        replacement.reply(&current.id).await;
+        assert!(receive(current.rx).await.is_ok());
+        replacement.peer.send(Message::Close(None)).await.unwrap();
+        replacement.task.await.unwrap();
+    })
+    .await
+    .expect("queued Cancel timeout and replacement fence");
+}
+
 async fn receive<T: Send + 'static>(rx: mpsc::Receiver<T>) -> T {
     pioneer_observability::work::spawn_blocking(move || {
         rx.recv_timeout(Duration::from_secs(3))
@@ -350,15 +631,24 @@ async fn ready_inbound_does_not_starve_outgoing_request_admission() {
     });
     let stop = StopInbound(inbound.clone());
     let (mut fixture, start) = Fixture::paused(Some(inbound.clone())).await;
+    let cancels = Arc::new(ReadyCancels {
+        receipt: fixture.receipt.clone(),
+        active: AtomicBool::new(true),
+        completed: AtomicBool::new(false),
+    });
+    let stop_cancels = StopCancels(cancels.clone());
+    cancels.queue();
     // Admission and incoming bytes are both ready before the monitor starts.
     let live = request(&fixture.commands, "synthetic/inbound-progress");
     start.send(()).unwrap();
     let observed = timeout(Duration::from_secs(5), fixture.next_request()).await;
     let still_active = inbound.active.load(Ordering::Acquire);
     let read = inbound.read.load(Ordering::Acquire);
+    let cancelled = cancels.completed.load(Ordering::Acquire);
     // Stop only after observing the outgoing request (or the deadlock fuse),
     // before asserting, so the old busy reader can always leave its poll loop.
     drop(stop);
+    drop(stop_cancels);
     fixture.task.abort();
     let _ = fixture.task.await;
     let observed = observed.expect("outgoing RPC must arrive while inbound stays ready");
@@ -367,6 +657,10 @@ async fn ready_inbound_does_not_starve_outgoing_request_admission() {
         "actual WebSocket reader must have consumed ready inbound"
     );
     assert!(still_active, "source must not stop to admit the command");
+    assert!(
+        cancelled,
+        "real Cancel mailbox cleanup must run during the flood"
+    );
     assert_eq!(observed["id"], live.id);
 }
 
@@ -535,6 +829,8 @@ async fn assert_teardown(termination: Termination) {
         renewal_request["method"],
         pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW
     );
+    let control = cancel_request(&f.receipt);
+    assert_eq!(f.next_request().await["id"], control.id);
     f.gate.block();
     f.commands
         .send(ConnectionRpcCommand::VoiceBinaryChunk {
@@ -599,6 +895,11 @@ async fn assert_teardown(termination: Termination) {
     );
     // Keep lifecycle handles alive through teardown: completion must be
     // explicit, rather than relying on last-Sender channel disconnect.
+    assert!(
+        receive(control.rx).await.is_err(),
+        "{termination:?}: Cancel"
+    );
+    assert!(!control.response.is_active());
     assert!(!pending.response.is_active());
     assert!(!queued.response.is_active());
     assert!(!renewal.is_active());

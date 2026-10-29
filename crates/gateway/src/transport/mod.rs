@@ -16,5 +16,5 @@ pub use server::spawn_server;
 
 #[cfg(test)]
 pub(crate) use server::{
-    ConnectionAccessLease, process_with_access_renewals, run_normal_connection,
+    ConnectionAccessLease, ConnectionHandlers, process_with_access_renewals, run_normal_connection,
 };

@@ -1,6 +1,6 @@
 //! WebSocket client worker.
 
-use super::runtime::{SocketLifetime, SocketReceipt};
+use super::runtime::{SocketCancelReceiver, SocketLifetime, SocketReceipt};
 use super::{
     GatewayWsConnectSpec, GatewayWsEvent,
     decode::{
@@ -631,7 +631,7 @@ async fn run_connection_task(
                 attempt = 0;
                 backoff = spec.timings.reconnect_initial;
 
-                let receipt = SocketReceipt::new(connection_id);
+                let (receipt, cancels) = SocketReceipt::new(connection_id);
                 *socket.lock().unwrap() = Some(receipt.clone());
                 let _lifetime = SocketLifetime(receipt.clone());
                 if let Some(sender) = initial_result_tx.take() {
@@ -647,6 +647,7 @@ async fn run_connection_task(
                     &event_tx,
                     &mut rpc_rx.0,
                     receipt,
+                    cancels,
                 )
                 .await;
 
@@ -774,13 +775,33 @@ async fn connection_writer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
     mut writer: futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
     mut data: tokio::sync::mpsc::Receiver<WriterFrame>,
     mut control: tokio::sync::mpsc::Receiver<WriterFrame>,
+    mut cancels: tokio::sync::mpsc::Receiver<WriterFrame>,
     connection_id: u64,
 ) -> String {
+    let mut prefer_cancel = true;
     loop {
         let frame = tokio::select! {
             biased;
+            // Domain Cancel cannot consume or displace transport control.
             frame = control.recv() => frame,
-            frame = data.recv() => frame,
+            frame = async {
+                if prefer_cancel {
+                    tokio::select! {
+                        biased;
+                        frame = cancels.recv() => Either::Left(frame),
+                        frame = data.recv() => Either::Right(frame),
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        frame = data.recv() => Either::Right(frame),
+                        frame = cancels.recv() => Either::Left(frame),
+                    }
+                }
+            } => match frame {
+                Either::Left(frame) => { prefer_cancel = false; frame }
+                Either::Right(frame) => { prefer_cancel = true; frame }
+            },
         };
         let Some(frame) = frame else {
             return "websocket writer channel closed".to_owned();
@@ -851,11 +872,13 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     event_tx: &GatewayWsEventSender,
     rpc_rx: &mut UnboundedReceiver<WorkItem<ConnectionRpcCommand>>,
     receipt: SocketReceipt,
+    mut cancels: SocketCancelReceiver,
 ) -> String {
     let (writer, mut reader) = stream.split();
     let (data_tx, data_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
     let (control_tx, control_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
-    let writer = connection_writer(writer, data_rx, control_rx, connection_id);
+    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
+    let writer = connection_writer(writer, data_rx, control_rx, cancel_rx, connection_id);
     tokio::pin!(writer);
     let mut ping_interval = tokio::time::interval(spec.timings.ping_interval);
     ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -870,6 +893,7 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
 
     let _lifetime = SocketLifetime(receipt.clone());
     let mut prefer_commands = false;
+    let mut prefer_cancels = true;
     let disconnect_reason = loop {
         let renewal_deadline = waiters.renewal.as_ref().map_or_else(
             || Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
@@ -893,6 +917,7 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                 }
             }
             input = async {
+                let regular = async {
                 if prefer_commands {
                     tokio::select! {
                         biased;
@@ -906,7 +931,37 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                         item = rpc_rx.recv() => Either::Left(item),
                     }
                 }
+                };
+                tokio::pin!(regular);
+                if prefer_cancels {
+                    tokio::select! {
+                        biased;
+                        cancel = cancels.receiver.recv() => Either::Left(cancel),
+                        input = &mut regular => Either::Right(input),
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        input = &mut regular => Either::Right(input),
+                        cancel = cancels.receiver.recv() => Either::Left(cancel),
+                    }
+                }
             } => match input {
+            Either::Left(cancel) => {
+                prefer_cancels = false;
+                let Some(cancel) = cancel else { break "websocket Cancel admission closed".to_owned(); };
+                if !cancel.response.is_active() { cancel.response.cancel(); continue; }
+                // Same pending owner, before frame admission/claim. Final writer
+                // claim still checks physical/subscription/deadline/cancellation.
+                waiters.requests.insert(cancel.request_id, cancel.response.clone());
+                let frame = WriterFrame::new(Message::Text(cancel.payload.into()), Some(cancel.response.clone()));
+                if cancel_tx.try_send(frame).is_err() {
+                    let _ = cancel.response.send(Err(crate::rpc::JsonRpcResponseError::transport("websocket Cancel writer handoff full or closed")));
+                }
+            }
+            Either::Right(input) => {
+            prefer_cancels = true;
+            match input {
             Either::Right(payload) => {
                 prefer_commands = true;
                 let carrier=pioneer_observability::work::WorkCarrier::independent(Boundary::EventLane,WorkKind::Event,pioneer_observability::work::Trigger::Event,ExecutorRole::ClientWs);
@@ -1024,7 +1079,7 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                         let frame = WriterFrame::new(Message::Text(request.payload.into()), Some(response_tx.clone()));
                         waiters.renewal = Some(PendingAccessRenewal { request_id: request.request_id,
                             spec: next, response_tx, deadline });
-                        if data_tx.try_send(frame).is_err() {
+                        if control_tx.try_send(frame).is_err() {
                             return Some("connection renewal writer handoff full or closed".to_owned());
                         }
                     }
@@ -1072,6 +1127,8 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                 if let Some(failure)=failure {break failure;}
             }
             }
+            }
+            }
         }
     };
     receipt.retire();
@@ -1110,6 +1167,7 @@ mod tests {
         let (events, _event_rx) = mpsc::channel();
         let events = GatewayWsEventSender::from(events);
         let (commands, mut command_rx) = work_channel(Boundary::ClientRpc);
+        let (receipt, cancels) = SocketReceipt::new(7);
         let task = tokio::spawn(async move {
             monitor_connection(
                 stream,
@@ -1117,7 +1175,8 @@ mod tests {
                 7,
                 &events,
                 &mut command_rx,
-                SocketReceipt::new(7),
+                receipt,
+                cancels,
             )
             .await;
             spec

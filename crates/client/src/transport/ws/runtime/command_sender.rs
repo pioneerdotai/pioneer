@@ -25,6 +25,19 @@ impl crate::rpc::JsonRpcRequestTransport for GatewayWsCommandSender {
         if let Some(transport) = self.test_requests.lock().unwrap().clone() {
             return transport.send_json_rpc_request(request_id, payload, response_tx);
         }
+        if is_turn_cancel(&payload) {
+            let Some(receipt) = self.socket.lock().unwrap().clone() else {
+                let message = "websocket Cancel socket unavailable";
+                let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(message)));
+                return Err(message.into());
+            };
+            if self.connection_generations.lock().unwrap().active != Some(receipt.scope.connection)
+            {
+                response_tx.cancel();
+                return Err("websocket Cancel route retired".into());
+            }
+            return receipt.admit_cancel(request_id, payload, response_tx);
+        }
         self.command_tx
             .send(GatewayWsCommand::Request {
                 expected_connection: None,
@@ -263,11 +276,24 @@ impl GatewayWsCommandSender {
     }
 
     pub fn shutdown(&self) -> Result<()> {
-        *self
-            .connection_generations
-            .lock()
-            .map_err(|_| anyhow!("Gateway connection owner poisoned"))? =
-            GatewayConnectionGenerations::default();
+        {
+            // Cancel bypasses queued lifecycle commands. Fence the current
+            // physical socket while route admission is locked; a socket published
+            // after this gate cannot admit a Cancel under the retired route.
+            let mut generations = self
+                .connection_generations
+                .lock()
+                .map_err(|_| anyhow!("Gateway connection owner poisoned"))?;
+            *generations = GatewayConnectionGenerations::default();
+            if let Some(receipt) = self.socket.lock().unwrap().as_ref() {
+                receipt.retire();
+            }
+        }
+        #[cfg(test)]
+        {
+            let owner = self.test_cancels.lock().unwrap().take();
+            drop(owner);
+        }
         self.replace_http_session_access(None)?;
         self.command_tx
             .send(GatewayWsCommand::Shutdown)
@@ -282,6 +308,14 @@ impl GatewayWsCommandSender {
                 .map_err(|_| anyhow!("Gateway connection owner poisoned"))?;
             generations.retiring = generations.active.take();
             generations.pending = None;
+            if let Some(receipt) = self.socket.lock().unwrap().as_ref() {
+                receipt.retire();
+            }
+        }
+        #[cfg(test)]
+        {
+            let owner = self.test_cancels.lock().unwrap().take();
+            drop(owner);
         }
         self.replace_http_session_access(None)?;
         self.command_tx
@@ -291,6 +325,8 @@ impl GatewayWsCommandSender {
 
     /// Retire only the named connection, preserving a newer active or pending attempt.
     pub(crate) fn disconnect_connection(&self, connection_id: u64) -> Result<()> {
+        #[cfg(test)]
+        let mut test_owner = None;
         let mut generations = self
             .connection_generations
             .lock()
@@ -300,6 +336,19 @@ impl GatewayWsCommandSender {
         }
         if generations.pending == Some(connection_id) {
             generations.pending = None;
+        }
+        if let Some(receipt) = self
+            .socket
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|receipt| receipt.scope.connection == connection_id)
+        {
+            receipt.retire();
+            #[cfg(test)]
+            {
+                test_owner = self.test_cancels.lock().unwrap().take();
+            }
         }
         {
             let mut access = self
@@ -313,9 +362,14 @@ impl GatewayWsCommandSender {
                 *access = None;
             }
         }
-        self.command_tx
+        let sent = self
+            .command_tx
             .send(GatewayWsCommand::DisconnectConnection { connection_id })
-            .map_err(|_| anyhow!("websocket worker is not available"))
+            .map_err(|_| anyhow!("websocket worker is not available"));
+        drop(generations);
+        #[cfg(test)]
+        drop(test_owner);
+        sent
     }
 
     pub fn current_gateway_http_access(
@@ -1260,6 +1314,57 @@ fn http_access_from_spec(
 #[cfg(test)]
 mod connection_generation_tests {
     use super::*;
+    #[tokio::test]
+    async fn typed_turn_cancel_uses_exact_socket_admission_for_bound_and_unbound_callers() {
+        for bound in [false, true] {
+            let client = GatewayWsClient::new();
+            let sender = client.command_sender();
+            let (receipt, mut owner) = SocketReceipt::new(7);
+            *sender.socket.lock().unwrap() = Some(receipt.clone());
+            sender.connection_generations.lock().unwrap().active = Some(7);
+            let transport: Box<dyn crate::rpc::JsonRpcRequestTransport + Send + Sync> = if bound {
+                Box::new(sender.requests_for_connection(7))
+            } else {
+                Box::new(sender)
+            };
+            let typed = pioneer_observability::work::spawn_blocking(move || {
+                client_ws_commands::turn_cancel(
+                    transport.as_ref(),
+                    TurnCancelParams {
+                        thread_id: "exact-thread".into(),
+                        turn_id: "exact-turn".into(),
+                        reason: Some("stop".into()),
+                    },
+                )
+            });
+            let request = tokio::time::timeout(Duration::from_secs(3), owner.receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let value: pioneer_protocol::JsonRpcRequest =
+                serde_json::from_str(&request.payload).unwrap();
+            assert_eq!(
+                value.method,
+                pioneer_protocol::constants::methods::TURN_CANCEL
+            );
+            assert_eq!(value.id.as_str(), request.request_id);
+            assert_eq!(value.params.unwrap()["turn_id"], "exact-turn");
+            let retained = request.response.clone();
+            request
+                .response
+                .send(Err(crate::rpc::JsonRpcResponseError::server(
+                    Some(-32004),
+                    "not found",
+                    None,
+                )))
+                .unwrap();
+            assert!(typed.await.unwrap().is_err());
+            assert!(!retained.is_active());
+            drop(owner);
+            assert!(!receipt.is_current());
+        }
+    }
+
     fn event(id: u64) -> GatewayWsEvent {
         GatewayWsEvent::Connecting {
             connection_id: id,
@@ -1413,7 +1518,7 @@ mod connection_generation_tests {
         let sender = client.command_sender();
         *sender.test_requests.lock().unwrap() = Some(Arc::new(Reply));
         let missing = sender.requests_for_connection(7);
-        let first = SocketReceipt::new(7);
+        let (first, _first_cancels) = SocketReceipt::new(7);
         *sender.socket.lock().unwrap() = Some(first.clone());
         let old = sender.requests_for_connection(7);
         let call = |transport: &ConnectionRequestTransport| {
@@ -1454,7 +1559,8 @@ mod connection_generation_tests {
             !retry.is_current(),
             "new subscription cannot revive physical socket"
         );
-        *sender.socket.lock().unwrap() = Some(SocketReceipt::new(7));
+        let (new_socket, _new_cancels) = SocketReceipt::new(7);
+        *sender.socket.lock().unwrap() = Some(new_socket);
         let current = sender.requests_for_connection(7);
         assert_ne!(old.scope(), current.scope());
         assert!(
@@ -1512,7 +1618,7 @@ mod connection_generation_tests {
         }
         let client = GatewayWsClient::new();
         let sender = client.command_sender();
-        let socket = SocketReceipt::new(7);
+        let (socket, _cancels) = SocketReceipt::new(7);
         *sender.socket.lock().unwrap() = Some(socket.clone());
         let subscription = Arc::new(Mutex::new(true));
         let captured = sender
@@ -1736,6 +1842,17 @@ impl crate::rpc::JsonRpcRequestTransport for ConnectionRequestTransport {
         #[cfg(test)]
         if let Some(transport) = self.sender.test_requests.lock().unwrap().clone() {
             return transport.send_json_rpc_request(request_id, payload, response_tx);
+        }
+        if is_turn_cancel(&payload) {
+            if self.sender.connection_generations.lock().unwrap().active != Some(self.connection) {
+                response_tx.cancel();
+                return Err("websocket Cancel route retired".into());
+            }
+            return self.receipt.as_ref().expect("current socket").admit_cancel(
+                request_id,
+                payload,
+                response_tx,
+            );
         }
         self.sender
             .command_tx

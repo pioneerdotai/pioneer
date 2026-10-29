@@ -1,3 +1,6 @@
+#[path = "tests/control_rpc.rs"]
+mod control_rpc;
+
 #[path = "tests/workspace_scope.rs"]
 mod workspace_scope;
 
