@@ -1729,7 +1729,7 @@ mod tests {
             };
             core.start_composer_voice_session_using(start_request(identity.clone()), &transport)
                 .unwrap();
-            let send = |sequence, samples| {
+            let send = |sequence, samples: usize| {
                 core.send_composer_voice_audio_chunk(
                     &identity,
                     "session".into(),
