@@ -1297,13 +1297,12 @@ impl MessageProcessor {
         // Keep the shared-facts future off the already deep task/CLI fanout
         // stack. Await it inline so cancellation still drops every fact/read;
         // only recipient IDs cross serialization.
-        let serialization_connection_ids = Box::pin(
-            self.pre_serialization_thread_notification_recipients(
+        let serialization_connection_ids =
+            Box::pin(self.pre_serialization_thread_notification_recipients(
                 thread_id,
                 serialization_subscribers,
-            ),
-        )
-        .await;
+            ))
+            .await;
         if serialization_connection_ids.is_empty() {
             return;
         }
