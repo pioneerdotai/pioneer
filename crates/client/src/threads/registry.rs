@@ -9471,6 +9471,12 @@ mod tests {
             "absent-new-generation",
             "absent-replace",
             "absent-evidence-full",
+            "absent-tombstone",
+            "absent-tombstone-rpc",
+            "absent-tombstone-dispatch",
+            "absent-tombstone-cancel",
+            "absent-tombstone-reauthorized",
+            "absent-tombstone-replace",
         ] {
             let core = core();
             core.upsert_thread(thread("a", "ws"));
@@ -9489,6 +9495,7 @@ mod tests {
                 removed_work_item_ids: vec![],
             };
             let absent = outcome.starts_with("absent");
+            let tombstoned = outcome.starts_with("absent-tombstone");
             core.apply_turn_work_items_get_response(page(if absent {
                 vec![]
             } else {
@@ -9515,6 +9522,9 @@ mod tests {
                 })
                 .unwrap()
                 .unwrap();
+            let key =
+                crate::timeline::semantic::semantic_timeline_request_key(&request.action).clone();
+            let generation = request.request_generation;
             let mut incoming = original.clone();
             incoming.metadata = Some(serde_json::json!(if outcome == "capacity" {
                 "x".repeat(SEMANTIC_CONTINUATION_BYTE_LIMIT / 2)
@@ -9525,7 +9535,7 @@ mod tests {
             peer.work_item_id = "item-99".into();
             peer.item_id = "peer-source".into();
             peer.turn_id = "turn".into();
-            let second = if outcome == "rpc" {
+            let second = if matches!(outcome, "rpc" | "absent-tombstone-rpc") {
                 Err("late chunk failure".into())
             } else if outcome == "capacity" {
                 Ok(page(vec![incoming.clone()]))
@@ -9556,7 +9566,7 @@ mod tests {
                 if absent { None } else { Some(&original) },
                 "the first successful chunk must not partially apply"
             );
-            if absent && outcome != "absent" {
+            if absent && outcome != "absent" && !tombstoned {
                 // Another response can make the range Ready without caching X.
                 // The relevant removal below then returns semantic changed=false.
                 core.apply_turn_work_items_get_response(page(vec![]));
@@ -9583,13 +9593,79 @@ mod tests {
                     "None-to-None removal still guards the active collection"
                 );
             }
+            if tombstoned {
+                let GatewayNotification::ThreadTimelineBlocksChanged(mut notification) =
+                    reconciliation_notification(&[])
+                else {
+                    unreachable!()
+                };
+                notification.removed_block_ids = vec!["turn:turn:work".into()];
+                notification.turn_work_tombstones = vec![pioneer_protocol::TurnWorkTombstone {
+                    turn_id: "turn".into(),
+                    block_id: "turn:turn:work".into(),
+                    source_high_watermark: 30,
+                    projection_updated_at_unix_micros: 30_000,
+                }];
+                assert!(core.apply_thread_semantic_live_update(
+                    crate::timeline::semantic::SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification)
+                ));
+                assert!(
+                    core.thread_semantic_snapshot("a")
+                        .thread("a")
+                        .unwrap()
+                        .work_range("turn")
+                        .is_none()
+                );
+                // Pending required IDs belong to the same invalidated collection.
+                assert!(
+                    core.begin_thread_semantic_request(
+                        SemanticTimelineRequestAction::TurnWorkItemsGet {
+                            key: key.clone(),
+                            params: TurnWorkItemsGetParams {
+                                thread_id: "a".into(),
+                                turn_id: "turn".into(),
+                                work_item_ids: vec!["trailing".into()],
+                            },
+                        }
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+            }
+            let mut replacement_ready = None;
             let mut live = original.clone();
             live.metadata = Some(serde_json::json!("live"));
             match outcome {
-                "cancel" => core.cancel_thread_requests(),
+                "cancel" | "absent-tombstone-cancel" => core.cancel_thread_requests(),
                 "replace" | "absent-replace" => {
                     core.remove_thread_store("a");
                     core.upsert_thread(thread("a", "ws"));
+                }
+                "absent-tombstone-replace" => {
+                    core.remove_thread_store("a");
+                    core.upsert_thread(thread("a", "ws"));
+                    let replacement = core
+                        .begin_thread_semantic_request(
+                            SemanticTimelineRequestAction::TurnWorkItemsGet {
+                                key: key.clone(),
+                                params: TurnWorkItemsGetParams {
+                                    thread_id: "a".into(),
+                                    turn_id: "turn".into(),
+                                    work_item_ids: vec!["item-0".into()],
+                                },
+                            },
+                        )
+                        .unwrap()
+                        .unwrap();
+                    let fresh = Transport {
+                        replies: std::cell::RefCell::new(vec![Ok(page(vec![incoming.clone()]))]),
+                        calls: std::cell::Cell::new(0),
+                    };
+                    assert!(
+                        core.execute_thread_semantic_request(&fresh, replacement)
+                            .is_none()
+                    );
+                    replacement_ready = core.thread_snapshot("a");
                 }
                 "live-edit" => {
                     core.apply_turn_work_items_get_response(page(vec![live.clone()]));
@@ -9612,13 +9688,25 @@ mod tests {
                 }
                 _ => {}
             }
-            assert!(
-                core.execute_thread_semantic_request(&transport, request)
-                    .is_none()
-            );
+            if outcome == "absent-tombstone-dispatch" {
+                assert!(core.send_timeline_request(request).is_err());
+            } else {
+                assert!(
+                    core.execute_thread_semantic_request(&transport, request)
+                        .is_none()
+                );
+            }
             assert_eq!(
                 transport.calls.get(),
-                if matches!(outcome, "cancel" | "replace" | "absent-replace") {
+                if matches!(
+                    outcome,
+                    "cancel"
+                        | "replace"
+                        | "absent-replace"
+                        | "absent-tombstone-replace"
+                        | "absent-tombstone-dispatch"
+                        | "absent-tombstone-cancel"
+                ) {
                     1
                 } else {
                     2
@@ -9628,14 +9716,21 @@ mod tests {
             let range = semantic.thread("a").unwrap().work_range("turn");
             let actual = range.and_then(|range| range.items_by_id.get("item-0"));
             match outcome {
-                "success" | "absent" => assert_eq!(actual, Some(&incoming)),
+                "success" | "absent" | "absent-tombstone-replace" => {
+                    assert_eq!(actual, Some(&incoming))
+                }
                 "live-edit" => assert_eq!(actual, Some(&live)),
                 "replace"
                 | "live-remove"
                 | "absent-remove"
                 | "absent-new-generation"
                 | "absent-replace"
-                | "absent-evidence-full" => assert!(actual.is_none()),
+                | "absent-evidence-full"
+                | "absent-tombstone"
+                | "absent-tombstone-rpc"
+                | "absent-tombstone-dispatch"
+                | "absent-tombstone-cancel"
+                | "absent-tombstone-reauthorized" => assert!(actual.is_none()),
                 _ => assert_eq!(actual, Some(&original)),
             }
             if matches!(outcome, "rpc" | "capacity" | "absent-evidence-full") {
@@ -9644,14 +9739,59 @@ mod tests {
                     crate::timeline::semantic::TimelineRequestStatus::Failed { .. }
                 ));
             }
-            if absent && !matches!(outcome, "absent-evidence-full" | "absent-replace") {
+            if tombstoned {
+                if let Some(ready) = replacement_ready {
+                    assert!(
+                        Arc::ptr_eq(&ready, &core.thread_snapshot("a").unwrap()),
+                        "late old collection must not publish over replacement"
+                    );
+                } else {
+                    assert!(
+                        range.is_none(),
+                        "neither success nor error cleanup may recreate the tombstoned range"
+                    );
+                }
+                let registry = core.thread_registry.lock().unwrap();
+                assert!(!registry.timeline.accepts(&key, generation));
+                assert!(
+                    registry
+                        .timeline
+                        .request_removals(&key, generation)
+                        .is_none()
+                );
+                assert!(!registry.timeline.pending.contains_key(&key));
+            }
+            if absent
+                && !tombstoned
+                && !matches!(outcome, "absent-evidence-full" | "absent-replace")
+            {
                 assert_eq!(
                     range.unwrap().items_by_id.get("item-99"),
                     Some(&peer),
                     "the other required IDs complete as the same successful collection"
                 );
             }
-            if matches!(outcome, "absent-new-generation" | "absent-replace") {
+            if matches!(
+                outcome,
+                "absent-new-generation" | "absent-replace" | "absent-tombstone-reauthorized"
+            ) {
+                if outcome == "absent-tombstone-reauthorized" {
+                    let mut work = run_work();
+                    work.turn_id = "turn".into();
+                    assert!(core.apply_thread_semantic_live_update(
+                        crate::timeline::semantic::SemanticTimelineLiveUpdate::TurnWorkStateChanged(
+                            pioneer_protocol::TurnWorkStateChangedNotification {
+                                workspace_id: "ws".into(),
+                                thread_id: "a".into(),
+                                turn_id: "turn".into(),
+                                source_high_watermark: 31,
+                                projection_updated_at_unix_micros: 31_000,
+                                work,
+                                reason: TimelineChangeReason::LiveEvent,
+                            }
+                        )
+                    ));
+                }
                 let next = core
                     .begin_thread_semantic_request(
                         SemanticTimelineRequestAction::TurnWorkItemsGet {
@@ -9668,8 +9808,11 @@ mod tests {
                     )
                     .unwrap()
                     .unwrap();
+                let mut fresh_page = page(vec![incoming.clone()]);
+                fresh_page.source_high_watermark = 32;
+                fresh_page.projection_updated_at_unix_micros = 32_000;
                 let fresh = Transport {
-                    replies: std::cell::RefCell::new(vec![Ok(page(vec![incoming.clone()]))]),
+                    replies: std::cell::RefCell::new(vec![Ok(fresh_page)]),
                     calls: std::cell::Cell::new(0),
                 };
                 assert!(core.execute_thread_semantic_request(&fresh, next).is_none());
@@ -13050,6 +13193,16 @@ impl ClientCore {
         {
             return;
         }
+        if let SemanticTimelineRequestAction::TurnWorkItemsGet { params, .. } = &request.action
+            && !crate::timeline::semantic::accepts_turn_work_items_change(
+                &registry.stores[&request.id].semantic,
+                &request.id,
+                &params.turn_id,
+            )
+        {
+            registry.timeline.reject_admission(key);
+            return;
+        }
         let preserve_refresh_status = matches!(
             &request.action,
             SemanticTimelineRequestAction::ThreadTimelinePage { .. }
@@ -13204,6 +13357,20 @@ impl ClientCore {
         if !registry.timeline.accepts(&key, request.request_generation) {
             return None;
         }
+        let Some(store) = registry.stores.get(&request.id) else {
+            return None;
+        };
+        if self.is_stopped() || store.generation != request.generation {
+            return None;
+        }
+        if let SemanticTimelineRequestAction::TurnWorkItemsGet { params, .. } = &request.action
+            && !accepts_turn_work_items_change(&store.semantic, &request.id, &params.turn_id)
+        {
+            // Current authority retired the whole range. Drop this exact collection
+            // (including trailing IDs/evidence) without creating a Failed range.
+            registry.timeline.reject_admission(&key);
+            return None;
+        }
         let removals = registry
             .timeline
             .request_removals(&key, request.request_generation)
@@ -13226,12 +13393,10 @@ impl ClientCore {
                 &request.action,
                 SemanticTimelineRequestAction::ThreadTimelinePage { .. }
             );
-        let Some(store) = registry.stores.get_mut(&request.id) else {
-            return None;
-        };
-        if self.is_stopped() || store.generation != request.generation {
-            return None;
-        }
+        let store = registry
+            .stores
+            .get_mut(&request.id)
+            .expect("validated request store");
         let valid_scope = |workspace: &str, id: &str| {
             workspace == store.coordinator.workspace_id && id == request.id
         };
@@ -13546,6 +13711,13 @@ fn set_request_status(
     status: crate::timeline::semantic::TimelineRequestStatus,
 ) {
     use SemanticTimelineRequestKey::*;
+    // Targeted cleanup (including cancellation) cannot create a range that
+    // current authority removed. Other page/status policies stay unchanged.
+    if let TurnWorkItems { thread_id, turn_id } = key
+        && !crate::timeline::semantic::accepts_turn_work_items_change(state, thread_id, turn_id)
+    {
+        return;
+    }
     let thread = state.thread_mut(request_thread_id(key));
     match key {
         ThreadNewest { .. } | ThreadBefore { .. } | ThreadAfter { .. } => {

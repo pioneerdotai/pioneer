@@ -4,7 +4,7 @@
 //! not measured throughput optima.
 use super::registry::ThreadControllerRequest;
 use pioneer_observability::{
-    queues::{QueueBytes, QueueObserver},
+    queues::{QueueBytes, QueueObserver, QueueOutcome},
     work::{Boundary, ExecutorRole, WorkItem, WorkKind},
 };
 use std::{
@@ -20,6 +20,17 @@ const INTERACTIVE_BURST: usize = 4;
 const MAX_COMMAND_BYTES: usize = 1024 * 1024;
 
 type Item = WorkItem<ThreadControllerRequest>;
+
+fn discard(item: &Item, reason: QueueOutcome) {
+    if let Some((queue, bytes)) = &item.queue {
+        queue.dequeued(*bytes);
+        // Stale/Dropped retain the reason; cancelling the processing guard
+        // balances dequeue without reporting an execution as Processed.
+        let _processing = queue.processing();
+        queue.outcome(reason, 1);
+    }
+}
+
 struct Pending {
     jobs: VecDeque<Item>,
     executing: bool,
@@ -111,10 +122,7 @@ impl ThreadControllerSender {
             if current(&item.value) {
                 return true;
             }
-            if let Some((queue, bytes)) = &item.queue {
-                queue.dequeued(*bytes);
-                queue.outcome(pioneer_observability::queues::QueueOutcome::Stale, 1);
-            }
+            discard(item, QueueOutcome::Stale);
             false
         });
     }
@@ -229,9 +237,8 @@ impl ThreadControllerReceiver {
         if let Some(item) = continuation {
             if !pending.closed {
                 pending.jobs.push_back(item);
-            } else if let Some((queue, bytes)) = &item.queue {
-                queue.dequeued(*bytes);
-                queue.outcome(pioneer_observability::queues::QueueOutcome::Dropped, 1);
+            } else {
+                discard(&item, QueueOutcome::Dropped);
             }
         }
     }
@@ -310,10 +317,7 @@ impl Drop for ThreadControllerReceiver {
             .expect("history pending poisoned");
         pending.closed = true;
         for item in pending.jobs.drain(..) {
-            if let Some((queue, bytes)) = &item.queue {
-                queue.dequeued(*bytes);
-                queue.outcome(pioneer_observability::queues::QueueOutcome::Dropped, 1);
-            }
+            discard(&item, QueueOutcome::Dropped);
         }
         self.shared.ready.notify_all();
     }
@@ -403,6 +407,143 @@ mod tests {
         receiver.finish(None);
         assert!(receiver.take_by(|_| true).is_some());
         receiver.finish(None);
+    }
+
+    #[test]
+    fn discarded_payloads_finish_processing_without_losing_the_reason_or_epoch() {
+        use pioneer_observability::live::{self, JournalPayload};
+        let _lock = crate::OBSERVABILITY_TEST_LOCK.lock().unwrap();
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                pioneer_observability::set_telemetry_enabled(self.0);
+            }
+        }
+        let _restore = Restore(pioneer_observability::telemetry_enabled());
+        for path in ["stale", "teardown", "closed-continuation", "old-epoch"] {
+            pioneer_observability::set_telemetry_enabled(false);
+            pioneer_observability::set_telemetry_enabled(true);
+            let (mut sender, receiver) = channel();
+            sender.observer = QueueObserver::new(
+                pioneer_observability::queues::QueueKind::ClientController,
+                Some(MAX_JOBS),
+                "fixture history discard",
+            );
+            sender.send(binding("discarded")).unwrap();
+            let queue_id = live::snapshot()
+                .unwrap()
+                .queues
+                .iter()
+                .find(|q| q.byte_definition == "fixture history discard")
+                .unwrap()
+                .id;
+            // Exercise the real WorkItem receive/processing contract for an
+            // executed payload; cancellation accounting belongs to the scheduler.
+            let execute = |item: Item, continued: bool| {
+                let queue = item.queue.as_ref().unwrap().0.clone();
+                let (value, work) = item.received(
+                    Boundary::StdThread,
+                    WorkKind::ClientCommand,
+                    ExecutorRole::ClientController,
+                );
+                let mut processing = queue.processing();
+                let next = work.run(|| {
+                    continued.then(|| {
+                        WorkItem::new(
+                            value,
+                            Boundary::StdThread,
+                            WorkKind::ClientCommand,
+                            ExecutorRole::ClientController,
+                        )
+                        .observed(queue, QueueBytes::Unsupported)
+                    })
+                });
+                processing.processed();
+                next
+            };
+            match path {
+                "stale" => {
+                    sender.retire_stale(|_| false);
+                    sender.send(binding("normal")).unwrap();
+                    assert!(execute(receiver.take_by(|_| false).unwrap(), false).is_none());
+                    receiver.finish(None);
+                    drop(receiver);
+                }
+                "teardown" => drop(receiver),
+                "closed-continuation" => {
+                    let continuation = execute(receiver.take_by(|_| false).unwrap(), true);
+                    // Finish the preceding real processing before closing the
+                    // owner, then offer its already observed continuation.
+                    drop(sender);
+                    receiver.finish(continuation);
+                    drop(receiver);
+                    let snapshot = live::snapshot().unwrap();
+                    let terminal = snapshot
+                        .journal
+                        .iter()
+                        .find_map(|record| match &record.payload {
+                            JournalPayload::Queue(q) if q.id == queue_id => Some(q),
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!((terminal.depth, terminal.in_processing), (0, 0));
+                    assert_eq!(
+                        (terminal.dropped, terminal.cancelled, terminal.processed),
+                        (1, 1, 1)
+                    );
+                    assert_eq!(terminal.abandoned_processing, 0);
+                    continue;
+                }
+                "old-epoch" => {
+                    pioneer_observability::set_telemetry_enabled(false);
+                    pioneer_observability::set_telemetry_enabled(true);
+                    sender.retire_stale(|_| false);
+                    drop(receiver);
+                    drop(sender);
+                    let snapshot = live::snapshot().unwrap();
+                    assert!(
+                        !snapshot
+                            .queues
+                            .iter()
+                            .any(|q| q.byte_definition == "fixture history discard")
+                    );
+                    assert!(!snapshot.journal.iter().any(|record| matches!(&record.payload, JournalPayload::Queue(q) if q.byte_definition == "fixture history discard")));
+                    continue;
+                }
+                _ => unreachable!(),
+            }
+            let snapshot = live::snapshot().unwrap();
+            let queue = snapshot.queues.iter().find(|q| q.id == queue_id).unwrap();
+            assert_eq!((queue.depth, queue.in_processing), (0, 0));
+            assert_eq!(queue.cancelled, 1);
+            assert_eq!(
+                (queue.stale, queue.dropped, queue.processed),
+                if path == "stale" {
+                    (1, 0, 1)
+                } else {
+                    (0, 1, 0)
+                }
+            );
+            assert_eq!(queue.accounting_errors, 0);
+            drop(sender);
+            let snapshot = live::snapshot().unwrap();
+            let terminal = snapshot
+                .journal
+                .iter()
+                .find_map(|record| match &record.payload {
+                    JournalPayload::Queue(q) if q.id == queue_id => Some(q),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                (
+                    terminal.depth,
+                    terminal.in_processing,
+                    terminal.abandoned_processing
+                ),
+                (0, 0, 0)
+            );
+        }
     }
 
     #[test]
