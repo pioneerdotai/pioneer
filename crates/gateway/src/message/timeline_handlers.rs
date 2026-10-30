@@ -83,6 +83,12 @@ struct TurnWorkItemsSnapshot {
     removed_work_item_ids: Vec<String>,
 }
 
+enum TurnWorkProjectionRead {
+    Present(turn_work_projection::Model),
+    DetachedAbsent { revision: (i64, i64) },
+    Absent,
+}
+
 #[derive(Default)]
 struct UserMessageTimelineBatch {
     turns: HashMap<String, Turn>,
@@ -723,35 +729,15 @@ impl MessageProcessor {
             }
         };
 
-        let work_projection = match self
-            .crud_store
-            .get_turn_work_projection(params.turn_id.as_str())
+        let projection_read = match self
+            .load_scoped_turn_work_projection(
+                authorization.workspace_id(),
+                &params.thread_id,
+                &params.turn_id,
+            )
             .await
         {
-            Ok(Some(projection))
-                if projection.thread_id == params.thread_id
-                    && projection.workspace_id == authorization.workspace_id() =>
-            {
-                Some(projection)
-            }
-            Ok(Some(_)) => {
-                self.send_error(
-                    connection_id,
-                    timeline_public_error(
-                        Some(request_id),
-                        INVALID_PARAMS_CODE,
-                        format!(
-                            "invalid params for `{}`: turn `{}` does not belong to thread `{}`",
-                            methods::TURN_WORK_PAGE,
-                            params.turn_id,
-                            params.thread_id
-                        ),
-                    ),
-                )
-                .await;
-                return;
-            }
-            Ok(None) => None,
+            Ok(read) => read,
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -765,21 +751,33 @@ impl MessageProcessor {
                 return;
             }
         };
+        let (work_projection, absent_revision) = match projection_read {
+            TurnWorkProjectionRead::Present(projection) => (Some(projection), None),
+            TurnWorkProjectionRead::DetachedAbsent { revision } => (None, Some(revision)),
+            TurnWorkProjectionRead::Absent => (None, None),
+        };
 
         let Some(work_projection) = work_projection else {
-            let (source_high_watermark, projection_updated_at_unix_micros) = match self
-                .crud_store
-                .get_turn_event_projection_stream_state(params.turn_id.as_str())
-                .await
-            {
-                Ok(state) => state
+            // Other lawful empty page cases retain their existing behavior.
+            let revision = match absent_revision {
+                Some(revision) => Ok(revision),
+                None => self
+                    .crud_store
+                    .get_turn_event_projection_stream_state(&params.turn_id)
+                    .await
                     .map(|state| {
-                        (
-                            state.projected_through_sequence,
-                            state.updated_at_unix_micros,
-                        )
-                    })
-                    .unwrap_or_default(),
+                        state
+                            .map(|state| {
+                                (
+                                    state.projected_through_sequence,
+                                    state.updated_at_unix_micros,
+                                )
+                            })
+                            .unwrap_or_default()
+                    }),
+            };
+            let (source_high_watermark, projection_updated_at_unix_micros) = match revision {
+                Ok(revision) => revision,
                 Err(error) => {
                     self.send_error(
                         connection_id,
@@ -973,68 +971,16 @@ impl MessageProcessor {
         work_item_ids.sort();
         work_item_ids.dedup();
 
-        let work_projection = match self
-            .crud_store
-            .get_turn_work_projection(params.turn_id.as_str())
+        let response_payload = match self
+            .load_turn_work_items_response(
+                authorization.workspace_id(),
+                &params.thread_id,
+                &params.turn_id,
+                work_item_ids,
+            )
             .await
         {
-            Ok(Some(projection))
-                if projection.thread_id == params.thread_id
-                    && projection.workspace_id == authorization.workspace_id() =>
-            {
-                projection
-            }
-            Ok(Some(_)) => {
-                self.send_error(
-                    connection_id,
-                    timeline_public_error(
-                        Some(request_id),
-                        INVALID_PARAMS_CODE,
-                        format!(
-                            "invalid params for `{}`: turn `{}` does not belong to thread `{}`",
-                            methods::TURN_WORK_ITEMS_GET,
-                            params.turn_id,
-                            params.thread_id
-                        ),
-                    ),
-                )
-                .await;
-                return;
-            }
-            Ok(None) => {
-                self.send_error(
-                    connection_id,
-                    timeline_public_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "turn work projection for turn `{}` was not found",
-                            params.turn_id
-                        ),
-                    ),
-                )
-                .await;
-                return;
-            }
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    timeline_public_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to load turn work projection: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-
-        let snapshot = match self
-            .load_consistent_turn_work_items_snapshot(work_projection, work_item_ids)
-            .await
-        {
-            Ok(snapshot) => snapshot,
+            Ok(response) => response,
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -1047,19 +993,6 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-        };
-
-        let workspace_id = snapshot.projection.workspace_id.clone();
-
-        let response_payload = TurnWorkItemsGetResponse {
-            workspace_id,
-            thread_id: params.thread_id,
-            turn_id: params.turn_id,
-            projection_version: SEMANTIC_TIMELINE_PROJECTION_VERSION,
-            source_high_watermark: snapshot.projection.source_high_watermark,
-            projection_updated_at_unix_micros: snapshot.projection.updated_at.timestamp_micros(),
-            items: snapshot.items,
-            removed_work_item_ids: snapshot.removed_work_item_ids,
         };
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
             Ok(response) => response,
@@ -1084,6 +1017,75 @@ impl MessageProcessor {
                 "failed to send turn/work/items/get response"
             );
         }
+    }
+
+    // Authorization is established by dispatch. This read independently validates
+    // authoritative scope, including when there is no Work row to validate.
+    async fn load_scoped_turn_work_projection(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<TurnWorkProjectionRead> {
+        let owner = self
+            .crud_store
+            .get_turn_work_owner(workspace_id, thread_id, turn_id)
+            .await?
+            .context("Turn is absent from the authorized scope")?;
+        if owner == pioneer_crud::TurnWorkOwner::DetachedTask {
+            let revision = self
+                .crud_store
+                .get_detached_turn_work_tombstone(workspace_id, thread_id, turn_id)
+                .await?
+                .context("detached Work absence is not confirmed by a healthy projected stream")?;
+            return Ok(TurnWorkProjectionRead::DetachedAbsent { revision });
+        }
+        let Some(projection) = self.crud_store.get_turn_work_projection(turn_id).await? else {
+            return Ok(TurnWorkProjectionRead::Absent);
+        };
+        anyhow::ensure!(
+            projection.workspace_id == workspace_id && projection.thread_id == thread_id,
+            "Work projection does not belong to the authorized scope"
+        );
+        Ok(TurnWorkProjectionRead::Present(projection))
+    }
+
+    async fn load_turn_work_items_response(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        work_item_ids: Vec<String>,
+    ) -> Result<TurnWorkItemsGetResponse> {
+        let (revision, items, removed_work_item_ids) = match self
+            .load_scoped_turn_work_projection(workspace_id, thread_id, turn_id)
+            .await?
+        {
+            TurnWorkProjectionRead::Present(projection) => {
+                let snapshot = self
+                    .load_consistent_turn_work_items_snapshot(projection, work_item_ids)
+                    .await?;
+                (
+                    turn_work_projection_revision(&snapshot.projection),
+                    snapshot.items,
+                    snapshot.removed_work_item_ids,
+                )
+            }
+            TurnWorkProjectionRead::DetachedAbsent { revision } => {
+                (revision, Vec::new(), work_item_ids)
+            }
+            TurnWorkProjectionRead::Absent => bail!("Turn Work projection was not found"),
+        };
+        Ok(TurnWorkItemsGetResponse {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            projection_version: SEMANTIC_TIMELINE_PROJECTION_VERSION,
+            source_high_watermark: revision.0,
+            projection_updated_at_unix_micros: revision.1,
+            items,
+            removed_work_item_ids,
+        })
     }
 
     async fn load_thread_timeline_rows(

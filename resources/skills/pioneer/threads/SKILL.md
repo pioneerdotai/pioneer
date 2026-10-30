@@ -20,6 +20,8 @@ Use Threads for conversation discovery, source reading, and permitted conversati
 
 Tasks and attached subagents have separate skills, `system:pioneer/tasks` and `system:pioneer/subagents`. Do not apply their wait, review, or accept protocol to a thread turn.
 
+Thread writes and launches are conversation actions, not an inter-agent communication channel. Do not use them for parent/child/sibling coordination, progress reports, questions, blockers, or task-result handoffs. Use the Tasks/Subagents result and review flow instead. Ordinary user-requested conversation actions remain available within their granted permissions.
+
 ## Tool Discovery And Authority
 
 A native agent opens hidden tools by requesting the domain, not individual names:
