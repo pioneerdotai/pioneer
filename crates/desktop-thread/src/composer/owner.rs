@@ -2491,6 +2491,46 @@ mod tests {
         }
 
         #[gpui_kit::test]
+        fn preparing_send_publication_preserves_marked_text_and_caret(cx: &mut TestAppContext) {
+            let mut fixture = Fixture::new(cx);
+            fixture.type_text("captured ");
+            fixture.synchronize();
+            fixture.cx.update(|window, cx| {
+                fixture.input.update(cx, |state, cx| {
+                    state.replace_and_mark_text_in_range(None, "input", Some(5..5), window, cx);
+                });
+            });
+            let (notifications, _observer) = fixture.observe_composer();
+            let draft = fixture.client.composer_snapshot("a").unwrap();
+            fixture
+                .client
+                .composer_intent(ComposerIntent::BeginOperation {
+                    thread_id: "a".into(),
+                    draft_id: draft.draft_id(),
+                    operation: ComposerOperationKind::Send,
+                });
+            fixture.synchronize();
+            assert!(notifications.get() > 0);
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(
+                    view.composer_input
+                        .as_ref()
+                        .unwrap()
+                        .preparing_send()
+                        .unwrap()
+                        .text(),
+                    "captured "
+                );
+            });
+            fixture.assert_editor("captured input", 14);
+            fixture.cx.update(|window, cx| {
+                fixture.input.update(cx, |state, cx| {
+                    assert!(state.marked_text_range(window, cx).is_some());
+                });
+            });
+        }
+
+        #[gpui_kit::test]
         fn unrelated_session_update_preserves_local_typing(cx: &mut TestAppContext) {
             let mut fixture = Fixture::new(cx);
             publish_connection(&fixture.client, GatewayConnectionState::Reconnecting);

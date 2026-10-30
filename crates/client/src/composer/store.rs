@@ -108,6 +108,7 @@ impl ComposerOperationPublication {
 }
 
 fn cancel_operation(input: &mut ComposerPublication) {
+    input.preparing_send = None;
     let Some(operation) = input
         .operation
         .as_mut()
@@ -156,12 +157,40 @@ pub enum ComposerOperationCompletion {
     Failed {
         message: String,
     },
+    // Boundary errors may arrive after admission; only the owner can decide
+    // whether the captured Send is still unadmitted.
+    SendAdmissionFailed {
+        message: String,
+    },
     Cancelled,
+}
+
+/// Captured local Send payload, visible until the prepared optimistic commit.
+/// This is Composer feedback, not a server turn or uploaded-artifact receipt.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ComposerPreparingSend {
+    identity: ComposerOperationIdentity,
+    text: String,
+    attachments: Vec<super::attachments::ComposerAttachment>,
+}
+
+impl ComposerPreparingSend {
+    pub fn identity(&self) -> &ComposerOperationIdentity {
+        &self.identity
+    }
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    pub fn attachments(&self) -> &[super::attachments::ComposerAttachment] {
+        &self.attachments
+    }
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ComposerPublication {
+    preparing_send: Option<ComposerPreparingSend>,
     pub(super) voice_readiness: Option<super::voice_readiness::ComposerVoiceReadinessPublication>,
     selected_provider_ready: bool,
     permission_options: Vec<super::permissions::ComposerPermissionModeOption>,
@@ -180,6 +209,32 @@ pub struct ComposerPublication {
 }
 
 impl ComposerPublication {
+    pub fn preparing_send(&self) -> Option<&ComposerPreparingSend> {
+        self.preparing_send.as_ref()
+    }
+
+    fn refresh_preparing_send(&mut self) {
+        self.preparing_send = self.operation.as_ref().and_then(|operation| {
+            if operation.kind != ComposerOperationKind::Send
+                || operation.identity.draft_id != self.draft_id
+                || !matches!(
+                    operation.status,
+                    ComposerOperationStatus::Pending
+                        | ComposerOperationStatus::Preparing
+                        | ComposerOperationStatus::Uploading
+                        | ComposerOperationStatus::Prepared
+                )
+            {
+                return None;
+            }
+            let plan = operation.plan.as_ref()?;
+            Some(ComposerPreparingSend {
+                identity: operation.identity.clone(),
+                text: plan.draft.text.clone(),
+                attachments: plan.draft.domain.attachments.clone(),
+            })
+        });
+    }
     pub fn voice_readiness(
         &self,
     ) -> Option<&super::voice_readiness::ComposerVoiceReadinessPublication> {
@@ -756,17 +811,12 @@ impl ClientCore {
             .revision
             .checked_add(1)
             .expect("composer revision exhausted");
-        // Draft cancellation and optimistic thread commit share this mutation boundary.
-        let patch = self.commit_prepared_thread_turn(
-            &identity.thread_id,
-            workspace_id,
-            next.draft.domain.selected_mode,
-            &reduction.thread_snapshot_update,
-            reduction.local_turn_start_requested_event.clone(),
-            reduction.composer_execution_mode,
-        );
+        let mode = next.draft.domain.selected_mode;
+        // Retire preparing feedback before any optimistic timeline publication can be
+        // observed. The existing owner lock still binds cancellation to the commit.
         let revision = next.revision;
         next.refresh_runtime_readiness();
+        next.refresh_preparing_send();
         let next = Arc::new(next);
         store
             .drafts
@@ -784,6 +834,15 @@ impl ClientCore {
             ),
             next,
             vec![],
+        );
+        // Draft cancellation and optimistic thread commit share this mutation boundary.
+        let patch = self.commit_prepared_thread_turn(
+            &identity.thread_id,
+            workspace_id,
+            mode,
+            &reduction.thread_snapshot_update,
+            reduction.local_turn_start_requested_event.clone(),
+            reduction.composer_execution_mode,
         );
         Some(patch)
     }
@@ -806,6 +865,7 @@ impl ClientCore {
             next.reconciliation = None;
             next.execution_capabilities_removed = false;
             next.operation = None;
+            next.preparing_send = None;
             next.message_edit = None;
             next.model_display = None;
             next.runtime_selection = None;
@@ -1227,6 +1287,7 @@ impl ClientCore {
                     defaults
                 };
                 let next = ComposerPublication {
+                    preparing_send: None,
                     thread_id: thread_id.clone(),
                     draft_id: store.identity(),
                     revision,
@@ -1557,6 +1618,14 @@ impl ClientCore {
                         else {
                             return self.transition(&authority, vec![], vec![]);
                         };
+                        if matches!(
+                            &completion,
+                            ComposerOperationCompletion::SendAdmissionFailed { .. }
+                        ) && (operation.kind != ComposerOperationKind::Send
+                            || operation.status != ComposerOperationStatus::Pending)
+                        {
+                            return self.transition(&authority, vec![], vec![]);
+                        }
                         let plan = operation
                             .plan
                             .as_ref()
@@ -1683,7 +1752,8 @@ impl ClientCore {
                                 next.voice_readiness = None;
                                 ComposerOperationStatus::Completed
                             }
-                            ComposerOperationCompletion::Failed { message } => {
+                            ComposerOperationCompletion::Failed { message }
+                            | ComposerOperationCompletion::SendAdmissionFailed { message } => {
                                 pioneer_observability::turn_startup::finish(
                                     &identity.startup_observation_key(),
                                     pioneer_observability::turn_startup::Outcome::Failed,
@@ -1800,6 +1870,7 @@ impl ClientCore {
             }
         };
         next.refresh_runtime_readiness();
+        next.refresh_preparing_send();
         let next = Arc::new(next);
         store.drafts.insert(thread_id.clone(), next.clone());
         let revision = next.revision;
@@ -1881,6 +1952,260 @@ mod tests {
             upload_state: super::super::attachments::ComposerAttachmentUploadState::Local,
         }
     }
+    #[test]
+    fn boundary_failure_retires_only_the_exact_unadmitted_send() {
+        for phase in [
+            "pending",
+            "preparing",
+            "uploading",
+            "prepared",
+            "edit",
+            "replacement",
+            "clear",
+            "revoke",
+            "shutdown",
+            "voice",
+            "picker",
+        ] {
+            let core = ClientCore::new();
+            let input = open(&core, "a");
+            edit(&core, &input, "captured payload");
+            let kind = match phase {
+                "voice" => ComposerOperationKind::Voice,
+                "picker" => ComposerOperationKind::PickFiles,
+                _ => ComposerOperationKind::Send,
+            };
+            let plan = begin(&core, &input, kind);
+            match phase {
+                "preparing" | "uploading" | "prepared" => {
+                    // This is the production submit admission boundary, before
+                    // session/runtime/upload work can begin.
+                    assert_eq!(
+                        core.composer_intent(ComposerIntent::PrepareOperation {
+                            identity: plan.identity.clone(),
+                        })
+                        .outcome(),
+                        ClientTransitionOutcome::Changed
+                    );
+                    if phase != "preparing" {
+                        assert_eq!(
+                            core.composer_intent(ComposerIntent::UploadOperation {
+                                identity: plan.identity.clone(),
+                            })
+                            .outcome(),
+                            ClientTransitionOutcome::Changed
+                        );
+                    }
+                    if phase == "prepared" {
+                        assert_eq!(
+                            complete(
+                                &core,
+                                &plan,
+                                ComposerOperationCompletion::Uploaded { artifacts: vec![] }
+                            ),
+                            ClientTransitionOutcome::Changed
+                        );
+                    }
+                }
+                "edit" | "replacement" => {
+                    edit(&core, &input, "new draft payload");
+                    if phase == "replacement" {
+                        let current = core.composer_snapshot("a").unwrap();
+                        let replacement = begin(&core, &current, ComposerOperationKind::Send);
+                        assert_ne!(replacement.identity.generation, plan.identity.generation);
+                    }
+                }
+                "clear" => {
+                    core.composer_intent(ComposerIntent::Clear {
+                        thread_id: "a".into(),
+                        draft_id: input.draft_id(),
+                    });
+                    let replacement = core.composer_snapshot("a").unwrap();
+                    assert_ne!(replacement.draft_id(), input.draft_id());
+                    edit(&core, &replacement, "new draft identity payload");
+                }
+                "revoke" => {
+                    core.forget_revoked_composer("a");
+                }
+                "shutdown" => {
+                    core.shutdown();
+                }
+                _ => {}
+            }
+            let before = core.composer_snapshot("a");
+            let admitted_phase = match phase {
+                "preparing" => Some(ComposerOperationStatus::Preparing),
+                "uploading" => Some(ComposerOperationStatus::Uploading),
+                "prepared" => Some(ComposerOperationStatus::Prepared),
+                _ => None,
+            };
+            if let Some(expected) = admitted_phase {
+                assert_eq!(
+                    before.as_ref().unwrap().operation().unwrap().status,
+                    expected
+                );
+            }
+            // Exercise the serialized boundary completion, with no JS phase receipt.
+            let failure: ComposerOperationCompletion = serde_json::from_value(serde_json::json!({
+                "kind": "send_admission_failed", "message": "boundary failed"
+            }))
+            .unwrap();
+            let changed = core.complete_composer_operation(plan.identity.clone(), failure.clone());
+            let after = core.composer_snapshot("a");
+            assert_eq!(changed, phase == "pending", "{phase}");
+            if phase == "pending" {
+                let failed = after.unwrap();
+                assert_eq!(failed.draft().text, "captured payload");
+                assert!(failed.preparing_send().is_none());
+                assert!(failed.operation().unwrap().plan.is_none());
+                assert_eq!(
+                    failed.operation().unwrap().status,
+                    ComposerOperationStatus::Failed {
+                        message: "boundary failed".into()
+                    }
+                );
+                let retry = begin(&core, &failed, ComposerOperationKind::Send);
+                assert_ne!(retry.identity.generation, plan.identity.generation);
+                let retry_snapshot = core.composer_snapshot("a").unwrap();
+                assert!(!core.complete_composer_operation(plan.identity.clone(), failure));
+                assert!(Arc::ptr_eq(
+                    &retry_snapshot,
+                    &core.composer_snapshot("a").unwrap()
+                ));
+                assert_eq!(
+                    retry_snapshot.preparing_send().unwrap().identity(),
+                    &retry.identity
+                );
+            } else {
+                assert_eq!(after, before, "cleanup mutated {phase}");
+                if let (Some(before), Some(after)) = (before, after) {
+                    assert!(
+                        Arc::ptr_eq(&before, &after),
+                        "cleanup published for {phase}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preparing_send_publishes_captured_local_payload_from_begin_until_retirement() {
+        for exit in ["edit", "failed", "cancel", "clear", "revoke", "shutdown"] {
+            let core = ClientCore::new();
+            let input = open(&core, "a");
+            edit(&core, &input, "  captured text  ");
+            core.composer_intent(ComposerIntent::Domain {
+                thread_id: "a".into(),
+                draft_id: input.draft_id(),
+                action: ComposerDomainAction::AddAttachment {
+                    attachment: attachment("local.txt"),
+                },
+            });
+            let plan = begin(&core, &input, ComposerOperationKind::Send);
+            let pending = core.composer_snapshot("a").unwrap();
+            let surface = pending.preparing_send().unwrap();
+            assert_eq!(surface.identity(), &plan.identity);
+            assert_eq!(surface.text(), "  captured text  ");
+            assert_eq!(surface.attachments(), &[attachment("local.txt")]);
+            assert_eq!(
+                pending.operation().unwrap().status,
+                ComposerOperationStatus::Pending
+            );
+            assert_eq!(
+                pending.domain().attachments[0].upload_state,
+                super::super::attachments::ComposerAttachmentUploadState::Uploading
+            );
+            // Same canonical publication crosses FFI, including Pending before submit.
+            let serialized = serde_json::to_value(pending.as_ref()).unwrap();
+            assert_eq!(serialized["preparing_send"]["text"], "  captured text  ");
+            assert_eq!(
+                serialized["preparing_send"]["attachments"][0]["upload_state"],
+                "Local"
+            );
+            assert_eq!(
+                core.composer_intent(ComposerIntent::BeginOperation {
+                    thread_id: "a".into(),
+                    draft_id: input.draft_id(),
+                    operation: ComposerOperationKind::Send,
+                })
+                .outcome(),
+                ClientTransitionOutcome::Noop
+            );
+            assert!(Arc::ptr_eq(&pending, &core.composer_snapshot("a").unwrap()));
+            core.composer_intent(ComposerIntent::PrepareOperation {
+                identity: plan.identity.clone(),
+            });
+            assert_eq!(
+                core.composer_snapshot("a").unwrap().preparing_send(),
+                Some(surface)
+            );
+            match exit {
+                "edit" => {
+                    edit(&core, &input, "new typing");
+                }
+                "failed" => {
+                    complete(
+                        &core,
+                        &plan,
+                        ComposerOperationCompletion::Failed {
+                            message: "validation failed".into(),
+                        },
+                    );
+                }
+                "cancel" => {
+                    complete(&core, &plan, ComposerOperationCompletion::Cancelled);
+                }
+                "clear" => {
+                    core.composer_intent(ComposerIntent::Clear {
+                        thread_id: "a".into(),
+                        draft_id: input.draft_id(),
+                    });
+                }
+                "revoke" => {
+                    core.forget_revoked_composer("a");
+                }
+                "shutdown" => {
+                    core.shutdown();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                core.composer_snapshot("a")
+                    .is_none_or(|p| p.preparing_send().is_none()),
+                "{exit}"
+            );
+            let before = core.composer_snapshot("a");
+            for completion in [
+                ComposerOperationCompletion::Sent,
+                ComposerOperationCompletion::Failed {
+                    message: "late failure".into(),
+                },
+            ] {
+                assert!(!core.complete_composer_operation(plan.identity.clone(), completion));
+                let after = core.composer_snapshot("a");
+                assert_eq!(before, after, "late completion after {exit}");
+            }
+            if exit == "edit" {
+                let current = core.composer_snapshot("a").unwrap();
+                assert_eq!(current.draft().text, "new typing");
+                let replacement = begin(&core, &current, ComposerOperationKind::Send);
+                assert_ne!(replacement.identity, plan.identity);
+                assert!(!core.complete_composer_operation(
+                    plan.identity.clone(),
+                    ComposerOperationCompletion::Sent
+                ));
+                assert_eq!(
+                    core.composer_snapshot("a")
+                        .unwrap()
+                        .preparing_send()
+                        .unwrap()
+                        .identity(),
+                    &replacement.identity
+                );
+            }
+        }
+    }
+
     #[test]
     fn activation_inherits_client_owned_selection_without_copying_another_draft_payload() {
         let core = ClientCore::new();
@@ -2124,6 +2449,12 @@ mod tests {
         });
         let input = core.composer_snapshot("a").unwrap();
         let plan = begin(&core, &input, ComposerOperationKind::Voice);
+        assert!(
+            core.composer_snapshot("a")
+                .unwrap()
+                .preparing_send()
+                .is_none()
+        );
         assert_eq!(
             core.composer_snapshot("a").unwrap().domain().attachments[0].upload_state,
             super::super::attachments::ComposerAttachmentUploadState::Local

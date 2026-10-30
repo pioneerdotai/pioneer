@@ -3,7 +3,11 @@ use crate::{
     avatar::DesktopMemberAvatarState, binding::ThreadBindings, ports::*,
     timeline::TimelineAvatarActivities,
 };
-use gpui_kit::{prelude::*, *};
+use gpui_kit::{
+    component::{Sizable, h_flex, spinner::Spinner, theme::ActiveTheme, v_flex},
+    prelude::*,
+    *,
+};
 pub(crate) use pioneer_client::state::client_state::GatewayConnectionState;
 use pioneer_client::{
     artifacts::store::ArtifactPublication,
@@ -86,10 +90,55 @@ pub(crate) struct TimelineView {
 impl EventEmitter<ThreadScreenEvent> for TimelineView {}
 impl Render for TimelineView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.render_timeline(window, cx)
+        let timeline = self.render_timeline(window, cx).into_any_element();
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .child(div().flex_1().min_h_0().child(timeline))
+            .children(self.render_preparing_send(cx))
     }
 }
 impl TimelineView {
+    fn render_preparing_send(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let input = self.composer_input.as_ref()?;
+        let preparing = input.preparing_send()?;
+        Some(
+            v_flex()
+                .id(("composer-preparing-send", preparing.identity().generation))
+                .min_w_0()
+                .gap_1()
+                .mx_6()
+                .mb_2()
+                .px_3()
+                .py_2()
+                .rounded(cx.theme().radius)
+                .bg(cx.theme().muted)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(Spinner::new().small())
+                        .child(t!("chat.composer.preparing_send").to_string()),
+                )
+                .when(!preparing.text().is_empty(), |surface| {
+                    surface.child(div().text_sm().line_clamp(3).child(preparing.text().to_owned()))
+                })
+                .when(!preparing.attachments().is_empty(), |surface| {
+                    surface.child(
+                        div()
+                            .text_sm()
+                            .line_clamp(2)
+                            .text_color(cx.theme().muted_foreground)
+                            .child(preparing.attachments().iter().map(
+                                pioneer_client::composer::attachments::composer_attachment_display_name,
+                            ).collect::<Vec<_>>().join(", ")),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     pub(crate) fn retire_timeline_rows(&mut self, cx: &mut Context<Self>) {
         self.set_row_activities_visible(&std::collections::HashSet::new(), cx);
         self.set_row_terminals_visible(&std::collections::HashSet::new(), cx);
@@ -457,7 +506,15 @@ impl TimelineView {
                     if view
                         .update_in(cx, |view, window, cx| {
                             if changes.iter().all(|publication| matches!(publication.scope(), pioneer_client::core::ClientScope::Timeline { .. })) {
-                                if crate::timeline::controller::DesktopTimelineController::reconcile_publication(view, window, cx) { cx.notify(); }
+                                // The timeline can advance before the editor binding.
+                                // Capture its current Composer input before notifying;
+                                // render only consumes the retained presentation.
+                                let next = view.client.composer_snapshot(&view.thread_id);
+                                let preparing_changed = view.composer_input.as_ref()
+                                    .and_then(|input| input.preparing_send())
+                                    != next.as_ref().and_then(|input| input.preparing_send());
+                                view.composer_input = next;
+                                if crate::timeline::controller::DesktopTimelineController::reconcile_publication(view, window, cx) || preparing_changed { cx.notify(); }
                                 return;
                             }
                             let only_composer_text = changes.iter().all(|publication| {
@@ -471,8 +528,14 @@ impl TimelineView {
                                 )
                             });
                             if only_composer_text {
-                                view.composer_input =
-                                    view.client.composer_snapshot(&view.thread_id);
+                                let next = view.client.composer_snapshot(&view.thread_id);
+                                let preparing_changed = view.composer_input.as_ref()
+                                    .and_then(|input| input.preparing_send())
+                                    != next.as_ref().and_then(|input| input.preparing_send());
+                                view.composer_input = next;
+                                if preparing_changed {
+                                    cx.notify();
+                                }
                                 return;
                             }
                             view.synchronize_inputs(window, cx);
@@ -553,11 +616,9 @@ impl TimelineView {
         use pioneer_client::core::ClientScope;
         let bindings = self.thread_bindings.clone();
         let payload = |scope: ClientScope| bindings.publication(&scope);
-        self.composer_input = payload(ClientScope::Composer {
-            thread_id: self.thread_id.clone(),
-        })
-        .and_then(|p| p.typed::<ComposerPublication>())
-        .map(|p| p.payload());
+        // Mixed batches can also carry a timeline newer than the retained
+        // Composer binding. Capture the current owner during synchronization.
+        self.composer_input = self.client.composer_snapshot(&self.thread_id);
         self.catalog_input = payload(ClientScope::ComposerCatalog {
             thread_id: self.thread_id.clone(),
         })
@@ -791,6 +852,100 @@ mod tests {
             assert_eq!(
                 view.thread_workspace_id("child").as_deref(),
                 Some("workspace")
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn delayed_composer_binding_cannot_duplicate_retired_feedback_beside_the_timeline(
+        cx: &mut TestAppContext,
+    ) {
+        use pioneer_client::composer::{state_machine::ComposerDomainState, store::*};
+        use pioneer_desktop_foundation::ClientPublicationSink;
+        cx.update(gpui_kit::init);
+        let client = Arc::new(ClientCore::new());
+        crate::test_support::install_thread_timeline(&client, "a", "Earlier message");
+        client.composer_intent(ComposerIntent::Open {
+            thread_id: "a".into(),
+            defaults: ComposerDomainState::default(),
+        });
+        let draft_id = client.composer_snapshot("a").unwrap().draft_id();
+        client.composer_intent(ComposerIntent::EditText {
+            thread_id: "a".into(),
+            draft_id,
+            text: "Captured message".into(),
+        });
+        client.composer_intent(ComposerIntent::BeginOperation {
+            thread_id: "a".into(),
+            draft_id,
+            operation: ComposerOperationKind::Send,
+        });
+        let pending = client.composer_snapshot("a").unwrap();
+        let identity = pending.preparing_send().unwrap().identity().clone();
+        let (registrar, deliver) = crate::test_support::binding_router(client.clone());
+        let binding = ThreadBindings::new(registrar, "a", vec![]);
+        deliver();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let screen = TimelineView::new(
+                client.clone(),
+                "a".into(),
+                binding.clone(),
+                Arc::new(crate::test_support::ThreadPorts),
+                Arc::new(crate::test_support::ThreadPorts),
+                1,
+                window,
+                cx,
+            );
+            Root::new(screen, window, cx)
+        });
+        let screen = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<TimelineView>().unwrap()
+        });
+        screen.update(cx, |view, cx| {
+            assert!(view.render_preparing_send(cx).is_some())
+        });
+        client.complete_composer_operation(identity, ComposerOperationCompletion::Sent);
+        crate::test_support::install_thread_timeline_at_revision(
+            &client,
+            "a",
+            "Captured message",
+            2,
+        );
+        // Deliver only the new timeline. The Composer binding deliberately retains
+        // the old captured operation, as independently scheduled views may do.
+        binding.publish(
+            client
+                .snapshot(&ClientScope::Timeline {
+                    thread_id: "a".into(),
+                })
+                .unwrap(),
+        );
+        cx.run_until_parked();
+        screen.update(cx, |view, cx| {
+            assert!(
+                binding
+                    .publication(&ClientScope::Composer {
+                        thread_id: "a".into()
+                    })
+                    .unwrap()
+                    .typed::<ComposerPublication>()
+                    .unwrap()
+                    .payload()
+                    .preparing_send()
+                    .is_some()
+            );
+            assert!(view.render_preparing_send(cx).is_none());
+            assert_eq!(
+                view.thread_timeline_view_state
+                    .model
+                    .item_presentations
+                    .values()
+                    .next()
+                    .unwrap()
+                    .content()
+                    .unwrap()
+                    .text,
+                "Captured message"
             );
         });
     }
