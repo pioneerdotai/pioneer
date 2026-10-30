@@ -3385,52 +3385,71 @@ impl TaskAgentExecutor {
                     ),
                 )
                 .await;
-            let prepared = processor
-                .prepare_task_cli_runtime_turn(
-                    TurnStartParams {
-                        agent_delegation_routes: Vec::new(),
-                        thread_id: child_thread_id.clone(),
-                        turn_id: child_turn_id.clone(),
-                        input,
-                        capabilities: turn_settings.capabilities.clone(),
-                        model: Some(effective_model.model.clone()),
-                        model_provider: Some(effective_model.model_provider.clone()),
-                        sandbox_policy: None,
-                        mode: Some(ThreadMode::Agent),
-                        agent_launch: None,
-                        reply_to_turn_id: None,
-                        mentioned_principal_ids: Vec::new(),
-                        execution_backend: Some(turn_settings.execution_backend.clone()),
-                        reasoning: turn_settings.reasoning.clone(),
-                        permission_profile: turn_settings.permission_selection.clone(),
-                        cli_runtime_options: None,
-                    },
-                    runtime_id,
-                    runtime_kind,
-                    child_permission_profile,
-                    child_security_snapshot,
-                    child_authorization_context,
-                    child_authorization_revalidation,
-                    child_thread_id.clone(),
-                    parent.parent_thread_id.clone(),
-                    run.id.clone(),
-                    execution.id.clone(),
-                    action_author,
-                    turn_response.clone(),
-                    None,
-                )
-                .await
-                .map_err(|error| {
-                    pioneer_tasks::TaskStartFailure::from_error(
-                        pioneer_tasks::TaskStartStage::CliPreparation,
-                        error,
+            let prepare_processor = Arc::clone(processor);
+            let continuation_thread_id = child_thread_id.clone();
+            let context_thread_id = parent.parent_thread_id.clone();
+            let task_run_id = run.id.clone();
+            let execution_id = execution.id.clone();
+            let prepare_params = TurnStartParams {
+                agent_delegation_routes: Vec::new(),
+                thread_id: child_thread_id.clone(),
+                turn_id: child_turn_id.clone(),
+                input,
+                capabilities: turn_settings.capabilities.clone(),
+                model: Some(effective_model.model.clone()),
+                model_provider: Some(effective_model.model_provider.clone()),
+                sandbox_policy: None,
+                mode: Some(ThreadMode::Agent),
+                agent_launch: None,
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
+                execution_backend: Some(turn_settings.execution_backend.clone()),
+                reasoning: turn_settings.reasoning.clone(),
+                permission_profile: turn_settings.permission_selection.clone(),
+                cli_runtime_options: None,
+            };
+            // As with initial Task startup, CLI preparation and activation need
+            // fresh poll stacks below revision dispatch. The existing task
+            // boundary aborts the owned work if this dispatch is cancelled.
+            let prepared = message_fresh_task(async move {
+                prepare_processor
+                    .prepare_task_cli_runtime_turn(
+                        prepare_params,
+                        runtime_id,
+                        runtime_kind,
+                        child_permission_profile,
+                        child_security_snapshot,
+                        child_authorization_context,
+                        child_authorization_revalidation,
+                        continuation_thread_id,
+                        context_thread_id,
+                        task_run_id,
+                        execution_id,
+                        action_author,
+                        turn_response,
+                        None,
                     )
-                })
-                .context("failed to prepare revision CLI runtime turn")?;
-            processor
-                .activate_prepared_task_cli_runtime_turn(prepared)
-                .await
-                .context("failed to activate revision CLI runtime turn")?;
+                    .await
+            })
+            .await
+            .context("revision CLI preparation task did not finish")
+            .and_then(|result| result)
+            .map_err(|error| {
+                pioneer_tasks::TaskStartFailure::from_error(
+                    pioneer_tasks::TaskStartStage::CliPreparation,
+                    error,
+                )
+            })
+            .context("failed to prepare revision CLI runtime turn")?;
+            let activation_processor = Arc::clone(processor);
+            message_fresh_task(async move {
+                activation_processor
+                    .activate_prepared_task_cli_runtime_turn(prepared)
+                    .await
+            })
+            .await
+            .context("revision CLI activation task did not finish")?
+            .context("failed to activate revision CLI runtime turn")?;
             let started_at = now_timestamp_secs();
             processor
                 .crud_store
