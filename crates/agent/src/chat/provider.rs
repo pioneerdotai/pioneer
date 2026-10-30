@@ -2344,6 +2344,7 @@ mod tests {
         let native = r#"{ "type":"error", "message":"unknown private_payload", "extra":42 }"#;
         let failed = r#"{ "status":"failed", "error":{"message":"private_payload"} }"#;
         let failed_event = format!(r#"{{ "type":"response.failed", "response":{failed} }}"#);
+        let long_response = format!("{} retained_tail", "private_payload ".repeat(2048));
         let oversized = "x".repeat(pioneer_protocol::ProviderErrorResponse::MAX_BYTES + 1);
         for (status, stream, body, expected, truncated, interrupted) in [
             (
@@ -2351,6 +2352,14 @@ mod tests {
                 false,
                 "upstream private_payload".to_owned(),
                 "upstream private_payload".to_owned(),
+                false,
+                false,
+            ),
+            (
+                400,
+                false,
+                long_response.clone(),
+                long_response,
                 false,
                 false,
             ),
@@ -2395,6 +2404,7 @@ mod tests {
                 false,
             ),
         ] {
+            let wire_body = body.clone();
             let failure = failure_from_local_endpoint(
                 "openai",
                 status,
@@ -2416,6 +2426,11 @@ mod tests {
                 .unwrap();
             assert_eq!(raw.body, expected);
             assert_eq!(raw.truncated, truncated);
+            assert!(raw.processing_error.is_none());
+            assert_eq!(
+                raw.stream_context.as_deref(),
+                (status == 200 && stream).then_some(wire_body.as_str())
+            );
             assert!(!diagnostic.public_message().contains("private_payload"));
         }
     }

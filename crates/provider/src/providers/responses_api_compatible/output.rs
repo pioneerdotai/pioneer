@@ -296,14 +296,16 @@ impl Reducer {
                         .is_none_or(|v| v.len() == item.reasoning.len()),
                     "Responses completed reasoning part conflict"
                 );
-                if let (Some(completed), Some(snapshot)) = (
-                    item.raw.get("encrypted_content"),
-                    value.get("encrypted_content"),
-                ) {
-                    ensure!(
-                        completed == snapshot,
-                        "Responses completed reasoning state conflict"
-                    );
+                if !terminal {
+                    if let (Some(completed), Some(snapshot)) = (
+                        item.raw.get("encrypted_content"),
+                        value.get("encrypted_content"),
+                    ) {
+                        ensure!(
+                            completed == snapshot,
+                            "Responses completed reasoning state conflict"
+                        );
+                    }
                 }
             }
         }
@@ -323,6 +325,18 @@ impl Reducer {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("invalid Responses item snapshot"))?
         {
+            // Streaming replay uses the completed reasoning item from
+            // response.output_item.done. A terminal response can carry a
+            // different ciphertext for the same item; keep the completed one.
+            // https://developers.openai.com/api/reference/resources/responses/streaming-events#response.output_item.added
+            if key == "encrypted_content"
+                && kind == "reasoning"
+                && terminal
+                && item.done
+                && merged.get(key).is_some()
+            {
+                continue;
+            }
             merged[key] = value.clone();
         }
         if merged.get("phase").is_none() {

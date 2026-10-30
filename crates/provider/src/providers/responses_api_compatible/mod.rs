@@ -144,25 +144,60 @@ impl SafeError {
         }
     }
     fn protocol(error: anyhow::Error) -> anyhow::Error {
-        if error.downcast_ref::<SafeError>().is_some()
-            || error
-                .downcast_ref::<crate::ProviderResponseTooLarge>()
-                .is_some()
-            || crate::failure::provider_stream_incomplete(&error).is_some()
-        {
+        if error.downcast_ref::<SafeError>().is_some() {
             return error;
         }
-        let mut facts = ProviderFailureClassification::new(
-            pioneer_protocol::ProviderFailureClass::MalformedProviderRequest,
-        );
-        facts.provider_code = Some("responses_protocol_error".into());
-        SafeError(facts).into()
+        use pioneer_protocol::ProviderFailureClass as Class;
+        let preserve_source = error.is::<crate::ProviderResponseTooLarge>()
+            || crate::failure::provider_stream_incomplete(&error).is_some();
+        let class = if error.is::<crate::ProviderResponseTooLarge>() {
+            Class::ProviderRejected
+        } else if crate::failure::provider_stream_incomplete(&error).is_some() {
+            Class::StreamTruncated
+        } else {
+            Class::MalformedProviderRequest
+        };
+        let mut facts = ProviderFailureClassification::new(class);
+        if !preserve_source {
+            facts.provider_code = Some("responses_protocol_error".into());
+        }
+        let mut response = pioneer_protocol::ProviderErrorResponse::from_bytes(&[], false);
+        response.processing_error = Some(format!("{error:#}"));
+        facts.raw_response = Some(response);
+        if preserve_source {
+            // Preserve typed bounds/completion causes and their existing retry
+            // classification while attaching the same local diagnostic fields.
+            error.context(SafeError(facts))
+        } else {
+            SafeError(facts).into()
+        }
     }
     fn with_response(mut error: anyhow::Error, body: &[u8]) -> anyhow::Error {
         if let Some(failure) = error.downcast_mut::<Self>() {
-            failure.0.raw_response = Some(pioneer_protocol::ProviderErrorResponse::from_bytes(
-                body, false,
-            ));
+            let captured = pioneer_protocol::ProviderErrorResponse::from_bytes(body, false);
+            let response = failure.0.raw_response.get_or_insert_with(|| {
+                pioneer_protocol::ProviderErrorResponse::from_bytes(&[], false)
+            });
+            response.body = captured.body;
+            response.truncated |= captured.truncated;
+        }
+        error
+    }
+    fn with_stream_context(
+        mut error: anyhow::Error,
+        bytes: &[u8],
+        truncated: bool,
+    ) -> anyhow::Error {
+        let incomplete = crate::failure::provider_stream_incomplete(&error).is_some()
+            || error
+                .downcast_ref::<Self>()
+                .is_some_and(|failure| failure.0.is_network_error);
+        if let Some(failure) = error.downcast_mut::<Self>() {
+            let response = failure.0.raw_response.get_or_insert_with(|| {
+                pioneer_protocol::ProviderErrorResponse::from_bytes(&[], false)
+            });
+            response.stream_context = Some(String::from_utf8_lossy(bytes).into_owned());
+            response.truncated |= truncated || incomplete;
         }
         error
     }
@@ -335,7 +370,11 @@ impl ResponsesApiCompatibleProvider {
             .flatten()
             .and_then(crate::failure::extract_retry_after_ms);
         let value = (!incomplete)
-            .then(|| serde_json::from_slice::<Value>(&bytes).ok())
+            .then(|| {
+                wire::parse(&bytes, ProviderResponseLimits::default().max_retained_bytes)
+                    .ok()
+                    .map(|(value, _)| value)
+            })
             .flatten()
             .unwrap_or(Value::Null);
         let mut failure = SafeError::native(value.get("error").unwrap_or(&value), Some(status));
@@ -377,28 +416,31 @@ impl ResponsesApiCompatibleProvider {
         )
         .await
         .map_err(|e| crate::usage::with_error_usage(SafeError::transport(e), &reducer.usage))?;
-        let budget = reducer
-            .parse_budget(bytes.len())
-            .map_err(|error| crate::usage::with_error_usage(error, &reducer.usage))?;
+        let budget = reducer.parse_budget(bytes.len()).map_err(|error| {
+            crate::usage::with_error_usage(
+                SafeError::with_response(SafeError::protocol(error), &bytes),
+                &reducer.usage,
+            )
+        })?;
         let (value, retained) = wire::parse(&bytes, budget).map_err(|error| {
             crate::usage::with_error_usage(
                 SafeError::with_response(SafeError::protocol(error), &bytes),
                 &reducer.usage,
             )
         })?;
-        let raw_response = (value["status"] == "failed")
-            .then(|| pioneer_protocol::ProviderErrorResponse::from_bytes(&bytes, false));
-        drop(bytes);
-        reducer
-            .stage(retained)
-            .map_err(|error| crate::usage::with_error_usage(error, &reducer.usage))?;
-        reducer.snapshot(&value).map_err(|e| {
-            let mut error = SafeError::protocol(e);
-            if let Some(failure) = error.downcast_mut::<SafeError>() {
-                failure.0.raw_response = raw_response;
-            }
-            crate::usage::with_error_usage(error, &reducer.usage)
+        reducer.stage(retained).map_err(|error| {
+            crate::usage::with_error_usage(
+                SafeError::with_response(SafeError::protocol(error), &bytes),
+                &reducer.usage,
+            )
         })?;
+        reducer.snapshot(&value).map_err(|e| {
+            crate::usage::with_error_usage(
+                SafeError::with_response(SafeError::protocol(e), &bytes),
+                &reducer.usage,
+            )
+        })?;
+        drop(bytes);
         drop(value);
         reducer
             .stage(0)
@@ -460,6 +502,13 @@ impl ResponsesApiCompatibleProvider {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let task = tokio::spawn(async move {
             let mut decoder = crate::tools::stream::IncrementalSseDecoder::default();
+            // A request-owned copy of received wire bytes is discarded on
+            // success/cancellation. Persist it only on failure, so a comparison
+            // error retains both the previous item.done and terminal snapshot.
+            // This separate diagnostic buffer shares the transport byte ceiling;
+            // it does not change the reducer's existing admission decisions.
+            let mut stream_context = Vec::new();
+            let mut context_truncated = false;
             loop {
                 let next =
                     tokio::select! { biased; _=tx.closed()=>return, next=bytes.next()=>next };
@@ -472,6 +521,10 @@ impl ResponsesApiCompatibleProvider {
                         );
                     };
                     let next = next.map_err(|e| SafeError::transport(e))?;
+                    let remaining = pioneer_protocol::ProviderErrorResponse::MAX_BYTES
+                        .saturating_sub(stream_context.len());
+                    stream_context.extend_from_slice(&next[..next.len().min(remaining)]);
+                    context_truncated |= next.len() > remaining;
                     // Framing can copy the incoming bytes and the pending frame.
                     // Admit that peak before asking the shared decoder to allocate.
                     reducer.stage(
@@ -497,7 +550,13 @@ impl ResponsesApiCompatibleProvider {
                             );
                         }
                         let (value, retained) =
-                            wire::parse(event.data.as_bytes(), reducer.parse_budget(buffers)?)?;
+                            wire::parse(event.data.as_bytes(), reducer.parse_budget(buffers)?)
+                                .map_err(|error| {
+                                    SafeError::with_response(
+                                        SafeError::protocol(error),
+                                        event.data.as_bytes(),
+                                    )
+                                })?;
                         reducer.stage(buffers.saturating_add(retained))?;
                         let chunks =
                             reducer
@@ -526,7 +585,11 @@ impl ResponsesApiCompatibleProvider {
                     Err(error) => {
                         let _ = tx
                             .send(Err(crate::usage::with_error_usage(
-                                SafeError::protocol(error),
+                                SafeError::with_stream_context(
+                                    SafeError::protocol(error),
+                                    &stream_context,
+                                    context_truncated,
+                                ),
                                 &reducer.usage,
                             )))
                             .await;

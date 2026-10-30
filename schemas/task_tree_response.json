@@ -470,11 +470,23 @@
       ]
     },
     "ProviderErrorResponse": {
-      "description": "Original provider error response, bounded for local diagnostic storage.\nDebug output deliberately omits the body; public prose never uses it.",
+      "description": "Original provider error response, bounded by the transport limit for local storage.\nDebug output deliberately omits all payloads; public prose never uses them.",
       "type": "object",
       "properties": {
         "body": {
           "type": "string"
+        },
+        "processingError": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "streamContext": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "truncated": {
           "type": "boolean"

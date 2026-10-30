@@ -40620,12 +40620,19 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut response = pioneer_protocol::ProviderErrorResponse::from_bytes(
+            format!(
+                "{} original provider diagnostic body",
+                "x".repeat(20 * 1024)
+            )
+            .as_bytes(),
+            false,
+        );
+        response.processing_error = Some("Responses completed reasoning state conflict".into());
+        response.stream_context = Some("data: original completed reasoning event\n\n".into());
         let final_diagnostic = RecoveryDiagnostic {
             last_failure: Some(RecoveryProviderFailure {
-                raw_response: Some(pioneer_protocol::ProviderErrorResponse::from_bytes(
-                    b"{\"error\":\"original provider diagnostic body\"}",
-                    false,
-                )),
+                raw_response: Some(response),
                 error_reason: Some(pioneer_protocol::ProviderErrorReason::PermissionDenied),
                 request_id: Some(
                     pioneer_protocol::ProviderRequestId::try_from("gen-atomic_fixture".to_owned())

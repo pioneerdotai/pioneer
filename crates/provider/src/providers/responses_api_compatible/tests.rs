@@ -407,6 +407,17 @@ async fn truncated_streams_and_every_byte_split_use_existing_sse_framing() {
             .collect::<Vec<_>>()
             .await;
         assert!(chunks.last().unwrap().is_err());
+        let error = chunks.last().unwrap().as_ref().unwrap_err();
+        assert!(crate::failure::provider_stream_incomplete(error).is_some());
+        let facts = super::classify_failure(error).unwrap();
+        assert_eq!(
+            facts.class,
+            pioneer_protocol::ProviderFailureClass::StreamTruncated
+        );
+        let raw = facts.raw_response.unwrap();
+        assert_eq!(raw.stream_context.as_deref(), Some(wire));
+        assert!(raw.truncated);
+        assert!(raw.processing_error.is_some());
         assert!(!chunks.iter().any(|c| c.as_ref().is_ok_and(|c| c.is_final)));
     }
     let value = json!({"type":"response.completed","response":snapshot(vec![message("m",json!("final_answer"),"Привет")])});
@@ -1990,8 +2001,13 @@ fn completed_ciphertext_events() -> Vec<Value> {
 }
 
 #[test]
-fn completed_reasoning_ciphertext_allows_partial_completion_and_equal_or_omitted_terminal() {
-    for omit in [false, true] {
+fn completed_reasoning_ciphertext_is_authoritative_across_terminal_snapshots() {
+    for ciphertext in [
+        Some(json!("SYNTHETIC_COMPLETE_A")),
+        Some(json!("SYNTHETIC_COMPLETE_B")),
+        Some(Value::Null),
+        None,
+    ] {
         let mut r = reducer();
         let mut chunks = Vec::new();
         for e in completed_ciphertext_events() {
@@ -2004,11 +2020,14 @@ fn completed_reasoning_ciphertext_allows_partial_completion_and_equal_or_omitted
             chunks.extend(emitted);
         }
         let mut terminal = reasoning_ciphertext(json!("SYNTHETIC_COMPLETE_A"));
-        if omit {
-            terminal
-                .as_object_mut()
-                .unwrap()
-                .remove("encrypted_content");
+        match ciphertext {
+            Some(ciphertext) => terminal["encrypted_content"] = ciphertext,
+            None => {
+                terminal
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("encrypted_content");
+            }
         }
         chunks.extend(event(&mut r, json!({"type":"response.completed","response":snapshot(vec![terminal, call(json!("real_call"), "{}")])})));
         let response = r.response().unwrap();
@@ -2069,13 +2088,21 @@ fn partial_ciphertext_is_not_promoted_when_first_completed_snapshot_omits_it() {
 }
 
 #[tokio::test]
-async fn conflicting_completed_reasoning_is_safe_protocol_failure_with_usage_and_no_executable_state()
+async fn conflicting_completed_identity_is_safe_protocol_failure_with_usage_and_no_executable_state()
  {
-    for conflicting in [json!("SYNTHETIC_COMPLETE_B"), Value::Null] {
-        let terminal = snapshot(vec![
-            reasoning_ciphertext(conflicting),
+    for (field, expected_error) in [
+        ("id", "Responses item snapshot conflict"),
+        ("call_id", "Responses item identity conflict"),
+    ] {
+        let mut terminal = snapshot(vec![
+            reasoning_ciphertext(json!("SYNTHETIC_COMPLETE_B")),
             call(json!("real_call"), "{}"),
         ]);
+        // A different final ciphertext is valid; changed call identity is not.
+        terminal["output"][1][field] = json!("conflicting_identity");
+        // A real completed event can repeat a long system prompt before the
+        // output. The failure evidence must survive beyond the old 16 KiB cut.
+        terminal["instructions"] = json!("private diagnostic prompt ".repeat(1024));
         let mut events = completed_ciphertext_events();
         events.push(json!({"type":"response.completed","response":terminal}));
         let mut r = reducer();
@@ -2094,7 +2121,7 @@ async fn conflicting_completed_reasoning_is_safe_protocol_failure_with_usage_and
             .map(|e| format!("data: {e}\n\n"))
             .collect::<String>();
         let (root, server) = super::super::usage_tests::fixture_with_headers(
-            body,
+            body.clone(),
             "X-Request-Id: req_openai_native\r\n".into(),
             "200 OK",
         )
@@ -2139,6 +2166,22 @@ async fn conflicting_completed_reasoning_is_safe_protocol_failure_with_usage_and
             pioneer_protocol::ProviderFailureClass::MalformedProviderRequest
         );
         assert_eq!(classification.http_status, None);
+        let raw = classification.raw_response.as_ref().unwrap();
+        assert_eq!(raw.body, events.last().unwrap().to_string());
+        assert!(!raw.truncated);
+        assert_eq!(raw.processing_error.as_deref(), Some(expected_error));
+        assert_eq!(raw.stream_context.as_deref(), Some(body.as_str()));
+        assert!(
+            raw.stream_context
+                .as_ref()
+                .unwrap()
+                .contains("SYNTHETIC_COMPLETE_A")
+        );
+        let stored = serde_json::to_string(raw).unwrap();
+        assert_eq!(
+            serde_json::from_str::<pioneer_protocol::ProviderErrorResponse>(&stored).unwrap(),
+            *raw
+        );
         let safe = format!("{error:#} {error:?} {facts:?}");
         for secret in [
             "SYNTHETIC_COMPLETE_A",
@@ -2146,10 +2189,90 @@ async fn conflicting_completed_reasoning_is_safe_protocol_failure_with_usage_and
             "SYNTHETIC_PARTIAL",
             "encrypted_content",
             "synthetic-key",
+            "private diagnostic prompt",
+            expected_error,
         ] {
             assert!(!safe.contains(secret));
         }
         server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn json_and_sse_processing_failures_preserve_full_wire_and_cause() {
+    for stream in [false, true] {
+        for malformed_json in [false, true] {
+            let mut invalid = snapshot(vec![json!({
+                "type":"message","id":"invalid_role","role":"user","content":[]
+            })]);
+            invalid["instructions"] = json!("private long prompt ".repeat(1024));
+            let valid_json = if stream {
+                json!({"type":"response.completed","response":invalid}).to_string()
+            } else {
+                invalid.to_string()
+            };
+            let raw_body = if malformed_json {
+                format!("{valid_json} trailing_invalid_json")
+            } else {
+                valid_json
+            };
+            let body = if stream {
+                format!("data: {raw_body}\n\n")
+            } else {
+                raw_body.clone()
+            };
+            let (root, server) = super::super::usage_tests::fixture_with_headers(
+                body.clone(),
+                "X-Request-Id: req_processing_fixture\r\n".into(),
+                "200 OK",
+            )
+            .await;
+            let registry = crate::ProviderRegistry::with_provider(
+                "openai",
+                std::sync::Arc::new(super::super::OpenAiProvider::with_base_url(
+                    "synthetic-key",
+                    root,
+                )),
+            );
+            let provider = registry.get_or_create("openai").unwrap();
+            let error = if stream {
+                let chunks = provider
+                    .stream_chat(request())
+                    .await
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await;
+                assert!(
+                    chunks
+                        .iter()
+                        .filter_map(|chunk| chunk.as_ref().ok())
+                        .all(|chunk| {
+                            chunk.tool_calls.is_empty() && chunk.provider_replay_state.is_none()
+                        })
+                );
+                chunks.into_iter().find_map(|chunk| chunk.err()).unwrap()
+            } else {
+                provider.chat(request()).await.unwrap_err()
+            };
+            let classification = provider.classify_failure(&error).unwrap();
+            assert_eq!(classification.http_status, None);
+            let raw = classification.raw_response.unwrap();
+            assert_eq!(raw.body, raw_body);
+            assert!(!raw.truncated);
+            let cause = raw.processing_error.as_deref().unwrap();
+            if malformed_json {
+                assert!(cause.contains("malformed or unsupported Responses JSON"));
+                assert!(cause.contains("trailing characters"));
+            } else {
+                assert_eq!(cause, "unsupported Responses message role");
+            }
+            assert_eq!(
+                raw.stream_context.as_deref(),
+                stream.then_some(body.as_str())
+            );
+            assert!(!format!("{error:#} {error:?} {raw:?}").contains("private long prompt"));
+            server.await.unwrap();
+        }
     }
 }
 

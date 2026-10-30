@@ -119,7 +119,9 @@ pub(super) fn parse(bytes: &[u8], limit: usize) -> Result<(Value, usize)> {
             limit.saturating_add(1),
         )
         .into()),
-        Err(_) => Err(anyhow::anyhow!("malformed or unsupported Responses JSON")),
+        Err(error) => {
+            Err(anyhow::Error::new(error).context("malformed or unsupported Responses JSON"))
+        }
     }
 }
 /// Same conservative node/string charges as the parser, without allocating a

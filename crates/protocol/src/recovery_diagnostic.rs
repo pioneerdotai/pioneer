@@ -168,23 +168,31 @@ impl From<ProviderRequestId> for String {
     }
 }
 
-/// Original provider error response, bounded for local diagnostic storage.
-/// Debug output deliberately omits the body; public prose never uses it.
+/// Original provider error response, bounded by the transport limit for local storage.
+/// Debug output deliberately omits all payloads; public prose never uses them.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderErrorResponse {
     pub body: String,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_context: Option<String>,
 }
 
 impl ProviderErrorResponse {
-    pub const MAX_BYTES: usize = 16 * 1024;
+    // Matches the provider transport ceiling, rather than cutting valid error
+    // responses or terminal events off in the middle of their JSON payload.
+    pub const MAX_BYTES: usize = 16 * 1024 * 1024;
 
     pub fn from_bytes(bytes: &[u8], incomplete: bool) -> Self {
         let end = bytes.len().min(Self::MAX_BYTES);
         Self {
             body: String::from_utf8_lossy(&bytes[..end]).into_owned(),
             truncated: incomplete || end < bytes.len(),
+            processing_error: None,
+            stream_context: None,
         }
     }
 }
