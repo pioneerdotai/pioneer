@@ -323,6 +323,9 @@ impl VercelAiGatewayProvider {
             };
             if eligible {
                 let mut info = model_info(raw, &model);
+                // Eligibility was established by the existing operation-specific
+                // native discovery above, including the actual Responses route.
+                info.capabilities.chat = Some(!embeddings);
                 if account_status(&value) == Some("unavailable") {
                     info.active = Some(false);
                 }

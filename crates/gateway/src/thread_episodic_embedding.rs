@@ -1802,14 +1802,19 @@ impl RemoteEmbeddingProvider {
         let retryable = classification.as_ref().map_or_else(
             || provider_embedding_error_is_retryable(&error),
             |failure| {
-                matches!(
-                    failure.class,
-                    pioneer_protocol::ProviderFailureClass::NetworkTransient
-                        | pioneer_protocol::ProviderFailureClass::RateLimit
-                        | pioneer_protocol::ProviderFailureClass::Provider5xx
-                )
+                // HTTP 403 uses the durable worker budget even for permanent classes.
+                failure.http_status == Some(403)
+                    || matches!(
+                        failure.class,
+                        pioneer_protocol::ProviderFailureClass::NetworkTransient
+                            | pioneer_protocol::ProviderFailureClass::RateLimit
+                            | pioneer_protocol::ProviderFailureClass::Provider5xx
+                    )
             },
         );
+        let retry_after_ms = classification
+            .as_ref()
+            .and_then(|failure| failure.retry_after_ms);
         let message = classification.map_or_else(
             || "embedding provider request failed (unclassified transport)".to_owned(),
             |failure| format!(
@@ -1817,7 +1822,7 @@ impl RemoteEmbeddingProvider {
                 failure.class, failure.http_status, failure.retry_after_ms
             ),
         );
-        if retryable {
+        let mut mapped = if retryable {
             ThreadEpisodicEmbeddingError::retryable_provider_failure(provider_id, model, message)
         } else {
             ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
@@ -1825,7 +1830,9 @@ impl RemoteEmbeddingProvider {
                 model,
                 message,
             )
-        }
+        };
+        mapped.retry_after_ms = retry_after_ms;
+        mapped
     }
 }
 
@@ -1839,7 +1846,8 @@ fn provider_embedding_error_is_retryable(error: &anyhow::Error) -> bool {
                 || error.status().is_some_and(|status| {
                     matches!(
                         status,
-                        reqwest::StatusCode::REQUEST_TIMEOUT
+                        reqwest::StatusCode::FORBIDDEN
+                            | reqwest::StatusCode::REQUEST_TIMEOUT
                             | reqwest::StatusCode::TOO_EARLY
                             | reqwest::StatusCode::TOO_MANY_REQUESTS
                     ) || status.is_server_error()
@@ -2610,35 +2618,77 @@ mod tests {
     #[test]
     fn embedding_adapter_classification_overrides_opaque_or_misleading_display() {
         use pioneer_protocol::ProviderFailureClass as Class;
-        let provider = FakeRemoteProvider::with_responses("openrouter", vec![]);
-        for (class, status, retryable) in [
-            (Class::AuthOrPermission, 403, false),
-            (Class::RateLimit, 429, true),
-            (Class::Provider5xx, 503, true),
-            (Class::Unknown, 400, false),
-        ] {
-            let mut facts = pioneer_provider::ProviderFailureClassification::new(class);
-            facts.http_status = Some(status);
-            facts.retry_after_ms = Some(1200);
-            let error = RemoteEmbeddingProvider::map_provider_error(
-                "openrouter",
+        for provider_id in ["openai", "openrouter", "vercel-ai-gateway"] {
+            let provider = FakeRemoteProvider::with_responses(provider_id, vec![]);
+            for class in [
+                Class::AuthOrPermission,
+                Class::PermissionDenied,
+                Class::Unknown,
+                Class::ProviderRejected,
+                Class::RateLimit,
+                Class::Provider5xx,
+            ] {
+                for status in [Some(403), Some(401), Some(400), None] {
+                    let mut facts = pioneer_provider::ProviderFailureClassification::new(class);
+                    facts.http_status = status;
+                    facts.retry_after_ms = Some(1200);
+                    let error = RemoteEmbeddingProvider::map_provider_error(
+                        provider_id,
+                        "fixture",
+                        &provider,
+                        OpaqueEmbeddingFailure(facts).into(),
+                    );
+                    assert_eq!(
+                        error.is_retryable(),
+                        status == Some(403)
+                            || matches!(class, Class::RateLimit | Class::Provider5xx)
+                    );
+                    assert_eq!(error.retry_after_ms, Some(1200));
+                    assert!(error.message.contains(&format!("class={class:?},")));
+                    assert!(!error.message.contains("NetworkTransient"));
+                    assert_eq!(error.provider_id, provider_id);
+                    assert_eq!(error.model, "fixture");
+                }
+            }
+            let unknown = RemoteEmbeddingProvider::map_provider_error(
+                provider_id,
                 "fixture",
                 &provider,
-                OpaqueEmbeddingFailure(facts).into(),
+                anyhow::anyhow!("HTTP 403 timeout rate limit retry_after_ms=1200"),
             );
-            assert_eq!(error.is_retryable(), retryable);
-            assert!(error.message.contains(&status.to_string()));
-            assert!(error.message.contains("1200"));
-            assert_eq!(error.provider_id, "openrouter");
-            assert_eq!(error.model, "fixture");
+            assert!(!unknown.is_retryable());
+            assert_eq!(unknown.retry_after_ms, None);
         }
-        let unknown = RemoteEmbeddingProvider::map_provider_error(
-            "openrouter",
-            "fixture",
-            &provider,
-            anyhow::anyhow!("timeout rate limit 503"),
-        );
-        assert!(!unknown.is_retryable());
+    }
+
+    #[test]
+    fn embedding_unclassified_http_status_uses_transport_facts() {
+        let provider = FakeRemoteProvider::with_responses("openai", vec![]);
+        for (status, retryable) in [
+            (403, true),
+            (401, false),
+            (400, false),
+            (408, true),
+            (425, true),
+            (429, true),
+            (503, true),
+        ] {
+            let response = reqwest::Response::from(
+                axum::http::Response::builder()
+                    .status(status)
+                    .body("")
+                    .unwrap(),
+            );
+            let error = response.error_for_status().unwrap_err();
+            let mapped = RemoteEmbeddingProvider::map_provider_error(
+                "openai",
+                "fixture",
+                &provider,
+                error.into(),
+            );
+            assert_eq!(mapped.is_retryable(), retryable);
+            assert_eq!(mapped.retry_after_ms, None);
+        }
     }
 
     #[test]

@@ -12590,6 +12590,8 @@ pub(super) fn provider_model_from_runtime_model_for_reasoning_lookup(
             context_window: model.max_input_tokens,
         },
         capabilities: ProviderModelCapabilities {
+            chat: None,
+            chat_operation: None,
             vision: model.supports_vision,
             tool_calling: None,
             json_output: None,
@@ -13102,6 +13104,8 @@ mod tests {
                 context_window: None,
             },
             capabilities: ProviderModelCapabilities {
+                chat: None,
+                chat_operation: None,
                 vision: None,
                 tool_calling: None,
                 json_output: None,
