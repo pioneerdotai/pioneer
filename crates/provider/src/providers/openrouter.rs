@@ -1686,7 +1686,25 @@ impl crate::traits::Provider for OpenRouterProvider {
             .list_model_entries(self.models_request())
             .await?
             .into_iter()
-            .map(provider_model_from_openrouter_model_entry)
+            .map(|entry| {
+                let mut model = provider_model_from_openrouter_model_entry(entry);
+                // The default OpenRouter list is filtered to text output and
+                // served by /chat/completions. Explicit native modalities can
+                // narrow that operation-scoped evidence, including private URLs.
+                model.capabilities.chat = Some(
+                    model
+                        .capabilities
+                        .input_modalities
+                        .as_ref()
+                        .is_none_or(|input| input.iter().any(|kind| kind == "text"))
+                        && model
+                            .capabilities
+                            .output_modalities
+                            .as_ref()
+                            .is_none_or(|output| output.iter().any(|kind| kind == "text")),
+                );
+                model
+            })
             .collect())
     }
 
@@ -1826,7 +1844,15 @@ fn openrouter_embedding_model_from_openrouter_model_entry(
     m: OpenRouterModelEntry,
 ) -> ProviderModelInfo {
     let mut model = provider_model_from_openrouter_model_entry(m);
-    model.capabilities.embeddings = Some(true);
+    // The server filter proves the operation when modalities are absent, but
+    // cannot erase an explicit narrower native output list.
+    model.capabilities.embeddings = Some(model.capabilities.output_modalities.as_ref().is_none_or(
+        |output| {
+            output
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "embedding" | "embeddings"))
+        },
+    ));
     model.family = Some("embedding".to_owned());
     model
 }
