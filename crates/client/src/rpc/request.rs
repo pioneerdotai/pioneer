@@ -142,6 +142,7 @@ struct RequestState {
     response: Option<Sender<JsonRpcResponseResult>>,
     deadline: Instant,
     write_started: bool,
+    control_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     transport_live: Option<Arc<Mutex<bool>>>,
     subscription_live: Option<Arc<Mutex<bool>>>,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -150,6 +151,7 @@ struct RequestState {
 
 impl Drop for RequestState {
     fn drop(&mut self) {
+        drop(self.control_slot.take());
         if let Some(response) = self.response.take() {
             let error = if Instant::now() >= self.deadline {
                 JsonRpcResponseError::DeadlineExceeded
@@ -173,6 +175,7 @@ impl JsonRpcResponseSender {
                 response: Some(response),
                 deadline,
                 write_started: false,
+                control_slot: None,
                 transport_live: None,
                 subscription_live: None,
                 wake: None,
@@ -205,6 +208,20 @@ impl JsonRpcResponseSender {
         self.state.lock().unwrap().subscription_live = Some(live);
     }
 
+    /// Retain a bounded socket control admission in the canonical request
+    /// lifetime, including pending response time and retained caller handles.
+    pub(crate) fn hold_control_slot(&self, slot: tokio::sync::OwnedSemaphorePermit) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.response.is_none()
+            || Instant::now() >= state.deadline
+            || state.control_slot.is_some()
+        {
+            return false;
+        }
+        state.control_slot = Some(slot);
+        true
+    }
+
     pub(crate) fn retire_on_drop(&self) -> impl Drop + use<> {
         RequestWaitGuard(Arc::downgrade(&self.state))
     }
@@ -225,13 +242,14 @@ impl JsonRpcResponseSender {
         &self,
         response: Option<JsonRpcResponseResult>,
     ) -> Result<(), SendError<JsonRpcResponseResult>> {
-        let (sender, registration, expired, wake) = {
+        let (sender, registration, expired, wake, control_slot) = {
             let mut state = self.state.lock().unwrap();
             (
                 state.response.take(),
                 state.registration.take(),
                 Instant::now() >= state.deadline,
                 state.wake.take(),
+                state.control_slot.take(),
             )
         };
         // insert holds state before registry; release state before acquiring
@@ -239,6 +257,7 @@ impl JsonRpcResponseSender {
         if let Some(registration) = registration {
             self.remove_registration(registration);
         }
+        drop(control_slot);
         let result = match (sender, response) {
             (Some(sender), Some(response)) if !expired => sender.send(response),
             (Some(sender), Some(response)) => {

@@ -1,6 +1,7 @@
 //! Durable soft-stop admission fence. Preparation reads a snapshot outside the
 //! writer; commit revalidates every fact used to close a task or stop a trigger.
 use crate::repositories::{task, task_actor_contract, task_run_execution, task_trigger};
+use crate::task_events::{DeferredAppendedTaskEvent, materialize_task_events};
 use crate::util::unix_to_datetime;
 use crate::{
     AppendedTaskEvent, CrudStore, task_from_db_model, task_run_from_db_model,
@@ -212,7 +213,7 @@ impl CrudStore {
             }
             let prepared = self.prepare_task_events_for_write(events).await?;
             let tx = self.connection.begin().await?;
-            let result: Result<Option<Vec<AppendedTaskEvent>>> = async {
+            let result: Result<Option<Vec<DeferredAppendedTaskEvent>>> = async {
                 if task::find_task_by_id(&tx, task_id).await? != Some(model)
                     || task_trigger::list_triggers_by_task(&tx, task_id).await? != triggers
                     || finish_runs(&tx, task_id, 0, None).await? != all_runs
@@ -241,7 +242,7 @@ impl CrudStore {
             match result {
                 Ok(Some(events)) => {
                     tx.commit().await?;
-                    return Ok((already_terminal, events));
+                    return Ok((already_terminal, materialize_task_events(events)));
                 }
                 Ok(None) => {
                     tx.rollback().await?;
@@ -325,7 +326,7 @@ impl CrudStore {
             .collect();
         let prepared = self.prepare_task_events_for_write(events).await?;
         let tx = self.connection.begin().await?;
-        let result: Result<Vec<AppendedTaskEvent>> = async {
+        let result: Result<Vec<DeferredAppendedTaskEvent>> = async {
             // No new admission may cross the marker; these exact queued runs
             // cannot become starting after the snapshot.
             let mut eligible = Vec::new();
@@ -407,7 +408,7 @@ impl CrudStore {
         match result {
             Ok(events) => {
                 tx.commit().await?;
-                Ok(events)
+                Ok(materialize_task_events(events))
             }
             Err(error) => {
                 let _ = tx.rollback().await;

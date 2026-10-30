@@ -367,7 +367,7 @@ where
     Box::pin(future)
 }
 
-struct AbortOnDropMessageTask<T> {
+pub(crate) struct AbortOnDropMessageTask<T> {
     handle: Option<JoinHandle<T>>,
 }
 
@@ -378,7 +378,7 @@ impl<T> AbortOnDropMessageTask<T> {
         }
     }
 
-    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+    pub(crate) async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
         let result = self
             .handle
             .as_mut()
@@ -386,6 +386,13 @@ impl<T> AbortOnDropMessageTask<T> {
             .await;
         self.handle = None;
         result
+    }
+
+    pub(crate) async fn abort_and_join(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+            let _ = self.join().await;
+        }
     }
 }
 
@@ -401,6 +408,14 @@ impl<T> Drop for AbortOnDropMessageTask<T> {
 
 // Heavy CRUD/projection calls otherwise inherit a deeply nested message-handler poll stack.
 pub(crate) async fn message_fresh_task<F, T>(future: F) -> Result<T, tokio::task::JoinError>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    spawn_message_task(future).join().await
+}
+
+fn spawn_message_task<F, T>(future: F) -> AbortOnDropMessageTask<T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -435,8 +450,6 @@ where
         future,
     );
     AbortOnDropMessageTask::new(tokio::spawn(future))
-        .join()
-        .await
 }
 
 const RESILIENCE_WORKER_POLL_INTERVAL_SECONDS: u64 = 2;

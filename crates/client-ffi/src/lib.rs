@@ -174,7 +174,9 @@ pub struct ClientFfiVoiceAudioChunkParams {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ClientFfiVoiceAudioChunkResult {
+    /// Admission only; worker completion is reported separately.
     pub sent: bool,
+    pub drained: bool,
 }
 
 #[derive(Serialize)]
@@ -895,10 +897,24 @@ impl ClientFfiRuntime {
             );
             return Err("Voice capture superseded".into());
         }
-        *capture = Some(voice_capture::MobileVoiceCapture::new(
-            operation,
+        let worker = match voice_capture::MobileVoiceCapture::new(
+            operation.clone(),
             response.session_id.clone(),
-        ));
+            self.core.clone(),
+        ) {
+            Ok(worker) => worker,
+            Err(error) => {
+                drop(capture);
+                self.core.complete_composer_operation(
+                    operation,
+                    pioneer_client::composer::store::ComposerOperationCompletion::Failed {
+                        message: error.clone(),
+                    },
+                );
+                return Err(error);
+            }
+        };
+        *capture = Some(worker);
         Ok(response)
     }
 
@@ -917,27 +933,17 @@ impl ClientFfiRuntime {
             .as_mut()
             .filter(|capture| capture.matches(&params.operation, &params.session_id))
             .ok_or("Voice capture retired")?;
-        if self
+        if !self
             .core
-            .composer_operation_plan(&params.operation)
-            .is_none()
+            .composer_voice_session_matches(&params.operation, &params.session_id)
         {
             return Err("Voice operation cancelled".into());
         }
-        capture.apply(&params, source_bytes, |sequence, captured_at, pcm| {
-            self.core
-                .send_composer_voice_audio_chunk(
-                    &params.operation,
-                    params.session_id.clone(),
-                    sequence,
-                    voice_capture::audio_format(),
-                    captured_at,
-                    Some((((pcm.len() / 2 * 1000 + 8000) / 16000) as u32).max(1)),
-                    pcm,
-                )
-                .map_err(|error| format!("{error:#}"))
-        })?;
-        Ok(ClientFfiVoiceAudioChunkResult { sent: true })
+        let drained = capture.enqueue(params, source_bytes)?;
+        Ok(ClientFfiVoiceAudioChunkResult {
+            sent: true,
+            drained,
+        })
     }
 
     fn voice_session_finalize(

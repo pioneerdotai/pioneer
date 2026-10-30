@@ -535,12 +535,12 @@ async fn prepare_native_projection_with_prepared(
             basis.clone(),
         )?;
         let mut message_tokens = full.message_input_tokens.clone();
-        let mut input = receipt.calibrated_input(
+        let mut input = receipt.calibrated_estimate(
             full.estimated_input_tokens,
             &message_tokens,
             measured.as_ref(),
         )?;
-        if !budget.fits(input, full.output_reserve, recovery) {
+        if !budget.fits_estimate(input, full.output_reserve, recovery) {
             if let Some(reduced) = super::result_budget::shrink_results(
                 &store, workspace, &full, &media, &budget, recovery,
             )
@@ -557,7 +557,7 @@ async fn prepare_native_projection_with_prepared(
                 )?;
                 // Representation changed: exact-prefix validation decides
                 // whether any earlier provider measurement is still usable.
-                input = receipt.calibrated_input(
+                input = receipt.calibrated_estimate(
                     full.estimated_input_tokens,
                     &message_tokens,
                     measured.as_ref(),
@@ -565,7 +565,7 @@ async fn prepare_native_projection_with_prepared(
             }
         }
         let history_check = history_check_metadata(&full)?;
-        if !recovery && budget.fits(input, full.output_reserve, false) {
+        if !recovery && budget.fits_estimate(input, full.output_reserve, false) {
             return Ok::<_, anyhow::Error>((full.request, receipt, history_check, None));
         }
         let _startup_compaction = pioneer_observability::turn_startup::current_stage(
@@ -594,14 +594,11 @@ async fn prepare_native_projection_with_prepared(
             &full.request.messages,
             &message_tokens,
         )?;
-        let message_total = message_tokens
-            .iter()
-            .fold(0_u64, |sum, n| sum.saturating_add(*n));
-        let fixed = input.saturating_sub(message_total);
-        let available = budget
-            .context
-            .saturating_sub(full.output_reserve)
-            .saturating_sub(fixed);
+        // Compaction changes the measured prefix; its replacement candidates
+        // must use their local fixed framing, not reuse an old provider anchor.
+        let fixed = full.fixed_input_tokens;
+        let available =
+            estimated_input_capacity(&budget, full.output_reserve, recovery).saturating_sub(fixed);
         let goal = summarizer
             .model_budget()
             .summarizer_cap(u64::MAX)?

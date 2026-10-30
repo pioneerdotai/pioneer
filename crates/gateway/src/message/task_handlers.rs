@@ -1550,18 +1550,60 @@ impl MessageProcessor {
                 ),
             confirmed_activity: None,
         };
-        match self
+        let result = self
             .task_runtime
             .service()
-            .wait_tasks(wait_context, params)
-            .await
-        {
+            .wait_tasks(wait_context, params.clone())
+            .await;
+        match result {
             Ok(response_payload) => {
                 let projected = crate::task_projection::project_task_wait(&response_payload);
-                self.send_task_response(connection_id, request_id, &projected)
+                let encoded = match JsonRpcResponse::from_result(request_id.clone(), &projected)
+                    .and_then(|response| serde_json::to_string(&response))
+                {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            task_public_error(
+                                None,
+                                pioneer_protocol::PublicErrorStage::Delivery,
+                                format!("failed to encode task response: {error}"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                // The initial proof only admits the wait. Re-resolve the same
+                // targets after waiting AND encoding, under current access/policy.
+                let Some(current) = self
+                    .reauthorize_task_wait(request_context, &request_id, &params)
                     .await
+                else {
+                    return;
+                };
+                // No queue await after the final connection/access gate. An
+                // overloaded or closed outbound retires the socket fail-closed.
+                if !matches!(
+                    self.session_manager
+                        .try_send_wait_response(connection_id, current.principal(), encoded)
+                        .await,
+                    Ok(true)
+                ) {
+                    self.session_manager
+                        .unregister_connection(connection_id)
+                        .await;
+                }
             }
             Err(error) => {
+                if self
+                    .reauthorize_task_wait(request_context, &request_id, &params)
+                    .await
+                    .is_none()
+                {
+                    return;
+                }
                 self.send_error(
                     connection_id,
                     task_public_error(
@@ -1571,6 +1613,70 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+            }
+        }
+    }
+
+    async fn reauthorize_task_wait(
+        &self,
+        original: &RequestContext,
+        request_id: &RequestId,
+        params: &TaskWaitParams,
+    ) -> Option<crate::request_context::ConnectionContext> {
+        let current = self
+            .session_manager
+            .connection_context(original.connection_id())
+            .await
+            .ok()?;
+        let expected = original.principal();
+        let principal = current.principal();
+        // Connection IDs are monotonic; additionally retain the original auth
+        // identity. A same-socket access renewal is allowed, a new session isn't.
+        if principal.gateway_id != expected.gateway_id
+            || principal.principal_id != expected.principal_id
+            || principal.device_id != expected.device_id
+            || principal.session_id != expected.session_id
+        {
+            return None;
+        }
+        let termination = self
+            .session_manager
+            .connection_termination_receiver(original.connection_id())
+            .await
+            .ok()?;
+        let expired = crate::helpers::unix_timestamp_secs()
+            .map_or(true, |now| now >= principal.access_expires_at_unix);
+        let invalid_lease = if let Some(auth) = &self.auth_service {
+            auth.validate_session_lease(principal).await.is_err()
+        } else {
+            false
+        };
+        let terminated = termination.borrow().is_some();
+        if terminated || expired || invalid_lease {
+            self.send_error(
+                original.connection_id(),
+                crate::authorization::AuthorizationExternalError::NotFound
+                    .response(request_id.clone()),
+            )
+            .await;
+            return None;
+        }
+        let context = RequestContext::new(
+            &current,
+            Some(request_id.clone()),
+            crate::request_context::CanonicalMethod::rpc(methods::TASK_WAIT),
+        );
+        let request = JsonRpcRequest {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: request_id.clone(),
+            method: methods::TASK_WAIT.to_owned(),
+            params: Some(serde_json::to_value(params).ok()?),
+        };
+        match self.authorize_normal_request(&context, &request).await {
+            Ok(_) => Some(current),
+            Err(error) => {
+                self.send_error(original.connection_id(), error).await;
+                None
             }
         }
     }
@@ -2188,11 +2294,13 @@ mod task_revision_failure_tests {
             for already_reported in [false, true] {
                 let ((response, public), events) =
                     crate::public_error::test_support::capture_events(|| {
-                        let public = crate::public_error::build_public_error(
+                        let mut public = crate::public_error::build_public_error(
                             code,
                             pioneer_protocol::PublicErrorStage::Admission,
                         );
+                        public.correlation_id = "revision-correlation".to_owned();
                         let failure = TaskStartFailure::new(TaskStartStage::CliAdmission, cause)
+                            .with_correlation_id("revision-correlation".to_owned())
                             .with_public_error(public.clone());
                         let failure = if already_reported {
                             failure.report()

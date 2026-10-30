@@ -471,13 +471,16 @@ impl CrudStore {
         reference: &SourceRef,
         character_offset: u64,
     ) -> Result<Option<CanonicalFragment>> {
-        repositories::compaction::compaction_reference_fragment(
-            self,
-            workspace,
-            thread,
-            reference,
-            character_offset,
-        )
+        self.run_scoped_database_quantum(|| async {
+            repositories::compaction::compaction_reference_fragment(
+                self,
+                workspace,
+                thread,
+                reference,
+                character_offset,
+            )
+            .await
+        })
         .await
     }
     pub async fn compaction_reference_payload(
@@ -486,8 +489,13 @@ impl CrudStore {
         thread: &str,
         reference: &SourceRef,
     ) -> Result<Option<String>> {
-        repositories::compaction::compaction_reference_payload(self, workspace, thread, reference)
+        self.run_scoped_database_quantum(|| async {
+            repositories::compaction::compaction_reference_payload(
+                self, workspace, thread, reference,
+            )
             .await
+        })
+        .await
     }
     pub async fn compaction_reference_payload_batch(
         &self,
@@ -495,9 +503,12 @@ impl CrudStore {
         thread: &str,
         references: &[SourceRef],
     ) -> Result<(usize, Vec<String>)> {
-        repositories::compaction::compaction_reference_payload_batch(
-            self, workspace, thread, references,
-        )
+        self.run_scoped_database_quantum(|| async {
+            repositories::compaction::compaction_reference_payload_batch(
+                self, workspace, thread, references,
+            )
+            .await
+        })
         .await
     }
     pub async fn compaction_references_current(
@@ -662,11 +673,13 @@ impl CrudStore {
         timestamp_secs: i64,
     ) -> Result<bool> {
         let maintenance = self.with_maintenance_access();
-        repositories::compaction::lifecycle::repair_lifecycle(
-            &maintenance,
-            prepared,
-            event,
-            timestamp_secs,
+        repositories::portable_payload::after_database_owners(
+            repositories::compaction::lifecycle::repair_lifecycle(
+                &maintenance,
+                prepared,
+                event,
+                timestamp_secs,
+            ),
         )
         .await
     }
@@ -1097,12 +1110,15 @@ impl CrudStore {
         thread: &str,
         turn: &str,
     ) -> Result<Option<AcceptedTaskBasis>> {
-        repositories::compaction::history::compaction_task_basis_snapshot(
-            &self.connection,
-            workspace,
-            thread,
-            turn,
-        )
+        self.run_scoped_database_quantum(|| async {
+            repositories::compaction::history::compaction_task_basis_snapshot(
+                &self.connection,
+                workspace,
+                thread,
+                turn,
+            )
+            .await
+        })
         .await
     }
     /// Refresh a stale metadata cache after decoding a scoped canonical source
@@ -1284,12 +1300,14 @@ impl CrudStore {
         event: CanonicalTurnEventPayload,
         timestamp_secs: i64,
     ) -> Result<()> {
-        repositories::compaction::lifecycle::compaction_materialize_lifecycle(
-            self,
-            operation,
-            generation,
-            event,
-            timestamp_secs,
+        repositories::portable_payload::after_database_owners(
+            repositories::compaction::lifecycle::compaction_materialize_lifecycle(
+                self,
+                operation,
+                generation,
+                event,
+                timestamp_secs,
+            ),
         )
         .await
     }

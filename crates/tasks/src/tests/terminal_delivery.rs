@@ -6,10 +6,18 @@ use sea_orm::{ColumnTrait, QueryFilter, TransactionTrait};
 async fn fixture_with_runtime(
     runtime: TaskRuntime,
 ) -> (TaskRuntime, TaskRun, TaskExecutionHandle, TaskResult) {
+    fixture_with_runtime_and_retry(runtime, None).await
+}
+
+async fn fixture_with_runtime_and_retry(
+    runtime: TaskRuntime,
+    retry_policy: Option<TaskRetryPolicy>,
+) -> (TaskRuntime, TaskRun, TaskExecutionHandle, TaskResult) {
     let mut params = create_params(TaskTriggerSpec::Immediate);
     params.owner_kind = TaskOwnerKind::Thread;
     params.owner_id = Some("thr_terminal_delivery".into());
     params.created_by_thread_id = params.owner_id.clone();
+    params.retry_policy = retry_policy;
     params.delivery_policy = Some(TaskDeliveryPolicy {
         mode: TaskDeliveryMode::Thread,
         thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
@@ -869,12 +877,39 @@ impl pioneer_sqlite::SqliteWriteObserver for TerminalQueueObserver {
 #[tokio::test]
 async fn cancelling_queued_terminal_commit_releases_capacity_without_partial_events() {
     use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor, SqliteWriteQueueSnapshot};
-    let connection = Database::connect("sqlite::memory:").await.unwrap();
+    // Commit refreshes event preflight through a reader before queuing its
+    // writer. A shared in-memory connection would stall that read behind the
+    // blocker, so it could never exercise queued-writer cancellation.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("terminal-cancellation.sqlite");
+    let mut options = sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+    options
+        .max_connections(1)
+        .min_connections(1)
+        .map_sqlx_sqlite_opts(|options| {
+            options
+                .pragma("journal_mode", "WAL")
+                .pragma("foreign_keys", "OFF")
+        });
+    let connection = Database::connect(options).await.unwrap();
     Migrator::up(&connection, None).await.unwrap();
     seed_task_test_workspace(&connection).await;
+    let mut options =
+        sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+    options
+        .max_connections(1)
+        .min_connections(1)
+        .map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+                .pragma("foreign_keys", "OFF")
+        });
+    let reader = Database::connect(options).await.unwrap();
     let observer = Arc::new(TerminalQueueObserver::default());
     let database = SqliteDatabase::from_executor(
-        connection.clone(),
+        reader,
         SqliteWriteExecutor::with_observer(connection, observer.clone()),
     );
     let (runtime, run, _, result) =
@@ -1692,6 +1727,522 @@ async fn cancellation_without_reason_rejects_unconfirmed_graph_facts_atomically(
         assert!(
             deliveries(&runtime, &run).await.is_empty(),
             "{invalid_fact}"
+        );
+    }
+}
+
+struct RevisionTerminalFixture {
+    _directory: tempfile::TempDir,
+    runtime: TaskRuntime,
+    run: TaskRun,
+    handle: TaskExecutionHandle,
+    revision: TaskRunTurn,
+    observer: Arc<DispatchDatabaseObserver>,
+}
+
+async fn revision_terminal_fixture() -> RevisionTerminalFixture {
+    revision_terminal_fixture_with_retry(None).await
+}
+
+async fn revision_terminal_fixture_with_retry(
+    retry_policy: Option<TaskRetryPolicy>,
+) -> RevisionTerminalFixture {
+    use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
+    use sea_orm::ConnectOptions;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("tasks.sqlite");
+    let mut writer_options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+    writer_options
+        .max_connections(1)
+        .sqlx_logging(false)
+        .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
+    let writer = Database::connect(writer_options).await.unwrap();
+    pioneer_sqlite::apply_sqlite_pragmas(&writer).await.unwrap();
+    let bootstrap = SqliteDatabase::from_single_connection(writer.clone());
+    let migration = bootstrap.begin().await.unwrap();
+    Migrator::up(&*migration, None).await.unwrap();
+    migration.commit().await.unwrap();
+    seed_task_test_workspace(&writer).await;
+    let mut reader_options =
+        ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+    reader_options
+        .max_connections(2)
+        .sqlx_logging(false)
+        .map_sqlx_sqlite_opts(|options| {
+            options
+                .pragma("query_only", "ON")
+                .pragma("foreign_keys", "OFF")
+        });
+    let reader = Database::connect(reader_options).await.unwrap();
+    let observer = Arc::new(DispatchDatabaseObserver::default());
+    let database = SqliteDatabase::from_executor_with_read_observer(
+        reader,
+        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        observer.clone(),
+    );
+    let (runtime, run, _, _) = fixture_with_runtime_and_retry(
+        TaskRuntime::new(Arc::new(CrudStore::new(database))),
+        retry_policy,
+    )
+    .await;
+    let store = Arc::new(
+        runtime
+            .service()
+            .store()
+            .with_maintenance_reads_and_critical_writes(),
+    );
+    let execution = store
+        .load_execution_for_run(&run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let revision = TaskRunTurn {
+        id: format!("revision_{}", run.id),
+        task_id: run.task_id.clone(),
+        run_id: run.id.clone(),
+        execution_id: Some(execution.id),
+        thread_id: "reserved-revision-thread".into(),
+        turn_id: "reserved-revision-turn".into(),
+        kind: TaskRunTurnKind::Revision,
+        round: 1,
+        sequence: 1,
+        status: TaskRunTurnStatus::InProgress,
+        reviews_candidate_id: None,
+        requested_by_candidate_id: Some("previous-candidate".into()),
+        requested_by_review_event_id: Some("revision-request".into()),
+        created_at: run.created_at,
+        started_at: Some(run.created_at),
+        completed_at: None,
+    };
+    store
+        .append_task_event(
+            TaskEventPayload::TaskRunTurnStarted {
+                task_run_turn: revision.clone(),
+            },
+            run.created_at,
+        )
+        .await
+        .unwrap();
+    let handle = TaskExecutionHandle::new(
+        store,
+        runtime.event_bus(),
+        run.task_id.clone(),
+        run.id.clone(),
+    );
+    RevisionTerminalFixture {
+        _directory: directory,
+        runtime,
+        run,
+        handle,
+        revision,
+        observer,
+    }
+}
+
+fn revision_start_error(run: &TaskRun) -> TaskError {
+    crate::TaskStartFailure::new(
+        crate::TaskStartStage::CliAdmission,
+        crate::TaskStartCause::Validation,
+    )
+    .with_reason(crate::TaskStartReason::CapabilityProjectionInvalid)
+    .descriptor()
+    .task_error(Some(run.id.clone()))
+}
+
+#[tokio::test]
+async fn terminal_revision_rolls_back_with_run_then_replays_after_restart() {
+    use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass};
+    for (failed, turn_status, run_status, execution_status) in [
+        (
+            false,
+            TaskRunTurnStatus::Blocked,
+            TaskRunStatus::Blocked,
+            TaskRunExecutionStatus::Blocked,
+        ),
+        (
+            true,
+            TaskRunTurnStatus::Failed,
+            TaskRunStatus::Failed,
+            TaskRunExecutionStatus::Failed,
+        ),
+    ] {
+        let fixture = revision_terminal_fixture().await;
+        let RevisionTerminalFixture {
+            runtime,
+            run,
+            handle,
+            revision,
+            observer,
+            ..
+        } = &fixture;
+        let store = runtime.service().store();
+        let db = store.database_connection();
+        let before = events(runtime, run).await;
+        let error = revision_start_error(run);
+        // Abort after the revision/run events have been projected, during the
+        // existing finalization. All events, delivery and domain rows must roll back.
+        db.execute_unprepared("CREATE TRIGGER reject_revision_terminal BEFORE UPDATE ON task_occurrence_contract WHEN NEW.status='failed' BEGIN SELECT RAISE(ABORT, 'injected revision finalization failure'); END").await.unwrap();
+        assert!(
+            commit_revision_failure(
+                handle,
+                revision.clone(),
+                error.clone(),
+                run.created_at + 10,
+                failed
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(events(runtime, run).await, before);
+        assert_eq!(
+            store
+                .get_task_run_turn(&revision.id)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(revision)
+        );
+        assert!(
+            !store
+                .get_task_run(&run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .is_terminal()
+        );
+        assert!(
+            !store
+                .load_execution_for_run(&run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .is_terminal()
+        );
+        assert!(deliveries(runtime, run).await.is_empty());
+        db.execute_unprepared("DROP TRIGGER reject_revision_terminal")
+            .await
+            .unwrap();
+        observer.reads.lock().unwrap().clear();
+        observer.writes.lock().unwrap().clear();
+        commit_revision_failure(
+            handle,
+            revision.clone(),
+            error.clone(),
+            run.created_at + 11,
+            failed,
+        )
+        .await
+        .unwrap();
+        assert_eq!(observer.writes.lock().unwrap().len(), 1);
+        observer.assert_scope(SqliteReadClass::Maintenance, SqliteWriteClass::Critical);
+        let saved = store
+            .get_task_run_turn(&revision.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.status, turn_status);
+        assert_eq!(saved.completed_at, Some(run.created_at + 11));
+        assert_eq!(
+            store.get_task_run(&run.id).await.unwrap().unwrap().status,
+            run_status
+        );
+        assert_eq!(
+            store
+                .get_task_run(&run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .error
+                .as_ref(),
+            Some(&error)
+        );
+        assert_eq!(
+            store
+                .load_execution_for_run(&run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            execution_status
+        );
+        assert_eq!(
+            store
+                .get_task_occurrence_contract_by_run(&run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskOccurrenceStatus::Failed
+        );
+        assert!(
+            store
+                .get_turn(&revision.thread_id, &revision.turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let committed = events(runtime, run).await;
+        let revision_event = committed
+            .iter()
+            .position(|event| {
+                if failed {
+                    matches!(event.payload, TaskEventPayload::TaskRunTurnFailed { .. })
+                } else {
+                    matches!(event.payload, TaskEventPayload::TaskRunTurnBlocked { .. })
+                }
+            })
+            .unwrap();
+        let run_event = committed
+            .iter()
+            .position(|event| {
+                if failed {
+                    matches!(event.payload, TaskEventPayload::RunFailed { .. })
+                } else {
+                    matches!(event.payload, TaskEventPayload::RunBlocked { .. })
+                }
+            })
+            .unwrap();
+        assert!(revision_event < run_event);
+        let queued = deliveries(runtime, run).await;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].error_snapshot.as_ref(), Some(&error));
+        let restarted = TaskRuntime::new(store.clone());
+        let restarted_handle = TaskExecutionHandle::new(
+            store.clone(),
+            restarted.event_bus(),
+            run.task_id.clone(),
+            run.id.clone(),
+        );
+        commit_revision_failure(
+            &restarted_handle,
+            revision.clone(),
+            error,
+            run.created_at + 99,
+            failed,
+        )
+        .await
+        .unwrap();
+        assert_eq!(events(&restarted, run).await, committed);
+        assert_eq!(deliveries(&restarted, run).await, queued);
+        assert_eq!(
+            store
+                .get_task_run_turn(&revision.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            saved
+        );
+    }
+}
+
+#[tokio::test]
+async fn prepared_revision_failure_cannot_overwrite_a_winner_or_a_new_revision() {
+    for failed in [false, true] {
+        for winner in ["cancel", "success", "revision", "turn_cancelled"] {
+            let fixture = revision_terminal_fixture().await;
+            let RevisionTerminalFixture {
+                runtime,
+                run,
+                handle,
+                revision,
+                ..
+            } = &fixture;
+            let store = runtime.service().store();
+            let prepared = store
+                .prepare_task_terminal_transition(if failed {
+                    TaskEventPayload::RunFailed {
+                        task_id: run.task_id.clone(),
+                        run_id: run.id.clone(),
+                        error: Some(revision_start_error(run)),
+                        completed_at: run.created_at + 20,
+                    }
+                } else {
+                    TaskEventPayload::RunBlocked {
+                        task_id: run.task_id.clone(),
+                        run_id: run.id.clone(),
+                        error: Some(revision_start_error(run)),
+                        blocked_at: run.created_at + 20,
+                    }
+                })
+                .await
+                .unwrap();
+            let prepared = store
+                .prepare_task_terminal_with_revision(prepared, revision.clone())
+                .await
+                .unwrap();
+            match winner {
+                "cancel" => handle
+                    .cancel_run(Some("cancelled".into()), run.created_at + 10)
+                    .await
+                    .unwrap(),
+                "success" => handle
+                    .complete_run(None, run.created_at + 10)
+                    .await
+                    .unwrap(),
+                "revision" => {
+                    let mut next = revision.clone();
+                    next.id.push_str("_next");
+                    next.turn_id.push_str("_next");
+                    next.sequence += 1;
+                    next.round += 1;
+                    store
+                        .append_task_event(
+                            TaskEventPayload::TaskRunTurnStarted {
+                                task_run_turn: next,
+                            },
+                            run.created_at + 10,
+                        )
+                        .await
+                        .unwrap();
+                }
+                "turn_cancelled" => {
+                    let mut cancelled = revision.clone();
+                    cancelled.status = TaskRunTurnStatus::Cancelled;
+                    cancelled.completed_at = Some(run.created_at + 10);
+                    handle
+                        .record_task_run_turn_failed(cancelled, None, run.created_at + 10)
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = store.get_task(&run.task_id).await.unwrap().unwrap();
+            let before_events = events(runtime, run).await;
+            let before_deliveries = deliveries(runtime, run).await;
+            let error = store
+                .commit_task_terminal_transition(prepared)
+                .await
+                .unwrap_err();
+            assert!(
+                error.downcast_ref::<TaskTerminalConflict>().is_some(),
+                "{winner}: {error:#}"
+            );
+            assert_eq!(store.get_task(&run.task_id).await.unwrap().unwrap(), before);
+            assert_eq!(events(runtime, run).await, before_events);
+            assert_eq!(deliveries(runtime, run).await, before_deliveries);
+        }
+    }
+}
+
+async fn commit_revision_failure(
+    handle: &TaskExecutionHandle,
+    revision: TaskRunTurn,
+    error: TaskError,
+    at: i64,
+    failed: bool,
+) -> TaskRuntimeResult<()> {
+    if failed {
+        handle.fail_run_with_revision(revision, error, at).await
+    } else {
+        handle.block_run_with_revision(revision, error, at).await
+    }
+}
+
+#[tokio::test]
+async fn failed_revision_preserves_policy_retry_and_replay() {
+    for retry_policy_error in [false, true] {
+        let fixture = revision_terminal_fixture_with_retry(Some(TaskRetryPolicy {
+            max_attempts: 2,
+            backoff: TaskRetryBackoffKind::Fixed,
+            initial_delay_seconds: Some(5),
+            max_delay_seconds: None,
+            retry_on: vec![if retry_policy_error {
+                TaskErrorClass::Policy
+            } else {
+                TaskErrorClass::Internal
+            }],
+        }))
+        .await;
+        let RevisionTerminalFixture {
+            runtime,
+            run,
+            handle,
+            revision,
+            ..
+        } = &fixture;
+        let error = TaskError {
+            recovery_diagnostic: None,
+            code: "write_lock_conflict".to_owned(),
+            message: "write scope conflicts with another active task run".to_owned(),
+            class: TaskErrorClass::Policy,
+            details: None,
+            failed_run_id: Some(run.id.clone()),
+        };
+        let at = run.created_at + 10;
+        handle
+            .fail_run_with_revision(revision.clone(), error.clone(), at)
+            .await
+            .unwrap();
+        let store = runtime.service().store();
+        let response = store.get_task(&run.task_id).await.unwrap().unwrap();
+        let source = response
+            .runs
+            .iter()
+            .find(|source| source.id == run.id)
+            .unwrap();
+        assert_eq!(source.status, TaskRunStatus::Failed);
+        assert_eq!(source.completed_at, Some(at));
+        assert_eq!(source.error.as_ref(), Some(&error));
+        assert_eq!(
+            store
+                .get_task_run_turn(&revision.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskRunTurnStatus::Failed
+        );
+        let retries: Vec<_> = response
+            .runs
+            .iter()
+            .filter(|candidate| candidate.retry_of_run_id.as_deref() == Some(run.id.as_str()))
+            .collect();
+        assert_eq!(retries.len(), usize::from(retry_policy_error));
+        if retry_policy_error {
+            assert_eq!(response.task.status, TaskStatus::Queued);
+            assert_eq!(retries[0].attempt_number, 2);
+            assert_eq!(retries[0].ready_at, Some(at + 5));
+            assert_eq!(retries[0].status, TaskRunStatus::Queued);
+            assert!(
+                !store
+                    .load_execution_for_run(&run.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .is_terminal()
+            );
+            assert!(deliveries(runtime, run).await.is_empty());
+        } else {
+            assert_eq!(response.task.status, TaskStatus::Failed);
+            assert_eq!(
+                store
+                    .load_execution_for_run(&run.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskRunExecutionStatus::Failed
+            );
+            assert_eq!(deliveries(runtime, run).await.len(), 1);
+        }
+        let before_events = events(runtime, run).await;
+        let restarted = TaskRuntime::new(store.clone());
+        TaskExecutionHandle::new(
+            store.clone(),
+            restarted.event_bus(),
+            run.task_id.clone(),
+            run.id.clone(),
+        )
+        .fail_run_with_revision(revision.clone(), error, at + 99)
+        .await
+        .unwrap();
+        assert_eq!(events(&restarted, run).await, before_events);
+        assert_eq!(
+            store.get_task(&run.task_id).await.unwrap().unwrap(),
+            response
         );
     }
 }

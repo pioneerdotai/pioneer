@@ -137,3 +137,8 @@ pub(crate) mod task_child_cleanup;
 pub(crate) mod unread_start;
 
 pub(crate) mod thread_history_read;
+
+pub(crate) mod portable_payload;
+pub(crate) mod portable_payload_legacy_text;
+
+mod portable_payload_json;

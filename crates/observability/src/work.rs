@@ -471,7 +471,8 @@ impl WorkCarrier {
         );
         let kind = match context.workload() {
             crate::DatabaseWorkload::FrozenStorageMaintenance
-            | crate::DatabaseWorkload::HtmlPreviewMaintenance => WorkKind::Maintenance,
+            | crate::DatabaseWorkload::HtmlPreviewMaintenance
+            | crate::DatabaseWorkload::PortablePayloadMaintenance => WorkKind::Maintenance,
             _ => WorkKind::Database,
         };
         self.context = make(

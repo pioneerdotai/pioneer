@@ -2188,8 +2188,8 @@ mod tests {
         append_test_packet(&store, "session", 0, &[8000; 1600]);
         assert!(append_test_packet(&store, "session", 0, &[20000; 1600]).already_buffered);
         assert_eq!(
-            append_test_packet(&store, "session", 3, &[12000; 1600]).missing_chunks,
-            2
+            append_test_packet(&store, "session", 1, &[12000; 1600]).missing_chunks,
+            0
         );
         let calls = Arc::new(Mutex::new(Vec::new()));
         let captured = calls.clone();
@@ -2199,7 +2199,7 @@ mod tests {
         }));
         std::thread::scope(|scope| {
             let worker = scope.spawn(|| process_buffered(&store, "session", &token, &fake, false));
-            append_test_packet(&store, "session", 4, &[16000; 79]);
+            append_test_packet(&store, "session", 2, &[16000; 79]);
             // The close and append boundary is the production inbox mutex.
             let _completion = store.finish_processing("session").unwrap();
             assert!(
@@ -2207,7 +2207,7 @@ mod tests {
                     .append_chunk(
                         VoiceChunkFrameHeader {
                             session_id: "session".to_owned(),
-                            sequence: 5,
+                            sequence: 3,
                             sample_rate_hz: 16000,
                             channels: 1,
                             encoding: VoiceAudioEncoding::PcmS16Le,

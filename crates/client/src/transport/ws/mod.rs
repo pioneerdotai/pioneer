@@ -14,6 +14,7 @@ pub mod decode;
 pub mod frames;
 pub mod rpc;
 pub mod runtime;
+mod voice_budget;
 pub mod worker;
 
 pub use runtime::{GatewayWsClient, GatewayWsCommandSender};

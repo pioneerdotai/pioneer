@@ -1,4 +1,7 @@
-use crate::{PAGE_BYTES, PAGE_TOKENS, RESULT_BYTES, RESULT_TOKENS, text_tokens};
+use crate::estimator::{TextSize, json_size, json_string_content_size};
+#[cfg(test)]
+use crate::text_tokens;
+use crate::{PAGE_BYTES, PAGE_TOKENS, RESULT_BYTES, RESULT_TOKENS};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -14,17 +17,6 @@ pub struct ResultPage {
     pub eof: bool,
 }
 
-fn fits(text: &str, tokens: u64, bytes: usize) -> bool {
-    text.len() <= bytes && (tokens == u64::MAX || text_tokens(text) <= tokens)
-}
-fn boundary_before(text: &str, mut offset: usize) -> usize {
-    offset = offset.min(text.len());
-    while !text.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
-}
-
 /// The caller may publish this representation only after the full source exists.
 pub fn result_excerpt(
     text: &str,
@@ -32,35 +24,80 @@ pub fn result_excerpt(
     available_tokens: u64,
     available_bytes: usize,
 ) -> anyhow::Result<String> {
-    let tokens = available_tokens.min(RESULT_TOKENS);
-    let bytes = available_bytes.min(RESULT_BYTES);
-    if fits(text, tokens, bytes) {
+    excerpt_in_budget(
+        text,
+        reference,
+        available_tokens.min(RESULT_TOKENS),
+        available_bytes.min(RESULT_BYTES),
+        TextSize::default(),
+        TextSize::of,
+    )
+}
+
+/// Select text for an already prepared JSON envelope whose text field is empty.
+/// Escaping participates in both limits; the source itself is never byte-cut.
+pub fn result_excerpt_in_json(
+    text: &str,
+    reference: &str,
+    available_tokens: u64,
+    available_bytes: usize,
+    empty_envelope: TextSize,
+) -> anyhow::Result<String> {
+    excerpt_in_budget(
+        text,
+        reference,
+        available_tokens.min(RESULT_TOKENS),
+        available_bytes.min(RESULT_BYTES),
+        empty_envelope,
+        json_string_content_size,
+    )
+}
+
+fn excerpt_in_budget(
+    text: &str,
+    reference: &str,
+    tokens: u64,
+    bytes: usize,
+    frame: TextSize,
+    size_of: impl Fn(&str) -> TextSize,
+) -> anyhow::Result<String> {
+    let fits = |size: TextSize| size.bytes <= bytes && size.tokens() <= tokens;
+    if text.len() <= bytes && fits(frame.saturating_add(size_of(text))) {
         return Ok(text.into());
     }
     let marker =
         format!("\n[Result shortened. Full source: {reference}; use threads_tools_result_read.]\n");
+    let mut size = frame.saturating_add(size_of(&marker));
     anyhow::ensure!(
-        fits(&marker, tokens, bytes),
+        fits(size),
         "result reference does not fit; context preparation required"
     );
-    let mut low = 0;
-    let mut high = text.len().min(bytes);
-    let mut best = marker.clone();
-    while low <= high {
-        let size = low + (high - low) / 2;
-        let head = boundary_before(text, size.div_ceil(2));
-        let tail = boundary_before(text, text.len().saturating_sub(size / 2));
-        let candidate = format!("{}{}{}", &text[..head], marker, &text[tail..]);
-        if fits(&candidate, tokens, bytes) {
-            best = candidate;
-            low = size + 1;
-        } else if size == 0 {
-            break;
+    // One bounded traversal of the two ends. Combine units before rounding;
+    // repeated candidate Strings and full-prefix scans are unnecessary.
+    let mut head = 0;
+    let mut tail = text.len();
+    let mut chars = text.char_indices();
+    let mut from_head = true;
+    loop {
+        let next = if from_head {
+            chars.next()
         } else {
-            high = size - 1;
+            chars.next_back()
+        };
+        let Some((offset, ch)) = next else { break };
+        let next_size = size.saturating_add(size_of(&text[offset..offset + ch.len_utf8()]));
+        if !fits(next_size) {
+            break;
         }
+        size = next_size;
+        if from_head {
+            head = offset + ch.len_utf8();
+        } else {
+            tail = offset;
+        }
+        from_head = !from_head;
     }
-    Ok(best)
+    Ok(format!("{}{}{}", &text[..head], marker, &text[tail..]))
 }
 
 /// Framing and continuation fields participate in both limits. This routine also
@@ -111,23 +148,47 @@ pub fn result_page_in_budget(
         }),
         eof: end == text.len(),
     };
-    let mut low = start;
-    let mut high = text.len().min(start.saturating_add(bytes));
-    let mut best = None;
-    while low <= high {
-        let mid = low + (high - low) / 2;
-        let end = boundary_before(text, mid);
-        let candidate = make(end);
-        let encoded = serde_json::to_string(&candidate)?;
-        if fits(&encoded, tokens, bytes) {
-            best = Some(candidate);
-            low = mid + 1;
-        } else if mid == 0 {
-            break;
-        } else {
-            high = mid - 1;
+    // EOF removes the cursor envelope, so consider it separately. Only scan
+    // the full remainder when it can fit the independent hard byte budget.
+    if text.len().saturating_sub(start) <= bytes {
+        let content = json_string_content_size(&text[start..]);
+        let eof_frame = json_size(&ResultPage {
+            text: String::new(),
+            next: None,
+            eof: true,
+        })?
+        .saturating_add(content);
+        if eof_frame.bytes <= bytes && eof_frame.tokens() <= tokens {
+            return Ok(make(text.len()));
         }
     }
+    let framing = json_size(&ResultPage {
+        text: String::new(),
+        next: Some(ResultCursor {
+            version: version.into(),
+            offset: 0,
+        }),
+        eof: false,
+    })?;
+    let mut content = TextSize::default();
+    let mut best = None;
+    for (offset, ch) in text[start..].char_indices() {
+        let end = start + offset + ch.len_utf8();
+        if end == text.len() {
+            break;
+        } // EOF was considered above.
+        content = content.saturating_add(json_string_content_size(&text[start + offset..end]));
+        let digit_extra = end.ilog10() as usize; // offset 0 frame has one digit.
+        let size = framing.saturating_add(content).saturating_add(TextSize {
+            utf16_units: digit_extra as u64,
+            bytes: digit_extra,
+        });
+        if size.bytes > bytes || size.tokens() > tokens {
+            break;
+        }
+        best = Some(end);
+    }
+    let best = best.map(make);
     let page = best.ok_or_else(|| anyhow::anyhow!("result page framing does not fit"))?;
     anyhow::ensure!(
         page.eof || !page.text.is_empty(),
@@ -152,6 +213,19 @@ mod tests {
             );
         }
         assert!(result_excerpt(&source, "ref", 1, 1).is_err());
+    }
+    #[test]
+    fn json_excerpt_keeps_escaped_content_inside_the_hard_envelope_budget() {
+        let text = format!("BEGIN{}END", "\n\"\\\u{0}🌍".repeat(1000));
+        let frame = json_size(&serde_json::json!({"text":"", "reference":"ref"})).unwrap();
+        let result = result_excerpt_in_json(&text, "ref", 200, 700, frame).unwrap();
+        let wire = serde_json::json!({"text":result,"reference":"ref"}).to_string();
+        assert!(wire.len() <= 700 && text_tokens(&wire) <= 200);
+        assert!(result.starts_with("BEGIN") && result.ends_with("END"));
+        assert!(result.contains("threads_tools_result_read"));
+        let empty = result_page("", "v", None, 100, 100).unwrap();
+        assert!(empty.eof && empty.next.is_none() && empty.text.is_empty());
+        assert!(result_page("🌍", "v", None, 1, 1).is_err());
     }
     #[test]
     fn pages_reconstruct_exact_unicode_with_framing_and_version() {

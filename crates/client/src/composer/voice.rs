@@ -8,7 +8,7 @@ use crate::core::{ClientCore, ClientTransitionOutcome};
 use crate::rpc::JsonRpcRequestTransport;
 use crate::transport::ws::command_sender;
 use pioneer_protocol::{
-    VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
+    VoiceAudioFormat, VoiceAudioIntegrity, VoiceSessionCancelParams, VoiceSessionCancelResponse,
     VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionStartParams,
     VoiceSessionStartResponse,
 };
@@ -45,6 +45,9 @@ pub(super) struct VoiceSessionCleanup {
     identity: ComposerOperationIdentity,
     authority: Option<(String, String, String, u64)>,
     cleanup_requested: bool,
+    audio_integrity: VoiceAudioIntegrity,
+    audio_closed: bool,
+    audio_failed: bool,
 }
 const VOICE_SESSION_CLEANUP_LIMIT: usize = 64;
 
@@ -295,6 +298,9 @@ impl ClientCore {
                         identity: identity.clone(),
                         authority: authority.clone(),
                         cleanup_requested: false,
+                        audio_integrity: VoiceAudioIntegrity::default(),
+                        audio_closed: false,
+                        audio_failed: false,
                     },
                 );
             }
@@ -330,6 +336,19 @@ impl ClientCore {
                     })
                     .ok_or_else(|| anyhow::anyhow!("Voice session owner retired"))?;
                 session.session_id = Some(response.session_id.clone());
+            }
+            if response.audio_integrity_version != Some(1) {
+                // Record exact-session cleanup before rejecting an old peer. Never
+                // start capture against a server that cannot verify the final tail.
+                let _ = self.cancel_composer_voice_session_using(
+                    ComposerVoiceCancelRequest {
+                        operation: identity.clone(),
+                        session_id: response.session_id,
+                        reason: Some("voice_audio_integrity_unsupported".into()),
+                    },
+                    sender,
+                );
+                anyhow::bail!("Gateway does not support complete voice capture");
             }
             if self
                 .composer_intent(ComposerIntent::VoiceSessionStarted {
@@ -420,15 +439,59 @@ impl ClientCore {
             self.composer_voice_session_matches(identity, &session_id),
             "Voice operation cancelled"
         );
-        let result = sender.send_voice_audio_chunk_for_connection(
-            connection,
-            session_id,
-            sequence,
-            audio_format,
-            captured_at_unix_ms,
-            duration_ms,
-            pcm_chunk,
-        );
+        let result = (|| {
+            // Serialize admission and sealing, not network IO. Every successful
+            // handoff is ordered before the finalize RPC on this connection.
+            let mut store = self.composer_store.lock().expect("composer store poisoned");
+            let session = store
+                .voice_sessions
+                .get_mut(&identity.generation)
+                .filter(|session| {
+                    session.identity == *identity
+                        && session.session_id.as_deref() == Some(session_id.as_str())
+                })
+                .ok_or_else(|| anyhow::anyhow!("Voice session owner retired"))?;
+            anyhow::ensure!(!session.audio_closed, "Voice audio admission is closed");
+            anyhow::ensure!(!session.audio_failed, "Voice audio delivery failed");
+            // Pessimistic until this exact handoff succeeds. A concurrent Commit
+            // must see the failure before terminal cleanup acquires the store.
+            session.audio_failed = true;
+            anyhow::ensure!(
+                audio_format.matches_pioneer_streaming_target(),
+                "Voice audio must be normalized PCM"
+            );
+            anyhow::ensure!(
+                !pcm_chunk.is_empty() && pcm_chunk.len() % 2 == 0,
+                "Voice PCM sample is incomplete"
+            );
+            anyhow::ensure!(
+                sequence == session.audio_integrity.next_sequence,
+                "Voice audio sequence gap or duplicate"
+            );
+            let next_sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("Voice audio sequence overflow"))?;
+            let normalized_samples = session
+                .audio_integrity
+                .normalized_samples
+                .checked_add((pcm_chunk.len() / 2) as u64)
+                .ok_or_else(|| anyhow::anyhow!("Voice audio sample count overflow"))?;
+            sender.send_voice_audio_chunk_for_connection(
+                connection,
+                session_id,
+                sequence,
+                audio_format,
+                captured_at_unix_ms,
+                duration_ms,
+                pcm_chunk,
+            )?;
+            session.audio_integrity = VoiceAudioIntegrity {
+                next_sequence,
+                normalized_samples,
+            };
+            session.audio_failed = false;
+            Ok(())
+        })();
         if let Err(error) = &result {
             self.complete_composer_operation(
                 identity.clone(),
@@ -494,13 +557,34 @@ impl ClientCore {
                 == ClientTransitionOutcome::Changed,
             "Voice finalization cancelled or already requested"
         );
-        let result = command_sender::voice_session_finalize(
-            sender,
-            VoiceSessionFinalizeParams {
-                session_id: session_id.clone(),
-                context,
-            },
-        );
+        let result = (|| {
+            let audio_integrity = {
+                let mut store = self.composer_store.lock().expect("composer store poisoned");
+                let session = store
+                    .voice_sessions
+                    .get_mut(&identity.generation)
+                    .filter(|session| {
+                        session.identity == identity
+                            && session.session_id.as_deref() == Some(session_id.as_str())
+                            && session.authority == authority
+                            && !session.audio_closed
+                            && !session.audio_failed
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Voice audio already closed or authority retired")
+                    })?;
+                session.audio_closed = true;
+                session.audio_integrity
+            };
+            command_sender::voice_session_finalize(
+                sender,
+                VoiceSessionFinalizeParams {
+                    session_id: session_id.clone(),
+                    context,
+                    audio_integrity: Some(audio_integrity),
+                },
+            )
+        })();
         let result = result.and_then(|response| {
             let terminal = self
                 .composer_snapshot(&identity.thread_id)
@@ -866,7 +950,7 @@ mod tests {
                 "voice/session/start" => {
                     assert_eq!(request["params"]["context"]["thread_id"], self.thread.id);
                     (self.on_start)();
-                    serde_json::json!({ "session_id": "session", "status": "recording" })
+                    serde_json::json!({ "session_id": "session", "status": "recording", "audio_integrity_version": 1 })
                 }
                 "voice/session/finalize" if self.fail_finalize => {
                     return Err("synthetic finalize failure".into());
@@ -1611,6 +1695,9 @@ mod tests {
                     },
                     authority: None,
                     cleanup_requested: false,
+                    audio_integrity: VoiceAudioIntegrity::default(),
+                    audio_closed: false,
+                    audio_failed: false,
                 },
             );
         }
@@ -1660,7 +1747,8 @@ mod tests {
         assert_eq!(transport.calls.borrow().len(), 2);
         assert_eq!(
             transport.calls.borrow()[1]["params"],
-            serde_json::json!({ "session_id": "session", "context": context })
+            serde_json::json!({ "session_id": "session", "context": context,
+                "audio_integrity": { "next_sequence": 0, "normalized_samples": 0 } })
         );
         assert_eq!(
             core.composer_snapshot("thread").unwrap().draft().text,
@@ -1681,6 +1769,117 @@ mod tests {
                 .draft()
                 .text
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn finalize_carries_every_admitted_normalized_sample_and_failed_sequence_cannot_publish_prefix()
+    {
+        for invalid_sequence in [None, Some(0), Some(2)] {
+            let (core, identity, thread) = fixture();
+            connection(&core, 7);
+            let transport = Transport {
+                thread,
+                calls: Default::default(),
+                on_start: Box::new(|| {}),
+                fail_finalize: false,
+            };
+            core.start_composer_voice_session_using(start_request(identity.clone()), &transport)
+                .unwrap();
+            let send = |sequence, samples: usize| {
+                core.send_composer_voice_audio_chunk(
+                    &identity,
+                    "session".into(),
+                    sequence,
+                    VoiceAudioFormat::pioneer_streaming_target(),
+                    None,
+                    None,
+                    vec![0; samples * 2],
+                )
+            };
+            send(0, 2).unwrap();
+            if let Some(sequence) = invalid_sequence {
+                assert!(send(sequence, 5).is_err());
+                assert!(
+                    core.finalize_composer_voice_session_using(
+                        ComposerVoiceFinalizeRequest {
+                            operation: identity.clone()
+                        },
+                        &transport,
+                    )
+                    .is_err()
+                );
+                assert!(
+                    !transport
+                        .calls
+                        .borrow()
+                        .iter()
+                        .any(|call| call["method"] == "voice/session/finalize")
+                );
+                assert_eq!(
+                    core.composer_snapshot("thread").unwrap().draft().text,
+                    "preserved draft"
+                );
+            } else {
+                send(1, 5).unwrap();
+                prepare(&core, &identity);
+                core.finalize_composer_voice_session_using(
+                    ComposerVoiceFinalizeRequest {
+                        operation: identity.clone(),
+                    },
+                    &transport,
+                )
+                .unwrap();
+                assert_eq!(
+                    transport.calls.borrow().last().unwrap()["params"]["audio_integrity"],
+                    serde_json::json!({"next_sequence": 2, "normalized_samples": 7})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_gateway_start_is_cancelled_before_capture_can_use_its_session() {
+        struct Legacy<'a>(Transport<'a>);
+        impl JsonRpcRequestTransport for Legacy<'_> {
+            fn send_json_rpc_request(
+                &self,
+                id: String,
+                payload: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                if request["method"] == "voice/session/start" {
+                    self.0.calls.borrow_mut().push(request);
+                    return response.send(Ok(serde_json::json!({"session_id":"legacy-session", "status":"recording"})))
+                        .map_err(|error| error.to_string());
+                }
+                self.0.send_json_rpc_request(id, payload, response)
+            }
+        }
+        let (core, identity, thread) = fixture();
+        let transport = Legacy(Transport {
+            thread,
+            calls: Default::default(),
+            on_start: Box::new(|| {}),
+            fail_finalize: false,
+        });
+        assert!(
+            core.start_composer_voice_session_using(start_request(identity.clone()), &transport)
+                .is_err()
+        );
+        assert!(!core.composer_voice_session_matches(&identity, "legacy-session"));
+        assert_eq!(
+            transport.0.calls.borrow().last().unwrap()["params"]["session_id"],
+            "legacy-session"
+        );
+        assert_eq!(
+            transport.0.calls.borrow().last().unwrap()["method"],
+            "voice/session/cancel"
+        );
+        assert_eq!(
+            core.composer_snapshot("thread").unwrap().draft().text,
+            "preserved draft"
         );
     }
 

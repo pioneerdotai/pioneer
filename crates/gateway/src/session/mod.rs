@@ -496,6 +496,40 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Exact connection gate for a completed local task/wait. Serialization and
+    /// resource policy resolution must finish first; no database capacity or
+    /// queue waiting occurs under this lock. A same-identity renewal can update
+    /// access expiry; it cannot substitute another principal/session/policy.
+    pub(crate) async fn try_send_wait_response(
+        &self,
+        connection_id: ConnectionId,
+        expected: &AuthenticatedSessionPrincipal,
+        payload: String,
+    ) -> Result<bool> {
+        let connections = self.connections.read().await;
+        let Some(connection) = connections.get(&connection_id) else {
+            return Ok(false);
+        };
+        let now = crate::helpers::unix_timestamp_secs()?;
+        let current = connection.principal.as_ref();
+        if current.gateway_id != expected.gateway_id
+            || current.principal_id != expected.principal_id
+            || current.device_id != expected.device_id
+            || current.session_id != expected.session_id
+            || current.kind != expected.kind
+            || current.role_key != expected.role_key
+            || connection.termination_tx.borrow().is_some()
+            || now >= current.access_expires_at_unix
+        {
+            return Ok(false);
+        }
+        connection
+            .sender
+            .try_send(Message::Text(payload.into()))
+            .map_err(|_| anyhow!("task wait outbound full or closed"))?;
+        Ok(true)
+    }
+
     /// Run a synchronous final scope/generation gate at the existing outbound
     /// lane. The callback cannot await or hold database capacity.
     pub(crate) async fn with_notification_outbound<T>(
