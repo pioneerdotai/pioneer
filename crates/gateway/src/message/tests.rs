@@ -16810,7 +16810,10 @@ fn owned_voice_ingress_case(
         )
         .await;
         let mut entered_rx = Some(entered_rx);
-        let initial_chunks = if early { 30 } else { 1 };
+        // Feed the first backlog packet before waiting for the 3 s preview:
+        // 48,000 samples leave an incomplete 512-sample VAD frame. This packet
+        // completes it without changing the source PCM or its total duration.
+        let initial_chunks = if early { 31 } else { 1 };
         for sequence in 0..initial_chunks {
             processor
                 .process_binary_frame_for_connection(
@@ -16819,7 +16822,15 @@ fn owned_voice_ingress_case(
                         &session.session_id,
                         sequence,
                         if early { 1600 } else { 960 },
-                        if terminal == "silence" { 0 } else { 12000 },
+                        if terminal == "silence"
+                            || (sequence == 30 && terminal == "sealed_tail_error")
+                        {
+                            0
+                        } else if sequence == 30 {
+                            6000
+                        } else {
+                            12000
+                        },
                     ),
                 )
                 .await
@@ -16851,7 +16862,7 @@ fn owned_voice_ingress_case(
                     .state,
                 crate::voice::session_store::GatewayVoiceSessionState::Recording
             );
-            // Duplicate accepted sequence is ACKed without replay. Keep a full
+            // Duplicate accepted sequences are ACKed without replay. Keep a full
             // second source span and a seven-sample tail behind native work.
             let last_sequence = match terminal {
                 "long_context" | "long_tail_error" | "buffered_long" => 200,
@@ -17242,12 +17253,14 @@ fn owned_voice_ingress_case(
             } else if terminal == "sealed_tail_error" {
                 assert_eq!(
                     calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, 55200, 7687]
+                    vec![48000, 55296, 7943]
                 );
                 let mut confirmed_source = vec![12000.0 / 32768.0; 48000];
-                confirmed_source.extend([0.0; 7200]);
+                // The mixed 512-sample frame ends at 48128, followed by
+                // fourteen real hangover frames before the span is sealed.
+                confirmed_source.extend([0.0; 7296]);
                 assert_eq!(calls[1], confirmed_source);
-                let mut tail = vec![0.0; 7680];
+                let mut tail = vec![0.0; 7936];
                 tail.extend([3000.0 / 32768.0; 7]);
                 assert_eq!(calls[2], tail);
             } else if matches!(terminal, "closed_13" | "closed_17") {
