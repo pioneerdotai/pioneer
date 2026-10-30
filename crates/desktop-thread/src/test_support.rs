@@ -197,12 +197,21 @@ impl crate::ports::ThreadExternalNavigationPort for ThreadPorts {
 }
 
 pub(crate) fn install_thread_timeline(client: &ClientCore, id: &str, text: &str) {
+    install_thread_timeline_at_revision(client, id, text, 1);
+}
+
+pub(crate) fn install_thread_timeline_at_revision(
+    client: &ClientCore,
+    id: &str,
+    text: &str,
+    revision: i64,
+) {
     client.upsert_thread(serde_json::from_value(serde_json::json!({
         "created_at":1,"id":id,"mode":"Chat","model":"synthetic-model","model_provider":"synthetic-provider","origin_kind":"user","preview":"","sidebar_visibility":"visible","status":"Idle","turns":[],"updated_at":2,"workspace_id":"workspace"
     })).unwrap());
     client.apply_thread_timeline_page(serde_json::from_value(serde_json::json!({
-        "workspaceId":"workspace","threadId":id,"projectionVersion":1,
-        "blocks":[{"workspaceId":"workspace","threadId":id,"blockId":"message","turnId":"turn","sortKey":"1","kind":{"kind":"user_message","text":text,"mode":"Message"}}],
+        "workspaceId":"workspace","threadId":id,"projectionVersion":revision,
+        "blocks":[{"workspaceId":"workspace","threadId":id,"blockId":"message","turnId":"turn","sortKey":"1","kind":{"kind":"user_message","text":text,"mode":"Message","revision":revision}}],
         "page":{"hasMoreBefore":false,"hasMoreAfter":false}
     })).unwrap(), pioneer_client::timeline::semantic::TopLevelPageMergeMode::Reset);
 }

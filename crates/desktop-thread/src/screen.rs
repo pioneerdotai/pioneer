@@ -100,10 +100,7 @@ impl Render for TimelineView {
 }
 impl TimelineView {
     fn render_preparing_send(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        // Timeline and editor bindings advance independently. Read the current
-        // Composer owner when painting this surface in the timeline's own frame,
-        // so a delayed editor echo cannot duplicate the optimistic message.
-        let input = self.client.composer_snapshot(&self.thread_id)?;
+        let input = self.composer_input.as_ref()?;
         let preparing = input.preparing_send()?;
         Some(
             v_flex()
@@ -509,7 +506,15 @@ impl TimelineView {
                     if view
                         .update_in(cx, |view, window, cx| {
                             if changes.iter().all(|publication| matches!(publication.scope(), pioneer_client::core::ClientScope::Timeline { .. })) {
-                                if crate::timeline::controller::DesktopTimelineController::reconcile_publication(view, window, cx) { cx.notify(); }
+                                // The timeline can advance before the editor binding.
+                                // Capture its current Composer input before notifying;
+                                // render only consumes the retained presentation.
+                                let next = view.client.composer_snapshot(&view.thread_id);
+                                let preparing_changed = view.composer_input.as_ref()
+                                    .and_then(|input| input.preparing_send())
+                                    != next.as_ref().and_then(|input| input.preparing_send());
+                                view.composer_input = next;
+                                if crate::timeline::controller::DesktopTimelineController::reconcile_publication(view, window, cx) || preparing_changed { cx.notify(); }
                                 return;
                             }
                             let only_composer_text = changes.iter().all(|publication| {
@@ -611,11 +616,9 @@ impl TimelineView {
         use pioneer_client::core::ClientScope;
         let bindings = self.thread_bindings.clone();
         let payload = |scope: ClientScope| bindings.publication(&scope);
-        self.composer_input = payload(ClientScope::Composer {
-            thread_id: self.thread_id.clone(),
-        })
-        .and_then(|p| p.typed::<ComposerPublication>())
-        .map(|p| p.payload());
+        // Mixed batches can also carry a timeline newer than the retained
+        // Composer binding. Capture the current owner during synchronization.
+        self.composer_input = self.client.composer_snapshot(&self.thread_id);
         self.catalog_input = payload(ClientScope::ComposerCatalog {
             thread_id: self.thread_id.clone(),
         })
@@ -902,7 +905,12 @@ mod tests {
             assert!(view.render_preparing_send(cx).is_some())
         });
         client.complete_composer_operation(identity, ComposerOperationCompletion::Sent);
-        crate::test_support::install_thread_timeline(&client, "a", "Captured message");
+        crate::test_support::install_thread_timeline_at_revision(
+            &client,
+            "a",
+            "Captured message",
+            2,
+        );
         // Deliver only the new timeline. The Composer binding deliberately retains
         // the old captured operation, as independently scheduled views may do.
         binding.publish(
@@ -915,9 +923,14 @@ mod tests {
         cx.run_until_parked();
         screen.update(cx, |view, cx| {
             assert!(
-                view.composer_input
-                    .as_ref()
+                binding
+                    .publication(&ClientScope::Composer {
+                        thread_id: "a".into()
+                    })
                     .unwrap()
+                    .typed::<ComposerPublication>()
+                    .unwrap()
+                    .payload()
                     .preparing_send()
                     .is_some()
             );
