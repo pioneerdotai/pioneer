@@ -300,12 +300,50 @@ struct PageFailure {
     retryable: bool,
 }
 
+// Evidence belongs to one admitted generation, including queued/RPC quanta.
+// It is not a cache tombstone: completion/cancellation drops the whole value.
+const REMOVAL_ID_LIMIT: usize = 4_096;
+const REMOVAL_BYTE_LIMIT: usize = 64 * 1024;
+
+#[derive(Clone, Default)]
+pub(crate) struct PageRemovals {
+    ids: HashSet<String>,
+    bytes: usize,
+    full: bool,
+}
+impl PageRemovals {
+    fn record(&mut self, id: &str) {
+        if self.full || self.ids.contains(id) {
+            return;
+        }
+        if self.ids.len() >= REMOVAL_ID_LIMIT
+            || id.len() > REMOVAL_BYTE_LIMIT.saturating_sub(self.bytes)
+        {
+            self.full = true;
+            return;
+        }
+        self.bytes += id.len();
+        self.ids.insert(id.to_owned());
+    }
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+    pub(crate) fn is_full(&self) -> bool {
+        self.full
+    }
+}
+struct ActivePageRequest {
+    generation: u64,
+    action: PageAction,
+    removals: PageRemovals,
+}
+
 #[derive(Default)]
 pub struct ThreadTimelineController {
     pub(crate) in_flight: HashSet<PageKey>,
     pub(crate) pending: HashMap<PageKey, PageAction>,
     pending_explicit: HashSet<PageKey>,
-    requests: HashMap<PageKey, (u64, PageAction)>,
+    requests: HashMap<PageKey, ActivePageRequest>,
     failures: HashMap<PageKey, PageFailure>,
     failed_refreshes: HashMap<String, PageAction>,
     demands: HashMap<(String, String), TimelineDemand>,
@@ -332,7 +370,7 @@ impl ThreadTimelineController {
             && self
                 .requests
                 .get(&key)
-                .is_some_and(|(_, action)| is_newest_refresh(action))
+                .is_some_and(|request| is_newest_refresh(&request.action))
     }
 
     pub(crate) fn retain_domain_request(&mut self, key: &PageKey) {
@@ -415,13 +453,18 @@ impl ThreadTimelineController {
             .keys()
             .chain(self.pending.keys())
             .chain(self.failures.keys())
+            .chain(
+                self.failed_refreshes
+                    .values()
+                    .map(semantic::semantic_timeline_request_key),
+            )
             .collect::<HashSet<_>>();
         keys.insert(&key);
         let (candidate_ids, candidate_bytes) = action_resources(&candidate);
         let (ids, bytes) = self
             .requests
             .values()
-            .map(|(_, action)| action)
+            .map(|request| &request.action)
             .chain(
                 self.pending
                     .iter()
@@ -436,7 +479,7 @@ impl ThreadTimelineController {
                     && !self
                         .requests
                         .get(saved_key)
-                        .is_some_and(|(_, active)| active == *saved)
+                        .is_some_and(|request| &request.action == *saved)
             }))
             .map(action_resources)
             .fold(
@@ -463,7 +506,14 @@ impl ThreadTimelineController {
             return Ok(None);
         };
         self.clock = self.clock.saturating_add(1);
-        self.requests.insert(key, (self.clock, action.clone()));
+        self.requests.insert(
+            key,
+            ActivePageRequest {
+                generation: self.clock,
+                action: action.clone(),
+                removals: PageRemovals::default(),
+            },
+        );
         Ok(Some(action))
     }
 
@@ -507,11 +557,11 @@ impl ThreadTimelineController {
             || !self
                 .requests
                 .get(key)
-                .is_some_and(|(_, action)| is_newest_refresh(action))
+                .is_some_and(|request| is_newest_refresh(&request.action))
         {
             return false;
         }
-        let (_, action) = self.requests.remove(key).unwrap();
+        let action = self.requests.remove(key).unwrap().action;
         self.in_flight.remove(key);
         self.failed_refreshes
             .insert(request_thread_id(key).to_owned(), action);
@@ -560,12 +610,58 @@ impl ThreadTimelineController {
         }))
     }
 
+    pub(crate) fn record_removals(&mut self, thread: &str, turn: Option<&str>, ids: &[String]) {
+        for request in self.requests.values_mut() {
+            if request.removals.is_full() {
+                continue;
+            }
+            match &request.action {
+                PageAction::ThreadTimelinePage { params, .. }
+                    if turn.is_none() && params.thread_id == thread =>
+                {
+                    for id in ids {
+                        request.removals.record(id);
+                        if request.removals.is_full() {
+                            break;
+                        }
+                    }
+                }
+                PageAction::TurnWorkItemsGet { params, .. }
+                    if params.thread_id == thread && Some(params.turn_id.as_str()) == turn =>
+                {
+                    for id in ids
+                        .iter()
+                        .filter(|id| params.work_item_ids.binary_search(id).is_ok())
+                    {
+                        request.removals.record(id);
+                        if request.removals.is_full() {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) fn request_removals(&self, key: &PageKey, generation: u64) -> Option<&PageRemovals> {
+        self.requests
+            .get(key)
+            .filter(|request| request.generation == generation)
+            .map(|request| &request.removals)
+    }
+
     pub(crate) fn request_generation(&self, key: &PageKey) -> u64 {
-        self.requests.get(key).map_or(0, |r| r.0)
+        self.requests
+            .get(key)
+            .map_or(0, |request| request.generation)
     }
 
     pub(crate) fn accepts(&self, key: &PageKey, generation: u64) -> bool {
-        self.requests.get(key).is_some_and(|r| r.0 == generation) && self.in_flight.contains(key)
+        self.requests
+            .get(key)
+            .is_some_and(|request| request.generation == generation)
+            && self.in_flight.contains(key)
     }
 
     pub(crate) fn page_retry_allowed(&self, key: &PageKey, now_ms: u64) -> bool {
@@ -590,7 +686,7 @@ impl ThreadTimelineController {
         retryable: bool,
         now_ms: u64,
     ) -> Option<PageAction> {
-        let (_, action) = self.requests.remove(key)?;
+        let action = self.requests.remove(key)?.action;
         let is_refresh = is_newest_refresh(&action);
         // Around/Oldest share the key, but do not own the failed Newest walk.
         let preserves_recovery = matches!(key, PageKey::ThreadNewest { .. })
@@ -677,7 +773,24 @@ impl ThreadTimelineController {
     }
 
     pub(crate) fn reset_page_retry(&mut self, key: &PageKey) {
-        self.failures.remove(key);
+        if self
+            .failed_refreshes
+            .values()
+            .any(|saved| semantic::semantic_timeline_request_key(saved) == key)
+        {
+            // Manual Retry resets the budget, but the saved obligation must
+            // retain an immediate deadline even if re-admission cannot run.
+            self.failures.insert(
+                key.clone(),
+                PageFailure {
+                    attempts: 0,
+                    retry_at_ms: 0,
+                    retryable: true,
+                },
+            );
+        } else {
+            self.failures.remove(key);
+        }
     }
 
     pub(crate) fn next_refresh_deadline(&self) -> Option<u64> {
@@ -810,8 +923,10 @@ impl ThreadTimelineController {
                 }
             } else if let PageAction::TurnWorkItemsGet { params, .. } = &action {
                 let mut missing = params.clone();
-                if let Some((_, PageAction::TurnWorkItemsGet { params: active, .. })) =
-                    self.requests.get(&key)
+                if let Some(ActivePageRequest {
+                    action: PageAction::TurnWorkItemsGet { params: active, .. },
+                    ..
+                }) = self.requests.get(&key)
                 {
                     missing
                         .work_item_ids
@@ -1697,6 +1812,56 @@ mod tests {
     }
 
     #[test]
+    fn manual_retry_keeps_saved_recovery_reserved_during_readmission_gap() {
+        let mut policy = ThreadTimelineController::default();
+        let mut saved = page();
+        if let PageAction::ThreadTimelinePage { params, .. } = &mut saved {
+            params.limit = Some(17);
+        }
+        let key = semantic::semantic_timeline_request_key(&saved).clone();
+        let first = policy.update(demand("visible"), vec![saved.clone()], 0);
+        assert_eq!(first.pages.len(), 1);
+        assert!(policy.finish(&key, false, 0).is_none());
+        let other = |index| PageAction::ThreadTimelinePage {
+            key: PageKey::ThreadNewest {
+                thread_id: format!("other-{index}"),
+            },
+            params: pioneer_protocol::ThreadTimelinePageParams {
+                thread_id: format!("other-{index}"),
+                anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                limit: Some(12),
+            },
+        };
+        for index in 0..HISTORY_KEY_LIMIT - 1 {
+            assert!(policy.begin(other(index)).unwrap().is_some());
+        }
+        // Retry releases its caller's registry lock before presentation/re-admission.
+        // A competing key must not take the retained recovery's logical slot.
+        assert!(policy.retry("a", "visible", 1).is_some());
+        let competitor = other(HISTORY_KEY_LIMIT);
+        assert_eq!(policy.begin(competitor.clone()), Err(competitor.clone()));
+        assert_eq!(
+            policy.next_refresh_deadline(),
+            None,
+            "Retry has removed the old failure; saved action alone reserves its key"
+        );
+        // ClientCore performs this within the same registry critical section as
+        // Retry, before any presentation lookup can return early.
+        policy.reset_page_retry(&key);
+        assert_eq!(policy.next_refresh_deadline(), Some(0));
+        let next = policy.due_refreshes(0, |_| true);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].action, saved);
+        assert!(next[0].generation > first.pages[0].generation);
+        assert!(policy.finish(&key, true, 0).is_none());
+        assert_eq!(policy.next_refresh_deadline(), None);
+        assert!(
+            policy.begin(competitor).unwrap().is_some(),
+            "success releases exactly the saved reservation"
+        );
+    }
+
+    #[test]
     fn saturated_scheduler_defers_exact_recovery_without_consuming_network_retry_budget() {
         let mut policy = ThreadTimelineController::default();
         let action = page();
@@ -1879,6 +2044,13 @@ impl crate::core::ClientCore {
                     return TimelineEffectPlan::default();
                 };
                 retry_refresh = registry.timeline.failed_refreshes.get(&thread_id).cloned();
+                if let Some(saved) = &retry_refresh {
+                    // Restore the reset budget's deadline before releasing this
+                    // lock. Presentation can be missing/stale on re-admission.
+                    registry
+                        .timeline
+                        .reset_page_retry(semantic::semantic_timeline_request_key(saved));
+                }
                 demand
             }
         };
@@ -1990,7 +2162,37 @@ impl crate::core::ClientCore {
             .demands
             .get(&(demand.thread_id.clone(), demand.consumer_id.clone()))
             != Some(&demand);
+        // Reserve the exact saved action before demand planning can admit a Newest
+        // with freshly planned parameters for the same logical key.
+        let retry_request = retry_refresh.and_then(|action| {
+            let key = semantic::semantic_timeline_request_key(&action).clone();
+            if registry
+                .timeline
+                .has_active_refresh(request_thread_id(&key))
+            {
+                return None;
+            }
+            registry.timeline.reset_page_retry(&key);
+            registry.timeline.retain_domain_request(&key);
+            match registry.timeline.begin(action) {
+                Ok(Some(action)) => Some(Ok(TimelinePageRequest {
+                    action,
+                    generation: registry.timeline.request_generation(&key),
+                })),
+                Ok(None) => None,
+                Err(action) => Some(Err(TimelinePageRejection {
+                    request_generation: registry.timeline.request_generation(&key),
+                    action,
+                    store_generation: 0,
+                })),
+            }
+        });
         let mut plan = registry.timeline.update(demand, actions, now_ms);
+        match retry_request {
+            Some(Ok(page)) => plan.pages.insert(0, page),
+            Some(Err(rejected)) => plan.rejected.push(rejected),
+            None => {}
+        }
         if changed_demand
             && registry.timeline.demands.get(&(
                 current_demand.thread_id.clone(),
@@ -2003,25 +2205,6 @@ impl crate::core::ClientCore {
                 &semantic_rows,
                 &semantic_ids,
             );
-        }
-        if let Some(action) = retry_refresh {
-            let key = semantic::semantic_timeline_request_key(&action).clone();
-            registry.timeline.reset_page_retry(&key);
-            registry.timeline.retain_domain_request(&key);
-            match registry.timeline.begin(action) {
-                Ok(Some(action)) => plan.pages.push(TimelinePageRequest {
-                    action,
-                    generation: registry.timeline.request_generation(&key),
-                }),
-                Ok(None) => {}
-                Err(action) => plan.rejected.push(TimelinePageRejection {
-                    request_generation: registry
-                        .timeline
-                        .request_generation(semantic::semantic_timeline_request_key(&action)),
-                    action,
-                    store_generation: 0,
-                }),
-            }
         }
         for rejected in &mut plan.rejected {
             rejected.store_generation = registry

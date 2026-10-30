@@ -2682,18 +2682,25 @@ fn remove_existing_work_items_for_item_id(
     changed
 }
 
+pub(crate) fn accepts_turn_work_items_change(
+    state: &SemanticTimelineState,
+    thread_id: &str,
+    turn_id: &str,
+) -> bool {
+    state.thread(thread_id).is_none_or(|thread| {
+        !thread.turn_work_tombstone_revisions.contains_key(turn_id)
+            && !thread.admission_turn_ids.contains(turn_id)
+    })
+}
+
 pub fn apply_turn_work_items_changed(
     state: &mut SemanticTimelineState,
     notification: TurnWorkItemsChangedNotification,
 ) -> bool {
-    let thread = state.thread_mut(notification.thread_id);
-    if thread
-        .turn_work_tombstone_revisions
-        .contains_key(&notification.turn_id)
-        || thread.admission_turn_ids.contains(&notification.turn_id)
-    {
+    if !accepts_turn_work_items_change(state, &notification.thread_id, &notification.turn_id) {
         return false;
     }
+    let thread = state.thread_mut(notification.thread_id);
     let range = thread.work_range_mut(notification.turn_id);
     let mut changed = false;
     let mut removed_item = false;

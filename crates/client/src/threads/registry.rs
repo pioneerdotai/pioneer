@@ -1583,6 +1583,28 @@ impl ClientCore {
         };
         let mut state = self.thread_timeline_mutation(id, workspace)?;
         let generation = state.registry.stores[id].generation;
+        // Record accepted-scope removals even when removing an absent value
+        // leaves semantic state unchanged. Preserve the reducer's turn guards.
+        match &update {
+            ThreadTimelineBlocksChanged(n) => {
+                state
+                    .registry
+                    .timeline
+                    .record_removals(id, None, &n.removed_block_ids)
+            }
+            TurnWorkItemsChanged(n)
+                if crate::timeline::semantic::accepts_turn_work_items_change(
+                    &state, id, &n.turn_id,
+                ) =>
+            {
+                state.registry.timeline.record_removals(
+                    id,
+                    Some(&n.turn_id),
+                    &n.removed_work_item_ids,
+                );
+            }
+            _ => {}
+        }
         let changed = crate::timeline::semantic::apply_semantic_timeline_live_update(
             &mut state,
             update.clone(),
@@ -5902,8 +5924,18 @@ mod tests {
     fn current_demand_preempts_between_pages_and_recovery_advances_under_visible_pressure() {
         let (core, receiver) = reconciliation_core();
         core.upsert_thread(thread("b", "ws"));
-        core.thread_demand_changed(&scope("a"), ClientDemand::Prefetch);
-        core.thread_demand_changed(&scope("b"), ClientDemand::Prefetch);
+        core.thread_demand_changed(
+            &ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            ClientDemand::Prefetch,
+        );
+        core.thread_demand_changed(
+            &ClientScope::Timeline {
+                thread_id: "b".into(),
+            },
+            ClientDemand::Prefetch,
+        );
         let action = |id: &str| SemanticTimelineRequestAction::ThreadTimelinePage {
             key: SemanticTimelineRequestKey::ThreadNewest {
                 thread_id: id.into(),
@@ -5938,7 +5970,12 @@ mod tests {
         // A's continuation is already ahead of B. Demand changes only after
         // B was enqueued, so an enqueue-time priority snapshot would choose A.
         core.schedule_thread_semantic_request(action("b")).unwrap();
-        core.thread_demand_changed(&scope("b"), ClientDemand::Visible);
+        core.thread_demand_changed(
+            &ClientScope::Timeline {
+                thread_id: "b".into(),
+            },
+            ClientDemand::Visible,
+        );
         assert_eq!(
             run_scheduled_semantic_quantum(&core, &receiver, &transport),
             "b"
@@ -6005,8 +6042,18 @@ mod tests {
         let core = core();
         core.upsert_thread(thread("a", "ws"));
         core.upsert_thread(thread("b", "ws"));
-        core.thread_demand_changed(&scope("a"), ClientDemand::Prefetch);
-        core.thread_demand_changed(&scope("b"), ClientDemand::Prefetch);
+        core.thread_demand_changed(
+            &ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            ClientDemand::Prefetch,
+        );
+        core.thread_demand_changed(
+            &ClientScope::Timeline {
+                thread_id: "b".into(),
+            },
+            ClientDemand::Prefetch,
+        );
         let (sender, receiver) = crate::threads::history_scheduler::channel();
         *core.thread_request_sender.lock().unwrap() = Some(sender);
         core.schedule_thread_semantic_request(SemanticTimelineRequestAction::TurnWorkItemsGet {
@@ -6037,7 +6084,12 @@ mod tests {
             },
         })
         .unwrap();
-        core.thread_demand_changed(&scope("b"), ClientDemand::Visible);
+        core.thread_demand_changed(
+            &ClientScope::Timeline {
+                thread_id: "b".into(),
+            },
+            ClientDemand::Visible,
+        );
         assert_eq!(
             run_scheduled_semantic_quantum(&core, &receiver, &transport),
             "b"
@@ -6067,7 +6119,12 @@ mod tests {
         let core = crate::catalog_test_support::settings_client();
         connect_subscription_test(&core);
         core.upsert_thread(thread("a", "ws"));
-        core.thread_demand_changed(&scope("a"), ClientDemand::Visible);
+        core.thread_demand_changed(
+            &ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            ClientDemand::Visible,
+        );
         for index in 0..crate::threads::history_scheduler::MAX_ORDINARY_JOBS {
             core.upsert_thread(thread(&format!("held-{index}"), "ws"));
         }
@@ -7393,6 +7450,126 @@ mod tests {
                 assert_eq!(receiver.try_iter().count(), 0);
             }
         }
+    }
+
+    #[test]
+    fn captured_unadmitted_refusal_cannot_overwrite_completed_same_key_generation() {
+        use crate::timeline::controller::{TimelineDemand, TimelineIntent};
+        use crate::timeline::semantic::TimelineRequestStatus;
+        let (core, _receiver) = reconciliation_core();
+        core.thread_demand_changed(
+            &ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            ClientDemand::Visible,
+        );
+        for index in 0..crate::timeline::controller::HISTORY_KEY_LIMIT {
+            let id = format!("held-{index}");
+            core.upsert_thread(thread(&id, "ws"));
+            core.begin_thread_semantic_request(SemanticTimelineRequestAction::ThreadTimelinePage {
+                key: SemanticTimelineRequestKey::ThreadNewest {
+                    thread_id: id.clone(),
+                },
+                params: ThreadTimelinePageParams {
+                    thread_id: id,
+                    anchor: TimelinePageAnchor::Newest,
+                    limit: Some(12),
+                },
+            })
+            .unwrap()
+            .unwrap();
+        }
+        core.materialize_demanded_timelines();
+        let timeline = core.thread_presentation_snapshot("a").unwrap().timeline();
+        let plan = core.plan_timeline_intent(
+            TimelineIntent::Update {
+                demand: TimelineDemand {
+                    thread_id: "a".into(),
+                    consumer_id: "refused".into(),
+                    generation: 1,
+                    source_revision: timeline.source_revision(),
+                    row_ids: vec![timeline.rows()[0].id().as_str().to_owned()],
+                    threshold: 0,
+                    before: true,
+                    after: false,
+                    work: false,
+                    presented_rows: true,
+                    scroll_generation: 1,
+                    latest_user_turn_id: None,
+                    viewed_through_turn_id: None,
+                    viewed_row_ids: vec![],
+                    viewed_through_block: None,
+                    read_requires_unread: false,
+                    prefetch_on_visibility: true,
+                    boundary_request_limit: 1,
+                },
+            },
+            0,
+        );
+        assert!(plan.pages.is_empty());
+        assert_eq!(plan.rejected.len(), 1);
+        let refused = &plan.rejected[0];
+        assert_eq!(refused.request_generation, 0);
+        for index in 0..crate::timeline::controller::HISTORY_KEY_LIMIT {
+            core.remove_thread_store(&format!("held-{index}"));
+        }
+        assert_eq!(
+            core.thread_operation_token("a").unwrap().generation,
+            refused.store_generation,
+            "free capacity without replacing the target store"
+        );
+        let new = core
+            .begin_thread_semantic_request(refused.action.clone())
+            .unwrap()
+            .unwrap();
+        let block = reconciliation_history().remove(0);
+        let transport = ReconciliationTransport {
+            calls: Default::default(),
+            reply: |_: usize, _: &ThreadTimelinePageParams| {
+                Ok(reconciliation_page(vec![block.clone()], false, false))
+            },
+        };
+        assert!(
+            core.execute_thread_semantic_request(&transport, new)
+                .is_none()
+        );
+        let key = crate::timeline::semantic::semantic_timeline_request_key(&refused.action);
+        assert_eq!(
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .timeline
+                .request_generation(key),
+            0,
+            "new operation has completed, not merely become active"
+        );
+        assert_eq!(
+            core.thread_operation_token("a").unwrap().generation,
+            refused.store_generation
+        );
+        let ready = core.thread_snapshot("a").unwrap();
+        assert_eq!(
+            ready.semantic.thread("a").unwrap().top_level.request_status,
+            TimelineRequestStatus::Ready
+        );
+        assert_eq!(
+            ready
+                .semantic
+                .thread("a")
+                .unwrap()
+                .top_level
+                .block(&block.block_id),
+            Some(&block)
+        );
+        core.fail_timeline_admission(
+            &refused.action,
+            refused.store_generation,
+            refused.request_generation,
+        );
+        assert!(
+            Arc::ptr_eq(&ready, &core.thread_snapshot("a").unwrap()),
+            "late refusal must not publish Failed or alter newer data"
+        );
     }
 
     #[test]
@@ -9289,6 +9466,11 @@ mod tests {
             "replace",
             "live-edit",
             "live-remove",
+            "absent",
+            "absent-remove",
+            "absent-new-generation",
+            "absent-replace",
+            "absent-evidence-full",
         ] {
             let core = core();
             core.upsert_thread(thread("a", "ws"));
@@ -9306,7 +9488,19 @@ mod tests {
                 items,
                 removed_work_item_ids: vec![],
             };
-            core.apply_turn_work_items_get_response(page(vec![original.clone()]));
+            let absent = outcome.starts_with("absent");
+            core.apply_turn_work_items_get_response(page(if absent {
+                vec![]
+            } else {
+                vec![original.clone()]
+            }));
+            let ids = if outcome == "absent-evidence-full" {
+                std::iter::once("item-0".to_owned())
+                    .chain((1..201).map(|ix| format!("item-{ix}-{}", "x".repeat(1024))))
+                    .collect::<Vec<_>>()
+            } else {
+                (0..201).map(|ix| format!("item-{ix}")).collect()
+            };
             let request = core
                 .begin_thread_semantic_request(SemanticTimelineRequestAction::TurnWorkItemsGet {
                     key: SemanticTimelineRequestKey::TurnWorkItems {
@@ -9316,7 +9510,7 @@ mod tests {
                     params: TurnWorkItemsGetParams {
                         thread_id: "a".into(),
                         turn_id: "turn".into(),
-                        work_item_ids: (0..201).map(|ix| format!("item-{ix}")).collect(),
+                        work_item_ids: ids.clone(),
                     },
                 })
                 .unwrap()
@@ -9327,12 +9521,20 @@ mod tests {
             } else {
                 "fetched".into()
             }));
+            let mut peer = run_action();
+            peer.work_item_id = "item-99".into();
+            peer.item_id = "peer-source".into();
+            peer.turn_id = "turn".into();
             let second = if outcome == "rpc" {
                 Err("late chunk failure".into())
             } else if outcome == "capacity" {
                 Ok(page(vec![incoming.clone()]))
             } else {
-                Ok(page(vec![]))
+                Ok(page(if absent && outcome != "absent-evidence-full" {
+                    vec![peer.clone()]
+                } else {
+                    vec![]
+                }))
             };
             let transport = Transport {
                 replies: std::cell::RefCell::new(vec![Ok(page(vec![incoming.clone()])), second]),
@@ -9342,21 +9544,50 @@ mod tests {
                 .execute_thread_semantic_request(&transport, request)
                 .unwrap();
             assert_eq!(transport.calls.get(), 1, "one RPC per quantum");
+            let before_apply = core.thread_semantic_snapshot("a");
             assert_eq!(
-                core.thread_semantic_snapshot("a")
+                before_apply
                     .thread("a")
                     .unwrap()
                     .work_range("turn")
                     .unwrap()
-                    .items_by_id["item-0"],
-                original,
+                    .items_by_id
+                    .get("item-0"),
+                if absent { None } else { Some(&original) },
                 "the first successful chunk must not partially apply"
             );
+            if absent && outcome != "absent" {
+                // Another response can make the range Ready without caching X.
+                // The relevant removal below then returns semantic changed=false.
+                core.apply_turn_work_items_get_response(page(vec![]));
+                let removed = if outcome == "absent-evidence-full" {
+                    ids.clone()
+                } else {
+                    vec!["item-0".into()]
+                };
+                assert!(
+                    !core.apply_thread_semantic_live_update(
+                        crate::timeline::semantic::SemanticTimelineLiveUpdate::TurnWorkItemsChanged(
+                            TurnWorkItemsChangedNotification {
+                                workspace_id: "ws".into(),
+                                thread_id: "a".into(),
+                                turn_id: "turn".into(),
+                                changed_work_item_ids: vec![],
+                                removed_work_item_ids: removed,
+                                before_cursor: None,
+                                after_cursor: None,
+                                reason: TimelineChangeReason::LiveEvent,
+                            }
+                        )
+                    ),
+                    "None-to-None removal still guards the active collection"
+                );
+            }
             let mut live = original.clone();
             live.metadata = Some(serde_json::json!("live"));
             match outcome {
                 "cancel" => core.cancel_thread_requests(),
-                "replace" => {
+                "replace" | "absent-replace" => {
                     core.remove_thread_store("a");
                     core.upsert_thread(thread("a", "ws"));
                 }
@@ -9387,7 +9618,7 @@ mod tests {
             );
             assert_eq!(
                 transport.calls.get(),
-                if matches!(outcome, "cancel" | "replace") {
+                if matches!(outcome, "cancel" | "replace" | "absent-replace") {
                     1
                 } else {
                     2
@@ -9397,18 +9628,208 @@ mod tests {
             let range = semantic.thread("a").unwrap().work_range("turn");
             let actual = range.and_then(|range| range.items_by_id.get("item-0"));
             match outcome {
-                "success" => assert_eq!(actual, Some(&incoming)),
+                "success" | "absent" => assert_eq!(actual, Some(&incoming)),
                 "live-edit" => assert_eq!(actual, Some(&live)),
-                "replace" | "live-remove" => assert!(actual.is_none()),
+                "replace"
+                | "live-remove"
+                | "absent-remove"
+                | "absent-new-generation"
+                | "absent-replace"
+                | "absent-evidence-full" => assert!(actual.is_none()),
                 _ => assert_eq!(actual, Some(&original)),
             }
-            if matches!(outcome, "rpc" | "capacity") {
+            if matches!(outcome, "rpc" | "capacity" | "absent-evidence-full") {
                 assert!(matches!(
                     range.unwrap().request_status,
                     crate::timeline::semantic::TimelineRequestStatus::Failed { .. }
                 ));
             }
+            if absent && !matches!(outcome, "absent-evidence-full" | "absent-replace") {
+                assert_eq!(
+                    range.unwrap().items_by_id.get("item-99"),
+                    Some(&peer),
+                    "the other required IDs complete as the same successful collection"
+                );
+            }
+            if matches!(outcome, "absent-new-generation" | "absent-replace") {
+                let next = core
+                    .begin_thread_semantic_request(
+                        SemanticTimelineRequestAction::TurnWorkItemsGet {
+                            key: SemanticTimelineRequestKey::TurnWorkItems {
+                                thread_id: "a".into(),
+                                turn_id: "turn".into(),
+                            },
+                            params: TurnWorkItemsGetParams {
+                                thread_id: "a".into(),
+                                turn_id: "turn".into(),
+                                work_item_ids: vec!["item-0".into()],
+                            },
+                        },
+                    )
+                    .unwrap()
+                    .unwrap();
+                let fresh = Transport {
+                    replies: std::cell::RefCell::new(vec![Ok(page(vec![incoming.clone()]))]),
+                    calls: std::cell::Cell::new(0),
+                };
+                assert!(core.execute_thread_semantic_request(&fresh, next).is_none());
+                assert_eq!(
+                    core.thread_semantic_snapshot("a")
+                        .thread("a")
+                        .unwrap()
+                        .work_range("turn")
+                        .unwrap()
+                        .items_by_id
+                        .get("item-0"),
+                    Some(&incoming),
+                    "old generation removal evidence must not poison a new operation/store"
+                );
+            }
             assert!(core.thread_semantic_in_flight("a").is_empty());
+        }
+    }
+
+    #[test]
+    fn cached_walk_missing_baseline_respects_removal_without_poisoning_new_generations() {
+        use crate::timeline::semantic::TimelineRequestStatus;
+        for outcome in [
+            "new",
+            "during-rpc",
+            "overlap",
+            "wrong-scope",
+            "evidence-full",
+        ] {
+            let (core, _receiver) = reconciliation_core();
+            let block = reconciliation_result(140); // absent from the frozen cache
+            let action = SemanticTimelineRequestAction::ThreadTimelinePage {
+                key: SemanticTimelineRequestKey::ThreadNewest {
+                    thread_id: "a".into(),
+                },
+                params: ThreadTimelinePageParams {
+                    thread_id: "a".into(),
+                    anchor: TimelinePageAnchor::Newest,
+                    limit: Some(12),
+                },
+            };
+            let request = core
+                .begin_thread_semantic_request(action.clone())
+                .unwrap()
+                .unwrap();
+            let remove = |workspace: &str, full: bool| {
+                let mut ids = vec![block.block_id.clone()];
+                if full {
+                    ids.extend((0..4_096).map(|id| format!("absent-{id}")));
+                }
+                let GatewayNotification::ThreadTimelineBlocksChanged(mut notification) =
+                    reconciliation_notification(&[])
+                else {
+                    unreachable!()
+                };
+                notification.workspace_id = workspace.into();
+                notification.removed_block_ids = ids;
+                core.apply_thread_semantic_live_update(crate::timeline::semantic::SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification))
+            };
+            let transport = ReconciliationTransport {
+                calls: Default::default(),
+                reply: |ix: usize, _: &ThreadTimelinePageParams| {
+                    // Materialize the old snapshot, then deliver removal before its
+                    // RPC response reaches the actual continuation completion path.
+                    let frozen = reconciliation_page(vec![block.clone()], false, false);
+                    if ix == 0 && matches!(outcome, "during-rpc" | "wrong-scope" | "evidence-full")
+                    {
+                        assert!(
+                            !remove(
+                                if outcome == "wrong-scope" {
+                                    "other"
+                                } else {
+                                    "ws"
+                                },
+                                outcome == "evidence-full"
+                            ),
+                            "absent removal need not change semantic cache"
+                        );
+                    }
+                    Ok(frozen)
+                },
+            };
+            let next = core.execute_thread_semantic_request(&transport, request);
+            assert_eq!(transport.calls.borrow().len(), 1);
+            if outcome == "evidence-full" {
+                assert!(next.is_none());
+            } else {
+                let next = next.unwrap();
+                if outcome == "overlap" {
+                    assert_eq!(
+                        core.thread_semantic_snapshot("a")
+                            .thread("a")
+                            .unwrap()
+                            .top_level
+                            .block(&block.block_id),
+                        Some(&block)
+                    );
+                    assert!(remove("ws", false));
+                }
+                let next = core
+                    .execute_thread_semantic_request(&transport, next)
+                    .unwrap();
+                assert_eq!(transport.calls.borrow().len(), 2);
+                assert!(
+                    core.execute_thread_semantic_request(&transport, next)
+                        .is_none()
+                );
+                assert_eq!(transport.calls.borrow().len(), 3);
+            }
+            let snapshot = core.thread_semantic_snapshot("a");
+            let cache = &snapshot.thread("a").unwrap().top_level;
+            if matches!(outcome, "new" | "wrong-scope") {
+                assert_eq!(
+                    cache.block(&block.block_id),
+                    Some(&block),
+                    "new absent-baseline data still loads without an accepted removal"
+                );
+            } else {
+                assert!(
+                    cache.block(&block.block_id).is_none(),
+                    "stale page/overlap must not undo live removal"
+                );
+            }
+            if outcome == "evidence-full" {
+                assert!(matches!(
+                    cache.request_status,
+                    TimelineRequestStatus::Failed { .. }
+                ));
+            } else {
+                assert_eq!(cache.request_status, TimelineRequestStatus::Ready);
+            }
+            assert!(core.thread_semantic_in_flight("a").is_empty());
+            if !matches!(outcome, "new" | "wrong-scope") {
+                let fresh = core.begin_thread_semantic_request(action).unwrap().unwrap();
+                let positive = ReconciliationTransport {
+                    calls: Default::default(),
+                    reply: |_: usize, _: &ThreadTimelinePageParams| {
+                        Ok(reconciliation_page(vec![block.clone()], false, false))
+                    },
+                };
+                let fresh = core
+                    .execute_thread_semantic_request(&positive, fresh)
+                    .unwrap();
+                let fresh = core
+                    .execute_thread_semantic_request(&positive, fresh)
+                    .unwrap();
+                assert!(
+                    core.execute_thread_semantic_request(&positive, fresh)
+                        .is_none()
+                );
+                assert_eq!(
+                    core.thread_semantic_snapshot("a")
+                        .thread("a")
+                        .unwrap()
+                        .top_level
+                        .block(&block.block_id),
+                    Some(&block),
+                    "finished generation evidence must not act as global tombstones"
+                );
+            }
         }
     }
 
@@ -12558,6 +12979,11 @@ impl ClientCore {
         expected_store: u64,
         expected_request: u64,
     ) {
+        // Zero denotes no admitted request, not an incarnation. It can recur
+        // after a newer success; Err/Rejected already completes that refusal.
+        if expected_request == 0 {
+            return;
+        }
         let key = crate::timeline::semantic::semantic_timeline_request_key(action);
         let id = request_thread_id(key);
         let mut registry = self
@@ -12778,6 +13204,16 @@ impl ClientCore {
         if !registry.timeline.accepts(&key, request.request_generation) {
             return None;
         }
+        let removals = registry
+            .timeline
+            .request_removals(&key, request.request_generation)
+            .expect("accepted removal owner")
+            .clone();
+        let result = if removals.is_full() {
+            Err(anyhow::anyhow!(TimelineContinuationFull))
+        } else {
+            result
+        };
         let refresh_key = SemanticTimelineRequestKey::ThreadNewest {
             thread_id: request.id.clone(),
         };
@@ -12814,6 +13250,9 @@ impl ClientCore {
                     // Preserve blocks changed since this operation began, including
                     // same-millisecond live updates and explicit live removals.
                     page.blocks.retain_mut(|incoming| {
+                        if removals.contains(&incoming.block_id) {
+                            return false;
+                        }
                         let cached = store
                             .semantic
                             .thread(&request.id)
@@ -12837,6 +13276,8 @@ impl ClientCore {
                         false
                     });
                 }
+                page.blocks
+                    .retain(|block| !removals.contains(&block.block_id));
                 let refresh_status = preserve_refresh_status.then(|| {
                     store
                         .semantic
@@ -12917,6 +13358,9 @@ impl ClientCore {
                         .thread(&request.id)
                         .and_then(|thread| thread.work_range(&page.turn_id));
                     page.items.retain(|incoming| {
+                        if removals.contains(&incoming.work_item_id) {
+                            return false;
+                        }
                         let cached =
                             range.and_then(|range| range.items_by_id.get(&incoming.work_item_id));
                         let baseline = request
