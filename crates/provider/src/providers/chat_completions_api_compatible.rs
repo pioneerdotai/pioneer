@@ -74,6 +74,8 @@ pub(super) struct CompatibleAssistantReplayMessage {
 
 #[derive(Debug, Serialize)]
 struct ApiChatRequest {
+    #[serde(skip)]
+    cache_affinity: Option<String>,
     model: String,
     messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -595,6 +597,57 @@ impl ChatCompletionsApiCompatibleProvider {
         }
 
         builder
+    }
+
+    // These controls belong to the documented native Chat endpoints. A
+    // compatible wire format alone does not authorize vendor extensions.
+    fn native_cache_affinity(&self, request: &ChatRequest) -> Option<String> {
+        if !matches!(self.name.as_str(), "mistral" | "xai" | "fireworks")
+            || crate::definition::provider_definition(&self.name)?.default_base_url?
+                != self.base_url.trim_end_matches('/')
+        {
+            return None;
+        }
+        let origin = request.messages.iter().rev().find_map(|message| {
+            (message.role == Role::User)
+                .then_some(message.provenance.as_ref())
+                .flatten()
+        })?;
+        let owner = origin
+            .context_thread
+            .as_deref()
+            .unwrap_or(&origin.thread_id);
+        if origin.workspace_id.is_empty() || owner.is_empty() {
+            return None;
+        }
+        use sha2::Digest;
+        let identity = serde_json::to_vec(&(
+            "pioneer-native-chat-affinity-v1",
+            &self.name,
+            &origin.workspace_id,
+            owner,
+        ))
+        .ok()?;
+        Some(hex::encode(sha2::Sha256::digest(identity)))
+    }
+
+    fn chat_post(&self, request: &ApiChatRequest) -> reqwest::RequestBuilder {
+        let mut builder = self.authorized_post(&self.chat_completions_url());
+        let affinity_header = match self.name.as_str() {
+            "xai" => Some("x-grok-conv-id"),
+            "fireworks" => Some("x-session-affinity"),
+            _ => None,
+        };
+        if let Some(header) = affinity_header
+            && !self
+                .extra_headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case(header))
+            && let Some(key) = &request.cache_affinity
+        {
+            builder = builder.header(header, key);
+        }
+        builder.json(request)
     }
 
     fn audio_format_from_mime(mime: &str) -> String {
@@ -1156,9 +1209,16 @@ impl ChatCompletionsApiCompatibleProvider {
         let request = crate::tools::policy::prepare_request(self.name.as_str(), request)?;
         crate::tools::policy::prepare_history(self.name.as_str(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name.as_str(), &prepared)?;
-        let generation =
+        let mut generation =
             crate::generation::chat_fields_from_catalog(catalog, &self.name, &request)?;
+        let cache_affinity = self.native_cache_affinity(&request);
+        if self.name == "mistral"
+            && let Some(key) = &cache_affinity
+        {
+            generation.insert("prompt_cache_key".into(), serde_json::json!(key));
+        }
         Ok(ApiChatRequest {
+            cache_affinity,
             stream_options: stream
                 .then(|| crate::usage::stream_options(&self.name, &request.model))
                 .flatten(),
@@ -1441,9 +1501,7 @@ impl crate::traits::Provider for ChatCompletionsApiCompatibleProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let api_request = self.build_chat_request_async(request, false).await?;
 
-        let request_builder = self
-            .authorized_post(&self.chat_completions_url())
-            .json(&api_request);
+        let request_builder = self.chat_post(&api_request);
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
             .await?;
@@ -1529,9 +1587,7 @@ impl crate::traits::Provider for ChatCompletionsApiCompatibleProvider {
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
         let api_request = self.build_chat_request_async(request, true).await?;
 
-        let request_builder = self
-            .authorized_post(&self.chat_completions_url())
-            .json(&api_request);
+        let request_builder = self.chat_post(&api_request);
         let response =
             crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
 
@@ -3152,6 +3208,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            cache_affinity: None,
             stream_options: None,
             generation: Default::default(),
             model: "gpt-4".into(),
@@ -3318,3 +3375,131 @@ mod tests {
 #[cfg(test)]
 #[path = "wire_tests/compatible.rs"]
 mod wire_contract_tests;
+
+#[cfg(test)]
+mod prompt_cache_tests {
+    use super::*;
+    use crate::{MessageProvenance, MessageSourceRef};
+
+    fn request(owner: &str) -> ChatRequest {
+        let mut input = ChatMessage::user("current input");
+        input.provenance = Some(MessageProvenance {
+            logical_turn_id: None,
+            workspace_id: "workspace".into(),
+            thread_id: "source-thread".into(),
+            context_thread: Some(owner.into()),
+            unit_id: "turn:input".into(),
+            sources: vec![MessageSourceRef {
+                scope: "input:turn".into(),
+                id: "input".into(),
+                version: "input-revision:1".into(),
+            }],
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+            inherited: false,
+            complete: true,
+            protected_input: true,
+        });
+        crate::providers::history_test_support::request(vec![input])
+    }
+
+    #[tokio::test]
+    async fn native_chat_cache_affinity_is_stable_and_endpoint_scoped_at_wire_boundary() {
+        for (name, root) in [
+            ("mistral", "https://api.mistral.ai/v1"),
+            ("xai", "https://api.x.ai/v1"),
+            ("fireworks", "https://api.fireworks.ai/inference/v1"),
+        ] {
+            let provider =
+                ChatCompletionsApiCompatibleProvider::new(name, root, "fixture", AuthStyle::Bearer);
+            let first = provider
+                .build_chat_request_async(request("execution-owner"), false)
+                .await
+                .unwrap();
+            let key = first.cache_affinity.clone().unwrap();
+            let mut next = request("execution-owner");
+            let mut latest = next.messages[0].clone();
+            latest.content = "a new question".into();
+            let origin = latest.provenance.as_mut().unwrap();
+            origin.thread_id = "other-source".into();
+            origin.unit_id = "another-turn:input".into();
+            origin.sources[0].version = "input-revision:3".into();
+            next.messages.push(latest);
+            let next = provider.build_chat_request_async(next, true).await.unwrap();
+            assert_eq!(next.cache_affinity.as_ref(), Some(&key));
+            assert_ne!(
+                provider
+                    .native_cache_affinity(&request("other-owner"))
+                    .as_ref(),
+                Some(&key)
+            );
+            let first_wire = serde_json::to_value(&first).unwrap();
+            let http = provider.chat_post(&first).build().unwrap();
+            if name == "mistral" {
+                assert_eq!(first_wire["prompt_cache_key"], key);
+                assert!(!http.headers().contains_key("x-grok-conv-id"));
+            } else {
+                assert!(first_wire.get("prompt_cache_key").is_none());
+                let header = if name == "xai" {
+                    "x-grok-conv-id"
+                } else {
+                    "x-session-affinity"
+                };
+                assert_eq!(http.headers()[header].to_str().unwrap(), key);
+            }
+            for field in ["cache_affinity", "prompt_cache_retention", "cache_control"] {
+                assert!(first_wire.get(field).is_none());
+            }
+            for endpoint in [
+                "https://proxy.example/v1",
+                "https://api.mistral.ai/v1/private",
+                "https://api.x.ai/v1/private",
+            ] {
+                let custom = ChatCompletionsApiCompatibleProvider::new(
+                    name,
+                    endpoint,
+                    "fixture",
+                    AuthStyle::Bearer,
+                );
+                assert!(
+                    custom
+                        .native_cache_affinity(&request("execution-owner"))
+                        .is_none()
+                );
+            }
+            let unknown = crate::providers::history_test_support::request(vec![ChatMessage::user(
+                "no trusted origin",
+            )]);
+            assert!(provider.native_cache_affinity(&unknown).is_none());
+        }
+        let custom = ChatCompletionsApiCompatibleProvider::new(
+            "custom",
+            "https://api.x.ai/v1",
+            "fixture",
+            AuthStyle::Bearer,
+        );
+        assert!(
+            custom
+                .native_cache_affinity(&request("execution-owner"))
+                .is_none()
+        );
+        let explicit = ChatCompletionsApiCompatibleProvider::new(
+            "xai",
+            "https://api.x.ai/v1",
+            "fixture",
+            AuthStyle::Bearer,
+        )
+        .with_extra_headers(HashMap::from([(
+            "X-Grok-Conv-Id".into(),
+            "explicit-owner".into(),
+        )]));
+        let body = explicit
+            .build_chat_request_async(request("execution-owner"), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            explicit.chat_post(&body).build().unwrap().headers()["x-grok-conv-id"],
+            "explicit-owner"
+        );
+    }
+}

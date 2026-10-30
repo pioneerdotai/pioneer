@@ -496,8 +496,8 @@ pub(crate) fn apply_cli_usage(
     observed.input_tokens = if claude {
         observed.uncached_input_tokens.and_then(|input| {
             input
-                .checked_add(observed.cache_read_input_tokens.unwrap_or(0))?
-                .checked_add(observed.cache_write_input_tokens.unwrap_or(0))
+                .checked_add(observed.cache_read_input_tokens?)?
+                .checked_add(observed.cache_write_input_tokens?)
         })
     } else {
         raw["input_tokens"].as_u64()
@@ -642,7 +642,9 @@ mod tests {
             &mut usage,
             &serde_json::json!({"input_tokens":10,"cache_read_input_tokens":20,"output_tokens":0,"total_cost_usd":0.02}),
         );
-        assert_eq!(usage.input_tokens, Some(30));
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.uncached_input_tokens, Some(10));
+        assert_eq!(usage.cache_read_input_tokens, Some(20));
         assert_eq!(usage.cache_write_input_tokens, None);
         assert!(usage.accounting.as_ref().unwrap()["reported_cost"].is_null());
         assert_eq!(

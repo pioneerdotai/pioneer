@@ -11531,7 +11531,10 @@ async fn completed_parallel_tool_result_is_journaled_before_the_batch_finishes()
         ],
         "final after parallel batch",
     ));
-    let registry = Arc::new(ProviderRegistry::with_provider("sequenced-tools", provider));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-tools",
+        provider.clone(),
+    ));
     let manager = AgentManager::new(registry, test_tool_loop_config());
     manager
         .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider {
@@ -11636,6 +11639,35 @@ async fn completed_parallel_tool_result_is_journaled_before_the_batch_finishes()
         AgentEvent::TurnLlmContextAppended { tool_name, .. }
             if tool_name == "batch_slow"
     )));
+
+    // This owner's small-result lifecycle proof complements the Gateway's
+    // actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wires,
+    // which owns full input/order, bounded results, restoration and HTTP proof.
+    let requests = provider.snapshot_requests();
+    let next = requests.last().unwrap();
+    let mut checked_calls = Vec::new();
+    for event in &observed {
+        if let AgentEvent::TurnLlmContextAppended {
+            source, payload, ..
+        } = event
+            && source == "tool_result_v2"
+        {
+            let saved = serde_json::to_value(payload).unwrap();
+            let saved = saved.get("value").expect("exact result envelope");
+            let next_result = next
+                .messages
+                .iter()
+                .find(|message| {
+                    message.role == Role::Tool
+                        && serde_json::to_value(&message.tool_call_id).unwrap()
+                            == saved["tool_call_id"]
+                })
+                .expect("acknowledged result must reach the next request");
+            assert_eq!(serde_json::to_value(next_result).unwrap(), *saved);
+            checked_calls.push(next_result.tool_call_id.as_deref().unwrap());
+        }
+    }
+    assert_eq!(checked_calls, ["call_batch_fast", "call_batch_slow"]);
 
     // Same parallel-result owner, now with a real CUA handler/receipt. The
     // lifecycle ItemCompleted ACK is deliberately distinct from exact history.

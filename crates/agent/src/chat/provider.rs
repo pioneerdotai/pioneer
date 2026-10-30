@@ -3963,6 +3963,7 @@ mod partial_observation_tests {
                     events.acknowledge_last(Ok(()));
                     if let Some(details) = usage {
                         assert_eq!(details["status"], "failed");
+                        assert_eq!(details["purpose"], "main");
                         assert_eq!(details["usage"]["generation_id"], "gen-header");
                         assert_eq!(details["usage"]["request_id"], "req-distinct");
                         assert_eq!(details["usage"]["reported_model"], "actual-returned");
@@ -4054,6 +4055,8 @@ fn observe_startup_chunk(turn_id: &str, chunk: &pioneer_provider::StreamChunk) {
 /// survive error; no usage is invented for a failed connect or missing terminal.
 pub(super) struct ProviderAttemptObservation {
     id: String,
+    purpose: &'static str,
+    connection: Option<String>,
     provider: String,
     model: String,
     api: String,
@@ -4064,6 +4067,8 @@ impl ProviderAttemptObservation {
     pub(super) fn new(provider: &dyn Provider, model: &str) -> Self {
         Self {
             id: super::generate_id(super::TURN_ITEM_ID_LEN),
+            purpose: "main",
+            connection: provider.authority_fingerprint().map(str::to_owned),
             provider: provider.name().to_owned(),
             model: model.to_owned(),
             api: provider.usage_api().to_owned(),
@@ -4082,6 +4087,10 @@ impl ProviderAttemptObservation {
         observation.api = profile.api;
         observation.route = profile.route;
         Ok(observation)
+    }
+    pub(super) fn with_purpose(mut self, purpose: &'static str) -> Self {
+        self.purpose = purpose;
+        self
     }
     pub(super) fn observe(&self, snapshot: &TokenUsage) {
         self.usage
@@ -4116,6 +4125,8 @@ impl ProviderAttemptObservation {
                 "physical_attempt_id":usage.physical_attempt_id,
                 "request_sent":serde_json::Value::Null,
                 "provider":self.provider,"model":self.model,"api":self.api,"route":self.route,
+                "purpose":self.purpose,
+                "connection_id":self.connection,
                 "status":match completed {None=>"started",Some(true)=>"completed",Some(false)=>"failed"},
                 "complete":completed == Some(true),"usage":usage})),
         };
@@ -4157,17 +4168,22 @@ pub(super) async fn request_agent_round(
     observation
         .publish(event_tx, workspace_id, thread_id, turn_id, None)
         .await?;
-    let result = request_agent_round_observed(
-        provider,
-        request,
+    let result = pioneer_provider::prompt_cache::scope(
         workspace_id,
         thread_id,
-        turn_id,
-        thinking_item_id,
-        force_non_stream,
-        provider_timeout_policy,
-        event_tx,
-        &observation,
+        "main",
+        request_agent_round_observed(
+            provider,
+            request,
+            workspace_id,
+            thread_id,
+            turn_id,
+            thinking_item_id,
+            force_non_stream,
+            provider_timeout_policy,
+            event_tx,
+            &observation,
+        ),
     )
     .await;
     observation
@@ -4197,17 +4213,22 @@ pub(super) async fn stream_provider_response(
     observation
         .publish(event_tx, workspace_id, thread_id, turn_id, None)
         .await?;
-    let result = stream_provider_response_observed(
-        provider,
-        request,
+    let result = pioneer_provider::prompt_cache::scope(
         workspace_id,
         thread_id,
-        turn_id,
-        thinking_item_id,
-        message_item_id,
-        provider_timeout_policy,
-        event_tx,
-        &observation,
+        "main",
+        stream_provider_response_observed(
+            provider,
+            request,
+            workspace_id,
+            thread_id,
+            turn_id,
+            thinking_item_id,
+            message_item_id,
+            provider_timeout_policy,
+            event_tx,
+            &observation,
+        ),
     )
     .await;
     observation
@@ -4236,16 +4257,21 @@ pub(super) async fn non_stream_provider_response(
     observation
         .publish(event_tx, workspace_id, thread_id, turn_id, None)
         .await?;
-    let result = non_stream_provider_response_observed(
-        provider,
-        request,
+    let result = pioneer_provider::prompt_cache::scope(
         workspace_id,
         thread_id,
-        turn_id,
-        thinking_item_id,
-        message_item_id,
-        event_tx,
-        &observation,
+        "main",
+        non_stream_provider_response_observed(
+            provider,
+            request,
+            workspace_id,
+            thread_id,
+            turn_id,
+            thinking_item_id,
+            message_item_id,
+            event_tx,
+            &observation,
+        ),
     )
     .await;
     observation

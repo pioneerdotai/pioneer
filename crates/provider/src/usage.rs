@@ -148,6 +148,7 @@ pub fn bounded_usage(value: &Value) -> Value {
                                 | "service_tier"
                                 | "serviceTier"
                                 | "prompt_eval_count"
+                                | "prompt_eval_cached_count"
                                 | "eval_count"
                                 | "server_tool_use"
                                 | "web_search_requests"
@@ -226,10 +227,7 @@ impl<const API: u8> WireUsage<API> {
             ),
         };
         let total_input = if matches!(API, 1 | 2) {
-            input.and_then(|i| {
-                i.checked_add(read.unwrap_or(0))?
-                    .checked_add(write.unwrap_or(0))
-            })
+            input.and_then(|i| i.checked_add(read?)?.checked_add(write?))
         } else {
             input
         };
@@ -742,11 +740,6 @@ impl UsageContext {
 /// custom proxies and other vendors are not assumed to accept Claude markers.
 /// https://platform.claude.com/docs/en/build-with-claude/prompt-caching
 pub(crate) fn anthropic_cache_control(base: &str, model: &str) -> Option<Value> {
-    if url::Url::parse(base).ok()?.host_str() != Some("api.anthropic.com")
-        || !model.starts_with("claude-")
-    {
-        return None;
-    }
     let catalog = crate::catalog::model_catalog().ok()?;
     anthropic_cache_control_in_catalog(base, model, &catalog)
 }
@@ -756,9 +749,7 @@ fn anthropic_cache_control_in_catalog(
     model: &str,
     catalog: &crate::catalog::ModelCatalog,
 ) -> Option<Value> {
-    if url::Url::parse(base).ok()?.host_str() != Some("api.anthropic.com")
-        || !model.starts_with("claude-")
-    {
+    if base.trim_end_matches('/') != crate::providers::anthropic::BASE_URL {
         return None;
     }
     let entry = catalog.model("anthropic", model)?;
@@ -781,6 +772,30 @@ fn anthropic_cache_control_in_catalog(
         return None;
     }
     Some(json!({"type":"ephemeral"}))
+}
+
+/// OpenRouter documents automatic Claude caching on its Chat route. The
+/// existing catalog supplies the format fact; neither a model name nor a
+/// cache-read tariff proves that an arbitrary endpoint accepts this field.
+pub(crate) fn openrouter_cache_control(base: &str, model: &str) -> Option<Value> {
+    let catalog = crate::catalog::model_catalog().ok()?;
+    openrouter_cache_control_in_catalog(base, model, &catalog)
+}
+
+fn openrouter_cache_control_in_catalog(
+    base: &str,
+    model: &str,
+    catalog: &crate::catalog::ModelCatalog,
+) -> Option<Value> {
+    if base.trim_end_matches('/') != crate::providers::openrouter::BASE_URL {
+        return None;
+    }
+    let entry = catalog.model("openrouter", model)?;
+    let compat = entry.metadata.get("compat")?;
+    (entry.api == "openai-completions"
+        && compat.get("cacheControlFormat").and_then(Value::as_str) == Some("anthropic")
+        && compat.get("supportsPromptCaching").and_then(Value::as_bool) != Some(false))
+    .then(|| json!({"type":"ephemeral"}))
 }
 
 impl TokenUsage {

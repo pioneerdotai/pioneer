@@ -407,6 +407,7 @@ impl ResponsesApiCompatibleProvider {
             id.as_deref(),
         );
         reducer.bind_request(&prepared.request);
+        reducer.bind_cache_comparison(prepared.comparison.clone());
         reducer.usage.api = Some("responses".into());
         reducer.usage.route = crate::usage::route(&self.root, "/responses");
         let bytes = crate::http::read_response_bytes_bounded(
@@ -483,6 +484,7 @@ impl ResponsesApiCompatibleProvider {
         )
         .with_provisional_messages(self.provisional_messages);
         reducer.bind_request(&prepared.request);
+        reducer.bind_cache_comparison(prepared.comparison.clone());
         reducer.usage.api = Some("responses".into());
         reducer.usage.route = crate::usage::route(&self.root, "/responses");
         Ok(ProviderStream {

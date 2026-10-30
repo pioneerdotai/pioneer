@@ -16,6 +16,7 @@ mod generation;
 pub mod history;
 mod http;
 pub mod messages;
+pub mod prompt_cache;
 pub use messages::{
     ProviderMessage, ProviderMessageBoundary, ProviderMessageCollector, ProviderMessageId,
     ProviderMessageMetadata, ProviderRoundUiCopy, ProviderRoundUiCopyKind,

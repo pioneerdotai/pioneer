@@ -16,7 +16,8 @@ fn exclusive_cache_absent_read_write_and_zero_are_preserved() {
         } else {
             decode::<2>(value)
         };
-        assert_eq!(u.input_tokens, Some(10));
+        assert_eq!(u.input_tokens, None);
+        assert_eq!(u.uncached_input_tokens, Some(10));
         assert_eq!(u.output_tokens, Some(8));
         assert_eq!(u.cache_read_input_tokens, None);
     }
@@ -688,4 +689,62 @@ fn vercel_responses_fixed_tariff_is_estimated_but_conditional_tariffs_are_not() 
             assert_eq!(evidence["price_status"], "unknown_or_conditional_price");
         }
     }
+}
+
+#[test]
+fn native_cache_controls_require_endpoint_and_existing_catalog_evidence() {
+    let models = json!({"openrouter":{"supported":{"id":"supported","provider":"openrouter","name":"Fixture","api":"openai-completions","baseUrl":"https://openrouter.ai/api/v1","contextWindow":1000,"maxTokens":100,"reasoning":false,"input":["text"],"cost":{},"compat":{"cacheControlFormat":"anthropic"}}}});
+    let origins = json!({"openrouter":{"supported":{"contextWindow":{"kind":"source","expression":"fixture"},"maxTokens":{"kind":"source","expression":"fixture"}}}});
+    let catalog =
+        crate::catalog::ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap();
+    assert_eq!(
+        openrouter_cache_control_in_catalog("https://openrouter.ai/api/v1", "supported", &catalog),
+        Some(json!({"type":"ephemeral"}))
+    );
+    for endpoint in [
+        "https://proxy.example/api/v1",
+        "https://openrouter.ai/private",
+        "http://openrouter.ai/api/v1",
+    ] {
+        assert!(openrouter_cache_control_in_catalog(endpoint, "supported", &catalog).is_none());
+    }
+    assert!(
+        openrouter_cache_control_in_catalog("https://openrouter.ai/api/v1", "unknown", &catalog)
+            .is_none()
+    );
+    let mut no_fact = models.clone();
+    no_fact["openrouter"]["supported"]["compat"] = json!({});
+    let unknown =
+        crate::catalog::ModelCatalog::parse(&no_fact.to_string(), &origins.to_string()).unwrap();
+    assert!(
+        openrouter_cache_control_in_catalog("https://openrouter.ai/api/v1", "supported", &unknown)
+            .is_none()
+    );
+    let mut denied = models;
+    denied["openrouter"]["supported"]["compat"]["supportsPromptCaching"] = json!(false);
+    let denied =
+        crate::catalog::ModelCatalog::parse(&denied.to_string(), &origins.to_string()).unwrap();
+    assert!(
+        openrouter_cache_control_in_catalog("https://openrouter.ai/api/v1", "supported", &denied)
+            .is_none()
+    );
+    assert!(
+        anthropic_cache_control_in_catalog(
+            "https://api.anthropic.com/proxy",
+            "supported",
+            &catalog
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn exclusive_partial_updates_complete_only_when_every_category_is_known() {
+    let mut usage = decode::<1>(json!({"input_tokens":10,"cache_read_input_tokens":80}));
+    assert_eq!(usage.input_tokens, None);
+    assert_eq!(usage.uncached_input_tokens, Some(10));
+    usage.update(&decode::<1>(json!({"cache_creation_input_tokens":0})));
+    assert_eq!(usage.input_tokens, Some(90));
+    usage.update(&decode::<1>(json!({"output_tokens":5})));
+    assert_eq!(usage.input_tokens, Some(90));
 }

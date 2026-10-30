@@ -50,6 +50,9 @@ mod agent_action_outbox;
 #[path = "tests/history_continuation.rs"]
 mod history_continuation;
 
+#[path = "tests/prompt_cache_sent_prefix.rs"]
+mod prompt_cache_sent_prefix;
+
 #[path = "tests/compaction_lifecycle_poll.rs"]
 mod compaction_lifecycle_poll;
 
@@ -36181,6 +36184,38 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
     )
     .await;
 
+    // These remain durable journal facts but must not be imported into the
+    // model-facing CLI bootstrap through a frozen Task basis.
+    crud_store
+        .materialize_item_tool_retry_resolved(
+            pioneer_protocol::ItemToolRetryResolvedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: root_thread_id.into(),
+                turn_id: root_turn_id.into(),
+                item_id: "historical-retry-item".into(),
+                item_type: pioneer_protocol::TurnItemType::DynamicToolCall,
+                tool_retry_episode_id: "historical-retry-episode".into(),
+                tool_name: "apply_patch".into(),
+                attempt_number: 2,
+                resolution: pioneer_protocol::ToolRetryResolution::Succeeded,
+                budgets: vec![],
+                reason: "CACHE_RETRY_TELEMETRY".into(),
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
+    crud_store.materialize_item_completed(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id:workspace_id.clone(), thread_id:root_thread_id.into(), turn_id:root_turn_id.into(),
+            item:pioneer_protocol::TurnItem::SystemEvent {
+                id:"historical-usage".into(), level:pioneer_protocol::SystemEventLevel::Info,
+                message:"CACHE_USAGE_TELEMETRY".into(), code:Some("agent_runtime_item".into()),
+                details:Some(json!({"nativeItemKind":"tokenUsage","input_tokens":100,"cache_read_input_tokens":80})),
+            },
+        }, phase_13_now_secs(),
+    ).await.unwrap();
+
     let mut parent_thread_id = root_thread_id.to_owned();
     let mut parent_turn_id = root_turn_id.to_owned();
     let mut lineages = Vec::new();
@@ -36224,6 +36259,8 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
         let start = &starts[level - 1];
         let input = start.input.to_string();
         assert!(input.contains(root_marker));
+        assert!(!input.contains("CACHE_RETRY_TELEMETRY"));
+        assert!(!input.contains("CACHE_USAGE_TELEMETRY"));
         for earlier in &output_markers {
             assert!(
                 input.contains(earlier),

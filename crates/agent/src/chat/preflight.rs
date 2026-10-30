@@ -751,6 +751,7 @@ async fn call_turn_preflight_provider_once(
         endpoint.provider.as_ref(),
         &request,
     )
+    .map(|observation| observation.with_purpose("preflight"))
     .map_err(|_| {
         turn_preflight_attempt_failure(
             TurnPreflightFallbackReason::ProviderError,
@@ -787,16 +788,26 @@ async fn call_turn_preflight_provider_once(
             ));
         }
     }
-    let response = tokio::time::timeout(
-        Duration::from_millis(timeout_ms.max(1)),
-        request_turn_preflight_provider_json(
-            endpoint.provider.as_ref(),
-            request,
-            Some(&observation),
-            max_output_chars,
-            attempt,
-        ),
-    )
+    let request_future = request_turn_preflight_provider_json(
+        endpoint.provider.as_ref(),
+        request,
+        Some(&observation),
+        max_output_chars,
+        attempt,
+    );
+    let response = tokio::time::timeout(Duration::from_millis(timeout_ms.max(1)), async {
+        if let Some(context) = usage_context {
+            pioneer_provider::prompt_cache::scope(
+                &context.workspace,
+                &context.thread,
+                "preflight",
+                request_future,
+            )
+            .await
+        } else {
+            request_future.await
+        }
+    })
     .await;
 
     if let Some(context) = usage_context {
@@ -3328,7 +3339,13 @@ mod tests {
                     tokio::select! {
                         result = &mut stage => break result,
                         event = durable.recv() => {
-                            event.expect("preflight durable lane must stay open");
+                            let event = event.expect("preflight durable lane must stay open");
+                            if let pioneer_protocol::AgentDurableEvent::ItemCompleted { notification } = event
+                                && let pioneer_protocol::TurnItem::SystemEvent { code, details: Some(details), .. } = notification.item
+                                && code.as_deref() == Some("provider_usage")
+                            {
+                                assert_eq!(details["purpose"], "preflight");
+                            }
                             durable.acknowledge_last(Ok(()));
                         }
                     }

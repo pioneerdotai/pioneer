@@ -13,6 +13,7 @@ pub(crate) struct PreparedRequest {
     pub(crate) request: ChatRequest,
     pub(crate) messages: PreparedProviderMessages,
     generation: crate::generation::Fields,
+    pub(crate) comparison: Option<crate::prompt_cache::Comparison>,
 }
 impl ResponsesApiCompatibleProvider {
     pub(crate) fn project(&self, mut request: ChatRequest) -> Result<ChatRequest> {
@@ -31,6 +32,7 @@ impl ResponsesApiCompatibleProvider {
         request: ChatRequest,
         capabilities: &ProviderCapabilities,
     ) -> Result<PreparedRequest> {
+        let comparison = crate::prompt_cache::Comparison::begin(&self.authority);
         let request = crate::tools::policy::prepare_responses_request(&self.name, request)?;
         let request = self.project(request)?;
         let generation = crate::generation::responses_fields(&self.name, &request)?;
@@ -49,6 +51,7 @@ impl ResponsesApiCompatibleProvider {
             request,
             messages,
             generation,
+            comparison,
         })
     }
     pub(crate) fn render(&self, prepared: &PreparedRequest, stream: bool) -> Result<Value> {
@@ -111,7 +114,14 @@ impl ResponsesApiCompatibleProvider {
                 input.push(json!({"role":if message.role==Role::System {"system"} else {"user"},"content":content}));
             }
         }
-        let mut body = json!({"model":request.model,"input":input,"store":false,"truncation":"disabled","include":["reasoning.encrypted_content"],"stream":stream});
+        let mut body = json!({"model":request.model,"input":input,"store":true,"truncation":"disabled","include":["reasoning.encrypted_content"],"stream":stream});
+        if let Some(id) = prepared
+            .comparison
+            .as_ref()
+            .and_then(|c| c.response_id.as_ref())
+        {
+            body["prompt_cache_options"] = json!({"comparison_response_id":id});
+        }
         if let Some(prompt) = &request.compiled_prompt {
             if let Some(text) = prompt.full_system_text() {
                 body["instructions"] = json!(text);

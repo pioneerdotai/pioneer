@@ -1079,6 +1079,10 @@ pub struct TokenUsage {
     pub semantics: Option<String>,
     pub raw_usage: Option<serde_json::Value>,
     pub generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_comparison_response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_diagnostics: Option<serde_json::Value>,
     pub reported_model: Option<String>,
     pub service_tier: Option<String>,
     pub request_id: Option<String>,
@@ -1112,6 +1116,8 @@ impl TokenUsage {
             service_tier,
             semantics,
             generation_id,
+            prompt_cache_comparison_response_id,
+            prompt_cache_diagnostics,
             request_id,
             provider,
             model,
@@ -1164,8 +1170,8 @@ impl TokenUsage {
         }
         if self.semantics.as_deref() == Some("exclusive_cache") {
             self.input_tokens = self.uncached_input_tokens.and_then(|i| {
-                i.checked_add(self.cache_read_input_tokens.unwrap_or(0))?
-                    .checked_add(self.cache_write_input_tokens.unwrap_or(0))
+                i.checked_add(self.cache_read_input_tokens?)?
+                    .checked_add(self.cache_write_input_tokens?)
             });
         }
     }

@@ -48,6 +48,8 @@ pub struct OpenRouterProvider {
 
 #[derive(Debug, Serialize)]
 struct ApiChatRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<serde_json::Value>,
     model: String,
     messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -673,6 +675,7 @@ impl OpenRouterProvider {
         let generation =
             crate::generation::chat_fields_from_catalog(catalog, "openrouter", request)?;
         Ok(ApiChatRequest {
+            cache_control: None,
             generation,
             model: request.model.clone(),
             messages,
@@ -1486,7 +1489,9 @@ impl crate::traits::Provider for OpenRouterProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = Self::build_request_from_prepared(&request, &prepared, false)?;
+        let mut api_request = Self::build_request_from_prepared(&request, &prepared, false)?;
+        api_request.cache_control =
+            crate::usage::openrouter_cache_control(&self.base_url, &request.model);
 
         let request_builder = Self::with_app_attribution(
             self.client
@@ -1643,7 +1648,9 @@ impl crate::traits::Provider for OpenRouterProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = Self::build_request_from_prepared(&request, &prepared, true)?;
+        let mut api_request = Self::build_request_from_prepared(&request, &prepared, true)?;
+        api_request.cache_control =
+            crate::usage::openrouter_cache_control(&self.base_url, &request.model);
 
         let request_builder = Self::with_app_attribution(
             self.client
@@ -2859,6 +2866,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            cache_control: None,
             generation: Default::default(),
             model: "anthropic/claude-sonnet-4".into(),
             messages: vec![

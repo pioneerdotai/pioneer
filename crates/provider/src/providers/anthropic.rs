@@ -2264,7 +2264,8 @@ mod tests {
             "input_tokens":10,"output_tokens":8
         }))
         .unwrap();
-        assert_eq!(missing.normalized().input_tokens, Some(10));
+        assert_eq!(missing.normalized().input_tokens, None);
+        assert_eq!(missing.normalized().uncached_input_tokens, Some(10));
         assert_eq!(missing.normalized().output_tokens, Some(8));
     }
 

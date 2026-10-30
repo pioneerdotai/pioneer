@@ -29,6 +29,220 @@ fn message(id: &str, phase: Value, text: &str) -> Value {
 fn snapshot(output: Vec<Value>) -> Value {
     json!({"id":"resp_synthetic","status":"completed","model":"gpt-6.1-sol","output":output,"usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":80},"output_tokens_details":{"reasoning_tokens":12},"total_tokens":120}})
 }
+
+#[tokio::test]
+async fn cache_diagnostics_follow_conversation_and_purpose_at_http_boundary() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let root = format!("http://{}/v1", listener.local_addr().unwrap());
+    let workspace = root.clone();
+    let expected = [
+        None,
+        None,
+        Some("resp_diag_0"),
+        None,
+        Some("resp_diag_2"),
+        Some("resp_diag_2"),
+        Some("resp_diag_1"),
+        None,
+        None,
+        Some("resp_diag_8"),
+    ];
+    let server = tokio::spawn(async move {
+        for (index, expected) in expected.into_iter().enumerate() {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let (offset, size) = loop {
+                let mut buf = [0; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buf[..n]);
+                if let Some(i) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&bytes[..i]).to_lowercase();
+                    let size = head
+                        .lines()
+                        .find_map(|s| s.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap();
+                    assert!(head.starts_with("post /v1/responses "));
+                    break (i + 4, size);
+                }
+            };
+            while bytes.len() < offset + size {
+                let mut buf = [0; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            let body: Value = serde_json::from_slice(&bytes[offset..offset + size]).unwrap();
+            assert_eq!(
+                body["prompt_cache_options"]["comparison_response_id"].as_str(),
+                expected
+            );
+            if expected.is_none() {
+                assert!(body.get("prompt_cache_options").is_none());
+            }
+            assert!(body.get("previous_response_id").is_none());
+            assert_eq!(
+                body["input"].as_array().unwrap().last().unwrap()["role"],
+                "user"
+            );
+            let mut response = snapshot(vec![message("m", json!("final_answer"), "answer")]);
+            response["id"] = json!(format!("resp_diag_{index}"));
+            response["model"] = body["model"].clone();
+            response["prompt_cache_diagnostics"] = match index {
+                2 => {
+                    json!({"type":"cache_miss","reason":"input_changed","comparison_reusable_tokens":999,"cache_missed_tokens":999})
+                }
+                4 => json!({"type":"unavailable"}),
+                5 => json!({"type":"comparison_response_not_found"}),
+                6 => json!({"type":"cache_hit"}),
+                _ => Value::Null,
+            };
+            if index == 4 {
+                response["status"] = json!("incomplete");
+                response["incomplete_details"] = json!({"reason":"max_output_tokens"});
+            }
+            let stream = body["stream"] == true;
+            let payload = if stream {
+                format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.completed","response":response})
+                )
+            } else {
+                response.to_string()
+            };
+            let content_type = if stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let mut inherited = None;
+    for index in 0..10 {
+        let provider: Box<dyn Provider> = if index >= 8 {
+            Box::new(crate::providers::OpenAiProvider::with_base_url(
+                "fixture", &root,
+            ))
+        } else {
+            Box::new(ResponsesApiCompatibleProvider::new(
+                "gateway-proxy",
+                &root,
+                if index == 7 { "other-key" } else { "fixture" },
+                AuthStyle::Bearer,
+            ))
+        };
+        let mut req = request();
+        if index == 3 {
+            let mut previous = ChatMessage::assistant("answer");
+            previous.provider_replay_state = inherited.clone();
+            req.messages.insert(0, previous);
+        }
+        if index == 5 {
+            req.model = "gpt-6-luna".into();
+        }
+        let owner = if index == 3 {
+            "attached-child"
+        } else {
+            "conversation"
+        };
+        let purpose = if matches!(index, 1 | 6) {
+            "preflight"
+        } else {
+            "main"
+        };
+        let execution = format!("execution-{index}");
+        let (usage, replay) = crate::prompt_cache::conversation_scope(
+            workspace.clone(),
+            owner.into(),
+            crate::prompt_cache::scope(&workspace, &execution, purpose, async {
+                if matches!(index, 1 | 2 | 5 | 9) {
+                    let mut stream = provider.stream_chat(req).await.unwrap();
+                    let mut usage = crate::TokenUsage::default();
+                    let mut replay = None;
+                    while let Some(chunk) = stream.next().await {
+                        let chunk = chunk.unwrap();
+                        if let Some(snapshot) = chunk.usage {
+                            usage.update(&snapshot);
+                        }
+                        if chunk.provider_replay_state.is_some() {
+                            replay = chunk.provider_replay_state;
+                        }
+                    }
+                    (usage, replay)
+                } else {
+                    let response = provider.chat(req).await.unwrap();
+                    assert_eq!(response.text, "answer");
+                    (response.usage.unwrap(), response.provider_replay_state)
+                }
+            }),
+        )
+        .await;
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
+        let stored: crate::TokenUsage =
+            serde_json::from_value(serde_json::to_value(&usage).unwrap()).unwrap();
+        assert_eq!(stored, usage);
+        match index {
+            2 => {
+                assert_eq!(
+                    usage.prompt_cache_comparison_response_id.as_deref(),
+                    Some("resp_diag_0")
+                );
+                assert_eq!(
+                    usage.prompt_cache_diagnostics.as_ref().unwrap()["cache_missed_tokens"],
+                    999
+                );
+                inherited = replay;
+            }
+            4 => assert_eq!(
+                usage.prompt_cache_diagnostics.as_ref().unwrap()["type"],
+                "unavailable"
+            ),
+            5 => assert_eq!(
+                usage.prompt_cache_diagnostics.as_ref().unwrap()["type"],
+                "comparison_response_not_found"
+            ),
+            6 => assert_eq!(
+                usage.prompt_cache_diagnostics.as_ref().unwrap()["type"],
+                "cache_hit"
+            ),
+            8 => assert!(usage.prompt_cache_comparison_response_id.is_none()),
+            9 => assert_eq!(
+                usage.prompt_cache_comparison_response_id.as_deref(),
+                Some("resp_diag_8")
+            ),
+            _ => {}
+        }
+    }
+    server.await.unwrap();
+}
+
+#[test]
+fn malformed_cache_diagnostics_do_not_fail_responses_or_change_usage() {
+    for diagnostic in [
+        Value::Null,
+        json!([]),
+        json!({"type":"future_kind"}),
+        json!({"type":"cache_miss","reason":"private prompt text","cache_missed_tokens":-1,"comparison_reusable_tokens":true,"private":"payload"}),
+    ] {
+        let mut value = snapshot(vec![message("m", json!("final_answer"), "answer")]);
+        value["prompt_cache_diagnostics"] = diagnostic;
+        let mut r = reducer();
+        r.snapshot(&value).unwrap();
+        let response = r.response().unwrap();
+        assert_eq!(response.text, "answer");
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
+        if let Some(diagnostic) = usage.prompt_cache_diagnostics {
+            assert_eq!(diagnostic, json!({"type":"cache_miss"}));
+        }
+    }
+}
 fn reducer() -> Reducer {
     reducer_for("openai")
 }
@@ -524,7 +738,7 @@ async fn generic_root_auth_profiles_and_openai_facade_dispatch_real_http() {
                 "authorization: bearer fixture"
             }));
             let body: Value = serde_json::from_slice(&bytes[offset..offset + size]).unwrap();
-            assert_eq!(body["store"], false);
+            assert_eq!(body["store"], true);
             assert_eq!(body["truncation"], "disabled");
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
             assert_eq!(body["max_output_tokens"], 100);

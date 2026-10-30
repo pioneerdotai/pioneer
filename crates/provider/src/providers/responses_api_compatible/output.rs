@@ -52,6 +52,7 @@ pub(super) struct Reducer {
     allowed_tools: Option<std::collections::BTreeSet<String>>,
     choice: Option<crate::ToolChoice>,
     provisional_messages: bool,
+    comparison: Option<crate::prompt_cache::Comparison>,
 }
 impl Reducer {
     pub(super) fn new(
@@ -78,11 +79,20 @@ impl Reducer {
             allowed_tools: None,
             choice: None,
             provisional_messages: false,
+            comparison: None,
         }
     }
     pub(super) fn with_provisional_messages(mut self, enabled: bool) -> Self {
         self.provisional_messages = enabled;
         self
+    }
+    pub(super) fn bind_cache_comparison(
+        &mut self,
+        comparison: Option<crate::prompt_cache::Comparison>,
+    ) {
+        self.usage.prompt_cache_comparison_response_id =
+            comparison.as_ref().and_then(|c| c.response_id.clone());
+        self.comparison = comparison;
     }
     pub(super) fn bind_request(&mut self, request: &crate::ChatRequest) {
         self.allowed_tools = Some(
@@ -562,6 +572,8 @@ impl Reducer {
     pub(super) fn snapshot(&mut self, response: &Value) -> Result<Vec<StreamChunk>> {
         ensure!(self.terminal.is_none(), "Responses duplicate terminal");
         self.observe(response)?;
+        self.usage.prompt_cache_diagnostics =
+            crate::prompt_cache::diagnostics(&response["prompt_cache_diagnostics"]);
         let status = response["status"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing Responses status"))?;
@@ -659,6 +671,11 @@ impl Reducer {
         self.bounds()?;
         let mut chunks = self.publish()?;
         self.collector.finish()?;
+        if status == "completed" && outcome.permits_success() {
+            if let Some(comparison) = &self.comparison {
+                comparison.completed(response);
+            }
+        }
         if !self.calls.is_empty() {
             chunks.push(StreamChunk::tool_calls(self.calls.clone()));
         }
