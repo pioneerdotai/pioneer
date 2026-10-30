@@ -2140,11 +2140,11 @@ impl ClientCore {
         self: &Arc<Self>,
         #[cfg(test)] waiting: Option<std::sync::mpsc::Sender<Option<std::time::Duration>>>,
     ) {
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = crate::threads::history_scheduler::channel();
         *self
             .thread_request_sender
             .lock()
-            .expect("thread request sender poisoned") = Some(sender.into());
+            .expect("thread request sender poisoned") = Some(sender);
         let weak_requests = Arc::downgrade(self);
         *self
             .thread_request_task
@@ -2160,6 +2160,24 @@ impl ClientCore {
                         if core.is_stopped() {
                             break;
                         }
+                        core.retire_thread_controller_jobs();
+                        // Due discovery publishes jobs only. It never executes a due vector.
+                        core.drive_due_thread_resumes();
+                        core.drive_timeline_requests();
+                        core.drive_thread_subscriptions();
+                        let item = {
+                            let registry = core
+                                .thread_registry
+                                .lock()
+                                .expect("thread registry poisoned");
+                            receiver
+                                .take_by(|request| registry.controller_request_interactive(request))
+                        };
+                        if let Some(item) = item {
+                            let continuation = core.dispatch_thread_controller_item(item);
+                            receiver.finish(continuation);
+                            continue;
+                        }
                         let delay = [
                             core.next_thread_resume_delay(),
                             core.next_timeline_request_delay(),
@@ -2173,42 +2191,9 @@ impl ClientCore {
                             let _ = waiting.send(delay);
                         }
                         drop(core);
-                        let request = match delay {
-                            Some(delay) => match receiver.recv_timeout(delay) {
-                                Ok(r) => Some(r),
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                                Err(_) => break,
-                            },
-                            None => match receiver.recv() {
-                                Ok(r) => Some(r),
-                                Err(_) => break,
-                            },
-                        };
-                        let Some(core) = weak_requests.upgrade() else {
-                            break;
-                        };
-                        if core.is_stopped() {
+                        if !receiver.wait(delay) {
                             break;
                         }
-                        let timer = request.is_none();
-                        if let Some(item) = request {
-                            core.dispatch_thread_controller_item(item);
-                        }
-                        pioneer_observability::work::WorkCarrier::independent(
-                            pioneer_observability::work::Boundary::Timer,
-                            pioneer_observability::work::WorkKind::ClientCommand,
-                            if timer {
-                                pioneer_observability::work::Trigger::Timer
-                            } else {
-                                pioneer_observability::work::Trigger::Reconcile
-                            },
-                            pioneer_observability::work::ExecutorRole::ClientController,
-                        )
-                        .run(|| {
-                            core.drive_due_thread_resumes();
-                            core.drive_timeline_requests();
-                            core.drive_thread_subscriptions();
-                        });
                     }
                 })
                 .expect("Client thread request task could not start"),
@@ -2220,43 +2205,74 @@ impl ClientCore {
         item: pioneer_observability::work::WorkItem<
             crate::threads::registry::ThreadControllerRequest,
         >,
-    ) {
+    ) -> Option<
+        pioneer_observability::work::WorkItem<crate::threads::registry::ThreadControllerRequest>,
+    > {
+        use pioneer_observability::work::{Boundary, ExecutorRole, WorkItem, WorkKind};
         let queue = item.queue.as_ref().map(|(q, _)| q.clone());
         let (request, work) = item.received(
-            pioneer_observability::work::Boundary::StdThread,
-            pioneer_observability::work::WorkKind::ClientCommand,
-            pioneer_observability::work::ExecutorRole::ClientController,
+            Boundary::StdThread,
+            WorkKind::ClientCommand,
+            ExecutorRole::ClientController,
         );
         let mut processing = queue.as_ref().map(|q| q.processing());
-        work.run(|| self.execute_thread_controller_request(request));
+        let continuation = work.run(|| {
+            self.execute_thread_controller_request(request)
+                .map(|request| {
+                    let item = WorkItem::new(
+                        request,
+                        Boundary::StdThread,
+                        WorkKind::ClientCommand,
+                        ExecutorRole::ClientController,
+                    );
+                    if let Some(queue) = &queue {
+                        item.observed(
+                            queue.clone(),
+                            pioneer_observability::queues::QueueBytes::Unsupported,
+                        )
+                    } else {
+                        item
+                    }
+                })
+        });
         if let Some(processing) = &mut processing {
             processing.processed();
         }
+        continuation
     }
 
     fn execute_thread_controller_request(
         &self,
         request: crate::threads::registry::ThreadControllerRequest,
-    ) {
+    ) -> Option<crate::threads::registry::ThreadControllerRequest> {
+        use crate::threads::registry::ThreadControllerRequest as R;
         match request {
-            crate::threads::registry::ThreadControllerRequest::Read(request) => {
-                self.execute_timeline_read(request)
+            R::Read(request) => self.execute_timeline_read(request),
+            R::Semantic(request) => {
+                return self
+                    .execute_thread_semantic_request(
+                        &self.transport_runtime.ws_command_sender(),
+                        request,
+                    )
+                    .map(R::Semantic);
             }
-            crate::threads::registry::ThreadControllerRequest::Semantic(request) => self
-                .execute_thread_semantic_request(
-                    &self.transport_runtime.ws_command_sender(),
-                    request,
-                ),
-            crate::threads::registry::ThreadControllerRequest::Subscribe(request) => {
-                self.execute_thread_subscription_request(request)
+            R::ResumeJob(request) => {
+                return self
+                    .execute_thread_resume_quantum(
+                        &self.transport_runtime.ws_command_sender(),
+                        request,
+                    )
+                    .map(R::ResumeJob);
             }
-            crate::threads::registry::ThreadControllerRequest::Binding {
+            R::Subscribe(request) => self.execute_thread_subscription_request(request),
+            R::Binding {
                 id,
                 workspace,
                 generation,
             } => self.execute_thread_cli_binding_request(&id, &workspace, generation),
-            _ => {}
+            R::Resume => {}
         }
+        None
     }
 
     pub(crate) fn start_gateway_event_dispatcher(self: &Arc<Self>) {
@@ -2507,6 +2523,9 @@ impl ClientCore {
             }
             ClientIntent::Timeline { intent } => {
                 let plan = self.timeline_intent(intent.clone());
+                let rejected = plan.dispatch_failed
+                    || !plan.rejected.is_empty()
+                    || !plan.rejected_reads.is_empty();
                 let changed = plan != Default::default();
                 let mut partitions = self.partitions.lock().expect("client partitions poisoned");
                 if changed {
@@ -2514,7 +2533,9 @@ impl ClientCore {
                 }
                 return Self::transition_without_publication(
                     &partitions,
-                    if changed {
+                    if rejected {
+                        ClientTransitionOutcome::Rejected
+                    } else if changed {
                         ClientTransitionOutcome::Changed
                     } else {
                         ClientTransitionOutcome::Noop
@@ -3641,8 +3662,7 @@ mod tests {
         assert_eq!(observed.thread().unwrap().name, fixture_thread.name);
         assert!(live::snapshot().unwrap().journal.iter().any(|record| matches!(&record.payload,
             JournalPayload::Work(w) if w.context.parent == Some(event_context.token) && w.context.kind == WorkKind::ClientPublication)));
-        let (tx, rx) = std::sync::mpsc::channel();
-        let sender = crate::threads::registry::ThreadControllerSender::from(tx);
+        let (sender, rx) = crate::threads::history_scheduler::channel();
 
         *core.thread_request_sender.lock().unwrap() = Some(sender.clone());
         struct BindingTransport(Arc<Mutex<Option<work::WorkContext>>>);
@@ -3669,7 +3689,7 @@ mod tests {
             .test_requests
             .lock()
             .unwrap() = Some(Arc::new(BindingTransport(observed_rpc.clone())));
-        parent.run(|| core.schedule_thread_cli_binding("thread", "ws"));
+        parent.run(|| core.schedule_thread_cli_binding("thread", "ws").unwrap());
         let item = rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("local request delivered");
@@ -3693,13 +3713,16 @@ mod tests {
             WorkCarrier::default(),
             None,
         ));
-        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
-        let closed = crate::threads::registry::ThreadControllerSender::from(closed_tx);
+        let (closed, closed_rx) = crate::threads::history_scheduler::channel();
         drop(closed_rx);
         parent.run(|| {
             assert!(
                 closed
-                    .send(crate::threads::registry::ThreadControllerRequest::Resume)
+                    .send(crate::threads::registry::ThreadControllerRequest::Binding {
+                        id: "thread".into(),
+                        workspace: "ws".into(),
+                        generation: 1
+                    })
                     .is_err()
             )
         });

@@ -664,8 +664,12 @@ impl TimelineView {
                     self.subscribed_workspace = Some(workspace.clone());
                     self.client
                         .schedule_thread_subscription(&self.thread_id, &workspace);
-                    self.client
-                        .schedule_thread_cli_binding(&self.thread_id, &workspace);
+                    if let Err(error) = self
+                        .client
+                        .schedule_thread_cli_binding(&self.thread_id, &workspace)
+                    {
+                        tracing::warn!(%error, "Thread binding admission failed");
+                    }
                     if previous_session.is_some()
                         && previous_connection != GatewayConnectionState::Connected
                     {
