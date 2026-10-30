@@ -417,7 +417,7 @@ async fn oversized_card_preserves_full_unicode_title_and_rejects_deleted_source_
 }
 
 #[tokio::test]
-async fn production_bound_recall_provider_uses_indexed_sources_and_trusted_execution_identity() {
+async fn optional_recall_adapter_uses_indexed_sources_and_trusted_execution_identity() {
     use crate::message::thread_read_tools::tests::member;
     use pioneer_memory::hooks::{AgentEpisodicRecallProvider, MemoryCurrentThreadRecallRequest};
     let (_h, p) = fixture().await;
@@ -478,15 +478,10 @@ async fn production_bound_recall_provider_uses_indexed_sources_and_trusted_execu
             .unwrap()
     );
     let p = Arc::new(p);
-    p.bind_memory_bridge().await;
-    let provider = p
-        .memory_bridge_providers
-        .read()
-        .await
-        .as_ref()
-        .unwrap()
-        .episodic_provider
-        .clone();
+    // Exercise the optional adapter directly. Production Memory hooks no
+    // longer install it; explicit Threads search retains this authorization.
+    let provider =
+        crate::thread_episodic_hooks::ThreadEpisodicMemoryRecallProvider::new(Arc::downgrade(&p));
     let output = provider
         .recall_current_thread(MemoryCurrentThreadRecallRequest {
             workspace_id: WORKSPACE_RED_ID.into(),

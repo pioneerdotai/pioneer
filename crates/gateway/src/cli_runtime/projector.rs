@@ -324,6 +324,55 @@ fn project_item_completed(
     context: &CLIRuntimeProjectorContext,
     completed: &RuntimeItemCompleted,
 ) -> CLIRuntimeProjectedEvents {
+    // Native completion describes the caller's lifecycle, not the execution
+    // outcome committed by the managed MCP invoker.
+    if is_mcp_tool_kind(&completed.item_kind)
+        && pioneer_crud::is_managed_cli_mcp_item(&completed_turn_item(completed))
+    {
+        // Preserve the existing Task observation contract using its existing
+        // semantic marker. This receipt supplements execution; it never emits
+        // a second completion for the MCP call or changes its outcome.
+        let metadata = completed.metadata.as_ref().expect("managed MCP metadata");
+        if metadata["serverInstallationId"] == "pioneer-task-tools-v1"
+            && metadata["canonicalCallableName"] == metadata["rawToolName"]
+            && terminal_tool_status(Some(metadata)) == ToolCallStatus::Completed
+            && let Some(tool) = metadata["canonicalCallableName"].as_str()
+            && let Some(payload) = metadata
+                .get("taskResult")
+                .cloned()
+                .or_else(|| crate::task_tools::delivered_task_payload(&metadata["result"]))
+        {
+            let outcomes =
+                pioneer_agent::observed_terminal_task_outcomes_from_payload(tool, &payload);
+            if !outcomes.is_empty() {
+                return CLIRuntimeProjectedEvents::durable(AgentDurableEvent::ItemCompleted {
+                    notification: ItemCompletedNotification {
+                        workspace_id: context.workspace_id.clone(),
+                        thread_id: context.thread_id.clone(),
+                        turn_id: context.turn_id.clone(),
+                        item: TurnItem::SystemEvent {
+                            id: pioneer_crud::canonical_agent_id(
+                                'I',
+                                &format!(
+                                    "cli-mcp-observed:{}:{:?}:{}:{}:{}",
+                                    context.turn_id,
+                                    completed.native_thread_id,
+                                    completed.native_turn_id,
+                                    completed.native_item_id,
+                                    metadata["sessionGeneration"],
+                                ),
+                            ),
+                            level: SystemEventLevel::Info,
+                            message: "Native CLI completed a task-result response.".to_owned(),
+                            code: Some("task.terminal.observed".to_owned()),
+                            details: Some(json!({"outcomes": outcomes})),
+                        },
+                    },
+                });
+            }
+        }
+        return CLIRuntimeProjectedEvents::ignored("managed MCP caller completion");
+    }
     if is_user_message_kind(completed.item_kind.as_str()) {
         return CLIRuntimeProjectedEvents::ignored("native userMessage echo");
     }
@@ -363,6 +412,145 @@ fn project_item_completed(
             item,
         },
     })
+}
+
+pub(crate) fn confirmed_mcp_call_completed(
+    invocation: &crate::turn_mcp::invoker::TurnMcpInvocation,
+    binding: &pioneer_crud::TurnMcpBindingRecord,
+    manifest_hash: &str,
+    result: &Result<
+        crate::turn_mcp::result::CanonicalMcpToolResult,
+        crate::turn_mcp::invoker::TurnMcpInvocationError,
+    >,
+    rejected_before_execution: bool,
+) -> ItemCompletedNotification {
+    use crate::turn_mcp::invoker::TurnMcpInvocationErrorCode;
+    use pioneer_protocol::{ToolErrorClass, ToolOutcome, ToolOutcomeStatus};
+    use sha2::{Digest, Sha256};
+    let native = invocation
+        .native_call
+        .as_ref()
+        .expect("managed MCP native identity");
+    let correlation = serde_json::to_vec(&json!({
+        "runtimeId": invocation.runtime_id,
+        "nativeThreadId": native.native_thread_id,
+        "nativeTurnId": native.native_turn_id,
+        "providerCallId": native.native_item_id,
+    }))
+    .expect("MCP identity is serializable");
+    let mut metadata = json!({
+        "canonicalCallableName": invocation.canonical_callable_name,
+        "serverInstallationId": binding.server_installation_id,
+        "serverName": binding.server_name,
+        "rawToolName": binding.raw_tool_name,
+        "arguments": invocation.arguments,
+        "providerCallId": native.native_item_id,
+        "sessionGeneration": invocation.session_generation,
+        "manifestHash": manifest_hash,
+        "canonicalSchemaFingerprint": binding.canonical_schema_fingerprint,
+        "providerSchemaFingerprint": binding.provider_schema_fingerprint,
+        "selectionReason": binding.selection_reason,
+        "capabilityId": binding.capability_id,
+        "invocationCorrelationId": hex::encode(Sha256::digest(correlation)),
+        "responseDelivery": "unconfirmed",
+    });
+    if rejected_before_execution {
+        metadata["executionAdmission"] = json!("rejected");
+    }
+    let (success, error_class, incomplete, reason) = match result {
+        Ok(result) => {
+            metadata["result"] = json!({"content": result.content,
+                "structuredContent": result.structured_content,
+                "isError": result.is_error, "_meta": result.meta});
+            metadata["durationMs"] = json!(result.duration_ms);
+            let unknown = result
+                .meta
+                .as_ref()
+                .is_some_and(|meta| meta["pioneer"]["outcome"] == "unknown");
+            (
+                !result.is_error && !unknown,
+                if unknown {
+                    Some(ToolErrorClass::Unknown)
+                } else {
+                    result.is_error.then_some(ToolErrorClass::ExecutionFailed)
+                },
+                unknown,
+                unknown.then(|| "mcp_execution_outcome_unknown".to_owned()),
+            )
+        }
+        Err(error) => {
+            metadata["error"] = json!({"code": error.reason_code()});
+            let class = match error.code {
+                TurnMcpInvocationErrorCode::Cancelled => ToolErrorClass::Cancelled,
+                TurnMcpInvocationErrorCode::TimedOut => ToolErrorClass::Timeout,
+                TurnMcpInvocationErrorCode::ExecutionFailed => ToolErrorClass::ExecutionFailed,
+                TurnMcpInvocationErrorCode::InvalidRequest => ToolErrorClass::InvalidArguments,
+                TurnMcpInvocationErrorCode::PermissionDenied => ToolErrorClass::PermissionDenied,
+                TurnMcpInvocationErrorCode::ToolUnbound => ToolErrorClass::ToolNotVisible,
+                _ => ToolErrorClass::Unknown,
+            };
+            let reason = if error.code == TurnMcpInvocationErrorCode::Cancelled {
+                error.message.clone()
+            } else {
+                error.reason_code().to_owned()
+            };
+            (false, Some(class), !rejected_before_execution, Some(reason))
+        }
+    };
+    let unconfirmed_success = !rejected_before_execution
+        && matches!(
+            error_class,
+            Some(ToolErrorClass::Unknown | ToolErrorClass::Cancelled | ToolErrorClass::Timeout)
+        );
+    metadata["success"] = json!(if unconfirmed_success {
+        None
+    } else {
+        Some(success)
+    });
+    metadata["status"] = json!(match error_class {
+        Some(ToolErrorClass::Unknown) if !rejected_before_execution => "unconfirmed",
+        Some(ToolErrorClass::Cancelled) => "cancelled",
+        Some(ToolErrorClass::Timeout) => "timed_out",
+        _ if success => "completed",
+        _ => "failed",
+    });
+    let mut item = mcp_tool_item(
+        &native.native_item_id,
+        Some(&metadata),
+        if success {
+            ToolCallStatus::Completed
+        } else {
+            ToolCallStatus::Failed
+        },
+    );
+    if let TurnItem::DynamicToolCall {
+        outcome,
+        success: item_success,
+        ..
+    } = &mut item
+    {
+        if unconfirmed_success {
+            *item_success = None;
+        }
+        *outcome = Some(ToolOutcome {
+            status: if success {
+                ToolOutcomeStatus::Ok
+            } else {
+                ToolOutcomeStatus::FatalError
+            },
+            error_class,
+            should_retry: false,
+            retry_hint: None,
+            incomplete,
+            incomplete_reason: reason,
+        });
+    }
+    ItemCompletedNotification {
+        workspace_id: invocation.workspace_id.clone(),
+        thread_id: invocation.thread_id.clone(),
+        turn_id: invocation.turn_id.clone(),
+        item,
+    }
 }
 
 fn project_item_updated(
@@ -2926,7 +3114,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_mcp_timeline_uses_one_enriched_native_item_for_start_terminal_and_replay() {
+    fn codex_mcp_timeline_keeps_native_start_identity_and_defers_execution_outcome_to_invoker() {
         let metadata = json!({
             "server": "pioneer",
             "tool": "mcp__server__tool",
@@ -2979,7 +3167,7 @@ mod tests {
         let completed = project_cli_runtime_event(&context(), &completed_event);
         assert_eq!(started, replayed, "replay must upsert the same identity");
         assert_eq!(started.durable.len(), 1);
-        assert_eq!(completed.durable.len(), 1);
+        assert!(completed.durable.is_empty());
 
         let AgentDurableEvent::ItemStarted { notification } = &started.durable[0] else {
             panic!("expected MCP item start");
@@ -3005,29 +3193,6 @@ mod tests {
         };
         assert_eq!(summary.title, "MCP: Real Server / real_tool");
         assert_eq!(*success, None);
-
-        let AgentDurableEvent::ItemCompleted { notification } = &completed.durable[0] else {
-            panic!("expected MCP item terminal");
-        };
-        let TurnItem::DynamicToolCall {
-            id,
-            tool_name,
-            status,
-            success,
-            display,
-            ..
-        } = &notification.item
-        else {
-            panic!("expected terminal canonical MCP tool item");
-        };
-        assert_eq!(id, "native_mcp_1");
-        assert_eq!(tool_name, "mcp__server__tool");
-        assert_eq!(*status, pioneer_protocol::ToolCallStatus::Failed);
-        assert_eq!(*success, Some(false));
-        let ToolDisplayPayload::Summary(summary) = display else {
-            panic!("expected terminal MCP summary");
-        };
-        assert_eq!(summary.lines, vec!["upstream failed".to_owned()]);
     }
 
     #[test]

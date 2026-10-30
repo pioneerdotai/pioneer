@@ -103,7 +103,7 @@ pub(crate) fn derive_task_agent_authorization_grant_seed(
             AgentActionServiceError::NotAuthorized("Task agent role has no allowed actions"),
         ));
     }
-    child_launch_grant.validate().map_err(|_| {
+    child_launch_grant.validate_for_execution().map_err(|_| {
         AgentToolAdapterError::InvalidInput("Task child launch grant is invalid".to_owned())
     })?;
     Ok(task_authorization_grant_seed_from_envelope(

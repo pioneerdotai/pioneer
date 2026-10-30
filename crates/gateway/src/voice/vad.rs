@@ -3,18 +3,35 @@ use anyhow::{Result, bail};
 use pioneer_protocol::VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ;
 use std::collections::VecDeque;
 
-pub(crate) const VOICE_VAD_FRAME_MS: u32 = 30;
-pub(crate) const VOICE_VAD_FRAME_SAMPLES: usize = 480;
+pub(crate) const VOICE_VAD_FRAME_MS: u32 = 32;
+pub(crate) const VOICE_VAD_FRAME_SAMPLES: usize = 512;
 pub(crate) const VOICE_VAD_SPEECH_THRESHOLD: f32 = 0.3;
-pub(crate) const VOICE_VAD_PREFILL_FRAMES: usize = 15;
-pub(crate) const VOICE_VAD_HANGOVER_FRAMES: usize = 15;
+pub(crate) const VOICE_VAD_PREFILL_FRAMES: usize = 14;
+pub(crate) const VOICE_VAD_HANGOVER_FRAMES: usize = 14;
 pub(crate) const VOICE_VAD_ONSET_FRAMES: usize = 2;
+// 450 ms prefill/hangover round down to 448 ms; 60 ms onset rounds up
+// to 64 ms. The pending PCM bound stays <= the old 16 * 480 samples.
+// After hangover, the same bounded real prefill bridges inter-speech gaps up
+// to 864 ms (448 + 13 * 32) completely. Longer gaps retain real edges only.
+pub(crate) const VOICE_VAD_CONTINUATION_THRESHOLD: f32 = 0.2;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct VadInterval {
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) probability: f32,
+    pub(super) voice: bool,
+    // Meaningful for quiet intervals: source start of this uninterrupted run
+    // on the full VAD input, even if a separating positive frame is not emitted.
+    pub(super) quiet_run_start: usize,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct VoiceVadConfig {
     pub(crate) frame_ms: u32,
     pub(crate) frame_samples: usize,
     pub(crate) speech_threshold: f32,
+    pub(crate) continuation_threshold: f32,
     pub(crate) prefill_frames: usize,
     pub(crate) hangover_frames: usize,
     pub(crate) onset_frames: usize,
@@ -26,6 +43,7 @@ impl Default for VoiceVadConfig {
             frame_ms: VOICE_VAD_FRAME_MS,
             frame_samples: VOICE_VAD_FRAME_SAMPLES,
             speech_threshold: VOICE_VAD_SPEECH_THRESHOLD,
+            continuation_threshold: VOICE_VAD_CONTINUATION_THRESHOLD,
             prefill_frames: VOICE_VAD_PREFILL_FRAMES,
             hangover_frames: VOICE_VAD_HANGOVER_FRAMES,
             onset_frames: VOICE_VAD_ONSET_FRAMES,
@@ -40,6 +58,11 @@ impl VoiceVadConfig {
         }
         if !(0.0..=1.0).contains(&self.speech_threshold) {
             bail!("voice VAD speech threshold must be between 0.0 and 1.0");
+        }
+        if !self.continuation_threshold.is_finite()
+            || !(0.0..=self.speech_threshold).contains(&self.continuation_threshold)
+        {
+            bail!("voice VAD continuation threshold must not exceed onset threshold");
         }
         if self.onset_frames == 0 {
             bail!("voice VAD onset_frames must be positive");
@@ -73,7 +96,7 @@ impl EnergyVoiceActivityDetector {
 impl VoiceActivityDetector for EnergyVoiceActivityDetector {
     fn speech_probability(&mut self, frame: &[f32]) -> Result<f32> {
         if frame.len() != VOICE_VAD_FRAME_SAMPLES {
-            bail!("test detector requires a full SDK-sized frame");
+            bail!("test detector requires a full v4 frame");
         }
         let rms = (frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32)
             .sqrt()
@@ -113,6 +136,9 @@ pub(crate) struct SmoothedVoiceVad<D> {
     detector: D,
     config: VoiceVadConfig,
     frame_buffer: VecDeque<Vec<f32>>,
+    recent_intervals: VecDeque<VadInterval>,
+    emitted_intervals: Vec<VadInterval>,
+    source_cursor: usize,
     hangover_counter: usize,
     onset_counter: usize,
     in_speech: bool,
@@ -130,6 +156,9 @@ where
             detector,
             config: config.validate()?,
             frame_buffer: VecDeque::new(),
+            recent_intervals: VecDeque::new(),
+            emitted_intervals: Vec::new(),
+            source_cursor: 0,
             hangover_counter: 0,
             onset_counter: 0,
             in_speech: false,
@@ -205,8 +234,17 @@ where
     // Never return that prefix again as prefill at the next onset.
     pub(super) fn push_incremental_frame(&mut self, frame: &[f32]) -> Result<SmoothedVadFrame> {
         let result = self.push_frame(frame)?;
-        if matches!(result, SmoothedVadFrame::Speech(_)) {
+        self.emitted_intervals.clear();
+        if let SmoothedVadFrame::Speech(samples) = &result {
+            let start = self.source_cursor - samples.len();
+            self.emitted_intervals.extend(
+                self.recent_intervals
+                    .iter()
+                    .copied()
+                    .filter(|interval| interval.end > start),
+            );
             self.frame_buffer.clear();
+            self.recent_intervals.clear();
         }
         Ok(result)
     }
@@ -215,44 +253,87 @@ where
         self.quiet_samples
     }
 
+    pub(super) fn take_emitted_intervals(&mut self) -> Vec<VadInterval> {
+        std::mem::take(&mut self.emitted_intervals)
+    }
+
     pub(super) fn finish_incremental_tail(&mut self, tail: &[f32]) -> Result<Vec<f32>> {
         if tail.len() >= self.config.frame_samples {
             bail!("voice VAD tail must be shorter than a frame");
         }
-        if self.in_speech {
-            return Ok(tail.to_vec());
-        }
-        // The SDK requires a full frame, including at Commit. Padding belongs
-        // only to this classification; downstream owns exactly the source PCM.
+        self.emitted_intervals.clear();
+        // Only the final partial input is padded, even while already in speech.
+        // Its probability/state sees padding; its clock and downstream PCM do not.
         let voiced_tail = if tail.is_empty() {
             false
         } else {
             let mut frame = vec![0.0; self.config.frame_samples];
             frame[..tail.len()].copy_from_slice(tail);
-            self.detector.speech_probability(&frame)? > self.config.speech_threshold
+            self.classify(&frame, tail.len())?
         };
+        if self.in_speech {
+            self.emitted_intervals
+                .extend(self.recent_intervals.drain(..));
+            self.frame_buffer.clear();
+            return Ok(tail.to_vec());
+        }
         if self.onset_counter == 0 && !voiced_tail {
             return Ok(Vec::new());
         }
         let mut samples: Vec<_> = self.frame_buffer.drain(..).flatten().collect();
+        self.emitted_intervals
+            .extend(self.recent_intervals.drain(..));
         self.onset_counter = 0;
         samples.extend_from_slice(tail);
         Ok(samples)
     }
 
-    fn push_frame(&mut self, frame: &[f32]) -> Result<SmoothedVadFrame> {
-        self.frame_buffer.push_back(frame.to_vec());
-        while self.frame_buffer.len() > self.config.prefill_frames + 1 {
-            self.frame_buffer.pop_front();
-        }
-
+    fn classify(&mut self, frame: &[f32], real_samples: usize) -> Result<bool> {
         let probability = self.detector.speech_probability(frame)?;
-        let is_voice = probability > self.config.speech_threshold;
-        self.quiet_samples = if is_voice {
+        if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+            bail!("voice VAD returned an invalid probability");
+        }
+        // Onset remains 0.3; continuing established speech uses 0.2. Quiet time
+        // and pause candidates use this SAME hysteretic decision, never hangover.
+        let threshold = if self.in_speech {
+            self.config.continuation_threshold
+        } else {
+            self.config.speech_threshold
+        };
+        let voice = probability > threshold;
+        self.recent_intervals.push_back(VadInterval {
+            start: self.source_cursor,
+            end: self.source_cursor + real_samples,
+            probability,
+            voice,
+            quiet_run_start: if voice {
+                self.source_cursor
+            } else {
+                self.source_cursor - self.quiet_samples
+            },
+        });
+        self.source_cursor += real_samples;
+        self.quiet_samples = if voice {
             0
         } else {
-            self.quiet_samples.saturating_add(self.config.frame_samples)
+            self.quiet_samples.saturating_add(real_samples)
         };
+        Ok(voice)
+    }
+
+    fn push_frame(&mut self, frame: &[f32]) -> Result<SmoothedVadFrame> {
+        if frame.len() != self.config.frame_samples {
+            bail!("voice VAD requires a complete frame");
+        }
+        let is_voice = self.classify(frame, frame.len())?;
+        self.frame_buffer.push_back(frame.to_vec());
+        // Keep un-emitted real PCM, including onset, only. This one queue both
+        // preserves short pauses and supplies the trailing edge of long ones;
+        // hangover already transferred to the caller cannot re-enter it.
+        while self.frame_buffer.len() > self.config.prefill_frames + 1 {
+            self.frame_buffer.pop_front();
+            self.recent_intervals.pop_front();
+        }
         match (self.in_speech, is_voice) {
             (false, true) => {
                 self.onset_counter += 1;
@@ -409,7 +490,7 @@ mod tests {
 
     #[test]
     fn final_onset_classifies_only_full_frames_and_emits_only_real_samples_once() {
-        for tail_samples in [0, 1, 137, 479] {
+        for tail_samples in [0, 1, 137, 479, 511] {
             let mut vad =
                 SmoothedVoiceVad::new(ScriptedVad::new([0.0, 0.9, 0.9]), VoiceVadConfig::default())
                     .unwrap();
@@ -450,7 +531,7 @@ mod tests {
 
     #[test]
     fn empty_and_subframe_input_have_no_synthetic_audio_or_synthetic_next_frame() {
-        for tail_samples in [0, 1, 137, 479] {
+        for tail_samples in [0, 1, 137, 479, 511] {
             for probability in [0.0, 0.9] {
                 let mut vad = SmoothedVoiceVad::new(
                     ScriptedVad::new([probability, 0.9, 0.9]),
@@ -469,5 +550,107 @@ mod tests {
                 assert_eq!(vad.frame_buffer.front().unwrap(), &real);
             }
         }
+    }
+
+    #[test]
+    fn pause_edges_preserve_real_short_gaps_and_bound_long_quiet_history() {
+        for quiet_frames in [0, 1, 14, 15, 20, 27, 28, 10000] {
+            let probabilities = [0.9, 0.9]
+                .into_iter()
+                .chain(std::iter::repeat_n(0.0, quiet_frames))
+                .chain([0.9, 0.9]);
+            let mut vad =
+                SmoothedVoiceVad::new(ScriptedVad::new(probabilities), VoiceVadConfig::default())
+                    .unwrap();
+            let mut emitted = Vec::new();
+            let mut mapping = Vec::new();
+            for index in 0..quiet_frames + 4 {
+                let frame = vec![(index + 1) as f32; 512];
+                if let SmoothedVadFrame::Speech(samples) =
+                    vad.push_incremental_frame(&frame).unwrap()
+                {
+                    emitted.extend(samples);
+                    mapping.extend(vad.take_emitted_intervals());
+                }
+                assert!(vad.frame_buffer.len() * 512 <= 7680);
+                assert!(vad.recent_intervals.len() <= 15);
+            }
+            assert!(vad.finish_incremental_tail(&[]).unwrap().is_empty());
+            let source: Vec<_> = (0..quiet_frames + 4)
+                .flat_map(|ix| vec![(ix + 1) as f32; 512])
+                .collect();
+            let expected = if quiet_frames <= 27 {
+                source.clone()
+            } else {
+                // Leading 448 ms hangover, trailing 416 ms real prefill.
+                [&source[..16 * 512], &source[(quiet_frames - 11) * 512..]].concat()
+            };
+            assert_eq!(emitted, expected, "quiet frames: {quiet_frames}");
+            let recovered: Vec<_> = mapping
+                .iter()
+                .flat_map(|interval| source[interval.start..interval.end].iter().copied())
+                .collect();
+            assert_eq!(emitted, recovered);
+            assert!(mapping.windows(2).all(|pair| pair[0].end <= pair[1].start));
+        }
+    }
+
+    #[test]
+    fn hysteresis_and_quiet_clock_share_the_detector_decision_not_hangover() {
+        let probabilities = [0.0, 0.31, 0.31, 0.25]
+            .into_iter()
+            .chain(std::iter::repeat_n(0.19, 15))
+            .chain([0.25, 0.31, 0.31]);
+        let mut vad =
+            SmoothedVoiceVad::new(ScriptedVad::new(probabilities), VoiceVadConfig::default())
+                .unwrap();
+        let mut emitted = Vec::new();
+        for index in 0..22 {
+            if let SmoothedVadFrame::Speech(samples) = vad
+                .push_incremental_frame(&vec![(index + 1) as f32; 512])
+                .unwrap()
+            {
+                emitted.extend(samples);
+            }
+            if index == 3 {
+                assert_eq!(vad.quiet_samples(), 0);
+            }
+            if index == 17 {
+                assert_eq!(vad.quiet_samples(), 14 * 512);
+            }
+            if index == 19 {
+                assert_eq!(vad.quiet_samples(), 16 * 512);
+            }
+        }
+        assert_eq!(
+            emitted,
+            (1..=22)
+                .flat_map(|ix| vec![ix as f32; 512])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(vad.quiet_samples(), 0);
+    }
+
+    #[test]
+    fn pure_quiet_and_noise_never_become_speech_even_at_commit() {
+        let mut vad = SmoothedVoiceVad::new(
+            ScriptedVad::new(std::iter::repeat_n(0.29, 1001)),
+            VoiceVadConfig::default(),
+        )
+        .unwrap();
+        for _ in 0..1000 {
+            assert!(matches!(
+                vad.push_incremental_frame(&[0.02; 512]).unwrap(),
+                SmoothedVadFrame::Noise
+            ));
+            assert!(vad.frame_buffer.len() <= 15);
+            assert!(vad.recent_intervals.len() <= 15);
+        }
+        assert!(
+            vad.finish_incremental_tail(&[0.02; 137])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(vad.quiet_samples(), 512000 + 137);
     }
 }

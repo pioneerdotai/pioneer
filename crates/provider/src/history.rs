@@ -309,8 +309,7 @@ pub(crate) fn deepseek_thinking_required(
     reasoning_enabled: bool,
     messages: &[ChatMessage],
 ) -> bool {
-    model.to_ascii_lowercase().contains("reasoner")
-        || reasoning_enabled
+    reasoning_enabled
         || messages.iter().any(|message| {
             message.role == Role::Assistant
                 && (message
@@ -919,7 +918,7 @@ mod tests {
             result("b", "unit-b"),
         ];
         let projected =
-            project_messages_for_provider("deepseek", "deepseek-reasoner", &canonical).unwrap();
+            project_messages("deepseek", "unlisted-engine-973", Some(true), &canonical).unwrap();
         assert_eq!(projected.len(), canonical.len());
         assert_eq!(projected[1], canonical[1]);
         assert!(projected[0].content.contains("\"id\":\"a\""));
@@ -934,7 +933,7 @@ mod tests {
         assert_eq!(projected[3].content_parts, canonical[3].content_parts);
         assert!(!projected[3].content.contains("AQIDBA=="));
         assert_eq!(
-            project_messages_for_provider("deepseek", "deepseek-reasoner", &projected).unwrap(),
+            project_messages("deepseek", "unlisted-engine-973", Some(true), &projected).unwrap(),
             projected
         );
         assert_eq!(canonical[0].provider_replay_state.as_ref(), Some(&replay));

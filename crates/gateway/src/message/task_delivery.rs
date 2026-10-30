@@ -679,19 +679,17 @@ impl MessageProcessor {
             super::task_agent_executor::select_agent_spec(&task_response, delivery.run_id.as_str())
                 .context("Agent Task delivery has no execution specification")?;
         let policy_generation = self.current_authorization_revision().await?;
-        let (mut adapter, _, _) =
-            super::task_agent_executor::materialize_task_agent_action_binding_for_execution(
-                self,
-                &task_response.task,
-                &agent_spec,
-                execution_id,
-                delivery.run_id.as_str(),
-                execution.home_root_thread_id.as_str(),
-                policy_generation,
-                true,
-            )
-            .await
-            .context("failed to restore exact Task delivery actor")?;
+        let mut adapter = super::task_agent_executor::restore_task_delivery_agent_action_binding(
+            self,
+            &task_response.task,
+            &agent_spec,
+            execution_id,
+            delivery.run_id.as_str(),
+            execution.home_root_thread_id.as_str(),
+            policy_generation,
+        )
+        .await
+        .context("failed to restore exact Task delivery actor")?;
 
         let route_id = actor_contract.delivery.route_id.as_deref();
         let target = if let Some(route_id) = route_id {
@@ -1713,5 +1711,332 @@ mod recovery_failure_tests {
                 .message
                 .contains("HTTP")
         );
+    }
+}
+
+#[cfg(test)]
+mod historical_grant_delivery_tests {
+    use super::*;
+    use crate::message::tests::task_launch_continuity::{
+        historical_task_fixture, historical_task_fixture_with_delivery_target,
+    };
+    use pioneer_protocol::{TaskDeliveryStatus, TurnItem, TurnItemEventPayload};
+    use sea_orm::{
+        ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
+        Set,
+    };
+
+    #[tokio::test]
+    async fn historical_result_delivery_and_post_commit_replay_keep_author_receipt_and_originals() {
+        for mode in [TaskDeliveryMode::Thread, TaskDeliveryMode::UserNotification] {
+            let fixture = historical_task_fixture(mode).await;
+            let processor = &fixture.processor;
+            let store = &processor.crud_store;
+            let db = store.database_connection();
+            fixture
+                .install_historical_grants(&[&fixture.execution.id])
+                .await;
+            let actor = store
+                .get_task_actor_contract(&fixture.response.task.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let original = pioneer_crud::load_agent_execution_grant(&db, &fixture.execution.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let author = crate::message::task_agent_executor::exact_agent_execution_author(
+                processor,
+                &fixture.execution.id,
+            )
+            .await
+            .unwrap();
+            let execution_count = pioneer_entity::agent_execution::Entity::find()
+                .count(&db)
+                .await
+                .unwrap();
+            let pending = fixture.complete().await;
+            assert_eq!(
+                store
+                    .get_task_run(&fixture.run.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskRunStatus::Succeeded
+            );
+            let pioneer_crud::TaskDeliveryTransitionOutcome::Applied((delivery, attempt)) =
+                processor
+                    .task_runtime
+                    .service()
+                    .start_delivery(&pending.id, now_timestamp_secs())
+                    .await
+                    .unwrap()
+            else {
+                panic!("fixture must own the delivery attempt")
+            };
+            assert!(delivery.error_snapshot.is_none());
+            processor
+                .ensure_task_delivery_still_authorized(&delivery)
+                .await
+                .unwrap();
+            // Commit the real destination, deliberately leaving its delivery
+            // acknowledgement outstanding as after a Gateway interruption.
+            match mode {
+                TaskDeliveryMode::Thread => {
+                    let turn_id = processor.deliver_to_thread(&delivery).await.unwrap();
+                    let (_, turn) = store
+                        .get_turn("continuity-root", &turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(turn.author.as_ref(), Some(&author));
+                    assert_eq!(turn.status, pioneer_protocol::TurnStatus::Completed);
+                }
+                TaskDeliveryMode::UserNotification => {
+                    let notification = processor
+                        .deliver_user_notification(&delivery)
+                        .await
+                        .unwrap();
+                    assert_eq!(notification.author.as_ref(), author.agent.as_ref());
+                    assert!(notification.delivery_action_receipt_id.is_some());
+                }
+                _ => unreachable!(),
+            }
+            let action_id = pioneer_crud::canonical_agent_id(
+                'A',
+                &format!("task-delivery-action\0{}", delivery.id),
+            );
+            let receipt = pioneer_crud::load_agent_action_receipt(&db, &action_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                receipt.actor_id.as_deref(),
+                Some(fixture.execution.id.as_str())
+            );
+            assert_eq!(receipt.actor_kind, "agent_execution");
+            assert_eq!(receipt.decision, "allowed");
+            assert_eq!(
+                store
+                    .get_task_delivery(&delivery.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskDeliveryStatus::Delivering
+            );
+            // Cold thread cache: recovery must read the committed destination
+            // and authenticate the old author again before acknowledging it.
+            let mut restarted = processor.as_ref().clone();
+            restarted.thread_manager =
+                Arc::new(crate::thread::ThreadManager::new("test-model", "openai"));
+            assert!(matches!(
+                restarted
+                    .execute_task_delivery(delivery.clone(), attempt)
+                    .await
+                    .unwrap(),
+                pioneer_crud::TaskDeliveryTransitionOutcome::Applied(())
+            ));
+            let delivered = store
+                .get_task_delivery(&delivery.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivered.status, TaskDeliveryStatus::Delivered);
+            assert_eq!(delivered.result_snapshot, delivery.result_snapshot);
+            assert_eq!(
+                pioneer_crud::load_agent_action_receipt(&db, &action_id)
+                    .await
+                    .unwrap(),
+                Some(receipt)
+            );
+            if let Some(turn_id) = delivered.delivered_turn_id.as_deref() {
+                let events = store
+                    .get_turn_item_events("continuity-root", turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let item_id = pioneer_protocol::task_delivery_result_item_id(&delivery.id);
+                assert_eq!(events.events.iter().filter(|event| matches!(&event.payload,
+                    TurnItemEventPayload::ItemCompleted { item: TurnItem::AgentMessage { id, .. }, .. } if id == &item_id)).count(), 1);
+            } else {
+                let notification = pioneer_entity::user_notification_outbox::Entity::find()
+                    .filter(
+                        pioneer_entity::user_notification_outbox::Column::TaskDeliveryId
+                            .eq(&delivery.id),
+                    )
+                    .all(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(notification.len(), 1);
+                let payload: pioneer_protocol::TaskUserNotificationDeliveredNotification =
+                    serde_json::from_str(&notification[0].payload_json).unwrap();
+                assert_eq!(payload.author.as_ref(), author.agent.as_ref());
+            }
+            assert_eq!(
+                store
+                    .get_task_actor_contract(&fixture.response.task.id)
+                    .await
+                    .unwrap(),
+                Some(actor)
+            );
+            assert_eq!(
+                pioneer_crud::load_agent_execution_grant(&db, &fixture.execution.id)
+                    .await
+                    .unwrap(),
+                Some(original)
+            );
+            assert_eq!(
+                pioneer_entity::agent_execution::Entity::find()
+                    .count(&db)
+                    .await
+                    .unwrap(),
+                execution_count
+            );
+            fixture.assert_no_provider_requests();
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_delivery_still_rejects_corrupt_snapshots_and_revoked_authority() {
+        for corruption in ["outer", "nested", "task", "identity", "route"] {
+            let destination_thread_id = if corruption == "route" {
+                "historical-delivery-target"
+            } else {
+                "continuity-root"
+            };
+            let fixture = historical_task_fixture_with_delivery_target(
+                TaskDeliveryMode::Thread,
+                destination_thread_id,
+            )
+            .await;
+            let processor = &fixture.processor;
+            let store = &processor.crud_store;
+            let db = store.database_connection();
+            fixture
+                .install_historical_grants(&[&fixture.execution.id])
+                .await;
+            let route = if corruption == "route" {
+                Some(fixture.add_delivery_route().await)
+            } else {
+                None
+            };
+            let pending = fixture.complete().await;
+            let pioneer_crud::TaskDeliveryTransitionOutcome::Applied((delivery, attempt)) =
+                processor
+                    .task_runtime
+                    .service()
+                    .start_delivery(&pending.id, now_timestamp_secs())
+                    .await
+                    .unwrap()
+            else {
+                panic!("fixture must own the delivery attempt")
+            };
+            if let Some((id, authority, fingerprint, generation)) = route {
+                assert!(
+                    processor
+                        .prepare_task_delivery_agent_action(&delivery, Some(destination_thread_id))
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "historical delivery must pass the active route before revocation"
+                );
+                assert!(
+                    store
+                        .revoke_agent_delegation_route(
+                            &id,
+                            1,
+                            generation,
+                            &authority,
+                            &fingerprint,
+                            pioneer_crud::utc_now()
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+            match corruption {
+                "outer" | "nested" => {
+                    let row = pioneer_crud::load_agent_execution_grant(&db, &fixture.execution.id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut value: serde_json::Value =
+                        serde_json::from_str(&row.grant_json).unwrap();
+                    if corruption == "outer" {
+                        value["root_thread_id"] = json!("altered");
+                    } else {
+                        value["child_launch_grant"]["allowServerDerivedEphemeral"] = json!(true);
+                    }
+                    let encoded = value.to_string();
+                    let mut row = row.into_active_model();
+                    if corruption == "nested" {
+                        row.grant_fingerprint =
+                            Set(pioneer_crud::agent_execution_grant_fingerprint(&encoded).unwrap());
+                    }
+                    row.grant_json = Set(encoded);
+                    row.update(&db).await.unwrap();
+                }
+                "task" => {
+                    let row = pioneer_entity::task_actor_contract::Entity::find_by_id(
+                        &fixture.response.task.id,
+                    )
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    let mut value: serde_json::Value = serde_json::from_str(
+                        row.derived_child_launch_grant_json.as_deref().unwrap(),
+                    )
+                    .unwrap();
+                    value["child_launch_grant"]["allowServerDerivedEphemeral"] = json!(true);
+                    let mut row = row.into_active_model();
+                    row.derived_child_launch_grant_json = Set(Some(value.to_string()));
+                    row.update(&db).await.unwrap();
+                }
+                "identity" => {
+                    let row = pioneer_crud::load_agent_identity(&db, "A00000000000000000001")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut row = row.into_active_model();
+                    row.status = Set("retired".into());
+                    row.retired_at = Set(Some(pioneer_crud::utc_now()));
+                    row.update(&db).await.unwrap();
+                }
+                "route" => {}
+                _ => unreachable!(),
+            }
+            assert!(
+                processor
+                    .execute_task_delivery(delivery.clone(), attempt)
+                    .await
+                    .is_err(),
+                "{corruption}"
+            );
+            let action_id = pioneer_crud::canonical_agent_id(
+                'A',
+                &format!("task-delivery-action\0{}", delivery.id),
+            );
+            assert!(
+                pioneer_crud::load_agent_action(&db, &action_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let turn_id = pioneer_crud::canonical_agent_id(
+                'T',
+                &format!("task-delivery-turn\0{}", delivery.id),
+            );
+            assert!(
+                store
+                    .get_turn(destination_thread_id, &turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            fixture.assert_no_provider_requests();
+        }
     }
 }

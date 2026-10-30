@@ -83,12 +83,12 @@ impl Provider for ChoiceModelsProvider {
                 default_effort: None,
                 mandatory: None,
                 supports_token_budget: None,
-                source: Some(pioneer_protocol::ReasoningCapabilitySource::StaticRegistry),
+                source: Some(pioneer_protocol::ReasoningCapabilitySource::ProviderMetadata),
             });
         no_effort.capabilities.thinking = Some(false);
         models.push(no_effort);
         let mut other = models[0].clone();
-        // Discovery cannot give an unknown OpenAI family an effort contract.
+        // Native metadata applies to this additional ID independently of its name.
         other.id = "gpt-5.4-catalog-other".into();
         other.name = Some("Another selectable model".into());
         models.push(other);
@@ -1504,8 +1504,8 @@ async fn inherited_reasoning_replay_uses_committed_choice_when_catalog_changes()
             .await
             .unwrap()
             .unwrap();
-        // Remove the selected model. OpenAI's documented effort options are
-        // supplemented by the reasoning registry, so discovery cannot remove low.
+        // Remove the selected model from current discovery. An admitted replay
+        // retains its recorded selection; a new launch needs current evidence.
         let changed_models = api_choice_models(&["gpt-5.4-catalog-other"]).await;
         *response.write().unwrap() = if unavailable {
             ChoiceCatalogResponse::Unavailable

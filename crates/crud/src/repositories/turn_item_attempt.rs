@@ -375,6 +375,74 @@ pub async fn finish_running_attempt<C: ConnectionTrait>(
     Ok(true)
 }
 
+pub(crate) async fn is_unconfirmed_cli_mcp_attempt<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    Ok(turn_item_attempt::Entity::find_by_id(attempt_id.to_owned())
+        .filter(turn_item_attempt::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item_attempt::Column::ItemId.eq(item_id.to_owned()))
+        .filter(turn_item_attempt::Column::Status.eq("interrupted"))
+        .filter(turn_item_attempt::Column::FailureReason.eq("turn_terminal_before_item_completed"))
+        .one(db)
+        .await?
+        .is_some())
+}
+
+/// Correct only the diagnostic gap created by terminal-Turn cleanup. A
+/// confirmed managed MCP outcome is not a retry or reactivation of execution.
+pub(crate) async fn finish_unconfirmed_cli_mcp_attempt<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+    attempt_id: &str,
+    status: TurnItemAttemptStatus,
+    failure_reason: Option<String>,
+    completed_event_sequence: i64,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let status = turn_item_attempt_status_to_db(status);
+    let affected = turn_item_attempt::Entity::update_many()
+        .col_expr(turn_item_attempt::Column::Status, Expr::value(status))
+        .col_expr(
+            turn_item_attempt::Column::FailureReason,
+            Expr::value(failure_reason),
+        )
+        .col_expr(
+            turn_item_attempt::Column::UpdatedAt,
+            Expr::value(updated_at),
+        )
+        .filter(turn_item_attempt::Column::Id.eq(attempt_id.to_owned()))
+        .filter(turn_item_attempt::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item_attempt::Column::ItemId.eq(item_id.to_owned()))
+        .filter(turn_item_attempt::Column::StartedEventSequence.lt(completed_event_sequence))
+        .filter(turn_item_attempt::Column::Status.eq("interrupted"))
+        .filter(turn_item_attempt::Column::FailureReason.eq("turn_terminal_before_item_completed"))
+        .exec(db)
+        .await?
+        .rows_affected;
+    if affected == 0 {
+        return Ok(false);
+    }
+    let affected = turn_item::Entity::update_many()
+        .col_expr(
+            turn_item::Column::ActiveAttemptStatus,
+            Expr::value(Some(status)),
+        )
+        .col_expr(turn_item::Column::UpdatedAt, Expr::value(updated_at))
+        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item::Column::ItemId.eq(item_id.to_owned()))
+        .filter(turn_item::Column::ActiveAttemptId.eq(attempt_id.to_owned()))
+        .filter(turn_item::Column::ActiveAttemptStatus.eq("interrupted"))
+        .exec(db)
+        .await?
+        .rows_affected;
+    anyhow::ensure!(affected == 1, "CLI MCP unconfirmed attempt lost its item");
+    Ok(true)
+}
+
 fn clears_attempt_payload(status: TurnItemAttemptStatus) -> bool {
     matches!(
         status,
@@ -917,7 +985,38 @@ pub(crate) async fn prepare_terminal_running_attempts<C: ConnectionTrait>(
             let terminal_state = TurnItemTerminalState::Failed {
                 reason: Some("turn_terminal_before_item_completed".to_owned()),
             };
+            let managed_mcp = crate::is_managed_cli_mcp_item(&terminal_item);
             terminalize_turn_item_payload(&mut terminal_item, terminal_state.clone());
+            if managed_mcp
+                && let TurnItem::DynamicToolCall { success, outcome, display, storage, .. } = &mut terminal_item
+            {
+                // Turn closure proves neither execution failure nor accepted
+                // cancellation. Retain an explicit unknown, non-retryable gap.
+                *success = None;
+                *outcome = Some(pioneer_protocol::ToolOutcome {
+                    status: pioneer_protocol::ToolOutcomeStatus::FatalError,
+                    error_class: Some(pioneer_protocol::ToolErrorClass::Unknown),
+                    should_retry: false,
+                    retry_hint: None,
+                    incomplete: true,
+                    incomplete_reason: Some("cli_mcp_result_unconfirmed".to_owned()),
+                });
+                let mark_metadata = |metadata: &mut pioneer_protocol::ToolMetadata| {
+                    metadata.insert("status", pioneer_protocol::ToolMetadataValue::from_json(
+                        serde_json::json!("unconfirmed")));
+                    metadata.insert("success", pioneer_protocol::ToolMetadataValue::Null);
+                    metadata.insert("responseDelivery", pioneer_protocol::ToolMetadataValue::from_json(
+                        serde_json::json!("unconfirmed")));
+                };
+                if let pioneer_protocol::ToolDisplayPayload::Summary(summary) = display {
+                    mark_metadata(&mut summary.metadata);
+                }
+                match storage {
+                    pioneer_protocol::ToolStoragePayload::Summary(summary) => mark_metadata(&mut summary.metadata),
+                    pioneer_protocol::ToolStoragePayload::Metadata { metadata } => mark_metadata(metadata),
+                    _ => {}
+                }
+            }
             let terminal_item_payload = serde_json::to_string(&terminal_item)
                 .context("failed to encode terminalized turn item")?;
             Ok(PreparedTerminalRunningAttempt {
