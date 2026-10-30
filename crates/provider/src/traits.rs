@@ -104,6 +104,7 @@ pub trait Provider: Send + Sync {
     /// shared provider-neutral fallback before endpoint errors are redacted.
     fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
         crate::failure::classify_stream_error(error)
+            .or_else(|| crate::failure::classify_http_error(error))
     }
 
     /// Materialize and locally budget the media that this request will send.
