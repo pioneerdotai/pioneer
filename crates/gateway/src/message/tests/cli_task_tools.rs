@@ -650,7 +650,8 @@ async fn deliver_task_cli_outcome(
             "serverName":if identified {"pioneer_tasks"} else {"foreign"},
             "serverInstallationId":if identified {"pioneer-task-tools-v1"} else {"foreign"},
             "providerCallId":call_id,"invocationCorrelationId":format!("fixture-{call_id}"),
-            "sessionGeneration":binding.mcp.unwrap().session_generation,
+            "sessionGeneration":binding.mcp.as_ref().unwrap().session_generation,
+            "manifestHash":binding.mcp.as_ref().unwrap().manifest_hash,
             "arguments":arguments,"result":returned,"success":native_success,
             "status":if native_success {"completed"} else {"failed"},
             "message":"display preview deliberately contains no task facts"})),
@@ -886,6 +887,55 @@ fn cli_terminal_outcomes_require_successful_identified_durable_delivery() {
                         .await
                         .unwrap();
                 assert!(!result.is_error);
+                // A confirmed execution in canonical history is not a native
+                // delivery receipt, even when its complete Task payload exists.
+                let cli = processor
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let frozen = processor
+                    .crud_store
+                    .list_turn_mcp_bindings(&turn_id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|binding| binding.canonical_callable_name == tool)
+                    .unwrap();
+                let invocation = TurnMcpInvocation {
+                    workspace_id: cli.workspace_id,
+                    thread_id: cli.thread_id,
+                    turn_id: turn_id.clone(),
+                    runtime_id: Some(cli.runtime_id),
+                    session_generation: Some(cli.mcp.as_ref().unwrap().session_generation as u64),
+                    provider_call_id: "terminal-outcome".into(),
+                    native_call: Some(crate::turn_mcp::invoker::NativeMcpCallIdentity {
+                        native_thread_id: cli.native_thread_id,
+                        native_turn_id: cli.native_turn_id.unwrap(),
+                        native_item_id: "terminal-outcome".into(),
+                    }),
+                    admission_deadline: None,
+                    canonical_callable_name: tool.into(),
+                    arguments: args.clone(),
+                    origin: TurnMcpInvocationOrigin::CliFacade,
+                };
+                let execution = crate::cli_runtime::projector::confirmed_mcp_call_completed(
+                    &invocation,
+                    &frozen,
+                    &cli.mcp.unwrap().manifest_hash,
+                    &Ok(result.clone()),
+                    false,
+                );
+                processor
+                    .crud_store
+                    .materialize_item_completed(execution, now_timestamp_secs())
+                    .await
+                    .unwrap();
+                assert!(
+                    observed_cli_tasks(&processor, &turn_id).await.is_empty(),
+                    "canonical execution alone must not bypass the Task delivery gate"
+                );
                 deliver_task_cli_outcome(
                     &harness,
                     &processor,
@@ -5419,11 +5469,57 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 .call("create", "create", "thread_create", create_args.clone())
                 .await;
             assert_eq!(created["status"], "accepted");
+            let create_item_id = match kind {
+                CLIAgentRuntimeKind::Codex => "create",
+                CLIAgentRuntimeKind::Claude => "toolu_create",
+                CLIAgentRuntimeKind::OpenCode => "assistant:tool:create",
+            };
+            let original_completion = processor
+                .crud_store
+                .get_turn_item(&turn, create_item_id)
+                .await
+                .unwrap()
+                .unwrap();
             let replay = ThreadsFacade::new(&processor, &turn, kind)
                 .await
                 .call("create-reconnected", "create", "thread_create", create_args)
                 .await;
             assert_eq!(replay["receiptId"], created["receiptId"]);
+            assert_eq!(
+                processor
+                    .crud_store
+                    .get_turn_item(&turn, create_item_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                original_completion,
+                "reconnecting must preserve the original canonical execution outcome"
+            );
+            let caller = processor
+                .crud_store
+                .get_cli_runtime_turn_binding(&turn)
+                .await
+                .unwrap()
+                .unwrap();
+            let events = processor
+                .crud_store
+                .get_turn_item_events(&caller.thread_id, &turn)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                events
+                    .events
+                    .iter()
+                    .filter(|event| matches!(
+                        &event.payload,
+                        pioneer_protocol::TurnItemEventPayload::ItemCompleted { item, .. }
+                            if item.item_id() == create_item_id
+                    ))
+                    .count(),
+                1,
+                "receipt replay must not append a second completion"
+            );
             let target = created["targetOptions"]
                 .as_array()
                 .unwrap()

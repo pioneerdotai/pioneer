@@ -1,4 +1,6 @@
+mod cli_mcp_call;
 mod codex_retry_notice;
+pub use cli_mcp_call::{CliMcpCallIdentity, is_managed_cli_mcp_item};
 pub use codex_retry_notice::{CodexRetryNoticeTarget, codex_retry_notice_item_id};
 mod frozen_lifetime;
 pub use frozen_lifetime::FrozenReadHold;
@@ -30769,7 +30771,7 @@ impl CrudStore {
         execution_owner_id: Option<String>,
         operation_guard: Option<sea_orm::Statement>,
     ) -> Result<()> {
-        let appended_event = self
+        let Some(appended_event) = self
             .append_claimed_turn_event_projection_once(
                 event,
                 created_at,
@@ -30779,7 +30781,10 @@ impl CrudStore {
                 execution_owner_id.as_deref(),
                 operation_guard,
             )
-            .await?;
+            .await?
+        else {
+            return Ok(());
+        };
 
         if !appended_event.was_inserted {
             return Ok(());
@@ -31252,6 +31257,7 @@ impl CrudStore {
             claim_expires_at,
             enqueue_optional_deliveries,
             false,
+            false,
         )
         .await
     }
@@ -31274,6 +31280,7 @@ impl CrudStore {
             claim_expires_at,
             true,
             repair_terminal_projection,
+            false,
         )
         .await
     }
@@ -31286,6 +31293,7 @@ impl CrudStore {
         claim_expires_at: DateTimeWithTimeZone,
         enqueue_optional_deliveries: bool,
         repair_compaction_projection: bool,
+        allow_deferred_cli_mcp_projection: bool,
     ) -> Result<()> {
         let PreparedProjectedTurnEvent {
             event,
@@ -31295,6 +31303,12 @@ impl CrudStore {
             terminal_effect_activation,
         } = prepared;
         validate_turn_event_durable_owner(transaction, event.payload()).await?;
+        if cli_mcp_call::cli_mcp_observation_is_superseded(transaction, event.payload(), None)
+            .await?
+            && !turn_event::prepared_event_already_exists(transaction, &event).await?
+        {
+            return Ok(());
+        }
         if terminal_turn_execution_status_for_event(event.payload()).is_some()
             && repositories::native_cancellation_context::has_accepted(
                 transaction,
@@ -31331,6 +31345,9 @@ impl CrudStore {
                 }
                 return Ok(());
             }
+            if allow_deferred_cli_mcp_projection {
+                return Ok(());
+            }
             anyhow::bail!(
                 "idempotent turn event `{}` exists but its authoritative projection is incomplete",
                 appended_event.id
@@ -31365,6 +31382,12 @@ impl CrudStore {
         )
         .await?
         {
+            if allow_deferred_cli_mcp_projection {
+                // The canonical fact and its existing projection claim are
+                // durable. The ordinary replay lane will apply it after its
+                // predecessor; never discard a confirmed MCP result here.
+                return Ok(());
+            }
             anyhow::bail!(
                 "turn event projection `{}` is not the next sequence after the authoritative watermark for turn `{}`",
                 appended_event.id,
@@ -31444,7 +31467,7 @@ impl CrudStore {
         claim_expires_at: DateTimeWithTimeZone,
         execution_owner_id: Option<&str>,
         operation_guard: Option<sea_orm::Statement>,
-    ) -> Result<crate::events::AppendedTurnEvent> {
+    ) -> Result<Option<crate::events::AppendedTurnEvent>> {
         let event = prepare_turn_event_for_permanent_storage(&self.connection, event).await?;
         let projection_context_json =
             serialize_turn_event_projection_context(&projection_context, event.id())?;
@@ -31458,6 +31481,13 @@ impl CrudStore {
         validate_turn_event_durable_owner(&transaction, event.payload()).await?;
         validate_turn_event_execution_owner(&transaction, event.payload(), execution_owner_id)
             .await?;
+        if cli_mcp_call::cli_mcp_observation_is_superseded(&transaction, event.payload(), None)
+            .await?
+            && !turn_event::prepared_event_already_exists(&transaction, &event).await?
+        {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
         // Fence execution writes and competing terminal results. Independently
         // owned service lifecycle and user edits retain their existing guards.
         if (execution_owner_id.is_some()
@@ -31577,7 +31607,7 @@ impl CrudStore {
                 .await
                 .context("failed to rollback idempotent turn event lookup")?;
             if projected || projection_context.native_cancellation.is_some() {
-                return Ok(appended_event);
+                return Ok(Some(appended_event));
             }
             // Another producer may have committed this exact canonical event
             // and still be projecting it. Its durable append is just as
@@ -31677,7 +31707,7 @@ impl CrudStore {
             .await
             .context("failed to commit turn event append transaction")?;
 
-        Ok(appended_event)
+        Ok(Some(appended_event))
     }
 
     async fn project_claimed_turn_event_once(
@@ -31733,11 +31763,19 @@ impl CrudStore {
             return Ok(TurnEventProjectionOutcome::DeferredByPredecessor);
         }
 
-        if let Err(error) = self
-            .projector
-            .project_prepared(&transaction, &appended_event, projection)
-            .await
-            .context("failed to project turn event to read models")
+        let superseded_observation = cli_mcp_call::cli_mcp_observation_is_superseded(
+            &transaction,
+            &appended_event.payload,
+            Some(appended_event.sequence),
+        )
+        .await?;
+
+        if !superseded_observation
+            && let Err(error) = self
+                .projector
+                .project_prepared(&transaction, &appended_event, projection)
+                .await
+                .context("failed to project turn event to read models")
         {
             let _ = transaction.rollback().await;
             return Err(error);
@@ -31789,10 +31827,12 @@ impl CrudStore {
             return Err(error);
         }
 
-        if let (TurnEventPayload::ItemStarted(notification), Some(deadlines)) = (
-            &appended_event.payload,
-            projection_context.item_started_deadlines,
-        ) {
+        if !superseded_observation
+            && let (TurnEventPayload::ItemStarted(notification), Some(deadlines)) = (
+                &appended_event.payload,
+                projection_context.item_started_deadlines,
+            )
+        {
             let configured = turn_item_attempt::configure_running_attempt_deadlines(
                 &transaction,
                 notification.turn_id.as_str(),
@@ -31813,10 +31853,11 @@ impl CrudStore {
             }
         }
 
-        if let Err(error) = self
-            .project_semantic_timeline_live_turn_event(&transaction, &appended_event)
-            .await
-            .context("failed to project turn event to semantic timeline")
+        if !superseded_observation
+            && let Err(error) = self
+                .project_semantic_timeline_live_turn_event(&transaction, &appended_event)
+                .await
+                .context("failed to project turn event to semantic timeline")
         {
             let _ = transaction.rollback().await;
             return Err(error);
@@ -50267,7 +50308,8 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("terminal event cannot be a superseded MCP observation");
         assert!(appended.was_inserted);
         let saved = pioneer_entity::task_run_cancellation_actor::Entity::find_by_id("stop-run")
             .one(&db)

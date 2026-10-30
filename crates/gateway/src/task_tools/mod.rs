@@ -5107,6 +5107,11 @@ pub(crate) async fn observed_terminal_task_outcomes(
         }) else {
             continue;
         };
+        // The Gateway can confirm execution before the native response arrives.
+        // Only the existing native observation/continuation receipts prove delivery.
+        if metadata["responseDelivery"] == "unconfirmed" {
+            continue;
+        }
         if metadata["canonicalCallableName"].as_str() != Some(tool_name.as_str())
             || metadata["rawToolName"].as_str() != Some(binding.raw_tool_name.as_str())
             || metadata["serverInstallationId"].as_str()
