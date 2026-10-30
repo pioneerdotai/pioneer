@@ -517,7 +517,7 @@ async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wire
                     .unwrap();
                 for row in page.entries {
                     saw_context |= matches!(kind, PagedSource::ProviderContext);
-                    latest = latest.max(row.created_at);
+                    latest = std::cmp::max(latest, row.created_at);
                 }
                 if page.next_sequence <= after {
                     break;

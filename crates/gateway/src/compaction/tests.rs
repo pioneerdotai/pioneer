@@ -6042,7 +6042,9 @@ async fn saved_candidate_survives_restart_without_regenerating() {
 #[tokio::test]
 async fn accepted_service_sources_resume_with_cursor_and_reference_material() {
     use pioneer_crud::CanonicalTurnEventPayload as Event;
-    use pioneer_protocol::{ItemCompletedNotification, SystemEventLevel, ToolRetryResolution};
+    use pioneer_protocol::{
+        ItemCompletedNotification, SystemEventLevel, ToolRetryResolution, TurnItem,
+    };
     let mut retry = prompt_cache_history_tests::resolved(ToolRetryResolution::Succeeded);
     if let Event::ItemToolRetryResolved(value) = &mut retry {
         value.reason = "accepted retry 漢字🌍 ".repeat(5_000);
