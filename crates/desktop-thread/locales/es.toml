@@ -334,3 +334,4 @@
 "timeline.web_search.results_count" = "%{count} resultados"
 "timeline.web_search.running" = "Buscando en la web"
 "timeline.work_group.completed" = "Trabajó"
+"chat.composer.preparing_send" = "Preparando mensaje"

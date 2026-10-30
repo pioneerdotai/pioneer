@@ -335,3 +335,4 @@
 
 "timeline.html.loading" = "Loading page…"
 "timeline.html.failed" = "Couldn’t display this page"
+"chat.composer.preparing_send" = "Preparing message"

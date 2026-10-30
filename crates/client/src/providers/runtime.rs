@@ -248,8 +248,8 @@ impl ClientCore {
     ) -> anyhow::Result<CLIRuntimeListResponse> {
         self.read_provider_runtime_request(workspace, refresh, None)
     }
-    /// The Send consumer shares the normal runtime owner and forced-refresh
-    /// policy, with an individual deadline/cancel lifetime for its wait.
+    /// The Send consumer shares the normal runtime owner, with an individual
+    /// deadline/cancel lifetime for its wait.
     pub(crate) fn read_provider_runtimes_with_budget(
         &self,
         workspace: &str,
@@ -866,6 +866,42 @@ impl ClientCore {
         };
         self.sync_composer_provider_runtimes(workspace);
     }
+    /// Retained rows are display evidence only until a read admitted after the
+    /// invalidation completes. A queued read can absorb more invalidations; an
+    /// already dispatched read must lose its identity before it can complete.
+    fn invalidate_provider_runtime_scope(
+        &self,
+        owner: &mut ProviderRuntimeController,
+        workspace: &str,
+    ) {
+        let scope = owner.scopes.get_mut(workspace).unwrap();
+        scope.loaded = false;
+        let needs_read = scope.demanded() || scope.prefetch;
+        let schedule = needs_read && (scope.request.is_none() || scope.due.is_none());
+        let auth = scope.auth;
+        let attempt = scope.request.as_ref().map_or(0, |request| request.attempt);
+        if !needs_read {
+            scope.request = None;
+            scope.due = None;
+        }
+        if schedule {
+            owner.schedule(workspace, auth);
+            // Invalidation preserves the active retry budget. An in-flight
+            // explicit probe is followed by a list, never replayed as a probe.
+            owner
+                .scopes
+                .get_mut(workspace)
+                .unwrap()
+                .request
+                .as_mut()
+                .unwrap()
+                .attempt = attempt;
+        }
+        let scope = owner.scopes.get_mut(workspace).unwrap();
+        let mut next = (*scope.publication).clone();
+        next.request = ProviderRuntimeRequestState::Loading;
+        self.publish_provider_runtime(scope, next);
+    }
     fn reduce_provider_runtime_notification(&self, notification: &GatewayNotification) {
         let workspace = match notification {
             GatewayNotification::CLIRuntimeStatusChanged(p) => &p.workspace_id,
@@ -887,10 +923,12 @@ impl ClientCore {
                 .provider_runtimes
                 .lock()
                 .expect("provider runtimes poisoned");
-            if owner.scopes.get(workspace).is_some_and(|scope| {
-                scope.auth == auth && scope.demanded() && scope.request.is_none()
-            }) {
-                owner.schedule(workspace, auth);
+            if owner
+                .scopes
+                .get(workspace)
+                .is_some_and(|scope| scope.auth == auth)
+            {
+                self.invalidate_provider_runtime_scope(&mut owner, workspace);
             }
             return;
         };
@@ -912,10 +950,7 @@ impl ClientCore {
             || update.revision == 0
             || update.revision != scope.source_revision.saturating_add(1)
         {
-            if scope.demanded() && scope.request.is_none() {
-                let auth = scope.auth;
-                owner.schedule(&update.workspace_id, auth);
-            }
+            self.invalidate_provider_runtime_scope(&mut owner, &update.workspace_id);
             return;
         }
         scope.source_revision = update.revision;
@@ -1606,10 +1641,12 @@ mod tests {
         // Revision 13 was lost. Applying 14 would create a mixed catalog;
         // the reducer retains rows and requests an authoritative snapshot.
         notify(14, "b", false, false);
-        assert!(Arc::ptr_eq(
-            &removed,
-            &core.provider_runtime_snapshot("workspace").unwrap()
-        ));
+        let loading = core.provider_runtime_snapshot("workspace").unwrap();
+        assert_eq!(loading.request(), &ProviderRuntimeRequestState::Loading);
+        assert_eq!(loading.runtimes.len(), removed.runtimes.len());
+        for (retained, previous) in loading.runtimes.iter().zip(&removed.runtimes) {
+            assert!(Arc::ptr_eq(retained, previous));
+        }
         let recovery = request(&core, "workspace");
         core.complete_provider_runtime(&recovery, Ok(response(14, &["b", "c"])), Instant::now());
         let recovered = core.provider_runtime_snapshot("workspace").unwrap();
@@ -1623,6 +1660,305 @@ mod tests {
             core.provider_runtime_request_for_test("workspace")
                 .is_none()
         );
+    }
+
+    fn invalidation(kind: &str) -> GatewayNotification {
+        use pioneer_protocol::*;
+        match kind {
+            "account" => GatewayNotification::CLIRuntimeAccountUpdated(
+                CLIRuntimeAccountUpdatedNotification {
+                    workspace_id: "workspace".into(),
+                    runtime_id: "a".into(),
+                    kind: None,
+                    account: None,
+                    status: RuntimeStatus::Ready,
+                },
+            ),
+            "apps" => {
+                GatewayNotification::CLIRuntimeAppsChanged(CLIRuntimeAppsChangedNotification {
+                    workspace_id: "workspace".into(),
+                    runtime_id: "a".into(),
+                    apps: vec![],
+                    refreshed_at_unix_ms: None,
+                })
+            }
+            "gap" | "zero" => {
+                GatewayNotification::CLIRuntimeStatusChanged(CLIRuntimeStatusChangedNotification {
+                    workspace_id: "workspace".into(),
+                    revision: if kind == "gap" { 12 } else { 0 },
+                    runtime: runtime("a"),
+                    removed: false,
+                })
+            }
+            _ => panic!("unknown invalidation fixture"),
+        }
+    }
+
+    #[test]
+    fn invalidations_fence_dispatched_reads_and_coalesce_before_the_next_dispatch() {
+        for kind in ["account", "apps", "gap", "zero"] {
+            for dispatched in [false, true] {
+                let core = authorized_core();
+                let first = observe(&core, "workspace");
+                core.complete_provider_runtime(&first, Ok(response(10, &["a"])), Instant::now());
+                let ready = core.provider_runtime_snapshot("workspace").unwrap();
+                core.provider_runtime_intent(ProviderRuntimeIntent::Refresh {
+                    workspace_id: "workspace".into(),
+                });
+                let old = request(&core, "workspace");
+                if dispatched {
+                    // The controller consumes due immediately before dispatch.
+                    core.provider_runtimes
+                        .lock()
+                        .unwrap()
+                        .scopes
+                        .get_mut("workspace")
+                        .unwrap()
+                        .due = None;
+                }
+                core.observe_provider_runtime_notification(&invalidation(kind));
+                let current = request(&core, "workspace");
+                let loading = core.provider_runtime_snapshot("workspace").unwrap();
+                assert_eq!(
+                    loading.request(),
+                    &ProviderRuntimeRequestState::Loading,
+                    "{kind}"
+                );
+                assert!(Arc::ptr_eq(&ready.runtimes[0], &loading.runtimes[0]));
+                for _ in 0..100 {
+                    core.observe_provider_runtime_notification(&invalidation(kind));
+                }
+                assert_eq!(request(&core, "workspace"), current);
+                if dispatched {
+                    // Even a newer stream revision cannot bless a response
+                    // whose request predates account/apps/unknown-gap evidence.
+                    core.complete_provider_runtime(
+                        &old,
+                        Ok(response(100, &["stale"])),
+                        Instant::now(),
+                    );
+                    assert!(Arc::ptr_eq(
+                        &loading,
+                        &core.provider_runtime_snapshot("workspace").unwrap()
+                    ));
+                } else {
+                    assert_eq!(old, current);
+                }
+                core.complete_provider_runtime(
+                    &current,
+                    Ok(response(12, &["fresh"])),
+                    Instant::now(),
+                );
+                let result = core.read_provider_runtimes("workspace", false).unwrap();
+                assert_eq!(result.runtimes[0].runtime_id, "fresh");
+                assert!(
+                    core.provider_runtime_request_for_test("workspace")
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn undemanded_invalidation_retains_display_but_next_reader_loads_authoritative_rows() {
+        for kind in ["account", "apps", "gap", "zero"] {
+            let core = authorized_core();
+            let first = observe(&core, "workspace");
+            core.complete_provider_runtime(&first, Ok(response(10, &["a"])), Instant::now());
+            core.provider_runtime_intent(ProviderRuntimeIntent::Release {
+                workspace_id: "workspace".into(),
+            });
+            core.observe_provider_runtime_notification(&invalidation(kind));
+            let retained = core.provider_runtime_snapshot("workspace").unwrap();
+            assert_eq!(retained.request(), &ProviderRuntimeRequestState::Loading);
+            assert_eq!(retained.runtimes[0].runtime_id, "a");
+            assert!(
+                core.provider_runtime_request_for_test("workspace")
+                    .is_none()
+            );
+            let mut reads = 0;
+            let result = core
+                .read_provider_runtime_request_with_wait("workspace", false, None, None, |_| {
+                    reads += 1;
+                    core.complete_provider_runtime(
+                        &request(&core, "workspace"),
+                        Ok(response(12, &["fresh"])),
+                        Instant::now(),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(reads, 1, "{kind}");
+            assert_eq!(result.runtimes[0].runtime_id, "fresh");
+        }
+    }
+
+    #[test]
+    fn invalidation_preserves_retry_budget_and_does_not_repeat_an_inflight_probe() {
+        let core = authorized_core();
+        let first = observe(&core, "workspace");
+        core.complete_provider_runtime(&first, Err(()), Instant::now());
+        let retry = request(&core, "workspace");
+        let due = core.provider_runtimes.lock().unwrap().scopes["workspace"].due;
+        core.observe_provider_runtime_notification(&invalidation("account"));
+        assert_eq!(request(&core, "workspace"), retry);
+        assert_eq!(
+            core.provider_runtimes.lock().unwrap().scopes["workspace"].due,
+            due
+        );
+        core.provider_runtimes
+            .lock()
+            .unwrap()
+            .scopes
+            .get_mut("workspace")
+            .unwrap()
+            .due = None;
+        core.observe_provider_runtime_notification(&invalidation("apps"));
+        let fenced_retry = request(&core, "workspace");
+        assert_eq!(fenced_retry.attempt, retry.attempt);
+        assert_ne!(fenced_retry.generation, retry.generation);
+        for attempt in fenced_retry.attempt..RETRY_DELAYS.len() {
+            core.observe_provider_runtime_notification(&invalidation("account"));
+            let work = request(&core, "workspace");
+            assert_eq!(work.attempt, attempt);
+            core.complete_provider_runtime(&work, Err(()), Instant::now());
+        }
+        assert_eq!(
+            core.provider_runtime_snapshot("workspace")
+                .unwrap()
+                .request(),
+            &ProviderRuntimeRequestState::Failed
+        );
+        assert!(
+            core.provider_runtime_request_for_test("workspace")
+                .is_none()
+        );
+        core.schedule_provider_runtime_refresh("workspace", Some("a".into()))
+            .unwrap();
+        let probe = request(&core, "workspace");
+        core.provider_runtimes
+            .lock()
+            .unwrap()
+            .scopes
+            .get_mut("workspace")
+            .unwrap()
+            .due = None;
+        core.observe_provider_runtime_notification(&invalidation("apps"));
+        let list = request(&core, "workspace");
+        assert_eq!(list.refresh_runtime, None);
+        core.complete_provider_runtime(&probe, Ok(response(50, &["probe"])), Instant::now());
+        assert_eq!(
+            core.provider_runtime_snapshot("workspace")
+                .unwrap()
+                .request(),
+            &ProviderRuntimeRequestState::Loading
+        );
+        core.complete_provider_runtime(&list, Ok(response(51, &["list"])), Instant::now());
+        assert_eq!(
+            core.read_provider_runtimes("workspace", false)
+                .unwrap()
+                .runtimes[0]
+                .runtime_id,
+            "list"
+        );
+    }
+
+    #[test]
+    fn budget_cancel_drops_only_the_send_waiter_while_visible_consumer_keeps_the_load() {
+        use crate::rpc::{JsonRpcRequestTransport, JsonRpcResponseSender, RequestBudget};
+        struct RuntimeReplies(mpsc::Sender<JsonRpcResponseSender>);
+        impl JsonRpcRequestTransport for RuntimeReplies {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                reply: JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: pioneer_protocol::JsonRpcRequest =
+                    serde_json::from_str(&payload).unwrap();
+                assert_eq!(
+                    request.method,
+                    pioneer_protocol::constants::methods::CLI_RUNTIME_LIST
+                );
+                self.0.send(reply).map_err(|error| error.to_string())
+            }
+        }
+        struct Cleanup(Arc<ClientCore>, RequestBudget);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.1.cancel();
+                self.0.shutdown();
+            }
+        }
+        let core = crate::catalog_test_support::client();
+        let budget = RequestBudget::new(Instant::now() + Duration::from_secs(60));
+        let _cleanup = Cleanup(core.clone(), budget.clone());
+        core.transport_runtime().inject_test_event(
+            crate::transport::ws::GatewayWsEvent::Connected {
+                connection_id: 7,
+                endpoint_id: "endpoint".into(),
+                endpoint_name: "Synthetic".into(),
+                gateway_base_url: pioneer_protocol::GatewayBaseUrl::parse_presentation(
+                    "https://synthetic.invalid",
+                )
+                .unwrap(),
+            },
+        );
+        let (replies, received) = mpsc::channel();
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(Arc::new(RuntimeReplies(replies)));
+        let visible = core.retain_provider_runtime("workspace");
+        core.start_provider_runtime_controller();
+        let reply = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        let load = request(&core, "workspace");
+        let (finished, result) = mpsc::channel();
+        let waiter_core = core.clone();
+        let waiter_budget = budget.clone();
+        let waiter = std::thread::spawn(move || {
+            finished
+                .send(waiter_core.read_provider_runtimes_with_budget(
+                    "workspace",
+                    false,
+                    &waiter_budget,
+                ))
+                .unwrap();
+        });
+        let registration_deadline = Instant::now() + Duration::from_secs(5);
+        while core.provider_runtimes.lock().unwrap().scopes["workspace"]
+            .listeners
+            .is_empty()
+        {
+            assert!(
+                Instant::now() < registration_deadline,
+                "Send waiter did not register"
+            );
+            std::thread::yield_now();
+        }
+        budget.cancel();
+        assert!(
+            result
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_err()
+        );
+        waiter.join().unwrap();
+        assert_eq!(request(&core, "workspace"), load);
+        reply
+            .send(Ok(
+                serde_json::to_value(response(1, &["surviving"])).unwrap()
+            ))
+            .unwrap();
+        let rows = core.read_provider_runtimes("workspace", false).unwrap();
+        assert_eq!(rows.runtimes[0].runtime_id, "surviving");
+        assert!(
+            received.try_recv().is_err(),
+            "cancel must not start a replacement list"
+        );
+        drop(visible);
     }
 
     #[test]

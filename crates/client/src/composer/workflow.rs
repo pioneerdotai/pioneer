@@ -196,7 +196,7 @@ fn resolve_selected_execution_target_with_budget(
     let _startup_readiness = pioneer_observability::turn_startup::current_stage(
         pioneer_observability::turn_startup::Stage::ReadinessWait,
     );
-    let runtimes = core.read_provider_runtimes_with_budget(workspace_id, true, budget)?;
+    let runtimes = core.read_provider_runtimes_with_budget(workspace_id, false, budget)?;
     selected_execution_target_from_runtimes(Some(provider), &runtimes.runtimes)
 }
 
@@ -1143,6 +1143,126 @@ mod tests {
     use pioneer_protocol::*;
     use std::{cell::Cell, sync::Arc};
 
+    #[test]
+    fn text_target_reuses_ready_runtime_but_voice_resolver_still_forces_a_list() {
+        use crate::rpc::{JsonRpcRequestTransport, JsonRpcResponseSender, RequestBudget};
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering},
+            time::{Duration, Instant},
+        };
+        struct RuntimeReplies(Arc<AtomicUsize>);
+        impl JsonRpcRequestTransport for RuntimeReplies {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                reply: JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: JsonRpcRequest = serde_json::from_str(&payload).unwrap();
+                assert_eq!(request.method, constants::methods::CLI_RUNTIME_LIST);
+                self.0.fetch_add(1, Ordering::SeqCst);
+                reply
+                    .send(Ok(serde_json::json!({"revision": 1, "runtimes": [{
+                        "runtime_id": "a", "kind": "codex", "display_name": "a", "enabled": true,
+                        "status": {"state": "ready"}, "capabilities": RuntimeCapabilities::default()
+                    }]})))
+                    .map_err(|error| error.to_string())
+            }
+        }
+        struct Cleanup(Arc<ClientCore>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.shutdown();
+            }
+        }
+        let core = crate::catalog_test_support::client();
+        let _cleanup = Cleanup(core.clone());
+        core.transport_runtime().inject_test_event(
+            crate::transport::ws::GatewayWsEvent::Connected {
+                connection_id: 7,
+                endpoint_id: "endpoint".into(),
+                endpoint_name: "Synthetic".into(),
+                gateway_base_url: GatewayBaseUrl::parse_presentation("https://synthetic.invalid")
+                    .unwrap(),
+            },
+        );
+        let lists = Arc::new(AtomicUsize::new(0));
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(Arc::new(RuntimeReplies(lists.clone())));
+        core.start_provider_runtime_controller();
+        let budget = RequestBudget::new(Instant::now() + Duration::from_secs(5));
+        for _ in 0..2 {
+            let target = resolve_selected_execution_target_with_budget(
+                &core,
+                "workspace",
+                Some("cli_runtime:a"),
+                &budget,
+            )
+            .unwrap();
+            assert!(
+                matches!(target.execution_backend, Some(AgentExecutionBackend::CLIAgentRuntime { runtime_id, .. }) if runtime_id == "a")
+            );
+        }
+        assert_eq!(lists.load(Ordering::SeqCst), 1);
+        assert!(
+            resolve_selected_execution_target_with_budget(
+                &core,
+                "workspace",
+                Some("cli_runtime:missing"),
+                &budget
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_selected_execution_target_with_budget(
+                &core,
+                "workspace",
+                Some("openai"),
+                &budget
+            )
+            .unwrap()
+            .execution_backend
+            .is_none()
+        );
+        assert_eq!(lists.load(Ordering::SeqCst), 1);
+        resolve_selected_execution_target(&core, "workspace", Some("cli_runtime:a")).unwrap();
+        assert_eq!(lists.load(Ordering::SeqCst), 2);
+        let mut runtime = core
+            .provider_runtime_snapshot("workspace")
+            .unwrap()
+            .runtimes()[0]
+            .runtime()
+            .clone();
+        runtime.enabled = false;
+        runtime.status = RuntimeStatus::Disabled;
+        for (revision, removed) in [(2, false), (3, true)] {
+            core.observe_provider_runtime_notification(
+                &GatewayNotification::CLIRuntimeStatusChanged(
+                    CLIRuntimeStatusChangedNotification {
+                        workspace_id: "workspace".into(),
+                        revision,
+                        runtime: runtime.clone(),
+                        removed,
+                    },
+                ),
+            );
+            assert!(
+                resolve_selected_execution_target_with_budget(
+                    &core,
+                    "workspace",
+                    Some("cli_runtime:a"),
+                    &budget
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(lists.load(Ordering::SeqCst), 2);
+    }
+
     struct Files;
     impl ClientFileSystem for Files {
         fn read_file(&self, _: &ClientPath) -> ClientResult<Vec<u8>> {
@@ -1369,6 +1489,14 @@ mod tests {
             checked_rx
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .unwrap();
+            assert_eq!(
+                core.composer_snapshot("a")
+                    .unwrap()
+                    .preparing_send()
+                    .unwrap()
+                    .text(),
+                "captured draft"
+            );
             match exit {
                 "cancel" => {
                     core.complete_composer_operation(
@@ -1392,6 +1520,12 @@ mod tests {
             waiter.join().unwrap();
             if exit != "refresh_failure" {
                 assert!(budget.check().is_err());
+                if exit != "budget_cancel" {
+                    assert!(
+                        core.composer_snapshot("a")
+                            .is_none_or(|p| p.preparing_send().is_none())
+                    );
+                }
             }
         }
     }
@@ -1399,7 +1533,22 @@ mod tests {
     #[test]
     fn preparation_consumes_captured_draft_and_duplicate_does_no_io() {
         let (core, identity) = fixture();
-        let transport = Transport::new(|| {});
+        let pending = core.composer_snapshot("a").unwrap();
+        assert_eq!(pending.preparing_send().unwrap().identity(), &identity);
+        let transport = Transport::new(|| {
+            let current = core.composer_snapshot("a").unwrap();
+            let surface = current.preparing_send().unwrap();
+            assert_eq!(surface.text(), "captured draft");
+            assert_eq!(surface.attachments()[0].path, "/synthetic/fixture.txt");
+            assert_eq!(
+                surface.attachments()[0].upload_state,
+                ComposerAttachmentUploadState::Local
+            );
+            assert_eq!(
+                current.operation().unwrap().status,
+                ComposerOperationStatus::Uploading
+            );
+        });
         let prepared = core
             .prepare_composer_send(&identity, &transport, &Files, context())
             .unwrap();
@@ -1415,6 +1564,7 @@ mod tests {
             ComposerOperationStatus::Prepared
         );
         let before = core.composer_snapshot("a").unwrap();
+        assert_eq!(before.preparing_send(), pending.preparing_send());
         assert!(
             core.prepare_composer_send(&identity, &transport, &Files, context())
                 .is_err()
@@ -1445,6 +1595,7 @@ mod tests {
         );
         let input = core.composer_snapshot("a").unwrap();
         assert_eq!(input.draft().text, "new text");
+        assert!(input.preparing_send().is_none());
         assert_eq!(
             input.operation().unwrap().status,
             ComposerOperationStatus::Cancelled
@@ -1685,6 +1836,7 @@ mod tests {
     #[test]
     fn submitted_send_reuses_warm_subscription_and_renews_only_for_new_socket() {
         struct Rpc {
+            core: std::sync::Weak<ClientCore>,
             thread: Thread,
             subscriptions: std::sync::atomic::AtomicUsize,
             turns: std::sync::Mutex<Vec<Turn>>,
@@ -1699,6 +1851,20 @@ mod tests {
                 let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
                 let result = match request["method"].as_str().unwrap() {
                     "thread/start" => {
+                        let core = self.core.upgrade().unwrap();
+                        let input = core.composer_snapshot("a").unwrap();
+                        assert_eq!(
+                            input.operation().unwrap().status,
+                            ComposerOperationStatus::Preparing
+                        );
+                        assert!(input.preparing_send().is_some());
+                        assert!(
+                            core.thread_coordinator_snapshot("a")
+                                .unwrap()
+                                .conversation
+                                .in_flight_turn_id()
+                                .is_none()
+                        );
                         self.subscriptions
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         serde_json::to_value(ThreadStartResponse {
@@ -1767,6 +1933,7 @@ mod tests {
                 access_token: AuthSecretString::new("initial"),
             }));
         let rpc = Arc::new(Rpc {
+            core: Arc::downgrade(&core),
             thread,
             subscriptions: std::sync::atomic::AtomicUsize::new(0),
             turns: Default::default(),
@@ -1925,6 +2092,112 @@ mod tests {
     }
 
     #[test]
+    fn preparing_handoff_retires_feedback_before_optimistic_thread_publication() {
+        for edit_before_commit in [false, true] {
+            let (core, identity) = fixture();
+            let reduction = ready_send(&core, &identity);
+            assert!(
+                core.composer_snapshot("a")
+                    .unwrap()
+                    .preparing_send()
+                    .is_some()
+            );
+            assert!(
+                core.thread_coordinator_snapshot("a")
+                    .unwrap()
+                    .conversation
+                    .projection()
+                    .turns
+                    .is_empty()
+            );
+            if edit_before_commit {
+                core.composer_intent(ComposerIntent::EditText {
+                    thread_id: "a".into(),
+                    draft_id: identity.draft_id,
+                    text: "new draft".into(),
+                });
+            }
+            let committed = core.commit_composer_send(&identity, "workspace", &reduction);
+            let composer = core
+                .snapshot(&crate::core::ClientScope::Composer {
+                    thread_id: "a".into(),
+                })
+                .unwrap();
+            assert!(
+                core.composer_snapshot("a")
+                    .unwrap()
+                    .preparing_send()
+                    .is_none()
+            );
+            let thread = core.thread_coordinator_snapshot("a").unwrap();
+            if edit_before_commit {
+                assert!(committed.is_none());
+                assert!(thread.conversation.projection().turns.is_empty());
+                assert_eq!(
+                    core.composer_snapshot("a").unwrap().draft().text,
+                    "new draft"
+                );
+            } else {
+                assert!(committed.is_some());
+                assert_eq!(thread.conversation.projection().turns.len(), 1);
+                let thread_publication = core
+                    .snapshot(&crate::core::ClientScope::Thread {
+                        thread_id: "a".into(),
+                    })
+                    .unwrap();
+                assert!(
+                    composer.snapshot().sequence() < thread_publication.snapshot().sequence(),
+                    "even a consumer splitting process batches must retire preparing before seeing the optimistic message"
+                );
+                assert!(
+                    core.commit_composer_send(&identity, "workspace", &reduction)
+                        .is_none()
+                );
+                assert_eq!(
+                    core.thread_coordinator_snapshot("a")
+                        .unwrap()
+                        .conversation
+                        .projection()
+                        .turns
+                        .len(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validation_failure_retires_preparing_without_starting_a_turn() {
+        let (core, identity) = fixture();
+        // No thread is open: actual submit fails its local admission before RPC/upload.
+        assert!(
+            core.composer_snapshot("a")
+                .unwrap()
+                .preparing_send()
+                .is_some()
+        );
+        let result = core.submit_composer_send(
+            identity.clone(),
+            &Files,
+            ComposerSendContext {
+                workspace_id: Some("workspace".into()),
+                endpoint_kind: None,
+                failure_message: "failed".into(),
+            },
+        );
+        assert!(result.is_err());
+        let input = core.composer_snapshot("a").unwrap();
+        assert!(input.preparing_send().is_none());
+        assert_eq!(input.draft().text, "captured draft");
+        assert!(matches!(
+            input.operation().unwrap().status,
+            ComposerOperationStatus::Failed { .. }
+        ));
+        assert!(core.thread_coordinator_snapshot("a").is_none());
+        assert!(core.composer_sends.lock().unwrap().tasks.is_empty());
+    }
+
+    #[test]
     fn send_acknowledgement_clears_only_matching_draft_and_failure_retains_payload() {
         for (draft, accepted) in [(true, true), (true, false), (false, true), (false, false)] {
             let (core, identity) = fixture();
@@ -1948,9 +2221,21 @@ mod tests {
             receive
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .unwrap();
+            let sending = core.composer_snapshot("a").unwrap();
+            assert_eq!(sending.draft().text, "captured draft");
+            assert!(sending.preparing_send().is_none());
             assert_eq!(
-                core.composer_snapshot("a").unwrap().draft().text,
-                "captured draft"
+                sending.operation().unwrap().status,
+                ComposerOperationStatus::Sending
+            );
+            assert_eq!(
+                core.thread_coordinator_snapshot("a")
+                    .unwrap()
+                    .conversation
+                    .projection()
+                    .turns
+                    .len(),
+                1
             );
             reply.send(accepted).unwrap();
             join_sends(&core);
@@ -1968,6 +2253,7 @@ mod tests {
                 "send completion must reach Desktop/Mobile publications"
             );
             assert!(!published.operation().unwrap().pending());
+            assert!(published.preparing_send().is_none());
             if accepted {
                 assert!(input.draft().text.is_empty());
                 assert_ne!(input.draft_id(), identity.draft_id);
