@@ -2161,10 +2161,19 @@ impl ClientCore {
                             break;
                         }
                         core.retire_thread_controller_jobs();
-                        // Due discovery publishes jobs only. It never executes a due vector.
-                        core.drive_due_thread_resumes();
-                        core.drive_timeline_requests();
-                        core.drive_thread_subscriptions();
+                        // Discovery is an intentional independent reconciliation pass.
+                        // It publishes jobs only; RPC execution stays with the scheduler.
+                        pioneer_observability::work::WorkCarrier::independent(
+                            pioneer_observability::work::Boundary::Timer,
+                            pioneer_observability::work::WorkKind::ClientCommand,
+                            pioneer_observability::work::Trigger::Reconcile,
+                            pioneer_observability::work::ExecutorRole::ClientController,
+                        )
+                        .run(|| {
+                            core.drive_due_thread_resumes();
+                            core.drive_timeline_requests();
+                            core.drive_thread_subscriptions();
+                        });
                         let item = {
                             let registry = core
                                 .thread_registry

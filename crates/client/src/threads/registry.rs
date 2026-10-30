@@ -1609,28 +1609,7 @@ impl ClientCore {
             &mut state,
             update.clone(),
         );
-        // Accepted whole-range removal ends the existing targeted lifetime.
-        // Reauthorization may admit a fresh generation, never revive its aggregate.
-        // Read authority from the actual reducer result, not notification revisions.
-        let retired = state
-            .registry
-            .timeline
-            .in_flight
-            .iter()
-            .filter(|key| {
-                let SemanticTimelineRequestKey::TurnWorkItems { thread_id, turn_id } = key else {
-                    return false;
-                };
-                thread_id == id
-                    && !crate::timeline::semantic::accepts_turn_work_items_change(
-                        &state, thread_id, turn_id,
-                    )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in &retired {
-            state.registry.timeline.reject_admission(key);
-        }
+        let retired = state.registry.retire_unauthorized_targeted_requests(id);
         // Read intent survives a duplicate invalidation, but only for IDs accepted
         // into the stale sets by the semantic reducer (including tombstone fences).
         let requests = thread_reconcile_actions(&state, &update);
@@ -1641,7 +1620,7 @@ impl ClientCore {
             && store.demand == ClientDemand::Visible
             && state.registry.timeline.rearm_exhausted_refresh(id);
         drop(state);
-        if !retired.is_empty() {
+        if retired {
             self.retire_thread_controller_jobs();
         }
         if rearmed {
@@ -2810,6 +2789,11 @@ impl ClientCore {
 
 #[cfg(test)]
 mod tests {
+    // Deterministic cut after capture and before enqueue, absent from production.
+    thread_local! {
+        pub(super) static RESUME_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+    }
+
     // Existing result-focused suites ask for a complete logical operation.
     // Advance only its returned continuation, with a fixed test bound; scheduler
     // ordering and one-quantum assertions use execute directly below.
@@ -9508,6 +9492,7 @@ mod tests {
             "absent-tombstone-cancel",
             "absent-tombstone-reauthorized",
             "absent-tombstone-inflight-reauthorized",
+            "absent-tombstone-work-page-reauthorized",
             "absent-tombstone-replace",
         ] {
             let core = core();
@@ -9529,6 +9514,9 @@ mod tests {
             let absent = outcome.starts_with("absent");
             let tombstoned = outcome.starts_with("absent-tombstone");
             let in_flight_reauthorization = outcome == "absent-tombstone-inflight-reauthorized";
+            let work_page_reauthorization = outcome == "absent-tombstone-work-page-reauthorized";
+            let reauthorized_before_completion =
+                in_flight_reauthorization || work_page_reauthorization;
             core.apply_turn_work_items_get_response(page(if absent {
                 vec![]
             } else {
@@ -9584,21 +9572,70 @@ mod tests {
                 page.projection_updated_at_unix_micros = 32_000;
             }
             let remove_range = || {
-                let GatewayNotification::ThreadTimelineBlocksChanged(mut notification) =
-                    reconciliation_notification(&[])
-                else {
-                    unreachable!()
-                };
-                notification.removed_block_ids = vec!["turn:turn:work".into()];
-                notification.turn_work_tombstones = vec![pioneer_protocol::TurnWorkTombstone {
-                    turn_id: "turn".into(),
-                    block_id: "turn:turn:work".into(),
-                    source_high_watermark: 30,
-                    projection_updated_at_unix_micros: 30_000,
-                }];
-                assert!(core.apply_thread_semantic_live_update(
+                if work_page_reauthorization {
+                    struct RemovalPage(pioneer_protocol::TurnWorkPageResponse);
+                    impl crate::rpc::JsonRpcRequestTransport for RemovalPage {
+                        fn send_json_rpc_request(
+                            &self,
+                            _: String,
+                            _: String,
+                            response: crate::rpc::JsonRpcResponseSender,
+                        ) -> Result<(), String> {
+                            response
+                                .send(Ok(serde_json::to_value(&self.0).unwrap()))
+                                .unwrap();
+                            Ok(())
+                        }
+                    }
+                    let page_request = core
+                        .begin_thread_semantic_request(
+                            SemanticTimelineRequestAction::TurnWorkPage {
+                                key: SemanticTimelineRequestKey::TurnWorkInitial {
+                                    thread_id: "a".into(),
+                                    turn_id: "turn".into(),
+                                },
+                                params: TurnWorkPageParams {
+                                    thread_id: "a".into(),
+                                    turn_id: "turn".into(),
+                                    anchor: TimelinePageAnchor::Newest,
+                                    limit: Some(12),
+                                },
+                            },
+                        )
+                        .unwrap()
+                        .unwrap();
+                    let page = RemovalPage(TurnWorkPageResponse {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn_id: "turn".into(),
+                        projection_version: 1,
+                        source_high_watermark: 30,
+                        projection_updated_at_unix_micros: 30_000,
+                        work: None,
+                        items: vec![],
+                        page: Default::default(),
+                    });
+                    assert!(
+                        core.execute_thread_semantic_request(&page, page_request)
+                            .is_none()
+                    );
+                } else {
+                    let GatewayNotification::ThreadTimelineBlocksChanged(mut notification) =
+                        reconciliation_notification(&[])
+                    else {
+                        unreachable!()
+                    };
+                    notification.removed_block_ids = vec!["turn:turn:work".into()];
+                    notification.turn_work_tombstones = vec![pioneer_protocol::TurnWorkTombstone {
+                        turn_id: "turn".into(),
+                        block_id: "turn:turn:work".into(),
+                        source_high_watermark: 30,
+                        projection_updated_at_unix_micros: 30_000,
+                    }];
+                    assert!(core.apply_thread_semantic_live_update(
                     crate::timeline::semantic::SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification)
                 ));
+                }
                 assert!(
                     core.thread_semantic_snapshot("a")
                         .thread("a")
@@ -9640,7 +9677,7 @@ mod tests {
             };
             let fresh_request = std::cell::RefCell::new(None);
             let fresh_loading = std::cell::RefCell::new(None);
-            let late_old = in_flight_reauthorization.then(|| ThreadSemanticRequest {
+            let late_old = reauthorized_before_completion.then(|| ThreadSemanticRequest {
                 id: request.id.clone(),
                 generation: request.generation,
                 request_generation: request.request_generation,
@@ -9650,6 +9687,35 @@ mod tests {
                 reconciliation: None,
                 work_items: WorkItemsContinuation::default(),
             });
+            let admit_fresh = || {
+                let next = core
+                    .begin_thread_semantic_request(
+                        SemanticTimelineRequestAction::TurnWorkItemsGet {
+                            key: key.clone(),
+                            params: TurnWorkItemsGetParams {
+                                thread_id: "a".into(),
+                                turn_id: "turn".into(),
+                                work_item_ids: vec!["item-0".into(), "fresh-required".into()],
+                            },
+                        },
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(next.request_generation, generation);
+                *fresh_request.borrow_mut() = Some(next);
+                let loading = core.thread_snapshot("a").unwrap();
+                assert!(matches!(
+                    &loading
+                        .semantic
+                        .thread("a")
+                        .unwrap()
+                        .work_range("turn")
+                        .unwrap()
+                        .request_status,
+                    crate::timeline::semantic::TimelineRequestStatus::Loading { .. }
+                ));
+                *fresh_loading.borrow_mut() = Some(loading);
+            };
             let transport = Transport {
                 replies: std::cell::RefCell::new(vec![Ok(page(vec![incoming.clone()])), second]),
                 calls: std::cell::Cell::new(0),
@@ -9657,25 +9723,7 @@ mod tests {
                     Box::new(|| {
                         remove_range();
                         reauthorize();
-                        let next = core
-                            .begin_thread_semantic_request(
-                                SemanticTimelineRequestAction::TurnWorkItemsGet {
-                                    key: key.clone(),
-                                    params: TurnWorkItemsGetParams {
-                                        thread_id: "a".into(),
-                                        turn_id: "turn".into(),
-                                        work_item_ids: vec![
-                                            "item-0".into(),
-                                            "fresh-required".into(),
-                                        ],
-                                    },
-                                },
-                            )
-                            .unwrap()
-                            .unwrap();
-                        assert_ne!(next.request_generation, generation);
-                        *fresh_request.borrow_mut() = Some(next);
-                        *fresh_loading.borrow_mut() = core.thread_snapshot("a");
+                        admit_fresh();
                     }) as Box<dyn Fn() + '_>
                 }),
             };
@@ -9740,6 +9788,10 @@ mod tests {
             }
             if tombstoned && !in_flight_reauthorization {
                 remove_range();
+            }
+            if work_page_reauthorization {
+                reauthorize();
+                admit_fresh();
             }
             let mut replacement_ready = None;
             let mut live = original.clone();
@@ -9819,6 +9871,7 @@ mod tests {
                         | "absent-tombstone"
                         | "absent-tombstone-rpc"
                         | "absent-tombstone-reauthorized"
+                        | "absent-tombstone-work-page-reauthorized"
                 ) {
                     1
                 } else {
@@ -9844,7 +9897,8 @@ mod tests {
                 | "absent-tombstone-dispatch"
                 | "absent-tombstone-cancel"
                 | "absent-tombstone-reauthorized"
-                | "absent-tombstone-inflight-reauthorized" => assert!(actual.is_none()),
+                | "absent-tombstone-inflight-reauthorized"
+                | "absent-tombstone-work-page-reauthorized" => assert!(actual.is_none()),
                 _ => assert_eq!(actual, Some(&original)),
             }
             if matches!(outcome, "rpc" | "capacity" | "absent-evidence-full") {
@@ -9859,7 +9913,7 @@ mod tests {
                         Arc::ptr_eq(&ready, &core.thread_snapshot("a").unwrap()),
                         "late old collection must not publish over replacement"
                     );
-                } else if in_flight_reauthorization {
+                } else if reauthorized_before_completion {
                     assert!(
                         Arc::ptr_eq(
                             fresh_loading.borrow().as_ref().unwrap(),
@@ -9937,7 +9991,7 @@ mod tests {
                     "old generation removal evidence must not poison a new operation/store"
                 );
             }
-            if in_flight_reauthorization {
+            if reauthorized_before_completion {
                 let next = fresh_request.borrow_mut().take().unwrap();
                 let mut fresh_item = incoming.clone();
                 fresh_item.metadata = Some(serde_json::json!("fresh generation"));
@@ -9962,6 +10016,10 @@ mod tests {
                 assert_eq!(range.items_by_id.get("item-0"), Some(&fresh_item));
                 assert_eq!(range.items_by_id.get("fresh-required"), Some(&fresh_peer));
                 assert!(!range.items_by_id.contains_key("item-99"));
+                assert!(matches!(
+                    &range.request_status,
+                    crate::timeline::semantic::TimelineRequestStatus::Ready
+                ));
                 let old = late_old.unwrap();
                 core.fail_timeline_dispatch(&old);
                 assert!(
@@ -9970,8 +10028,8 @@ mod tests {
                 );
                 assert_eq!(
                     transport.calls.get(),
-                    2,
-                    "retired token cannot issue a third RPC"
+                    if work_page_reauthorization { 1 } else { 2 },
+                    "retired token cannot issue another RPC"
                 );
                 assert!(
                     Arc::ptr_eq(&ready, &core.thread_snapshot("a").unwrap()),
@@ -10655,6 +10713,222 @@ mod tests {
         let b = core.thread_snapshot("b").unwrap();
         assert!(b.coordinator.conversation.in_flight_turn_id().is_none());
         assert!(!b.coordinator.resume.in_progress);
+    }
+
+    #[test]
+    fn resume_enqueue_cleanup_cannot_consume_replacement_ready_intent() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        core.apply_thread_conversation_event(
+            "ws",
+            ConversationEvent::TurnStarted {
+                thread_id: "a".into(),
+                turn: running_turn("old"),
+            },
+            None,
+        );
+        let old_generation = core.thread_operation_token("a").unwrap().generation;
+        let (sender, receiver) = crate::threads::history_scheduler::channel();
+        *core.thread_request_sender.lock().unwrap() = Some(sender);
+        core.enqueue_thread_resume("a".into()).unwrap();
+        let replacement = core.clone();
+        RESUME_CAPTURE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                replacement.remove_thread_store("a");
+                replacement.upsert_thread(thread("a", "ws"));
+                replacement.apply_thread_conversation_event(
+                    "ws",
+                    ConversationEvent::TurnStarted {
+                        thread_id: "a".into(),
+                        turn: running_turn("new"),
+                    },
+                    None,
+                );
+                replacement.enqueue_thread_resume("a".into()).unwrap();
+                assert_eq!(
+                    replacement.next_thread_resume_delay(),
+                    None,
+                    "accepted ready intent has no fallback deadline"
+                );
+            }))
+        });
+        core.drive_due_thread_resumes();
+        let new_generation = core.thread_operation_token("a").unwrap().generation;
+        assert_ne!(old_generation, new_generation);
+        let ThreadControllerRequest::ResumeJob(old) = receiver.try_recv().unwrap().value else {
+            panic!()
+        };
+        assert_eq!(old.generation, old_generation);
+        struct ResumeRpc(std::cell::RefCell<Vec<String>>);
+        impl crate::rpc::JsonRpcRequestTransport for ResumeRpc {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(request["params"]["turnId"], "new");
+                let method = request["method"].as_str().unwrap();
+                self.0.borrow_mut().push(method.into());
+                let result = match method {
+                    "turn/get" => {
+                        let mut turn = running_turn("new");
+                        turn.status = TurnStatus::Completed;
+                        serde_json::to_value(TurnGetResponse {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn,
+                        })
+                        .unwrap()
+                    }
+                    "turn/items/page" => serde_json::to_value(TurnItemsResponse {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn_id: "new".into(),
+                        events: vec![],
+                        last_sequence: 0,
+                        has_more: false,
+                        next_cursor: None,
+                    })
+                    .unwrap(),
+                    _ => panic!("unexpected resume RPC"),
+                };
+                response.send(Ok(result)).unwrap();
+                Ok(())
+            }
+        }
+        let transport = ResumeRpc(Default::default());
+        assert!(
+            core.execute_thread_resume_quantum(&transport, old)
+                .is_none()
+        );
+        assert!(
+            transport.0.borrow().is_empty(),
+            "old store job cannot execute"
+        );
+        core.drive_due_thread_resumes();
+        let ThreadControllerRequest::ResumeJob(new) = receiver.try_recv().unwrap().value else {
+            panic!("replacement ready intent must remain discoverable")
+        };
+        assert_eq!(new.generation, new_generation);
+        let next = core.execute_thread_resume_quantum(&transport, new).unwrap();
+        assert_eq!(*transport.0.borrow(), ["turn/get"]);
+        assert!(
+            core.execute_thread_resume_quantum(&transport, next)
+                .is_none()
+        );
+        assert_eq!(*transport.0.borrow(), ["turn/get", "turn/items/page"]);
+        let snapshot = core.thread_coordinator_snapshot("a").unwrap();
+        assert!(snapshot.conversation.in_flight_turn_id().is_none());
+        assert!(!snapshot.resume.in_progress);
+    }
+
+    #[test]
+    fn independent_due_worker_preserves_intentional_ancestor_through_rpc() {
+        use pioneer_observability::{
+            live::{self, JournalPayload},
+            work::{self, ContextOrigin, ExecutorRole, Trigger, WorkContext, WorkKind},
+        };
+        let _lock = crate::OBSERVABILITY_TEST_LOCK.lock().unwrap();
+        let enabled = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(false);
+        pioneer_observability::set_telemetry_enabled(true);
+        let core = core();
+        struct Cleanup {
+            core: Arc<ClientCore>,
+            enabled: bool,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.core.shutdown();
+                pioneer_observability::set_telemetry_enabled(self.enabled);
+            }
+        }
+        let _cleanup = Cleanup {
+            core: core.clone(),
+            enabled,
+        };
+        core.upsert_thread(thread("a", "ws"));
+        core.apply_thread_conversation_event(
+            "ws",
+            ConversationEvent::TurnStarted {
+                thread_id: "a".into(),
+                turn: running_turn("due"),
+            },
+            None,
+        );
+        struct ObserveRpc(std::sync::mpsc::Sender<WorkContext>);
+        impl crate::rpc::JsonRpcRequestTransport for ObserveRpc {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(request["method"], "turn/get");
+                self.0
+                    .send(work::current().expect("real RPC scope"))
+                    .unwrap();
+                response
+                    .send(Err(crate::rpc::JsonRpcResponseError::InvalidResponse))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        let (rpc_tx, rpc_rx) = std::sync::mpsc::channel();
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(Arc::new(ObserveRpc(rpc_tx)));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let watchdog = Duration::from_secs(5);
+        core.start_thread_request_controller(Some(waiting_tx));
+        assert_eq!(waiting_rx.recv_timeout(watchdog).unwrap(), None);
+        // Public ready admission + coalesced wake, no manually parented payload.
+        core.schedule_thread_resume("a").unwrap();
+        let rpc = rpc_rx.recv_timeout(watchdog).unwrap();
+        let snapshot = live::snapshot().unwrap();
+        let context = |token| {
+            snapshot
+                .active
+                .iter()
+                .map(|work| work.context)
+                .chain(
+                    snapshot
+                        .journal
+                        .iter()
+                        .filter_map(|record| match &record.payload {
+                            JournalPayload::Work(work) => Some(work.context),
+                            _ => None,
+                        }),
+                )
+                .find(|context| context.token == token)
+                .expect("actual carried ancestor")
+        };
+        assert_eq!(rpc.kind, WorkKind::ClientRpc);
+        assert_eq!(rpc.origin, ContextOrigin::Inherited);
+        let job = context(rpc.parent.unwrap());
+        assert_eq!(job.kind, WorkKind::ClientCommand);
+        assert_eq!(job.origin, ContextOrigin::Inherited);
+        let cycle = context(job.parent.unwrap());
+        assert_eq!(cycle.origin, ContextOrigin::IntentionallyIndependent);
+        assert_eq!(cycle.trigger, Trigger::Reconcile);
+        assert_eq!(cycle.executor, ExecutorRole::ClientController);
+        assert_eq!(cycle.parent, None);
+        assert_eq!(cycle.consent_generation, rpc.consent_generation);
+        core.shutdown();
+        // Wait for actual worker exit before restoring consent; no sleep ordering.
+        loop {
+            match waiting_rx.recv_timeout(watchdog) {
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(error) => panic!("controller did not stop: {error}"),
+            }
+        }
     }
 
     #[test]
@@ -13730,6 +14004,7 @@ impl ClientCore {
             ),
             Err(_) => {}
         }
+        let retired = registry.retire_unauthorized_targeted_requests(&request.id);
         if continue_reconciliation {
             let drafts = registry.publish(&request.id);
             self.transition_directory(
@@ -13739,6 +14014,9 @@ impl ClientCore {
                 vec![],
             );
             drop(registry);
+            if retired {
+                self.retire_thread_controller_jobs();
+            }
             return Some(request);
         }
         let next_explicit = registry.timeline.take_pending_explicit(&key);
@@ -13790,6 +14068,9 @@ impl ClientCore {
             vec![],
         );
         drop(registry);
+        if retired {
+            self.retire_thread_controller_jobs();
+        }
         if let Some(action) = rejected {
             self.fail_timeline_admission(&action, request.generation, 0);
         }
@@ -14467,6 +14748,31 @@ impl ThreadControllerRequest {
     }
 }
 impl ThreadRegistry {
+    fn retire_unauthorized_targeted_requests(&mut self, id: &str) -> bool {
+        // Read the actual reducer result. Reauthorization may admit a fresh
+        // generation, never revive an aggregate that survived authority removal.
+        let semantic = &self.stores[id].semantic;
+        let retired = self
+            .timeline
+            .in_flight
+            .iter()
+            .filter(|key| {
+                let SemanticTimelineRequestKey::TurnWorkItems { thread_id, turn_id } = key else {
+                    return false;
+                };
+                thread_id == id
+                    && !crate::timeline::semantic::accepts_turn_work_items_change(
+                        semantic, thread_id, turn_id,
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in &retired {
+            self.timeline.reject_admission(key);
+        }
+        !retired.is_empty()
+    }
+
     fn controller_request_current(&self, request: &ThreadControllerRequest) -> bool {
         use ThreadControllerRequest as R;
         match request {
@@ -14609,8 +14915,16 @@ impl ClientCore {
                 })
                 .collect::<Vec<_>>()
         };
+        #[cfg(test)]
+        tests::RESUME_CAPTURE_HOOK.with(|slot| {
+            let hook = slot.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
         for request in jobs {
             let id = request.id.clone();
+            let generation = request.generation;
             if sender
                 .send(ThreadControllerRequest::ResumeJob(request))
                 .is_ok()
@@ -14619,8 +14933,15 @@ impl ClientCore {
                     .thread_registry
                     .lock()
                     .expect("thread registry poisoned");
-                registry.ready_resume_set.remove(&id);
-                registry.ready_resume.retain(|queued| queued != &id);
+                // Successful enqueue of an old job cannot consume a replacement's intent.
+                if registry
+                    .stores
+                    .get(&id)
+                    .is_some_and(|store| store.generation == generation)
+                {
+                    registry.ready_resume_set.remove(&id);
+                    registry.ready_resume.retain(|queued| queued != &id);
+                }
                 // A due deadline remains owned until dispatch begins. Duplicate
                 // discovery coalesces; full admission never loses recovery.
             }
