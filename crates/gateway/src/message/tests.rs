@@ -66,7 +66,7 @@ mod memory_post_turn_response;
 mod task_capsule;
 
 #[path = "tests/task_launch_continuity.rs"]
-mod task_launch_continuity;
+pub(super) mod task_launch_continuity;
 #[path = "tests/task_webhooks.rs"]
 mod task_webhooks;
 
