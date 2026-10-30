@@ -738,6 +738,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn picker_purposes_preserve_local_operation_lists_without_chat() {
+        use crate::selection::ModelPurpose;
+        let provider = LocalProvider::new();
+        let embeddings = provider
+            .list_models_for_selection(ModelPurpose::Embeddings)
+            .await
+            .unwrap();
+        let transcription = provider
+            .list_models_for_selection(ModelPurpose::Transcription)
+            .await
+            .unwrap();
+        assert!(!embeddings.is_empty());
+        assert!(!transcription.is_empty());
+        assert!(
+            embeddings
+                .iter()
+                .all(|m| m.capabilities.embeddings == Some(true))
+        );
+        assert!(
+            transcription
+                .iter()
+                .all(|m| m.capabilities.transcription == Some(true))
+        );
+        assert!(
+            provider
+                .list_models_for_selection(ModelPurpose::Chat)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn local_provider_lists_embedding_models_as_records() {
         let provider = LocalProvider::new();
         let models = provider

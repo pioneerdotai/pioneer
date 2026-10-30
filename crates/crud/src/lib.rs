@@ -23131,6 +23131,30 @@ impl CrudStore {
         find_turn_work_projection(&self.connection, turn_id).await
     }
 
+    pub async fn get_turn_work_owner(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<TurnWorkOwner>> {
+        turn::find_turn_work_owner(&self.connection, workspace_id, thread_id, turn_id).await
+    }
+
+    pub async fn get_detached_turn_work_tombstone(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<(i64, i64)>> {
+        turn_event_projection_stream_state::find_detached_work_tombstone(
+            &self.connection,
+            workspace_id,
+            thread_id,
+            turn_id,
+        )
+        .await
+    }
+
     pub async fn get_agent_work_graph_projection_for_turn(
         &self,
         turn_id: &str,

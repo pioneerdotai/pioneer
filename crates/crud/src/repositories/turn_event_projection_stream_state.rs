@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use pioneer_entity::turn_event_projection_stream_state;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait, Set,
+};
 
 pub const STREAM_STATUS_HEALTHY: &str = "healthy";
 pub const STREAM_STATUS_QUARANTINED: &str = "quarantined";
@@ -55,6 +57,60 @@ pub async fn find<C: ConnectionTrait>(
         .one(db)
         .await
         .with_context(|| format!("failed to load projection stream state for Turn `{turn_id}`"))
+}
+
+/// One reader snapshot proves scope, immutable ownership, projected admission,
+/// stream health and summary absence. Never synthesize a zero-revision tombstone.
+pub async fn find_detached_work_tombstone<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<(i64, i64)>> {
+    use pioneer_entity::{thread, turn, turn_work_projection};
+
+    let state = turn_event_projection_stream_state::Entity::find_by_id(turn_id.to_owned())
+        .filter(turn_event_projection_stream_state::Column::ThreadId.eq(thread_id))
+        .filter(turn_event_projection_stream_state::Column::Status.eq(STREAM_STATUS_HEALTHY))
+        .filter(turn_event_projection_stream_state::Column::BlockingEventId.is_null())
+        .filter(turn_event_projection_stream_state::Column::ProjectedThroughSequence.gt(0))
+        .filter(
+            turn_event_projection_stream_state::Column::TurnId.in_subquery(
+                turn::Entity::find_by_id(turn_id.to_owned())
+                    .select_only()
+                    .column(turn::Column::Id)
+                    .filter(turn::Column::ThreadId.eq(thread_id))
+                    .filter(
+                        turn::Column::WorkOwner.eq(crate::TurnWorkOwner::DetachedTask.as_db_str()),
+                    )
+                    .filter(
+                        turn::Column::ThreadId.in_subquery(
+                            thread::Entity::find_by_id(thread_id.to_owned())
+                                .select_only()
+                                .column(thread::Column::Id)
+                                .filter(thread::Column::WorkspaceId.eq(workspace_id))
+                                .into_query(),
+                        ),
+                    )
+                    .into_query(),
+            ),
+        )
+        .filter(
+            turn_event_projection_stream_state::Column::TurnId.not_in_subquery(
+                turn_work_projection::Entity::find_by_id(turn_id.to_owned())
+                    .select_only()
+                    .column(turn_work_projection::Column::TurnId)
+                    .into_query(),
+            ),
+        )
+        .one(db)
+        .await?;
+    Ok(state.map(|state| {
+        (
+            state.projected_through_sequence,
+            state.updated_at.timestamp_micros(),
+        )
+    }))
 }
 
 pub async fn advance_projected_through<C: ConnectionTrait>(
