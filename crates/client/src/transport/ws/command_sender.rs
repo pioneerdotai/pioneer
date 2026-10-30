@@ -3872,6 +3872,7 @@ mod tests {
                     VoiceSessionFinalizeParams {
                         session_id: " ".to_owned(),
                         context: voice_turn_context(),
+                        audio_integrity: None,
                     },
                 )
                 .expect_err("session id should be required")
@@ -3909,6 +3910,7 @@ mod tests {
             VoiceSessionFinalizeParams {
                 session_id: "voice_session_1".to_owned(),
                 context,
+                audio_integrity: None,
             },
         )
         .expect_err("test transport stops after payload inspection");

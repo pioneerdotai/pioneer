@@ -1,8 +1,8 @@
 use super::audio_normalization::{VoiceAudioNormalizationError, normalize_voice_pcm_chunk};
 use super::incremental::VoiceProcessingCompletion;
 use pioneer_protocol::{
-    VOICE_AUDIO_MAX_CHUNK_BYTES, VoiceAudioFormat, VoiceChunkFrameHeader, VoiceError,
-    VoiceErrorKind,
+    VOICE_AUDIO_MAX_CHUNK_BYTES, VoiceAudioFormat, VoiceAudioIntegrity, VoiceChunkFrameHeader,
+    VoiceError, VoiceErrorKind,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
@@ -48,6 +48,7 @@ pub(crate) enum VoiceChunkIngestErrorKind {
     StaleChunk,
     AudioFormatMismatch,
     BufferLimitExceeded,
+    IncompleteAudio,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,7 +66,7 @@ impl VoiceChunkIngestError {
                 VoiceErrorKind::InvalidSession,
                 pioneer_protocol::PublicErrorCode::InvalidInput,
             ),
-            VoiceChunkIngestErrorKind::StaleChunk => (
+            VoiceChunkIngestErrorKind::StaleChunk | VoiceChunkIngestErrorKind::IncompleteAudio => (
                 VoiceErrorKind::StaleChunk,
                 pioneer_protocol::PublicErrorCode::InvalidInput,
             ),
@@ -91,6 +92,7 @@ impl VoiceChunkIngestError {
                     VoiceChunkIngestErrorKind::UnknownSession => "unknown_session",
                     VoiceChunkIngestErrorKind::DuplicateSession => "duplicate_session",
                     VoiceChunkIngestErrorKind::StaleChunk => "stale_chunk",
+                    VoiceChunkIngestErrorKind::IncompleteAudio => "incomplete_audio",
                     VoiceChunkIngestErrorKind::AudioFormatMismatch => "audio_format_mismatch",
                     VoiceChunkIngestErrorKind::BufferLimitExceeded => "buffer_limit_exceeded",
                     VoiceChunkIngestErrorKind::StoreUnavailable => unreachable!(),
@@ -210,18 +212,54 @@ impl GatewayVoiceSessionBufferStore {
 
     // Close and append share a mutex: every successful append before this
     // boundary is drained in sequence, including backlog behind native work.
-    pub(crate) fn finish_processing(
+    pub(crate) fn finish_processing_verified(
         &self,
         session_id: &str,
+        expected: Option<VoiceAudioIntegrity>,
     ) -> Result<oneshot::Receiver<VoiceProcessingCompletion>, VoiceChunkIngestError> {
         let mut sessions = self.sessions.lock().map_err(|_| store_unavailable())?;
         let buffer = sessions.get_mut(session_id).ok_or_else(inactive_session)?;
+        self.close_buffer(buffer, expected)
+    }
+
+    fn close_buffer(
+        &self,
+        buffer: &mut VoiceSessionBuffer,
+        expected: Option<VoiceAudioIntegrity>,
+    ) -> Result<oneshot::Receiver<VoiceProcessingCompletion>, VoiceChunkIngestError> {
+        if let Err(error) = buffer.verify_integrity(expected) {
+            self.ready.notify_all();
+            return Err(error);
+        }
         let processing = buffer.processing.as_mut().ok_or_else(inactive_session)?;
         let completion = processing.completion.take().ok_or_else(inactive_session)?;
         processing.startup_key = pioneer_observability::turn_startup::current_key();
         buffer.closed = true;
         self.ready.notify_all();
         Ok(completion)
+    }
+
+    // DSP-only tests do not model a transport peer. Still run the same sticky
+    // failure guard, using the inbox's current counts as their final barrier.
+    #[cfg(test)]
+    pub(crate) fn finish_processing(
+        &self,
+        session_id: &str,
+    ) -> Result<oneshot::Receiver<VoiceProcessingCompletion>, VoiceChunkIngestError> {
+        let mut sessions = self.sessions.lock().map_err(|_| store_unavailable())?;
+        let buffer = sessions.get_mut(session_id).ok_or_else(inactive_session)?;
+        let expected = buffer.integrity();
+        self.close_buffer(buffer, Some(expected))
+    }
+
+    pub(crate) fn reject_ingress(&self, session_id: &str) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            if let Some(buffer) = sessions.get_mut(session_id) {
+                if !buffer.closed {
+                    buffer.ingress_failed = true;
+                }
+            }
+        }
     }
 
     pub(super) fn next_processing_chunk(
@@ -368,6 +406,9 @@ impl GatewayVoiceSessionBufferStore {
                 )
             })?;
         let result = state.append_chunk(header, audio_payload);
+        if result.is_err() && !state.closed {
+            state.ingress_failed = true;
+        }
         self.ready.notify_all();
         result
     }
@@ -405,6 +446,8 @@ struct VoiceSessionBuffer {
     buffered_bytes: usize,
     chunks: VecDeque<BufferedVoiceChunk>,
     accepted_chunks: usize,
+    normalized_samples: u64,
+    ingress_failed: bool,
     closed: bool,
     processing: Option<VoiceProcessingInput>,
 }
@@ -417,6 +460,8 @@ impl VoiceSessionBuffer {
             buffered_bytes: 0,
             chunks: VecDeque::new(),
             accepted_chunks: 0,
+            normalized_samples: 0,
+            ingress_failed: false,
             closed: false,
             processing: None,
         }
@@ -426,6 +471,29 @@ impl VoiceSessionBuffer {
         if let Some(processing) = &self.processing {
             processing.cancellation.cancel();
         }
+    }
+
+    fn integrity(&self) -> VoiceAudioIntegrity {
+        VoiceAudioIntegrity {
+            next_sequence: self.next_sequence,
+            normalized_samples: self.normalized_samples,
+        }
+    }
+
+    fn verify_integrity(
+        &mut self,
+        expected: Option<VoiceAudioIntegrity>,
+    ) -> Result<(), VoiceChunkIngestError> {
+        if self.ingress_failed || expected != Some(self.integrity()) {
+            self.ingress_failed = true;
+            self.closed = true;
+            self.cancel_processing();
+            return Err(ingest_error(
+                VoiceChunkIngestErrorKind::IncompleteAudio,
+                "voice audio ingress is incomplete or peer integrity contract is unsupported",
+            ));
+        }
+        Ok(())
     }
 
     fn append_chunk(
@@ -457,6 +525,11 @@ impl VoiceSessionBuffer {
         }
 
         let missing_chunks = header.sequence - self.next_sequence;
+        if missing_chunks != 0 {
+            // Keep processing available for diagnostics/previews, but a later
+            // packet cannot repair an ordered-stream gap or authorize a turn.
+            self.ingress_failed = true;
+        }
 
         let normalized = normalize_voice_pcm_chunk(header.audio_format(), audio_payload.as_slice())
             .map_err(|error| match error {
@@ -503,6 +576,7 @@ impl VoiceSessionBuffer {
         // never permits an infinitely long recording.
         self.buffered_bytes = next_buffered_bytes;
         self.accepted_chunks += 1;
+        self.normalized_samples += normalized.samples.len() as u64;
         self.next_sequence = sequence.saturating_add(1);
         self.chunks.push_back(BufferedVoiceChunk {
             sequence,
@@ -640,6 +714,116 @@ mod tests {
     }
 
     #[test]
+    fn verified_close_counts_ingress_before_vad_and_rejects_missing_tail_legacy_and_sticky_refusal()
+    {
+        for case in [
+            "complete",
+            "duplicate",
+            "missing_tail",
+            "sample_count",
+            "gap",
+            "capacity",
+            "rejected",
+            "legacy",
+        ] {
+            for incremental in [false, true] {
+                let store = GatewayVoiceSessionBufferStore::default();
+                let token = CancellationToken::new();
+                let (_sender, receiver) = oneshot::channel();
+                store
+                    .start_processing("session".into(), target_format(), token.clone(), receiver)
+                    .unwrap();
+                store
+                    .append_chunk(header("session", 0), vec![0; 640])
+                    .unwrap();
+                if incremental {
+                    assert_eq!(
+                        store
+                            .next_processing_chunk("session")
+                            .unwrap()
+                            .unwrap()
+                            .normalized_samples
+                            .len(),
+                        320
+                    );
+                }
+                match case {
+                    "duplicate" => {
+                        assert!(
+                            store
+                                .append_chunk(header("session", 0), vec![0; 640])
+                                .unwrap()
+                                .already_buffered
+                        );
+                    }
+                    "gap" => {
+                        store
+                            .append_chunk(header("session", 2), vec![0; 640])
+                            .unwrap();
+                    }
+                    "capacity" => {
+                        assert!(
+                            store
+                                .append_chunk(
+                                    header("session", 1),
+                                    vec![0; VOICE_SESSION_MAX_BUFFERED_BYTES / 3]
+                                )
+                                .is_err()
+                        );
+                    }
+                    "rejected" => store.reject_ingress("session"),
+                    _ => {}
+                }
+                let expected = match case {
+                    "missing_tail" => Some(VoiceAudioIntegrity {
+                        next_sequence: 2,
+                        normalized_samples: 327,
+                    }),
+                    "sample_count" => Some(VoiceAudioIntegrity {
+                        next_sequence: 1,
+                        normalized_samples: 321,
+                    }),
+                    // Even matching totals cannot repair an internal gap or refusal.
+                    "gap" => Some(VoiceAudioIntegrity {
+                        next_sequence: 3,
+                        normalized_samples: 640,
+                    }),
+                    "legacy" => None,
+                    _ => Some(VoiceAudioIntegrity {
+                        next_sequence: 1,
+                        normalized_samples: 320,
+                    }),
+                };
+                let result = store.finish_processing_verified("session", expected);
+                if matches!(case, "complete" | "duplicate") {
+                    assert!(result.is_ok(), "{case} incremental={incremental}");
+                    assert!(!token.is_cancelled());
+                    assert!(
+                        store
+                            .finish_processing_verified("session", expected)
+                            .is_err()
+                    );
+                } else {
+                    assert_eq!(
+                        result
+                            .err()
+                            .expect("incomplete audio must be rejected")
+                            .kind,
+                        VoiceChunkIngestErrorKind::IncompleteAudio,
+                        "{case} incremental={incremental}"
+                    );
+                    assert!(token.is_cancelled());
+                }
+                assert!(
+                    store
+                        .append_chunk(header("session", 3), vec![0; 640])
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stale_chunks_are_idempotent_and_sequence_gaps_resume_capture() {
         let store = GatewayVoiceSessionBufferStore::default();
         store
@@ -710,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_incremental_close_drains_accepted_gaps_once_and_rejects_late_input() {
+    fn voice_incremental_gap_cannot_be_closed_as_a_complete_recording() {
         let store = GatewayVoiceSessionBufferStore::default();
         let token = CancellationToken::new();
         let (_sender, receiver) = oneshot::channel();
@@ -738,7 +922,15 @@ mod tests {
                 .unwrap()
                 .already_buffered
         );
-        let _completion = store.finish_processing("session").unwrap();
+        assert_eq!(
+            store
+                .finish_processing("session")
+                .err()
+                .expect("sequence gap must prevent close")
+                .kind,
+            VoiceChunkIngestErrorKind::IncompleteAudio
+        );
+        assert!(token.is_cancelled());
         assert!(store.finish_processing("session").is_err());
         assert!(
             store

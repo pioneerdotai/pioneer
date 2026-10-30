@@ -1168,6 +1168,7 @@ impl GatewayWsCommandSender {
             duration_ms,
             &pcm_chunk,
         )?;
+        let payload = self.voice_budget.admit(payload)?;
         self.command_tx
             .send(GatewayWsCommand::VoiceBinaryChunk {
                 expected_connection: Some(connection),
@@ -1193,7 +1194,7 @@ impl GatewayWsCommandSender {
             duration_ms,
             pcm_chunk.as_slice(),
         )?;
-
+        let payload = self.voice_budget.admit(payload)?;
         self.command_tx
             .send(GatewayWsCommand::VoiceBinaryChunk {
                 expected_connection: None,

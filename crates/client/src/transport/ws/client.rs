@@ -190,7 +190,7 @@ pub enum GatewayWsCommand {
     },
     VoiceBinaryChunk {
         expected_connection: Option<u64>,
-        payload: Vec<u8>,
+        payload: super::voice_budget::QueuedVoiceAudio,
     },
     Disconnect,
     DisconnectConnection {
@@ -224,7 +224,7 @@ enum ConnectionRpcCommand {
         response_tx: JsonRpcResponseSender,
     },
     VoiceBinaryChunk {
-        payload: Vec<u8>,
+        payload: super::voice_budget::QueuedVoiceAudio,
     },
 }
 
@@ -754,6 +754,7 @@ struct WriterFrame {
     message: Message,
     request: Option<JsonRpcResponseSender>,
     carrier: pioneer_observability::work::WorkCarrier,
+    voice_reservation: Option<super::voice_budget::VoiceReservation>,
 }
 
 impl WriterFrame {
@@ -761,6 +762,7 @@ impl WriterFrame {
         Self {
             message,
             request,
+            voice_reservation: None,
             carrier: pioneer_observability::work::WorkCarrier::child(
                 Boundary::ClientRpc,
                 WorkKind::ClientRpc,
@@ -768,6 +770,12 @@ impl WriterFrame {
                 ExecutorRole::ClientWs,
             ),
         }
+    }
+
+    fn voice(payload: super::voice_budget::QueuedVoiceAudio) -> Self {
+        let mut frame = Self::new(Message::Binary(payload.bytes.into()), None);
+        frame.voice_reservation = Some(payload.reservation);
+        frame
     }
 }
 
@@ -810,6 +818,7 @@ async fn connection_writer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
             message,
             request,
             carrier,
+            voice_reservation,
         } = frame;
         let result = carrier
             .scope_result(async {
@@ -831,6 +840,7 @@ async fn connection_writer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
                 result
             })
             .await;
+        drop(voice_reservation);
         if let Err(error) = result {
             return websocket_write_failed_message(error);
         }
@@ -1113,7 +1123,7 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                         }
                     }
                     Some(ConnectionRpcCommand::VoiceBinaryChunk { payload }) => {
-                        if data_tx.try_send(WriterFrame::new(Message::Binary(payload.into()), None)).is_err() {
+                        if data_tx.try_send(WriterFrame::voice(payload)).is_err() {
                             return Some("websocket voice writer handoff full or closed".to_owned());
                         }
                     }
@@ -1242,7 +1252,11 @@ mod tests {
         );
         commands
             .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                payload: vec![1, 2, 3],
+                payload: std::sync::Arc::new(
+                    super::super::voice_budget::VoiceTransportBudget::default(),
+                )
+                .admit(vec![1, 2, 3])
+                .unwrap(),
             })
             .unwrap();
         loop {
@@ -1407,8 +1421,10 @@ impl WsQueued for GatewayWsCommand {
         match self {
             Self::Request { payload, .. } => QueueBytes::Known(payload.len() as u64),
             Self::BinaryUploadChunk { payload, .. }
-            | Self::ArtifactBinaryUploadChunk { payload, .. }
-            | Self::VoiceBinaryChunk { payload, .. } => QueueBytes::Known(payload.len() as u64),
+            | Self::ArtifactBinaryUploadChunk { payload, .. } => {
+                QueueBytes::Known(payload.len() as u64)
+            }
+            Self::VoiceBinaryChunk { payload, .. } => QueueBytes::Known(payload.len() as u64),
             _ => QueueBytes::Unsupported,
         }
     }
@@ -1419,8 +1435,10 @@ impl WsQueued for ConnectionRpcCommand {
         match self {
             Self::Request { payload, .. } => QueueBytes::Known(payload.len() as u64),
             Self::BinaryUploadChunk { payload, .. }
-            | Self::ArtifactBinaryUploadChunk { payload, .. }
-            | Self::VoiceBinaryChunk { payload, .. } => QueueBytes::Known(payload.len() as u64),
+            | Self::ArtifactBinaryUploadChunk { payload, .. } => {
+                QueueBytes::Known(payload.len() as u64)
+            }
+            Self::VoiceBinaryChunk { payload, .. } => QueueBytes::Known(payload.len() as u64),
             _ => QueueBytes::Unsupported,
         }
     }

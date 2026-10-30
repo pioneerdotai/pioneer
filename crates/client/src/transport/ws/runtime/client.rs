@@ -8,6 +8,7 @@ impl GatewayWsClient {
 
         let command_sender = GatewayWsCommandSender {
             command_tx,
+            voice_budget: Arc::default(),
             next_connection_id: Arc::new(AtomicU64::new(0)),
             socket: Arc::default(),
             session_access: Arc::new(Mutex::new(None)),

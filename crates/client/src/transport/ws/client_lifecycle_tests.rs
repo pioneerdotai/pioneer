@@ -626,6 +626,75 @@ struct QueueTransport {
     commands: WsSender<ConnectionRpcCommand>,
     admitted: mpsc::Sender<String>,
 }
+
+#[tokio::test]
+async fn delayed_voice_tail_and_finalize_keep_socket_order_without_per_packet_ack() {
+    timeout(Duration::from_secs(10), async {
+        let mut fixture = Fixture::start().await;
+        let pcm = crate::transport::ws::frames::encode_voice_audio_chunk_frame(
+            "voice_session_integrity".into(),
+            0,
+            pioneer_protocol::VoiceAudioFormat::pioneer_streaming_target(),
+            None,
+            None,
+            &[0; 14],
+        )
+        .unwrap();
+        fixture.gate.block();
+        let budget = Arc::new(super::super::voice_budget::VoiceTransportBudget::default());
+        fixture
+            .commands
+            .send(ConnectionRpcCommand::VoiceBinaryChunk {
+                payload: budget.admit(pcm.clone()).unwrap(),
+            })
+            .unwrap();
+        fixture.gate.wait_entered().await;
+        // The in-flight socket write still owns its capacity reservation.
+        assert!(budget.admit(vec![0; 256 * 1024]).is_err());
+        let finalize = crate::rpc::build_json_rpc_request_payload(
+            "voice/session/finalize",
+            json!({
+                "session_id":"voice_session_integrity",
+                "audio_integrity":{"next_sequence":1,"normalized_samples":7}
+            }),
+        )
+        .unwrap();
+        let (response_tx, response_rx) = mpsc::channel();
+        fixture
+            .commands
+            .send(ConnectionRpcCommand::Request {
+                request_id: finalize.request_id.clone(),
+                payload: finalize.payload,
+                response_tx: JsonRpcResponseSender::new(
+                    response_tx,
+                    std::time::Instant::now() + Duration::from_secs(30),
+                ),
+            })
+            .unwrap();
+        assert!(matches!(
+            response_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        fixture.gate.release(false);
+        assert_eq!(fixture.next_data().await, Message::Binary(pcm.into()));
+        let observed = fixture.next_request().await;
+        assert_eq!(observed["method"], "voice/session/finalize");
+        assert_eq!(
+            observed["params"]["audio_integrity"],
+            json!({"next_sequence":1,"normalized_samples":7})
+        );
+        assert!(matches!(
+            response_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        fixture.reply(&finalize.request_id).await;
+        assert!(receive(response_rx).await.is_ok());
+        fixture.task.abort();
+        let _ = fixture.task.await;
+    })
+    .await
+    .unwrap();
+}
 impl JsonRpcRequestTransport for QueueTransport {
     fn send_json_rpc_request(
         &self,
@@ -867,7 +936,9 @@ async fn assert_teardown(termination: Termination) {
     f.gate.block();
     f.commands
         .send(ConnectionRpcCommand::VoiceBinaryChunk {
-            payload: vec![5, 6],
+            payload: Arc::new(super::super::voice_budget::VoiceTransportBudget::default())
+                .admit(vec![5, 6])
+                .unwrap(),
         })
         .unwrap();
     f.gate.wait_entered().await;
