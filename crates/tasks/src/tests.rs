@@ -524,6 +524,26 @@ fn create_params(spec: TaskTriggerSpec) -> TaskCreateParams {
     }
 }
 
+#[test]
+fn task_create_budget_counts_utf8_and_json_escaping_at_exact_boundary() {
+    let validator = crate::admission::TaskAdmissionNormalizer::new();
+    for sample in ["Ж", "\\", "\"", "\u{0001}", "Ж\\\"\u{0001}"] {
+        let mut params = create_params(TaskTriggerSpec::Immediate);
+        params.goal = sample.repeat(1_000);
+        // Derive the padding from the complete serialized request, including
+        // every field. An extra ASCII byte must cross the fixed public budget.
+        let remaining = 524_288 - serde_json::to_vec(&params).unwrap().len();
+        params.goal.push_str(&"x".repeat(remaining));
+        assert_eq!(serde_json::to_vec(&params).unwrap().len(), 524_288);
+        validator
+            .validate_create(&params)
+            .expect("exactly 512 KiB must fit");
+        params.goal.push('x');
+        assert_eq!(serde_json::to_vec(&params).unwrap().len(), 524_289);
+        assert!(validator.validate_create(&params).is_err());
+    }
+}
+
 fn test_agent_launch_facts() -> (
     pioneer_protocol::AgentLaunchSelection,
     pioneer_protocol::AgentIdentityProjection,
@@ -5240,7 +5260,7 @@ async fn pause_excludes_due_trigger_and_resume_restores_future_fire() {
 }
 
 #[tokio::test]
-async fn scheduled_agent_task_executes_from_version_one_child_launch_grant_without_write_on_read() {
+async fn scheduler_reads_version_one_child_launch_grant_without_rewriting_its_snapshot() {
     let runtime = runtime().await;
     let starts = Arc::new(AtomicUsize::new(0));
     let release = Arc::new(Notify::new());
@@ -5344,7 +5364,7 @@ async fn scheduled_agent_task_executes_from_version_one_child_launch_grant_witho
     .expect("upcast Task child launch grant should decode");
     assert_eq!(
         projected["child_launch_grant"]["version"],
-        serde_json::json!(2)
+        serde_json::json!(1)
     );
 
     let stored = pioneer_entity::task_actor_contract::Entity::find_by_id(response.task.id)

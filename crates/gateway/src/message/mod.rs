@@ -157,7 +157,6 @@ use crate::thread_episodic::{
     ThreadEpisodicIndexExecutor, ThreadEpisodicIngestor, ThreadEpisodicRecallService,
     ThreadEpisodicRuntimeConfig,
 };
-use crate::thread_episodic_hooks::ThreadEpisodicMemoryRecallProvider;
 use anyhow::Context as AnyhowContext;
 use futures_util::FutureExt;
 use pioneer_agent::MemoryLoopConfig;
@@ -961,7 +960,6 @@ impl AgentMarkdownBufferStats {
 
 #[derive(Clone)]
 struct MemoryBridgeProviders {
-    episodic_provider: Arc<ThreadEpisodicMemoryRecallProvider>,
     memory_provider: Arc<crate::memory_tools::GatewayMemoryProvider>,
     memory_policy_provider: Arc<crate::memory_policy::GatewayMemoryTurnPolicyProvider>,
 }
@@ -2112,9 +2110,6 @@ impl MessageProcessor {
             .await;
 
         let bridge = MemoryBridgeProviders {
-            episodic_provider: Arc::new(ThreadEpisodicMemoryRecallProvider::new(Arc::downgrade(
-                self,
-            ))),
             memory_provider,
             memory_policy_provider,
         };
@@ -2130,7 +2125,9 @@ impl MessageProcessor {
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_policy_provider),
-                Some(bridge.episodic_provider),
+                // Pre-turn recall uses saved active memories. Conversation
+                // history is searched explicitly through the Threads tools.
+                None,
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.memory_loop_config(),
             ))

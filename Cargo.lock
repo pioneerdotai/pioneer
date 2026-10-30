@@ -10995,6 +10995,7 @@ dependencies = [
  "memvid-core",
  "mime_guess",
  "notify 8.2.0",
+ "ort",
  "pioneer-agent",
  "pioneer-artifacts",
  "pioneer-cli-agent-runtime",

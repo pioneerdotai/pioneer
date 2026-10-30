@@ -4592,6 +4592,7 @@ async fn html_preview_mcp_content(
 
 #[cfg(test)]
 mod tests {
+    mod cli_mcp_call_finalization_tests;
     use super::*;
     use crate::auth::AuthenticatedSessionPrincipal;
     use crate::authorization::ExecutionAuthorizationContext;

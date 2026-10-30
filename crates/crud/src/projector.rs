@@ -74,6 +74,8 @@ pub(crate) struct PreparedTurnProjection {
     item_attempt_payload_json: Option<String>,
     item_attempt_id: Option<String>,
     item_attempt_failure_reason: Option<String>,
+    managed_cli_mcp_completion: bool,
+    item_terminal_attempt_status: Option<TurnItemAttemptStatus>,
     input: Option<turn::PreparedTurnInputProjection>,
     terminal_running_attempts: Vec<turn_item_attempt::PreparedTerminalRunningAttempt>,
     message_mutation: Option<PreparedTurnMessageMutationProjection>,
@@ -166,12 +168,34 @@ impl TurnProjector {
                 prepared.item = Some(item);
             }
             TurnEventPayload::ItemCompleted(payload) => {
-                let status = terminal_turn_item_status_from_payload(&payload.item);
+                prepared.managed_cli_mcp_completion = crate::is_managed_cli_mcp_item(&payload.item);
+                let mut status = terminal_turn_item_status_from_payload(&payload.item);
+                let mut attempt_status = attempt_status_from_payload(&payload.item);
+                if prepared.managed_cli_mcp_completion
+                    && let pioneer_protocol::TurnItem::DynamicToolCall {
+                        outcome: Some(outcome),
+                        ..
+                    } = &payload.item
+                    && outcome.error_class == Some(pioneer_protocol::ToolErrorClass::Cancelled)
+                {
+                    status = crate::convention::TURN_ITEM_STATUS_CANCELLED;
+                    attempt_status = TurnItemAttemptStatus::Cancelled;
+                }
+                prepared.item_terminal_attempt_status = Some(attempt_status);
                 if attempt_status_from_payload(&payload.item) == TurnItemAttemptStatus::Failed {
                     prepared.item_attempt_failure_reason = Some(format!(
                         "item `{}` completed with failed status",
                         payload.item.item_id()
                     ));
+                    if prepared.managed_cli_mcp_completion
+                        && let pioneer_protocol::TurnItem::DynamicToolCall {
+                            outcome: Some(outcome),
+                            ..
+                        } = &payload.item
+                        && outcome.incomplete_reason.is_some()
+                    {
+                        prepared.item_attempt_failure_reason = outcome.incomplete_reason.clone();
+                    }
                 }
                 prepared.item = Some(turn::prepare_turn_item_projection(
                     payload.turn_id.as_str(),
@@ -339,6 +363,15 @@ impl TurnProjector {
         prepared: PreparedTurnProjection,
     ) -> Result<()> {
         let created_at = event.created_at;
+        if crate::cli_mcp_call::cli_mcp_observation_is_superseded(
+            db,
+            &event.payload,
+            Some(event.sequence),
+        )
+        .await?
+        {
+            return Ok(());
+        }
         if let Some(mut observation) = prepared.liveness {
             observation.activity_sequence = event.sequence;
             turn_liveness::observe_activity(db, observation).await?;
@@ -347,6 +380,8 @@ impl TurnProjector {
         let item_attempt_payload_json = prepared.item_attempt_payload_json;
         let item_attempt_id = prepared.item_attempt_id;
         let item_attempt_failure_reason = prepared.item_attempt_failure_reason;
+        let managed_cli_mcp_completion = prepared.managed_cli_mcp_completion;
+        let item_terminal_attempt_status = prepared.item_terminal_attempt_status;
         let input_projection = prepared.input;
         let terminal_running_attempts = prepared.terminal_running_attempts;
         let message_mutation = prepared.message_mutation;
@@ -407,13 +442,51 @@ impl TurnProjector {
                 Ok(())
             }),
             TurnEventPayload::ItemCompleted(payload) => project_future(async move {
+                let attempt_status = item_terminal_attempt_status
+                    .context("item/completed attempt status was not prepared")?;
+                if managed_cli_mcp_completion
+                    && let Some(item) =
+                        turn::find_turn_item(db, &payload.turn_id, payload.item.item_id()).await?
+                {
+                    if item.active_attempt_status.as_deref() == Some("interrupted") {
+                        anyhow::ensure!(
+                            turn_item_attempt::finish_unconfirmed_cli_mcp_attempt(
+                                db,
+                                &payload.turn_id,
+                                payload.item.item_id(),
+                                item.active_attempt_id
+                                    .as_deref()
+                                    .context("CLI MCP attempt is missing")?,
+                                attempt_status,
+                                item_attempt_failure_reason.clone(),
+                                event.sequence,
+                                created_at,
+                            )
+                            .await?,
+                            "CLI MCP outcome no longer owns the unconfirmed attempt"
+                        );
+                    } else {
+                        let attempt = turn_item_attempt::find_latest_running_attempt(
+                            db,
+                            &payload.turn_id,
+                            payload.item.item_id(),
+                        )
+                        .await?
+                        .context("CLI MCP outcome has no running attempt")?;
+                        anyhow::ensure!(
+                            item.active_attempt_id.as_deref() == Some(attempt.id.as_str())
+                                && attempt
+                                    .started_event_sequence
+                                    .is_some_and(|sequence| sequence < event.sequence),
+                            "CLI MCP outcome no longer owns the item attempt"
+                        );
+                    }
+                }
                 turn::upsert_prepared_turn_item(
                     db,
                     item_projection.context("item/completed projection was not prepared")?,
                 )
                 .await?;
-
-                let attempt_status = attempt_status_from_payload(&payload.item);
 
                 let _ = turn_item_attempt::finish_running_attempt(
                     db,

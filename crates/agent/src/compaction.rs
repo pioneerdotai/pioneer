@@ -61,20 +61,6 @@ impl NativeSummarizer {
             .map(|effort| {
                 let effort = ReasoningEffort::from_str(effort)
                     .ok_or_else(|| anyhow::anyhow!("unsupported native reasoning effort"))?;
-                if let Some(capabilities) =
-                    pioneer_provider::reasoning_registry::reasoning_capabilities_for_model(
-                        self.provider.name(),
-                        &request.selection.model,
-                    )
-                {
-                    ensure!(
-                        capabilities
-                            .effort_options
-                            .iter()
-                            .any(|value| value == effort.as_str()),
-                        "reasoning effort is unavailable for selected model"
-                    );
-                }
                 Ok::<_, anyhow::Error>(if effort == ReasoningEffort::None {
                     ReasoningConfig::Disabled
                 } else {
@@ -291,35 +277,42 @@ mod tests {
     }
     #[tokio::test]
     async fn native_summary_uses_exact_selection_cap_and_fresh_tool_free_request() {
-        let provider = fake(ProviderTermination::Complete, false);
-        let service = NativeSummarizer::new(
-            provider.clone(),
-            selection(),
-            ModelBudget::new(Some(128_000), None, Some(16_384)),
-        )
-        .unwrap();
-        let result = service.summarize(request()).await.unwrap();
-        validate_summary(&result, 500).unwrap();
-        {
-            let calls = provider.calls.lock().unwrap();
-            assert_eq!(calls.len(), 1);
-            let sent = &calls[0];
-            assert_eq!(sent.model, "fixture-model");
-            assert_eq!(sent.max_tokens, Some(500));
-            assert_eq!(
-                sent.reasoning,
-                Some(ReasoningConfig::Effort(ReasoningEffort::High))
-            );
-            assert!(sent.tools.is_none() && sent.compiled_prompt.is_none());
-            assert_eq!(sent.messages.len(), 2);
-            assert_eq!(sent.messages[0].content, INSTRUCTIONS);
-            let data: SummaryInput = serde_json::from_str(&sent.messages[1].content).unwrap();
-            assert_eq!(data.previous_summary, "previous state");
+        for (effort, expected) in [
+            (None, None),
+            (Some("none"), Some(ReasoningConfig::Disabled)),
+            (
+                Some("high"),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+            ),
+        ] {
+            let provider = fake(ProviderTermination::Complete, false);
+            let mut request = request();
+            request.selection.effort = effort.map(str::to_owned);
+            let service = NativeSummarizer::new(
+                provider.clone(),
+                request.selection.clone(),
+                ModelBudget::new(Some(128_000), None, Some(16_384)),
+            )
+            .unwrap();
+            let result = service.summarize(request.clone()).await.unwrap();
+            validate_summary(&result, 500).unwrap();
+            {
+                let calls = provider.calls.lock().unwrap();
+                assert_eq!(calls.len(), 1);
+                let sent = &calls[0];
+                assert_eq!(sent.model, "fixture-model");
+                assert_eq!(sent.max_tokens, Some(500));
+                assert_eq!(sent.reasoning, expected);
+                assert!(sent.tools.is_none() && sent.compiled_prompt.is_none());
+                assert_eq!(sent.messages.len(), 2);
+                assert_eq!(sent.messages[0].content, INSTRUCTIONS);
+                let data: SummaryInput = serde_json::from_str(&sent.messages[1].content).unwrap();
+                assert_eq!(data.previous_summary, "previous state");
+            }
+            request.selection.model = "hidden-fallback".into();
+            assert!(service.summarize(request).await.is_err());
+            assert_eq!(provider.calls.lock().unwrap().len(), 1);
         }
-        let mut changed = request();
-        changed.selection.model = "hidden-fallback".into();
-        assert!(service.summarize(changed).await.is_err());
-        assert_eq!(provider.calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

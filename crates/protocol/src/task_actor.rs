@@ -71,45 +71,25 @@ pub enum TaskDerivedChildLaunchGrant {
     },
 }
 
-/// Migrates the nested child-launch contract through every registered adjacent
-/// version and returns a JSON document that current runtime code can consume.
+/// Validates the saved snapshot without changing the original JSON. The
+/// durable child deserializer authenticates first and projects for the reader.
 pub fn migrate_task_derived_child_launch_grant_json_to_current(
     json: &str,
 ) -> Result<String, TaskDerivedChildLaunchGrantMigrationError> {
     if json.len() > TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES {
         return Err(
-            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(format!(
-                "task launch contract exceeds {} bytes",
-                TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES
-            )),
+            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(
+                "task launch contract exceeds its byte limit".to_owned(),
+            ),
         );
     }
-    let migrated = crate::migrate_embedded_child_launch_grant_json_to_current(json)
-        .map_err(TaskDerivedChildLaunchGrantMigrationError::ChildGrant)?;
-    let current =
-        serde_json::from_str::<TaskDerivedChildLaunchGrant>(&migrated).map_err(|error| {
-            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(error.to_string())
-        })?;
+    let current: TaskDerivedChildLaunchGrant = serde_json::from_str(json).map_err(|error| {
+        TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(error.to_string())
+    })?;
     current.validate_embedded().map_err(|error| {
         TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(format!("{error:?}"))
     })?;
-    // Task actor contracts compare their immutable JSON on idempotent insert.
-    // Re-encode through the current typed outer contract so an upcast V1 row
-    // has exactly the same representation as a newly produced V2 row. The
-    // generic embedded migrator cannot do this because AgentExecution grants
-    // intentionally have a different, open outer document.
-    let encoded = serde_json::to_string(&current).map_err(|error| {
-        TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(error.to_string())
-    })?;
-    if encoded.len() > TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES {
-        return Err(
-            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(format!(
-                "migrated task launch contract exceeds {} bytes",
-                TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES
-            )),
-        );
-    }
-    Ok(encoded)
+    Ok(json.to_owned())
 }
 
 #[derive(Debug)]
@@ -158,12 +138,9 @@ impl TaskDerivedChildLaunchGrant {
         child_launch_grant
             .validate()
             .map_err(|_| TaskActorContractError::InvalidResolvedLaunchGrant)?;
-        crate::validate_selected_agent_launch_profile(
-            identity,
-            profile,
-            &child_launch_grant.identities,
-        )
-        .map_err(|_| TaskActorContractError::ResolvedLaunchGrantMismatch)?;
+        child_launch_grant
+            .validate_selected_profile(identity, profile)
+            .map_err(|_| TaskActorContractError::ResolvedLaunchGrantMismatch)?;
         let mut unique_actions = allowed_actions.clone();
         unique_actions.sort();
         unique_actions.dedup();

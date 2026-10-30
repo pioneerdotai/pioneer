@@ -776,6 +776,16 @@ pub(super) struct DetachedAgentThreadAdmission {
     pub action: pioneer_crud::AgentCommitInput,
 }
 
+// The final serialized request is prepared and budget-checked before the parent
+// is durable. Only the separate authorization context is built after admission.
+struct ComposerDetachedTaskPlan {
+    prepared: pioneer_tasks::PreparedComposerTask,
+    resolved_launch: Option<(
+        pioneer_protocol::AgentIdentityProjection,
+        pioneer_protocol::AgentExecutionProfileProjection,
+    )>,
+}
+
 fn task_creator_actor_id(actor: &pioneer_protocol::PersistedActorRef) -> Option<String> {
     match actor {
         pioneer_protocol::PersistedActorRef::Principal(principal_id) => {
@@ -1686,6 +1696,141 @@ impl MessageProcessor {
         }
     }
 
+    fn prepare_composer_detached_task<'a>(
+        &'a self,
+        thread: &'a pioneer_protocol::Thread,
+        launch: &'a TurnStartParams,
+        outcome: &'a crate::thread::TurnStartOutcome,
+        security_snapshot: &'a pioneer_protocol::TurnExecutionSecuritySnapshot,
+        agent: Option<&'a DetachedAgentThreadAdmission>,
+    ) -> MessageFuture<'a, Result<ComposerDetachedTaskPlan, TurnStartFailure>> {
+        message_future(async move {
+            let first_text = first_user_text(launch.input.as_slice());
+            let title = first_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .unwrap_or("Composer task")
+                .chars()
+                .take(96)
+                .collect::<String>();
+            let permission_profile = outcome.materialization.turn.permission_profile.clone();
+            let task_model_provider = outcome.materialization.thread.model_provider.clone();
+            // Keep the full request only in Composer launch. The goals describe
+            // the work; the child executes launch.input, including on recovery.
+            let mut task_params = pioneer_protocol::TaskCreateParams {
+                workspace_id: thread.workspace_id.clone(),
+                owner_kind: pioneer_protocol::TaskOwnerKind::Thread,
+                owner_id: Some(thread.id.clone()),
+                created_by_thread_id: Some(thread.id.clone()),
+                created_by_turn_id: Some(launch.turn_id.clone()),
+                parent_task_id: None,
+                executor_kind: pioneer_protocol::TaskExecutorKind::Agent,
+                title: title.clone(),
+                goal: title.clone(),
+                priority: 0,
+                trigger: pioneer_protocol::TaskTriggerInput {
+                    spec: pioneer_protocol::TaskTriggerSpec::Immediate,
+                },
+                launch: None,
+                agent_spec: Some(pioneer_protocol::TaskAgentSpecInput {
+                    agent_role: thread.agent_role.clone(),
+                    agent_nickname: thread.agent_nickname.clone(),
+                    model: Some(outcome.materialization.thread.model.clone()),
+                    model_provider: Some(task_model_provider.clone()),
+                    prompt: pioneer_protocol::TaskAgentPrompt {
+                        goal: title,
+                        instructions: Vec::new(),
+                        input: None,
+                        output_instructions: None,
+                    },
+                    context_policy: None,
+                    tool_policy: None,
+                    permission_cap: Some(pioneer_protocol::task_permission_cap_from_snapshot(
+                        &permission_profile,
+                    )),
+                    security_cap: Some(crate::turn_security::task_security_cap_from_snapshot(
+                        security_snapshot,
+                    )),
+                    result_contract: None,
+                    review_policy: None,
+                    depth: 0,
+                    max_depth: 3,
+                }),
+                lifecycle_policy: Some(pioneer_protocol::TaskLifecyclePolicy {
+                    attachment: pioneer_protocol::TaskAttachmentMode::Detached,
+                    on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                    on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                    completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
+                }),
+                delivery_policy: Some(pioneer_protocol::TaskDeliveryPolicy {
+                    mode: pioneer_protocol::TaskDeliveryMode::Thread,
+                    thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+                    thread_id: Some(thread.id.clone()),
+                    webhook_url: None,
+                    include_result: true,
+                    format: pioneer_protocol::TaskDeliveryFormat::FullResult,
+                }),
+                retry_policy: None,
+                timeout_policy: None,
+                concurrency_policy: None,
+                metadata: Some(pioneer_protocol::TaskMetadata {
+                    labels: vec!["composer".to_owned()],
+                    data: None,
+                    finish_request: None,
+                    composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch.clone())),
+                }),
+            };
+            let (mut canonical_launch, resolved_launch) = if let Some(agent) = agent {
+                (
+                    agent.launch.clone(),
+                    Some((agent.identity.clone(), agent.profile.clone())),
+                )
+            } else {
+                super::agent_action_tools::resolve_workspace_task_launch(
+                    self,
+                    thread.workspace_id.as_str(),
+                    task_model_provider.as_str(),
+                    outcome.materialization.thread.model.as_str(),
+                    launch.agent_launch.as_ref(),
+                    launch.execution_backend.as_ref(),
+                    launch.turn_id.as_str(),
+                )
+                .await
+                .map_err(|error| {
+                    TurnStartFailure::unavailable(format!(
+                        "failed to resolve Composer Task launch: {error:#}"
+                    ))
+                })?
+            };
+            if agent.is_none() {
+                super::agent_action_tools::pin_launch_selection_capabilities(
+                    &mut canonical_launch,
+                    outcome.materialization.capabilities.as_slice(),
+                )
+                .map_err(|error| {
+                    TurnStartFailure::protocol_invalid_input(format!(
+                        "failed to freeze Composer Task capabilities: {error:#}"
+                    ))
+                })?;
+            }
+            task_params.launch = Some(canonical_launch);
+            let prepared = self
+                .task_runtime
+                .service()
+                .prepare_composer_task(task_params)
+                .map_err(|error| {
+                    TurnStartFailure::protocol_invalid_input(format!(
+                        "invalid Composer Task request: {error:#}"
+                    ))
+                })?;
+            Ok(ComposerDetachedTaskPlan {
+                prepared,
+                resolved_launch,
+            })
+        })
+    }
+
     /// RPC/voice completion adapter. All detached admission and Task execution
     /// below is shared with execution-bound Threads actions.
     pub(super) fn composer_detached_task_start<'a>(
@@ -2014,6 +2159,17 @@ impl MessageProcessor {
                     .await?
                 }
             };
+            // Freeze and size-check the complete Task request before making the
+            // parent durable. Creation still revalidates the live admission.
+            let task_plan = self
+                .prepare_composer_detached_task(
+                    &thread,
+                    &launch,
+                    &outcome,
+                    &security_snapshot,
+                    agent.as_ref(),
+                )
+                .await?;
             if !replay {
                 let audit = self
                     .turn_profile_selected_audit_event(&outcome)
@@ -2063,11 +2219,11 @@ impl MessageProcessor {
                         ))
                     })?;
             }
-            Ok::<_, TurnStartFailure>(security_snapshot)
+            Ok::<_, TurnStartFailure>(task_plan)
         })
         .await;
-        let security_snapshot = match materialized {
-            Ok(snapshot) => snapshot,
+        let task_plan = match materialized {
+            Ok(plan) => plan,
             Err(error) => {
                 if parent_committed {
                     self.mark_turn_blocked(thread.id.clone(), turn_id.clone(), error.to_string())
@@ -2106,82 +2262,10 @@ impl MessageProcessor {
             )
             .await;
         let task_created = message_future(async {
-            let first_text = first_user_text(launch.input.as_slice());
-            let goal = first_text
-                .as_deref()
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .unwrap_or("Composer task")
-                .to_owned();
-            let title = goal.chars().take(96).collect::<String>();
-            let permission_profile = outcome.materialization.turn.permission_profile.clone();
-            let task_model_provider = outcome.materialization.thread.model_provider.clone();
-            // Persist the Composer launch here; context preparation belongs to
-            // the durable child execution, not the connection-owned request.
-            let mut task_params = pioneer_protocol::TaskCreateParams {
-                workspace_id: thread.workspace_id.clone(),
-                owner_kind: pioneer_protocol::TaskOwnerKind::Thread,
-                owner_id: Some(thread.id.clone()),
-                created_by_thread_id: Some(thread.id.clone()),
-                created_by_turn_id: Some(launch.turn_id.clone()),
-                parent_task_id: None,
-                executor_kind: pioneer_protocol::TaskExecutorKind::Agent,
-                title,
-                goal: goal.clone(),
-                priority: 0,
-                trigger: pioneer_protocol::TaskTriggerInput {
-                    spec: pioneer_protocol::TaskTriggerSpec::Immediate,
-                },
-                launch: None,
-                agent_spec: Some(pioneer_protocol::TaskAgentSpecInput {
-                    agent_role: thread.agent_role.clone(),
-                    agent_nickname: thread.agent_nickname.clone(),
-                    model: Some(outcome.materialization.thread.model.clone()),
-                    model_provider: Some(task_model_provider.clone()),
-                    prompt: pioneer_protocol::TaskAgentPrompt {
-                        goal,
-                        instructions: Vec::new(),
-                        input: None,
-                        output_instructions: None,
-                    },
-                    context_policy: None,
-                    tool_policy: None,
-                    permission_cap: Some(pioneer_protocol::task_permission_cap_from_snapshot(
-                        &permission_profile,
-                    )),
-                    security_cap: Some(crate::turn_security::task_security_cap_from_snapshot(
-                        &security_snapshot,
-                    )),
-                    result_contract: None,
-                    review_policy: None,
-                    depth: 0,
-                    max_depth: 3,
-                }),
-                lifecycle_policy: Some(pioneer_protocol::TaskLifecyclePolicy {
-                    attachment: pioneer_protocol::TaskAttachmentMode::Detached,
-                    on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
-                    on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
-                    completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
-                }),
-                delivery_policy: Some(pioneer_protocol::TaskDeliveryPolicy {
-                    mode: pioneer_protocol::TaskDeliveryMode::Thread,
-                    thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
-                    thread_id: Some(thread.id.clone()),
-                    webhook_url: None,
-                    include_result: true,
-                    format: pioneer_protocol::TaskDeliveryFormat::FullResult,
-                }),
-                retry_policy: None,
-                timeout_policy: None,
-                concurrency_policy: None,
-                metadata: Some(pioneer_protocol::TaskMetadata {
-                    labels: vec!["composer".to_owned()],
-                    data: None,
-                    finish_request: None,
-                    composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch.clone())),
-                }),
-            };
-
+            let ComposerDetachedTaskPlan {
+                prepared,
+                resolved_launch,
+            } = task_plan;
             let task_execution_context = match &authority {
                 TurnExecutionAuthority::Durable { context, .. } => context.clone(),
                 TurnExecutionAuthority::Fresh(_) => {
@@ -2215,7 +2299,7 @@ impl MessageProcessor {
                     ),
                     // Authorship records provenance; this independent destination
                     // does not inherit the source's resource root or cancellation.
-                    launch_selection: Some(agent.launch),
+                    launch_selection: prepared.params().launch.clone(),
                     resolved_launch_identity: Some(agent.identity),
                     resolved_launch_profile: Some(agent.profile),
                     agent_authorization_grant: Some(agent.grant),
@@ -2223,23 +2307,8 @@ impl MessageProcessor {
                     ..Default::default()
                 }
             } else {
-                let (mut canonical_launch, resolved) =
-                    super::agent_action_tools::resolve_workspace_task_launch(
-                        self,
-                        &thread.workspace_id,
-                        &task_model_provider,
-                        &outcome.materialization.thread.model,
-                        launch.agent_launch.as_ref(),
-                        launch.execution_backend.as_ref(),
-                        &turn_id,
-                    )
-                    .await?;
-                super::agent_action_tools::pin_launch_selection_capabilities(
-                    &mut canonical_launch,
-                    &outcome.materialization.capabilities,
-                )?;
                 let (identity, profile) =
-                    resolved.context("detached launch has no resolved identity/profile")?;
+                    resolved_launch.context("detached launch has no resolved identity/profile")?;
                 let skill_ids = task_execution_context
                     .granted_skill_ids()
                     .iter()
@@ -2270,14 +2339,13 @@ impl MessageProcessor {
                 .map_err(|error| anyhow::anyhow!("invalid detached Agent grant: {error:?}"))?;
                 pioneer_tasks::TaskCreateContext {
                     actor_id: task_creator_actor_id(&request_actor),
-                    launch_selection: Some(canonical_launch),
+                    launch_selection: prepared.params().launch.clone(),
                     resolved_launch_identity: Some(identity),
                     resolved_launch_profile: Some(profile),
                     agent_authorization_grant: Some(grant),
                     ..Default::default()
                 }
             };
-            task_params.launch = create_context.launch_selection.clone();
             create_context.execution_admission = Some(pioneer_tasks::TaskExecutionAdmissionSeed {
                 workspace_id: task_execution_context.workspace_id().to_owned(),
                 root_thread_id: task_execution_context.root_thread_id().to_owned(),
@@ -2299,7 +2367,7 @@ impl MessageProcessor {
             .await?;
             self.task_runtime
                 .service()
-                .create_task(create_context, task_params)
+                .create_prepared_composer_task(create_context, prepared)
                 .await
                 .map_err(anyhow::Error::from)
         })
@@ -12225,7 +12293,6 @@ fn reasoning_capability_source_label(source: Option<ReasoningCapabilitySource>) 
     match source {
         Some(ReasoningCapabilitySource::ProviderMetadata) => "provider_metadata",
         Some(ReasoningCapabilitySource::CliMetadata) => "cli_metadata",
-        Some(ReasoningCapabilitySource::StaticRegistry) => "static_registry",
         Some(ReasoningCapabilitySource::ConfigOverride) => "config_override",
         Some(ReasoningCapabilitySource::Unknown) | None => "unknown",
     }
@@ -12322,7 +12389,7 @@ fn resolve_reasoning_effort_for_model(
         ));
     }
 
-    if reasoning.effort_options.is_empty() {
+    if reasoning.supported.is_none() || reasoning.effort_options.is_empty() {
         return Err(format!(
             "reasoning effort `{effort}` cannot be used with {backend_label} model `{model_id}` because supported reasoning efforts are unknown; capability source: {capability_source}"
         ));
@@ -12970,144 +13037,76 @@ mod tests {
     }
 
     #[test]
-    fn documented_claude_off_survives_catalog_selector_and_admission() {
+    fn catalog_reasoning_choices_survive_wire_selector_and_admission() {
         use pioneer_provider::catalog::ModelCatalog;
-        for (provider, key, id, template, optional) in [
+
+        // An arbitrary ID exercises data-driven support without a model-family rule.
+        let id = "aurora-unlisted-927";
+        let catalog = ModelCatalog::parse(
+            &serde_json::json!({"openai":{(id):{
+                "id":id, "name":"Aurora", "provider":"openai",
+                "api":"openai-responses", "baseUrl":"https://api.openai.com/v1",
+                "contextWindow":32000, "maxTokens":4000, "reasoning":true,
+                "input":["text"], "cost":{"input":2.0,"output":8.0},
+                "thinkingLevelMap":{"low":"low","high":"high"}
+            }}}).to_string(),
+            &serde_json::json!({"openai":{(id):{
+                "contextWindow":{"kind":"source","expression":"provider context"},
+                "maxTokens":{"kind":"source","expression":"provider output"},
+                "inputLimit":{"value":24000,"origin":{"kind":"source","expression":"provider input"}}
+            }}}).to_string(),
+        ).unwrap();
+
+        for (case, model_id, native, expected) in [
+            ("catalog fallback", id, None, vec!["low", "high"]),
             (
-                "anthropic",
-                "anthropic",
-                "claude-opus-4-5-20251101",
-                "claude-opus-4-5",
-                true,
+                "provider enum wins",
+                id,
+                Some(reasoning_capabilities(Some(true), &["medium"])),
+                vec!["medium"],
             ),
             (
-                "anthropic",
-                "anthropic",
-                "claude-opus-4-6",
-                "claude-opus-4-6",
-                true,
+                "provider denial wins",
+                id,
+                Some(reasoning_capabilities(Some(false), &["high"])),
+                vec![],
             ),
-            (
-                "anthropic",
-                "anthropic",
-                "claude-sonnet-5",
-                "claude-opus-4-6",
-                true,
-            ),
-            (
-                "anthropic",
-                "anthropic",
-                "claude-opus-5",
-                "claude-opus-4-6",
-                true,
-            ),
-            (
-                "anthropic",
-                "anthropic",
-                "claude-fable-5-1",
-                "claude-opus-4-6",
-                false,
-            ),
-            (
-                "anthropic",
-                "anthropic",
-                "claude-sonnet-5-5",
-                "claude-opus-4-6",
-                false,
-            ),
-            (
-                "bedrock",
-                "amazon-bedrock",
-                "us.anthropic.claude-opus-4-6-v1",
-                "anthropic.claude-opus-4-6-v1",
-                true,
-            ),
-            (
-                "bedrock",
-                "amazon-bedrock",
-                "anthropic.claude-opus-4-5-20251101-v1:0",
-                "anthropic.claude-opus-4-6-v1",
-                true,
-            ),
-            (
-                "bedrock",
-                "amazon-bedrock",
-                "anthropic.claude-fable-5",
-                "anthropic.claude-opus-4-6-v1",
-                false,
-            ),
+            ("unknown model", "another-unlisted-928", None, vec![]),
         ] {
-            for kind in [
-                "saved",
-                "missing",
-                "partial",
-                "catalog-veto",
-                "native-veto",
-                "capability-veto",
-            ] {
-                let mut models: serde_json::Value = serde_json::from_str(include_str!(
-                    "../../../provider/tests/fixtures/catalog/models.json"
-                ))
-                .unwrap();
-                let mut provenance: serde_json::Value = serde_json::from_str(include_str!(
-                    "../../../provider/tests/fixtures/catalog/provenance.json"
-                ))
-                .unwrap();
-                if kind == "missing" {
-                    models[key].as_object_mut().unwrap().remove(id);
-                } else if kind != "saved" {
-                    let mut entry = models[key][template].clone();
-                    assert!(entry.get("api").is_some());
-                    entry["id"] = serde_json::json!(id);
-                    entry["thinkingLevelMap"] = if kind == "catalog-veto" {
-                        serde_json::json!({"off":null})
-                    } else {
-                        serde_json::json!({"max":"max"})
-                    };
-                    if kind == "capability-veto" {
-                        entry["reasoning"] = serde_json::json!(false);
-                    }
-                    models[key][id] = entry;
-                    provenance[key][id] = provenance[key][template].clone();
-                }
-                // Saved profiles can explicitly veto off too (Opus 5 has
-                // off:null). A documented optional mode only fills missing
-                // metadata; it cannot override that catalog denial.
-                let catalog_off_veto = models[key][id]["reasoning"] == false
-                    || models[key][id]
-                        .get("thinkingLevelMap")
-                        .and_then(|map| map.get("off"))
-                        .is_some_and(serde_json::Value::is_null);
-                let catalog =
-                    ModelCatalog::parse(&models.to_string(), &provenance.to_string()).unwrap();
-                let mut model = reasoning_test_model(None);
-                model.id = id.into();
-                model.provider = provider.into();
-                if kind == "native-veto" {
-                    model.capabilities.reasoning = Some(ProviderModelReasoningCapabilities {
-                        native: [("thinking.types.disabled".into(), Some(false))]
-                            .into_iter()
-                            .collect(),
-                        ..Default::default()
-                    });
-                }
-                catalog.enrich(provider, std::slice::from_mut(&mut model));
-                let rows = pioneer_client::providers::presentation::reasoning_effort_rows_for_model(
-                    &model, None,
-                );
-                let off_allowed = optional && !catalog_off_veto && kind != "native-veto";
-                assert_eq!(
-                    rows.iter().any(|r| r.effort == "none"),
-                    off_allowed,
-                    "{provider}/{id}/{kind}"
+            let mut discovered = reasoning_test_model(native);
+            discovered.id = model_id.into();
+            discovered.provider = "openai".into();
+            catalog.enrich("openai", std::slice::from_mut(&mut discovered));
+            // UI and admission must agree on the serialized public facts, without
+            // depending on discovery-only native metadata or a source registry.
+            let model: ProviderModelInfo =
+                serde_json::from_value(serde_json::to_value(discovered).unwrap()).unwrap();
+            let rows = pioneer_client::providers::presentation::reasoning_effort_rows_for_model(
+                &model,
+                Some("high"),
+            );
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.effort.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{case}"
+            );
+            for effort in ["none", "low", "medium", "high"] {
+                let accepted = resolve_reasoning_effort_for_model(
+                    ReasoningEffortValidationPolicy::KnownOnly,
+                    "provider `openai`",
+                    model_id,
+                    effort,
+                    Some(&model),
                 );
                 assert_eq!(
-                    validate_reasoning_effort_for_model(provider, id, "none", Some(&model)).is_ok(),
-                    off_allowed
+                    accepted.is_ok(),
+                    expected.contains(&effort),
+                    "{case}/{effort}"
                 );
-                for row in rows {
-                    validate_reasoning_effort_for_model(provider, id, &row.effort, Some(&model))
-                        .unwrap();
+                if expected.contains(&effort) {
+                    assert_eq!(accepted.unwrap(), effort, "{case}");
                 }
             }
         }
@@ -13127,7 +13126,7 @@ mod tests {
             default_effort: None,
             mandatory: None,
             supports_token_budget: None,
-            source: Some(ReasoningCapabilitySource::StaticRegistry),
+            source: Some(ReasoningCapabilitySource::ProviderMetadata),
         }
     }
 
@@ -13288,6 +13287,17 @@ mod tests {
                 "model-a",
                 "high",
                 Some(reasoning_test_model(Some(reasoning_capabilities(
+                    None,
+                    &["high"],
+                )))),
+                "unconfirmed support should reject an advertised effort",
+                "supported reasoning efforts are unknown",
+            ),
+            (
+                "provider `openai`",
+                "model-a",
+                "high",
+                Some(reasoning_test_model(Some(reasoning_capabilities(
                     Some(false),
                     &["low", "high"],
                 )))),
@@ -13334,7 +13344,7 @@ mod tests {
                 reasoning_test_model(Some(reasoning_capabilities(Some(true), &["low", "medium"]))),
                 "high",
                 "unsupported value should reject selected effort",
-                "reasoning effort `high` is not supported by provider `openai` model `model-a`; supported efforts: low, medium; capability source: static_registry",
+                "reasoning effort `high` is not supported by provider `openai` model `model-a`; supported efforts: low, medium; capability source: provider_metadata",
             ),
             (
                 model,

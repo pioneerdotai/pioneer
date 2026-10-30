@@ -2367,6 +2367,9 @@ pub async fn insert_agent_execution_grant<C: ConnectionTrait>(
 ) -> Result<agent_execution_grant::Model> {
     let (identity, profile, child_launch_grant) =
         parse_agent_execution_launch_grant(input.grant_json.as_str())?;
+    child_launch_grant.validate_for_execution().map_err(|_| {
+        anyhow::anyhow!("historical child launch ceiling cannot authorize a new execution")
+    })?;
     if input.grant_fingerprint != agent_execution_grant_fingerprint(input.grant_json.as_str())?
         || !agent_execution_launch_grant_matches_child_identity(
             &identity,
@@ -2400,7 +2403,7 @@ pub async fn insert_agent_execution_grant<C: ConnectionTrait>(
         .context("failed to reload agent execution grant")?
         .context("agent execution grant disappeared after idempotent insert")?;
     let grant = upgrade_agent_execution_grant_model_to_current(grant)
-        .context("failed to upcast reloaded agent execution grant")?;
+        .context("failed to validate reloaded agent execution grant")?;
     if grant.execution_id != input.execution_id
         || grant.parent_execution_id != input.parent_execution_id
         || grant.child_identity_id != input.child_identity_id
@@ -2423,24 +2426,17 @@ pub fn agent_execution_grant_fingerprint(grant_json: &str) -> Result<String> {
     Ok(hex::encode(digest.finalize()))
 }
 
-/// Verifies an immutable AgentExecution grant in its stored representation,
-/// then upcasts only its embedded child-launch ceiling for current readers.
-/// The returned model is an in-memory projection; background maintenance owns
-/// durable rewrites so ordinary reads never acquire a write dependency.
+/// Verifies the original outer and nested snapshots. Neither the bytes nor
+/// either fingerprint may be rewritten by a reader.
 pub fn upgrade_agent_execution_grant_model_to_current(
-    mut grant: agent_execution_grant::Model,
+    grant: agent_execution_grant::Model,
 ) -> Result<agent_execution_grant::Model> {
     let stored_fingerprint = agent_execution_grant_fingerprint(grant.grant_json.as_str())?;
     if grant.grant_fingerprint != stored_fingerprint {
         bail!("agent execution grant fingerprint does not match its stored JSON");
     }
-
-    let migrated = pioneer_protocol::migrate_embedded_child_launch_grant_json_to_current(
-        grant.grant_json.as_str(),
-    )
-    .context("failed to upcast agent execution child launch ceiling")?;
     let (identity, profile, child_launch_grant) =
-        parse_agent_execution_launch_grant(migrated.as_str())?;
+        parse_agent_execution_launch_grant(grant.grant_json.as_str())?;
     if !agent_execution_launch_grant_matches_child_identity(
         &identity,
         &profile,
@@ -2448,11 +2444,6 @@ pub fn upgrade_agent_execution_grant_model_to_current(
         grant.child_identity_id.as_str(),
     ) {
         bail!("agent execution grant identity/profile is outside its child launch ceiling");
-    }
-
-    if migrated != grant.grant_json {
-        grant.grant_fingerprint = agent_execution_grant_fingerprint(migrated.as_str())?;
-        grant.grant_json = migrated;
     }
     Ok(grant)
 }
@@ -2464,12 +2455,9 @@ fn agent_execution_launch_grant_matches_child_identity(
     child_identity_id: &str,
 ) -> bool {
     identity.id.as_str() == child_identity_id
-        && pioneer_protocol::validate_selected_agent_launch_profile(
-            identity,
-            profile,
-            &child_launch_grant.identities,
-        )
-        .is_ok()
+        && child_launch_grant
+            .validate_selected_profile(identity, profile)
+            .is_ok()
 }
 
 fn parse_agent_execution_launch_grant(
@@ -2519,7 +2507,7 @@ pub async fn load_agent_execution_grant<C: ConnectionTrait>(
         .context("failed to load agent execution grant")?
         .map(upgrade_agent_execution_grant_model_to_current)
         .transpose()
-        .context("failed to upcast loaded agent execution grant")
+        .context("failed to validate loaded agent execution grant")
 }
 
 pub async fn insert_agent_turn_response<C: ConnectionTrait>(
@@ -5931,6 +5919,9 @@ pub async fn commit_agent_execution_graph(
     }
     let (grant_identity, grant_profile, child_launch_grant) =
         parse_agent_execution_launch_grant(input.grant.grant_json.as_str())?;
+    child_launch_grant.validate_for_execution().map_err(|_| {
+        anyhow::anyhow!("historical child launch ceiling cannot authorize a new execution")
+    })?;
     let existing = load_agent_execution(db, &input.child_execution.id).await?;
     let identity = ensure_agent_identity(db, &input.identity).await?;
     if identity.workspace_id != input.child_execution.workspace_id
@@ -6161,6 +6152,9 @@ pub async fn commit_agent_execution_graph(
             .context("exact parent execution has no immutable launch grant")?;
         let (_, _, parent_launch_grant) =
             parse_agent_execution_launch_grant(parent_grant.grant_json.as_str())?;
+        parent_launch_grant.validate_for_execution().map_err(|_| {
+            anyhow::anyhow!("historical parent launch ceiling cannot authorize a new execution")
+        })?;
         let ephemeral_child =
             grant_identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::Ephemeral;
         let identity_ceiling_is_monotonic = child_launch_grant.identities.iter().all(|candidate| {
@@ -7607,7 +7601,7 @@ mod tests {
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{Database, DatabaseBackend, TransactionTrait};
 
-    fn version_one_child_launch_grant() -> serde_json::Value {
+    pub(super) fn version_one_child_launch_grant() -> serde_json::Value {
         serde_json::json!({
             "version": 1,
             "identities": [{
@@ -7658,7 +7652,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_grant_read_projection_verifies_v1_before_upcasting_and_rehashing_outer_json() {
+    fn execution_grant_history_verifies_v1_and_preserves_both_original_checksums() {
         let child = version_one_child_launch_grant();
         let grant_json = serde_json::json!({
             "kind": "test",
@@ -7685,10 +7679,30 @@ mod tests {
             serde_json::from_str(upgraded.grant_json.as_str()).expect("upgraded grant JSON");
         assert_eq!(
             upgraded_json["child_launch_grant"]["version"],
-            serde_json::json!(2)
+            serde_json::json!(1)
         );
-        assert_ne!(upgraded.grant_json, model.grant_json);
-        assert_ne!(upgraded.grant_fingerprint, stored_fingerprint);
+        assert_eq!(upgraded.grant_json, model.grant_json);
+        assert_eq!(upgraded.grant_fingerprint, stored_fingerprint);
+        let (_, _, child) = parse_agent_execution_launch_grant(&upgraded.grant_json).unwrap();
+        assert!(child.validate_for_execution().is_err());
+        let mut widened_profile = model.clone();
+        let mut outer: serde_json::Value =
+            serde_json::from_str(&widened_profile.grant_json).unwrap();
+        outer["profile"]["modelId"] = serde_json::json!("not-in-historical-ceiling");
+        widened_profile.grant_json = outer.to_string();
+        widened_profile.grant_fingerprint =
+            agent_execution_grant_fingerprint(&widened_profile.grant_json).unwrap();
+        assert!(upgrade_agent_execution_grant_model_to_current(widened_profile).is_err());
+        let mut broken_child = model.clone();
+        let mut outer: serde_json::Value = serde_json::from_str(&broken_child.grant_json).unwrap();
+        outer["child_launch_grant"]["allowServerDerivedEphemeral"] = serde_json::json!(true);
+        broken_child.grant_json = outer.to_string();
+        broken_child.grant_fingerprint =
+            agent_execution_grant_fingerprint(&broken_child.grant_json).unwrap();
+        assert!(
+            upgrade_agent_execution_grant_model_to_current(broken_child).is_err(),
+            "a valid outer checksum cannot replace the nested integrity check"
+        );
         assert_eq!(
             upgraded.grant_fingerprint,
             agent_execution_grant_fingerprint(upgraded.grant_json.as_str())
@@ -8804,3 +8818,7 @@ mod tests {
 #[cfg(test)]
 #[path = "agent_domain/action_outbox_tests.rs"]
 mod action_outbox_tests;
+
+#[cfg(test)]
+#[path = "grant_json_compat_tests.rs"]
+mod grant_json_compat_tests;

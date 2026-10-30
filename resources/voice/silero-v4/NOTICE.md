@@ -19,16 +19,26 @@ license). No conversion or modification of the model bytes was performed.
 
 Gateway embeds this model, this notice, and LICENSE. Its existing gzip/ZIP and
 computer-use gateway packaging therefore carries them on Linux x86_64/aarch64,
-macOS x86_64/aarch64, and Windows x86_64/aarch64. The SDK requires a filesystem
+macOS x86_64/aarch64, and Windows x86_64/aarch64. The ONNX loader uses a filesystem
 path: the blocking gateway lifecycle stages a private temporary copy with the
 notices, verifies the bytes, and loads one Session per recording. There is no
 runtime download, user-supplied model path, or mobile resource copy.
 
-Consumer: locked `transcribe-rs 0.3.12`, feature `vad-silero`. Its Silero v4
-wrapper takes 480 samples at 16 kHz, inputs `input/sr/h/c`, outputs
-`output/hn/cn`, and independent h/c tensors of shape `[2,1,64]`. Upstream v4's
-Python helper rejects frames below 512, while the model has dynamic input
-length and the upstream README says it was trained on 30 ms. Pioneer uses the
-locked Rust wrapper's 480-sample contract; native load/inference verification
-is deferred to external acceptance, with a prepared smoke test. This is not
-a v5/v6 model with combined recurrent state.
+Consumer: gateway-local `SileroV4Session` in `voice/silero.rs`, using the
+already locked `ort 2.0.0-rc.12` ONNX runtime. No ASR SDK fork is involved.
+Inputs are `input/sr/h/c`, outputs `output/hn/cn`, with independent h/c tensors
+of shape `[2,1,64]`. The sample rate is scalar 16000, as in the pinned Python
+helper. Gateway feeds sequential 512-sample (32 ms) frames. This matches v4
+`utils_vad.py`'s minimum accepted 16 kHz frame and default `audio_forward` /
+`get_speech_timestamps` frame size:
+https://github.com/snakers4/silero-vad/blob/915dd3d639b8333a52e001af095f87c5b7f1e0ac/utils_vad.py
+
+The locked transcribe-rs 0.3.12 VAD wrapper instead requires 480 samples.
+That contract difference is the reason for the narrow local adapter, not a
+claim of measured quality degradation. Only the final partial native frame
+is zero padded; real PCM/time never includes that padding. Sessions retain
+recurrent state through silence and are never shared between recordings.
+Native load/inference verification is deferred to external acceptance; the
+ignored smoke checks isolation but is not an independent quality oracle.
+Model bytes, license, integrity checks and packaging are unchanged. This is
+not a v5/v6 model with combined recurrent state.

@@ -1,13 +1,16 @@
 //! Mandatory gateway-only VAD resource. No model download or ASR selection dependency.
-use super::vad::{VOICE_VAD_FRAME_SAMPLES, VOICE_VAD_SPEECH_THRESHOLD, VoiceActivityDetector};
+use super::vad::{VOICE_VAD_FRAME_SAMPLES, VoiceActivityDetector};
 use anyhow::{Context, Result, bail};
+use ort::{
+    session::{Session, builder::GraphOptimizationLevel},
+    value::TensorRef,
+};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{fs, path::Path};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
-use transcribe_rs::vad::SileroVad;
 
 const MODEL: &[u8] = include_bytes!("../../../../resources/voice/silero-v4/silero_vad.onnx");
 const LICENSE: &str = include_str!("../../../../resources/voice/silero-v4/LICENSE");
@@ -18,8 +21,79 @@ const MODEL_BYTES: u64 = 1_807_522;
 // Session and recurrent h/c are owned by exactly one recording's blocking worker.
 // Keep the private materialization alive until native Session has been dropped.
 pub(super) struct SileroVoiceActivityDetector {
-    detector: SileroVad,
+    detector: SileroV4Session,
     _resource: TempDir,
+}
+
+// Local adapter for the pinned v4 graph, independent of the ASR SDK's 480
+// sample VAD wrapper. v4 utils_vad.py accepts >=512 samples at 16 kHz and uses
+// 512 by default. State is never reset on silence or at a packet boundary.
+struct SileroV4Session {
+    session: Session,
+    h: [f32; 128],
+    c: [f32; 128],
+}
+
+impl SileroV4Session {
+    fn new(path: &Path) -> Result<Self> {
+        let session = Session::builder()?
+            // Drop the recoverable builder before converting errors to anyhow.
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(ort::Error::<()>::from)?
+            .with_intra_threads(1)
+            .map_err(ort::Error::<()>::from)?
+            .with_inter_threads(1)
+            .map_err(ort::Error::<()>::from)?
+            .commit_from_file(path)?;
+        Ok(Self {
+            session,
+            h: [0.0; 128],
+            c: [0.0; 128],
+        })
+    }
+
+    fn speech_probability(&mut self, frame: &[f32]) -> Result<f32> {
+        if frame.len() != VOICE_VAD_FRAME_SAMPLES {
+            bail!("Silero v4 requires exactly 512 samples at 16 kHz");
+        }
+        let sr = [16000i64];
+        let outputs = self.session.run(ort::inputs![
+            "input" => TensorRef::from_array_view(([1usize, VOICE_VAD_FRAME_SAMPLES], frame))?,
+            "sr" => TensorRef::from_array_view(([] as [usize; 0], &sr[..]))?,
+            "h" => TensorRef::from_array_view(([2usize, 1, 64], &self.h[..]))?,
+            "c" => TensorRef::from_array_view(([2usize, 1, 64], &self.c[..]))?,
+        ])?;
+        let (shape, probability) = outputs
+            .get("output")
+            .context("Silero v4 missing output")?
+            .try_extract_tensor::<f32>()?;
+        if &shape[..] != [1, 1]
+            || probability.len() != 1
+            || !probability[0].is_finite()
+            || !(0.0..=1.0).contains(&probability[0])
+        {
+            bail!("Silero v4 returned invalid probability tensor");
+        }
+        let (h_shape, h) = outputs
+            .get("hn")
+            .context("Silero v4 missing hn")?
+            .try_extract_tensor::<f32>()?;
+        let (c_shape, c) = outputs
+            .get("cn")
+            .context("Silero v4 missing cn")?
+            .try_extract_tensor::<f32>()?;
+        if &h_shape[..] != [2, 1, 64]
+            || &c_shape[..] != [2, 1, 64]
+            || h.len() != 128
+            || c.len() != 128
+            || h.iter().chain(c).any(|value| !value.is_finite())
+        {
+            bail!("Silero v4 returned invalid recurrent state");
+        }
+        self.h.copy_from_slice(h);
+        self.c.copy_from_slice(c);
+        Ok(probability[0])
+    }
 }
 
 impl VoiceActivityDetector for SileroVoiceActivityDetector {
@@ -33,19 +107,19 @@ impl VoiceActivityDetector for SileroVoiceActivityDetector {
 }
 
 /// Only call from a blocking lifecycle/worker, outside supervisor/store locks.
-/// Each call creates a fresh SDK Session and zeroed h/c; pauses never reset it.
+/// Each call creates a fresh ONNX Session and zeroed h/c; pauses never reset it.
 pub(super) fn create_voice_detector(
     cancellation: &CancellationToken,
 ) -> Result<SileroVoiceActivityDetector> {
     ensure_active(cancellation)?;
-    // The SDK accepts a path only. A private temporary directory avoids mutable
+    // The ONNX loader opens a path. A private temporary directory avoids mutable
     // shared files/state and works with the existing single-binary packaging on
     // every gateway target. These bytes and notices are embedded in that binary.
     let builder = tempfile::Builder::new();
     #[cfg(unix)]
     let builder = {
         let mut builder = builder;
-        // Restrict access at creation, before verification and the SDK's reopen.
+        // Restrict access at creation, before verification and the loader's reopen.
         builder.permissions(fs::Permissions::from_mode(0o700));
         builder
     };
@@ -65,7 +139,10 @@ pub(super) fn create_voice_detector(
     })
 }
 
-fn load_verified_detector(path: &Path, cancellation: &CancellationToken) -> Result<SileroVad> {
+fn load_verified_detector(
+    path: &Path,
+    cancellation: &CancellationToken,
+) -> Result<SileroV4Session> {
     ensure_active(cancellation)?;
     if fs::metadata(path)
         .context("required Silero VAD asset is unavailable")?
@@ -79,13 +156,12 @@ fn load_verified_detector(path: &Path, cancellation: &CancellationToken) -> Resu
         bail!("required Silero VAD asset failed SHA256 verification");
     }
     ensure_active(cancellation)?;
-    let detector = SileroVad::new(path, VOICE_VAD_SPEECH_THRESHOLD)
-        .context("failed to load required Silero v4 VAD")?;
+    let detector = SileroV4Session::new(path).context("failed to load required Silero v4 VAD")?;
     ensure_active(cancellation)?;
     Ok(detector)
 }
 
-/// Readiness requires the exact SDK/model interface to work, not merely a file
+/// Readiness requires the exact adapter/model interface to work, not merely a file
 /// or successful ASR load. The probe is discarded, never shared with recordings.
 pub(super) fn prepare_voice_vad(cancellation: &CancellationToken) -> Result<()> {
     let mut detector = create_voice_detector(cancellation)?;
@@ -110,7 +186,6 @@ pub(super) fn check_asset_failure_for_test(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use transcribe_rs::vad::Vad;
 
     #[test]
     fn missing_truncated_and_same_size_corrupt_asset_fail_before_native_load() {
@@ -149,7 +224,7 @@ mod tests {
     fn silero_v4_bundled_load_inference_and_recording_state_isolation_smoke() {
         let cancellation = CancellationToken::new();
         prepare_voice_vad(&cancellation)
-            .expect("readiness probe: actual 480-sample SDK/model contract");
+            .expect("readiness probe: actual 512-sample adapter/model contract");
         let mut first = create_voice_detector(&cancellation).unwrap();
         let mut second = create_voice_detector(&cancellation).unwrap();
         #[cfg(unix)]
@@ -159,8 +234,8 @@ mod tests {
                 .permissions();
             assert_eq!(permissions.mode() & 0o077, 0);
         }
-        // Raw pinned SDK instances are the independent recurrent-state oracle,
-        // so an adapter that resets or shares state per frame cannot self-confirm.
+        // Separately loaded sessions check recording isolation. This is not an
+        // independent v4 probability/state oracle or a speech-quality test.
         let mut first_reference = load_verified_detector(
             &first._resource.path().join("silero_vad.onnx"),
             &cancellation,
@@ -204,7 +279,8 @@ mod tests {
                     < 1e-6
             );
         }
-        first.detector.reset();
+        first.detector.h.fill(0.0);
+        first.detector.c.fill(0.0);
         let mut fresh = create_voice_detector(&cancellation).unwrap();
         assert!(
             (first.speech_probability(&frames[0]).unwrap()

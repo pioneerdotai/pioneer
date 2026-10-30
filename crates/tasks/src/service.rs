@@ -106,6 +106,25 @@ struct TaskReviseValidationContext {
     additional_instructions: Vec<String>,
 }
 
+struct PreparedTaskContract {
+    task: Task,
+    trigger: TaskTrigger,
+    agent_spec: Option<TaskAgentSpec>,
+}
+
+/// Immutable, size-checked request and normalized durable Composer contract.
+/// This is preparation only, not an authorization or a durable creation receipt.
+pub struct PreparedComposerTask {
+    params: TaskCreateParams,
+    contract: PreparedTaskContract,
+}
+
+impl PreparedComposerTask {
+    pub fn params(&self) -> &TaskCreateParams {
+        &self.params
+    }
+}
+
 pub struct TaskRuntime {
     service: Arc<TaskService>,
     critical_service: Arc<TaskService>,
@@ -1936,10 +1955,172 @@ impl TaskService {
             .saturating_add(1))
     }
 
+    fn prepare_task_contract(
+        &self,
+        params: &TaskCreateParams,
+        webhook_secret_ref: Option<String>,
+        parent: ParentContext,
+        now: i64,
+    ) -> TaskRuntimeResult<PreparedTaskContract> {
+        let trigger_kind = params.trigger.spec.kind();
+        TaskTriggerCalculator::validate(&params.trigger.spec)?;
+
+        let depth = parent.depth;
+        let max_depth = normalize_max_depth(depth, parent.max_depth, params.agent_spec.as_ref())?;
+        if depth > max_depth {
+            bail!("task depth {depth} exceeds max depth {max_depth}");
+        }
+
+        let task_id = generate_id(ID_LEN);
+        let trigger_id = generate_id(ID_LEN);
+        let next_fire_at = TaskTriggerCalculator::initial_next_fire_at(&params.trigger.spec, now)?;
+        let lifecycle_policy = params.lifecycle_policy.clone().unwrap_or_else(|| {
+            default_lifecycle_policy_for_trigger(
+                &params.trigger.spec,
+                params.created_by_turn_id.is_some(),
+            )
+        });
+        let attachment = lifecycle_policy.attachment;
+        let agent_review_policy =
+            self.effective_agent_review_policy_for_create(params, trigger_kind, &lifecycle_policy);
+        let task = Task {
+            id: task_id.clone(),
+            workspace_id: params.workspace_id.clone(),
+            owner_kind: params.owner_kind,
+            owner_id: params.owner_id.clone(),
+            created_by_thread_id: params.created_by_thread_id.clone(),
+            created_by_turn_id: params.created_by_turn_id.clone(),
+            root_task_id: parent.root_task_id.clone(),
+            parent_task_id: params.parent_task_id.clone(),
+            executor_kind: params.executor_kind,
+            status: if is_webhook_spec(&params.trigger.spec) {
+                TaskStatus::Waiting
+            } else {
+                TaskStatus::Draft
+            },
+            title: required_trimmed(&params.title, "title")?,
+            goal: required_trimmed(&params.goal, "goal")?,
+            priority: params.priority,
+            lifecycle_policy: Some(lifecycle_policy),
+            delivery_policy: Some(params.delivery_policy.clone().unwrap_or_else(|| {
+                default_delivery_policy_for_trigger(
+                    &params.trigger.spec,
+                    attachment,
+                    params.owner_kind,
+                    params.owner_id.as_deref(),
+                    params.created_by_thread_id.as_deref(),
+                )
+            })),
+            retry_policy: Some(
+                params
+                    .retry_policy
+                    .clone()
+                    .unwrap_or_else(default_retry_policy),
+            ),
+            timeout_policy: params.timeout_policy.clone(),
+            concurrency_policy: params.concurrency_policy.clone(),
+            metadata: params.metadata.clone(),
+            result: None,
+            error: None,
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        let trigger = TaskTrigger {
+            webhook_secret_ref,
+            id: trigger_id.clone(),
+            task_id: task_id.clone(),
+            status: TaskTriggerStatus::Active,
+            spec: params.trigger.spec.clone(),
+            next_fire_at,
+            last_fire_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let agent_spec = params.agent_spec.clone().map(|input| TaskAgentSpec {
+            id: generate_id(ID_LEN),
+            task_id: task_id.clone(),
+            run_id: None,
+            agent_role: input.agent_role,
+            agent_nickname: input.agent_nickname,
+            model: input.model,
+            model_provider: input.model_provider,
+            prompt: input.prompt,
+            context_policy: input.context_policy,
+            tool_policy: input.tool_policy,
+            permission_cap: input.permission_cap,
+            security_cap: input.security_cap,
+            result_contract: input.result_contract,
+            review_policy: agent_review_policy,
+            depth,
+            max_depth,
+            created_at: now,
+            updated_at: now,
+        });
+        TaskAdmissionNormalizer::new().validate_durable(
+            &task,
+            Some(&trigger),
+            agent_spec.as_ref(),
+        )?;
+
+        Ok(PreparedTaskContract {
+            task,
+            trigger,
+            agent_spec,
+        })
+    }
+
+    /// Prepare both byte-budgeted contracts without writing or starting work.
+    /// This intentionally accepts only root, immediate Composer tasks: their
+    /// depth/defaults are independent of mutable parent Task state. Keep the
+    /// generated IDs and timestamps through creation so the durable byte count
+    /// cannot drift after the source message is accepted.
+    pub fn prepare_composer_task(
+        &self,
+        params: TaskCreateParams,
+    ) -> TaskRuntimeResult<PreparedComposerTask> {
+        validate_create_params(&params)?;
+        if params.parent_task_id.is_some()
+            || params.executor_kind != TaskExecutorKind::Agent
+            || params.trigger.spec.kind() != TaskTriggerKind::Immediate
+            || params
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.composer_work.as_ref())
+                .is_none()
+        {
+            bail!("prepared creation requires a root immediate Composer task");
+        }
+        let contract =
+            self.prepare_task_contract(&params, None, ParentContext::root(), now_timestamp_secs())?;
+        Ok(PreparedComposerTask { params, contract })
+    }
+
+    /// Consume the prevalidated Composer contracts while retaining the ordinary
+    /// creation path's live authorization/admission checks and atomic commit.
+    pub async fn create_prepared_composer_task(
+        &self,
+        context: TaskCreateContext,
+        prepared: PreparedComposerTask,
+    ) -> TaskRuntimeResult<TaskCreateResponse> {
+        self.create_task_inner(context, prepared.params, Some(prepared.contract))
+            .await
+    }
+
     pub async fn create_task(
+        &self,
+        context: TaskCreateContext,
+        params: TaskCreateParams,
+    ) -> TaskRuntimeResult<TaskCreateResponse> {
+        self.create_task_inner(context, params, None).await
+    }
+
+    async fn create_task_inner(
         &self,
         mut context: TaskCreateContext,
         params: TaskCreateParams,
+        prepared_contract: Option<PreparedTaskContract>,
     ) -> TaskRuntimeResult<TaskCreateResponse> {
         if params
             .metadata
@@ -2001,7 +2182,10 @@ impl TaskService {
                 }
             }
         }
-        let now = now_timestamp_secs();
+        let now = prepared_contract
+            .as_ref()
+            .map(|contract| contract.task.created_at)
+            .unwrap_or_else(now_timestamp_secs);
         let parent = self
             .parent_context(
                 params.parent_task_id.as_deref(),
@@ -2009,82 +2193,23 @@ impl TaskService {
                 params.created_by_thread_id.as_deref(),
             )
             .await?;
-        let trigger_kind = params.trigger.spec.kind();
-        TaskTriggerCalculator::validate(&params.trigger.spec)?;
-
-        let depth = parent.depth;
-        let max_depth = normalize_max_depth(depth, parent.max_depth, params.agent_spec.as_ref())?;
-        if depth > max_depth {
-            bail!("task depth {depth} exceeds max depth {max_depth}");
-        }
-
-        let task_id = generate_id(ID_LEN);
-        let trigger_id = generate_id(ID_LEN);
-        let next_fire_at = TaskTriggerCalculator::initial_next_fire_at(&params.trigger.spec, now)?;
-        let lifecycle_policy = params.lifecycle_policy.clone().unwrap_or_else(|| {
-            default_lifecycle_policy_for_trigger(
-                &params.trigger.spec,
-                params.created_by_turn_id.is_some(),
-            )
-        });
-        let attachment = lifecycle_policy.attachment;
-        let agent_review_policy =
-            self.effective_agent_review_policy_for_create(&params, trigger_kind, &lifecycle_policy);
-        let task = Task {
-            id: task_id.clone(),
-            workspace_id: params.workspace_id.clone(),
-            owner_kind: params.owner_kind,
-            owner_id: params.owner_id.clone(),
-            created_by_thread_id: params.created_by_thread_id.clone(),
-            created_by_turn_id: params.created_by_turn_id.clone(),
-            root_task_id: parent.root_task_id.clone(),
-            parent_task_id: params.parent_task_id.clone(),
-            executor_kind: params.executor_kind,
-            status: if is_webhook_spec(&params.trigger.spec) {
-                TaskStatus::Waiting
-            } else {
-                TaskStatus::Draft
-            },
-            title: required_trimmed(&params.title, "title")?,
-            goal: required_trimmed(&params.goal, "goal")?,
-            priority: params.priority,
-            lifecycle_policy: Some(lifecycle_policy),
-            delivery_policy: Some(params.delivery_policy.clone().unwrap_or_else(|| {
-                default_delivery_policy_for_trigger(
-                    &params.trigger.spec,
-                    attachment,
-                    params.owner_kind,
-                    params.owner_id.as_deref(),
-                    params.created_by_thread_id.as_deref(),
-                )
-            })),
-            retry_policy: Some(
-                params
-                    .retry_policy
-                    .clone()
-                    .unwrap_or_else(default_retry_policy),
-            ),
-            timeout_policy: params.timeout_policy.clone(),
-            concurrency_policy: params.concurrency_policy.clone(),
-            metadata: params.metadata.clone(),
-            result: None,
-            error: None,
-            revision: 1,
-            created_at: now,
-            updated_at: now,
-            completed_at: None,
+        let PreparedTaskContract {
+            task,
+            trigger,
+            agent_spec,
+        } = match prepared_contract {
+            Some(contract) => contract,
+            None => self.prepare_task_contract(
+                &params,
+                context.webhook_secret_ref.clone(),
+                parent,
+                now,
+            )?,
         };
-        let trigger = TaskTrigger {
-            webhook_secret_ref: context.webhook_secret_ref.clone(),
-            id: trigger_id.clone(),
-            task_id: task_id.clone(),
-            status: TaskTriggerStatus::Active,
-            spec: params.trigger.spec.clone(),
-            next_fire_at,
-            last_fire_at: None,
-            created_at: now,
-            updated_at: now,
-        };
+        let task_id = task.id.clone();
+        let trigger_id = trigger.id.clone();
+        let trigger_kind = trigger.spec.kind();
+        let next_fire_at = trigger.next_fire_at;
         let immediate_run = (trigger_kind == TaskTriggerKind::Immediate).then(|| TaskRun {
             trigger_input: None,
             id: generate_id(ID_LEN),
@@ -2108,32 +2233,8 @@ impl TaskService {
             created_at: now,
             updated_at: now,
         });
-        let agent_spec = params.agent_spec.clone().map(|input| TaskAgentSpec {
-            id: generate_id(ID_LEN),
-            task_id: task_id.clone(),
-            run_id: None,
-            agent_role: input.agent_role,
-            agent_nickname: input.agent_nickname,
-            model: input.model,
-            model_provider: input.model_provider,
-            prompt: input.prompt,
-            context_policy: input.context_policy,
-            tool_policy: input.tool_policy,
-            permission_cap: input.permission_cap,
-            security_cap: input.security_cap,
-            result_contract: input.result_contract,
-            review_policy: agent_review_policy,
-            depth,
-            max_depth,
-            created_at: now,
-            updated_at: now,
-        });
-        TaskAdmissionNormalizer::new().validate_durable(
-            &task,
-            Some(&trigger),
-            agent_spec.as_ref(),
-        )?;
-
+        // Prepared Composer creation consumes the same tuple checked before
+        // parent admission; its IDs, timestamps and defaults remain unchanged.
         let mut events = vec![
             TaskEventPayload::TaskCreated { task: task.clone() },
             TaskEventPayload::TriggerCreated {
@@ -4666,11 +4767,7 @@ impl TaskService {
             }
             bail!("parent task `{parent_task_id}` not found");
         }
-        Ok(ParentContext {
-            root_task_id: None,
-            depth: 1,
-            max_depth: DEFAULT_MAX_TASK_DEPTH,
-        })
+        Ok(ParentContext::root())
     }
 
     async fn collaboration_root_thread_id(&self, thread_id: &str) -> TaskRuntimeResult<String> {
@@ -5252,6 +5349,16 @@ struct ParentContext {
     root_task_id: Option<String>,
     depth: i64,
     max_depth: i64,
+}
+
+impl ParentContext {
+    fn root() -> Self {
+        Self {
+            root_task_id: None,
+            depth: 1,
+            max_depth: DEFAULT_MAX_TASK_DEPTH,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
