@@ -1383,19 +1383,20 @@ fn cli_observation_tracks_the_child_outcome_across_same_run_resume() {
                     )
                     .await
                     .unwrap();
-                let resumed = processor
-                    .crud_store
-                    .resume_task_owned_turn(
-                        &a_child.thread_id,
-                        &a_child.turn_id,
-                        Some(&job.id),
-                        now,
-                        processor.turn_execution_owner_id.as_ref(),
-                        now + 100,
-                    )
-                    .await
-                    .unwrap()
-                    .unwrap();
+                // The fixture keeps both terminal snapshots alive across the
+                // resume. Heap-own the storage future rather than composing
+                // its transaction state into this already large CLI scenario.
+                let resumed = Box::pin(processor.crud_store.resume_task_owned_turn(
+                    &a_child.thread_id,
+                    &a_child.turn_id,
+                    Some(&job.id),
+                    now,
+                    processor.turn_execution_owner_id.as_ref(),
+                    now + 100,
+                ))
+                .await
+                .unwrap()
+                .unwrap();
                 let pioneer_crud::TaskOwnedTurnResumeOutcome::Resumed {
                     task,
                     run,
