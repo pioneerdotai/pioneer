@@ -66,6 +66,7 @@ pub struct FrozenStorageLifetimeProgress {
     sweep_round: [frozen_sweep_work::ServiceRound; 2],
     accounting: SweepAccounting,
     discard_after: String,
+    discard_pending: VecDeque<Option<String>>,
     discard: Option<DiscardPreparation>,
     pub(super) conversion: Option<super::compaction_frozen_storage::StagedCopyCheck>,
 }
@@ -2013,22 +2014,18 @@ impl FrozenStorageLifetimeProgress {
             }
             return Ok(true);
         }
-        let row = history::Entity::find()
-            .select_only()
-            .column(history::Column::Id)
+        // The existing (expired, ready, id) index selects one lightweight
+        // header directly. No payload lives in this Entity; the writer still
+        // revalidates the complete header and root/hold observations.
+        let header = history::Entity::find()
             .filter(history::Column::Expired.eq(0))
             .filter(history::Column::Ready.eq(1))
             .filter(history::Column::Id.gt(&self.expiry_after))
             .order_by_asc(history::Column::Id)
-            .into_tuple::<String>()
             .one(&store.connection)
             .await?;
-        if let Some(id) = row {
-            let header = history::Entity::find_by_id(&id)
-                .one(&store.connection)
-                .await?;
-            self.expiry_after = id;
-            let header = header.ok_or_else(|| anyhow::anyhow!("expiry discovery changed"))?;
+        if let Some(header) = header {
+            self.expiry_after = header.id.clone();
             ensure!(counter_health(&header), "corrupt expiry counters");
             self.expiry = Some(ExpiryPreparation::new(header));
             Ok(true)
@@ -2189,70 +2186,61 @@ impl FrozenStorageLifetimeProgress {
             self.discard = None;
             return Ok(true);
         }
-        let row = store
-            .connection
-            .query_one(
-                &Query::select()
-                    .from(checkpoint::Entity)
-                    .column((checkpoint::Entity, checkpoint::Column::Id))
-                    .join(
-                        JoinType::InnerJoin,
-                        operation::Entity,
-                        Expr::col((operation::Entity, operation::Column::Id))
-                            .eq(Expr::col((
-                                checkpoint::Entity,
-                                checkpoint::Column::OperationId,
-                            )))
-                            .and(
-                                Expr::col((operation::Entity, operation::Column::Owner))
-                                    .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
-                            ),
-                    )
-                    .join(
-                        JoinType::InnerJoin,
-                        projection::Entity,
-                        Expr::col((projection::Entity, projection::Column::OperationId))
-                            .eq(Expr::col((operation::Entity, operation::Column::Id))),
-                    )
-                    .join(
-                        JoinType::InnerJoin,
-                        history::Entity,
-                        Expr::col((history::Entity, history::Column::Id)).eq(Expr::col((
-                            projection::Entity,
-                            projection::Column::ManifestId,
-                        ))),
-                    )
-                    .and_where(
-                        Expr::col((checkpoint::Entity, checkpoint::Column::Id))
-                            .gt(&self.discard_after),
-                    )
-                    .and_where(Expr::col((history::Entity, history::Column::Expired)).eq(1))
-                    .and_where(
-                        Expr::col((operation::Entity, operation::Column::Status)).is_in([
-                            "failed",
-                            "cancelled",
-                            "stale",
-                        ]),
-                    )
-                    .and_where(
-                        Expr::col((checkpoint::Entity, checkpoint::Column::Status)).ne("applied"),
-                    )
-                    .order_by((checkpoint::Entity, checkpoint::Column::Id), Order::Asc)
-                    .limit(1)
-                    .to_owned(),
+        if self.discard_pending.is_empty() {
+            // Physical PK seek only: no eligibility predicate/JOIN can make
+            // SQLite search past this page to fill it. Bound actual UTF-8 key
+            // bytes as well as rows, like ScopeDiscovery's metadata pages.
+            let key: SimpleExpr = Expr::case(
+                Expr::cust(format!(
+                    "length(CAST(id AS BLOB)) <= {SCOPE_PAGE_KEY_BYTES}"
+                )),
+                Expr::col(checkpoint::Column::Id),
             )
-            .await?;
-        let Some(row) = row else {
+            .finally(Expr::val(Option::<String>::None))
+            .into();
+            self.discard_pending = checkpoint::Entity::find()
+                .select_only()
+                .column_as(key, "id")
+                .filter(checkpoint::Column::Id.gt(&self.discard_after))
+                .order_by_asc(checkpoint::Column::Id)
+                .limit(META_ROWS)
+                .into_tuple::<Option<String>>()
+                .all(&store.connection)
+                .await?
+                .into();
+        }
+        let id = match self.discard_pending.front() {
+            Some(Some(id)) => Some(id.clone()),
+            Some(None) => {
+                // Preserve the legacy TEXT ID domain without retaining a page
+                // of oversized keys. A fresh single seek also handles deletion
+                // of the sentinel row. Never acknowledge its old cached tail.
+                self.discard_pending.clear();
+                checkpoint::Entity::find()
+                    .select_only()
+                    .column(checkpoint::Column::Id)
+                    .filter(checkpoint::Column::Id.gt(&self.discard_after))
+                    .order_by_asc(checkpoint::Column::Id)
+                    .into_tuple::<String>()
+                    .one(&store.connection)
+                    .await?
+            }
+            None => None,
+        };
+        let Some(id) = id else {
+            // Only an empty physical seek is EOF. Rejected eligibility on a
+            // nonempty page always returns more; the existing pass/revisit
+            // policy later rediscovers eligibility changes behind the cursor.
             self.discard_after.clear();
             return Ok(false);
         };
-        let id: String = row.try_get("", "id")?;
-        // One exact-key metadata read, after LIMIT has selected this candidate.
+        // One exact-key eligibility/preflight read, after physical selection.
         // A failed read acknowledges nothing; a successful refusal advances the
         // keyset without allocating a reverse traversal or decoding runner JSON.
         let admitted = discard_preflight(store, &id).await?;
         if !admitted {
             self.discard_after = id;
+            self.discard_pending.pop_front();
             return Ok(true);
         }
         // Discovery/preflight may already be stale. Fetch all current binding
@@ -2260,6 +2248,7 @@ impl FrozenStorageLifetimeProgress {
         // leaves this visit unacknowledged; a successful refusal is not EOF.
         let discard = prepare_discard_candidate(store, &id).await?;
         self.discard_after = id;
+        self.discard_pending.pop_front();
         self.discard = discard;
         Ok(true)
     }
@@ -2269,21 +2258,92 @@ impl FrozenStorageLifetimeProgress {
 // Use the same broad incoming-edge predicates as its final guard, including
 // unknown foreign scope/version combinations that must conservatively retain.
 async fn discard_preflight(store: &CrudStore, id: &str) -> Result<bool> {
-    let row = store
-        .connection
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT 1 AS admitted FROM compaction_checkpoint c WHERE c.id=?1 \
-             AND NOT EXISTS(SELECT 1 FROM compaction_checkpoint WHERE previous=?1) \
-             AND NOT EXISTS(SELECT 1 FROM compaction_coverage WHERE source_id=?1 AND source_scope LIKE 'checkpoint:%') \
-             AND (c.proof_version=1 \
-             OR EXISTS(SELECT 1 FROM compaction_checkpoint_import WHERE checkpoint_id=?1) \
-             OR EXISTS(SELECT 1 FROM compaction_checkpoint_replay_alias WHERE checkpoint_id=?1) \
-             OR EXISTS(SELECT 1 FROM compaction_checkpoint_event_input WHERE checkpoint_id=?1)) LIMIT 1",
-            [id.into()],
-        ))
-        .await?;
-    Ok(row.is_some())
+    use pioneer_entity::{
+        compaction_checkpoint_event_input as event_input, compaction_checkpoint_import as import,
+        compaction_checkpoint_replay_alias as replay_alias,
+    };
+    // Correlated exact-key binding lookups: operation/projection/history PKs
+    // cannot fan out into a global terminal-operation scan per candidate.
+    let binding =
+        operation::Entity::find()
+            .select_only()
+            .column(operation::Column::Id)
+            .filter(
+                Expr::col((operation::Entity, operation::Column::Id)).eq(Expr::col((
+                    checkpoint::Entity,
+                    checkpoint::Column::OperationId,
+                ))),
+            )
+            .filter(
+                Expr::col((operation::Entity, operation::Column::Owner))
+                    .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
+            )
+            .filter(operation::Column::Status.is_in(["failed", "cancelled", "stale"]))
+            .filter(Expr::exists(
+                projection::Entity::find()
+                    .select_only()
+                    .column(projection::Column::OperationId)
+                    .filter(
+                        Expr::col((projection::Entity, projection::Column::OperationId))
+                            .eq(Expr::col((operation::Entity, operation::Column::Id))),
+                    )
+                    .filter(Expr::exists(
+                        history::Entity::find()
+                            .select_only()
+                            .column(history::Column::Id)
+                            .filter(Expr::col((history::Entity, history::Column::Id)).eq(
+                                Expr::col((projection::Entity, projection::Column::ManifestId)),
+                            ))
+                            .filter(history::Column::Expired.eq(1))
+                            .into_query(),
+                    ))
+                    .into_query(),
+            ))
+            .into_query();
+    let previous = checkpoint::Entity::find()
+        .select_only()
+        .column(checkpoint::Column::Id)
+        .filter(checkpoint::Column::Previous.eq(id))
+        .into_query();
+    let incoming = coverage::Entity::find()
+        .select_only()
+        .column(coverage::Column::CheckpointId)
+        .filter(coverage::Column::SourceId.eq(id))
+        .filter(coverage::Column::SourceScope.like("checkpoint:%"))
+        .into_query();
+    let imports = import::Entity::find()
+        .select_only()
+        .column(import::Column::CheckpointId)
+        .filter(import::Column::CheckpointId.eq(id))
+        .into_query();
+    let aliases = replay_alias::Entity::find()
+        .select_only()
+        .column(replay_alias::Column::CheckpointId)
+        .filter(replay_alias::Column::CheckpointId.eq(id))
+        .into_query();
+    let events = event_input::Entity::find()
+        .select_only()
+        .column(event_input::Column::CheckpointId)
+        .filter(event_input::Column::CheckpointId.eq(id))
+        .into_query();
+    Ok(checkpoint::Entity::find_by_id(id)
+        .select_only()
+        .column(checkpoint::Column::ProofVersion)
+        .filter(checkpoint::Column::Status.ne("applied"))
+        .filter(Expr::exists(binding))
+        .filter(Expr::exists(previous).not())
+        .filter(Expr::exists(incoming).not())
+        .filter(
+            Condition::any()
+                .add(checkpoint::Column::ProofVersion.eq(1))
+                .add(Expr::exists(imports))
+                .add(Expr::exists(aliases))
+                .add(Expr::exists(events)),
+        )
+        .into_tuple::<i64>()
+        .one(&store.connection)
+        .await?
+        .is_some())
 }
 
 // Both reads are advisory: cleanup still owns final authorization in its
@@ -2346,6 +2406,10 @@ async fn prepare_discard_candidate(
         manifest,
         status,
         generation,
+        operation,
+        owner,
+        checkpoint_status,
+        thread: scope.thread_id,
     }))
 }
 
@@ -2355,6 +2419,10 @@ struct DiscardPreparation {
     status: String,
     generation: Option<i64>,
     reverse: Reachability,
+    operation: String,
+    owner: String,
+    checkpoint_status: String,
+    thread: String,
 }
 impl DiscardPreparation {
     async fn cleanup(&self, store: &CrudStore) -> Result<()> {
@@ -2438,6 +2506,12 @@ impl DiscardPreparation {
                     )
                     .join(
                         JoinType::InnerJoin,
+                        context::Entity,
+                        Expr::col((context::Entity, context::Column::Owner))
+                            .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
+                    )
+                    .join(
+                        JoinType::InnerJoin,
                         runner::Entity,
                         Expr::col((runner::Entity, runner::Column::OperationId))
                             .eq(Expr::col((operation::Entity, operation::Column::Id))),
@@ -2465,6 +2539,33 @@ impl DiscardPreparation {
                     )
                     .and_where(Expr::col((history::Entity, history::Column::Id)).eq(&self.manifest))
                     .and_where(Expr::col((history::Entity, history::Column::Expired)).eq(1))
+                    // The reader's terminal proof/reverse traversal belongs to
+                    // this exact operation and scope, including unsealed keys
+                    // whose identity is not protected by sealed-row triggers.
+                    .and_where(
+                        Expr::col((checkpoint::Entity, checkpoint::Column::OperationId))
+                            .eq(&self.operation),
+                    )
+                    .and_where(
+                        Expr::col((checkpoint::Entity, checkpoint::Column::Owner)).eq(&self.owner),
+                    )
+                    .and_where(
+                        Expr::col((operation::Entity, operation::Column::Owner)).eq(&self.owner),
+                    )
+                    .and_where(
+                        Expr::col((checkpoint::Entity, checkpoint::Column::Status))
+                            .eq(&self.checkpoint_status),
+                    )
+                    .and_where(
+                        Expr::col((checkpoint::Entity, checkpoint::Column::FormatVersion)).eq(1),
+                    )
+                    .and_where(
+                        Expr::col((context::Entity, context::Column::WorkspaceId))
+                            .eq(&self.reverse.workspace),
+                    )
+                    .and_where(
+                        Expr::col((context::Entity, context::Column::ThreadId)).eq(&self.thread),
+                    )
                     .and_where(Expr::exists(incoming_previous).not())
                     .and_where(Expr::exists(incoming_foreign).not());
                 match self.generation {
@@ -6253,6 +6354,10 @@ mod tests {
             status: "failed".into(),
             generation: Some(0),
             reverse: Reachability::new("cp-1", "ws"),
+            operation: "op".into(),
+            owner: "owner".into(),
+            checkpoint_status: "candidate".into(),
+            thread: "thread".into(),
         };
         progress.discard = Some(discard);
         // The final pending reverse node is consumed before its first DB read.

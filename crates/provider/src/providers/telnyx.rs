@@ -551,18 +551,7 @@ impl TelnyxProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("Telnyx API error ({status}): {body}")
+        crate::http::provider_api_error(response, "Telnyx").await
     }
 }
 
