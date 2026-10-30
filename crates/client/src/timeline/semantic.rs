@@ -6252,7 +6252,7 @@ mod tests {
             },
             20,
         ));
-        assert!(!apply_conversation_event_to_semantic_timeline(
+        assert!(apply_conversation_event_to_semantic_timeline(
             &mut state,
             "workspace_a",
             &ConversationEvent::TurnStarted {

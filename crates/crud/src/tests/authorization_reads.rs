@@ -299,7 +299,7 @@ async fn authorization_projections_use_only_required_columns_on_scoped_physical_
         // Count and column assertions detect a second full lookup as well.
         let columns = [
             "\"turn\".\"execution_authorization_context_json\"",
-            "\"turn\".\"id\", \"turn\".\"status\", \"turn\".\"turn_kind\", \"turn\".\"origin\"",
+            "\"turn\".\"id\", \"turn\".\"status\", \"turn\".\"turn_kind\", \"turn\".\"origin\", \"turn\".\"work_owner\"",
             "\"turn\".\"status\"",
             "\"turn\".\"initiated_by_actor_kind\", \"turn\".\"initiated_by_actor_id\"",
             "\"turn\".\"id\", \"turn\".\"thread_id\"",

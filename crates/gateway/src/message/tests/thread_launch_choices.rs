@@ -5476,6 +5476,12 @@ async fn detached_threads_action_recovers_after_commit_without_recreating_or_dis
         .await
         .unwrap();
     assert!(batch.errors.is_empty(), "{:?}", batch.errors);
+    let reconciled = pioneer_crud::load_agent_action_outbox(&database, action.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.delivered, 1, "{reconciled:?}");
+    assert_eq!(reconciled.status, "delivered");
     assert_eq!(
         recovered
             .crud_store
@@ -5652,10 +5658,16 @@ async fn detached_admission_early_stop_preserves_live_source_graph_on_both_sides
                 .iter()
                 .all(|e| !matches!(e.status.as_str(), "cancelled" | "completed" | "failed"))
         );
+        // Thread creation refreshes the target catalog. Exclude the sibling
+        // when selecting the next newly created destination.
+        let refreshed = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
         let (thread_id, target) = create_detached_review_target(
             &processor,
             &tools,
-            &binding.options,
+            &refreshed.options,
             "New delegated root",
             "stop-detached-thread",
         )
