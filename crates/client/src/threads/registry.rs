@@ -12926,6 +12926,108 @@ mod tests {
     }
 
     #[test]
+    fn late_shared_subscription_executor_preserves_completed_receipt() {
+        let (core, transport, responses, requests) = shared_subscription_core();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let completing_core = core.clone();
+        SUBSCRIPTION_PROMOTION_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // The first actual executor has passed its current check. Let
+                // a second foreground caller ACK that same flight before resume.
+                let request = completing_core.thread_registry.lock().unwrap().stores["a"]
+                    .subscription_request
+                    .clone()
+                    .unwrap();
+                let watchdog = Duration::from_secs(2);
+                let second = spawn_subscription_waiter(
+                    &completing_core,
+                    crate::rpc::RequestBudget::new(Instant::now() + watchdog),
+                );
+                let response = responses.recv_timeout(watchdog).unwrap();
+                assert_eq!(
+                    completing_core.thread_registry.lock().unwrap().stores["a"]
+                        .subscription_request
+                        .as_ref(),
+                    Some(&request)
+                );
+                subscription_reply(&response);
+                let binding = second.join().unwrap().unwrap();
+                assert!(binding.is_current());
+                {
+                    let registry = completing_core.thread_registry.lock().unwrap();
+                    let store = &registry.stores["a"];
+                    assert!(store.subscription_request.is_none());
+                    let receipt = store.subscription_receipt.as_ref().unwrap();
+                    assert_eq!(Some(&receipt.scope), request.scope().as_ref());
+                    assert!(Arc::ptr_eq(&receipt.live, &request.live));
+                    assert!(*receipt.live.lock().unwrap());
+                    assert!(
+                        request
+                            .flight
+                            .lock()
+                            .unwrap()
+                            .result
+                            .as_ref()
+                            .unwrap()
+                            .is_ok()
+                    );
+                }
+                let publication = completing_core.thread_snapshot("a").unwrap();
+                completed_tx.send((binding, request, publication)).unwrap();
+            }));
+        });
+        let budget = crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2));
+        let first = core.ensure_thread_subscription("a", "ws", &budget).unwrap();
+        let (second, request, publication) = completed_rx.try_recv().unwrap();
+        assert!(first.is_current());
+        assert!(second.is_current());
+        assert_eq!(first.scope(), second.scope());
+        assert_eq!(
+            first.scope().as_ref(),
+            Some(&request.scope().unwrap().socket)
+        );
+        assert!(Arc::ptr_eq(
+            &publication,
+            &core.thread_snapshot("a").unwrap()
+        ));
+        {
+            let registry = core.thread_registry.lock().unwrap();
+            let store = &registry.stores["a"];
+            let receipt = store.subscription_receipt.as_ref().unwrap();
+            assert_eq!(Some(&receipt.scope), request.scope().as_ref());
+            assert!(Arc::ptr_eq(&receipt.live, &request.live));
+            assert!(*receipt.live.lock().unwrap());
+            assert!(store.subscription_request.is_none());
+            assert!(store.subscription_retry_at.is_none());
+            assert!(!store.coordinator.history_loading);
+            assert!(!store.subscription_failed);
+            assert!(
+                request
+                    .flight
+                    .lock()
+                    .unwrap()
+                    .result
+                    .as_ref()
+                    .unwrap()
+                    .is_ok()
+            );
+        }
+        let reused = core.ensure_thread_subscription("a", "ws", &budget).unwrap();
+        assert!(reused.is_current());
+        assert_eq!(reused.scope(), first.scope());
+        assert!(Arc::ptr_eq(
+            &publication,
+            &core.thread_snapshot("a").unwrap()
+        ));
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            requests.try_recv().is_err(),
+            "foreground ACK does not schedule hydration"
+        );
+        core.shutdown();
+    }
+
+    #[test]
     fn subscription_waiter_cancel_and_timeout_leave_other_consumer_alive() {
         for cancel in [false, true] {
             let (core, transport, responses, _requests) = shared_subscription_core();
@@ -16198,8 +16300,10 @@ impl ClientCore {
                 })
         };
         let Some(baseline) = baseline else {
-            request.retire();
-            self.notify_send_readiness();
+            self.finish_thread_subscription_request(
+                request,
+                Err(anyhow::anyhow!("Thread subscription retired")),
+            );
             return;
         };
         let response = {
