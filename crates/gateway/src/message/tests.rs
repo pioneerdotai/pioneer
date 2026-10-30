@@ -3965,6 +3965,7 @@ impl pioneer_sqlite::SqliteWriteObserver for NativeSchedulingObserver {
 struct PreflightCaptureProvider {
     text: String,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
+    native_media: Option<CaptureSummaryProvider>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4369,7 +4370,17 @@ impl PreflightCaptureProvider {
         Self {
             text: text.into(),
             requests: std::sync::Mutex::new(Vec::new()),
+            native_media: None,
         }
+    }
+
+    fn with_native_attachments(mut self) -> Self {
+        self.native_media = Some(
+            CaptureSummaryProvider::new("")
+                .with_native_attachments()
+                .named("openai"),
+        );
+        self
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
@@ -4590,10 +4601,18 @@ impl Provider for CaptureSummaryProvider {
 #[async_trait::async_trait]
 impl Provider for PreflightCaptureProvider {
     fn name(&self) -> &str {
-        "preflight-capture"
+        self.native_media
+            .as_ref()
+            .map_or("preflight-capture", |provider| provider.name())
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
+        if let Some(provider) = &self.native_media {
+            return ProviderCapabilities {
+                tool_calling: true,
+                ..provider.capabilities()
+            };
+        }
         ProviderCapabilities {
             streaming: false,
             vision: false,
@@ -4601,6 +4620,13 @@ impl Provider for PreflightCaptureProvider {
             embeddings: false,
             transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
+        match &self.native_media {
+            Some(provider) => provider.list_models().await,
+            None => anyhow::bail!("preflight capture does not expose model discovery"),
         }
     }
 
@@ -15087,15 +15113,20 @@ async fn detached_composer_live_ordering_impl() {
     sessions
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
-    let provider = Arc::new(PreflightCaptureProvider::new(
-        r#"<task_result>{"summary":"detached result","data":{}}</task_result>"#,
+    let provider = Arc::new(
+        PreflightCaptureProvider::new(
+            r#"<task_result>{"summary":"detached result","data":{}}</task_result>"#,
+        )
+        .with_native_attachments(),
+    );
+    let providers = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
     ));
+    discover_native_capture_models(&providers, &workspace).await;
     let processor = Arc::new(MessageProcessor::new(
         threads.clone(),
-        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-            "openai",
-            provider.clone(),
-        )),
+        providers,
         sessions,
         workspaces,
         store.clone(),
@@ -15213,11 +15244,15 @@ async fn detached_composer_live_ordering_impl() {
     }
     // Reuse the rejected Turn id below: early failure must also roll back the
     // in-memory admission, allowing a corrected request to be accepted.
-    let artifact = ingest_user_test_artifact_for_thread(
+    // Native OpenAI file inputs use the documented PDF contract.
+    let artifact = ingest_typed_test_artifact_for_thread(
         &processor,
         &workspace,
         Some(parent),
-        "large-composer-context.txt",
+        "large-composer-context.pdf",
+        crate::media_test_fixtures::pdf(),
+        pioneer_protocol::ArtifactKind::File,
+        "application/pdf",
     )
     .await;
 
@@ -15418,9 +15453,17 @@ async fn detached_composer_live_ordering_impl() {
     assert_eq!(launch.input, exact_input);
     assert_eq!(launch.thread_id, parent);
     assert_eq!(launch.turn_id, turn_id);
+    let status = wait_for_task_status(store.clone(), &task.id, TaskStatus::Completed).await;
+    let terminal = store.get_task(&task.id).await.unwrap().unwrap();
     assert_eq!(
-        wait_for_task_status(store.clone(), &task.id, TaskStatus::Completed).await,
-        TaskStatus::Completed
+        status,
+        TaskStatus::Completed,
+        "large Composer execution failed: {:?}",
+        terminal
+            .runs
+            .iter()
+            .map(|run| &run.error)
+            .collect::<Vec<_>>()
     );
     let lineage = wait_for_child_lineage_for_run(store.clone(), &saved.runs[0].id).await;
     assert_eq!(
@@ -15436,7 +15479,7 @@ async fn detached_composer_live_ordering_impl() {
     assert_eq!(user.content, full_text);
     assert!(matches!(user.content_parts.as_slice(),
         [pioneer_provider::MessageContentPart::File { file }]
-            if file.name.as_deref() == Some("large-composer-context.txt")));
+            if file.name.as_deref() == Some("large-composer-context.pdf")));
 
     // Simulate a lost admission response by retrying the exact logical Turn.
     // The existing admission guard may replay or refuse; it must never create
