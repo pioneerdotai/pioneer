@@ -5378,7 +5378,6 @@ async fn recovery_terminalization_cannot_apply_blocked_over_a_resumed_generation
 
 #[tokio::test]
 async fn detached_threads_action_recovers_after_commit_without_recreating_or_dispatching_parent() {
-    use sea_orm::{ActiveModelTrait, Set};
     let probe = Arc::new(ChoiceRuntimeProbe::default());
     let (processor, context, tools) = fixture_with_probe(
         Default::default(),
@@ -5466,15 +5465,7 @@ async fn detached_threads_action_recovers_after_commit_without_recreating_or_dis
         .unwrap();
     // The lease expires across Gateway replacement; preserve owner/generation
     // so the production CAS, rather than a fabricated owner, admits recovery.
-    let mut owner: pioneer_entity::turn_execution::ActiveModel =
-        pioneer_entity::turn_execution::Entity::find_by_id(turn_id)
-            .one(&database)
-            .await
-            .unwrap()
-            .unwrap()
-            .into();
-    owner.lease_until = Set(pioneer_crud::utc_now() - chrono::Duration::seconds(1));
-    owner.update(&database).await.unwrap();
+    expire_review_admission(&processor, turn_id).await;
     let recovered = restart_choice_processor(&processor);
     recovered
         .recovery_coordinator
