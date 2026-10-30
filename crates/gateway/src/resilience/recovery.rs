@@ -793,6 +793,14 @@ impl RecoveryCoordinator {
     }
 
     fn provider_recovery_policy(&self, failure: &ProviderFailureDetails) -> ProviderRecoveryPolicy {
+        if failure.http_status == Some(403) {
+            // A confirmed provider HTTP response takes precedence over the
+            // classification hint. Reuse the bounded unchanged-request retry
+            // profile without rewriting the original diagnostic class/hint.
+            return self
+                .policy_registry
+                .policy_for_provider_failure(ProviderFailureClass::NetworkTransient);
+        }
         if !failure.is_recoverable_hint {
             return non_retryable_provider_failure_policy();
         }
@@ -4423,6 +4431,25 @@ impl RecoveryCoordinator {
     ) -> Result<RecoveryAttemptPlan> {
         if job.trigger != RecoveryTrigger::ProviderError {
             return Ok(RecoveryAttemptPlan::default());
+        }
+
+        if let Some(failure) = job
+            .diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.last_failure.as_ref())
+            .filter(|failure| failure.http_status == Some(403))
+        {
+            // The latest structured failure survives reload and can differ
+            // from the admission class. Keep the persisted episode budgets,
+            // but never apply class-based request mutations to an HTTP 403.
+            // Legacy prose alone is not evidence of an HTTP response status.
+            // This flag overwrites the execution option, so preserve the
+            // last actual transport rather than re-enabling streaming.
+            return Ok(RecoveryAttemptPlan {
+                force_non_stream: failure.transport
+                    == pioneer_protocol::ProviderTransportKind::NonStream,
+                ..Default::default()
+            });
         }
 
         let class = job.error_class.unwrap_or(ProviderFailureClass::Unknown);
@@ -8961,9 +8988,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_http_403_reloads_as_bounded_unchanged_request_retry() {
+        let (store, coordinator) = setup_coordinator().await;
+        let restarted = CrudStore::new(store.database_connection());
+        for class in [
+            ProviderFailureClass::AuthOrPermission,
+            ProviderFailureClass::AuthExpired,
+            ProviderFailureClass::PermissionDenied,
+            ProviderFailureClass::Unknown,
+            ProviderFailureClass::ModelNotFound,
+            ProviderFailureClass::ContextTooLarge,
+            ProviderFailureClass::PromptTooLong,
+            ProviderFailureClass::MaxOutputTokens,
+            ProviderFailureClass::StreamStall,
+            ProviderFailureClass::StreamTruncated,
+            ProviderFailureClass::UnsupportedStreaming,
+            ProviderFailureClass::UnsupportedToolCalling,
+            ProviderFailureClass::UnsupportedImageInput,
+            ProviderFailureClass::UnsupportedParameter,
+            ProviderFailureClass::UnsupportedCapability,
+            ProviderFailureClass::MalformedProviderRequest,
+            ProviderFailureClass::ProviderRejected,
+            ProviderFailureClass::InvalidRequest,
+            ProviderFailureClass::NetworkTransient,
+            ProviderFailureClass::RateLimit,
+            ProviderFailureClass::Provider5xx,
+            ProviderFailureClass::EmptyResponse,
+        ] {
+            let mut failure = provider_failure(class, "provider denied the request");
+            if matches!(
+                class,
+                ProviderFailureClass::StreamStall
+                    | ProviderFailureClass::StreamTruncated
+                    | ProviderFailureClass::UnsupportedStreaming
+            ) {
+                failure.transport = ProviderTransportKind::Stream;
+            }
+            failure.http_status = Some(403);
+            failure.is_recoverable_hint = false;
+            let job = coordinator
+                .enqueue_provider_failure_job(
+                    &ProviderFailureCandidate {
+                        turn_id: format!("turn_http_403_{class:?}"),
+                        item_id: "reasoning_403".into(),
+                        item_type: TurnItemType::Reasoning,
+                        failure: failure.clone(),
+                    },
+                    1_700_000_000,
+                )
+                .await
+                .unwrap()
+                .into_job();
+            let reloaded = restarted.get_recovery_job(&job.id).await.unwrap().unwrap();
+            let policy = coordinator
+                .policy_for_recovery_job(&reloaded)
+                .await
+                .unwrap();
+            assert_eq!(policy.action, RecoveryAction::RetryWithBackoff, "{class:?}");
+            assert_eq!(policy.max_attempts, 3);
+            assert_eq!(policy.base_backoff_secs, 2);
+            assert_eq!(policy.max_wall_clock_secs, 900);
+            assert_eq!(policy.no_progress_limit, 3);
+            assert_eq!(reloaded.error_class, Some(class));
+            assert_eq!(reloaded.policy_snapshot["class"], serde_json::json!(class));
+            assert_eq!(reloaded.policy_snapshot["is_recoverable_hint"], false);
+            assert_eq!(
+                reloaded.diagnostic,
+                Some(pioneer_protocol::RecoveryDiagnostic::provider(&failure))
+            );
+            for attempt_number in 1..=3 {
+                let plan = coordinator
+                    .build_attempt_plan(&reloaded, attempt_number)
+                    .await
+                    .unwrap();
+                assert!(!plan.refresh_provider_auth, "{class:?}");
+                assert_eq!(
+                    plan.force_non_stream,
+                    failure.transport == ProviderTransportKind::NonStream,
+                    "{class:?}: retry must preserve the last actual transport"
+                );
+                assert!(!plan.disable_tool_calling, "{class:?}");
+                assert!(!plan.disable_image_input, "{class:?}");
+                assert!(!plan.compact_history, "{class:?}");
+                assert!(!plan.continue_generation, "{class:?}");
+                assert!(plan.model_override.is_none(), "{class:?}");
+                assert!(plan.terminal_reason.is_none(), "{class:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn non_403_auth_and_local_failures_keep_existing_policy() {
+        let (_store, coordinator) = setup_coordinator().await;
+        for (class, status, hint, action, max_attempts) in [
+            (
+                ProviderFailureClass::AuthExpired,
+                Some(401),
+                true,
+                RecoveryAction::RefreshProviderAuth,
+                1,
+            ),
+            (
+                ProviderFailureClass::AuthOrPermission,
+                Some(401),
+                true,
+                RecoveryAction::RefreshProviderAuth,
+                1,
+            ),
+            (
+                ProviderFailureClass::AuthOrPermission,
+                None,
+                true,
+                RecoveryAction::RefreshProviderAuth,
+                1,
+            ),
+            (
+                ProviderFailureClass::PermissionDenied,
+                None,
+                true,
+                RecoveryAction::RefreshProviderAuth,
+                1,
+            ),
+            (
+                ProviderFailureClass::PermissionDenied,
+                None,
+                false,
+                RecoveryAction::MarkFailed,
+                0,
+            ),
+            (
+                ProviderFailureClass::Unknown,
+                None,
+                false,
+                RecoveryAction::MarkFailed,
+                0,
+            ),
+        ] {
+            // Neither legacy prose nor a public error code establishes an HTTP status.
+            let mut failure = provider_failure(class, "Unavailable: HTTP 403");
+            failure.http_status = status;
+            failure.is_recoverable_hint = hint;
+            let policy = coordinator.provider_recovery_policy(&failure);
+            assert_eq!(policy.action, action);
+            assert_eq!(policy.max_attempts, max_attempts);
+            let mut job = provider_plan_job(class, "stream");
+            job.reason = failure.message.clone();
+            job.diagnostic = Some(pioneer_protocol::RecoveryDiagnostic::provider(&failure));
+            let plan = coordinator.build_attempt_plan(&job, 2).await.unwrap();
+            if class == ProviderFailureClass::Unknown {
+                assert!(plan.terminal_reason.is_some());
+            } else {
+                assert!(plan.refresh_provider_auth);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn last_provider_failure_is_durable_without_replacing_initial_policy() {
         let (store, coordinator) = setup_coordinator().await;
-        let initial = provider_failure(ProviderFailureClass::StreamTruncated, "raw stream secret");
+        let mut initial =
+            provider_failure(ProviderFailureClass::StreamTruncated, "raw stream secret");
+        initial.transport = ProviderTransportKind::Stream;
         let job = coordinator
             .enqueue_provider_failure_job(
                 &ProviderFailureCandidate {
@@ -8987,6 +9172,7 @@ mod tests {
             "HTTP 401 raw response https://secret.example/token /private/key",
         );
         last.http_status = Some(403);
+        last.is_recoverable_hint = false;
         last.stage = ProviderFailureStage::Connect;
         last.provider_code = Some("credential=secret".to_owned());
         let events = coordinator
@@ -9009,6 +9195,13 @@ mod tests {
             pending.diagnostic.as_ref().unwrap().last_failure,
             Some(pioneer_protocol::RecoveryProviderFailure::from(&last))
         );
+        let plan = coordinator.build_attempt_plan(&pending, 2).await.unwrap();
+        assert!(
+            plan.force_non_stream,
+            "latest NonStream HTTP 403 must remain NonStream"
+        );
+        assert!(!plan.refresh_provider_auth);
+        assert!(plan.terminal_reason.is_none());
         let claimed = store
             .claim_due_recovery_jobs(pending.next_run_at_unix, 45, 1)
             .await
@@ -9143,6 +9336,138 @@ mod tests {
             .unwrap();
         assert_eq!(reloaded.status, RecoveryJobStatus::Pending);
         assert_eq!(reloaded.run_count, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_http_403_cooldown_replay_and_reload_preserve_attempt_budget() {
+        let (store, coordinator) = setup_coordinator().await;
+        let now = 1_700_000_000;
+        let mut failure = provider_failure(ProviderFailureClass::AuthOrPermission, "forbidden");
+        failure.http_status = Some(403);
+        failure.is_recoverable_hint = false;
+        failure.retry_after_ms = Some(1_501);
+        let candidate = ProviderFailureCandidate {
+            turn_id: "turn_http_403_budget".into(),
+            item_id: "reasoning_403_budget".into(),
+            item_type: TurnItemType::Reasoning,
+            failure,
+        };
+        let mut job = coordinator
+            .enqueue_provider_failure_job(&candidate, now)
+            .await
+            .unwrap()
+            .into_job();
+        assert_eq!(job.next_run_at_unix, now + 2);
+        assert_eq!(job.scheduled_at_unix, now + 2);
+        let restarted = Arc::new(CrudStore::new(store.database_connection()));
+        for run in 1..=3 {
+            // Recreate the coordinator between attempts: only durable state
+            // may carry the consumed budget and the provider status forward.
+            let coordinator = RecoveryCoordinator::new(
+                restarted.clone(),
+                coordinator.agent_manager.clone(),
+                Arc::new(ProviderRegistry::with_provider(
+                    "echo",
+                    Arc::new(EchoProvider::new()),
+                )),
+                RecoveryPolicyRegistry::default(),
+                test_tool_loop_config().normalized(),
+            );
+            let due = job.next_run_at_unix;
+            assert!(
+                restarted
+                    .claim_due_recovery_jobs(due - 1, 45, 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let claimed = restarted.claim_due_recovery_jobs(due, 45, 1).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].id, job.id);
+            let attempt = format!("http_403_attempt_{run}");
+            assert!(matches!(
+                restarted
+                    .mark_claimed_recovery_job_active(
+                        &job.id,
+                        claimed[0].claim_token.as_deref().unwrap(),
+                        &attempt,
+                        due,
+                    )
+                    .await
+                    .unwrap(),
+                ClaimedRecoveryActivation::Activated
+            ));
+            let mut renewed = candidate.failure.clone();
+            renewed.retry_after_ms = Some(3_201);
+            let events = coordinator
+                .record_recovery_provider_failure(&job.id, &attempt, renewed.clone(), due + 1, None)
+                .await
+                .unwrap();
+            let saved = restarted.get_recovery_job(&job.id).await.unwrap().unwrap();
+            assert_eq!(saved.run_count, run);
+            assert_eq!(saved.provider_attempt_number, run);
+            assert_eq!(saved.max_attempts, 3);
+            assert_eq!(saved.policy_snapshot, job.policy_snapshot);
+            assert_eq!(
+                saved.diagnostic.as_ref().unwrap().last_failure,
+                Some(pioneer_protocol::RecoveryProviderFailure::from(&renewed))
+            );
+            assert!(
+                coordinator
+                    .record_recovery_provider_failure(&job.id, &attempt, renewed, due + 2, None,)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "duplicate failure must not consume budget twice"
+            );
+            if run < 3 {
+                assert!(matches!(
+                    events.as_slice(),
+                    [RecoveryCoordinatorEvent::RetryScheduled { .. }]
+                ));
+                assert_eq!(saved.next_run_at_unix, due + 5);
+                assert_eq!(
+                    saved.scheduled_at_unix,
+                    job.scheduled_at_unix + 4,
+                    "cooldown pauses the budget without discarding consumed time"
+                );
+                let reused = coordinator
+                    .enqueue_provider_failure_job(&candidate, due + 2)
+                    .await
+                    .unwrap();
+                assert!(!reused.is_created());
+                let reused = reused.into_job();
+                assert_eq!(reused.id, job.id);
+                assert_eq!(reused.run_count, run);
+                assert_eq!(reused.scheduled_at_unix, saved.scheduled_at_unix);
+                assert_eq!(reused.next_run_at_unix, saved.next_run_at_unix);
+            } else {
+                assert!(matches!(
+                    events.as_slice(),
+                    [RecoveryCoordinatorEvent::RecoveryExhausted(_)]
+                ));
+                assert_eq!(saved.status, RecoveryJobStatus::Exhausted);
+                assert_eq!(
+                    saved.diagnostic.as_ref().unwrap().stop_reason,
+                    Some(pioneer_protocol::RecoveryStopReason::AttemptsExhausted)
+                );
+                assert!(
+                    restarted
+                        .claim_due_recovery_jobs(due + 100, 45, 1)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            job = saved;
+        }
+        assert_eq!(
+            restarted
+                .count_recovery_jobs_for_turn(&candidate.turn_id)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -10676,7 +11001,8 @@ mod tests {
             ProviderFailureClass::UnsupportedCapability,
             ProviderFailureClass::Unknown,
         ] {
-            let job = provider_plan_job(class, "stream");
+            let mut job = provider_plan_job(class, "stream");
+            job.reason = Some("legacy HTTP 403 without structured status".into());
             let plan = coordinator
                 .build_attempt_plan(&job, 1)
                 .await
