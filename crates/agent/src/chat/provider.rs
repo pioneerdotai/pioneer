@@ -1851,18 +1851,54 @@ fn infer_failure_classification(
 
 fn merge_failure_classification(
     classification: Option<ProviderFailureClassification>,
-    inferred: ProviderFailureClassification,
+    mut inferred: ProviderFailureClassification,
 ) -> ProviderFailureClassification {
+    // Display text can retain legacy transient hints, but must never authorize
+    // history reduction. Both adapter translation and final failure creation
+    // merge here, so a second fallback cannot restore an unconfirmed overflow.
+    if matches!(
+        inferred.class,
+        ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+    ) {
+        inferred.class = ProviderFailureClass::Unknown;
+    }
     match classification {
-        Some(classification) => ProviderFailureClassification {
-            is_network_error: classification.is_network_error,
-            error_reason: classification.error_reason,
-            request_id: classification.request_id,
-            class: classification.class,
-            http_status: classification.http_status.or(inferred.http_status),
-            provider_code: classification.provider_code.or(inferred.provider_code),
-            retry_after_ms: classification.retry_after_ms.or(inferred.retry_after_ms),
-        },
+        Some(mut classification) => {
+            if matches!(
+                classification.class,
+                ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+            ) {
+                // A few adapters classify a typed HTTP rejection's body using
+                // legacy text rules. Auth/transient HTTP evidence vetoes that
+                // body's misleading size claim; other typed classes stay authoritative.
+                classification.class = match classification.http_status {
+                    Some(401) => ProviderFailureClass::AuthExpired,
+                    Some(403) => ProviderFailureClass::AuthOrPermission,
+                    Some(408 | 425) => ProviderFailureClass::NetworkTransient,
+                    Some(429) => ProviderFailureClass::RateLimit,
+                    Some(500..=599) => ProviderFailureClass::Provider5xx,
+                    _ => classification.class,
+                };
+            }
+            ProviderFailureClassification {
+                is_network_error: classification.is_network_error,
+                error_reason: classification.error_reason,
+                request_id: classification.request_id,
+                class: classification.class,
+                // Do not promote a Display-only number to HTTP authority for
+                // the second merge of a confirmed overflow classification.
+                http_status: if matches!(
+                    classification.class,
+                    ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+                ) {
+                    classification.http_status
+                } else {
+                    classification.http_status.or(inferred.http_status)
+                },
+                provider_code: classification.provider_code.or(inferred.provider_code),
+                retry_after_ms: classification.retry_after_ms.or(inferred.retry_after_ms),
+            }
+        }
         None => inferred,
     }
 }
