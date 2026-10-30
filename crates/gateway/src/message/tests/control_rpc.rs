@@ -53,6 +53,24 @@ impl Fixture {
     async fn new() -> Self {
         let (mut processor, store, workspace) =
             setup_execution_window_terminal_turn(THREAD, TURN).await;
+        // Completed message-only turns have no Work projection. Persist actual
+        // visible work so every allowlisted read exercises a successful result.
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: THREAD.into(),
+                    turn_id: TURN.into(),
+                    item: pioneer_protocol::TurnItem::Reasoning {
+                        id: "control-read-work".into(),
+                        summary: vec!["Read fixture work".into()],
+                        content: Vec::new(),
+                    },
+                },
+                now_timestamp_secs(),
+            )
+            .await
+            .unwrap();
         processor
             .thread_manager
             .turn_finish(THREAD, TURN, TurnStatus::Completed, None)
