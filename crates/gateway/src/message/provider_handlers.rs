@@ -2,7 +2,7 @@ use super::*;
 use crate::authorization::AuthorizationExternalError;
 
 impl MessageProcessor {
-    /// Shared model discovery for RPC and execution-bound launch catalogs.
+    /// Raw discovery for execution-bound launch catalogs and saved profile lookups.
     pub(super) async fn provider_models_catalog(
         &self,
         workspace_id: &str,
@@ -13,6 +13,24 @@ impl MessageProcessor {
             .get_or_create_for_workspace(workspace_id, provider_id)?;
         Ok(provider
             .list_models()
+            .await?
+            .into_iter()
+            .map(provider_model_info_to_protocol)
+            .collect())
+    }
+
+    /// Selectable API chat models. Execution-bound profile lookups continue to
+    /// use provider_models_catalog so saved selections remain executable.
+    pub(super) async fn provider_chat_models_for_selection(
+        &self,
+        workspace_id: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<Vec<ProviderModelInfo>> {
+        let provider = self
+            .provider_registry
+            .get_or_create_for_workspace(workspace_id, provider_id)?;
+        Ok(provider
+            .list_models_for_selection(pioneer_provider::selection::ModelPurpose::Chat)
             .await?
             .into_iter()
             .map(provider_model_info_to_protocol)
@@ -299,8 +317,10 @@ impl MessageProcessor {
             return;
         }
 
+        // Picker policy must not narrow the execution-bound catalog used by
+        // saved launch profiles. Keep that raw discovery method unchanged.
         match self
-            .provider_models_catalog(workspace_id.as_str(), &params.provider)
+            .provider_chat_models_for_selection(workspace_id.as_str(), &params.provider)
             .await
         {
             Ok(models) => {
@@ -445,7 +465,10 @@ impl MessageProcessor {
             }
         };
 
-        match provider.list_embedding_models().await {
+        match provider
+            .list_models_for_selection(pioneer_provider::selection::ModelPurpose::Embeddings)
+            .await
+        {
             Ok(models) => {
                 let result = ProviderListModelsResponse {
                     provider: params.provider.clone(),
@@ -588,7 +611,10 @@ impl MessageProcessor {
             }
         };
 
-        match provider.list_transcription_models().await {
+        match provider
+            .list_models_for_selection(pioneer_provider::selection::ModelPurpose::Transcription)
+            .await
+        {
             Ok(models) => {
                 let result = ProviderListModelsResponse {
                     provider: params.provider.clone(),
@@ -1450,6 +1476,8 @@ fn provider_model_info_to_protocol(m: ProviderModelInfo) -> ProviderModelInfo {
             context_window: m.limits.context_window,
         },
         capabilities: ProviderModelCapabilities {
+            chat: m.capabilities.chat,
+            chat_operation: m.capabilities.chat_operation,
             vision: m.capabilities.vision,
             tool_calling: m.capabilities.tool_calling,
             json_output: m.capabilities.json_output,

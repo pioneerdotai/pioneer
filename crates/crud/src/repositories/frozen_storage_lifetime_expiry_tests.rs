@@ -324,7 +324,16 @@ async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_
     progress.scope.done = true;
     progress.pass_done = [true, false, false, true, true, true];
     progress.phase = 2;
+    routes.clear();
     assert!(progress.quantum(&store).await.unwrap());
+    // Discovery returns the complete lightweight header in one reader call;
+    // the next quantum still owns the independent root/hold preflight.
+    routes.assert_single_read(SqliteReadOutcome::Ok);
+    assert_eq!(
+        progress.expiry.as_ref().unwrap().header.id,
+        descriptor.manifest_id
+    );
+    assert!(!progress.expiry.as_ref().unwrap().roots_checked);
     assert_eq!(progress.expiry_after, "origin");
     routes.clear();
     progress.phase = 2;
