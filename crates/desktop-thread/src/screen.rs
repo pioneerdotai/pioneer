@@ -4,7 +4,7 @@ use crate::{
     timeline::TimelineAvatarActivities,
 };
 use gpui_kit::{
-    component::{Sizable, spinner::Spinner, theme::ActiveTheme},
+    component::{Sizable, h_flex, spinner::Spinner, theme::ActiveTheme, v_flex},
     prelude::*,
     *,
 };
