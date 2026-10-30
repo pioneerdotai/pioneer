@@ -1,6 +1,9 @@
 #[path = "tests/workspace_scope.rs"]
 mod workspace_scope;
 
+#[path = "tests/authorization_reads.rs"]
+mod authorization_reads;
+
 #[cfg(unix)]
 #[path = "tests/title_recovery.rs"]
 mod title_recovery;
@@ -20403,6 +20406,24 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
     );
 }
 
+// Exercises mutations at the real synchronous serialization boundary. Only
+// fixtures call this callback; recipient authorization stays in the processor.
+struct NotificationSerializationProbe<F> {
+    serializations: Arc<AtomicUsize>,
+    on_serialize: F,
+}
+
+impl<F: Fn()> serde::Serialize for NotificationSerializationProbe<F> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.serializations.fetch_add(1, Ordering::SeqCst);
+        (self.on_serialize)();
+        serializer.serialize_str("protected notification payload")
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_notification_fanout_revalidates_membership_before_serialization() {
     const MEMBER_ALLOWED_ID: &str = "P0000000000000000000A";
@@ -20617,16 +20638,70 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
         "invitation changes are visible only to Superuser and the owning inviter"
     );
 
+    let (second_device_tx, mut second_device_rx) = mpsc::channel(8);
+    let second_device_connection_id = session_manager
+        .register_connection(
+            second_device_tx,
+            member_principal(
+                MEMBER_ALLOWED_ID,
+                "D0000000000000000000D",
+                "S0000000000000000000D",
+            ),
+        )
+        .await
+        .expect("register a second device for the exact recipient");
+    let other_workspace_id = "W0000000000000000000B";
+    processor
+        .workspace_manager
+        .create_workspace(other_workspace_id, Some("Selected elsewhere"))
+        .await
+        .expect("create the other selected workspace");
+    for connection_id in [allowed_connection_id, second_device_connection_id] {
+        session_manager
+            .set_connection_workspace(connection_id, Some(other_workspace_id.to_owned()))
+            .await;
+    }
+    for (workspace, recipient) in [
+        ("", MEMBER_ALLOWED_ID),
+        (" ", MEMBER_ALLOWED_ID),
+        (workspace_id.as_str(), ""),
+        (workspace_id.as_str(), " "),
+        (workspace_id.as_str(), "invalid-principal"),
+        (workspace_id.as_str(), "P0000000000000000000Z"),
+        (workspace_id.as_str(), MEMBER_DENIED_ID),
+    ] {
+        let serializations = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            processor
+                .send_task_user_notification(
+                    workspace,
+                    recipient,
+                    "test/task-user-invalid-or-denied",
+                    &CountedPayload {
+                        serializations: serializations.clone()
+                    },
+                )
+                .await,
+            0,
+        );
+        assert_eq!(serializations.load(Ordering::SeqCst), 0);
+    }
+    assert!(allowed_rx.try_recv().is_err());
+    assert!(second_device_rx.try_recv().is_err());
+    assert!(superuser_rx.try_recv().is_err());
+    assert!(denied_rx.try_recv().is_err());
+    assert!(unselected_rx.try_recv().is_err());
+
     let live_task_notification_recipients = processor
         .send_task_user_notification(
             workspace_id.as_str(),
-            MEMBER_ALLOWED_ID,
+            " P0000000000000000000A ",
             "test/task-user-notification",
             &json!({ "notification_id": "N0000000000000000000A" }),
         )
         .await;
     assert_eq!(
-        live_task_notification_recipients, 1,
+        live_task_notification_recipients, 2,
         "an exact-recipient task notification must reach every authorized session of only that principal"
     );
     assert_eq!(
@@ -20641,6 +20716,14 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
     );
     assert!(denied_rx.try_recv().is_err());
     assert!(unselected_rx.try_recv().is_err());
+
+    assert_eq!(
+        recv_notification_by_method(&mut second_device_rx, "test/task-user-notification")
+            .await
+            .method,
+        "test/task-user-notification",
+        "every device of the exact principal remains eligible while selected in workspace B",
+    );
 
     let queued_before_revoke = processor
         .authorized_workspace_notification_recipients(
@@ -20763,6 +20846,50 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
         "membership removal must affect the next workspace notification"
     );
     assert!(denied_rx.try_recv().is_err());
+
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT INTO workspace_membership(\
+            principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at\
+         ) SELECT 'P0000000000000000000A',id,'system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP \
+           FROM workspace WHERE is_current=1 LIMIT 1",
+        )
+        .await
+        .expect("restore exact recipient workspace membership");
+    let serializations = Arc::new(AtomicUsize::new(0));
+    let revoke = "DELETE FROM workspace_membership WHERE principal_id='P0000000000000000000A'";
+    let accepted = processor
+        .send_task_user_notification(
+            workspace_id.as_str(),
+            MEMBER_ALLOWED_ID,
+            "test/task-user-revoked-during-serialization",
+            &NotificationSerializationProbe {
+                serializations: serializations.clone(),
+                on_serialize: || {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            crud_store
+                                .database_connection()
+                                .execute_unprepared(revoke)
+                                .await
+                                .expect("revoke exact recipient during serialization");
+                        });
+                    })
+                },
+            },
+        )
+        .await;
+    assert_eq!(serializations.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        accepted, 0,
+        "final current policy controls the return count"
+    );
+    assert!(allowed_rx.try_recv().is_err());
+    assert!(second_device_rx.try_recv().is_err());
+    assert!(superuser_rx.try_recv().is_err());
+    assert!(denied_rx.try_recv().is_err());
+    assert!(unselected_rx.try_recv().is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -21435,15 +21562,13 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         "the direct terminal voice result must reach its currently authorized owner"
     );
 
-    let queued_before_revoke = processor
-        .authorized_thread_notification_recipients(
-            THREAD_ID,
-            thread_manager.subscribed_connections(THREAD_ID).await,
-        )
+    let queued_before_revoke = thread_manager.subscribed_connections(THREAD_ID).await;
+    let authorized_before_revoke = processor
+        .authorized_thread_notification_recipients(THREAD_ID, queued_before_revoke.clone())
         .await;
     assert!(
-        queued_before_revoke.contains(&allowed_connection_id)
-            && queued_before_revoke.contains(&superuser_connection_id),
+        authorized_before_revoke.contains(&allowed_connection_id)
+            && authorized_before_revoke.contains(&superuser_connection_id),
         "the deterministic race must capture both authorized recipients before the revoke"
     );
 
@@ -21473,8 +21598,47 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         allowed_rx.try_recv().is_err(),
         "progress delivery must observe an ACL revoke even before subscriber eviction"
     );
+    let denied_serializations = Arc::new(AtomicUsize::new(0));
     processor
-        .send_notification_to_reauthorized_thread_connections(
+        .send_notification_to_authorized_thread_subscribers(
+            THREAD_ID,
+            "test/private-thread-denied-before-serialization",
+            &NotificationSerializationProbe {
+                serializations: denied_serializations.clone(),
+                on_serialize: || {},
+            },
+            queued_before_revoke
+                .iter()
+                .filter(|subscriber| subscriber.connection_id == allowed_connection_id)
+                .cloned()
+                .collect(),
+        )
+        .await;
+    assert_eq!(denied_serializations.load(Ordering::SeqCst), 0);
+    assert!(allowed_rx.try_recv().is_err());
+    assert!(superuser_rx.try_recv().is_err());
+    for (thread_id, candidates) in [
+        (THREAD_ID, vec![allowed_connection_id]),
+        ("", vec![superuser_connection_id]),
+        (THREAD_ID, Vec::new()),
+    ] {
+        processor
+            .send_thread_scoped_notification_to_connections(
+                thread_id,
+                "test/direct-denied-before-serialization",
+                &NotificationSerializationProbe {
+                    serializations: denied_serializations.clone(),
+                    on_serialize: || {},
+                },
+                candidates,
+            )
+            .await;
+    }
+    assert_eq!(denied_serializations.load(Ordering::SeqCst), 0);
+    assert!(allowed_rx.try_recv().is_err());
+    assert!(superuser_rx.try_recv().is_err());
+    processor
+        .send_notification_to_authorized_thread_subscribers(
             THREAD_ID,
             "test/private-thread-after-revoke",
             &json!({"private": true}),
@@ -21621,6 +21785,280 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         denied_rx.try_recv().is_err(),
         "workspace visibility cannot repair a mismatched subscription identity"
     );
+
+    // Selected workspace is not the scope of an existing subscription.
+    let selected_workspace_id = "W0000000000000000000B";
+    processor
+        .workspace_manager
+        .create_workspace(selected_workspace_id, Some("Selected elsewhere"))
+        .await
+        .expect("create another workspace for selection");
+    processor
+        .session_manager
+        .set_connection_workspace(
+            allowed_connection_id,
+            Some(selected_workspace_id.to_owned()),
+        )
+        .await;
+    processor
+        .send_notification_to_thread_subscribers(
+            THREAD_ID,
+            "test/subscription-A-selected-B",
+            &json!({"protected": true}),
+        )
+        .await;
+    let _ = recv_notification_by_method(&mut allowed_rx, "test/subscription-A-selected-B").await;
+    let _ = recv_notification_by_method(&mut superuser_rx, "test/subscription-A-selected-B").await;
+    assert!(denied_rx.try_recv().is_err());
+    let original_subscriber = thread_manager
+        .subscribed_connections(THREAD_ID)
+        .await
+        .into_iter()
+        .find(|subscriber| subscriber.connection_id == allowed_connection_id)
+        .expect("original authenticated subscriber");
+
+    async fn replace_subscription(
+        manager: &ThreadManager,
+        subscriber: &crate::thread::ThreadSubscriber,
+        workspace_id: &str,
+        thread_id: &str,
+    ) {
+        manager
+            .thread_unsubscribe(subscriber.connection_id, thread_id)
+            .await;
+        manager
+            .thread_start_seeded_authenticated(
+                subscriber.connection_id,
+                subscriber.identity.clone(),
+                workspace_id.to_owned(),
+                serde_json::from_value(json!({
+                    "thread_id": thread_id, "workspace_id": workspace_id,
+                }))
+                .expect("subscription parameters"),
+                None,
+                None,
+            )
+            .await
+            .expect("resubscribe through the actual manager boundary");
+    }
+
+    // A removed subscription cannot authorize ordinary serialization. Direct
+    // domain delivery still works without subscription membership.
+    thread_manager
+        .thread_unsubscribe(allowed_connection_id, THREAD_ID)
+        .await;
+    let serializations = Arc::new(AtomicUsize::new(0));
+    let payload = NotificationSerializationProbe {
+        serializations: serializations.clone(),
+        on_serialize: || {},
+    };
+    processor
+        .send_notification_to_authorized_thread_subscribers(
+            THREAD_ID,
+            "test/unsubscribed-snapshot",
+            &payload,
+            vec![original_subscriber.clone()],
+        )
+        .await;
+    assert_eq!(serializations.load(Ordering::SeqCst), 0);
+    assert!(allowed_rx.try_recv().is_err());
+    processor
+        .send_thread_scoped_notification_to_connections(
+            THREAD_ID,
+            "test/direct-without-subscription",
+            &payload,
+            vec![allowed_connection_id],
+        )
+        .await;
+    assert_eq!(serializations.load(Ordering::SeqCst), 1);
+    let _ = recv_notification_by_method(&mut allowed_rx, "test/direct-without-subscription").await;
+    replace_subscription(
+        &thread_manager,
+        &original_subscriber,
+        &workspace_id,
+        THREAD_ID,
+    )
+    .await;
+
+    // Replace the actual subscription identity both before and during
+    // serialization. The captured recipient must never adopt that identity.
+    for identity in [
+        crate::thread::ThreadSubscriptionIdentity::new(
+            original_subscriber.identity.principal_id.clone(),
+            pioneer_protocol::AuthSessionId::new("S0000000000000000000C").unwrap(),
+        ),
+        crate::thread::ThreadSubscriptionIdentity::new(
+            pioneer_protocol::PrincipalId::new(MEMBER_DENIED_ID).unwrap(),
+            pioneer_protocol::AuthSessionId::new("S0000000000000000000B").unwrap(),
+        ),
+    ] {
+        let replacement = crate::thread::ThreadSubscriber {
+            connection_id: allowed_connection_id,
+            identity,
+        };
+        replace_subscription(&thread_manager, &replacement, &workspace_id, THREAD_ID).await;
+        let replacement_snapshot = thread_manager
+            .subscribed_connections_for_candidates(THREAD_ID, vec![allowed_connection_id])
+            .await
+            .pop()
+            .expect("replacement subscriber snapshot");
+        for (captured, current) in [
+            (&original_subscriber, &replacement_snapshot),
+            (&replacement_snapshot, &original_subscriber),
+        ] {
+            replace_subscription(&thread_manager, current, &workspace_id, THREAD_ID).await;
+            let serializations = Arc::new(AtomicUsize::new(0));
+            processor
+                .send_notification_to_authorized_thread_subscribers(
+                    THREAD_ID,
+                    "test/replaced-before-serialization",
+                    &NotificationSerializationProbe {
+                        serializations: serializations.clone(),
+                        on_serialize: || {},
+                    },
+                    vec![captured.clone()],
+                )
+                .await;
+            assert_eq!(serializations.load(Ordering::SeqCst), 0);
+            assert!(allowed_rx.try_recv().is_err());
+        }
+
+        let serializations = Arc::new(AtomicUsize::new(0));
+        processor
+            .send_notification_to_thread_subscribers(
+                THREAD_ID,
+                "test/replaced-during-serialization",
+                &NotificationSerializationProbe {
+                    serializations: serializations.clone(),
+                    on_serialize: || {
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(replace_subscription(
+                                &thread_manager,
+                                &replacement,
+                                &workspace_id,
+                                THREAD_ID,
+                            ));
+                        })
+                    },
+                },
+            )
+            .await;
+        assert_eq!(serializations.load(Ordering::SeqCst), 1);
+        let _ =
+            recv_notification_by_method(&mut superuser_rx, "test/replaced-during-serialization")
+                .await;
+        assert!(allowed_rx.try_recv().is_err());
+        assert!(denied_rx.try_recv().is_err());
+        replace_subscription(
+            &thread_manager,
+            &original_subscriber,
+            &workspace_id,
+            THREAD_ID,
+        )
+        .await;
+    }
+
+    // Both real paths must observe revoke during serialization, and a grant
+    // during serialization cannot resurrect a recipient denied beforehand.
+    let revoke = "DELETE FROM workspace_membership WHERE principal_id='P0000000000000000000A'";
+    let grant = "INSERT INTO workspace_membership(\
+        principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at\
+        ) SELECT 'P0000000000000000000A',id,'system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP \
+          FROM workspace WHERE is_current=1 LIMIT 1";
+    for direct in [false, true] {
+        for mutation in [revoke, grant] {
+            let serializations = Arc::new(AtomicUsize::new(0));
+            let payload = NotificationSerializationProbe {
+                serializations: serializations.clone(),
+                on_serialize: || {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            crud_store
+                                .database_connection()
+                                .execute_unprepared(mutation)
+                                .await
+                                .expect("mutate ACL during serialization");
+                        });
+                    })
+                },
+            };
+            if direct {
+                processor
+                    .send_thread_scoped_notification_to_connections(
+                        THREAD_ID,
+                        "test/thread-acl-serialization-race",
+                        &payload,
+                        vec![allowed_connection_id, superuser_connection_id],
+                    )
+                    .await;
+            } else {
+                processor
+                    .send_notification_to_thread_subscribers(
+                        THREAD_ID,
+                        "test/thread-acl-serialization-race",
+                        &payload,
+                    )
+                    .await;
+            }
+            assert_eq!(serializations.load(Ordering::SeqCst), 1);
+            let _ = recv_notification_by_method(
+                &mut superuser_rx,
+                "test/thread-acl-serialization-race",
+            )
+            .await;
+            assert!(
+                allowed_rx.try_recv().is_err(),
+                "revoke forbids delivery; a later grant cannot add an initially denied recipient"
+            );
+            assert!(denied_rx.try_recv().is_err());
+        }
+    }
+
+    // Re-registering a different principal creates a new connection. An old
+    // subscriber snapshot cannot become a candidate for that new session.
+    processor
+        .session_manager
+        .unregister_connection(allowed_connection_id)
+        .await;
+    let (replacement_tx, mut replacement_rx) = mpsc::channel(8);
+    let replacement_principal = member_principal(
+        MEMBER_DENIED_ID,
+        "D0000000000000000000E",
+        "S0000000000000000000E",
+    );
+    let replacement_connection_id = processor
+        .session_manager
+        .register_connection(replacement_tx, replacement_principal.clone())
+        .await
+        .expect("register the replacement principal/session");
+    assert_ne!(replacement_connection_id, allowed_connection_id);
+    replace_subscription(
+        &thread_manager,
+        &crate::thread::ThreadSubscriber {
+            connection_id: replacement_connection_id,
+            identity: crate::thread::ThreadSubscriptionIdentity::new(
+                replacement_principal.principal_id.clone(),
+                replacement_principal.session_id.clone(),
+            ),
+        },
+        &workspace_id,
+        THREAD_ID,
+    )
+    .await;
+    let serializations = Arc::new(AtomicUsize::new(0));
+    processor
+        .send_notification_to_authorized_thread_subscribers(
+            THREAD_ID,
+            "test/retired-snapshot",
+            &NotificationSerializationProbe {
+                serializations: serializations.clone(),
+                on_serialize: || {},
+            },
+            vec![original_subscriber],
+        )
+        .await;
+    assert_eq!(serializations.load(Ordering::SeqCst), 0);
+    assert!(replacement_rx.try_recv().is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -38752,24 +39190,35 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
     )
     .await;
 
-    let mut child_dispatched = false;
-    for _ in 0..200 {
-        let batch =
-            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
-                .await
-                .expect("direct Agent outbox dispatch should succeed");
-        assert!(
-            batch.errors.is_empty(),
-            "direct Agent outbox storage should succeed: {:?}",
-            batch.errors
+    // Thread creation can be the first delivered outbox row. Keep driving the
+    // real dispatcher while the parent prepares and commits the child start.
+    let opened = timeout(Duration::from_secs(30), async {
+        let permission = recv_notification_by_method_timeout(
+            &mut rx,
+            events::TURN_PERMISSION_REQUEST_OPENED,
+            Duration::from_secs(30),
         );
-        if batch.delivered > 0 {
-            child_dispatched = true;
-            break;
+        tokio::pin!(permission);
+        loop {
+            tokio::select! {
+                opened = &mut permission => break opened,
+                _ = sleep(Duration::from_millis(25)) => {
+                    let batch = crate::message::agent_action_tools::process_due_agent_action_outbox(
+                        &processor, 64,
+                    )
+                    .await
+                    .expect("direct Agent outbox dispatch should succeed");
+                    assert!(
+                        batch.errors.is_empty(),
+                        "direct Agent outbox storage should succeed: {:?}",
+                        batch.errors
+                    );
+                }
+            }
         }
-        sleep(Duration::from_millis(25)).await;
-    }
-    if !child_dispatched {
+    })
+    .await;
+    if opened.is_err() {
         let db = crud_store.database_connection();
         let outbox_rows = pioneer_entity::agent_action_outbox::Entity::find()
             .all(&db)
@@ -38807,11 +39256,12 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
             .await
             .expect("direct Agent root events should load");
         panic!(
-            "direct Agent child must be activated through its durable outbox; provider_rounds={:?}; root_turn={root_turn:#?}; root_events={root_events:#?}",
+            "direct Agent child must request permission after durable outbox dispatch; provider_rounds={:?}; root_turn={root_turn:#?}; root_events={root_events:#?}",
             provider.rounds()
         );
     }
-    let opened = recv_notification_by_method(&mut rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+    let opened =
+        opened.expect("direct Agent child must request permission within the launch budget");
     let opened_request = opened
         .params
         .as_ref()

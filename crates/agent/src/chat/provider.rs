@@ -1404,17 +1404,21 @@ fn adapter_error_for_target(
     prefix: &str,
     error: &anyhow::Error,
 ) -> ChatTurnError {
-    let mut classification = if let Some(http_error) =
-        error.downcast_ref::<pioneer_provider::ProviderHttpErrorBodyTooLarge>()
-    {
-        Some(classify_http_error_body_too_large(http_error.status))
-    } else if error.downcast_ref::<ProviderResponseTooLarge>().is_some() {
-        Some(ProviderFailureClassification::new(
-            ProviderFailureClass::ProviderRejected,
-        ))
-    } else {
-        provider.classify_failure(error)
-    };
+    // Adapter facts can include request/retry metadata even for bounded-body
+    // failures. Use the size-only fallback only when no typed facts exist.
+    let mut classification = provider.classify_failure(error).or_else(|| {
+        if let Some(http_error) =
+            error.downcast_ref::<pioneer_provider::ProviderHttpErrorBodyTooLarge>()
+        {
+            Some(classify_http_error_body_too_large(http_error.status))
+        } else if error.downcast_ref::<ProviderResponseTooLarge>().is_some() {
+            Some(ProviderFailureClassification::new(
+                ProviderFailureClass::ProviderRejected,
+            ))
+        } else {
+            None
+        }
+    });
     if let Some(id) = pioneer_provider::usage::error_usage(error)
         .and_then(|usage| usage.request_id.clone())
         .and_then(|id| pioneer_protocol::ProviderRequestId::try_from(id).ok())
@@ -1837,7 +1841,9 @@ fn infer_failure_classification(
         error_reason: None,
         request_id: None,
         class: classify_provider_failure_message(message, stage),
-        http_status: extract_http_status(message),
+        // Message text can classify legacy failures, but cannot prove that an
+        // HTTP response was received (or establish its numeric status).
+        http_status: None,
         provider_code: extract_provider_code(message),
         retry_after_ms: extract_retry_after_ms(&message.to_ascii_lowercase()),
     }
@@ -2078,12 +2084,12 @@ mod tests {
             assert_eq!(after.provider_code, before.provider_code);
             assert_eq!(after.retry_after_ms, before.retry_after_ms);
             if message.starts_with("OpenRouter API error 429") {
-                assert_eq!(after.http_status, Some(429));
+                assert_eq!(after.http_status, None);
                 assert_eq!(after.provider_code.as_deref(), Some("rate_limit_exceeded"));
                 assert_eq!(after.retry_after_ms, Some(2000));
             }
             if message.starts_with("OpenRouter API error 503") {
-                assert_eq!(after.http_status, Some(503));
+                assert_eq!(after.http_status, None);
             }
             assert_eq!(after.is_recoverable_hint, before.is_recoverable_hint);
             assert_eq!(after.stage, before.stage);
@@ -2277,6 +2283,7 @@ mod tests {
     ) -> ProviderFailureDetails {
         failure_from_local_response(
             provider_name,
+            "fixture",
             status,
             message,
             stream_request,
@@ -2290,6 +2297,7 @@ mod tests {
 
     async fn failure_from_local_response(
         provider_name: &'static str,
+        model: &'static str,
         status: u16,
         message: &'static str,
         stream_request: bool,
@@ -2302,6 +2310,7 @@ mod tests {
             std::time::Duration::from_secs(10),
             failure_from_local_response_inner(
                 provider_name,
+                model,
                 status,
                 message,
                 stream_request,
@@ -2321,6 +2330,7 @@ mod tests {
 
     async fn failure_from_local_response_inner(
         provider_name: &'static str,
+        model: &'static str,
         status: u16,
         message: &'static str,
         stream_request: bool,
@@ -2404,7 +2414,7 @@ mod tests {
             .unwrap()
         };
         let request = ChatRequest {
-            model: "fixture".into(),
+            model: model.into(),
             messages: vec![pioneer_provider::ChatMessage::user("hello")],
             temperature: None,
             max_tokens: None,
@@ -2452,10 +2462,11 @@ mod tests {
                 .chain()
                 .any(|cause| format!("{cause:?}").contains(secret))
         );
+        let error = error.context("provider call context");
         let ChatTurnError::ProviderFailure { failure, .. } = adapter_error_for_target(
             FailureTarget::new("item", TurnItemType::Reasoning),
             provider.as_ref(),
-            "fixture",
+            model,
             if stream_request {
                 ProviderTransportKind::Stream
             } else {
@@ -2695,6 +2706,7 @@ mod tests {
             ] {
                 let failure = failure_from_local_response(
                     "openrouter",
+                    "fixture",
                     502,
                     "",
                     false,
@@ -2735,6 +2747,7 @@ mod tests {
             ] {
                 let failure = failure_from_local_response(
                     "openrouter",
+                    "fixture",
                     200,
                     "",
                     false,
@@ -2801,7 +2814,7 @@ mod tests {
                 )
                 .await;
                 assert_eq!(failure.class, ProviderFailureClass::Provider5xx);
-                assert_eq!(failure.http_status, Some(502));
+                assert_eq!(failure.http_status, None);
                 assert_eq!(
                     failure
                         .request_id
@@ -2827,7 +2840,7 @@ mod tests {
             }
         }
         let choice_error = serde_json::json!({"id":"gen-fixture", "choices":[{"error":{
-            "code":502,"metadata":{"error_type":"provider_unavailable"}
+            "code":403,"metadata":{"error_type":"provider_unavailable"}
         }}]})
         .to_string();
         for stream in [false, true] {
@@ -2842,11 +2855,21 @@ mod tests {
                 "",
                 stream,
                 Some(body),
-                false,
+                true,
                 "",
                 false,
             )
             .await;
+            assert_eq!(failure.class, ProviderFailureClass::AuthOrPermission);
+            assert_eq!(failure.http_status, None);
+            assert_eq!(
+                RecoveryDiagnostic::provider(&failure)
+                    .last_failure
+                    .as_ref()
+                    .unwrap()
+                    .http_status,
+                None
+            );
             assert_eq!(
                 RecoveryDiagnostic::provider(&failure)
                     .last_failure
@@ -2988,7 +3011,7 @@ mod tests {
                 )
                 .await;
                 assert_eq!(failure.class, ProviderFailureClass::Provider5xx);
-                assert_eq!(failure.http_status, Some(502));
+                assert_eq!(failure.http_status, (!stream).then_some(502));
                 assert_eq!(failure.retry_after_ms, Some(2000));
                 assert_eq!(
                     failure.stage,
@@ -3031,6 +3054,138 @@ mod tests {
                     assert!(!safe.contains(secret));
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_http_facts_survive_error_body_failures_to_recovery_details() {
+        use pioneer_protocol::RecoveryDiagnostic;
+        // One representative per distinct adapter; vllm uses the shared Chat
+        // compatible path, and deepseek delegates classification to that path.
+        for (provider, model) in [
+            ("openai", "gpt-audio"),
+            ("anthropic", "fixture"),
+            ("gemini", "fixture"),
+            ("glm", "fixture"),
+            ("copilot", "fixture"),
+            ("telnyx", "fixture"),
+            ("ollama", "fixture"),
+            ("vllm", "fixture"),
+            ("deepseek", "fixture"),
+        ] {
+            for stream in [false, true] {
+                for (status, body, truncated, class) in [
+                    (
+                        408,
+                        b"private_fixture".to_vec(),
+                        true,
+                        ProviderFailureClass::NetworkTransient,
+                    ),
+                    (
+                        408,
+                        b"private_fixture".to_vec(),
+                        false,
+                        ProviderFailureClass::Unknown,
+                    ),
+                    (408, vec![0xff], false, ProviderFailureClass::Unknown),
+                    (
+                        403,
+                        b"private_fixture forbidden".to_vec(),
+                        false,
+                        ProviderFailureClass::AuthOrPermission,
+                    ),
+                    (
+                        403,
+                        b"private_fixture".to_vec(),
+                        true,
+                        ProviderFailureClass::AuthOrPermission,
+                    ),
+                    (
+                        403,
+                        vec![0xff],
+                        false,
+                        ProviderFailureClass::AuthOrPermission,
+                    ),
+                    (
+                        403,
+                        vec![b'x'; 16 * 1024 + 1],
+                        false,
+                        ProviderFailureClass::ProviderRejected,
+                    ),
+                    (
+                        503,
+                        b"private_fixture body mentions 403".to_vec(),
+                        true,
+                        ProviderFailureClass::Provider5xx,
+                    ),
+                    (
+                        429,
+                        b"private_fixture body mentions 403".to_vec(),
+                        false,
+                        ProviderFailureClass::RateLimit,
+                    ),
+                ] {
+                    // Shared semantics are owned by the OpenAI / compatible
+                    // rows; other rows protect their adapter wiring only.
+                    if !matches!(provider, "openai" | "vllm") && !(status == 403 && truncated) {
+                        continue;
+                    }
+                    let failure = failure_from_local_response(
+                        provider,
+                        model,
+                        status,
+                        "",
+                        stream,
+                        Some(body),
+                        true,
+                        "Retry-After: 7\r\n",
+                        truncated,
+                    )
+                    .await;
+                    assert_eq!(failure.http_status, Some(status), "{provider}");
+                    assert_eq!(failure.class, class, "{provider}");
+                    assert_eq!(failure.stage, ProviderFailureStage::Connect);
+                    assert_eq!(failure.retry_after_ms, Some(7000));
+                    let last = RecoveryDiagnostic::provider(&failure).last_failure.unwrap();
+                    assert_eq!(last.http_status, Some(status));
+                    assert_eq!(last.retry_after_ms, Some(7000));
+                    if status == 408 {
+                        // Only a real body-read network failure restores the
+                        // old retry hint; complete/local decode failures do not.
+                        assert_eq!(failure.is_recoverable_hint, truncated);
+                        assert_eq!(last.class, class);
+                        assert_eq!(last.stage, ProviderFailureStage::Connect);
+                    }
+                    assert!(
+                        !serde_json::to_string(&failure)
+                            .unwrap()
+                            .contains("private_fixture")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_and_native_403_text_cannot_invent_http_response_facts() {
+        let provider = pioneer_provider::providers::OpenAiProvider::new("fixture");
+        for error in [
+            anyhow::anyhow!("connection reset by peer; local diagnostic 403"),
+            anyhow::Error::from(pioneer_provider::failure::AnthropicStreamError::Permission)
+                .context("HTTP 200 stream event mentions 403"),
+        ] {
+            let ChatTurnError::ProviderFailure { failure, .. } = adapter_error_for_target(
+                FailureTarget::new("item", TurnItemType::Reasoning),
+                &provider,
+                "fixture",
+                ProviderTransportKind::Stream,
+                ProviderFailureStage::MidStream,
+                "provider error",
+                &error,
+            ) else {
+                panic!("expected provider failure")
+            };
+            assert_eq!(failure.http_status, None);
         }
     }
 
@@ -3466,14 +3621,13 @@ mod tests {
     }
 
     #[test]
-    fn raw_provider_http_failures_keep_class_status_and_recoverability() {
-        for (model, stage, error, class, status, recoverable) in [
+    fn message_only_provider_failures_keep_class_without_inventing_http_status() {
+        for (model, stage, error, class, recoverable) in [
             (
                 "deepseek/deepseek-v4-flash",
                 ProviderFailureStage::Connect,
                 r#"provider stream error: OpenRouter API error (404 Not Found): {"error":{"message":"No endpoints found that support image input","code":404}}"#,
                 ProviderFailureClass::UnsupportedImageInput,
-                404,
                 true,
             ),
             (
@@ -3481,7 +3635,6 @@ mod tests {
                 ProviderFailureStage::MidStream,
                 r#"provider stream error: API error (400 Bad Request): {"error":{"message":"bad request","code":400}}"#,
                 ProviderFailureClass::ProviderRejected,
-                400,
                 false,
             ),
         ] {
@@ -3497,7 +3650,7 @@ mod tests {
                 panic!("expected provider failure");
             };
             assert_eq!(failure.class, class);
-            assert_eq!(failure.http_status, Some(status));
+            assert_eq!(failure.http_status, None);
             assert_eq!(failure.is_recoverable_hint, recoverable);
         }
     }

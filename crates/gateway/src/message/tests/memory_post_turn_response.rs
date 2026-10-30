@@ -6,7 +6,7 @@ use pioneer_memory::hooks::{
     MemoryDurableTerminalEffectClaim, MemoryManifest, MemoryManifestRequest,
     MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest, MemoryTurnContext,
 };
-use pioneer_provider::ProviderTermination;
+use pioneer_provider::{ProviderFailureClassification, ProviderTermination};
 use sea_orm::EntityTrait;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,6 +20,36 @@ struct ResponseProvider {
     calls: AtomicUsize,
     streams: std::sync::Mutex<Option<VecDeque<Vec<StreamChunk>>>>,
     revoke: std::sync::Mutex<Option<(Arc<CrudStore>, String, String, i64)>>,
+    failures: std::sync::Mutex<VecDeque<ScriptedProviderFailure>>,
+}
+
+#[derive(Debug)]
+struct ScriptedProviderFailure(ProviderFailureDetails);
+
+impl std::fmt::Display for ScriptedProviderFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately contradict the transport status: diagnostics are not policy.
+        f.write_str("HTTP 401 private diagnostic, retryable=false")
+    }
+}
+
+impl std::error::Error for ScriptedProviderFailure {}
+
+fn http_403_failure(class: ProviderFailureClass) -> ScriptedProviderFailure {
+    ScriptedProviderFailure(ProviderFailureDetails {
+        provider: "openai".into(),
+        model: "test-model".into(),
+        class,
+        stage: ProviderFailureStage::Connect,
+        transport: ProviderTransportKind::NonStream,
+        http_status: Some(403),
+        retry_after_ms: Some(30_001),
+        is_recoverable_hint: false,
+        error_reason: None,
+        request_id: None,
+        provider_code: None,
+        message: None,
+    })
 }
 
 impl ResponseProvider {
@@ -29,6 +59,7 @@ impl ResponseProvider {
             calls: AtomicUsize::new(0),
             streams: std::sync::Mutex::new(None),
             revoke: std::sync::Mutex::new(None),
+            failures: std::sync::Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -44,11 +75,24 @@ impl Provider for ResponseProvider {
             ..Default::default()
         }
     }
+    fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+        let Some(failure) = error.downcast_ref::<ScriptedProviderFailure>() else {
+            return pioneer_provider::failure::classify_stream_error(error);
+        };
+        let failure = &failure.0;
+        let mut classification = ProviderFailureClassification::new(failure.class);
+        classification.http_status = failure.http_status;
+        classification.retry_after_ms = failure.retry_after_ms;
+        Some(classification)
+    }
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         if is_memory_post_turn_extractor_request(&request) {
             assert!(request.tools.is_none());
             assert!(request.max_tokens.is_none());
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(failure) = self.failures.lock().unwrap().pop_front() {
+                return Err(failure.into());
+            }
             let revoke = self.revoke.lock().unwrap().take();
             if let Some((store, effect, token, now)) = revoke {
                 store
@@ -101,6 +145,7 @@ struct Fixture {
     provider: Arc<ResponseProvider>,
     effect_id: String,
     now: i64,
+    preparation: pioneer_protocol::NativeTerminalEffectPreparation,
 }
 
 async fn fixture(replies: Vec<ChatResponse>) -> Fixture {
@@ -122,7 +167,29 @@ async fn fixture_with_registry(
     provider_name: &str,
     fail_write: bool,
 ) -> Fixture {
-    let harness = setup_memory_agent_e2e_harness("response_validation", registry).await;
+    fixture_on_workspace(provider, registry, provider_name, fail_write, None, Some(3)).await
+}
+
+async fn fixture_on_workspace(
+    provider: Arc<ResponseProvider>,
+    registry: Arc<pioneer_provider::ProviderRegistry>,
+    provider_name: &str,
+    fail_write: bool,
+    workspace: Option<(Arc<WorkspaceManager>, Arc<CrudStore>, String)>,
+    max_attempts: Option<u16>,
+) -> Fixture {
+    let harness = match workspace {
+        Some(workspace) => {
+            setup_memory_agent_e2e_harness_on_workspace(
+                "response_validation",
+                registry,
+                test_tool_loop_config(),
+                workspace,
+            )
+            .await
+        }
+        None => setup_memory_agent_e2e_harness("response_validation", registry).await,
+    };
     if fail_write {
         let bridge = Arc::new(GatewayMemoryProvider::new(Arc::downgrade(
             &harness.processor,
@@ -192,12 +259,15 @@ async fn fixture_with_registry(
         .await
         .unwrap()
         .unwrap();
-    preparation.effects[0].max_attempts = 3;
+    assert_eq!(preparation.effects[0].max_attempts, 8);
+    if let Some(max_attempts) = max_attempts {
+        preparation.effects[0].max_attempts = max_attempts;
+    }
     let effect_id = preparation.effects[0].effect_id.clone();
     let now = now_timestamp_secs();
     harness
         .crud_store
-        .prepare_native_terminal_effects(preparation, now)
+        .prepare_native_terminal_effects(preparation.clone(), now)
         .await
         .unwrap();
     let (_, mut turn) = harness
@@ -224,6 +294,7 @@ async fn fixture_with_registry(
         provider,
         effect_id,
         now,
+        preparation,
     }
 }
 
@@ -325,35 +396,58 @@ fn valid_fact() -> String {
 }
 
 #[test]
-fn memory_response_invalid_then_valid_durable_attempt() {
+fn memory_response_invalid_or_http_403_then_valid_durable_attempt() {
     run_gateway_message_test("memory_response_invalid_then_valid", || async {
-        for raw in [
-            format!("{{\"facts\":{CANARY}}}"),
-            format!("{{\"facts\":\"{CANARY}\"}}"),
+        for (raw, failure_class) in [
+            (Some(format!("{{\"facts\":{CANARY}}}")), None),
+            (Some(format!("{{\"facts\":\"{CANARY}\"}}")), None),
+            (None, Some(ProviderFailureClass::AuthOrPermission)),
+            (None, Some(ProviderFailureClass::Unknown)),
         ] {
-            let f = fixture_with_write_failure(
-                vec![text_response(raw), text_response(valid_fact())],
-                true,
-            )
-            .await;
+            let mut replies = Vec::new();
+            if let Some(raw) = raw {
+                replies.push(text_response(raw));
+            }
+            replies.push(text_response(valid_fact()));
+            let f = fixture_with_write_failure(replies, true).await;
+            if let Some(class) = failure_class {
+                f.provider
+                    .failures
+                    .lock()
+                    .unwrap()
+                    .push_back(http_403_failure(class));
+            }
             f.attempt().await;
             let first = f.row().await;
             assert_eq!(first.status, "retry_wait");
             assert!(first.handler_checkpoint_json.is_none());
             assert_eq!(
                 first.last_error_code.as_deref(),
-                Some("memory.post_turn_extractor.fresh_response_invalid")
+                Some(if failure_class.is_some() {
+                    "memory.post_turn_extractor.provider_http_403"
+                } else {
+                    "memory.post_turn_extractor.fresh_response_invalid"
+                })
             );
             let message = first.last_error_message.unwrap();
             assert!(!message.contains(CANARY));
-            for field in [
-                "provider=openai",
-                "model=test-model",
-                "failure_stage=fresh_response_validation",
-                "failure_class=",
-                "termination=complete",
-                "parse_category=",
-            ] {
+            let fields = if failure_class.is_some() {
+                vec![
+                    "failure_stage=provider_non_stream_response",
+                    "failure_class=",
+                ]
+            } else {
+                vec![
+                    "failure_stage=fresh_response_validation",
+                    "failure_class=",
+                    "termination=complete",
+                    "parse_category=",
+                ]
+            };
+            for field in ["provider=openai", "model=test-model"]
+                .into_iter()
+                .chain(fields)
+            {
                 assert!(message.contains(field), "{message}");
             }
             f.no_memory().await;
@@ -364,7 +458,11 @@ fn memory_response_invalid_then_valid_durable_attempt() {
             let checkpoint = row.handler_checkpoint_json.unwrap();
             assert!(checkpoint.contains("raw_json"));
             f.attempt().await;
-            assert_eq!(f.row().await.status, "succeeded");
+            let completed = f.row().await;
+            assert_eq!(completed.status, "succeeded");
+            assert_eq!(completed.attempt_count, 3);
+            // Successful terminalization compacts the consumed checkpoint.
+            assert!(completed.handler_checkpoint_json.is_none());
             assert_eq!(f.provider.calls.load(Ordering::SeqCst), 2);
             let records = f
                 .harness
@@ -376,8 +474,262 @@ fn memory_response_invalid_then_valid_durable_attempt() {
                 .await
                 .unwrap();
             assert_eq!(records.len(), 1);
+            let runs = f
+                .harness
+                .crud_store
+                .list_hook_runs_for_turn(TURN, Some(HookPhase::TurnPostTurn), 20)
+                .await
+                .unwrap();
+            let extractor_runs: Vec<_> = runs
+                .iter()
+                .filter(|run| run.hook_id.as_str() == "memory.post_turn_extractor")
+                .collect();
+            assert_eq!(
+                extractor_runs.len(),
+                1,
+                "retries retain the same occurrence"
+            );
+            assert_eq!(
+                f.harness
+                    .crud_store
+                    .list_hook_run_attempts(&extractor_runs[0].id)
+                    .await
+                    .unwrap()
+                    .len(),
+                3
+            );
             let _ = std::fs::remove_dir_all(&f.harness.runtime_home);
         }
+    });
+}
+
+#[test]
+fn memory_http_403_exhausts_original_eight_attempts_across_database_restart() {
+    run_gateway_message_test("memory_http_403_budget", || async {
+        use sea_orm::ConnectOptions;
+        let (directory, manager, store, workspace) = setup_pooled_file_workspace_manager().await;
+        let provider = Arc::new(ResponseProvider::new(vec![]));
+        provider
+            .failures
+            .lock()
+            .unwrap()
+            .extend((0..8).map(|index| {
+                http_403_failure(if index % 2 == 0 {
+                    ProviderFailureClass::AuthOrPermission
+                } else {
+                    ProviderFailureClass::Unknown
+                })
+            }));
+        let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            provider.clone(),
+        ));
+        let f = fixture_on_workspace(
+            provider.clone(),
+            registry,
+            "openai",
+            false,
+            Some((manager, store, workspace)),
+            None,
+        )
+        .await;
+        let database = f
+            .harness
+            .crud_store
+            .with_maintenance_access()
+            .database_connection();
+        assert_eq!(
+            database.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        assert_eq!(
+            database.write_class(),
+            pioneer_sqlite::SqliteWriteClass::Maintenance
+        );
+        assert_eq!(database.writer_max_connections(), 1);
+        assert!(database.reader_query_only_enabled().await.unwrap());
+        let delays = [31, 31, 120, 600, 1_800, 7_200, 21_600];
+        for attempt in 1..=8 {
+            f.attempt().await;
+            let row = f.row().await;
+            assert_eq!(row.attempt_count, attempt);
+            assert_eq!(row.max_attempts, 8);
+            assert_eq!(
+                provider.calls.load(Ordering::SeqCst),
+                attempt as usize,
+                "each durable attempt makes exactly one extractor request"
+            );
+            assert_eq!(
+                row.last_error_code.as_deref(),
+                Some("memory.post_turn_extractor.provider_http_403")
+            );
+            assert!(row.handler_checkpoint_json.is_none());
+            assert!(
+                !row.last_error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("private diagnostic")
+            );
+            if attempt < 8 {
+                assert_eq!(row.status, "retry_wait");
+                let due = row.next_run_at.unwrap().timestamp();
+                assert_eq!(
+                    due - row.updated_at.timestamp(),
+                    delays[(attempt - 1) as usize]
+                );
+                assert_eq!(
+                    f.harness
+                        .processor
+                        .process_due_native_terminal_effects(due - 1, 1)
+                        .await
+                        .unwrap()
+                        .count,
+                    0,
+                    "cooldown/backoff must delay admission"
+                );
+            } else {
+                assert_eq!(row.status, "unresolved");
+                assert!(row.next_run_at.is_none());
+            }
+        }
+        f.no_memory().await;
+        let exhausted = f.row().await;
+        let scan_at = exhausted.completed_at.unwrap().timestamp() + 3_602;
+        assert!(exhausted.prepared_at.timestamp() >= scan_at - 86_400);
+        let runs = f
+            .harness
+            .crud_store
+            .list_hook_runs_for_turn(TURN, Some(HookPhase::TurnPostTurn), 20)
+            .await
+            .unwrap();
+        let extractor_runs: Vec<_> = runs
+            .iter()
+            .filter(|run| run.hook_id.as_str() == "memory.post_turn_extractor")
+            .collect();
+        assert_eq!(extractor_runs.len(), 1);
+        let run_id = extractor_runs[0].id.clone();
+        assert_eq!(
+            f.harness
+                .crud_store
+                .list_hook_run_attempts(&run_id)
+                .await
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(
+            f.harness
+                .crud_store
+                .requeue_retryable_unresolved_native_terminal_effects(scan_at, 10)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            f.harness
+                .processor
+                .process_due_native_terminal_effects(scan_at, 10)
+                .await
+                .unwrap()
+                .count,
+            0
+        );
+        let effect_id = f.effect_id.clone();
+        let preparation = f.preparation.clone();
+        let runtime_home = f.harness.runtime_home.clone();
+        drop(f);
+        database.close().await.unwrap();
+
+        // Reopen the actual file with the existing Gateway reader/writer contour.
+        let url = format!(
+            "sqlite://{}?mode=rw",
+            directory.path().join("gateway.sqlite").display()
+        );
+        let mut writer_options = ConnectOptions::new(url.clone());
+        writer_options.max_connections(1).sqlx_logging(false);
+        let mut reader_options = ConnectOptions::new(url);
+        reader_options
+            .max_connections(1)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
+        let writer = Database::connect(writer_options).await.unwrap();
+        let reader = Database::connect(reader_options).await.unwrap();
+        let database = pioneer_sqlite::SqliteDatabase::new(reader, writer).maintenance();
+        let restarted = CrudStore::new(database.clone());
+        // Reconciliation/repeated preparation of the same terminal input is idempotent.
+        restarted
+            .prepare_native_terminal_effects(preparation, scan_at)
+            .await
+            .unwrap();
+        restarted
+            .reconcile_prepared_turn_finalizations(10, scan_at)
+            .await
+            .unwrap();
+        for now in [scan_at, scan_at + 3_602, scan_at + 172_800] {
+            assert_eq!(
+                restarted
+                    .requeue_retryable_unresolved_native_terminal_effects(now, 10)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert!(
+                restarted
+                    .claim_due_native_terminal_effects_at(now, 90, 10)
+                    .await
+                    .unwrap()
+                    .records
+                    .is_empty()
+            );
+            assert!(
+                restarted
+                    .list_recoverable_hook_runs(pioneer_hooks::HookRecoveryScan {
+                        now_unix_ms: now * 1_000,
+                        batch_size: 10,
+                        stale_running_after_ms: 90_000,
+                        phases: Some(vec![HookPhase::TurnPostTurn]),
+                    })
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "generic hook recovery must not become a second retry owner"
+            );
+        }
+        let persisted = restarted
+            .native_terminal_effect_status(&effect_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, "unresolved");
+        assert_eq!(persisted.attempt_count, 8);
+        assert_eq!(persisted.max_attempts, 8);
+        assert_eq!(
+            persisted.last_error_code.as_deref(),
+            Some("memory.post_turn_extractor.provider_http_403")
+        );
+        let runs = restarted
+            .list_hook_runs_for_turn(TURN, Some(HookPhase::TurnPostTurn), 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            runs.iter()
+                .filter(|run| run.hook_id.as_str() == "memory.post_turn_extractor")
+                .map(|run| &run.id)
+                .collect::<Vec<_>>(),
+            vec![&run_id]
+        );
+        assert_eq!(
+            restarted
+                .list_hook_run_attempts(&run_id)
+                .await
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 8);
+        drop(restarted);
+        database.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(runtime_home);
     });
 }
 
@@ -563,6 +915,19 @@ fn memory_response_stale_claim_cannot_publish_checkpoint_or_memory() {
             .records
             .pop()
             .unwrap();
+        let checkpoint = json!({"schema_version": 1, "raw_json": "{\"facts\":[]}",
+            "model": "test-model", "model_provider": "openai"})
+        .to_string();
+        f.harness
+            .crud_store
+            .store_native_terminal_effect_handler_checkpoint(
+                &f.effect_id,
+                &current.claim_token,
+                &checkpoint,
+                f.now + 2,
+            )
+            .await
+            .unwrap();
         let bridge = GatewayMemoryProvider::new(Arc::downgrade(&f.harness.processor));
         let context = MemoryPostTurnExtractorContext {
             workspace_id: f.harness.workspace_id.clone(),
@@ -605,12 +970,42 @@ fn memory_response_stale_claim_cannot_publish_checkpoint_or_memory() {
                 .is_err()
         );
         assert!(
+            !f.harness
+                .crud_store
+                .complete_native_terminal_effect(&f.effect_id, &old.claim_token, f.now + 2,)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !f.harness
+                .crud_store
+                .fail_native_terminal_effect(
+                    &f.effect_id,
+                    &old.claim_token,
+                    "memory.post_turn_extractor.provider_http_403",
+                    "late HTTP failure",
+                    true,
+                    f.now + 3,
+                    f.now + 2,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
             f.harness
                 .crud_store
                 .native_terminal_effect_handler_checkpoint(&f.effect_id, &current.claim_token)
                 .await
                 .unwrap()
-                .is_none()
+                .as_deref(),
+            Some(checkpoint.as_str())
+        );
+        let row = f.row().await;
+        assert_eq!(row.status, "running");
+        assert_eq!(row.attempt_count, 2);
+        assert_eq!(
+            row.claim_token.as_deref(),
+            Some(current.claim_token.as_str())
         );
         assert_eq!(f.provider.calls.load(Ordering::SeqCst), 0);
         f.no_memory().await;

@@ -1909,7 +1909,7 @@ mod tests {
                     turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id\
                  ) VALUES(\
                     'U0000000000000000000A','T0000000000000000000A','completed','{}',\
-                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'chat','user','principal',\
+                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'conversation','user','principal',\
                     'P0000000000000000000A'),(\
                     'U0000000000000000000I','T0000000000000000000I','completed','{}',\
                     CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'agent','task','system',NULL\
