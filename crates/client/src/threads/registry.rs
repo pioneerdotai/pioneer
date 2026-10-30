@@ -1609,6 +1609,28 @@ impl ClientCore {
             &mut state,
             update.clone(),
         );
+        // Accepted whole-range removal ends the existing targeted lifetime.
+        // Reauthorization may admit a fresh generation, never revive its aggregate.
+        // Read authority from the actual reducer result, not notification revisions.
+        let retired = state
+            .registry
+            .timeline
+            .in_flight
+            .iter()
+            .filter(|key| {
+                let SemanticTimelineRequestKey::TurnWorkItems { thread_id, turn_id } = key else {
+                    return false;
+                };
+                thread_id == id
+                    && !crate::timeline::semantic::accepts_turn_work_items_change(
+                        &state, thread_id, turn_id,
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in &retired {
+            state.registry.timeline.reject_admission(key);
+        }
         // Read intent survives a duplicate invalidation, but only for IDs accepted
         // into the stale sets by the semantic reducer (including tombstone fences).
         let requests = thread_reconcile_actions(&state, &update);
@@ -1619,6 +1641,9 @@ impl ClientCore {
             && store.demand == ClientDemand::Visible
             && state.registry.timeline.rearm_exhausted_refresh(id);
         drop(state);
+        if !retired.is_empty() {
+            self.retire_thread_controller_jobs();
+        }
         if rearmed {
             // Preserve the wake even when admission below returns no request.
             self.wake_thread_timeline_requests();
@@ -9439,11 +9464,12 @@ mod tests {
 
     #[test]
     fn work_chunks_preserve_aggregate_failure_capacity_and_live_authority_between_quanta() {
-        struct Transport {
+        struct Transport<'a> {
             replies: std::cell::RefCell<Vec<Result<TurnWorkItemsGetResponse, String>>>,
             calls: std::cell::Cell<usize>,
+            before_last_reply: Option<Box<dyn Fn() + 'a>>,
         }
-        impl crate::rpc::JsonRpcRequestTransport for Transport {
+        impl crate::rpc::JsonRpcRequestTransport for Transport<'_> {
             fn send_json_rpc_request(
                 &self,
                 _: String,
@@ -9452,6 +9478,11 @@ mod tests {
             ) -> Result<(), String> {
                 self.calls.set(self.calls.get() + 1);
                 let page = self.replies.borrow_mut().remove(0)?;
+                if self.calls.get() == 2
+                    && let Some(callback) = &self.before_last_reply
+                {
+                    callback();
+                }
                 response
                     .send(Ok(serde_json::to_value(page).unwrap()))
                     .unwrap();
@@ -9476,6 +9507,7 @@ mod tests {
             "absent-tombstone-dispatch",
             "absent-tombstone-cancel",
             "absent-tombstone-reauthorized",
+            "absent-tombstone-inflight-reauthorized",
             "absent-tombstone-replace",
         ] {
             let core = core();
@@ -9496,6 +9528,7 @@ mod tests {
             };
             let absent = outcome.starts_with("absent");
             let tombstoned = outcome.starts_with("absent-tombstone");
+            let in_flight_reauthorization = outcome == "absent-tombstone-inflight-reauthorized";
             core.apply_turn_work_items_get_response(page(if absent {
                 vec![]
             } else {
@@ -9535,7 +9568,7 @@ mod tests {
             peer.work_item_id = "item-99".into();
             peer.item_id = "peer-source".into();
             peer.turn_id = "turn".into();
-            let second = if matches!(outcome, "rpc" | "absent-tombstone-rpc") {
+            let mut second = if matches!(outcome, "rpc" | "absent-tombstone-rpc") {
                 Err("late chunk failure".into())
             } else if outcome == "capacity" {
                 Ok(page(vec![incoming.clone()]))
@@ -9546,10 +9579,122 @@ mod tests {
                     vec![]
                 }))
             };
+            if in_flight_reauthorization && let Ok(page) = &mut second {
+                page.source_high_watermark = 32;
+                page.projection_updated_at_unix_micros = 32_000;
+            }
+            let remove_range = || {
+                let GatewayNotification::ThreadTimelineBlocksChanged(mut notification) =
+                    reconciliation_notification(&[])
+                else {
+                    unreachable!()
+                };
+                notification.removed_block_ids = vec!["turn:turn:work".into()];
+                notification.turn_work_tombstones = vec![pioneer_protocol::TurnWorkTombstone {
+                    turn_id: "turn".into(),
+                    block_id: "turn:turn:work".into(),
+                    source_high_watermark: 30,
+                    projection_updated_at_unix_micros: 30_000,
+                }];
+                assert!(core.apply_thread_semantic_live_update(
+                    crate::timeline::semantic::SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification)
+                ));
+                assert!(
+                    core.thread_semantic_snapshot("a")
+                        .thread("a")
+                        .unwrap()
+                        .work_range("turn")
+                        .is_none()
+                );
+                assert!(
+                    core.begin_thread_semantic_request(
+                        SemanticTimelineRequestAction::TurnWorkItemsGet {
+                            key: key.clone(),
+                            params: TurnWorkItemsGetParams {
+                                thread_id: "a".into(),
+                                turn_id: "turn".into(),
+                                work_item_ids: vec!["blocked-required".into()],
+                            },
+                        }
+                    )
+                    .is_err(),
+                    "admission behind current authority barrier must refuse whole action"
+                );
+            };
+            let reauthorize = || {
+                let mut work = run_work();
+                work.turn_id = "turn".into();
+                assert!(core.apply_thread_semantic_live_update(
+                    crate::timeline::semantic::SemanticTimelineLiveUpdate::TurnWorkStateChanged(
+                        pioneer_protocol::TurnWorkStateChangedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn_id: "turn".into(),
+                            source_high_watermark: 31,
+                            projection_updated_at_unix_micros: 31_000,
+                            work,
+                            reason: TimelineChangeReason::LiveEvent,
+                        }
+                    )
+                ));
+            };
+            let fresh_request = std::cell::RefCell::new(None);
+            let fresh_loading = std::cell::RefCell::new(None);
+            let late_old = in_flight_reauthorization.then(|| ThreadSemanticRequest {
+                id: request.id.clone(),
+                generation: request.generation,
+                request_generation: request.request_generation,
+                explicit_intent: request.explicit_intent,
+                recovery: request.recovery,
+                action: request.action.clone(),
+                reconciliation: None,
+                work_items: WorkItemsContinuation::default(),
+            });
             let transport = Transport {
                 replies: std::cell::RefCell::new(vec![Ok(page(vec![incoming.clone()])), second]),
                 calls: std::cell::Cell::new(0),
+                before_last_reply: in_flight_reauthorization.then(|| {
+                    Box::new(|| {
+                        remove_range();
+                        reauthorize();
+                        let next = core
+                            .begin_thread_semantic_request(
+                                SemanticTimelineRequestAction::TurnWorkItemsGet {
+                                    key: key.clone(),
+                                    params: TurnWorkItemsGetParams {
+                                        thread_id: "a".into(),
+                                        turn_id: "turn".into(),
+                                        work_item_ids: vec![
+                                            "item-0".into(),
+                                            "fresh-required".into(),
+                                        ],
+                                    },
+                                },
+                            )
+                            .unwrap()
+                            .unwrap();
+                        assert_ne!(next.request_generation, generation);
+                        *fresh_request.borrow_mut() = Some(next);
+                        *fresh_loading.borrow_mut() = core.thread_snapshot("a");
+                    }) as Box<dyn Fn() + '_>
+                }),
             };
+            if tombstoned {
+                assert!(
+                    core.begin_thread_semantic_request(
+                        SemanticTimelineRequestAction::TurnWorkItemsGet {
+                            key: key.clone(),
+                            params: TurnWorkItemsGetParams {
+                                thread_id: "a".into(),
+                                turn_id: "turn".into(),
+                                work_item_ids: vec!["trailing-old".into()],
+                            },
+                        }
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+            }
             let request = core
                 .execute_thread_semantic_request(&transport, request)
                 .unwrap();
@@ -9593,44 +9738,8 @@ mod tests {
                     "None-to-None removal still guards the active collection"
                 );
             }
-            if tombstoned {
-                let GatewayNotification::ThreadTimelineBlocksChanged(mut notification) =
-                    reconciliation_notification(&[])
-                else {
-                    unreachable!()
-                };
-                notification.removed_block_ids = vec!["turn:turn:work".into()];
-                notification.turn_work_tombstones = vec![pioneer_protocol::TurnWorkTombstone {
-                    turn_id: "turn".into(),
-                    block_id: "turn:turn:work".into(),
-                    source_high_watermark: 30,
-                    projection_updated_at_unix_micros: 30_000,
-                }];
-                assert!(core.apply_thread_semantic_live_update(
-                    crate::timeline::semantic::SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification)
-                ));
-                assert!(
-                    core.thread_semantic_snapshot("a")
-                        .thread("a")
-                        .unwrap()
-                        .work_range("turn")
-                        .is_none()
-                );
-                // Pending required IDs belong to the same invalidated collection.
-                assert!(
-                    core.begin_thread_semantic_request(
-                        SemanticTimelineRequestAction::TurnWorkItemsGet {
-                            key: key.clone(),
-                            params: TurnWorkItemsGetParams {
-                                thread_id: "a".into(),
-                                turn_id: "turn".into(),
-                                work_item_ids: vec!["trailing".into()],
-                            },
-                        }
-                    )
-                    .unwrap()
-                    .is_none()
-                );
+            if tombstoned && !in_flight_reauthorization {
+                remove_range();
             }
             let mut replacement_ready = None;
             let mut live = original.clone();
@@ -9660,6 +9769,7 @@ mod tests {
                     let fresh = Transport {
                         replies: std::cell::RefCell::new(vec![Ok(page(vec![incoming.clone()]))]),
                         calls: std::cell::Cell::new(0),
+                        before_last_reply: None,
                     };
                     assert!(
                         core.execute_thread_semantic_request(&fresh, replacement)
@@ -9706,6 +9816,9 @@ mod tests {
                         | "absent-tombstone-replace"
                         | "absent-tombstone-dispatch"
                         | "absent-tombstone-cancel"
+                        | "absent-tombstone"
+                        | "absent-tombstone-rpc"
+                        | "absent-tombstone-reauthorized"
                 ) {
                     1
                 } else {
@@ -9730,7 +9843,8 @@ mod tests {
                 | "absent-tombstone-rpc"
                 | "absent-tombstone-dispatch"
                 | "absent-tombstone-cancel"
-                | "absent-tombstone-reauthorized" => assert!(actual.is_none()),
+                | "absent-tombstone-reauthorized"
+                | "absent-tombstone-inflight-reauthorized" => assert!(actual.is_none()),
                 _ => assert_eq!(actual, Some(&original)),
             }
             if matches!(outcome, "rpc" | "capacity" | "absent-evidence-full") {
@@ -9744,6 +9858,14 @@ mod tests {
                     assert!(
                         Arc::ptr_eq(&ready, &core.thread_snapshot("a").unwrap()),
                         "late old collection must not publish over replacement"
+                    );
+                } else if in_flight_reauthorization {
+                    assert!(
+                        Arc::ptr_eq(
+                            fresh_loading.borrow().as_ref().unwrap(),
+                            &core.thread_snapshot("a").unwrap()
+                        ),
+                        "old completion cannot change the newly authorized summary/Loading publication"
                     );
                 } else {
                     assert!(
@@ -9776,21 +9898,7 @@ mod tests {
                 "absent-new-generation" | "absent-replace" | "absent-tombstone-reauthorized"
             ) {
                 if outcome == "absent-tombstone-reauthorized" {
-                    let mut work = run_work();
-                    work.turn_id = "turn".into();
-                    assert!(core.apply_thread_semantic_live_update(
-                        crate::timeline::semantic::SemanticTimelineLiveUpdate::TurnWorkStateChanged(
-                            pioneer_protocol::TurnWorkStateChangedNotification {
-                                workspace_id: "ws".into(),
-                                thread_id: "a".into(),
-                                turn_id: "turn".into(),
-                                source_high_watermark: 31,
-                                projection_updated_at_unix_micros: 31_000,
-                                work,
-                                reason: TimelineChangeReason::LiveEvent,
-                            }
-                        )
-                    ));
+                    reauthorize();
                 }
                 let next = core
                     .begin_thread_semantic_request(
@@ -9814,6 +9922,7 @@ mod tests {
                 let fresh = Transport {
                     replies: std::cell::RefCell::new(vec![Ok(fresh_page)]),
                     calls: std::cell::Cell::new(0),
+                    before_last_reply: None,
                 };
                 assert!(core.execute_thread_semantic_request(&fresh, next).is_none());
                 assert_eq!(
@@ -9826,6 +9935,47 @@ mod tests {
                         .get("item-0"),
                     Some(&incoming),
                     "old generation removal evidence must not poison a new operation/store"
+                );
+            }
+            if in_flight_reauthorization {
+                let next = fresh_request.borrow_mut().take().unwrap();
+                let mut fresh_item = incoming.clone();
+                fresh_item.metadata = Some(serde_json::json!("fresh generation"));
+                let mut fresh_peer = peer.clone();
+                fresh_peer.work_item_id = "fresh-required".into();
+                let mut response = page(vec![fresh_item.clone(), fresh_peer.clone()]);
+                response.source_high_watermark = 32;
+                response.projection_updated_at_unix_micros = 32_000;
+                let fresh = Transport {
+                    replies: std::cell::RefCell::new(vec![Ok(response)]),
+                    calls: std::cell::Cell::new(0),
+                    before_last_reply: None,
+                };
+                assert!(core.execute_thread_semantic_request(&fresh, next).is_none());
+                let ready = core.thread_snapshot("a").unwrap();
+                let range = ready
+                    .semantic
+                    .thread("a")
+                    .unwrap()
+                    .work_range("turn")
+                    .unwrap();
+                assert_eq!(range.items_by_id.get("item-0"), Some(&fresh_item));
+                assert_eq!(range.items_by_id.get("fresh-required"), Some(&fresh_peer));
+                assert!(!range.items_by_id.contains_key("item-99"));
+                let old = late_old.unwrap();
+                core.fail_timeline_dispatch(&old);
+                assert!(
+                    core.execute_thread_semantic_request(&transport, old)
+                        .is_none()
+                );
+                assert_eq!(
+                    transport.calls.get(),
+                    2,
+                    "retired token cannot issue a third RPC"
+                );
+                assert!(
+                    Arc::ptr_eq(&ready, &core.thread_snapshot("a").unwrap()),
+                    "late old cleanup must not alter fresh data/status/publication"
                 );
             }
             assert!(core.thread_semantic_in_flight("a").is_empty());
@@ -12857,6 +13007,19 @@ impl ClientCore {
         };
         if expected_store.is_some_and(|generation| store.generation != generation) {
             return Ok(None);
+        }
+        if let SemanticTimelineRequestAction::TurnWorkItemsGet { params, .. } = &action
+            && !crate::timeline::semantic::accepts_turn_work_items_change(
+                &store.semantic,
+                &id,
+                &params.turn_id,
+            )
+        {
+            let key = crate::timeline::semantic::semantic_timeline_request_key(&action);
+            if reserved.is_some_and(|generation| registry.timeline.accepts(key, generation)) {
+                registry.timeline.reject_admission(key);
+            }
+            anyhow::bail!("Turn work collection authority retired");
         }
         if automatic_hydration {
             let SemanticTimelineRequestKey::TurnWorkInitial { turn_id, .. } =
