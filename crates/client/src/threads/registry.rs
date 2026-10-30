@@ -2792,6 +2792,7 @@ mod tests {
     // Deterministic cut after capture and before enqueue, absent from production.
     thread_local! {
         pub(super) static RESUME_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+        pub(super) static SUBSCRIPTION_DUE_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
     }
 
     // Existing result-focused suites ask for a complete logical operation.
@@ -6283,7 +6284,7 @@ mod tests {
 
         // Permanent command refusal on an empty, open scheduler must consume
         // the existing finite failure policy, unlike the transient full above.
-        let (core, transport, _responses, receiver) = shared_subscription_core();
+        let (core, transport, responses, receiver) = shared_subscription_core();
         assert!(
             !core
                 .thread_request_sender
@@ -6354,6 +6355,91 @@ mod tests {
         core.drive_thread_subscriptions();
         assert!(receiver.try_recv().is_err());
         assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Capture a fresh dormant attempt, then let the real foreground owner
+        // promote that same flight before the worker claims capacity failure.
+        core.schedule_thread_subscription(&id, "ws");
+        let saved = {
+            let mut registry = core.thread_registry.lock().unwrap();
+            let store = registry.stores.get_mut(&id).unwrap();
+            store.subscription_retry_at = Some(Instant::now());
+            let saved = store.subscription_request.clone().unwrap();
+            assert_eq!(saved.attempt, 1);
+            saved
+        };
+        let expected_scope = saved.scope().unwrap();
+        let (promoted_tx, promoted_rx) = std::sync::mpsc::channel();
+        let foreground_core = core.clone();
+        let foreground_id = id.clone();
+        SUBSCRIPTION_DUE_CAPTURE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let core = foreground_core.clone();
+                let id = foreground_id.clone();
+                let watchdog = Duration::from_secs(2);
+                let waiter = std::thread::spawn(move || {
+                    core.ensure_thread_subscription(
+                        &id,
+                        "ws",
+                        &crate::rpc::RequestBudget::new(Instant::now() + watchdog),
+                    )
+                });
+                let response = responses.recv_timeout(watchdog).unwrap();
+                let publication = foreground_core.thread_snapshot(&foreground_id).unwrap();
+                promoted_tx.send((waiter, response, publication)).unwrap();
+            }));
+        });
+        core.drive_thread_subscriptions();
+        let (waiter, response, promoted_publication) = promoted_rx.try_recv().unwrap();
+        assert!(
+            response.is_active(),
+            "scheduled refusal cannot cancel foreground RPC"
+        );
+        assert!(*saved.live.lock().unwrap());
+        assert!(Arc::ptr_eq(
+            &promoted_publication,
+            &core.thread_snapshot(&id).unwrap()
+        ));
+        {
+            let registry = core.thread_registry.lock().unwrap();
+            let store = &registry.stores[&id];
+            assert_eq!(store.subscription_request.as_ref(), Some(&saved));
+            assert_eq!(store.subscription_request.as_ref().unwrap().attempt, 1);
+            assert!(store.subscription_retry_at.is_none());
+            let flight = saved.flight.lock().unwrap();
+            assert!(flight.queued);
+            assert!(flight.response.is_some());
+            assert!(flight.result.is_none());
+        }
+        response
+            .send(Ok(serde_json::to_value(ThreadStartResponse {
+                thread: thread(&id, "ws"),
+                sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+            })
+            .unwrap()))
+            .unwrap();
+        let binding = waiter.join().unwrap().unwrap();
+        assert!(binding.is_current());
+        assert_eq!(binding.scope().as_ref(), Some(&expected_scope.socket));
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let registry = core.thread_registry.lock().unwrap();
+        let store = &registry.stores[&id];
+        let receipt = store.subscription_receipt.as_ref().unwrap();
+        assert_eq!(&receipt.scope, &expected_scope);
+        assert!(Arc::ptr_eq(&receipt.live, &saved.live));
+        assert!(*receipt.live.lock().unwrap());
+        assert!(!store.coordinator.history_loading);
+        assert!(!store.subscription_failed);
+        assert!(store.subscription_request.is_none());
+        assert!(
+            saved
+                .flight
+                .lock()
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap()
+                .is_ok()
+        );
     }
 
     fn viewed_read_plan(
@@ -16127,6 +16213,15 @@ impl ClientCore {
         request: &ThreadSubscriptionRequest,
         result: anyhow::Result<()>,
     ) {
+        self.finish_thread_subscription_request_inner(request, result, false);
+    }
+
+    fn finish_thread_subscription_request_inner(
+        &self,
+        request: &ThreadSubscriptionRequest,
+        result: anyhow::Result<()>,
+        only_if_dormant: bool,
+    ) {
         let current = self.thread_subscription_request_current(request);
         let retryable = result.as_ref().err().is_some_and(|error| {
             crate::rpc::json_rpc_response_error(error)
@@ -16134,9 +16229,14 @@ impl ClientCore {
         });
         let (response, hydrate) = {
             let mut flight = request.flight.lock().expect("subscription flight poisoned");
-            if flight.result.is_some() {
+            if flight.result.is_some()
+                || (only_if_dormant
+                    && (flight.queued || flight.response.is_some() || flight.completing))
+            {
                 return;
             }
+            // Promotion marks queued under this same lock, before installing a
+            // response. Claim capacity failure here or leave that active flight alone.
             flight.result = Some(
                 result
                     .as_ref()
@@ -16265,6 +16365,13 @@ impl ClientCore {
             }
             (active, due)
         };
+        #[cfg(test)]
+        tests::SUBSCRIPTION_DUE_CAPTURE_HOOK.with(|slot| {
+            let hook = slot.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
         for request in active {
             if !self.thread_subscription_request_current(&request) {
                 self.finish_thread_subscription_request(
@@ -16285,11 +16392,12 @@ impl ClientCore {
             if !command.command_fits(super::history_scheduler::MAX_COMMAND_BYTES) {
                 // Permanent capacity refusal must advance the existing bounded
                 // failure policy, rather than retain an expired full-queue retry.
-                self.finish_thread_subscription_request(
+                self.finish_thread_subscription_request_inner(
                     &request,
                     Err(anyhow::anyhow!(
                         "Thread subscription command capacity exceeded"
                     )),
+                    true,
                 );
                 continue;
             }
