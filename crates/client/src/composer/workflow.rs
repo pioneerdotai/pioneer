@@ -2139,6 +2139,17 @@ mod tests {
                 );
             } else {
                 assert!(committed.is_some());
+                let sending = core.composer_snapshot("a").unwrap();
+                assert!(!core.complete_composer_operation(
+                    identity.clone(),
+                    ComposerOperationCompletion::SendAdmissionFailed {
+                        message: "late bridge error".into()
+                    }
+                ));
+                assert!(
+                    Arc::ptr_eq(&sending, &core.composer_snapshot("a").unwrap()),
+                    "pre-admission cleanup cannot retire a committed Sending operation"
+                );
                 assert_eq!(thread.conversation.projection().turns.len(), 1);
                 let thread_publication = core
                     .snapshot(&crate::core::ClientScope::Thread {

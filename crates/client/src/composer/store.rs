@@ -157,6 +157,11 @@ pub enum ComposerOperationCompletion {
     Failed {
         message: String,
     },
+    // Boundary errors may arrive after admission; only the owner can decide
+    // whether the captured Send is still unadmitted.
+    SendAdmissionFailed {
+        message: String,
+    },
     Cancelled,
 }
 
@@ -1613,6 +1618,14 @@ impl ClientCore {
                         else {
                             return self.transition(&authority, vec![], vec![]);
                         };
+                        if matches!(
+                            &completion,
+                            ComposerOperationCompletion::SendAdmissionFailed { .. }
+                        ) && (operation.kind != ComposerOperationKind::Send
+                            || operation.status != ComposerOperationStatus::Pending)
+                        {
+                            return self.transition(&authority, vec![], vec![]);
+                        }
                         let plan = operation
                             .plan
                             .as_ref()
@@ -1739,7 +1752,8 @@ impl ClientCore {
                                 next.voice_readiness = None;
                                 ComposerOperationStatus::Completed
                             }
-                            ComposerOperationCompletion::Failed { message } => {
+                            ComposerOperationCompletion::Failed { message }
+                            | ComposerOperationCompletion::SendAdmissionFailed { message } => {
                                 pioneer_observability::turn_startup::finish(
                                     &identity.startup_observation_key(),
                                     pioneer_observability::turn_startup::Outcome::Failed,
@@ -1938,6 +1952,142 @@ mod tests {
             upload_state: super::super::attachments::ComposerAttachmentUploadState::Local,
         }
     }
+    #[test]
+    fn boundary_failure_retires_only_the_exact_unadmitted_send() {
+        for phase in [
+            "pending",
+            "preparing",
+            "uploading",
+            "prepared",
+            "edit",
+            "replacement",
+            "clear",
+            "revoke",
+            "shutdown",
+            "voice",
+            "picker",
+        ] {
+            let core = ClientCore::new();
+            let input = open(&core, "a");
+            edit(&core, &input, "captured payload");
+            let kind = match phase {
+                "voice" => ComposerOperationKind::Voice,
+                "picker" => ComposerOperationKind::PickFiles,
+                _ => ComposerOperationKind::Send,
+            };
+            let plan = begin(&core, &input, kind);
+            match phase {
+                "preparing" | "uploading" | "prepared" => {
+                    // This is the production submit admission boundary, before
+                    // session/runtime/upload work can begin.
+                    assert_eq!(
+                        core.composer_intent(ComposerIntent::PrepareOperation {
+                            identity: plan.identity.clone(),
+                        })
+                        .outcome(),
+                        ClientTransitionOutcome::Changed
+                    );
+                    if phase != "preparing" {
+                        assert_eq!(
+                            core.composer_intent(ComposerIntent::UploadOperation {
+                                identity: plan.identity.clone(),
+                            })
+                            .outcome(),
+                            ClientTransitionOutcome::Changed
+                        );
+                    }
+                    if phase == "prepared" {
+                        assert_eq!(
+                            complete(
+                                &core,
+                                &plan,
+                                ComposerOperationCompletion::Uploaded { artifacts: vec![] }
+                            ),
+                            ClientTransitionOutcome::Changed
+                        );
+                    }
+                }
+                "edit" | "replacement" => {
+                    edit(&core, &input, "new draft payload");
+                    if phase == "replacement" {
+                        let current = core.composer_snapshot("a").unwrap();
+                        let replacement = begin(&core, &current, ComposerOperationKind::Send);
+                        assert_ne!(replacement.identity.generation, plan.identity.generation);
+                    }
+                }
+                "clear" => {
+                    core.composer_intent(ComposerIntent::Clear {
+                        thread_id: "a".into(),
+                        draft_id: input.draft_id(),
+                    });
+                    let replacement = core.composer_snapshot("a").unwrap();
+                    assert_ne!(replacement.draft_id(), input.draft_id());
+                    edit(&core, &replacement, "new draft identity payload");
+                }
+                "revoke" => {
+                    core.forget_revoked_composer("a");
+                }
+                "shutdown" => {
+                    core.shutdown();
+                }
+                _ => {}
+            }
+            let before = core.composer_snapshot("a");
+            let admitted_phase = match phase {
+                "preparing" => Some(ComposerOperationStatus::Preparing),
+                "uploading" => Some(ComposerOperationStatus::Uploading),
+                "prepared" => Some(ComposerOperationStatus::Prepared),
+                _ => None,
+            };
+            if let Some(expected) = admitted_phase {
+                assert_eq!(
+                    before.as_ref().unwrap().operation().unwrap().status,
+                    expected
+                );
+            }
+            // Exercise the serialized boundary completion, with no JS phase receipt.
+            let failure: ComposerOperationCompletion = serde_json::from_value(serde_json::json!({
+                "kind": "send_admission_failed", "message": "boundary failed"
+            }))
+            .unwrap();
+            let changed = core.complete_composer_operation(plan.identity.clone(), failure.clone());
+            let after = core.composer_snapshot("a");
+            assert_eq!(changed, phase == "pending", "{phase}");
+            if phase == "pending" {
+                let failed = after.unwrap();
+                assert_eq!(failed.draft().text, "captured payload");
+                assert!(failed.preparing_send().is_none());
+                assert!(failed.operation().unwrap().plan.is_none());
+                assert_eq!(
+                    failed.operation().unwrap().status,
+                    ComposerOperationStatus::Failed {
+                        message: "boundary failed".into()
+                    }
+                );
+                let retry = begin(&core, &failed, ComposerOperationKind::Send);
+                assert_ne!(retry.identity.generation, plan.identity.generation);
+                let retry_snapshot = core.composer_snapshot("a").unwrap();
+                assert!(!core.complete_composer_operation(plan.identity.clone(), failure));
+                assert!(Arc::ptr_eq(
+                    &retry_snapshot,
+                    &core.composer_snapshot("a").unwrap()
+                ));
+                assert_eq!(
+                    retry_snapshot.preparing_send().unwrap().identity(),
+                    &retry.identity
+                );
+            } else {
+                assert_eq!(after, before, "cleanup mutated {phase}");
+                if let (Some(before), Some(after)) = (before, after) {
+                    assert!(
+                        Arc::ptr_eq(&before, &after),
+                        "cleanup published for {phase}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn preparing_send_publishes_captured_local_payload_from_begin_until_retirement() {
         for exit in ["edit", "failed", "cancel", "clear", "revoke", "shutdown"] {

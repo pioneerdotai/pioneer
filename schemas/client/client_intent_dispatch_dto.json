@@ -4546,6 +4546,22 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "send_admission_failed"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "cancelled"
             }
           },
