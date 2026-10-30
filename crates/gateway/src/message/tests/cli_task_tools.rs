@@ -3745,13 +3745,82 @@ fn cli_frozen_reader_catalog_does_not_gain_search_after_upgrade() {
     });
 }
 
+// Record both legacy and paginated retrieval at the existing backend boundary,
+// while retaining real indexes and source/authorization checks.
+struct RecordingRecallSearchBackend {
+    inner: pioneer_memory::MemvidThreadEpisodicBackend,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl pioneer_memory::ThreadEpisodicMemvidBackend for RecordingRecallSearchBackend {
+    fn capabilities(&self) -> pioneer_memory::ThreadEpisodicMemvidBackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn index_item(
+        &self,
+        request: pioneer_memory::ThreadEpisodicMemvidIndexRequest,
+    ) -> Result<
+        pioneer_memory::ThreadEpisodicMemvidIndexOutput,
+        pioneer_memory::ThreadEpisodicMemvidError,
+    > {
+        self.inner.index_item(request).await
+    }
+
+    async fn search(
+        &self,
+        request: pioneer_memory::ThreadEpisodicMemvidSearchRequest,
+    ) -> Result<
+        pioneer_memory::ThreadEpisodicMemvidSearchOutput,
+        pioneer_memory::ThreadEpisodicMemvidError,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.search(request).await
+    }
+
+    async fn search_segment_page(
+        &self,
+        request: pioneer_memory::ThreadEpisodicMemvidSearchRequest,
+        page_size: usize,
+        cursor: Option<String>,
+        embedding: Option<pioneer_memory::ThreadEpisodicMemvidIndexEmbedding>,
+    ) -> Result<
+        pioneer_memory::ThreadEpisodicMemvidSearchPage,
+        pioneer_memory::ThreadEpisodicMemvidError,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .search_segment_page(request, page_size, cursor, embedding)
+            .await
+    }
+}
+
 #[test]
-fn admitted_cli_production_recall_hook_searches_another_accessible_conversation() {
-    run_standard_stack_message_test("indexed workspace recall hook", async {
+fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_search() {
+    run_standard_stack_message_test("active memory and explicit history search", async {
+        use crate::thread_episodic::ThreadEpisodicRecallService;
         use pioneer_crud::ThreadEpisodicWorkspaceActiveWriteSegmentRequest;
         use pioneer_hooks::*;
         let (_harness, processor, turn_id) =
             start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let backend = Arc::new(RecordingRecallSearchBackend {
+            inner: pioneer_memory::MemvidThreadEpisodicBackend::new(),
+            calls: AtomicUsize::new(0),
+        });
+        let mut configured = processor.as_ref().clone();
+        configured.thread_episodic_recall_service = Arc::new(
+            ThreadEpisodicRecallService::with_embedding_provider_resolver(
+                configured.crud_store.clone(),
+                backend.clone(),
+                None,
+            ),
+        );
+        configured.memory_runtime = Arc::new(GatewayMemoryRuntime::enabled_with_backend_for_test(
+            configured.crud_store.clone(),
+            Arc::new(pioneer_memory::InMemoryMemoryBackend::default()),
+        ));
+        let processor = Arc::new(configured);
         let binding = processor
             .crud_store
             .get_cli_runtime_turn_binding(&turn_id)
@@ -3802,11 +3871,20 @@ fn admitted_cli_production_recall_hook_searches_another_accessible_conversation(
             tool["threads"][0]["threadId"], other,
             "positive control: admitted execution can read the other source"
         );
+        assert!(backend.calls.load(Ordering::SeqCst) > 0);
+        let search_calls = backend.calls.load(Ordering::SeqCst);
         let mut memory_config = processor.memory_loop_config();
         memory_config.active_recall.mode = pioneer_memory::hooks::MemoryActiveRecallMode::Hybrid;
         processor.apply_memory_loop_config(memory_config);
-        processor.bind_memory_bridge().await;
-        let runtime = processor.hook_runtime.read().await.clone().unwrap();
+        let mut config = processor
+            .thread_episodic_runtime_config
+            .read()
+            .unwrap()
+            .clone();
+        config.enabled = true;
+        config.indexing_enabled = true;
+        config.recall_enabled = true;
+        processor.apply_thread_episodic_runtime_config(config).await;
         let mut policy = std::collections::BTreeMap::new();
         for (key, value) in [
             ("recall", "allow"),
@@ -3843,32 +3921,26 @@ fn admitted_cli_production_recall_hook_searches_another_accessible_conversation(
             priority: 500,
             diagnostics: Vec::new(),
         }]);
-        let input=TurnPostPreflightPromptContextHookInput::from_parts("searchneedle",Some("test-model"),Some("openai"))
-            .with_active_memory_recall_preflight_plan(json!({"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},"episodic":{"status":"run","reasonCode":"provider_run","confidence":1.0,"queries":[{"mode":"workspace_thread","query":"searchneedle","targets":[]}]}}));
-        let request = HookPhaseRequest::new(
-            HookPhase::TurnPostPreflightPromptContext,
-            HookContext {
-                workspace_id: Some(HookWorkspaceId::new(binding.workspace_id.clone()).unwrap()),
-                thread_id: Some(HookThreadId::new(binding.thread_id.clone()).unwrap()),
-                turn_id: Some(HookTurnId::new(turn_id.clone()).unwrap()),
-                ..HookContext::default()
-            },
-            HookInput::turn_post_preflight_prompt_context(input),
-        )
-        .with_policy_set(policies);
-        let response = runtime.run_phase_to_completion(request).await.unwrap();
-        let rendered = serde_json::to_string(&response.contributions).unwrap();
-        assert!(
-            rendered.contains("remembered in the other conversation"),
-            "installed production hook must consume workspace results: {response:?}"
-        );
-        assert!(
-            rendered.contains("hook-other-source"),
-            "real source anchor must reach the hook contribution"
-        );
-        // Materialize a real restricted Agent policy intersected with the
-        // admitted root adapter. The initiating user's workspace ACL stays
-        // broad; this binding omits workspace observation by role policy.
+        let hook_context = HookContext {
+            workspace_id: Some(HookWorkspaceId::new(binding.workspace_id.clone()).unwrap()),
+            thread_id: Some(HookThreadId::new(binding.thread_id.clone()).unwrap()),
+            turn_id: Some(HookTurnId::new(turn_id.clone()).unwrap()),
+            ..HookContext::default()
+        };
+        let mixed_plan = json!({
+            "durable":{"status":"run","reasonCode":"provider_run","confidence":1.0,
+                "modes":["project"],"targets":[]},
+            "episodic":{"status":"run","reasonCode":"provider_run","confidence":1.0,
+                "queries":[{"mode":"current_thread","query":"searchneedle","targets":[]},
+                    {"mode":"related_thread","query":"searchneedle","targets":[]},
+                    {"mode":"workspace_thread","query":"searchneedle","targets":[]}]}
+        });
+        let stale_plan = json!({
+            "durable":{"status":"run","reasonCode":"provider_run","confidence":1.0,
+                "modes":["project","thread_episodic","workspace_thread","task_context"],"targets":[]},
+            "episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}
+        });
+        // Include the current conversation in the indexed corpus as well.
         crate::message::thread_search_tools::tests::seed(
             &processor,
             &capsule,
@@ -3877,6 +3949,205 @@ fn admitted_cli_production_recall_hook_searches_another_accessible_conversation(
             "searchneedle own runner context",
         )
         .await;
+        for state in ["empty", "saved", "read_error"] {
+            if state == "saved" {
+                let runtime = processor.memory_runtime();
+                for (key, content) in [
+                    (
+                        "recall-deterministic",
+                        "The Searchneedle project uses cobalt storage for audit logs.",
+                    ),
+                    (
+                        "recall-project",
+                        "Use amber ledger storage for this project",
+                    ),
+                ] {
+                    runtime
+                        .service()
+                        .remember(
+                            runtime.operation_context(Some(binding.workspace_id.clone()), None),
+                            memory_remember_params(
+                                MemoryScope {
+                                    kind: MemoryScopeKind::Workspace,
+                                    key: binding.workspace_id.clone(),
+                                },
+                                MemoryCategory::ProjectFact,
+                                Some(key),
+                                content,
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            let current = if state == "read_error" {
+                // Reuse the failing backend to exercise actual service errors,
+                // with control-plane rows still present from the saved case.
+                let mut failing = processor.as_ref().clone();
+                failing.memory_runtime =
+                    Arc::new(GatewayMemoryRuntime::enabled_with_backend_for_test(
+                        failing.crud_store.clone(),
+                        Arc::new(pioneer_memory::NoopMemoryBackend),
+                    ));
+                Arc::new(failing)
+            } else {
+                processor.clone()
+            };
+            current.bind_memory_bridge_if_enabled().await;
+            for reinstall in [false, true] {
+                if reinstall {
+                    let mut config = current
+                        .thread_episodic_runtime_config
+                        .read()
+                        .unwrap()
+                        .clone();
+                    config.enabled = true;
+                    config.indexing_enabled = true;
+                    config.recall_enabled = true;
+                    current.apply_thread_episodic_runtime_config(config).await;
+                    current.reinstall_memory_hook_runtime_if_bound().await;
+                    current.ensure_hook_runtime_with_run_store().await;
+                }
+                let runtime = current.hook_runtime.read().await.clone().unwrap();
+                let deterministic = runtime
+                    .run_phase_to_completion(
+                        HookPhaseRequest::new(
+                            HookPhase::TurnPrePromptContext,
+                            hook_context.clone(),
+                            HookInput::turn_pre_prompt_context(
+                                TurnPrePromptContextHookInput::from_parts(
+                                    "searchneedle",
+                                    Some("test-model"),
+                                    Some("openai"),
+                                ),
+                            ),
+                        )
+                        .with_policy_set(policies.clone()),
+                    )
+                    .await
+                    .unwrap();
+                let rendered = serde_json::to_string(&deterministic.contributions).unwrap();
+                assert_eq!(
+                    rendered.contains("cobalt storage for audit logs"),
+                    state == "saved",
+                    "{state}: {deterministic:?}"
+                );
+                assert!(
+                    !rendered.contains("amber ledger storage"),
+                    "the second fact must exercise active recall rather than deterministic recall"
+                );
+                if state == "read_error" {
+                    assert!(
+                        deterministic
+                            .diagnostics
+                            .iter()
+                            .any(|d| d.code.as_str() == "memory.recall_failed"),
+                        "{deterministic:?}"
+                    );
+                }
+                let prompt_context = HookPromptContextSet::aggregate_hook_contributions(
+                    deterministic.contributions,
+                    HookPromptContextLimits::default(),
+                );
+                for (case, plan, expects_project) in [
+                    ("local", None, true),
+                    ("mixed", Some(mixed_plan.clone()), true),
+                    ("legacy_modes", Some(stale_plan.clone()), true),
+                    ("invalid", Some(json!({"obsolete":true})), true),
+                    (
+                        "episodic_only",
+                        Some(json!({
+                            "durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},
+                            "episodic":{"status":"run","reasonCode":"provider_run","confidence":1.0,
+                                "queries":[{"mode":"current_thread","query":"searchneedle","targets":[]}]}
+                        })),
+                        false,
+                    ),
+                    (
+                        "debug_fallback",
+                        Some(json!({
+                            "durable":{"status":"run","reasonCode":"provider_run","confidence":1.0,
+                                "modes":[],"targets":[],"debugFallback":true},
+                            "episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}
+                        })),
+                        false,
+                    ),
+                ] {
+                    let mut input = TurnPostPreflightPromptContextHookInput::from_parts(
+                        "searchneedle",
+                        Some("test-model"),
+                        Some("openai"),
+                    );
+                    if let Some(plan) = plan {
+                        input = input.with_active_memory_recall_preflight_plan(plan);
+                    }
+                    let response = runtime
+                        .run_phase_to_completion(
+                            HookPhaseRequest::new(
+                                HookPhase::TurnPostPreflightPromptContext,
+                                hook_context.clone(),
+                                HookInput::turn_post_preflight_prompt_context(input),
+                            )
+                            .with_policy_set(policies.clone())
+                            .with_prompt_context_set(prompt_context.clone()),
+                        )
+                        .await
+                        .unwrap();
+                    let rendered = serde_json::to_string(&response.contributions).unwrap();
+                    if state == "saved" && expects_project {
+                        assert!(
+                            rendered.contains("amber ledger storage"),
+                            "active project operation must survive normalization: {response:?}"
+                        );
+                    }
+                    assert!(
+                        !rendered.contains("remembered in the other conversation"),
+                        "{response:?}"
+                    );
+                    assert!(!rendered.contains("own runner context"), "{response:?}");
+                    assert_eq!(
+                        backend.calls.load(Ordering::SeqCst),
+                        search_calls,
+                        "automatic recall must not search history: state={state}, reinstall={reinstall}, case={case}, response={response:?}"
+                    );
+                }
+            }
+        }
+        let tool = invoke_task(
+            &processor,
+            &turn_id,
+            "explicit-history-after-recall",
+            "threads_search",
+            json!({"query":"searchneedle", "limit":10}),
+        )
+        .await
+        .unwrap();
+        assert!(!tool.is_error, "{tool:?}");
+        assert_eq!(
+            tool.structured_content.unwrap()["threads"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        // The frozen CLI handlers retain the original fixture processor. Also
+        // exercise the configured processor to validate the recording backend.
+        let page = processor
+            .search_threads_page(
+                &context,
+                pioneer_protocol::ThreadsSearchParams {
+                    query: "searchneedle".into(),
+                    limit: 10,
+                    cursor: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page["threads"].as_array().unwrap().len(), 2);
+        assert!(backend.calls.load(Ordering::SeqCst) > search_calls);
+        // Materialize a real restricted Agent policy intersected with the
+        // admitted root adapter. The initiating user's workspace ACL stays
+        // broad; this binding omits workspace observation by role policy.
         let parent_binding = processor.agent_action_binding(&turn_id).await.unwrap();
         let parent_adapter = parent_binding.adapter.lock().await;
         let facts = parent_adapter.persistence_facts();

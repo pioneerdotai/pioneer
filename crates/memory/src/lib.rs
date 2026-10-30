@@ -75,6 +75,7 @@ pub use service::MemoryService;
 pub use thread_episodic::{
     MemvidThreadEpisodicBackend, PioneerAdaptiveCutoff, PioneerAdaptiveCutoffConfig,
     PioneerAdaptiveCutoffDiagnostics, PioneerAdaptiveCutoffReason,
+    THREAD_EPISODIC_MEMVID_BATCH_BYTES, THREAD_EPISODIC_MEMVID_BATCH_ITEMS,
     ThreadEpisodicAdaptiveRetrievalImplementation, ThreadEpisodicCandidateSuppression,
     ThreadEpisodicCandidateSuppressionReason, ThreadEpisodicExactSourceTarget,
     ThreadEpisodicFilteredSearchCandidates, ThreadEpisodicMemvidAskRetrievalMode,

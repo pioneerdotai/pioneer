@@ -4691,6 +4691,7 @@ impl Provider for PromptParityCaptureProvider {
             owned_by: Some("openai".to_owned()),
             limits: pioneer_protocol::ProviderModelLimits::default(),
             capabilities: pioneer_protocol::ProviderModelCapabilities {
+                chat: Some(true),
                 tool_calling: Some(true),
                 thinking: Some(true),
                 reasoning: Some(pioneer_protocol::ProviderModelReasoningCapabilities {
@@ -16815,7 +16816,10 @@ fn owned_voice_ingress_case(
             "closed_17" => 169,
             _ => 60,
         };
-        let initial_chunks = if early { 30 } else { 1 };
+        // Feed the first backlog packet before waiting for the 3 s preview:
+        // 48,000 samples leave an incomplete 512-sample VAD frame. This packet
+        // completes it without changing the source PCM or its total duration.
+        let initial_chunks = if early { 31 } else { 1 };
         for sequence in 0..initial_chunks {
             processor
                 .process_binary_frame_for_connection(
@@ -16824,7 +16828,15 @@ fn owned_voice_ingress_case(
                         &session.session_id,
                         sequence,
                         if early { 1600 } else { 960 },
-                        if terminal == "silence" { 0 } else { 12000 },
+                        if terminal == "silence"
+                            || (sequence == 30 && terminal == "sealed_tail_error")
+                        {
+                            0
+                        } else if sequence == 30 {
+                            6000
+                        } else {
+                            12000
+                        },
                     ),
                 )
                 .await
@@ -16856,7 +16868,7 @@ fn owned_voice_ingress_case(
                     .state,
                 crate::voice::session_store::GatewayVoiceSessionState::Recording
             );
-            // Duplicate accepted sequence is ACKed without replay. Keep a full
+            // Duplicate accepted sequences are ACKed without replay. Keep a full
             // second source span and a seven-sample tail behind native work.
             for sequence in 29..=last_sequence {
                 let samples = if sequence == last_sequence
@@ -17243,12 +17255,14 @@ fn owned_voice_ingress_case(
             } else if terminal == "sealed_tail_error" {
                 assert_eq!(
                     calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, 55200, 7687]
+                    vec![48000, 55296, 7943]
                 );
                 let mut confirmed_source = vec![12000.0 / 32768.0; 48000];
-                confirmed_source.extend([0.0; 7200]);
+                // The mixed 512-sample frame ends at 48128, followed by
+                // fourteen real hangover frames before the span is sealed.
+                confirmed_source.extend([0.0; 7296]);
                 assert_eq!(calls[1], confirmed_source);
-                let mut tail = vec![0.0; 7680];
+                let mut tail = vec![0.0; 7936];
                 tail.extend([3000.0 / 32768.0; 7]);
                 assert_eq!(calls[2], tail);
             } else if matches!(terminal, "closed_13" | "closed_17") {
@@ -20230,6 +20244,13 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
     gateway_secrets
         .set_workspace_provider_base_url(MEMBER_WORKSPACE_ID, "vllm", &local_url)
         .unwrap();
+    // Keep vLLM URL-only availability coverage; use explicit operation facts for choices.
+    gateway_secrets
+        .set_workspace_provider_api_key(MEMBER_WORKSPACE_ID, "mistral", "member-test-secret")
+        .unwrap();
+    gateway_secrets
+        .set_workspace_provider_base_url(MEMBER_WORKSPACE_ID, "mistral", &local_url)
+        .unwrap();
     let model_server = tokio::spawn(async move {
         let (mut stream, _) = model_listener.accept().await.unwrap();
         let mut bytes = [0u8; 8192];
@@ -20239,7 +20260,8 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
             .next()
             .unwrap()
             .to_owned();
-        let body = r#"{"data":[{"id":"member-local-model"}]}"#;
+        let body =
+            r#"{"data":[{"id":"member-local-model","capabilities":{"completion_chat":true}}]}"#;
         stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         request
     });
@@ -20252,17 +20274,24 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
         .set_workspace_provider_base_url(MEMBER_WORKSPACE_ID, "ollama", &ollama_url)
         .unwrap();
     let ollama_server = tokio::spawn(async move {
-        let (mut stream, _) = ollama_listener.accept().await.unwrap();
-        let mut bytes = [0u8; 8192];
-        let count = stream.read(&mut bytes).await.unwrap();
-        let request = String::from_utf8_lossy(&bytes[..count])
-            .lines()
-            .next()
-            .unwrap()
-            .to_owned();
-        let body = r#"{"models":[{"name":"member-ollama-model"}]}"#;
-        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-        request
+        let mut requests = Vec::new();
+        for body in [
+            r#"{"models":[{"name":"member-ollama-model"}]}"#,
+            r#"{"capabilities":["completion"]}"#,
+        ] {
+            let (mut stream, _) = ollama_listener.accept().await.unwrap();
+            let mut bytes = [0u8; 8192];
+            let count = stream.read(&mut bytes).await.unwrap();
+            requests.push(
+                String::from_utf8_lossy(&bytes[..count])
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned(),
+            );
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+        requests
     });
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
         {
@@ -20502,7 +20531,7 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
             member_connection_id,
             &json!({
                 "jsonrpc":"2.0", "id":models_id, "method":"provider/models/list",
-                "params":{"workspace_id":MEMBER_WORKSPACE_ID,"provider":"vllm"}
+                "params":{"workspace_id":MEMBER_WORKSPACE_ID,"provider":"mistral"}
             })
             .to_string(),
         )
@@ -20542,7 +20571,10 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
     );
     assert_eq!(
         ollama_server.await.unwrap(),
-        "GET /member-ollama-private/api/tags HTTP/1.1"
+        vec![
+            "GET /member-ollama-private/api/tags HTTP/1.1",
+            "POST /member-ollama-private/api/show HTTP/1.1",
+        ]
     );
 
     let configure_id = generate_test_request_id("memberws", "urlconfigure");
