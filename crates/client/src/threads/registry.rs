@@ -10746,9 +10746,18 @@ mod tests {
                 );
                 replacement.enqueue_thread_resume("a".into()).unwrap();
                 assert_eq!(
-                    replacement.next_thread_resume_delay(),
+                    replacement
+                        .thread_coordinator_snapshot("a")
+                        .unwrap()
+                        .resume
+                        .next_attempt_at,
                     None,
                     "accepted ready intent has no fallback deadline"
+                );
+                assert_eq!(
+                    replacement.next_thread_resume_delay(),
+                    Some(Duration::ZERO),
+                    "accepted ready intent requires immediate discovery"
                 );
             }))
         });
