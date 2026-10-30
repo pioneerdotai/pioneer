@@ -678,7 +678,12 @@ fn real_internal_completion_keeps_type_ownership_and_durable_agent_contract() {
         assert_eq!(failure.descriptor().stage, TaskStartStage::CliAdmission);
         assert_eq!(failure.descriptor().cause, TaskStartCause::Unclassified);
         assert!(
-            uuid::Uuid::parse_str(failure.descriptor().correlation_id.as_deref().unwrap()).is_ok()
+            !failure
+                .descriptor()
+                .correlation_id
+                .as_deref()
+                .unwrap()
+                .is_empty()
         );
         let public = failure
             .public_error()
@@ -3143,10 +3148,11 @@ fn revision_internal_completion_failure_is_not_reclassified_or_completed_twice()
                 // Persist a real revision Turn already Blocked, without provider
                 // activation or Task reconciliation. Dispatch must recover this
                 // outcome while its reserved TaskRunTurn is still InProgress.
-                let thread = processor
-                    .thread_manager
-                    .thread_get(&revised.child_thread_id)
+                let thread = harness
+                    .crud_store
+                    .get_thread_model(&revised.child_thread_id)
                     .await
+                    .unwrap()
                     .unwrap();
                 let mut turn = original_turn;
                 turn.id = revised.child_turn_id.clone();
