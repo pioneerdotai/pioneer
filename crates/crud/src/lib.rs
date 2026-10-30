@@ -35601,6 +35601,7 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 #[cfg(test)]
 mod tests {
     mod authorization_reads;
+    mod execution_window_repair;
     mod saved_history_read;
     mod task_child_discovery;
     mod task_webhook;
