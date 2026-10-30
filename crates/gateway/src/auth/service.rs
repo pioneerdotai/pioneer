@@ -3783,6 +3783,8 @@ mod tests {
         let transaction = service.database.begin().await.unwrap();
         let mut deferred = std::collections::VecDeque::new();
         let outbound = crate::session::SessionOutbound::from(outbound);
+        let mut handlers = crate::transport::ConnectionHandlers::default();
+        let dispatch = |_, _| async { panic!("renewal fixture contains no domain RPC") };
         let processing = crate::transport::process_with_access_renewals(
             async {
                 admitted_rx.await.unwrap();
@@ -3795,6 +3797,8 @@ mod tests {
             &mut context,
             &renewal,
             &outbound,
+            &mut handlers,
+            &dispatch,
         );
         let acknowledge = async {
             let Message::Text(text) = responses.recv().await.unwrap() else {

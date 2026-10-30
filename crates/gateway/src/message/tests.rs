@@ -1,3 +1,6 @@
+#[path = "tests/control_rpc.rs"]
+mod control_rpc;
+
 #[path = "tests/detached_work_projection.rs"]
 mod detached_work_projection;
 
