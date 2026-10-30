@@ -2789,10 +2789,11 @@ impl ClientCore {
 
 #[cfg(test)]
 mod tests {
-    // Deterministic cut after capture and before enqueue, absent from production.
+    // Deterministic owner handoff cuts, absent from production.
     thread_local! {
         pub(super) static RESUME_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
         pub(super) static SUBSCRIPTION_DUE_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+        pub(super) static SUBSCRIPTION_PROMOTION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
     }
 
     // Existing result-focused suites ask for a complete logical operation.
@@ -6354,6 +6355,115 @@ mod tests {
         assert_eq!(core.next_thread_subscription_delay(), None);
         core.drive_thread_subscriptions();
         assert!(receiver.try_recv().is_err());
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // The opposite cut: foreground passes the real current check, then
+        // capacity finalization replaces its flight before registry promotion.
+        core.schedule_thread_subscription(&id, "ws");
+        let saved = {
+            let mut registry = core.thread_registry.lock().unwrap();
+            let store = registry.stores.get_mut(&id).unwrap();
+            store.subscription_retry_at = Some(Instant::now());
+            let saved = store.subscription_request.clone().unwrap();
+            assert_eq!(saved.attempt, 1);
+            saved
+        };
+        let (replacement_tx, replacement_rx) = std::sync::mpsc::channel();
+        let due_core = core.clone();
+        let due_id = id.clone();
+        let captured = saved.clone();
+        SUBSCRIPTION_PROMOTION_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(
+                    due_core.thread_registry.lock().unwrap().stores[&due_id]
+                        .subscription_request
+                        .as_ref(),
+                    Some(&captured)
+                );
+                due_core.drive_thread_subscriptions();
+                let (next, retry_at, deadline) = {
+                    let registry = due_core.thread_registry.lock().unwrap();
+                    let store = &registry.stores[&due_id];
+                    let next = store.subscription_request.clone().unwrap();
+                    assert_ne!(next, captured);
+                    assert_eq!(next.attempt, 2);
+                    let retry_at = store.subscription_retry_at.unwrap();
+                    assert!(retry_at > Instant::now());
+                    let deadline = next.flight.lock().unwrap().deadline;
+                    (next, retry_at, deadline)
+                };
+                let publication = due_core.thread_snapshot(&due_id).unwrap();
+                replacement_tx
+                    .send((next, retry_at, deadline, publication))
+                    .unwrap();
+            }));
+        });
+        let error = core
+            .ensure_thread_subscription(
+                &id,
+                "ws",
+                &crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
+            )
+            .err()
+            .expect("capacity claim completed the old flight");
+        assert!(format!("{error:#}").contains("capacity exceeded"));
+        let (next, retry_at, deadline, publication) = replacement_rx.try_recv().unwrap();
+        assert!(Arc::ptr_eq(
+            &publication,
+            &core.thread_snapshot(&id).unwrap()
+        ));
+        assert!(!*saved.live.lock().unwrap());
+        assert!(*next.live.lock().unwrap());
+        assert!(receiver.try_recv().is_err());
+        assert!(responses.try_recv().is_err());
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        {
+            let registry = core.thread_registry.lock().unwrap();
+            let store = &registry.stores[&id];
+            assert_eq!(store.subscription_request.as_ref(), Some(&next));
+            assert_eq!(store.subscription_request.as_ref().unwrap().attempt, 2);
+            assert_eq!(store.subscription_retry_at, Some(retry_at));
+            assert!(!store.coordinator.history_loading);
+            assert!(store.subscription_failed);
+            assert!(store.subscription_receipt.is_none());
+            let flight = next.flight.lock().unwrap();
+            assert_eq!(flight.deadline, deadline);
+            assert!(!flight.queued);
+            assert!(flight.baseline.is_none());
+            assert!(flight.response.is_none());
+            assert!(flight.result.is_none());
+        }
+        core.thread_registry
+            .lock()
+            .unwrap()
+            .stores
+            .get_mut(&id)
+            .unwrap()
+            .subscription_retry_at = Some(Instant::now());
+        core.drive_thread_subscriptions();
+        {
+            let registry = core.thread_registry.lock().unwrap();
+            let store = &registry.stores[&id];
+            assert!(store.subscription_request.is_none());
+            assert!(store.subscription_retry_at.is_none());
+            assert!(!store.coordinator.history_loading);
+            assert!(store.subscription_failed);
+            assert!(
+                next.flight
+                    .lock()
+                    .unwrap()
+                    .result
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap_err()
+                    .message
+                    .contains("capacity exceeded")
+            );
+        }
+        assert_eq!(core.next_thread_subscription_delay(), None);
+        assert!(receiver.try_recv().is_err());
+        assert!(responses.try_recv().is_err());
         assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         // Capture a fresh dormant attempt, then let the real foreground owner
@@ -16053,6 +16163,13 @@ impl ClientCore {
             );
             return;
         }
+        #[cfg(test)]
+        tests::SUBSCRIPTION_PROMOTION_HOOK.with(|slot| {
+            let hook = slot.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
         let baseline = {
             let mut registry = self
                 .thread_registry
@@ -16061,7 +16178,10 @@ impl ClientCore {
             registry
                 .stores
                 .get_mut(&request.id)
-                .filter(|store| store.generation == request.generation)
+                .filter(|store| {
+                    store.generation == request.generation
+                        && store.subscription_request.as_ref() == Some(request)
+                })
                 .map(|store| {
                     if store.subscription_retry_at.take().is_some() {
                         let mut flight =
