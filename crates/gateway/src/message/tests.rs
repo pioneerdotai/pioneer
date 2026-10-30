@@ -83340,7 +83340,9 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
                         id: format!("background-answer-{index}"),
                         text: format!(
                             "background answer {index} {}",
-                            "retained ".repeat(if index == 0 { 60_000 } else { 80 })
+                            // Keep the baseline below the 128k fallback window with UTF-16
+                            // estimation; fixed input below exercises the exact boundary.
+                            "retained ".repeat(if index == 0 { 20_000 } else { 80 })
                         ),
                         phase: Default::default(),
                         markdown: None,
