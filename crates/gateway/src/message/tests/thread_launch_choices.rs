@@ -922,18 +922,27 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
             .unwrap()
             .is_some()
     );
-    let parent = processor
+    // Thread snapshots contain only the latest turn. The card must remain
+    // in public history even when another turn wins that snapshot.
+    let parent_history = processor
         .crud_store
-        .get_thread_model(thread_id)
+        .get_thread_history(thread_id, None)
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        parent
-            .turns
-            .iter()
-            .any(|turn| turn.id == run_id && turn.turn_kind == pioneer_protocol::TurnKind::TaskRun)
-    );
+    assert!(parent_history.events.iter().any(|event| {
+        event.turn_id == run_id
+            && matches!(
+                &event.payload,
+                pioneer_protocol::ThreadHistoryEventPayload::TurnStarted {
+                    thread_id: owner_thread_id,
+                    turn,
+                    ..
+                } if owner_thread_id.as_str() == thread_id
+                    && turn.id == run_id
+                    && turn.turn_kind == pioneer_protocol::TurnKind::TaskRun
+            )
+    }));
     assert!(
         processor
             .crud_store
