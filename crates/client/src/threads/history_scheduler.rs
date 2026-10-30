@@ -17,7 +17,7 @@ pub(crate) const MAX_JOBS: usize = 16;
 // Interactive arrivals cannot consume the last durable-recovery reservation.
 pub(crate) const MAX_ORDINARY_JOBS: usize = MAX_JOBS - 1;
 const INTERACTIVE_BURST: usize = 4;
-const MAX_COMMAND_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_COMMAND_BYTES: usize = 1024 * 1024;
 
 type Item = WorkItem<ThreadControllerRequest>;
 

@@ -6205,6 +6205,18 @@ mod tests {
             crate::core::ClientTransitionOutcome::Rejected
         );
 
+        let (starts, _responses) = std::sync::mpsc::channel();
+        let transport = Arc::new(SubscriptionRecorder {
+            starts,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            thread: thread("a", "ws"),
+        });
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(transport.clone());
         core.schedule_thread_subscription("a", "ws");
         let registry = core.thread_registry.lock().unwrap();
         let store = &registry.stores["a"];
@@ -6220,8 +6232,36 @@ mod tests {
             flight.result.is_none(),
             "the retry remains dormant until its existing backoff expires"
         );
+        let saved = retry.clone();
+        let deadline = flight.deadline;
         drop(flight);
         drop(registry);
+        let due_at = Instant::now();
+        core.thread_registry
+            .lock()
+            .unwrap()
+            .stores
+            .get_mut("a")
+            .unwrap()
+            .subscription_retry_at = Some(due_at);
+        core.drive_thread_subscriptions();
+        {
+            let registry = core.thread_registry.lock().unwrap();
+            let store = &registry.stores["a"];
+            assert_eq!(store.subscription_request.as_ref(), Some(&saved));
+            assert_eq!(
+                store.subscription_request.as_ref().unwrap().attempt,
+                saved.attempt
+            );
+            assert_eq!(store.subscription_retry_at, Some(due_at));
+            assert!(!store.coordinator.history_loading);
+            let flight = saved.flight.lock().unwrap();
+            assert_eq!(flight.deadline, deadline);
+            assert!(!flight.queued);
+            assert!(flight.response.is_none());
+            assert!(flight.result.is_none());
+        }
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         core.apply_thread_conversation_event(
             "ws",
             ConversationEvent::TurnStarted {
@@ -6240,6 +6280,80 @@ mod tests {
                 .any(|item| matches!(&item.value, ThreadControllerRequest::ResumeJob(_))),
             "continuous ordinary admission cannot take the durable recovery reservation"
         );
+
+        // Permanent command refusal on an empty, open scheduler must consume
+        // the existing finite failure policy, unlike the transient full above.
+        let (core, transport, _responses, receiver) = shared_subscription_core();
+        assert!(
+            !core
+                .thread_request_sender
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_closed()
+        );
+        let id = "x".repeat(crate::threads::history_scheduler::MAX_COMMAND_BYTES);
+        core.upsert_thread(thread(&id, "ws"));
+        core.thread_demand_changed(
+            &ClientScope::Timeline {
+                thread_id: id.clone(),
+            },
+            ClientDemand::Visible,
+        );
+        core.schedule_thread_subscription(&id, "ws");
+        assert!(
+            receiver.try_recv().is_err(),
+            "oversized Subscribe never queues"
+        );
+        for attempt in [1, 2] {
+            let due_at = Instant::now();
+            let saved = {
+                let mut registry = core.thread_registry.lock().unwrap();
+                let store = registry.stores.get_mut(&id).unwrap();
+                assert!(!store.coordinator.history_loading);
+                assert!(store.subscription_failed);
+                let saved = store.subscription_request.clone().unwrap();
+                assert_eq!(saved.attempt, attempt);
+                assert!(store.subscription_retry_at.is_some());
+                store.subscription_retry_at = Some(due_at);
+                saved
+            };
+            core.drive_thread_subscriptions();
+            assert!(receiver.try_recv().is_err(), "empty scheduler stays empty");
+            assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let registry = core.thread_registry.lock().unwrap();
+            let store = &registry.stores[&id];
+            assert!(!store.coordinator.history_loading);
+            assert!(store.subscription_failed);
+            assert!(store.subscription_receipt.is_none());
+            let flight = saved.flight.lock().unwrap();
+            assert!(!flight.queued);
+            assert!(flight.response.is_none());
+            assert!(
+                flight
+                    .result
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap_err()
+                    .message
+                    .contains("capacity exceeded")
+            );
+            if attempt == 1 {
+                let next = store.subscription_request.as_ref().unwrap();
+                assert_ne!(next, &saved);
+                assert_eq!(next.attempt, 2);
+                assert!(store.subscription_retry_at.unwrap() > due_at);
+            } else {
+                assert!(store.subscription_request.is_none());
+                assert!(store.subscription_retry_at.is_none());
+            }
+        }
+        assert_eq!(core.next_thread_subscription_delay(), None);
+        core.drive_thread_subscriptions();
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     fn viewed_read_plan(
@@ -16167,12 +16281,20 @@ impl ClientCore {
             .expect("thread request sender poisoned")
             .clone();
         for request in due {
+            let command = ThreadControllerRequest::Subscribe(request.clone());
+            if !command.command_fits(super::history_scheduler::MAX_COMMAND_BYTES) {
+                // Permanent capacity refusal must advance the existing bounded
+                // failure policy, rather than retain an expired full-queue retry.
+                self.finish_thread_subscription_request(
+                    &request,
+                    Err(anyhow::anyhow!(
+                        "Thread subscription command capacity exceeded"
+                    )),
+                );
+                continue;
+            }
             if let Some(sender) = &sender {
-                if sender
-                    .send(ThreadControllerRequest::Subscribe(request.clone()))
-                    .is_ok()
-                    || !sender.is_closed()
-                {
+                if sender.send(command).is_ok() || !sender.is_closed() {
                     // Full leaves the dormant retry and its original budget in
                     // its existing owner. No flight was started or Loading added.
                     continue;
