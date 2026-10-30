@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum StartupPhase {
     AddressWait,
+    AddressLineRead,
     RetryDelay,
     PreparingPlugin,
     GroupCleanupConfirmed,
@@ -60,7 +61,7 @@ pub(super) async fn pause_at(phase: StartupPhase) {
 pub(super) async fn observe_address_read<F: std::future::Future>(read: F) -> F::Output {
     tokio::pin!(read);
     let mut announced = false;
-    std::future::poll_fn(|cx| {
+    let result = std::future::poll_fn(|cx| {
         let result = read.as_mut().poll(cx);
         if result.is_pending() && !announced {
             if let Some(gate) = phase_gate(StartupPhase::AddressWait) {
@@ -70,7 +71,9 @@ pub(super) async fn observe_address_read<F: std::future::Future>(read: F) -> F::
         }
         result
     })
-    .await
+    .await;
+    pause_at(StartupPhase::AddressLineRead).await;
+    result
 }
 
 // Reuses the shell-child + loopback HTTP fixture pattern used by the other CLI
@@ -237,6 +240,28 @@ while read line; do :; done
     }
 }
 
+async fn expire_startup_after_stdout_line(fixture: &StartupFixture) -> anyhow::Error {
+    let gate = PhaseGate::new(StartupPhase::AddressLineRead, 1);
+    let budget = Duration::from_millis(fixture.instance.startup_probe_timeout_ms);
+    let future = PHASE_GATE.scope(gate.clone(), fixture.start());
+    tokio::pin!(future);
+    tokio::select! {
+        result = &mut future => panic!("startup completed before its stdout checkpoint: {}", result.is_ok()),
+        entered = tokio_timeout(Duration::from_secs(2), gate.entered.notified()) => entered.unwrap()
+    }
+    assert_eq!(fixture.starts().len(), 1);
+    // Spend the budget only after the real child has produced output. Resume
+    // real time before awaiting OS process cleanup.
+    gate.release.notify_one();
+    tokio::time::pause();
+    tokio::time::advance(budget).await;
+    tokio::time::resume();
+    future
+        .await
+        .err()
+        .expect("the startup deadline must expire")
+}
+
 fn process_present(pid: u32) -> bool {
     // SAFETY: signal zero only observes a PID recorded by this fixture.
     if unsafe { libc::kill(i32::try_from(pid).unwrap(), 0) } == 0 {
@@ -360,16 +385,21 @@ async fn non_sqlite_exit_eof_auth_and_invalid_address_never_retry() {
 
 #[tokio::test]
 async fn startup_timeout_never_retries_even_with_sqlite_stderr() {
-    let mut fixture = StartupFixture::new(
-        "echo 'SQLiteError: database is locked' >&2; while read line; do :; done",
+    let fixture = StartupFixture::new(
+        "echo 'SQLiteError: database is locked' >&2; echo 'fixture stdout ready'; while read line; do :; done",
         "ready",
     )
     .await;
-    fixture.instance.startup_probe_timeout_ms = 100;
-    let error = fixture.start().await.err().unwrap();
+    let error = expire_startup_after_stdout_line(&fixture).await;
     let failure = error.downcast_ref::<OpenCodeStartupFailure>().unwrap();
     assert_eq!(failure.stage, OpenCodeStartupStage::Timeout);
     assert!(!failure.sqlite_busy);
+    assert!(
+        failure
+            .stderr
+            .iter()
+            .any(|line| line.contains("SQLiteError: database is locked"))
+    );
     assert_eq!(fixture.starts().len(), 1);
     fixture.wait_stopped().await;
 }
@@ -461,13 +491,12 @@ async fn startup_cancellation_during_confirmed_retry_delay_does_not_spawn_again(
 #[tokio::test]
 async fn startup_pid_health_failures_never_retry_and_health_shares_address_deadline() {
     for mode in ["wrong-pid", "health-error", "health-delay"] {
-        let mut fixture = StartupFixture::new(
-            "sleep 0.08; echo 'SQLiteError: database is locked' >&2",
-            mode,
-        )
-        .await;
-        fixture.instance.startup_probe_timeout_ms = if mode == "health-delay" { 150 } else { 2000 };
-        let error = fixture.start().await.err().unwrap();
+        let fixture = StartupFixture::new("echo 'SQLiteError: database is locked' >&2", mode).await;
+        let error = if mode == "health-delay" {
+            expire_startup_after_stdout_line(&fixture).await
+        } else {
+            fixture.start().await.err().unwrap()
+        };
         let failure = error.downcast_ref::<OpenCodeStartupFailure>().unwrap();
         assert!(!failure.sqlite_busy);
         if mode == "health-delay" {
