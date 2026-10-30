@@ -2294,11 +2294,13 @@ mod task_revision_failure_tests {
             for already_reported in [false, true] {
                 let ((response, public), events) =
                     crate::public_error::test_support::capture_events(|| {
-                        let public = crate::public_error::build_public_error(
+                        let mut public = crate::public_error::build_public_error(
                             code,
                             pioneer_protocol::PublicErrorStage::Admission,
                         );
+                        public.correlation_id = "revision-correlation".to_owned();
                         let failure = TaskStartFailure::new(TaskStartStage::CliAdmission, cause)
+                            .with_correlation_id("revision-correlation".to_owned())
                             .with_public_error(public.clone());
                         let failure = if already_reported {
                             failure.report()

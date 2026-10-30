@@ -271,7 +271,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.retain, vec![1, 2, 3]);
-        let tight = ModelBudget::new(Some(30_000), None, None);
+        // Two tail rounds plus the summary fit after the estimate allowance;
+        // retaining the third round still exceeds this window.
+        let tight = ModelBudget::new(Some(32_000), None, None);
         let p = plan_compaction(
             &units,
             &tight,

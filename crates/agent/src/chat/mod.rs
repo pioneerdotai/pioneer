@@ -1162,29 +1162,32 @@ pub(crate) fn bounded_tool_result_message_with_budget(
     message.content.clear();
     let framing =
         serde_json::to_string(&message).map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
-    if framing.len() > pioneer_compaction::RESULT_BYTES
-        || pioneer_compaction::text_tokens(&framing) > token_limit
-    {
+    let frame = pioneer_compaction::estimator::TextSize::of(&framing);
+    if frame.bytes > pioneer_compaction::RESULT_BYTES || frame.tokens() > token_limit {
         return Err(ChatTurnError::Blocked(
             "tool result attachment references exceed available context".into(),
         ));
     }
-    let mut tokens = token_limit.saturating_sub(pioneer_compaction::text_tokens(&framing));
-    let mut bytes = pioneer_compaction::RESULT_BYTES.saturating_sub(framing.len());
-    loop {
-        message.content =
-            pioneer_compaction::results::result_excerpt(&text, reference, tokens, bytes)
-                .map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
-        let encoded =
-            serde_json::to_string(&message).map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
-        if encoded.len() <= pioneer_compaction::RESULT_BYTES
-            && pioneer_compaction::text_tokens(&encoded) <= token_limit
-        {
-            return Ok(message);
-        }
-        tokens /= 2;
-        bytes /= 2;
+    message.content = pioneer_compaction::results::result_excerpt_in_json(
+        &text,
+        reference,
+        token_limit,
+        pioneer_compaction::RESULT_BYTES,
+        frame,
+    )
+    .map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
+    // One bounded validation of the completed representation, including typed
+    // attachment references. No candidate loop serializes this message again.
+    let encoded =
+        serde_json::to_string(&message).map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
+    if encoded.len() > pioneer_compaction::RESULT_BYTES
+        || pioneer_compaction::text_tokens(&encoded) > token_limit
+    {
+        return Err(ChatTurnError::Blocked(
+            "tool result does not fit available context".into(),
+        ));
     }
+    Ok(message)
 }
 
 // Search pages can exceed the working-context budget. Publish a machine-readable

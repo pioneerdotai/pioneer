@@ -396,6 +396,7 @@ struct ReferenceExcerpt {
     thread: String,
     source: SourceRef,
     text: String,
+    summary_units: u64,
 }
 
 pub(crate) struct CompactionRunner {
@@ -590,10 +591,16 @@ impl CompactionRunner {
                     } else {
                         excerpt
                     };
-                    excerpts.push(ReferenceExcerpt {
-                        thread: entry.thread_id,
+                    let material = ReferenceMaterial {
                         source: entry.source,
                         text,
+                    };
+                    let summary_units = summary_component_units(&material)?;
+                    excerpts.push(ReferenceExcerpt {
+                        thread: entry.thread_id,
+                        source: material.source,
+                        text: material.text,
+                        summary_units,
                     });
                     // `payload` is dropped here before the next reference is read.
                 }
@@ -816,10 +823,34 @@ impl CompactionRunner {
                     }
                     let portion = match self.portion(&state, purpose).await {
                         Ok(portion) => portion,
-                        Err(_) => {
+                        Err(error) => {
+                            let capacity = error.downcast_ref::<SummaryInputCapacity>().is_some();
+                            let (kind, code, explanation) = if capacity {
+                                (
+                                    FailureKind::InputOverflow,
+                                    "summary_input_capacity",
+                                    "Summary input cannot be reduced further while retaining checkpoint and source progress",
+                                )
+                            } else {
+                                (
+                                    FailureKind::Permanent,
+                                    "source_preparation_failed",
+                                    "Could not prepare the next portion from admitted source revisions",
+                                )
+                            };
                             state = self
-                                .persist(&state, Self::diagnose(state.terminate(FailureKind::Permanent)?,
-                                    FailureDiagnostic::new("portion_preparation", "source_preparation_failed", "Could not prepare the next portion from admitted source revisions")), None)
+                                .persist(
+                                    &state,
+                                    Self::diagnose(
+                                        state.terminate(kind)?,
+                                        FailureDiagnostic::new(
+                                            "portion_preparation",
+                                            code,
+                                            explanation,
+                                        ),
+                                    ),
+                                    None,
+                                )
                                 .await?;
                             continue;
                         }
@@ -1066,12 +1097,11 @@ impl CompactionRunner {
             },
         }
     }
-    fn fits(&self, request: &SummaryRequest) -> Result<bool> {
-        Ok(self.summarizer.model_budget().fits(
-            self.summarizer.input_tokens(request)?,
-            request.output_cap,
-            false,
-        ))
+    fn portion_fits(&self, state: &RunnerState, tokens: u64, output: u64) -> bool {
+        state
+            .input_ceiling()
+            .is_none_or(|ceiling| tokens <= ceiling)
+            && self.summarizer.model_budget().fits(tokens, output, false)
     }
     async fn portion(&self, state: &RunnerState, purpose: AttemptPurpose) -> Result<Portion> {
         let previous = if let Some(id) = &state.previous_checkpoint {
@@ -1086,8 +1116,12 @@ impl CompactionRunner {
         let mut request = self.request(state, previous);
         if purpose == AttemptPurpose::Correction {
             ensure!(
-                self.fits(&request)?,
-                "correction input exceeds model capacity"
+                self.portion_fits(
+                    state,
+                    self.summarizer.input_tokens(&request)?,
+                    request.output_cap
+                ),
+                SummaryInputCapacity
             );
             return Ok(Portion {
                 request,
@@ -1161,21 +1195,32 @@ impl CompactionRunner {
             last_part: false,
             text: initial.text,
         };
+        // Both native and CLI transports carry SummaryInput JSON in one JSON
+        // string. Prepare fixed framing once, then add escaped component units
+        // before rounding. No candidate serializes the accumulated prefix.
+        let mut sizing = PortionSizing::new(self.summarizer.input_tokens(&request)?);
+        let reserve_units = summary_component_units(&reserve_part)?;
         for excerpt in reference_excerpts {
-            let mut proposed = request.clone();
-            proposed.input.reference_only.push(ReferenceMaterial {
-                source: excerpt.source.clone(),
-                text: excerpt.text.clone(),
-            });
-            proposed.input.compact_units.push(reserve_part.clone());
-            if self.fits(&proposed)? {
-                proposed.input.compact_units.clear();
-                request = proposed;
+            let units = excerpt
+                .summary_units
+                .saturating_add(u64::from(!request.input.reference_only.is_empty()));
+            if self.portion_fits(
+                state,
+                sizing.with(units.saturating_add(reserve_units)),
+                request.output_cap,
+            ) {
+                sizing.add(units);
+                request.input.reference_only.push(ReferenceMaterial {
+                    source: excerpt.source.clone(),
+                    text: excerpt.text.clone(),
+                });
             }
         }
         let mut cursor = state.cursor;
         let mut completed = Vec::new();
-        let mut boundary: Option<Portion> = None;
+        // Save only positions at complete unit boundaries, not a full request
+        // clone each time a unit finishes. Truncate once if the next unit fails.
+        let mut boundary: Option<(usize, SourceCursor, u32, usize, bool)> = None;
         for _ in 0..SOURCE_PAGE_ROWS {
             let page = self
                 .store
@@ -1212,11 +1257,19 @@ impl CompactionRunner {
                 last_part: finishes_unit,
                 text: fragment.text,
             };
-            let mut proposed = request.clone();
-            proposed.input.compact_units.push(part.clone());
-            if !self.fits(&proposed)? {
-                if let Some(boundary) = boundary {
-                    return Ok(boundary);
+            let separator = u64::from(!request.input.compact_units.is_empty());
+            let units = summary_component_units(&part)?.saturating_add(separator);
+            if !self.portion_fits(state, sizing.with(units), request.output_cap) {
+                if let Some((parts, saved_cursor, projection, covered, final_portion)) = boundary {
+                    request.input.compact_units.truncate(parts);
+                    completed.truncate(covered);
+                    return Ok(Portion {
+                        request,
+                        cursor: saved_cursor,
+                        source_text_projection_version: projection,
+                        completed,
+                        final_portion,
+                    });
                 }
                 if !request.input.compact_units.is_empty() {
                     return Ok(Portion {
@@ -1227,34 +1280,43 @@ impl CompactionRunner {
                         final_portion: false,
                     });
                 }
-                let mut low = 0;
-                let mut high = part.text.len();
+                // A bounded source fragment can exceed the remaining capacity.
+                // Its fixed metadata is prepared once and its text visited once;
+                // double JSON escaping is accounted for without allocating
+                // candidate strings or rescanning prefixes in a binary search.
+                let mut partial = SummaryPart {
+                    sources: part.sources.clone(),
+                    unit: part.unit,
+                    part: part.part,
+                    text: String::new(),
+                    last_part: false,
+                };
+                let fixed = summary_component_units(&partial)?.saturating_add(separator);
+                let mut text_units = 0u64;
                 let mut best = 0;
-                while low <= high {
-                    let mid = low + (high - low) / 2;
-                    let mut end = mid;
-                    while !part.text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    proposed.input.compact_units[0].text = part.text[..end].to_owned();
-                    proposed.input.compact_units[0].last_part = false;
-                    if self.fits(&proposed)? {
-                        best = end;
-                        low = mid + 1;
-                    } else if mid == 0 {
+                let mut characters = 0u64;
+                for (offset, ch) in part.text.char_indices() {
+                    let candidate = text_units.saturating_add(summary_character_units(ch));
+                    if !self.portion_fits(
+                        state,
+                        sizing.with(fixed.saturating_add(candidate)),
+                        request.output_cap,
+                    ) {
                         break;
-                    } else {
-                        high = mid - 1;
                     }
+                    text_units = candidate;
+                    best = offset + ch.len_utf8();
+                    characters += 1;
                 }
-                ensure!(best > 0, "summary framing leaves no source capacity");
-                proposed.input.compact_units[0].text = part.text[..best].to_owned();
+                ensure!(best > 0, SummaryInputCapacity);
+                partial.text = part.text[..best].to_owned();
+                request.input.compact_units.push(partial);
                 let character = cursor
                     .character
-                    .checked_add(proposed.input.compact_units[0].text.chars().count() as u64)
+                    .checked_add(characters)
                     .ok_or_else(|| anyhow::anyhow!("source cursor overflow"))?;
                 return Ok(Portion {
-                    request: proposed,
+                    request,
                     cursor: SourceCursor {
                         unit: entry.unit,
                         source: source_index,
@@ -1265,7 +1327,8 @@ impl CompactionRunner {
                     final_portion: false,
                 });
             }
-            request = proposed;
+            sizing.add(units);
+            request.input.compact_units.push(part);
             if let Some(character) = fragment.next_character {
                 cursor = SourceCursor {
                     unit: entry.unit,
@@ -1305,13 +1368,13 @@ impl CompactionRunner {
                         source_text_projection_for_new_source(&next.source);
                 }
                 if finishes_unit {
-                    boundary = Some(Portion {
-                        request: request.clone(),
+                    boundary = Some((
+                        request.input.compact_units.len(),
                         cursor,
                         source_text_projection_version,
-                        completed: completed.clone(),
-                        final_portion: next.is_none(),
-                    });
+                        completed.len(),
+                        next.is_none(),
+                    ));
                 }
                 if next.is_none() {
                     return Ok(Portion {
@@ -1324,8 +1387,16 @@ impl CompactionRunner {
                 }
             }
         }
-        if let Some(boundary) = boundary {
-            return Ok(boundary);
+        if let Some((parts, cursor, projection, covered, final_portion)) = boundary {
+            request.input.compact_units.truncate(parts);
+            completed.truncate(covered);
+            return Ok(Portion {
+                request,
+                cursor,
+                source_text_projection_version: projection,
+                completed,
+                final_portion,
+            });
         }
         ensure!(
             !request.input.compact_units.is_empty(),
@@ -1338,6 +1409,77 @@ impl CompactionRunner {
             completed,
             final_portion: false,
         })
+    }
+}
+
+/// Largest local estimate admitted by the shared budget policy. Bounded numeric
+/// inversion avoids a second copy of estimate-error/headroom/output rules.
+pub(crate) fn estimated_input_capacity(
+    budget: &pioneer_compaction::ModelBudget,
+    output_reserve: u64,
+    recovery: bool,
+) -> u64 {
+    let mut low = 0u64;
+    let mut high = budget.context;
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if budget.fits(middle, output_reserve, recovery) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    low
+}
+
+#[derive(Debug)]
+struct SummaryInputCapacity;
+impl std::fmt::Display for SummaryInputCapacity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("summary framing leaves no source capacity")
+    }
+}
+impl std::error::Error for SummaryInputCapacity {}
+
+/// The fixed frame is rounded once by the transport. Round the combined added
+/// units upwards, so composing with that rounded base never undercounts its
+/// full-frame estimate. The difference is at most one estimated token.
+struct PortionSizing {
+    fixed_tokens: u64,
+    added_units: u64,
+}
+impl PortionSizing {
+    fn new(fixed_tokens: u64) -> Self {
+        Self {
+            fixed_tokens,
+            added_units: 0,
+        }
+    }
+    fn with(&self, units: u64) -> u64 {
+        let units = self.added_units.saturating_add(units);
+        self.fixed_tokens.saturating_add(
+            pioneer_compaction::estimator::tokens_from_utf16(units)
+                .saturating_add(u64::from(units % 4 == 1)),
+        )
+    }
+    fn add(&mut self, units: u64) {
+        self.added_units = self.added_units.saturating_add(units);
+    }
+}
+fn summary_component_units(value: &impl serde::Serialize) -> Result<u64> {
+    Ok(
+        pioneer_compaction::estimator::json_string_content_size(&serde_json::to_string(value)?)
+            .utf16_units,
+    )
+}
+/// One source character inside SummaryInput JSON inside the transport's JSON
+/// string. This is JSON framing arithmetic, not a second token estimator.
+fn summary_character_units(ch: char) -> u64 {
+    match ch {
+        '"' | '\\' => 4,
+        '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 3,
+        '\u{0}'..='\u{1f}' => 7,
+        _ => ch.len_utf16() as u64,
     }
 }
 

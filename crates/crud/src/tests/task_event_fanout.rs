@@ -6,11 +6,12 @@ use crate::{
     TaskEventFanoutPage,
 };
 use pioneer_entity::{
-    task_event, task_event_fanout_cursor as cursor, task_event_fanout_pending as pending,
-    task_event_fanout_sequence as sequence,
+    portable_payload, task_event, task_event_fanout_cursor as cursor,
+    task_event_fanout_pending as pending, task_event_fanout_sequence as sequence,
 };
 use sea_orm::TransactionTrait;
 use sea_orm::sea_query::Expr;
+use sha2::{Digest, Sha256};
 const NOW: i64 = 4_000_000_000;
 const MIGRATION: &str = "m20261008_000007_task_event_fanout_pending";
 async fn store() -> CrudStore {
@@ -49,6 +50,26 @@ async fn progress(store: &CrudStore, task_id: &str, message: &str) -> crate::App
         )
         .await
         .unwrap()
+}
+// Drain through consecutive idle quanta, including each registered family’s EOF.
+// Keep the same progress owner so a later append exercises rescan after EOF.
+async fn finish_portable_payload_pass(
+    store: &CrudStore,
+    worker: &mut crate::PortablePayloadProgress,
+) {
+    let maintenance = store.with_maintenance_access();
+    let mut idle = 0;
+    for _ in 0..2048 {
+        if worker.quantum(&maintenance).await.unwrap() {
+            idle = 0;
+        } else {
+            idle += 1;
+            if idle == 16 {
+                return;
+            }
+        }
+    }
+    panic!("portable payload pass did not finish within fixture budget");
 }
 async fn claim(store: &CrudStore, id: &str, token: &str, now: i64) -> TaskEventFanoutClaim {
     queue::claim(
@@ -118,20 +139,142 @@ async fn initial_append_precedes_task_projection_and_rollback_restores_frontier_
 }
 
 #[tokio::test]
-async fn duplicate_append_does_not_refresh_or_reset_a_poison_reservation() {
+async fn compressed_duplicate_append_preserves_winner_reservation_and_later_insert() {
     let store = store().await;
-    let task = created(&store, "fanout_duplicate").await;
+    let mut task = sample_task(1_700_000_000);
+    task.id = "fanout_compressed_duplicate".into();
+    task.goal = "Повторное создание 界🙂\n".repeat(4096);
+    let payload = TaskEventPayload::TaskCreated { task: task.clone() };
+    let original = store
+        .append_task_event(payload.clone(), task.created_at)
+        .await
+        .unwrap();
     claim(&store, &task.id, "holder", NOW).await;
     let before = row(&store, &task.id).await.unwrap();
-    let event = store
-        .append_task_event(
-            TaskEventPayload::TaskCreated { task: task.clone() },
-            task.created_at,
+    let mut worker = crate::PortablePayloadProgress::default();
+    finish_portable_payload_pass(&store, &mut worker).await;
+    let compressed = task_event::Entity::find_by_id(original.id.clone())
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(compressed.payload_json, "");
+    let header = portable_payload::Entity::find_by_id(
+        compressed
+            .payload_json_payload_id
+            .expect("published TaskCreated payload"),
+    )
+    .one(&store.connection)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(header.raw, 0, "fixture must actually be compressed");
+    // Both persisted replays share proof payloads during writer admission.
+    let replays = store
+        .append_task_events(vec![payload.clone(), payload.clone()], task.created_at + 1)
+        .await
+        .unwrap();
+    assert_eq!(replays.len(), 2);
+    for event in replays {
+        assert!(!event.append_status.is_inserted());
+        assert_eq!(event.id, original.id);
+        assert_eq!(event.sequence, original.sequence);
+        assert_eq!(event.created_at, original.created_at);
+        assert_eq!(event.payload, payload);
+    }
+    assert_eq!(row(&store, &task.id).await.unwrap(), before);
+
+    let later_message = "new event after completed pass 界🙂".repeat(4096);
+    let later = progress(&store, &task.id, &later_message).await;
+    assert!(later.append_status.is_inserted());
+    assert_eq!(later.sequence, original.sequence + 1);
+    let appended = row(&store, &task.id).await.unwrap();
+    assert!(appended.generation > before.generation);
+    assert_eq!(appended.first_sequence, before.first_sequence);
+    assert_eq!(appended.newest_sequence, later.sequence);
+    assert_eq!(appended.claim_token, before.claim_token);
+    assert_eq!(appended.attempts, before.attempts);
+    assert_eq!(appended.due_at, before.due_at);
+    finish_portable_payload_pass(&store, &mut worker).await;
+    let published = task_event::Entity::find_by_id(later.id.clone())
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.payload_json, "");
+    assert!(published.payload_json_payload_id.is_some());
+    let decoded = store.list_task_events_after(&task.id, 0).await.unwrap();
+    assert_eq!(decoded.len(), 2);
+    assert_eq!(
+        (decoded[0].id.as_str(), decoded[0].sequence),
+        (original.id.as_str(), original.sequence)
+    );
+    assert_eq!(decoded[0].payload, payload);
+    assert_eq!(
+        (decoded[1].id.as_str(), decoded[1].sequence),
+        (later.id.as_str(), later.sequence)
+    );
+    assert_eq!(
+        decoded[1].payload,
+        TaskEventPayload::Progress {
+            task_id: task.id.clone(),
+            run_id: None,
+            message: later_message,
+            details: None,
+        }
+    );
+    assert_eq!(row(&store, &task.id).await.unwrap(), appended);
+}
+
+#[tokio::test]
+async fn atomic_cancelled_replays_keep_first_uncommitted_payload_and_sequence() {
+    let store = store().await;
+    let task = created(&store, "fanout_cancelled_batch").await;
+    let before = row(&store, &task.id).await.unwrap();
+    let original = TaskEventPayload::TaskCancelled {
+        task_id: task.id.clone(),
+        reason: Some("first cancellation 界🙂\n".repeat(16384)),
+        completed_at: task.created_at + 1,
+    };
+    let retry = TaskEventPayload::TaskCancelled {
+        task_id: task.id.clone(),
+        reason: Some("replayed cancellation".into()),
+        completed_at: task.created_at + 2,
+    };
+    // No cancellation exists during reader preflight. Three equivalent inputs
+    // exercise a shared large candidate, retaining the first semantic winner.
+    let events = store
+        .append_task_events(
+            vec![original.clone(), retry.clone(), retry],
+            task.created_at + 2,
         )
         .await
         .unwrap();
-    assert!(!event.append_status.is_inserted());
-    assert_eq!(row(&store, &task.id).await.unwrap(), before);
+    assert_eq!(events.len(), 3);
+    assert!(events[0].append_status.is_inserted());
+    assert!(!events[1].append_status.is_inserted());
+    assert!(!events[2].append_status.is_inserted());
+    assert_eq!(events[0].id, events[1].id);
+    assert_eq!(events[0].id, events[2].id);
+    assert_eq!(events[0].sequence, before.newest_sequence + 1);
+    assert_eq!(events[1].sequence, events[0].sequence);
+    assert_eq!(events[2].sequence, events[0].sequence);
+    assert_eq!(events[0].payload, original);
+    assert_eq!(events[1].payload, original);
+    assert_eq!(events[2].payload, original);
+    let pending = row(&store, &task.id).await.unwrap();
+    assert_eq!(pending.generation, before.generation + 1);
+    assert_eq!(pending.first_sequence, before.first_sequence);
+    assert_eq!(pending.newest_sequence, events[0].sequence);
+    let decoded = store
+        .list_task_events_after(&task.id, before.newest_sequence)
+        .await
+        .unwrap();
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].payload, original);
+    let projected = store.get_task_record(&task.id).await.unwrap().unwrap();
+    assert_eq!(projected.status, TaskStatus::Cancelled);
+    assert_eq!(projected.completed_at, Some(task.created_at + 1));
 }
 
 #[tokio::test]
@@ -471,14 +614,17 @@ async fn discovery_and_pages_are_bounded_with_oversized_supported_separately() {
     assert_eq!(page.len(), 128);
 }
 
-// Historical fixtures are built before installing tracking, never by production initialization.
+// Historical tracking is absent, while the orthogonal TaskEvent storage
+// projection supports current CRUD used to build the pre-install history.
 async fn before_tracking() -> CrudStore {
     let db = Database::connect("sqlite::memory:").await.unwrap();
-    let before = Migrator::migrations()
+    let before = FanoutFixtureMigrator::migrations()
         .iter()
         .position(|m| m.name() == MIGRATION)
         .unwrap();
-    Migrator::up(&db, Some(before as u32)).await.unwrap();
+    FanoutFixtureMigrator::up(&db, Some(before as u32))
+        .await
+        .unwrap();
     CrudStore::new(db)
 }
 async fn install_tracking(store: &CrudStore) {
@@ -1258,17 +1404,85 @@ async fn utf8_metadata_bytecode_does_not_fetch_overflow_payload_before_admission
         .unwrap()
         .unwrap();
     assert_eq!(encoding.try_get::<String>("", "encoding").unwrap(), "UTF-8");
+    let small_payload = TaskEventPayload::Progress {
+        task_id: task.id.clone(),
+        run_id: None,
+        message: "界🙂".into(),
+        details: None,
+    };
     let small = progress(&store, &task.id, "界🙂").await;
-    let expected = serde_json::to_string(&small.payload).unwrap().len();
-    assert!(
-        expected
-            > serde_json::to_string(&small.payload)
-                .unwrap()
-                .chars()
-                .count()
-    );
+    let small_json = serde_json::to_string(&small_payload).unwrap();
+    let expected = small_json.len();
+    assert!(expected > small_json.chars().count());
+    let mut originals = vec![(small.id.clone(), small_json)];
+    let large_message = "界".repeat(BYTES);
+    let large_json = serde_json::to_string(&TaskEventPayload::Progress {
+        task_id: task.id.clone(),
+        run_id: None,
+        message: large_message.clone(),
+        details: None,
+    })
+    .unwrap();
     for _ in 0..3 {
-        progress(&store, &task.id, &"界".repeat(BYTES)).await;
+        let event = progress(&store, &task.id, &large_message).await;
+        originals.push((event.id, large_json.clone()));
+    }
+    let pending_before = row(&store, &task.id).await.unwrap();
+    let cursor_before = store.get_task_event_fanout_cursor(&task.id).await.unwrap();
+    let generation_before = sequence::Entity::find_by_id(1_i64)
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut worker = crate::PortablePayloadProgress::default();
+    finish_portable_payload_pass(&store, &mut worker).await;
+    assert_eq!(
+        row(&store, &task.id).await.unwrap(),
+        pending_before,
+        "physical publication cannot enqueue work or change the pending interval"
+    );
+    assert_eq!(
+        store.get_task_event_fanout_cursor(&task.id).await.unwrap(),
+        cursor_before
+    );
+    assert_eq!(
+        sequence::Entity::find_by_id(1_i64)
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap(),
+        generation_before
+    );
+    for (index, (id, original)) in originals.iter().enumerate() {
+        let stored = task_event::Entity::find_by_id(id.clone())
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let header = portable_payload::Entity::find_by_id(
+            stored
+                .payload_json_payload_id
+                .expect("published event payload"),
+        )
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(header.family, "task.event");
+        assert_eq!(header.retired, 0);
+        assert_eq!(header.original_bytes, original.len() as i64);
+        assert_eq!(header.original_chars, original.chars().count() as i64);
+        assert_eq!(header.sha256, Sha256::digest(original.as_bytes()).to_vec());
+        if index == 0 {
+            assert_eq!(
+                header.raw, 1,
+                "tiny UTF-8 event uses completed raw fallback"
+            );
+            assert_eq!(stored.payload_json, *original);
+        } else {
+            assert_eq!(header.raw, 0, "oversized fixture must actually compress");
+            assert_eq!(stored.payload_json, "");
+        }
     }
     assert!(matches!(
         store
@@ -1288,6 +1502,7 @@ async fn utf8_metadata_bytecode_does_not_fetch_overflow_payload_before_admission
     assert_eq!(events.len(), 1);
     assert_eq!(bytes, expected);
     assert_eq!(bytes_left, 0, "payload charged before full read/decode");
+    assert_eq!(events[0].as_ref().unwrap().payload, small_payload);
     let TaskEventFanoutPage::Prefix { events, bytes } = store
         .task_event_fanout_page(&task.id, small.sequence, 128, &mut { BYTES }, true)
         .await
@@ -1301,6 +1516,16 @@ async fn utf8_metadata_bytecode_does_not_fetch_overflow_payload_before_admission
         "three large inputs must fetch only one payload"
     );
     assert!(bytes > BYTES);
+    assert_eq!(
+        bytes,
+        originals[1].1.len(),
+        "admission charges original bytes"
+    );
+    assert_eq!(events[0].as_ref().unwrap().id, originals[1].0);
+    assert_eq!(
+        serde_json::to_string(&events[0].as_ref().unwrap().payload).unwrap(),
+        originals[1].1
+    );
     let statement = events::fanout_metadata_query(&task.id, 1, 128).build(DatabaseBackend::Sqlite);
     assert!(statement.sql.contains("octet_length(payload_json)"));
     assert!(!statement.sql.contains("CAST"));
@@ -1325,9 +1550,9 @@ async fn utf8_metadata_bytecode_does_not_fetch_overflow_payload_before_admission
             .query_all_raw(explained)
             .await
             .unwrap();
-        let function_row = bytecode
+        let function_index = bytecode
             .iter()
-            .find(|r| {
+            .position(|r| {
                 let op: String = r.try_get("", "opcode").unwrap();
                 op == "Function"
                     && r.try_get::<Option<String>>("", "p4")
@@ -1335,9 +1560,12 @@ async fn utf8_metadata_bytecode_does_not_fetch_overflow_payload_before_admission
                         .is_some_and(|p| p.starts_with(function))
             })
             .expect("byte-length function in bytecode");
-        let argument: i64 = function_row.try_get("", "p2").unwrap();
-        let column = bytecode
+        let argument: i64 = bytecode[function_index].try_get("", "p2").unwrap();
+        // CASE and its header subquery reuse temporary registers. Inspect the
+        // last column write before this function, not an earlier register use.
+        let column = bytecode[..function_index]
             .iter()
+            .rev()
             .find(|r| {
                 r.try_get::<String>("", "opcode").unwrap() == "Column"
                     && r.try_get::<i64>("", "p3").unwrap() == argument
@@ -1397,8 +1625,8 @@ async fn budget_deferral_fences_new_holders_resets_and_keeps_appended_work() {
     assert_eq!(row(&store, &task.id).await.unwrap(), reset);
 }
 
-// Migration rollback fixtures use the production schema through fanout,
-// excluding later irreversible migrations.
+// Keep fanout last for down(Some(1)); the shared fixture helper installs only
+// current TaskEvent storage before the trackers, without later frozen schemas.
 struct FanoutFixtureMigrator;
 impl MigratorTrait for FanoutFixtureMigrator {
     fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {

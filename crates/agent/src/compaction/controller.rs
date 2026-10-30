@@ -2,7 +2,7 @@
 //! transports; the agent retains the actual request receipt and measured input.
 use anyhow::Result;
 use async_trait::async_trait;
-use pioneer_compaction::{RequestIdentity, SourceRef};
+use pioneer_compaction::{InputEstimate, RequestIdentity, SourceRef};
 use pioneer_provider::{ChatRequest, Provider, TokenUsage};
 use pioneer_runtime_events::ExecutionEventHub;
 use sha2::{Digest, Sha256};
@@ -44,6 +44,12 @@ impl NativeInputReceipt {
         };
         let instructions_hash = digest(&serde_json::json!({
             "system_sections": request.compiled_prompt.as_ref().map(|v|v.system_sections()),
+            // This is request-level provider context, omitted from per-message
+            // append estimates. Replacing it invalidates an otherwise exact
+            // message-prefix anchor rather than silently charging only the tail.
+            "native_prefix_context": request.messages.iter().rev()
+                .filter_map(|message| message.provider_replay_state.as_ref())
+                .find_map(|state| state.payload.get("prefix_context")),
         }))?;
         let tools_hash = digest(&serde_json::json!({
             "tools": request.tools, "tool_choice": request.tool_choice,
@@ -97,6 +103,19 @@ impl NativeInputReceipt {
         local_messages: &[u64],
         measured: Option<&NativeUsageMeasurement>,
     ) -> Result<u64> {
+        Ok(self
+            .calibrated_estimate(local_complete, local_messages, measured)?
+            .total())
+    }
+
+    /// The receipt covers normalized provider input only. Its generated answer
+    /// and subsequent tool results are unmeasured additions to this exact prefix.
+    pub fn calibrated_estimate(
+        &self,
+        local_complete: u64,
+        local_messages: &[u64],
+        measured: Option<&NativeUsageMeasurement>,
+    ) -> Result<InputEstimate> {
         anyhow::ensure!(
             local_messages.len() == self.messages.len(),
             "missing message estimates"
@@ -104,12 +123,15 @@ impl NativeInputReceipt {
         let Some(measured) = measured.filter(|m| {
             self.identity == m.receipt.identity && self.messages.starts_with(&m.receipt.messages)
         }) else {
-            return Ok(local_complete);
+            return Ok(InputEstimate::local(local_complete));
         };
         let appended = local_messages[measured.receipt.messages.len()..]
             .iter()
             .fold(0_u64, |sum, value| sum.saturating_add(*value));
-        Ok(local_complete.max(measured.input_tokens.saturating_add(appended)))
+        Ok(InputEstimate {
+            measured: measured.input_tokens,
+            estimated: appended,
+        })
     }
 }
 
@@ -280,6 +302,161 @@ mod tests {
     fn receipt(request: &ChatRequest) -> NativeInputReceipt {
         NativeInputReceipt::for_request(request, "instance", "api/authority", 0, None).unwrap()
     }
+    struct UnusedBoundary;
+    #[async_trait]
+    impl NativeContextController for UnusedBoundary {
+        async fn stop(&self, _: &NativeContext) -> Result<()> {
+            unreachable!("usage bookkeeping does not stop")
+        }
+        async fn prepare(
+            &self,
+            _: &NativeContext,
+            _: ChatRequest,
+            _: Option<NativeUsageMeasurement>,
+            _: bool,
+        ) -> Result<NativePreparedRequest> {
+            unreachable!("usage bookkeeping does not prepare")
+        }
+    }
+    #[async_trait]
+    impl Provider for UnusedBoundary {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        async fn chat(&self, _: ChatRequest) -> Result<pioneer_provider::ChatResponse> {
+            unreachable!("usage bookkeeping does not call provider")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> Result<futures_util::stream::BoxStream<'static, Result<pioneer_provider::StreamChunk>>>
+        {
+            unreachable!("usage bookkeeping does not stream")
+        }
+    }
+    #[test]
+    fn recorded_normalized_usage_does_not_add_cache_output_or_reasoning_and_unknown_clears_anchor()
+    {
+        let context = NativeContext {
+            overflow_recovery: false,
+            recovery_deadline_ms: None,
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            conversation_thread_id: None,
+            provider_instance: "instance".into(),
+            provider: Arc::new(UnusedBoundary),
+            events: Arc::new(ExecutionEventHub::new()),
+            cancellation: CancellationToken::new(),
+        };
+        let session = NativeContextSession::new(context, Arc::new(UnusedBoundary));
+        let receipt = receipt(&request());
+        let mut usage = TokenUsage {
+            input_tokens: Some(200),
+            output_tokens: Some(100),
+            cache_read_input_tokens: Some(150),
+            cache_write_input_tokens: Some(20),
+            reasoning_tokens: Some(80),
+            reported_total_tokens: Some(999),
+            ..Default::default()
+        };
+        session.record_usage(receipt.clone(), Some(&usage)).unwrap();
+        {
+            let measured = session.measurement.lock().unwrap();
+            assert_eq!(
+                receipt
+                    .calibrated_estimate(900, &[20], measured.as_ref())
+                    .unwrap(),
+                InputEstimate {
+                    measured: 200,
+                    estimated: 0
+                }
+            );
+        }
+        usage.input_tokens = None;
+        session.record_usage(receipt.clone(), Some(&usage)).unwrap();
+        let measured = session.measurement.lock().unwrap();
+        assert!(measured.is_none());
+        assert_eq!(
+            receipt
+                .calibrated_estimate(900, &[20], measured.as_ref())
+                .unwrap(),
+            InputEstimate::local(900)
+        );
+    }
+
+    #[test]
+    fn changing_native_prefix_context_invalidates_input_anchor() {
+        let mut request = request();
+        request.messages[0].provider_replay_state =
+            Some(pioneer_provider::ProviderReplayState::for_model(
+                "fixture",
+                "m",
+                serde_json::json!({"prefix_context":{"prefix":"old"}}),
+            ));
+        let measured = NativeUsageMeasurement {
+            receipt: receipt(&request),
+            input_tokens: 200,
+        };
+        let mut appended = ChatMessage::assistant("new answer");
+        appended.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
+            "fixture",
+            "m",
+            serde_json::json!({"prefix_context":{"prefix":"replacement"}}),
+        ));
+        request.messages.push(appended);
+        assert_eq!(
+            receipt(&request)
+                .calibrated_estimate(900, &[20, 30], Some(&measured))
+                .unwrap(),
+            InputEstimate::local(900)
+        );
+    }
+
+    #[test]
+    fn usage_anchor_covers_input_only_and_missing_or_shortened_prefix_is_local() {
+        let mut request = request();
+        let measured = NativeUsageMeasurement {
+            receipt: receipt(&request),
+            input_tokens: 200,
+        };
+        request
+            .messages
+            .push(ChatMessage::assistant("generated answer"));
+        request
+            .messages
+            .push(ChatMessage::tool_result("call", "tool", "new result"));
+        let current = receipt(&request);
+        let estimate = current
+            .calibrated_estimate(900, &[20, 30, 40], Some(&measured))
+            .unwrap();
+        assert_eq!(
+            estimate,
+            InputEstimate {
+                measured: 200,
+                estimated: 70
+            }
+        );
+        assert_eq!(estimate.padded(), 281);
+        assert_eq!(
+            current
+                .calibrated_estimate(900, &[20, 30, 40], None)
+                .unwrap(),
+            InputEstimate::local(900)
+        );
+        let shortened = NativeUsageMeasurement {
+            receipt: current,
+            input_tokens: 400,
+        };
+        request.messages.pop();
+        assert_eq!(
+            receipt(&request)
+                .calibrated_estimate(80, &[20, 30], Some(&shortened))
+                .unwrap(),
+            InputEstimate::local(80)
+        );
+    }
+
     #[test]
     fn native_target_identity_tracks_unattributed_runtime_messages() {
         let mut request = request();
@@ -324,7 +501,7 @@ mod tests {
             receipt(&request)
                 .calibrated_input(400, &[20, 30, 40], Some(&measurement))
                 .unwrap(),
-            400
+            270
         );
         for change in 0..4 {
             let mut changed = request.clone();

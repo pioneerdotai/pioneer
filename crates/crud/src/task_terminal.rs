@@ -6,8 +6,9 @@ use crate::convention::{
 };
 use crate::repositories::{
     task as task_repository, task_actor_contract, task_agent_spec, task_delivery, task_event,
-    task_run, task_run_execution, task_trigger, task_write_lock,
+    task_run, task_run_execution, task_run_turn, task_trigger, task_write_lock,
 };
+use crate::task_events::{DeferredAppendedTaskEvent, materialize_task_events};
 use crate::util::unix_to_datetime;
 use crate::{
     AppendedTaskEvent, CrudStore, load_agent_execution_resource_state,
@@ -19,7 +20,8 @@ use pioneer_protocol::{
     TaskActorContract, TaskCompletionBehavior, TaskDeliveryMode, TaskDeliveryStatus, TaskError,
     TaskErrorClass, TaskEventPayload, TaskGetResponse, TaskOccurrenceContract,
     TaskOccurrenceStatus, TaskRescheduleReason, TaskResult, TaskRetryBackoffKind, TaskRun,
-    TaskRunExecutionStatus, TaskRunStatus, TaskWriteLockStatus, generate_id,
+    TaskRunExecutionStatus, TaskRunStatus, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus,
+    TaskWriteLockStatus, generate_id,
 };
 use sea_orm::{ConnectionTrait, TransactionTrait};
 use sha2::{Digest, Sha256};
@@ -87,6 +89,7 @@ pub struct PreparedTaskTerminalTransition {
     delivery: Option<task_delivery::PreparedTaskDeliveryProjection>,
     at: i64,
     retry_scheduled: bool,
+    terminal_revision: Option<TaskRunTurn>,
 }
 
 impl PreparedTaskTerminalTransition {
@@ -123,7 +126,69 @@ pub struct TaskTerminalCommitOutcome {
     pub retry_scheduled: bool,
 }
 
+#[derive(Debug)]
+struct DeferredTaskTerminalCommitOutcome {
+    pub status: TaskTerminalCommitStatus,
+    pub events: Vec<DeferredAppendedTaskEvent>,
+    pub completed_at: i64,
+    pub delivery_id: Option<String>,
+    pub retry_scheduled: bool,
+}
+
 impl CrudStore {
+    /// Add the exact reserved revision to the existing terminal batch. Inputs
+    /// come from the dispatch snapshot, not a fresh adoption of the latest turn.
+    /// Only immutable identity and the terminal projection are prepared here;
+    /// the writer revalidates every field and latest-revision ownership.
+    pub async fn prepare_task_terminal_with_revision(
+        &self,
+        mut prepared: PreparedTaskTerminalTransition,
+        revision: TaskRunTurn,
+    ) -> Result<PreparedTaskTerminalTransition> {
+        let (status, error) = match &prepared.terminal {
+            TaskEventPayload::RunBlocked { error, .. } => (TaskRunTurnStatus::Blocked, error),
+            TaskEventPayload::RunFailed { error, .. } => (TaskRunTurnStatus::Failed, error),
+            _ => return conflict("revision requires RunBlocked or RunFailed"),
+        };
+        if prepared.events.len() >= crate::MAX_ATOMIC_TASK_EVENT_BATCH_SIZE {
+            bail!("revision exceeds the atomic Task event batch limit");
+        }
+        if revision.task_id != prepared.state.task.id
+            || revision.run_id != prepared.state.run.id
+            || revision.kind != TaskRunTurnKind::Revision
+            || revision.status != TaskRunTurnStatus::InProgress
+            || revision.completed_at.is_some()
+            || revision.execution_id.as_deref()
+                != prepared
+                    .state
+                    .execution_fence
+                    .as_ref()
+                    .map(|(id, _)| id.as_str())
+            || prepared.terminal_revision.is_some()
+        {
+            return conflict("revision does not belong to the dispatch attempt");
+        }
+        let mut terminal_turn = revision.clone();
+        terminal_turn.status = status;
+        terminal_turn.completed_at = Some(prepared.at);
+        let event = match status {
+            TaskRunTurnStatus::Blocked => TaskEventPayload::TaskRunTurnBlocked {
+                task_run_turn: terminal_turn,
+                error: error.clone(),
+            },
+            TaskRunTurnStatus::Failed => TaskEventPayload::TaskRunTurnFailed {
+                task_run_turn: terminal_turn,
+                error: error.clone(),
+            },
+            _ => unreachable!(),
+        };
+        let mut events = self.prepare_task_events_for_write(vec![event]).await?;
+        events.append(&mut prepared.events);
+        prepared.events = events;
+        prepared.terminal_revision = Some(revision);
+        Ok(prepared)
+    }
+
     pub async fn prepare_task_terminal_transition(
         &self,
         terminal: TaskEventPayload,
@@ -359,6 +424,7 @@ impl CrudStore {
             delivery,
             at,
             retry_scheduled,
+            terminal_revision: None,
         })
     }
 
@@ -377,6 +443,7 @@ impl CrudStore {
     ) -> Result<TaskTerminalCommitOutcome> {
         let fence = prepared.state.execution_fence.clone();
         let terminal = prepared.terminal.clone();
+        let terminal_revision = prepared.terminal_revision.clone();
         let mut prepared = prepared;
         for _ in 0..16 {
             match self
@@ -391,6 +458,11 @@ impl CrudStore {
                         .await?;
                     if prepared.state.execution_fence != fence {
                         return conflict("execution fence changed while reconciling finish");
+                    }
+                    if let Some(revision) = &terminal_revision {
+                        prepared = self
+                            .prepare_task_terminal_with_revision(prepared, revision.clone())
+                            .await?;
                     }
                 }
                 Err(error)
@@ -410,7 +482,12 @@ impl CrudStore {
                             "protected terminal facts changed while reloading webhook progress",
                         );
                     }
-                    prepared = refreshed;
+                    prepared = if let Some(revision) = &terminal_revision {
+                        self.prepare_task_terminal_with_revision(refreshed, revision.clone())
+                            .await?
+                    } else {
+                        refreshed
+                    };
                 }
                 outcome => return outcome,
             }
@@ -420,8 +497,11 @@ impl CrudStore {
 
     async fn commit_task_terminal_transition_once(
         &self,
-        prepared: PreparedTaskTerminalTransition,
+        mut prepared: PreparedTaskTerminalTransition,
     ) -> Result<TaskTerminalCommitOutcome> {
+        // A retry may receive a clone of the original prepared transition.
+        // Refresh semantic caches before begin while retaining domain fences.
+        prepared.events = self.refresh_task_event_preflight(prepared.events).await?;
         let tx = self
             .connection
             .begin()
@@ -431,7 +511,13 @@ impl CrudStore {
         match outcome {
             Ok(outcome) => {
                 tx.commit().await?;
-                Ok(outcome)
+                Ok(TaskTerminalCommitOutcome {
+                    status: outcome.status,
+                    events: materialize_task_events(outcome.events),
+                    completed_at: outcome.completed_at,
+                    delivery_id: outcome.delivery_id,
+                    retry_scheduled: outcome.retry_scheduled,
+                })
             }
             Err(error) => {
                 let _ = tx.rollback().await;
@@ -619,7 +705,7 @@ impl CrudStore {
         &self,
         db: &C,
         mut prepared: PreparedTaskTerminalTransition,
-    ) -> Result<(Vec<AppendedTaskEvent>, Option<String>)> {
+    ) -> Result<(Vec<DeferredAppendedTaskEvent>, Option<String>)> {
         let current =
             load_terminal_state(db, &prepared.state.task.id, &prepared.state.run.id).await?;
         validate_terminal_policy(&prepared.state, &current)?;
@@ -678,21 +764,21 @@ impl CrudStore {
                 Some(persisted.id)
             }
             (None, Some(_)) => {
-                let delivery_events = prepared
-                    .events
-                    .iter()
+                let delivery_events = std::mem::take(&mut prepared.events)
+                    .into_iter()
                     .filter(|event| {
                         matches!(event.payload(), TaskEventPayload::DeliveryQueued { .. })
                     })
-                    .cloned()
                     .collect();
                 events = self
                     .append_task_events_in_connection(db, delivery_events, at)
                     .await?;
-                events.iter().find_map(|event| match &event.payload {
-                    TaskEventPayload::DeliveryQueued { delivery } => Some(delivery.id.clone()),
-                    _ => None,
-                })
+                events
+                    .iter()
+                    .find_map(|event| match event.payload.as_ref() {
+                        TaskEventPayload::DeliveryQueued { delivery } => Some(delivery.id.clone()),
+                        _ => None,
+                    })
             }
             (None, None) => None,
             _ => return conflict("different stopped retry delivery plan"),
@@ -706,7 +792,7 @@ impl CrudStore {
         &self,
         db: &C,
         mut prepared: PreparedTaskTerminalTransition,
-    ) -> Result<TaskTerminalCommitOutcome> {
+    ) -> Result<DeferredTaskTerminalCommitOutcome> {
         // These exact, bounded reads happen BEFORE RunCompleted/Failed/etc.
         // Serialization, random identity allocation and retry calculation have
         // already finished. No provider work or notification runs in this scope.
@@ -722,6 +808,32 @@ impl CrudStore {
         let run_terminal = task_run_status_from_db(&current.run.status)
             .context("invalid terminal run status")?
             .is_terminal();
+        if let Some(expected) = &prepared.terminal_revision {
+            if !run_terminal
+                && task_status_from_db(&current.task.status)
+                    .is_some_and(|status| status.is_terminal())
+            {
+                return conflict("task ended before revision terminal commit");
+            }
+            let latest = task_run_turn::find_latest_turn_by_run(db, &current.run.id)
+                .await?
+                .context("revision disappeared")?;
+            let latest = crate::task_run_turn_from_db_model(latest)?;
+            let mut expected = expected.clone();
+            if run_terminal {
+                // Replay may observe only this already committed terminal turn.
+                // Run outcome/payload/idempotency are checked below as usual.
+                expected.status = match prepared.terminal {
+                    TaskEventPayload::RunBlocked { .. } => TaskRunTurnStatus::Blocked,
+                    TaskEventPayload::RunFailed { .. } => TaskRunTurnStatus::Failed,
+                    _ => unreachable!(),
+                };
+                expected.completed_at = current.run.completed_at.map(|at| at.timestamp());
+            }
+            if latest != expected {
+                return conflict("revision changed before terminal commit");
+            }
+        }
         if run_terminal
             && current.finish_first_run.is_some()
             && matches!(current.run.status.as_str(), "failed" | "cancelled")
@@ -742,7 +854,7 @@ impl CrudStore {
             let (events, delivery_id) = self
                 .settle_finished_retry_in_connection(db, prepared)
                 .await?;
-            return Ok(TaskTerminalCommitOutcome {
+            return Ok(DeferredTaskTerminalCommitOutcome {
                 status: TaskTerminalCommitStatus::Applied,
                 events,
                 completed_at,
@@ -825,7 +937,7 @@ impl CrudStore {
                 self.finalize_task_terminal_in_connection(db, &prepared, completed_at)
                     .await?;
             }
-            return Ok(TaskTerminalCommitOutcome {
+            return Ok(DeferredTaskTerminalCommitOutcome {
                 status: TaskTerminalCommitStatus::Replayed,
                 events: Vec::new(),
                 completed_at,
@@ -850,7 +962,7 @@ impl CrudStore {
             let events = self
                 .append_task_events_in_connection(db, events, prepared.at)
                 .await?;
-            return Ok(TaskTerminalCommitOutcome {
+            return Ok(DeferredTaskTerminalCommitOutcome {
                 status: TaskTerminalCommitStatus::TaskAlreadyTerminal,
                 events,
                 completed_at: prepared.at,
@@ -909,7 +1021,7 @@ impl CrudStore {
             self.finalize_task_terminal_in_connection(db, &prepared, prepared.at)
                 .await?;
         }
-        Ok(TaskTerminalCommitOutcome {
+        Ok(DeferredTaskTerminalCommitOutcome {
             status: TaskTerminalCommitStatus::Applied,
             events,
             completed_at: prepared.at,
