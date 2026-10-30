@@ -3841,6 +3841,19 @@ async fn reconcile_detached_thread_start(
         );
         return Ok(AgentActionOutboxDispatch::Delivered);
     }
+    // Loading a thread seeds metadata without its Turns. Restore this exact
+    // committed admission before rehydration, preserving any live loaded Turns.
+    let mut thread = processor
+        .thread_manager
+        .thread_get(thread_id)
+        .await
+        .context(pioneer_crud::AgentActionOutboxFailure::PreparationUnavailable)?;
+    thread.turns = vec![turn];
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(thread, None)
+        .await
+        .context(pioneer_crud::AgentActionOutboxFailure::PreparationUnavailable)?;
     let params = &task
         .task
         .metadata
