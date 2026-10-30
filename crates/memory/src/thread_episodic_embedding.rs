@@ -92,6 +92,8 @@ pub struct ThreadEpisodicEmbeddingError {
     pub provider_id: String,
     pub model: String,
     pub message: String,
+    /// Provider-supplied cooldown in milliseconds; never inferred from the message.
+    pub retry_after_ms: Option<u64>,
 }
 
 impl ThreadEpisodicEmbeddingError {
@@ -99,6 +101,7 @@ impl ThreadEpisodicEmbeddingError {
         let provider_id = provider_id.into();
         let model = model.into();
         Self {
+            retry_after_ms: None,
             kind: ThreadEpisodicEmbeddingErrorKind::MissingKey,
             message: format!("embedding provider `{provider_id}` is missing an API key"),
             provider_id,
@@ -110,6 +113,7 @@ impl ThreadEpisodicEmbeddingError {
         let provider_id = provider_id.into();
         let model = model.into();
         Self {
+            retry_after_ms: None,
             kind: ThreadEpisodicEmbeddingErrorKind::MissingModel,
             message: format!("embedding model `{model}` is not installed or available"),
             provider_id,
@@ -126,6 +130,7 @@ impl ThreadEpisodicEmbeddingError {
         let provider_id = provider_id.into();
         let model = model.into();
         Self {
+            retry_after_ms: None,
             kind: ThreadEpisodicEmbeddingErrorKind::DimensionMismatch { expected, actual },
             message: format!(
                 "embedding dimension mismatch for `{provider_id}`/`{model}`: expected {expected}, got {actual}"
@@ -141,6 +146,7 @@ impl ThreadEpisodicEmbeddingError {
         message: impl Into<String>,
     ) -> Self {
         Self {
+            retry_after_ms: None,
             kind: ThreadEpisodicEmbeddingErrorKind::RetryableProviderFailure,
             provider_id: provider_id.into(),
             model: model.into(),
@@ -154,6 +160,7 @@ impl ThreadEpisodicEmbeddingError {
         message: impl Into<String>,
     ) -> Self {
         Self {
+            retry_after_ms: None,
             kind: ThreadEpisodicEmbeddingErrorKind::NonRetryableProviderFailure,
             provider_id: provider_id.into(),
             model: model.into(),

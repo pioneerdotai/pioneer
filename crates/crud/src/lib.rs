@@ -12,6 +12,7 @@ mod model_history;
 mod projector;
 mod repositories;
 pub use repositories::provider_usage::ProviderUsageObservation;
+pub use repositories::turn::TurnExecutionBinding;
 mod task_delivery_lifecycle;
 mod task_delivery_recovery;
 mod task_event_context;
@@ -226,8 +227,8 @@ pub use repositories::task_completion_inbox::{
     mark_task_completion_inbox_read, mark_viewed_task_completion_inbox_read,
 };
 pub use repositories::thread::{
-    ThreadManagementChange, advance_thread_read_cursor, find_thread_read_cursor,
-    thread_read_cursor_from_model,
+    ThreadManagementChange, ThreadReadPosition, advance_thread_read_cursor,
+    find_thread_read_cursor, thread_read_cursor_from_model,
 };
 pub use repositories::turn::{
     NewTurnMessageRevision, PersistedTurnCollaboration, TURN_MESSAGE_GUARD_PAGE_BYTES,
@@ -19057,6 +19058,22 @@ impl CrudStore {
             .collect()
     }
 
+    pub async fn get_turn_execution_binding(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<TurnExecutionBinding>> {
+        turn::find_turn_execution_binding(&self.connection, thread_id, turn_id).await
+    }
+
+    pub async fn get_turn_execution_status(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<TurnStatus>> {
+        turn::find_turn_execution_status(&self.connection, thread_id, turn_id).await
+    }
+
     pub async fn get_turn(&self, thread_id: &str, turn_id: &str) -> Result<Option<(String, Turn)>> {
         let Some(thread_model) = thread::find_thread_by_id(&self.connection, thread_id).await?
         else {
@@ -23114,6 +23131,30 @@ impl CrudStore {
         find_turn_work_projection(&self.connection, turn_id).await
     }
 
+    pub async fn get_turn_work_owner(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<TurnWorkOwner>> {
+        turn::find_turn_work_owner(&self.connection, workspace_id, thread_id, turn_id).await
+    }
+
+    pub async fn get_detached_turn_work_tombstone(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<(i64, i64)>> {
+        turn_event_projection_stream_state::find_detached_work_tombstone(
+            &self.connection,
+            workspace_id,
+            thread_id,
+            turn_id,
+        )
+        .await
+    }
+
     pub async fn get_agent_work_graph_projection_for_turn(
         &self,
         turn_id: &str,
@@ -23695,11 +23736,10 @@ impl CrudStore {
     pub async fn list_thread_read_candidates_page(
         &self,
         workspace_id: &str,
-        after_thread_id: Option<&str>,
+        after: Option<&ThreadReadPosition>,
         limit: u64,
-    ) -> Result<Vec<String>> {
-        thread::list_read_candidates_page(&self.connection, workspace_id, after_thread_id, limit)
-            .await
+    ) -> Result<Vec<ThreadReadPosition>> {
+        thread::list_read_candidates_page(&self.connection, workspace_id, after, limit).await
     }
 
     pub async fn list_threads_for_workspace(
@@ -35192,6 +35232,7 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    mod authorization_reads;
     mod saved_history_read;
     mod task_child_discovery;
     mod task_webhook;

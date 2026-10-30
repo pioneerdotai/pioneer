@@ -35,7 +35,7 @@ pub(crate) fn thread_read_tool_specs() -> Vec<ConfiguredToolSpec> {
     let definitions = [
         (
             "threads_list",
-            "List accessible saved conversations in the current workspace, including hidden internal children and archived conversations. Bounded pages ordered by immutable thread ID. Follow nextCursor until eof; an empty nonterminal page is possible. Metadata changes invalidate cursors; restart listing. Oversized metadata uses UTF-8 JSON fragments: concatenate text by byte offsets before decoding. No search. Read a selected conversation with threads_history_read.",
+            "List accessible saved conversations in the current workspace, including hidden internal children and archived conversations. Bounded pages ordered by created_at DESC, id DESC (newest creation first, not latest activity). Follow nextCursor until eof; an empty nonterminal page is possible. Continuation retains the last candidate's full creation date and ID; unrelated activity does not invalidate it. New threads before that position appear on a fresh first page. Access is rechecked on every page. Oversized metadata uses UTF-8 JSON fragments: concatenate text by byte offsets before decoding; changes to the continued card invalidate its fragments. Invalid or incompatible cursors require restarting the list. No search. Read a selected conversation with threads_history_read.",
             json!({"limit":limit,"cursor":cursor}),
             vec!["limit"],
         ),
@@ -65,10 +65,19 @@ pub(super) struct ThreadReadAuthority {
     pub(super) workspace_id: String,
     root_thread_id: String,
     current_thread_id: String,
+    current_turn_id: String,
     observe_children: bool,
     observe_workspace: bool,
 }
 impl ThreadReadAuthority {
+    fn list_scope(&self, limit: u32) -> String {
+        json!([
+            self.scope("list-created-desc-v1", "", false, limit),
+            self.current_turn_id
+        ])
+        .to_string()
+    }
+
     pub(super) fn scope(
         &self,
         operation: &str,
@@ -97,8 +106,7 @@ impl ThreadReadAuthority {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListCursor {
-    revision: String,
-    after: Option<String>,
+    after: Option<pioneer_crud::ThreadReadPosition>,
     fragment: Option<MetadataFragment>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -191,6 +199,7 @@ impl MessageProcessor {
             workspace_id: context.workspace_id.clone(),
             root_thread_id: envelope.root_thread_id().to_owned(),
             current_thread_id: context.thread_id.clone(),
+            current_turn_id: context.turn_id.clone(),
             observe_children,
             observe_workspace: false,
         };
@@ -288,45 +297,6 @@ impl MessageProcessor {
         ThreadReadCursorCodec::new(secret.as_bytes())
     }
 
-    // Hash bounded, released reads instead of putting a catalog/tree snapshot
-    // into the cursor. Any workspace metadata/lineage edit invalidates a list;
-    // ACLs are separately checked against the current principal on every page.
-    async fn thread_listing_revision(&self, workspace: &str) -> Result<String> {
-        let mut digest = Sha256::new();
-        let mut after = None;
-        loop {
-            let rows = self
-                .crud_store
-                .list_thread_read_candidates_page(workspace, after.as_deref(), CANDIDATE_QUANTUM)
-                .await?;
-            let done = rows.len() < CANDIDATE_QUANTUM as usize;
-            for id in &rows {
-                let row = self
-                    .crud_store
-                    .get_thread_by_id(id)
-                    .await?
-                    .ok_or_else(|| anyhow!("cursor is stale; restart reading"))?;
-                let lineage = self.crud_store.get_task_thread_lineage(id).await?;
-                digest.update(serde_json::to_vec(&json!([
-                    id,
-                    row.workspace_id,
-                    row.name,
-                    row.preview,
-                    row.status,
-                    row.sidebar_visibility,
-                    row.created_at,
-                    row.updated_at,
-                    lineage
-                ]))?);
-            }
-            after = rows.last().cloned();
-            if done {
-                break;
-            }
-        }
-        Ok(hex::encode(digest.finalize()))
-    }
-
     // Children depend on actual parent edges within the requested traversal and
     // the fields they return, not unrelated workspace activity. Recomputing the
     // subtree also detects reparenting/deletion ahead of the current position.
@@ -401,56 +371,61 @@ impl MessageProcessor {
         params: ThreadsListParams,
         codec: &ThreadReadCursorCodec,
     ) -> Result<Value> {
-        let scope = authority.scope("list", "", false, params.limit);
+        // Changing only the list operation's authenticated scope rejects legacy
+        // ID-ascending/revision cursors without changing history or children.
+        let scope = authority.list_scope(params.limit);
         let state: Option<ListCursor> = params
             .cursor
             .as_deref()
             .map(|c| codec.decode(c, &scope))
             .transpose()?;
-        let revision = self
-            .thread_listing_revision(&authority.workspace_id)
-            .await?;
-        ensure!(
-            state
-                .as_ref()
-                .is_none_or(|state| state.revision == revision),
-            "cursor is stale; restart reading"
-        );
-        let rows = self
-            .crud_store
-            .list_thread_read_candidates_page(
-                &authority.workspace_id,
-                state.as_ref().and_then(|s| s.after.as_deref()),
-                CANDIDATE_QUANTUM,
-            )
-            .await?;
-        let mut threads = Vec::new();
         let mut state = state.unwrap_or(ListCursor {
-            revision: revision.clone(),
             after: None,
             fragment: None,
         });
-        let mut done = rows.len() < CANDIDATE_QUANTUM as usize;
+        let continuing_fragment = state.fragment.is_some();
+        let rows = if let Some(fragment) = &state.fragment {
+            let position = state
+                .after
+                .as_ref()
+                .filter(|position| position.id == fragment.thread_id)
+                .ok_or_else(|| anyhow!("invalid list cursor"))?;
+            ensure!(
+                self.thread_source_readable(authority, &fragment.thread_id)
+                    .await?,
+                "source unavailable or access denied"
+            );
+            // Resume this exact card, regardless of new candidates around it.
+            // Its digest is checked by metadata_page_record below. Ordinary
+            // completed candidates never need to be looked up again.
+            vec![position.clone()]
+        } else {
+            self.crud_store
+                .list_thread_read_candidates_page(
+                    &authority.workspace_id,
+                    state.after.as_ref(),
+                    CANDIDATE_QUANTUM,
+                )
+                .await?
+        };
+        let mut threads = Vec::new();
+        let mut done = !continuing_fragment && rows.len() < CANDIDATE_QUANTUM as usize;
         for (index, row) in rows.iter().enumerate() {
-            if self.thread_source_readable(authority, row).await? {
-                let metadata = self.thread_read_metadata(authority, row).await?;
+            if self.thread_source_readable(authority, &row.id).await? {
+                let metadata = self.thread_read_metadata(authority, &row.id).await?;
                 let (metadata, fragment) = metadata_page_record(
                     metadata,
                     state.fragment.as_ref(),
                     |candidate, fragment| {
                         let next = codec.encode(
                             &ListCursor {
-                                revision: revision.clone(),
-                                after: if fragment.is_some() {
-                                    state.after.clone()
-                                } else {
-                                    Some(row.clone())
-                                },
+                                after: Some(row.clone()),
                                 fragment: fragment.cloned(),
                             },
                             &scope,
                         )?;
-                        let done = fragment.is_none()
+                        let done = !continuing_fragment
+                            && fragment.is_none()
                             && index + 1 == rows.len()
                             && rows.len() < CANDIDATE_QUANTUM as usize;
                         let next = if done { None } else { Some(next) };
@@ -467,17 +442,23 @@ impl MessageProcessor {
                     break;
                 };
                 threads.push(metadata);
+                state.after = Some(row.clone());
                 state.fragment = fragment;
                 if state.fragment.is_some() {
                     done = false;
                     break;
                 }
             } else {
-                ensure!(state.fragment.is_none(), "cursor is stale; restart reading");
+                ensure!(
+                    state.fragment.is_none(),
+                    "source unavailable or access denied"
+                );
             }
             state.after = Some(row.clone());
             if threads.len() == params.limit as usize {
-                done = index + 1 == rows.len() && rows.len() < CANDIDATE_QUANTUM as usize;
+                done = !continuing_fragment
+                    && index + 1 == rows.len()
+                    && rows.len() < CANDIDATE_QUANTUM as usize;
                 break;
             }
         }
@@ -490,12 +471,6 @@ impl MessageProcessor {
         } else {
             Some(codec.encode(&state, &scope)?)
         };
-        ensure!(
-            self.thread_listing_revision(&authority.workspace_id)
-                .await?
-                == revision,
-            "cursor is stale; restart reading"
-        );
         Ok(json!({"threads":threads,"nextCursor":next,"eof":done}))
     }
 
@@ -927,19 +902,50 @@ impl ThreadReadHandler {
 
 // Storage errors may contain SQL/resource identities. Never expose them through
 // an agent tool; only the bounded public error vocabulary crosses this boundary.
+const PUBLIC_READ_ERRORS: [(&str, &str); 5] = [
+    (
+        "cursor is stale; restart reading from the first page",
+        "read_source_changed",
+    ),
+    (
+        "invalid or incompatible cursor; restart reading with the same resource and parameters",
+        "read_cursor_incompatible",
+    ),
+    ("limit must be between 1 and 100", "read_invalid_parameters"),
+    ("invalid read parameters", "read_invalid_parameters"),
+    (
+        "source unavailable or access denied",
+        "read_source_unavailable",
+    ),
+];
+
+/// Only exact native public messages can cross the CLI adapter. Never publish
+/// arbitrary ToolError diagnostics, including router/runtime failures.
+pub(crate) fn public_read_error(error: &ToolError) -> (&'static str, &'static str) {
+    if let ToolError::InvalidArguments(message) = error {
+        if let Some(public) = PUBLIC_READ_ERRORS
+            .iter()
+            .find(|(text, _)| *text == message.as_str())
+        {
+            return *public;
+        }
+    }
+    PUBLIC_READ_ERRORS[4]
+}
+
 fn safe_read_error(error: &anyhow::Error) -> ToolError {
     let message = error.to_string();
     let safe = if message.contains("cursor is stale") || message.contains("source changed; restart")
     {
-        "cursor is stale; restart reading from the first page"
+        PUBLIC_READ_ERRORS[0].0
     } else if message.contains("cursor") {
-        "invalid or incompatible cursor; restart reading with the same resource and parameters"
+        PUBLIC_READ_ERRORS[1].0
     } else if message.starts_with("limit must") {
-        "limit must be between 1 and 100"
+        PUBLIC_READ_ERRORS[2].0
     } else if message.starts_with("invalid ") && message.ends_with(" parameters") {
-        "invalid read parameters"
+        PUBLIC_READ_ERRORS[3].0
     } else {
-        "source unavailable or access denied"
+        PUBLIC_READ_ERRORS[4].0
     };
     ToolError::invalid_arguments(safe)
 }

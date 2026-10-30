@@ -20,6 +20,8 @@ Use Threads for conversation discovery, source reading, and permitted conversati
 
 Tasks and attached subagents have separate skills, `system:pioneer/tasks` and `system:pioneer/subagents`. Do not apply their wait, review, or accept protocol to a thread turn.
 
+Thread writes and launches are conversation actions, not an inter-agent communication channel. Do not use them for parent/child/sibling coordination, progress reports, questions, blockers, or task-result handoffs. Use the Tasks/Subagents result and review flow instead. Ordinary user-requested conversation actions remain available within their granted permissions.
+
 ## Tool Discovery And Authority
 
 A native agent opens hidden tools by requesting the domain, not individual names:
@@ -46,7 +48,7 @@ Read access is scoped to the initiating user's current permissions, workspace, a
 
 ## Listing And Search
 
-`threads_list` returns pages of accessible workspace threads, including accessible hidden internal and archived conversations, ordered by immutable thread ID. Follow `nextCursor` until `eof`, including empty nonterminal pages. Metadata can be fragmented rather than shortened.
+`threads_list` returns pages of accessible workspace threads, including accessible hidden internal and archived conversations, ordered by creation time newest first (`created_at DESC, id DESC` for ties), not by latest activity. Follow `nextCursor` until `eof`, including empty nonterminal pages. Continuation retains the full creation date and ID of the last examined candidate, including candidates that cannot be disclosed. Unrelated metadata edits and activity do not reset it; new threads before the current position appear on a fresh first page. Access is checked on every page. Metadata can be fragmented rather than shortened; finish the same card before interpreting it. Changes to that continued card invalidate its fragments. An invalid, incompatible, or old-format cursor requires restarting the list with the original parameters; never edit it or silently substitute a first page.
 
 `threads_search` takes `query`, `limit`, and optional `cursor`. The server chooses lexical/hybrid retrieval automatically; do not send a mode or embeddings. Search considers all accessible indexed threads and their associated indexes. A page contains up to 100 matching fragments and 2 MiB; these are page sizes, not limits on the threads, index files, or candidates considered. `nextCursor` requests the next results page, not an unfinished scan of remaining files. Keep `query` and `limit` unchanged during continuation.
 
