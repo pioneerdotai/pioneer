@@ -1222,7 +1222,17 @@ struct CancellationSchemaFixtureMigrator;
 
 impl MigratorTrait for CancellationSchemaFixtureMigrator {
     fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-        migrations_through(&cancellation_migration_name())
+        // These upgrade proofs need the exact production prefix, rather than
+        // the tracking helper's current TaskEvent storage compatibility schema.
+        let cancellation = cancellation_migration_name();
+        let mut migrations = migrations_before(&cancellation);
+        migrations.push(
+            Migrator::migrations()
+                .into_iter()
+                .find(|migration| migration.name() == cancellation)
+                .unwrap(),
+        );
+        migrations
     }
 }
 
@@ -1233,9 +1243,10 @@ async fn cancellation_schema_store(workspace_id: &str) -> CrudStore {
     let store =
         test_store_with_workspace_migrator::<CancellationSchemaFixtureMigrator>(workspace_id).await;
     add_thread_unread_column_to_legacy_fixture(&store).await;
-    // Keep down(1) aimed at cancellation, without applying later migrations.
+    // Keep down(1) aimed at cancellation, without registering later migrations.
     // These tests still use today's terminal projector: its CLI binding Entity
-    // selects the locator even though these fixtures have no CLI/frozen roots.
+    // selects storage metadata even though these fixtures have no CLI/frozen
+    // roots. Pure upgrade proofs above/below never use this compatibility setup.
     let transaction = store.connection.begin().await.unwrap();
     let schema = SchemaManager::new(&*transaction);
     assert!(
@@ -1258,13 +1269,23 @@ async fn cancellation_schema_store(workspace_id: &str) -> CrudStore {
         )
         .await
         .unwrap();
+    // Use the real physical projection after adding its locator prerequisite;
+    // leave migration receipts untouched so cancellation remains the last step.
+    for migration in Migrator::migrations().into_iter().filter(|migration| {
+        matches!(
+            migration.name(),
+            "m20261027_000001_portable_payload" | "m20261027_000003_portable_cli_mapping"
+        )
+    }) {
+        migration.up(&schema).await.unwrap();
+    }
     assert!(
         pioneer_entity::turn_cli_runtime_binding::Entity::find()
             .one(&transaction)
             .await
             .unwrap()
             .is_none(),
-        "the compatibility column must not reclassify existing CLI roots"
+        "the compatibility projection must not reclassify existing CLI roots"
     );
     transaction.commit().await.unwrap();
     add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
@@ -2952,21 +2973,11 @@ async fn accepted_unactivated_stop_and_activation_share_a_durable_writer_fence()
         };
         let (store, turn, plan, expected) = unactivated_fixture(suffix).await;
         if claim_before_stop {
-            assert!(
-                store
-                    .claim_unactivated_agent_turn(&expected)
-                    .await
-                    .unwrap()
-            );
+            assert!(store.claim_unactivated_agent_turn(&expected).await.unwrap());
             let claimed = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
             assert_eq!(claimed.status, crate::TurnExecutionStatus::Starting);
             assert!(claimed.started_at.is_some());
-            assert!(
-                !store
-                    .claim_unactivated_agent_turn(&expected)
-                    .await
-                    .unwrap()
-            );
+            assert!(!store.claim_unactivated_agent_turn(&expected).await.unwrap());
         }
         let event = interrupted(&turn, &plan, "Stop before runtime");
         store
@@ -3011,12 +3022,7 @@ async fn accepted_unactivated_stop_and_activation_share_a_durable_writer_fence()
                 .await
                 .is_err()
         );
-        assert!(
-            !store
-                .claim_unactivated_agent_turn(&expected)
-                .await
-                .unwrap()
-        );
+        assert!(!store.claim_unactivated_agent_turn(&expected).await.unwrap());
         store
             .materialize_unactivated_turn_cancellation_owned_as(
                 event,
@@ -3209,7 +3215,9 @@ async fn unactivated_refusal_and_stop_preserve_activation_terminal_results_and_r
     let (store, turn, plan, expected) = unactivated_fixture("new_owner").await;
     let replacement = store
         .claim_expired_turn_execution(
-            &expected, "replacement-owner", expected.lease_until.timestamp() + 1,
+            &expected,
+            "replacement-owner",
+            expected.lease_until.timestamp() + 1,
             expected.lease_until.timestamp() + 101,
         )
         .await
@@ -3262,7 +3270,9 @@ async fn unactivated_refusal_and_stop_preserve_activation_terminal_results_and_r
         .unwrap();
     let replacement = store
         .claim_expired_turn_execution(
-            &expected, OWNER, expected.lease_until.timestamp() + 1,
+            &expected,
+            OWNER,
+            expected.lease_until.timestamp() + 1,
             expected.lease_until.timestamp() + 101,
         )
         .await

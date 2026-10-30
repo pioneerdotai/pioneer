@@ -1,3 +1,6 @@
+#[path = "tests/control_rpc.rs"]
+mod control_rpc;
+
 #[path = "tests/detached_work_projection.rs"]
 mod detached_work_projection;
 
@@ -17311,6 +17314,12 @@ fn owned_voice_ingress_case(
         )
         .await;
         let mut entered_rx = Some(entered_rx);
+        let last_sequence = match terminal {
+            "long_context" | "long_tail_error" | "buffered_long" => 200,
+            "closed_13" => 129,
+            "closed_17" => 169,
+            _ => 60,
+        };
         // Feed the first backlog packet before waiting for the 3 s preview:
         // 48,000 samples leave an incomplete 512-sample VAD frame. This packet
         // completes it without changing the source PCM or its total duration.
@@ -17365,12 +17374,6 @@ fn owned_voice_ingress_case(
             );
             // Duplicate accepted sequences are ACKed without replay. Keep a full
             // second source span and a seven-sample tail behind native work.
-            let last_sequence = match terminal {
-                "long_context" | "long_tail_error" | "buffered_long" => 200,
-                "closed_13" => 129,
-                "closed_17" => 169,
-                _ => 60,
-            };
             for sequence in 29..=last_sequence {
                 let samples = if sequence == last_sequence
                     && !matches!(terminal, "closed_13" | "closed_17")
@@ -17509,7 +17512,9 @@ fn owned_voice_ingress_case(
         );
         let before_events = serde_json::to_value(&before.events).unwrap();
         let finalize = json!({"jsonrpc":"2.0","id":finalize_id,"method":"voice/session/finalize","params":{
-            "session_id":session.session_id,"context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":turn_id}
+            "session_id":session.session_id,"context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":turn_id},
+            "audio_integrity": {"next_sequence": if early { last_sequence + 1 } else { 1 },
+                "normalized_samples": if early { last_sequence * 1600 + if matches!(terminal, "closed_13" | "closed_17") { 1600 } else { 7 } } else { 960 }}
         }});
         let expected_startup_key = if terminal == "runtime_error" {
             None
@@ -17996,6 +18001,7 @@ fn owned_voice_ingress_case(
                     processor.clone().process_owned_request(peer_context, json!({
                         "jsonrpc":"2.0", "id":finalize_id, "method":"voice/session/finalize",
                         "params":{"session_id":next_session.session_id,
+                            "audio_integrity":{"next_sequence":40,"normalized_samples":64000},
                             "context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":next_turn}}
                     }).to_string()).await;
                     let (ack, result) = recv_response_and_notification_by_id_method(
@@ -18192,6 +18198,7 @@ async fn submit_test_voice_turn(
                 "method": "voice/session/finalize",
                 "params": {
                     "session_id": start_payload.session_id,
+                    "audio_integrity": {"next_sequence":1,"normalized_samples":960},
                     "context": {
                         "workspace_id": workspace_id,
                         "thread_id": thread_id,
@@ -18841,7 +18848,8 @@ async fn voice_session_transcript_starts_turn_and_preserves_authorized_context_a
         "method": "voice/session/finalize",
         "params": {
             "session_id": start_payload.session_id,
-            "context": voice_context
+            "context": voice_context,
+            "audio_integrity": {"next_sequence":1,"normalized_samples":960}
         }
     });
     processor
@@ -19061,6 +19069,7 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
         "method": "voice/session/finalize",
         "params": {
             "session_id": start_payload.session_id,
+            "audio_integrity": {"next_sequence":0,"normalized_samples":0},
             "context": {
                 "workspace_id": workspace_id,
                 "thread_id": thread.thread.id,
@@ -19115,6 +19124,223 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
         missing_turn.is_none(),
         "no-speech voice finalize must not create a transcript-only turn"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_new_session() {
+    for case in [
+        "missing_tail",
+        "preview_missing_tail",
+        "gap",
+        "malformed",
+        "legacy",
+        "late_old",
+    ] {
+        let (tx, mut rx) = mpsc::channel(32);
+        let sessions = Arc::new(SessionManager::new());
+        let connection_id = register_authenticated_test_connection(&sessions, tx).await;
+        let (workspaces, crud, workspace_id) = setup_workspace_manager().await;
+        let mut processor = MessageProcessor::new(
+            Arc::new(ThreadManager::new("o4-mini", "openai")),
+            test_provider(),
+            sessions,
+            workspaces,
+            crud.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )
+        .with_test_voice_transcript("controlled transcript");
+        let (preview_tx, mut preview_rx) = tokio::sync::mpsc::unbounded_channel();
+        if case == "preview_missing_tail" {
+            processor.voice_test_transcriber = Some(Arc::new(move |_| {
+                let text = "successful preliminary transcript".to_owned();
+                let _ = preview_tx.send(());
+                Ok(text)
+            }));
+        }
+        let thread = start_thread_for_artifact_test(
+            &processor,
+            connection_id,
+            &mut rx,
+            &workspace_id,
+            "thr_voice_integrity",
+        )
+        .await;
+        let turn_id = "turn_voice_integrity_0001";
+        let old_session = if case == "late_old" {
+            let old = start_test_voice_session(
+                &processor,
+                connection_id,
+                &mut rx,
+                &workspace_id,
+                &thread.thread.id,
+                "turn_voice_old_integrity",
+                &generate_test_request_id("voice", "old_start"),
+            )
+            .await;
+            let cancel_id = generate_test_request_id("voice", "old_cancel");
+            processor
+                .process_request_for_connection(
+                    connection_id,
+                    &json!({
+                        "jsonrpc":"2.0","id":cancel_id,"method":"voice/session/cancel",
+                        "params":{"session_id":old.session_id}
+                    })
+                    .to_string(),
+                )
+                .await;
+            let _ = recv_response_and_notification_by_id_method(
+                &mut rx,
+                &cancel_id,
+                events::VOICE_SESSION_RESULT,
+            )
+            .await;
+            Some(old)
+        } else {
+            None
+        };
+        let session = start_test_voice_session(
+            &processor,
+            connection_id,
+            &mut rx,
+            &workspace_id,
+            &thread.thread.id,
+            turn_id,
+            &generate_test_request_id("voice", "integrity_start"),
+        )
+        .await;
+        assert_eq!(session.audio_integrity_version, Some(1));
+        if let Some(old) = old_session {
+            let mut late = voice_test_frame(&old.session_id, 0, 7, 12000);
+            processor
+                .process_binary_frame_for_connection(connection_id, &late)
+                .await
+                .unwrap();
+            late.pop();
+            processor
+                .process_binary_frame_for_connection(connection_id, &late)
+                .await
+                .unwrap();
+        }
+        let packets = if case == "preview_missing_tail" {
+            31
+        } else {
+            1
+        };
+        for sequence in 0..packets {
+            processor
+                .process_binary_frame_for_connection(
+                    connection_id,
+                    &voice_test_frame(
+                        &session.session_id,
+                        sequence,
+                        if case == "preview_missing_tail" {
+                            1600
+                        } else {
+                            960
+                        },
+                        12000,
+                    ),
+                )
+                .await
+                .unwrap();
+            let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
+        }
+        if case == "preview_missing_tail" {
+            tokio::time::timeout(Duration::from_secs(5), preview_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                crud.get_turn(&thread.thread.id, turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let expected = match case {
+            "gap" => {
+                processor
+                    .process_binary_frame_for_connection(
+                        connection_id,
+                        &voice_test_frame(&session.session_id, 2, 7, 12000),
+                    )
+                    .await
+                    .unwrap();
+                let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
+                json!({"next_sequence":3,"normalized_samples":967})
+            }
+            "malformed" => {
+                let mut frame = voice_test_frame(&session.session_id, 1, 7, 12000);
+                frame.pop();
+                processor
+                    .process_binary_frame_for_connection(connection_id, &frame)
+                    .await
+                    .unwrap();
+                json!({"next_sequence":1,"normalized_samples":960})
+            }
+            "legacy" => JsonValue::Null,
+            "late_old" => json!({"next_sequence":1,"normalized_samples":960}),
+            "preview_missing_tail" => json!({"next_sequence":32,"normalized_samples":49607}),
+            _ => json!({"next_sequence":2,"normalized_samples":967}),
+        };
+        let request_id = generate_test_request_id("voice", "integrity_finalize");
+        let mut request = json!({"jsonrpc":"2.0","id":request_id,"method":"voice/session/finalize",
+            "params":{"session_id":session.session_id,"audio_integrity":expected,
+                "context":{"workspace_id":workspace_id,"thread_id":thread.thread.id,"turn_id":turn_id}}});
+        if case == "legacy" {
+            request["params"]
+                .as_object_mut()
+                .unwrap()
+                .remove("audio_integrity");
+        }
+        processor
+            .process_request_for_connection(connection_id, &request.to_string())
+            .await;
+        let (_ack, terminal) = recv_response_and_notification_by_id_method(
+            &mut rx,
+            &request_id,
+            events::VOICE_SESSION_RESULT,
+        )
+        .await;
+        let terminal: VoiceSessionResultNotification =
+            serde_json::from_value(terminal.params.unwrap()).unwrap();
+        assert_eq!(
+            terminal.outcome,
+            if case == "late_old" {
+                VoiceSessionOutcome::TurnStarted
+            } else {
+                VoiceSessionOutcome::Failed
+            },
+            "{case}"
+        );
+        assert_eq!(
+            crud.get_turn(&thread.thread.id, turn_id)
+                .await
+                .unwrap()
+                .is_some(),
+            case == "late_old",
+            "{case}"
+        );
+        assert!(
+            processor
+                .voice_sessions
+                .lookup_session(&session.session_id, connection_id)
+                .is_err()
+        );
+        while let Ok(Message::Text(payload)) = rx.try_recv() {
+            let value: JsonValue = serde_json::from_str(&payload).unwrap();
+            if case != "late_old" {
+                assert_ne!(value["method"], events::TURN_STARTED, "{case}");
+            }
+            assert_ne!(
+                value["method"],
+                events::VOICE_SESSION_RESULT,
+                "duplicate terminal: {case}"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -28570,15 +28796,16 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         "background root question",
     )
     .await;
+    // Keep the root above the unknown model's 128k fallback context even with
+    // UTF-16 estimation, so the summarizer barrier requires a provider call.
+    let history_answer = "🧪 ".repeat(180_000);
+    assert!(pioneer_compaction::text_tokens(&history_answer) > 128_000);
     root_conversation_compaction::answer(
         &history,
         history_thread,
         history_turn,
         history_at,
-        // Exceed the context budget with dense tokens, rather than megabytes
-        // of low-density text that require many incremental fragment fits.
-        // The spaces keep tokenizer pieces bounded as well.
-        &"🧪 ".repeat(60_000),
+        &history_answer,
     )
     .await;
     let pending = crud_store
@@ -31669,7 +31896,7 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     .await;
     // Make the edited unit exceed the transfer token target so it must enter
     // the summary, even if its replacement row sorts into the retained tail.
-    let edited_body = format!("EDITED ACCEPTED SOURCE 00 {}", "b ".repeat(70_000));
+    let edited_body = format!("EDITED ACCEPTED SOURCE 00 {}", "b ".repeat(120_000));
     assert!(pioneer_compaction::text_tokens(&edited_body) > max_input_tokens);
     store
         .edit_turn_message(pioneer_crud::EditTurnMessageRequest {
@@ -32375,7 +32602,10 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
             .await;
         let thread = format!("pending-heartbeat-{case}");
         let history_created_at = super::now_timestamp_secs().saturating_sub(1);
+        let mut history_tokens = 0;
         for index in 0..12 {
+            let text = format!("PENDING HEARTBEAT CHUNK {index:02} {}", "a ".repeat(10_000));
+            history_tokens += pioneer_compaction::text_tokens(&text);
             seed_completed_task_parent_with_inputs_at(
                 &processor,
                 &workspace,
@@ -32383,13 +32613,17 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
                 &format!("pending-heartbeat-source-{index:02}"),
                 "accepted history",
                 vec![UserInput::Text {
-                    text: format!("PENDING HEARTBEAT CHUNK {index:02} {}", "a ".repeat(6_500)),
+                    text,
                     text_elements: Vec::new(),
                 }],
                 history_created_at,
             )
             .await;
         }
+        assert!(
+            history_tokens > 50_000,
+            "heartbeat requires foreground compaction"
+        );
         open_persisted_child_for_test(
             &processor,
             connection,
@@ -32934,7 +33168,10 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
         )))
         .await;
     let thread = "cancelled-oversized-cli-transfer";
+    let mut history_tokens = 0;
     for index in 0..12 {
+        let text = format!("CHUNK {index:02} {}", "a ".repeat(10_000));
+        history_tokens += pioneer_compaction::text_tokens(&text);
         seed_completed_task_parent_with_inputs(
             &processor,
             &workspace,
@@ -32942,12 +33179,16 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
             &format!("source-{index:02}"),
             "large history",
             vec![UserInput::Text {
-                text: format!("CHUNK {index:02} {}", "a ".repeat(6_500)),
+                text,
                 text_elements: Vec::new(),
             }],
         )
         .await;
     }
+    assert!(
+        history_tokens > 50_000,
+        "cancellation requires foreground compaction"
+    );
     open_persisted_child_for_test(
         &processor,
         connection,
@@ -33447,22 +33688,22 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             .insert("openai", summary_provider.clone())
             .expect("CLI test provider should register");
         discover_native_capture_models(&provider_registry, workspace_id.as_str()).await;
-        let mut processor = Arc::new(with_enabled_test_cli_runtime_catalog(
-            MessageProcessor::new(
-                thread_manager,
-                provider_registry.clone(),
-                session_manager.clone(),
-                workspace_manager.clone(),
-                crud_store.clone(),
-                test_gateway_secrets(),
-                test_summary_config(),
-                test_tool_loop_config(),
-            )
-            .with_cli_runtime_manager_for_tests(cli_manager.clone())
-            .with_cli_mcp_readiness_override_for_tests(
-                supported_test_cli_mcp_readiness(runtime_kind),
-            ),
-        ));
+        let processor = MessageProcessor::new(
+            thread_manager,
+            provider_registry.clone(),
+            session_manager.clone(),
+            workspace_manager.clone(),
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone())
+        .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(runtime_kind));
+        // The CLI settings helper changes the configuration home, but the
+        // artifact service still owns the blob directory from construction.
+        let artifact_store_home = processor.artifact_runtime_home.clone();
+        let mut processor = Arc::new(with_enabled_test_cli_runtime_catalog(processor));
         processor
             .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
             .await
@@ -34675,7 +34916,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 // skill receipts and identity source fingerprints intact.
                 let runtime_home = processor.artifact_runtime_home.clone();
                 processor = Arc::new(
-                    MessageProcessor::new(
+                    MessageProcessor::new_with_memory_runtime(
                         cold_thread_manager.clone(),
                         provider_registry.clone(),
                         session_manager.clone(),
@@ -34684,6 +34925,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         test_gateway_secrets(),
                         test_summary_config(),
                         test_tool_loop_config(),
+                        Arc::new(GatewayMemoryRuntime::disabled(crud_store.clone())),
+                        artifact_store_home.clone(),
+                        pioneer_config::GatewayArtifactsConfig::default(),
                     )
                     .with_cli_runtime_manager_for_tests(cli_manager.clone())
                     .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
@@ -34745,8 +34989,8 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 .connection_context(connection)
                 .await
                 .expect("manual child connection context must remain available");
-            Arc::clone(&processor)
-                .process_owned_request(
+            let (_, admission_events) = crate::public_error::test_support::capture_events_async(
+                Arc::clone(&processor).process_owned_request(
                     context,
                     json!({
                         "jsonrpc": "2.0",
@@ -34770,9 +35014,22 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         }
                     })
                     .to_string(),
-                )
-                .await;
-            let response = recv_response_by_id(&mut rx, &request_id).await;
+                ),
+            )
+            .await;
+            let payload = recv_jsonrpc_payload_by_id(&mut rx, &request_id).await;
+            let response: JsonRpcResponse = match serde_json::from_str(&payload) {
+                Ok(response) => response,
+                Err(error) => {
+                    let progress = pioneer_entity::compaction_runner_state::Entity::find()
+                        .all(&crud_store.database_connection())
+                        .await
+                        .unwrap();
+                    panic!(
+                        "manual {runtime_id} child follow-up {followup_index} rejected: {error}; payload: {payload}; compaction: {progress:?}; admission_reports: {admission_events:#?}"
+                    );
+                }
+            };
             let accepted: TurnStartResponse = serde_json::from_value(response.result)
                 .expect("manual child follow-up must be accepted as a foreground turn");
             assert_eq!(accepted.turn.id, followup_turn_id);
@@ -81573,6 +81830,14 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
         .await;
     let tool_fixture = tempfile::tempdir().unwrap();
     let executions = tool_fixture.path().join("executions");
+    #[derive(Debug)]
+    struct ConfirmedContextOverflow;
+    impl std::fmt::Display for ConfirmedContextOverflow {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("provider context limit exceeded")
+        }
+    }
+    impl std::error::Error for ConfirmedContextOverflow {}
     struct OverflowProvider(std::sync::Mutex<Vec<ChatRequest>>, Vec<ProviderToolCall>);
     #[async_trait::async_trait]
     impl Provider for OverflowProvider {
@@ -81606,7 +81871,7 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
                     tool_calls: self.1.clone(),
                 });
             }
-            anyhow::bail!("provider error: maximum context length exceeded")
+            Err(anyhow::Error::new(ConfirmedContextOverflow))
         }
         async fn stream_chat(
             &self,
@@ -81614,6 +81879,16 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
         ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
         {
             anyhow::bail!("non-stream fixture")
+        }
+        fn classify_failure(
+            &self,
+            error: &anyhow::Error,
+        ) -> Option<pioneer_provider::ProviderFailureClassification> {
+            error.downcast_ref::<ConfirmedContextOverflow>().map(|_| {
+                pioneer_provider::ProviderFailureClassification::new(
+                    pioneer_protocol::ProviderFailureClass::ContextTooLarge,
+                )
+            })
         }
     }
     let calls = if with_tool {
@@ -83956,7 +84231,9 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
                         id: format!("background-answer-{index}"),
                         text: format!(
                             "background answer {index} {}",
-                            "retained ".repeat(if index == 0 { 60_000 } else { 80 })
+                            // Keep the baseline below the 128k fallback window with UTF-16
+                            // estimation; fixed input below exercises the exact boundary.
+                            "retained ".repeat(if index == 0 { 20_000 } else { 80 })
                         ),
                         phase: Default::default(),
                         markdown: None,
@@ -84236,11 +84513,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
             .count(),
         2
     );
-    let available = std::cmp::min(
-        baseline.context_tokens.unwrap().saturating_sub(reserve),
-        baseline.input_limit.unwrap_or(u64::MAX),
-    );
-    let raw_boundary = (available as u128 * 100 / 105).min(u64::MAX as u128) as u64;
+    let raw_boundary = crate::compaction::estimated_input_capacity(&budget, reserve, false);
     let fitting_fixed = raw_boundary.saturating_sub(estimate);
     assert!(budget.fits(estimate + fitting_fixed, reserve, false));
     assert!(!budget.fits(duplicated_estimate + fitting_fixed, reserve, false));
@@ -85698,7 +85971,10 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
 
     let context = fitting.context_tokens.unwrap();
     let reserve = fitting.output_reserve.unwrap();
-    let fixed = (context - reserve) * 100 / 105 - 6_000;
+    let model_budget =
+        pioneer_compaction::ModelBudget::new(Some(context), fitting.input_limit, None);
+    let fixed = crate::compaction::estimated_input_capacity(&model_budget, reserve, false)
+        .saturating_sub(6_000);
     let mut compacted = HistoryCheckDiagnostic::default();
     let outcome = crate::compaction::prepare_completed_history_owned(
         &harness.processor,

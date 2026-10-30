@@ -2,13 +2,19 @@ use super::microphone::{
     DesktopMicrophoneFormatRequest, DesktopMicrophoneGateReport, DesktopMicrophoneGateState,
 };
 use pioneer_client::composer::voice::{ComposerVoiceFinalizeRequest, ComposerVoiceStartRequest};
-use pioneer_client::voice::resampling::VoiceResampler;
+use pioneer_client::voice::{
+    capture_worker::{CaptureQueueError, CaptureQueueSender, capture_queue},
+    resampling::VoiceResampler,
+};
 use pioneer_protocol::{
     VoiceAudioEncoding, VoiceAudioFormat, VoiceSessionFinalizeResponse, VoiceSessionStartContext,
     VoiceTurnContext,
 };
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -88,7 +94,116 @@ pub(crate) enum DesktopVoiceInput<'a> {
         sample_rate_hz: u32,
         captured_at_unix_ms: Option<u64>,
     },
+    /// Native source representation is copied here, converted only by the worker.
+    NativeSamples {
+        samples: DesktopNativeSamples<'a>,
+        channels: u16,
+        sample_rate_hz: u32,
+        captured_at_unix_ms: Option<u64>,
+    },
     /// A route discontinuity can retain the same reported sample format.
+    Discontinuity,
+}
+
+pub(crate) enum DesktopNativeSamples<'a> {
+    I8(&'a [i8]),
+    I16(&'a [i16]),
+    I32(&'a [i32]),
+    U8(&'a [u8]),
+    U16(&'a [u16]),
+    U32(&'a [u32]),
+    F32(&'a [f32]),
+    F64(&'a [f64]),
+}
+
+enum OwnedDesktopSamples {
+    I8(Vec<i8>),
+    I16(Vec<i16>),
+    I32(Vec<i32>),
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+}
+impl DesktopNativeSamples<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::I8(samples) => samples.len(),
+            Self::I16(samples) => samples.len(),
+            Self::I32(samples) => samples.len(),
+            Self::U8(samples) => samples.len(),
+            Self::U16(samples) => samples.len(),
+            Self::U32(samples) => samples.len(),
+            Self::F32(samples) => samples.len(),
+            Self::F64(samples) => samples.len(),
+        }
+    }
+    fn bytes(&self) -> usize {
+        match self {
+            Self::I8(samples) => std::mem::size_of_val(*samples),
+            Self::I16(samples) => std::mem::size_of_val(*samples),
+            Self::I32(samples) => std::mem::size_of_val(*samples),
+            Self::U8(samples) => std::mem::size_of_val(*samples),
+            Self::U16(samples) => std::mem::size_of_val(*samples),
+            Self::U32(samples) => std::mem::size_of_val(*samples),
+            Self::F32(samples) => std::mem::size_of_val(*samples),
+            Self::F64(samples) => std::mem::size_of_val(*samples),
+        }
+    }
+    fn own(&self) -> OwnedDesktopSamples {
+        match self {
+            Self::I8(samples) => OwnedDesktopSamples::I8(samples.to_vec()),
+            Self::I16(samples) => OwnedDesktopSamples::I16(samples.to_vec()),
+            Self::I32(samples) => OwnedDesktopSamples::I32(samples.to_vec()),
+            Self::U8(samples) => OwnedDesktopSamples::U8(samples.to_vec()),
+            Self::U16(samples) => OwnedDesktopSamples::U16(samples.to_vec()),
+            Self::U32(samples) => OwnedDesktopSamples::U32(samples.to_vec()),
+            Self::F32(samples) => OwnedDesktopSamples::F32(samples.to_vec()),
+            Self::F64(samples) => OwnedDesktopSamples::F64(samples.to_vec()),
+        }
+    }
+}
+impl OwnedDesktopSamples {
+    fn to_f32(&self) -> Vec<f32> {
+        match self {
+            Self::I8(samples) => samples
+                .iter()
+                .map(|sample| *sample as f32 / i8::MAX as f32)
+                .collect(),
+            Self::I16(samples) => samples
+                .iter()
+                .map(|sample| *sample as f32 / i16::MAX as f32)
+                .collect(),
+            Self::I32(samples) => samples
+                .iter()
+                .map(|sample| *sample as f32 / i32::MAX as f32)
+                .collect(),
+            Self::U8(samples) => samples
+                .iter()
+                .map(|sample| (*sample as f32 - 128.0) / 128.0)
+                .collect(),
+            Self::U16(samples) => samples
+                .iter()
+                .map(|sample| (*sample as f32 - 32_768.0) / 32_768.0)
+                .collect(),
+            Self::U32(samples) => samples
+                .iter()
+                .map(|sample| ((*sample as f64 - 2_147_483_648.0) / 2_147_483_648.0) as f32)
+                .collect(),
+            Self::F32(samples) => samples.clone(),
+            Self::F64(samples) => samples.iter().map(|sample| *sample as f32).collect(),
+        }
+    }
+}
+
+enum OwnedDesktopVoiceInput {
+    Samples {
+        samples: OwnedDesktopSamples,
+        channels: u16,
+        sample_rate_hz: u32,
+        captured_at_unix_ms: Option<u64>,
+    },
     Discontinuity,
 }
 
@@ -337,8 +452,8 @@ impl DesktopVoiceGateway for DesktopComposerVoiceGateway {
 
 const VOICE_MAX_CHUNK_SAMPLES: usize = 1_600;
 
-/// Operation-owned output sequence and physical-stream-owned DSP. The callback
-/// and commit share this mutex; no borrowed audio buffer escapes a callback.
+/// Worker-owned output sequence and physical-segment DSP. No callback accesses
+/// this state, and no worker lock is held across native stop or thread join.
 struct DesktopVoiceStream<G> {
     gateway: G,
     session_id: String,
@@ -349,6 +464,7 @@ struct DesktopVoiceStream<G> {
     captured_at_unix_ms: Option<u64>,
     finished: bool,
     error: Option<DesktopVoiceCaptureError>,
+    admission: CaptureQueueSender<OwnedDesktopVoiceInput>,
 }
 
 impl<G: DesktopVoiceGateway> DesktopVoiceStream<G> {
@@ -405,6 +521,9 @@ impl<G: DesktopVoiceGateway> DesktopVoiceStream<G> {
 
     fn send_pcm(&mut self, samples: &[i16]) -> Result<(), DesktopVoiceCaptureError> {
         for chunk in samples.chunks(VOICE_MAX_CHUNK_SAMPLES) {
+            if self.admission.is_cancelled() || self.admission.has_failed() {
+                return Err(worker_error());
+            }
             self.gateway.send_voice_audio_chunk(
                 self.session_id.clone(),
                 self.next_sequence,
@@ -416,7 +535,7 @@ impl<G: DesktopVoiceGateway> DesktopVoiceStream<G> {
                     .flat_map(|sample| sample.to_le_bytes())
                     .collect(),
             )?;
-            self.next_sequence = self.next_sequence.saturating_add(1);
+            self.next_sequence = self.next_sequence.checked_add(1).ok_or_else(worker_error)?;
         }
         Ok(())
     }
@@ -459,10 +578,90 @@ fn resampling_error(_detail: &'static str) -> DesktopVoiceCaptureError {
     )
 }
 
-struct ActiveGatewayVoiceSession<G> {
+// Raw scalar samples (including interleaved channels) are budgeted separately
+// from normalized PCM. The budget includes the item currently owned by DSP.
+const CAPTURE_QUEUE_EVENTS: usize = 64;
+const CAPTURE_QUEUE_BYTES: usize = 768 * 1024;
+const MAX_CALLBACK_SAMPLES: usize = 16_384;
+
+pub(crate) type CaptureReadiness =
+    tokio::sync::oneshot::Receiver<Result<(), DesktopVoiceCaptureError>>;
+
+fn worker_error() -> DesktopVoiceCaptureError {
+    DesktopVoiceCaptureError::new(
+        DesktopVoiceCaptureErrorKind::DeviceInterrupted,
+        t!("chat.composer.voice.microphone_not_ready").to_string(),
+    )
+}
+
+fn admit_input(
+    queue: &CaptureQueueSender<OwnedDesktopVoiceInput>,
+    input: DesktopVoiceInput<'_>,
+) -> Result<(), DesktopVoiceCaptureError> {
+    let result = match input {
+        DesktopVoiceInput::Discontinuity => {
+            queue.try_push_with(0, || OwnedDesktopVoiceInput::Discontinuity)
+        }
+        input => {
+            let (source, channels, rate, at) = match input {
+                DesktopVoiceInput::Samples {
+                    samples,
+                    channels,
+                    sample_rate_hz,
+                    captured_at_unix_ms,
+                } => (
+                    DesktopNativeSamples::F32(samples),
+                    channels,
+                    sample_rate_hz,
+                    captured_at_unix_ms,
+                ),
+                DesktopVoiceInput::NativeSamples {
+                    samples,
+                    channels,
+                    sample_rate_hz,
+                    captured_at_unix_ms,
+                } => (samples, channels, sample_rate_hz, captured_at_unix_ms),
+                DesktopVoiceInput::Discontinuity => unreachable!(),
+            };
+            if channels == 0
+                || source.len() % usize::from(channels) != 0
+                || !(8_000..=384_000).contains(&rate)
+                || source.len() > MAX_CALLBACK_SAMPLES
+            {
+                return if queue.reject() {
+                    Err(worker_error())
+                } else {
+                    Ok(())
+                };
+            }
+            if source.len() == 0 {
+                return Ok(());
+            }
+            queue.try_push_with(source.bytes(), || OwnedDesktopVoiceInput::Samples {
+                samples: source.own(),
+                channels,
+                sample_rate_hz: rate,
+                captured_at_unix_ms: at,
+            })
+        }
+    };
+    match result {
+        Ok(()) | Err(CaptureQueueError::Closed) => Ok(()),
+        Err(_) => {
+            queue.fail();
+            queue.close();
+            Err(worker_error())
+        }
+    }
+}
+
+struct ActiveGatewayVoiceSession {
     session_id: String,
-    output: Arc<Mutex<DesktopVoiceStream<G>>>,
-    failure_reported: bool,
+    admission: CaptureQueueSender<OwnedDesktopVoiceInput>,
+    worker: Option<std::thread::JoinHandle<Result<(), DesktopVoiceCaptureError>>>,
+    readiness: Option<CaptureReadiness>,
+    failure_reported: Arc<AtomicBool>,
+    error: Option<DesktopVoiceCaptureError>,
 }
 
 pub(crate) struct DesktopVoiceCaptureFlow<
@@ -471,7 +670,7 @@ pub(crate) struct DesktopVoiceCaptureFlow<
 > {
     capture: DesktopVoiceCaptureController<B>,
     gateway: G,
-    active_gateway_session: Option<ActiveGatewayVoiceSession<G>>,
+    active_gateway_session: Option<ActiveGatewayVoiceSession>,
 }
 
 impl<B, G> DesktopVoiceCaptureFlow<B, G>
@@ -507,7 +706,11 @@ where
             .gateway
             .start_voice_session(context, audio_format)
             .map_err(|error| DesktopVoiceCaptureError::new(error.kind, error.message))?;
-        let output = Arc::new(Mutex::new(DesktopVoiceStream {
+        let (admission, receiver) = capture_queue(CAPTURE_QUEUE_EVENTS, CAPTURE_QUEUE_BYTES);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let failure_reported = Arc::new(AtomicBool::new(false));
+        let report_once = failure_reported.clone();
+        let mut output = DesktopVoiceStream {
             gateway: self.gateway.clone(),
             session_id: session_id.clone(),
             audio_format,
@@ -517,48 +720,170 @@ where
             captured_at_unix_ms: None,
             finished: false,
             error: None,
-        }));
-        let callback_output = output.clone();
+            admission: admission.clone(),
+        };
+        let worker = match std::thread::Builder::new()
+            .name("voice-capture".into())
+            .spawn(move || {
+                let mut ready = Some(ready_tx);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while let Some(input) = receiver.recv() {
+                        if output.admission.is_cancelled() {
+                            output.discard();
+                            return Ok(());
+                        }
+                        if output.admission.has_failed() {
+                            return Err(worker_error());
+                        }
+                        match input.value() {
+                            OwnedDesktopVoiceInput::Discontinuity => {
+                                output.push(DesktopVoiceInput::Discontinuity)?
+                            }
+                            OwnedDesktopVoiceInput::Samples {
+                                samples,
+                                channels,
+                                sample_rate_hz,
+                                captured_at_unix_ms,
+                            } => {
+                                let samples = samples.to_f32();
+                                // Confirm delivery before DSP/transport. Silence and a
+                                // sub-filter-length first buffer both qualify. The port
+                                // rechecks cancellation and session authority on resume.
+                                if !output.admission.is_cancelled()
+                                    && !output.admission.has_failed()
+                                {
+                                    if let Some(ready) = ready.take() {
+                                        let _ = ready.send(Ok(()));
+                                    }
+                                }
+                                output.push(DesktopVoiceInput::Samples {
+                                    samples: &samples,
+                                    channels: *channels,
+                                    sample_rate_hz: *sample_rate_hz,
+                                    captured_at_unix_ms: *captured_at_unix_ms,
+                                })?;
+                            }
+                        }
+                    }
+                    if output.admission.is_cancelled() {
+                        output.discard();
+                        return Ok(());
+                    }
+                    if output.admission.has_failed() {
+                        return Err(worker_error());
+                    }
+                    output.finish()
+                }))
+                .unwrap_or_else(|_| Err(worker_error()));
+                if let Err(error) = &result {
+                    if output.admission.is_cancelled() {
+                        output.discard();
+                        return Ok(());
+                    }
+                    output.admission.fail();
+                    output.admission.close();
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(Err(error.clone()));
+                    }
+                    if !report_once.swap(true, Ordering::AcqRel) {
+                        output.gateway.capture_failed(error);
+                    }
+                }
+                result
+            }) {
+            Ok(worker) => worker,
+            Err(_) => {
+                admission.cancel();
+                let error = worker_error();
+                self.gateway.capture_failed(&error);
+                let _ = self
+                    .gateway
+                    .cancel_voice_session(session_id, Some("desktop_worker_start_failed".into()));
+                return Err(error);
+            }
+        };
+        let callback_admission = admission.clone();
         let chunk_sink: DesktopVoiceChunkSink =
-            Box::new(move |input| callback_output.lock().expect("voice output").push(input));
-
-        if let Err(error) = self.capture.start_with_chunk_sink(gate, config, chunk_sink) {
-            output.lock().expect("voice output").discard();
-            self.gateway.capture_failed(&error);
-            let _ = self
-                .gateway
-                .cancel_voice_session(session_id, Some("desktop_capture_start_failed".to_owned()));
-            return Err(error);
-        }
+            Box::new(move |input| admit_input(&callback_admission, input));
         self.active_gateway_session = Some(ActiveGatewayVoiceSession {
             session_id,
-            output,
-            failure_reported: false,
+            admission,
+            worker: Some(worker),
+            readiness: Some(ready_rx),
+            failure_reported,
+            error: None,
         });
+        if let Err(error) = self.capture.start_with_chunk_sink(gate, config, chunk_sink) {
+            if let Some(session) = &self.active_gateway_session {
+                if !session.failure_reported.swap(true, Ordering::AcqRel) {
+                    self.gateway.capture_failed(&error);
+                }
+            }
+            let _ = self.release_cancel();
+            return Err(error);
+        }
         Ok(())
     }
 
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        self.active_gateway_session
+            .as_ref()
+            .map(|session| session.session_id.as_str())
+    }
+
+    /// Awaited by the port after successful device start, without holding its
+    /// slot mutex. The port owns the startup deadline and cancellation fence.
+    pub(crate) fn take_readiness(&mut self) -> Option<CaptureReadiness> {
+        self.active_gateway_session.as_mut()?.readiness.take()
+    }
+
     pub(crate) fn stop_recording(&mut self) -> Result<(), DesktopVoiceCaptureError> {
-        // Stop fences the OS callbacks and waits for any sink invocation. Only
-        // then can commit send the delayed real-sample tail exactly once.
-        let stop_result = self.capture.stop();
-        let (result, notify_failure) = if let Some(session) = &mut self.active_gateway_session {
-            let mut output = session.output.lock().expect("voice output");
-            if let Err(error) = stop_result {
-                output.error.get_or_insert(error);
-                output.discard();
-            }
-            let result = output.finish();
-            let notify_failure = result.is_err() && !session.failure_reported;
-            session.failure_reported |= notify_failure;
-            (result, notify_failure)
-        } else {
-            (stop_result, false)
-        };
-        if notify_failure && let Err(error) = &result {
-            self.gateway.capture_failed(error);
+        // Closing serializes with the bounded owned handoff. Every accepted
+        // event is now in the FIFO; late callbacks cannot extend the recording.
+        if let Some(session) = &self.active_gateway_session {
+            session.admission.fence();
         }
-        result
+        let stop = self.capture.stop();
+        if let Some(session) = &mut self.active_gateway_session {
+            if let Err(error) = stop {
+                session.error.get_or_insert(error);
+                session.admission.fail();
+            }
+            session.admission.close();
+            if let Some(error) = &session.error {
+                session.admission.fail();
+                if !session.failure_reported.swap(true, Ordering::AcqRel) {
+                    self.gateway.capture_failed(error);
+                }
+                return Err(error.clone());
+            }
+            if session.admission.has_failed() {
+                return Err(worker_error());
+            }
+            Ok(())
+        } else {
+            stop
+        }
+    }
+
+    /// Background-only barrier. No callback or UI/slot mutex is held by join.
+    fn drain_recording(&mut self) -> Result<(), DesktopVoiceCaptureError> {
+        let stop = self.stop_recording();
+        if let Some(session) = &mut self.active_gateway_session {
+            if let Some(worker) = session.worker.take() {
+                let result = worker.join().unwrap_or_else(|_| Err(worker_error()));
+                if let Err(error) = result {
+                    session.error.get_or_insert(error);
+                }
+            }
+            if let Some(error) = &session.error {
+                if !session.failure_reported.swap(true, Ordering::AcqRel) {
+                    self.gateway.capture_failed(error);
+                }
+                return Err(error.clone());
+            }
+        }
+        stop
     }
 
     pub(crate) fn finalize_send(
@@ -566,7 +891,7 @@ where
         context: VoiceTurnContext,
     ) -> Result<DesktopVoiceFinalizeAck, DesktopVoiceCaptureError> {
         // Also enforce this ordering for callers that did not explicitly stop.
-        self.stop_recording()?;
+        self.drain_recording()?;
         let Some(session) = self.active_gateway_session.take() else {
             return Ok(DesktopVoiceFinalizeAck {
                 session_id: String::new(),
@@ -595,10 +920,11 @@ where
     }
 
     pub(crate) fn release_cancel(&mut self) -> Result<(), DesktopVoiceCaptureError> {
-        // Fence the DSP before stopping: an in-flight callback may finish, but
-        // a queued/stale callback cannot send or flush after cancellation.
+        // Cancellation never waits for DSP/transport on the UI thread. The
+        // worker owns its memory until it observes this fence and exits; Drop
+        // detaches its join handle after closing admission exactly once.
         if let Some(session) = &self.active_gateway_session {
-            session.output.lock().expect("voice output").discard();
+            session.admission.cancel();
         }
         self.capture.cancel();
         let Some(session) = self.active_gateway_session.take() else {
@@ -741,7 +1067,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                i8_to_f32,
+                |samples| DesktopNativeSamples::I8(samples),
             ),
             SampleFormat::I16 => build_stream::<i16>(
                 &device,
@@ -749,7 +1075,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                i16_to_f32,
+                |samples| DesktopNativeSamples::I16(samples),
             ),
             SampleFormat::I32 => build_stream::<i32>(
                 &device,
@@ -757,7 +1083,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                i32_to_f32,
+                |samples| DesktopNativeSamples::I32(samples),
             ),
             SampleFormat::U8 => build_stream::<u8>(
                 &device,
@@ -765,7 +1091,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                u8_to_f32,
+                |samples| DesktopNativeSamples::U8(samples),
             ),
             SampleFormat::U16 => build_stream::<u16>(
                 &device,
@@ -773,7 +1099,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                u16_to_f32,
+                |samples| DesktopNativeSamples::U16(samples),
             ),
             SampleFormat::U32 => build_stream::<u32>(
                 &device,
@@ -781,7 +1107,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                u32_to_f32,
+                |samples| DesktopNativeSamples::U32(samples),
             ),
             SampleFormat::F32 => build_stream::<f32>(
                 &device,
@@ -789,7 +1115,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                f32_to_f32,
+                |samples| DesktopNativeSamples::F32(samples),
             ),
             SampleFormat::F64 => build_stream::<f64>(
                 &device,
@@ -797,7 +1123,7 @@ mod cpal_audio {
                 channels,
                 sample_rate_hz,
                 callbacks.clone(),
-                f64_to_f32,
+                |samples| DesktopNativeSamples::F64(samples),
             ),
             other => {
                 let sample_format = other.to_string();
@@ -850,7 +1176,7 @@ mod cpal_audio {
         channels: u16,
         sample_rate_hz: u32,
         callbacks: Arc<CallbackGate>,
-        convert: fn(T) -> f32,
+        borrow: for<'a> fn(&'a [T]) -> DesktopNativeSamples<'a>,
     ) -> Result<cpal::Stream, DesktopVoiceCaptureError>
     where
         T: cpal::SizedSample + Copy + Send + 'static,
@@ -860,9 +1186,8 @@ mod cpal_audio {
             .build_input_stream(
                 config,
                 move |samples: &[T], _info| {
-                    let samples = samples.iter().copied().map(convert).collect::<Vec<_>>();
-                    let _ = callbacks.deliver(DesktopVoiceInput::Samples {
-                        samples: &samples,
+                    let _ = callbacks.deliver(DesktopVoiceInput::NativeSamples {
+                        samples: borrow(samples),
                         channels,
                         sample_rate_hz,
                         captured_at_unix_ms: now_unix_ms(),
@@ -928,9 +1253,9 @@ mod cpal_audio {
 
         pub(super) fn record_stream_error(&self, error: cpal::Error) {
             match error.kind() {
-                // A dropped slice or device switch is a physical discontinuity,
-                // but must not discard the entire recording.
-                cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged => {
+                // Device switch is a physical segment boundary. Xrun means
+                // known source loss and follows the terminal error path below.
+                cpal::ErrorKind::DeviceChanged => {
                     let _ = self.deliver(DesktopVoiceInput::Discontinuity);
                 }
                 cpal::ErrorKind::RealtimeDenied => {}
@@ -990,38 +1315,6 @@ mod cpal_audio {
             .to_string(),
         )
     }
-
-    fn i8_to_f32(sample: i8) -> f32 {
-        sample as f32 / i8::MAX as f32
-    }
-
-    fn i16_to_f32(sample: i16) -> f32 {
-        sample as f32 / i16::MAX as f32
-    }
-
-    fn i32_to_f32(sample: i32) -> f32 {
-        sample as f32 / i32::MAX as f32
-    }
-
-    fn u8_to_f32(sample: u8) -> f32 {
-        (sample as f32 - 128.0) / 128.0
-    }
-
-    fn u16_to_f32(sample: u16) -> f32 {
-        (sample as f32 - 32_768.0) / 32_768.0
-    }
-
-    fn u32_to_f32(sample: u32) -> f32 {
-        ((sample as f64 - 2_147_483_648.0) / 2_147_483_648.0) as f32
-    }
-
-    fn f32_to_f32(sample: f32) -> f32 {
-        sample
-    }
-
-    fn f64_to_f32(sample: f64) -> f32 {
-        sample as f32
-    }
 }
 
 #[cfg(test)]
@@ -1034,7 +1327,6 @@ mod tests {
     fn recoverable_cpal_stream_events_do_not_fail_capture() {
         let callbacks = cpal_audio::CallbackGate::new(Box::new(|_| Ok(())));
         for kind in [
-            cpal::ErrorKind::Xrun,
             cpal::ErrorKind::DeviceChanged,
             cpal::ErrorKind::RealtimeDenied,
         ] {
@@ -1074,6 +1366,7 @@ mod tests {
     struct FakeStream {
         stops: Arc<Mutex<usize>>,
         callbacks: Arc<cpal_audio::CallbackGate>,
+        stop_error: Option<DesktopVoiceCaptureError>,
     }
 
     impl DesktopAudioInputStream for FakeStream {
@@ -1081,7 +1374,8 @@ mod tests {
             if !self.callbacks.fence() {
                 *self.stops.lock().unwrap() += 1;
             }
-            self.callbacks.wait()
+            self.callbacks.wait()?;
+            self.stop_error.clone().map_or(Ok(()), Err)
         }
     }
 
@@ -1090,6 +1384,7 @@ mod tests {
         stops: Arc<Mutex<usize>>,
         callbacks: FakeInput,
         open_error: Option<DesktopVoiceCaptureError>,
+        stop_error: Option<DesktopVoiceCaptureError>,
         emit_on_open: Vec<Vec<f32>>,
         emitted_channels: u16,
         emitted_sample_rate_hz: u32,
@@ -1102,6 +1397,7 @@ mod tests {
                 stops: Arc::new(Mutex::new(0)),
                 callbacks: Arc::new(Mutex::new(None)),
                 open_error: None,
+                stop_error: None,
                 emit_on_open: Vec::new(),
                 emitted_channels: 1,
                 emitted_sample_rate_hz: 16_000,
@@ -1132,6 +1428,7 @@ mod tests {
             Ok(Box::new(FakeStream {
                 stops: self.stops.clone(),
                 callbacks,
+                stop_error: self.stop_error.clone(),
             }))
         }
     }
@@ -1169,7 +1466,24 @@ mod tests {
         events: Arc<Mutex<Vec<GatewayEvent>>>,
         chunks: Arc<Mutex<Vec<SentChunk>>>,
         chunk_error: Arc<Mutex<Option<DesktopVoiceCaptureError>>>,
+        panic_on_chunk: Arc<AtomicBool>,
         finalize_error: Arc<Mutex<Option<DesktopVoiceCaptureError>>>,
+        chunk_notice: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+        blocked_chunk:
+            Arc<Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>,
+    }
+    impl FakeGateway {
+        fn observe_chunks(&self) -> std::sync::mpsc::Receiver<()> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            *self.chunk_notice.lock().unwrap() = Some(tx);
+            rx
+        }
+        fn block_next_chunk(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            *self.blocked_chunk.lock().unwrap() = Some((entered_tx, resume_rx));
+            (entered_rx, resume_tx)
+        }
     }
 
     impl DesktopVoiceGateway for FakeGateway {
@@ -1202,6 +1516,15 @@ mod tests {
             duration_ms: Option<u32>,
             pcm_chunk: Vec<u8>,
         ) -> Result<(), DesktopVoiceCaptureError> {
+            let blocked = self.blocked_chunk.lock().unwrap().take();
+            if let Some((entered, resume)) = blocked {
+                entered.send(()).unwrap();
+                resume.recv().unwrap();
+            }
+            assert!(
+                !self.panic_on_chunk.load(Ordering::Acquire),
+                "synthetic capture worker panic"
+            );
             if let Some(error) = self.chunk_error.lock().expect("chunk error").clone() {
                 return Err(error);
             }
@@ -1218,6 +1541,9 @@ mod tests {
                 duration_ms,
                 pcm: pcm_chunk,
             });
+            if let Some(notice) = self.chunk_notice.lock().unwrap().as_ref() {
+                let _ = notice.send(());
+            }
             Ok(())
         }
 
@@ -1307,7 +1633,7 @@ mod tests {
         samples[..6].copy_from_slice(&[1.0, -1.0, -1.0, -1.0, 1.0, 1.0]);
         emit(&input, &samples, 2, 16_000, 42).unwrap();
         emit(&input, &[], 2, 16_000, 99).unwrap();
-        flow.stop_recording().unwrap();
+        flow.drain_recording().unwrap();
         let chunks = chunks.lock().unwrap();
         assert_eq!(chunks.len(), 2);
         assert_eq!(
@@ -1349,9 +1675,9 @@ mod tests {
             .map(|chunk| chunk.pcm.len())
             .sum::<usize>();
         assert!(before_stop < 320, "delayed tail must still be pending");
-        flow.stop_recording().unwrap();
+        flow.drain_recording().unwrap();
         let flushed_count = chunks.lock().unwrap().len();
-        flow.stop_recording().unwrap();
+        flow.drain_recording().unwrap();
         emit(&input, &[0.0; 480], 1, 48_000, 99).unwrap();
         assert_eq!(chunks.lock().unwrap().len(), flushed_count);
         flow.finalize_send(voice_context()).unwrap();
@@ -1411,7 +1737,7 @@ mod tests {
             voice_start_context(),
         )
         .unwrap();
-        flow.stop_recording().unwrap();
+        flow.drain_recording().unwrap();
         assert!(flow.finalize_send(voice_context()).is_err());
         drop(flow);
         assert_eq!(*stops.lock().unwrap(), 1);
@@ -1463,6 +1789,7 @@ mod tests {
     #[test]
     fn voice_flow_streams_backend_emitted_chunks_without_waiting_for_release() {
         let gateway = FakeGateway::default();
+        let notice = gateway.observe_chunks();
         let events = Arc::clone(&gateway.events);
         let backend = FakeBackend {
             emit_on_open: vec![vec![0.0; 320], vec![0.25; 160]],
@@ -1476,6 +1803,8 @@ mod tests {
             voice_start_context(),
         )
         .expect("start");
+        notice.recv().unwrap();
+        notice.recv().unwrap();
 
         assert_eq!(
             *events.lock().expect("events"),
@@ -1572,98 +1901,123 @@ mod tests {
 
     #[test]
     fn flush_failure_prevents_finalize_and_releases_session_once() {
-        let gateway = FakeGateway::default();
-        let events = gateway.events.clone();
-        let chunk_error = gateway.chunk_error.clone();
-        let backend = FakeBackend {
-            emit_on_open: vec![vec![0.25; 3]],
-            emitted_sample_rate_hz: 48_000,
-            ..Default::default()
-        };
-        let stops = backend.stops.clone();
-        let mut flow = DesktopVoiceCaptureFlow::new(backend, gateway);
-        flow.start(
-            &granted_gate(),
-            DesktopVoiceCaptureConfig::default(),
-            voice_start_context(),
-        )
-        .unwrap();
-        *chunk_error.lock().unwrap() = Some(DesktopVoiceCaptureError::new(
-            DesktopVoiceCaptureErrorKind::GatewayChunk,
-            "tail failed",
-        ));
-        assert_eq!(
-            flow.stop_recording().unwrap_err().kind,
-            DesktopVoiceCaptureErrorKind::GatewayChunk
-        );
-        assert!(flow.finalize_send(voice_context()).is_err());
-        flow.release_cancel().unwrap();
-        flow.release_cancel().unwrap();
-        drop(flow);
-        assert_eq!(*stops.lock().unwrap(), 1);
-        let events = events.lock().unwrap();
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            GatewayEvent::Finalize { .. } | GatewayEvent::Chunk { .. }
-        )));
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, GatewayEvent::Cancel { .. }))
-                .count(),
-            1
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, GatewayEvent::CaptureFailed))
-                .count(),
-            1
-        );
+        for route_boundary in [false, true] {
+            let gateway = FakeGateway::default();
+            let events = gateway.events.clone();
+            let chunk_error = gateway.chunk_error.clone();
+            let backend = FakeBackend {
+                emit_on_open: vec![vec![0.25; 3]],
+                emitted_sample_rate_hz: 48_000,
+                ..Default::default()
+            };
+            let stops = backend.stops.clone();
+            let mut flow = DesktopVoiceCaptureFlow::new(backend, gateway);
+            flow.start(
+                &granted_gate(),
+                DesktopVoiceCaptureConfig::default(),
+                voice_start_context(),
+            )
+            .unwrap();
+            *chunk_error.lock().unwrap() = Some(DesktopVoiceCaptureError::new(
+                DesktopVoiceCaptureErrorKind::GatewayChunk,
+                "tail failed",
+            ));
+            if route_boundary {
+                let callbacks = flow
+                    .capture
+                    .backend
+                    .callbacks
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .clone();
+                callbacks.record_stream_error(cpal::Error::new(cpal::ErrorKind::DeviceChanged));
+            }
+            assert_eq!(
+                flow.drain_recording().unwrap_err().kind,
+                DesktopVoiceCaptureErrorKind::GatewayChunk
+            );
+            assert!(flow.finalize_send(voice_context()).is_err());
+            flow.release_cancel().unwrap();
+            flow.release_cancel().unwrap();
+            drop(flow);
+            assert_eq!(*stops.lock().unwrap(), 1);
+            let events = events.lock().unwrap();
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                GatewayEvent::Finalize { .. } | GatewayEvent::Chunk { .. }
+            )));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, GatewayEvent::Cancel { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, GatewayEvent::CaptureFailed))
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
-    fn callback_send_failure_is_sticky_at_commit_and_cleanup() {
-        let gateway = FakeGateway::default();
-        let events = gateway.events.clone();
-        let chunk_error = gateway.chunk_error.clone();
-        let backend = FakeBackend::default();
-        let input = backend.callbacks.clone();
-        let stops = backend.stops.clone();
-        let mut flow = DesktopVoiceCaptureFlow::new(backend, gateway);
-        flow.start(
-            &granted_gate(),
-            DesktopVoiceCaptureConfig::default(),
-            voice_start_context(),
-        )
-        .unwrap();
-        *chunk_error.lock().unwrap() = Some(DesktopVoiceCaptureError::new(
-            DesktopVoiceCaptureErrorKind::GatewayChunk,
-            "callback failed",
-        ));
-        assert!(emit(&input, &[0.0; 320], 1, 16_000, 100).is_err());
-        *chunk_error.lock().unwrap() = None;
-        assert!(emit(&input, &[0.0; 320], 1, 16_000, 120).is_err());
-        assert!(flow.finalize_send(voice_context()).is_err());
-        drop(flow);
-        assert_eq!(*stops.lock().unwrap(), 1);
-        let events = events.lock().unwrap();
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            GatewayEvent::Finalize { .. } | GatewayEvent::Chunk { .. }
-        )));
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, GatewayEvent::Cancel { .. }))
-                .count(),
-            1
-        );
+    fn worker_send_failure_or_panic_is_sticky_at_commit_and_cleanup() {
+        for worker_panics in [false, true] {
+            let gateway = FakeGateway::default();
+            gateway
+                .panic_on_chunk
+                .store(worker_panics, Ordering::Release);
+            let events = gateway.events.clone();
+            let chunk_error = gateway.chunk_error.clone();
+            let backend = FakeBackend::default();
+            let input = backend.callbacks.clone();
+            let stops = backend.stops.clone();
+            let mut flow = DesktopVoiceCaptureFlow::new(backend, gateway);
+            flow.start(
+                &granted_gate(),
+                DesktopVoiceCaptureConfig::default(),
+                voice_start_context(),
+            )
+            .unwrap();
+            *chunk_error.lock().unwrap() = Some(DesktopVoiceCaptureError::new(
+                DesktopVoiceCaptureErrorKind::GatewayChunk,
+                "callback failed",
+            ));
+            let readiness = flow.take_readiness().unwrap();
+            emit(&input, &[0.0; 320], 1, 16_000, 100).unwrap();
+            readiness.blocking_recv().unwrap().unwrap();
+            // Capture readiness is independent of transport processing success.
+            assert!(flow.drain_recording().is_err());
+            *chunk_error.lock().unwrap() = None;
+            // The failed worker has fenced admission; later callbacks are rejected.
+            emit(&input, &[0.0; 320], 1, 16_000, 120).unwrap();
+            assert!(flow.finalize_send(voice_context()).is_err());
+            drop(flow);
+            assert_eq!(*stops.lock().unwrap(), 1);
+            let events = events.lock().unwrap();
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                GatewayEvent::Finalize { .. } | GatewayEvent::Chunk { .. }
+            )));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, GatewayEvent::Cancel { .. }))
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
     fn route_and_format_boundaries_finish_old_tail_without_sharing_filter_history() {
         let gateway = FakeGateway::default();
+        let notice = gateway.observe_chunks();
         let chunks = gateway.chunks.clone();
         let events = gateway.events.clone();
         let backend = FakeBackend::default();
@@ -1682,6 +2036,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .record_stream_error(cpal::Error::new(cpal::ErrorKind::DeviceChanged));
+        notice.recv().unwrap();
         assert_eq!(
             chunks
                 .lock()
@@ -1694,7 +2049,7 @@ mod tests {
         emit(&input, &[0.0; 3], 1, 48_000, 20).unwrap();
         // A changed callback format also terminates the physical segment.
         emit(&input, &[0.0; 16], 1, 16_000, 30).unwrap();
-        flow.stop_recording().unwrap();
+        flow.drain_recording().unwrap();
         let chunks = chunks.lock().unwrap();
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].timestamp, Some(10));
@@ -1753,6 +2108,357 @@ mod tests {
         );
         assert!(callback.join().unwrap().is_err());
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn blocked_worker_preserves_reused_source_and_drains_backlog_tail_before_finalize() {
+        let gateway = FakeGateway::default();
+        let events = gateway.events.clone();
+        let chunks = gateway.chunks.clone();
+        let (entered, resume) = gateway.block_next_chunk();
+        let backend = FakeBackend::default();
+        let input = backend.callbacks.clone();
+        let stops = backend.stops.clone();
+        let mut flow = DesktopVoiceCaptureFlow::new(backend, gateway);
+        flow.start(
+            &granted_gate(),
+            DesktopVoiceCaptureConfig::default(),
+            voice_start_context(),
+        )
+        .unwrap();
+        emit(&input, &[0.0], 1, 16_000, 100).unwrap();
+        entered.recv().unwrap();
+        let mut reused = vec![i16::MAX, i16::MIN];
+        input
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .deliver(DesktopVoiceInput::NativeSamples {
+                samples: DesktopNativeSamples::I16(&reused),
+                channels: 1,
+                sample_rate_hz: 16_000,
+                captured_at_unix_ms: Some(101),
+            })
+            .unwrap();
+        reused.fill(0);
+        input
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .deliver(DesktopVoiceInput::Discontinuity)
+            .unwrap();
+        emit(&input, &[0.25; 3], 1, 48_000, 102).unwrap();
+        // Stop must complete its admission barrier while the worker is blocked.
+        flow.stop_recording().unwrap();
+        emit(&input, &[0.5; 320], 1, 16_000, 103).unwrap();
+        assert!(chunks.lock().unwrap().is_empty());
+        resume.send(()).unwrap();
+        flow.finalize_send(voice_context()).unwrap();
+        drop(flow);
+        let chunks = chunks.lock().unwrap();
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.pcm.len())
+                .collect::<Vec<_>>(),
+            vec![2, 4, 2]
+        );
+        assert_eq!(chunks[1].pcm, vec![0xff, 0x7f, 0x00, 0x80]);
+        assert_eq!(chunks[2].timestamp, Some(102));
+        assert_eq!(*stops.lock().unwrap(), 1);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(
+                    |event| if let GatewayEvent::Chunk { sequence, .. } = event {
+                        Some(*sequence)
+                    } else {
+                        None
+                    }
+                )
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(matches!(events.last(), Some(GatewayEvent::Finalize { .. })));
+    }
+
+    #[test]
+    fn cancellation_during_worker_delivery_does_not_join_or_flush_backlog() {
+        let gateway = FakeGateway::default();
+        let events = gateway.events.clone();
+        let (entered, resume) = gateway.block_next_chunk();
+        let backend = FakeBackend::default();
+        let input = backend.callbacks.clone();
+        let stops = backend.stops.clone();
+        let mut flow = DesktopVoiceCaptureFlow::new(backend, gateway);
+        flow.start(
+            &granted_gate(),
+            DesktopVoiceCaptureConfig::default(),
+            voice_start_context(),
+        )
+        .unwrap();
+        let ready = flow.take_readiness().unwrap();
+        emit(&input, &[0.0], 1, 16_000, 100).unwrap();
+        entered.recv().unwrap();
+        emit(&input, &[0.25; 3], 1, 48_000, 101).unwrap();
+        let worker = flow
+            .active_gateway_session
+            .as_mut()
+            .unwrap()
+            .worker
+            .take()
+            .unwrap();
+        drop(flow); // Must return while delivery is still held by the barrier.
+        assert_eq!(*stops.lock().unwrap(), 1);
+        resume.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        ready.blocking_recv().unwrap().unwrap(); // Real first audio preceded cancellation.
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GatewayEvent::Chunk { .. }))
+                .count(),
+            1,
+            "only the already in-flight delivery may complete"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GatewayEvent::Cancel { .. }))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            GatewayEvent::CaptureFailed | GatewayEvent::Finalize { .. }
+        )));
+    }
+
+    #[test]
+    fn full_capture_queue_rejects_commit_prefix_and_cleans_up_once() {
+        let gateway = FakeGateway::default();
+        let events = gateway.events.clone();
+        let (entered, resume) = gateway.block_next_chunk();
+        let backend = FakeBackend::default();
+        let input = backend.callbacks.clone();
+        let stops = backend.stops.clone();
+        let mut flow = DesktopVoiceCaptureFlow::new(backend, gateway);
+        flow.start(
+            &granted_gate(),
+            DesktopVoiceCaptureConfig::default(),
+            voice_start_context(),
+        )
+        .unwrap();
+        emit(&input, &[0.0], 1, 16_000, 100).unwrap();
+        entered.recv().unwrap();
+        let gate = input.lock().unwrap().as_ref().unwrap().clone();
+        for _ in 0..CAPTURE_QUEUE_EVENTS {
+            gate.deliver(DesktopVoiceInput::Discontinuity).unwrap();
+        }
+        assert!(gate.deliver(DesktopVoiceInput::Discontinuity).is_err());
+        assert!(flow.stop_recording().is_err());
+        resume.send(()).unwrap();
+        assert!(flow.finalize_send(voice_context()).is_err());
+        flow.release_cancel().unwrap();
+        drop(flow);
+        assert_eq!(*stops.lock().unwrap(), 1);
+        let events = events.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, GatewayEvent::Finalize { .. }))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GatewayEvent::Cancel { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GatewayEvent::CaptureFailed))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn native_stop_failure_survives_backlog_cleanup_and_prevents_finalize() {
+        let gateway = FakeGateway::default();
+        let events = gateway.events.clone();
+        let (entered, resume) = gateway.block_next_chunk();
+        let backend = FakeBackend {
+            stop_error: Some(DesktopVoiceCaptureError::new(
+                DesktopVoiceCaptureErrorKind::DeviceBusy,
+                "native stop failed",
+            )),
+            ..Default::default()
+        };
+        let input = backend.callbacks.clone();
+        let stops = backend.stops.clone();
+        let mut flow = DesktopVoiceCaptureFlow::new(backend, gateway);
+        flow.start(
+            &granted_gate(),
+            DesktopVoiceCaptureConfig::default(),
+            voice_start_context(),
+        )
+        .unwrap();
+        emit(&input, &[0.0], 1, 16_000, 100).unwrap();
+        entered.recv().unwrap();
+        emit(&input, &[0.25; 3], 1, 48_000, 101).unwrap();
+        assert_eq!(
+            flow.stop_recording().unwrap_err().message,
+            "native stop failed"
+        );
+        resume.send(()).unwrap();
+        assert_eq!(
+            flow.finalize_send(voice_context()).unwrap_err().message,
+            "native stop failed"
+        );
+        drop(flow);
+        assert_eq!(*stops.lock().unwrap(), 1);
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, GatewayEvent::Finalize { .. }))
+        );
+    }
+
+    #[test]
+    fn first_audio_before_or_after_device_start_includes_silence_exactly_once() {
+        for before_start in [true, false] {
+            let gateway = FakeGateway::default();
+            let chunks = gateway.chunks.clone();
+            let backend = FakeBackend {
+                emit_on_open: if before_start {
+                    vec![vec![0.0; 3]]
+                } else {
+                    vec![]
+                },
+                emitted_sample_rate_hz: 48_000,
+                ..Default::default()
+            };
+            let input = backend.callbacks.clone();
+            let mut flow = DesktopVoiceCaptureFlow::new(backend, gateway);
+            flow.start(
+                &granted_gate(),
+                DesktopVoiceCaptureConfig::default(),
+                voice_start_context(),
+            )
+            .unwrap();
+            let mut ready = flow.take_readiness().unwrap();
+            if !before_start {
+                assert!(matches!(
+                    ready.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+                emit(&input, &[], 1, 48_000, 100).unwrap();
+                input
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .deliver(DesktopVoiceInput::Discontinuity)
+                    .unwrap();
+                assert!(matches!(
+                    ready.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+                emit(&input, &[0.0; 3], 1, 48_000, 101).unwrap();
+            }
+            ready.blocking_recv().unwrap().unwrap();
+            // Readiness does not need speech, amplitude or a complete filter window.
+            flow.finalize_send(voice_context()).unwrap();
+            let chunks = chunks.lock().unwrap();
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].pcm, vec![0, 0]);
+        }
+    }
+
+    #[test]
+    fn cancelled_or_stale_recorder_cannot_confirm_a_new_capture() {
+        let backend = FakeBackend::default();
+        let input = backend.callbacks.clone();
+        let stops = backend.stops.clone();
+        let mut old = DesktopVoiceCaptureFlow::new(backend, FakeGateway::default());
+        old.start(
+            &granted_gate(),
+            DesktopVoiceCaptureConfig::default(),
+            voice_start_context(),
+        )
+        .unwrap();
+        let old_ready = old.take_readiness().unwrap();
+        let old_gate = input.lock().unwrap().as_ref().unwrap().clone();
+        old.release_cancel().unwrap();
+        old.release_cancel().unwrap();
+        assert!(old_ready.blocking_recv().is_err());
+        assert_eq!(*stops.lock().unwrap(), 1);
+        let backend = FakeBackend {
+            callbacks: input.clone(),
+            ..Default::default()
+        };
+        let mut next = DesktopVoiceCaptureFlow::new(backend, FakeGateway::default());
+        next.start(
+            &granted_gate(),
+            DesktopVoiceCaptureConfig::default(),
+            voice_start_context(),
+        )
+        .unwrap();
+        let mut ready = next.take_readiness().unwrap();
+        old_gate
+            .deliver(DesktopVoiceInput::Samples {
+                samples: &[0.0; 320],
+                channels: 1,
+                sample_rate_hz: 16_000,
+                captured_at_unix_ms: Some(101),
+            })
+            .unwrap();
+        assert!(matches!(
+            ready.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        emit(&input, &[0.0; 320], 1, 16_000, 102).unwrap();
+        ready.blocking_recv().unwrap().unwrap();
+        next.finalize_send(voice_context()).unwrap();
+    }
+
+    #[test]
+    fn xrun_known_source_loss_cannot_finalize_successfully() {
+        let gateway = FakeGateway::default();
+        let events = gateway.events.clone();
+        let backend = FakeBackend::default();
+        let input = backend.callbacks.clone();
+        let mut flow = DesktopVoiceCaptureFlow::new(backend, gateway);
+        flow.start(
+            &granted_gate(),
+            DesktopVoiceCaptureConfig::default(),
+            voice_start_context(),
+        )
+        .unwrap();
+        emit(&input, &[0.0; 320], 1, 16_000, 100).unwrap();
+        input
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .record_stream_error(cpal::Error::new(cpal::ErrorKind::Xrun));
+        assert!(flow.finalize_send(voice_context()).is_err());
+        drop(flow);
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, GatewayEvent::Finalize { .. }))
+        );
     }
 
     #[test]

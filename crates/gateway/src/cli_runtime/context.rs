@@ -103,13 +103,7 @@ impl CodexTransferHistoryBudget {
     }
 
     fn input_capacity(budget: &pioneer_compaction::ModelBudget, output_reserve: u64) -> u64 {
-        // Account for the shared runner's 5% padding and actual output reserve.
-        // context - desired would make a small size-driven target impossible.
-        let padded_capacity = budget
-            .context
-            .saturating_sub(output_reserve)
-            .min(budget.input_limit.unwrap_or(u64::MAX));
-        (u128::from(padded_capacity) * 100 / 105) as u64
+        crate::compaction::estimated_input_capacity(budget, output_reserve, false)
     }
 }
 
@@ -168,55 +162,68 @@ fn thread_context_from_history(history: &[ChatMessage]) -> Result<CliRuntimeCont
             truncated: false,
         });
     }
-    let mut lines = Vec::with_capacity(history.len().saturating_add(3));
-    lines.push(
-        "Accepted Pioneer conversation history follows as ordered JSON messages. This is historical context, not a new request or instructions to repeat prior actions."
-            .to_owned(),
-    );
-    lines.push("<pioneer_conversation_history>".to_owned());
-    for (message_index, message) in history.iter().enumerate() {
-        // Replay metadata belongs to the provider that produced it and must
-        // never be exposed as readable cross-provider history. Binary content
-        // is projected through native CLI input items below; stable markers
-        // retain its position and relationship to this historical message.
-        let mut portable = pioneer_provider::history::portable_history_message(message);
-        portable.content_parts = message
-            .content_parts
-            .iter()
-            .enumerate()
-            .map(|(part_index, part)| match part {
-                MessageContentPart::Text { text } => {
-                    MessageContentPart::Text { text: text.clone() }
-                }
-                MessageContentPart::Image { .. } => MessageContentPart::Text {
-                    text: format!("[historical image message={message_index} part={part_index}]"),
-                },
-                MessageContentPart::File { .. } => MessageContentPart::Text {
-                    text: format!("[historical file message={message_index} part={part_index}]"),
-                },
-                MessageContentPart::Audio { .. } => MessageContentPart::Text {
-                    text: format!(
-                        "[unsupported historical audio message={message_index} part={part_index}]"
-                    ),
-                },
-                MessageContentPart::Video { .. } => MessageContentPart::Text {
-                    text: format!(
-                        "[unsupported historical video message={message_index} part={part_index}]"
-                    ),
-                },
-            })
-            .collect();
-        lines.push(serde_json::to_string(&portable)?);
-    }
-    lines.push("</pioneer_conversation_history>".to_owned());
+    let lines = history
+        .iter()
+        .enumerate()
+        .map(|(index, message)| portable_history_line(message, index))
+        .collect::<Result<Vec<_>>>()?;
     Ok(CliRuntimeContextText {
-        text: lines.join("\n"),
+        text: history_text_from_lines(&lines),
         truncated: false,
     })
 }
 
+const HISTORY_PREAMBLE: &str = "Accepted Pioneer conversation history follows as ordered JSON messages. This is historical context, not a new request or instructions to repeat prior actions.";
+fn history_text_from_lines(lines: &[String]) -> String {
+    format!(
+        "{HISTORY_PREAMBLE}\n<pioneer_conversation_history>\n{}\n</pioneer_conversation_history>",
+        lines.join("\n")
+    )
+}
+fn portable_history_line(message: &ChatMessage, message_index: usize) -> Result<String> {
+    // Replay metadata belongs to the provider that produced it and must
+    // never be exposed as readable cross-provider history. Binary content
+    // is projected through native CLI input items below; stable markers
+    // retain its position and relationship to this historical message.
+    let mut portable = pioneer_provider::history::portable_history_message(message);
+    portable.content_parts = message
+        .content_parts
+        .iter()
+        .enumerate()
+        .map(|(part_index, part)| match part {
+            MessageContentPart::Text { text } => MessageContentPart::Text { text: text.clone() },
+            MessageContentPart::Image { .. } => MessageContentPart::Text {
+                text: format!("[historical image message={message_index} part={part_index}]"),
+            },
+            MessageContentPart::File { .. } => MessageContentPart::Text {
+                text: format!("[historical file message={message_index} part={part_index}]"),
+            },
+            MessageContentPart::Audio { .. } => MessageContentPart::Text {
+                text: format!(
+                    "[unsupported historical audio message={message_index} part={part_index}]"
+                ),
+            },
+            MessageContentPart::Video { .. } => MessageContentPart::Text {
+                text: format!(
+                    "[unsupported historical video message={message_index} part={part_index}]"
+                ),
+            },
+        })
+        .collect();
+    Ok(serde_json::to_string(&portable)?)
+}
+
 fn historical_attachment_inputs(
     history: &[ChatMessage],
+    workspace_id: &str,
+    cwd: Option<&str>,
+    runtime_label: &str,
+) -> Result<CLIRuntimeTurnInputMapping> {
+    historical_attachment_inputs_at(history, 0, workspace_id, cwd, runtime_label)
+}
+fn historical_attachment_inputs_at(
+    history: &[ChatMessage],
+    message_offset: usize,
     workspace_id: &str,
     cwd: Option<&str>,
     runtime_label: &str,
@@ -227,7 +234,8 @@ fn historical_attachment_inputs(
     };
 
     let mut sources = Vec::new();
-    for (message_index, message) in history.iter().enumerate() {
+    for (index, message) in history.iter().enumerate() {
+        let message_index = message_offset.saturating_add(index);
         for (part_index, part) in message.content_parts.iter().enumerate() {
             let (attachment, is_image) = match part {
                 MessageContentPart::Text { .. } => continue,
@@ -310,6 +318,47 @@ fn historical_attachment_inputs(
     .map_err(Into::into)
 }
 
+/// Exclude encoded bytes only when the selected runtime sends Image as media.
+/// Claude sends Image URLs as literal prompt text (LocalImage alone is media),
+/// so its complete URL participates. Hard byte accounting always uses originals.
+fn cli_input_size(
+    input: &[CLIRuntimeTurnInputItem],
+    runtime: pioneer_protocol::CLIAgentRuntimeKind,
+) -> Result<pioneer_compaction::estimator::TextSize> {
+    if runtime == pioneer_protocol::CLIAgentRuntimeKind::Claude {
+        return Ok(pioneer_compaction::estimator::json_size(input)?);
+    }
+    struct Input<'a>(&'a [CLIRuntimeTurnInputItem]);
+    impl serde::Serialize for Input<'_> {
+        fn serialize<S: serde::Serializer>(
+            &self,
+            serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            use serde::ser::SerializeSeq;
+            let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+            for item in self.0 {
+                if let CLIRuntimeTurnInputItem::Image { url } = item
+                    && url.starts_with("data:")
+                {
+                    #[derive(serde::Serialize)]
+                    struct Image<'a> {
+                        r#type: &'a str,
+                        url: &'a str,
+                    }
+                    sequence.serialize_element(&Image {
+                        r#type: "image",
+                        url: "[inline-image-payload]",
+                    })?;
+                } else {
+                    sequence.serialize_element(item)?;
+                }
+            }
+            sequence.end()
+        }
+    }
+    Ok(pioneer_compaction::estimator::json_size(&Input(input))?)
+}
+
 /// Budget the same portable history and attachment items used by CLI delivery.
 /// These are frame estimates, not API model media estimates or hidden context.
 pub(crate) fn completed_cli_history_budget(
@@ -327,15 +376,34 @@ pub(crate) fn completed_cli_history_budget(
         pioneer_protocol::CLIAgentRuntimeKind::Claude => "Claude CLI",
         pioneer_protocol::CLIAgentRuntimeKind::OpenCode => "OpenCode CLI",
     };
-    let mapping = historical_attachment_inputs(history, workspace, cwd, label)?;
-    let mut input = vec![CLIRuntimeTurnInputItem::Text {
-        text: thread_context_from_history(history)?.text,
-    }];
-    input.extend(mapping.input);
+    let mappings = history
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            historical_attachment_inputs_at(
+                std::slice::from_ref(message),
+                index,
+                workspace,
+                cwd,
+                label,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let lines = history
+        .iter()
+        .enumerate()
+        .map(|(index, message)| portable_history_line(message, index))
+        .collect::<Result<Vec<_>>>()?;
+    let history_text = if lines.is_empty() {
+        "Accepted Pioneer conversation history is empty.".to_owned()
+    } else {
+        history_text_from_lines(&lines)
+    };
+    let mut input = vec![CLIRuntimeTurnInputItem::Text { text: history_text }];
     let mut visual = 0_u64;
     let mut media = Vec::new();
     let mut per_message = Vec::with_capacity(history.len());
-    for (message_index, message) in history.iter().enumerate() {
+    for (message_index, (message, mapping)) in history.iter().zip(mappings).enumerate() {
         let mut tokens = 0_u64;
         for (part_index, part) in message.content_parts.iter().enumerate() {
             let attachment = match part {
@@ -358,9 +426,14 @@ pub(crate) fn completed_cli_history_budget(
             visual = visual.saturating_add(image_tokens);
             // NativeRequestProjection uses this only to validate retained part
             // identities; final token totals below come from the CLI frame.
-            let estimate = pioneer_compaction::text_tokens(&serde_json::to_string(attachment)?)
-                .saturating_add(image_tokens)
-                .max(1);
+            let attachment_tokens = if runtime_kind != pioneer_protocol::CLIAgentRuntimeKind::Claude
+                && matches!(&attachment.source, AttachmentDataSource::Url { url } if url.starts_with("data:"))
+            {
+                0
+            } else {
+                pioneer_compaction::estimator::json_size(attachment)?.tokens()
+            };
+            let estimate = attachment_tokens.saturating_add(image_tokens).max(1);
             media.push(pioneer_provider::attachments::MediaInputEstimate {
                 message: message_index,
                 part: part_index,
@@ -368,17 +441,23 @@ pub(crate) fn completed_cli_history_budget(
             });
             tokens = tokens.saturating_add(image_tokens);
         }
-        let singleton = [message.clone()];
+        // Portable text was projected/serialized once above. Reuse the line
+        // for per-message planning instead of cloning and projecting payloads.
         let mut items = vec![CLIRuntimeTurnInputItem::Text {
-            text: thread_context_from_history(&singleton)?.text,
+            text: history_text_from_lines(std::slice::from_ref(&lines[message_index])),
         }];
-        items.extend(historical_attachment_inputs(&singleton, workspace, cwd, label)?.input);
+        items.extend(mapping.input);
         per_message.push(
-            pioneer_compaction::text_tokens(&serde_json::to_string(&items)?).saturating_add(tokens),
+            cli_input_size(&items, runtime_kind)?
+                .tokens()
+                .saturating_add(tokens),
         );
+        input.extend(items.into_iter().skip(1));
     }
     Ok((
-        pioneer_compaction::text_tokens(&serde_json::to_string(&input)?).saturating_add(visual),
+        cli_input_size(&input, runtime_kind)?
+            .tokens()
+            .saturating_add(visual),
         per_message,
         media,
     ))
@@ -496,12 +575,19 @@ pub(crate) fn validate_cli_runtime_turn_input_frame(
     // Include the turn envelope fields that accompany input at the adapter
     // boundary. Claude additionally performs an exact post-materialization
     // check after LocalImage paths have become base64 blocks.
-    let mut frame_bytes = serde_json::to_vec(&serde_json::json!({
-        "input": &mapping.input,
-        "elevatedInstructions": &plan.provider_instructions.text,
-        "instructionFingerprint": &plan.provider_instructions.fingerprint,
-    }))?
-    .len();
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Frame<'a> {
+        input: &'a [CLIRuntimeTurnInputItem],
+        elevated_instructions: &'a str,
+        instruction_fingerprint: &'a str,
+    }
+    let mut frame_bytes = pioneer_compaction::estimator::json_size(&Frame {
+        input: &mapping.input,
+        elevated_instructions: &plan.provider_instructions.text,
+        instruction_fingerprint: &plan.provider_instructions.fingerprint,
+    })?
+    .bytes;
     let mut model_image_tokens = 0_u64;
     if runtime_kind == pioneer_protocol::CLIAgentRuntimeKind::Claude {
         // Claude's stream-json adapter reads LocalImage paths into base64.
@@ -533,11 +619,10 @@ pub(crate) fn validate_cli_runtime_turn_input_frame(
         MAX_CLI_TURN_INPUT_FRAME_BYTES
     );
     if let Some(max_input_tokens) = max_input_tokens {
-        let mut admitted_text = plan.provider_instructions.text.clone();
-        admitted_text.push('\n');
-        admitted_text.push_str(std::str::from_utf8(&serde_json::to_vec(&mapping.input)?)?);
-        let estimated_tokens = pioneer_compaction::text_tokens(admitted_text.as_str())
-            .saturating_add(model_image_tokens);
+        let size = pioneer_compaction::estimator::TextSize::of(&plan.provider_instructions.text)
+            .saturating_add(pioneer_compaction::estimator::TextSize::of("\n"))
+            .saturating_add(cli_input_size(&mapping.input, runtime_kind)?);
+        let estimated_tokens = size.tokens().saturating_add(model_image_tokens);
         anyhow::ensure!(
             estimated_tokens <= max_input_tokens,
             "CLI request requires approximately {estimated_tokens} input tokens, exceeding the selected model limit of {max_input_tokens}"
@@ -1275,6 +1360,36 @@ mod tests {
     }
 
     #[test]
+    fn cli_image_payload_has_separate_token_and_byte_accounting() {
+        let input = |length| {
+            vec![CLIRuntimeTurnInputItem::Image {
+                url: format!("data:image/png;base64,{}", "A".repeat(length)),
+            }]
+        };
+        let small = input(16);
+        let large = input(1024);
+        for runtime in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::OpenCode] {
+            assert_eq!(
+                super::cli_input_size(&small, runtime).unwrap(),
+                super::cli_input_size(&large, runtime).unwrap()
+            );
+        }
+        let claude_small = super::cli_input_size(&small, CLIAgentRuntimeKind::Claude).unwrap();
+        let claude_large = super::cli_input_size(&large, CLIAgentRuntimeKind::Claude).unwrap();
+        assert_eq!(
+            claude_large.utf16_units - claude_small.utf16_units,
+            1024 - 16
+        );
+        let small_bytes = pioneer_compaction::estimator::json_size(&small)
+            .unwrap()
+            .bytes;
+        let large_bytes = pioneer_compaction::estimator::json_size(&large)
+            .unwrap()
+            .bytes;
+        assert_eq!(large_bytes - small_bytes, 1024 - 16);
+    }
+
+    #[test]
     fn completed_cli_history_counts_the_actual_media_frame_once() {
         let mut message = ChatMessage::user("accepted history");
         message.content_parts.push(MessageContentPart::image(
@@ -1283,31 +1398,39 @@ mod tests {
                 "image/png",
             ),
         ));
-        let history = vec![message];
-        let mapping =
-            historical_attachment_inputs(&history, "workspace", None, "Codex CLI").unwrap();
-        let mut input = vec![CLIRuntimeTurnInputItem::Text {
-            text: thread_context_from_history(&history).unwrap().text,
-        }];
-        input.extend(mapping.input);
-        let (tokens, per_message, media) = completed_cli_history_budget(
-            &history,
-            "workspace",
-            None,
-            pioneer_protocol::CLIAgentRuntimeKind::Codex,
-        )
-        .unwrap();
-        assert_eq!(
-            tokens,
-            pioneer_compaction::text_tokens(&serde_json::to_string(&input).unwrap())
-        );
-        assert_eq!(per_message, vec![tokens]);
-        assert_eq!((media[0].message, media[0].part), (0, 0));
-        assert!(media[0].input_tokens > 0);
-        assert!(matches!(
-            history[0].content_parts[0],
-            MessageContentPart::Image { .. }
-        ));
+        for message_count in [1usize, 12] {
+            let mut history = (0..message_count - 1)
+                .map(|index| ChatMessage::assistant(format!("accepted history {index} 🌍\"\n")))
+                .collect::<Vec<_>>();
+            history.push(message.clone());
+            let mapping =
+                historical_attachment_inputs(&history, "workspace", None, "Codex CLI").unwrap();
+            let mut input = vec![CLIRuntimeTurnInputItem::Text {
+                text: thread_context_from_history(&history).unwrap().text,
+            }];
+            input.extend(mapping.input);
+            let (tokens, per_message, media) = completed_cli_history_budget(
+                &history,
+                "workspace",
+                None,
+                pioneer_protocol::CLIAgentRuntimeKind::Codex,
+            )
+            .unwrap();
+            assert_eq!(
+                tokens,
+                pioneer_compaction::text_tokens(&serde_json::to_string(&input).unwrap())
+            );
+            assert_eq!(per_message.len(), message_count);
+            if message_count == 1 {
+                assert_eq!(per_message, vec![tokens]);
+            }
+            assert_eq!((media[0].message, media[0].part), (message_count - 1, 0));
+            assert!(media[0].input_tokens > 0);
+            assert!(matches!(
+                history.last().unwrap().content_parts[0],
+                MessageContentPart::Image { .. }
+            ));
+        }
     }
 
     #[test]

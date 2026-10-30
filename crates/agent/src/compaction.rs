@@ -11,7 +11,7 @@ use pioneer_compaction::runner::FailureKind;
 use pioneer_compaction::summary::{
     CompletionKind, INSTRUCTIONS, Summarizer, SummaryCompletion, SummaryFailure, SummaryRequest,
 };
-use pioneer_compaction::{ModelBudget, ModelSelection, Transport, text_tokens};
+use pioneer_compaction::{ModelBudget, ModelSelection, Transport};
 use pioneer_protocol::{ProviderFailureClass, ProviderFailureStage};
 use pioneer_provider::{
     ChatMessage, ChatRequest, Provider, ProviderTermination, ReasoningConfig, ReasoningEffort,
@@ -83,6 +83,25 @@ impl NativeSummarizer {
             compiled_prompt: None,
         })
     }
+    fn prepared_tokens(&self, prepared: &ChatRequest, request: &SummaryRequest) -> Result<u64> {
+        #[derive(serde::Serialize)]
+        struct Frame<'a> {
+            model: &'a str,
+            messages: &'a [ChatMessage],
+            max_tokens: Option<u32>,
+            reasoning: &'a Option<String>,
+        }
+        // JSON escaping and complete role/option framing are included without
+        // allocating a second full JSON string or cloning message Values.
+        Ok(pioneer_compaction::estimator::json_size(&Frame {
+            model: &prepared.model,
+            messages: &prepared.messages,
+            max_tokens: prepared.max_tokens,
+            reasoning: &request.selection.effort,
+        })?
+        .tokens()
+        .saturating_add(32))
+    }
 }
 #[async_trait]
 impl Summarizer for NativeSummarizer {
@@ -90,12 +109,7 @@ impl Summarizer for NativeSummarizer {
         self.budget.clone()
     }
     fn input_tokens(&self, request: &SummaryRequest) -> Result<u64> {
-        let prepared = self.prepare(request)?;
-        let wire = serde_json::json!({"model":prepared.model,"messages":prepared.messages,
-            "max_tokens":prepared.max_tokens,"reasoning":request.selection.effort});
-        // Count complete text/role/option framing; the ordinary N2 padding is
-        // applied by ModelBudget::fits, in addition to this API framing reserve.
-        Ok(text_tokens(&wire.to_string()).saturating_add(32))
+        self.prepared_tokens(&self.prepare(request)?, request)
     }
     async fn summarize(
         &self,
@@ -107,7 +121,10 @@ impl Summarizer for NativeSummarizer {
             retry_after_ms: None,
             code: "invalid_summary_request",
         };
-        let input = self.input_tokens(&request).map_err(|_| invalid())?;
+        let prepared = self.prepare(&request).map_err(|_| invalid())?;
+        let input = self
+            .prepared_tokens(&prepared, &request)
+            .map_err(|_| invalid())?;
         if !self.budget.fits(input, request.output_cap, false) {
             return Err(SummaryFailure {
                 diagnostic: None,
@@ -116,13 +133,23 @@ impl Summarizer for NativeSummarizer {
                 code: "summary_input_overflow",
             });
         }
-        let prepared = self.prepare(&request).map_err(|_| invalid())?;
         let response = self.provider.chat(prepared).await.map_err(|error| {
             let classification = self.provider.classify_failure(&error);
             let class = classification.as_ref().map(|c| c.class).unwrap_or_else(|| {
                 crate::classify_provider_failure_message(
                     &pioneer_provider::usage::classification_source(&error).to_string(),
                     ProviderFailureStage::Connect,
+                )
+            });
+            // Only provider-owned typed evidence permits destructive context
+            // reduction. Legacy Display parsing remains a transient retry hint.
+            let overflow = classification.as_ref().is_some_and(|value| {
+                matches!(
+                    value.class,
+                    ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+                ) && !matches!(
+                    value.http_status,
+                    Some(401 | 403 | 408 | 425 | 429 | 500..=599)
                 )
             });
             let transient = matches!(
@@ -137,13 +164,17 @@ impl Summarizer for NativeSummarizer {
                     "summary_provider_failure",
                     &format!("Provider failure class: {:?}", class),
                 )),
-                kind: if transient {
+                kind: if overflow {
+                    FailureKind::InputOverflow
+                } else if transient {
                     FailureKind::Transient
                 } else {
                     FailureKind::Permanent
                 },
                 retry_after_ms: classification.and_then(|c| c.retry_after_ms),
-                code: if transient {
+                code: if overflow {
+                    "summary_input_overflow"
+                } else if transient {
                     "summary_transport_transient"
                 } else {
                     "summary_transport_rejected"
@@ -194,6 +225,9 @@ mod tests {
         calls: Mutex<Vec<ChatRequest>>,
         termination: ProviderTermination,
         fail: bool,
+        failure_class: Option<ProviderFailureClass>,
+        failure_message: &'static str,
+        failure_status_override: Option<u16>,
     }
     #[async_trait]
     impl Provider for Fake {
@@ -203,7 +237,7 @@ mod tests {
         async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
             self.calls.lock().unwrap().push(request);
             if self.fail {
-                anyhow::bail!("synthetic failure")
+                anyhow::bail!("{}", self.failure_message)
             }
             Ok(ChatResponse {
                 messages: Vec::new(),
@@ -225,13 +259,20 @@ mod tests {
             anyhow::bail!("not used by service adapter")
         }
         fn classify_failure(&self, _: &anyhow::Error) -> Option<ProviderFailureClassification> {
+            let class = self.failure_class?;
             Some(ProviderFailureClassification {
                 is_network_error: false,
                 raw_response: None,
                 error_reason: None,
                 request_id: None,
-                class: ProviderFailureClass::RateLimit,
-                http_status: Some(429),
+                class,
+                http_status: self.failure_status_override.or(match class {
+                    ProviderFailureClass::RateLimit => Some(429),
+                    ProviderFailureClass::AuthOrPermission => Some(403),
+                    ProviderFailureClass::ContextTooLarge => Some(413),
+                    ProviderFailureClass::PromptTooLong => Some(400),
+                    _ => None,
+                }),
                 provider_code: None,
                 retry_after_ms: Some(12_000),
             })
@@ -274,8 +315,87 @@ mod tests {
             calls: Mutex::new(vec![]),
             termination,
             fail,
+            failure_class: Some(ProviderFailureClass::RateLimit),
+            failure_message: "synthetic failure",
+            failure_status_override: None,
         })
     }
+    #[tokio::test]
+    async fn untyped_overflow_text_and_misleading_typed_auth_do_not_grant_shrink() {
+        for (classification, status) in [
+            (None, None),
+            (Some(ProviderFailureClass::AuthOrPermission), None),
+            (Some(ProviderFailureClass::Unknown), None),
+            (Some(ProviderFailureClass::ContextTooLarge), Some(401)),
+            (Some(ProviderFailureClass::ContextTooLarge), Some(429)),
+            (Some(ProviderFailureClass::PromptTooLong), Some(503)),
+        ] {
+            let provider = Arc::new(Fake {
+                calls: Mutex::new(vec![]),
+                termination: ProviderTermination::Complete,
+                fail: true,
+                failure_class: classification,
+                failure_message: "context length exceeded",
+                failure_status_override: status,
+            });
+            let service = NativeSummarizer::new(
+                provider.clone(),
+                selection(),
+                ModelBudget::new(None, None, None),
+            )
+            .unwrap();
+            let failure = service.summarize(request()).await.unwrap_err();
+            assert_eq!(failure.kind, FailureKind::Permanent);
+            assert_eq!(failure.code, "summary_transport_rejected");
+            assert_eq!(provider.calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_summary_only_confirmed_context_failures_request_runner_shrink() {
+        for (class, expected) in [
+            (
+                ProviderFailureClass::PromptTooLong,
+                FailureKind::InputOverflow,
+            ),
+            (
+                ProviderFailureClass::ContextTooLarge,
+                FailureKind::InputOverflow,
+            ),
+            (
+                ProviderFailureClass::AuthOrPermission,
+                FailureKind::Permanent,
+            ),
+            (ProviderFailureClass::Unknown, FailureKind::Permanent),
+            (
+                ProviderFailureClass::NetworkTransient,
+                FailureKind::Transient,
+            ),
+            (ProviderFailureClass::RateLimit, FailureKind::Transient),
+        ] {
+            let provider = Arc::new(Fake {
+                calls: Mutex::new(vec![]),
+                termination: ProviderTermination::Complete,
+                fail: true,
+                failure_class: Some(class),
+                failure_message: "synthetic failure",
+                failure_status_override: None,
+            });
+            let service = NativeSummarizer::new(
+                provider.clone(),
+                selection(),
+                ModelBudget::new(None, None, None),
+            )
+            .unwrap();
+            assert_eq!(
+                service.summarize(request()).await.unwrap_err().kind,
+                expected
+            );
+            // Retry/shrink belongs to the durable owner, never the adapter.
+            assert_eq!(provider.calls.lock().unwrap().len(), 1);
+        }
+    }
+
     #[tokio::test]
     async fn native_summary_uses_exact_selection_cap_and_fresh_tool_free_request() {
         for (effort, expected) in [

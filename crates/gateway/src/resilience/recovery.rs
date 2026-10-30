@@ -793,6 +793,14 @@ impl RecoveryCoordinator {
     }
 
     fn provider_recovery_policy(&self, failure: &ProviderFailureDetails) -> ProviderRecoveryPolicy {
+        if failure.http_status == Some(403) {
+            // A confirmed provider HTTP response takes precedence over the
+            // classification hint. Reuse the bounded unchanged-request retry
+            // profile without rewriting the original diagnostic class/hint.
+            return self
+                .policy_registry
+                .policy_for_provider_failure(ProviderFailureClass::NetworkTransient);
+        }
         if !failure.is_recoverable_hint {
             return non_retryable_provider_failure_policy();
         }
@@ -4425,6 +4433,25 @@ impl RecoveryCoordinator {
             return Ok(RecoveryAttemptPlan::default());
         }
 
+        if let Some(failure) = job
+            .diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.last_failure.as_ref())
+            .filter(|failure| failure.http_status == Some(403))
+        {
+            // The latest structured failure survives reload and can differ
+            // from the admission class. Keep the persisted episode budgets,
+            // but never apply class-based request mutations to an HTTP 403.
+            // Legacy prose alone is not evidence of an HTTP response status.
+            // This flag overwrites the execution option, so preserve the
+            // last actual transport rather than re-enabling streaming.
+            return Ok(RecoveryAttemptPlan {
+                force_non_stream: failure.transport
+                    == pioneer_protocol::ProviderTransportKind::NonStream,
+                ..Default::default()
+            });
+        }
+
         let class = job.error_class.unwrap_or(ProviderFailureClass::Unknown);
 
         let mut plan = RecoveryAttemptPlan::default();
@@ -5944,6 +5971,313 @@ mod tests {
                     .max_wall_clock_secs,
                 TURN_RECOVERY_MAX_WALL_CLOCK_SECS
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_chat_requires_provider_owned_overflow_before_durable_compaction() {
+        use anyhow::Result;
+        use pioneer_protocol::AgentDurableEvent;
+        use pioneer_provider::{
+            ChatRequest, ChatResponse, Provider, ProviderFailureClassification, StreamChunk,
+        };
+
+        struct Rejected {
+            message: &'static str,
+            classification: Option<ProviderFailureClassification>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Rejected {
+            fn name(&self) -> &str {
+                "overflow-fixture"
+            }
+            fn classify_failure(&self, _: &anyhow::Error) -> Option<ProviderFailureClassification> {
+                self.classification.clone()
+            }
+            async fn chat(&self, _: ChatRequest) -> Result<ChatResponse> {
+                anyhow::bail!(self.message)
+            }
+            async fn stream_chat(
+                &self,
+                _: ChatRequest,
+            ) -> Result<futures_util::stream::BoxStream<'static, Result<StreamChunk>>> {
+                anyhow::bail!(self.message)
+            }
+        }
+
+        let (store, coordinator) = setup_coordinator().await;
+        let misleading = "maximum context length exceeded";
+        let display_only_unavailable = "API error (503 Service Unavailable): unavailable";
+        let cases = [
+            (
+                misleading,
+                None,
+                None,
+                ProviderFailureClass::Unknown,
+                RecoveryAction::MarkFailed,
+            ),
+            (
+                "API error (413 Payload Too Large): context length exceeded",
+                None,
+                None,
+                ProviderFailureClass::Unknown,
+                RecoveryAction::MarkFailed,
+            ),
+            (
+                "context length exceeded: 503 tokens requested",
+                Some(ProviderFailureClass::ContextTooLarge),
+                None,
+                ProviderFailureClass::ContextTooLarge,
+                RecoveryAction::CompactHistory,
+            ),
+            (
+                "API error (401 Unauthorized): context length exceeded",
+                Some(ProviderFailureClass::ContextTooLarge),
+                None,
+                ProviderFailureClass::ContextTooLarge,
+                RecoveryAction::CompactHistory,
+            ),
+            (
+                "API error (401 Unauthorized): context length exceeded",
+                None,
+                None,
+                ProviderFailureClass::Unknown,
+                RecoveryAction::MarkFailed,
+            ),
+            (
+                "opaque rejection",
+                Some(ProviderFailureClass::PromptTooLong),
+                Some(413),
+                ProviderFailureClass::PromptTooLong,
+                RecoveryAction::CompactHistory,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::Unknown),
+                None,
+                ProviderFailureClass::Unknown,
+                RecoveryAction::MarkFailed,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::AuthExpired),
+                Some(401),
+                ProviderFailureClass::AuthExpired,
+                RecoveryAction::RefreshProviderAuth,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::RateLimit),
+                Some(429),
+                ProviderFailureClass::RateLimit,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::Provider5xx),
+                Some(503),
+                ProviderFailureClass::Provider5xx,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::ContextTooLarge),
+                Some(401),
+                ProviderFailureClass::AuthExpired,
+                RecoveryAction::RefreshProviderAuth,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::ContextTooLarge),
+                Some(403),
+                ProviderFailureClass::AuthOrPermission,
+                RecoveryAction::RefreshProviderAuth,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::ContextTooLarge),
+                Some(408),
+                ProviderFailureClass::NetworkTransient,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::ContextTooLarge),
+                Some(425),
+                ProviderFailureClass::NetworkTransient,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::ContextTooLarge),
+                Some(429),
+                ProviderFailureClass::RateLimit,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                misleading,
+                Some(ProviderFailureClass::PromptTooLong),
+                Some(503),
+                ProviderFailureClass::Provider5xx,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                "connection reset by peer",
+                None,
+                None,
+                ProviderFailureClass::NetworkTransient,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                "API error (429 Too Many Requests): rate limit",
+                None,
+                None,
+                ProviderFailureClass::RateLimit,
+                RecoveryAction::RetryWithBackoff,
+            ),
+            (
+                display_only_unavailable,
+                None,
+                None,
+                ProviderFailureClass::Provider5xx,
+                RecoveryAction::RetryWithBackoff,
+            ),
+        ];
+        for redacted in [false, true] {
+            for (index, (message, typed_class, status, expected_class, expected_action)) in
+                cases.iter().copied().enumerate()
+            {
+                // Endpoint redaction keeps typed HTTP facts, not a status
+                // written only in Display text. The public legacy path can
+                // still infer a transient hint from that text.
+                let (expected_class, expected_action) =
+                    if redacted && message == display_only_unavailable {
+                        (ProviderFailureClass::Unknown, RecoveryAction::MarkFailed)
+                    } else {
+                        (expected_class, expected_action)
+                    };
+                // Use the real scoped registry, including custom-endpoint error
+                // redaction. Its fallback must not masquerade as typed evidence.
+                let registry = Arc::new(
+                    ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+                        |_, _| Ok(String::new()),
+                        |_, _| Ok(None),
+                        move |_, _| Ok(redacted.then(|| "https://fixture.invalid/private".into())),
+                        pioneer_provider::ProviderTimeoutPolicy::default(),
+                    ),
+                );
+                registry
+                    .insert(
+                        "overflow-fixture",
+                        Arc::new(Rejected {
+                            message,
+                            classification: typed_class.map(|class| {
+                                let mut classification = ProviderFailureClassification::new(class);
+                                classification.http_status = status;
+                                classification
+                            }),
+                        }),
+                    )
+                    .unwrap();
+                let manager = AgentManager::new(registry, test_tool_loop_config());
+                let thread = format!("thr_overflow_{redacted}_{index}");
+                let turn = format!("turn_overflow_{redacted}_{index}");
+                manager.ensure_thread(&thread, "ws_overflow").await.unwrap();
+                let mut receiver = manager.take_durable_receiver(&thread).await.unwrap();
+                manager
+                    .start_turn_with_hook_context_permission_profile_and_security_snapshot(
+                        &thread,
+                        &turn,
+                        ThreadMode::Chat,
+                        pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                        "fixture",
+                        "overflow-fixture",
+                        HashMap::new(),
+                        pioneer_skills::SkillCatalogSnapshot {
+                            version: 1,
+                            generated_at_unix: 0,
+                            skills: Vec::new(),
+                        },
+                        vec![UserInput::Text {
+                            text: "hello".into(),
+                            text_elements: Vec::new(),
+                        }],
+                        Vec::new(),
+                        Vec::new(),
+                        HashMap::new(),
+                        Vec::new(),
+                        pioneer_protocol::default_turn_permission_profile_snapshot(),
+                        TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                            std::env::temp_dir().display().to_string(),
+                            1,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                let candidate = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let event = receiver.recv().await.expect("primary failure event");
+                        // This fixture collects the agent output; the recovery
+                        // job below is persisted by the real coordinator/store.
+                        receiver.acknowledge_last(Ok(()));
+                        match event {
+                            AgentDurableEvent::ProviderFailureDetected {
+                                turn_id,
+                                item_id,
+                                item_type,
+                                failure,
+                                ..
+                            } => {
+                                break ProviderFailureCandidate {
+                                    turn_id,
+                                    item_id,
+                                    item_type,
+                                    failure,
+                                };
+                            }
+                            AgentDurableEvent::TurnFailed { .. }
+                            | AgentDurableEvent::TurnCompleted { .. } => {
+                                panic!("expected provider failure")
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .expect("primary failure must reach durable admission");
+                assert_eq!(
+                    candidate.failure.class, expected_class,
+                    "redacted={redacted}, case={index}"
+                );
+                if typed_class == Some(ProviderFailureClass::ContextTooLarge) && status.is_none() {
+                    assert_eq!(candidate.failure.http_status, None);
+                }
+                let job = coordinator
+                    .enqueue_provider_failure_job(&candidate, 1_700_000_000)
+                    .await
+                    .unwrap()
+                    .into_job();
+                let persisted = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+                assert_eq!(persisted.error_class, Some(expected_class));
+                assert_eq!(persisted.action, expected_action);
+                let plan = coordinator.build_attempt_plan(&persisted, 1).await.unwrap();
+                assert_eq!(
+                    plan.compact_history,
+                    expected_action == RecoveryAction::CompactHistory
+                );
+                assert_eq!(
+                    plan.refresh_provider_auth,
+                    expected_action == RecoveryAction::RefreshProviderAuth
+                );
+                assert_eq!(
+                    plan.terminal_reason.is_some(),
+                    expected_action == RecoveryAction::MarkFailed
+                );
+                if expected_action == RecoveryAction::CompactHistory {
+                    assert_eq!(persisted.max_attempts, 1);
+                }
+                manager.remove_thread(&thread).await;
+            }
         }
     }
 
@@ -8962,9 +9296,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_http_403_reloads_as_bounded_unchanged_request_retry() {
+        let (store, coordinator) = setup_coordinator().await;
+        let restarted = CrudStore::new(store.database_connection());
+        for class in [
+            ProviderFailureClass::AuthOrPermission,
+            ProviderFailureClass::AuthExpired,
+            ProviderFailureClass::PermissionDenied,
+            ProviderFailureClass::Unknown,
+            ProviderFailureClass::ModelNotFound,
+            ProviderFailureClass::ContextTooLarge,
+            ProviderFailureClass::PromptTooLong,
+            ProviderFailureClass::MaxOutputTokens,
+            ProviderFailureClass::StreamStall,
+            ProviderFailureClass::StreamTruncated,
+            ProviderFailureClass::UnsupportedStreaming,
+            ProviderFailureClass::UnsupportedToolCalling,
+            ProviderFailureClass::UnsupportedImageInput,
+            ProviderFailureClass::UnsupportedParameter,
+            ProviderFailureClass::UnsupportedCapability,
+            ProviderFailureClass::MalformedProviderRequest,
+            ProviderFailureClass::ProviderRejected,
+            ProviderFailureClass::InvalidRequest,
+            ProviderFailureClass::NetworkTransient,
+            ProviderFailureClass::RateLimit,
+            ProviderFailureClass::Provider5xx,
+            ProviderFailureClass::EmptyResponse,
+        ] {
+            let mut failure = provider_failure(class, "provider denied the request");
+            if matches!(
+                class,
+                ProviderFailureClass::StreamStall
+                    | ProviderFailureClass::StreamTruncated
+                    | ProviderFailureClass::UnsupportedStreaming
+            ) {
+                failure.transport = ProviderTransportKind::Stream;
+            }
+            failure.http_status = Some(403);
+            failure.is_recoverable_hint = false;
+            let job = coordinator
+                .enqueue_provider_failure_job(
+                    &ProviderFailureCandidate {
+                        turn_id: format!("turn_http_403_{class:?}"),
+                        item_id: "reasoning_403".into(),
+                        item_type: TurnItemType::Reasoning,
+                        failure: failure.clone(),
+                    },
+                    1_700_000_000,
+                )
+                .await
+                .unwrap()
+                .into_job();
+            let reloaded = restarted.get_recovery_job(&job.id).await.unwrap().unwrap();
+            let policy = coordinator
+                .policy_for_recovery_job(&reloaded)
+                .await
+                .unwrap();
+            assert_eq!(policy.action, RecoveryAction::RetryWithBackoff, "{class:?}");
+            assert_eq!(policy.max_attempts, 3);
+            assert_eq!(policy.base_backoff_secs, 2);
+            assert_eq!(policy.max_wall_clock_secs, 900);
+            assert_eq!(policy.no_progress_limit, 3);
+            assert_eq!(reloaded.error_class, Some(class));
+            assert_eq!(reloaded.policy_snapshot["class"], serde_json::json!(class));
+            assert_eq!(reloaded.policy_snapshot["is_recoverable_hint"], false);
+            assert_eq!(
+                reloaded.diagnostic,
+                Some(pioneer_protocol::RecoveryDiagnostic::provider(&failure))
+            );
+            for attempt_number in 1..=3 {
+                let plan = coordinator
+                    .build_attempt_plan(&reloaded, attempt_number)
+                    .await
+                    .unwrap();
+                assert!(!plan.refresh_provider_auth, "{class:?}");
+                assert_eq!(
+                    plan.force_non_stream,
+                    failure.transport == ProviderTransportKind::NonStream,
+                    "{class:?}: retry must preserve the last actual transport"
+                );
+                assert!(!plan.disable_tool_calling, "{class:?}");
+                assert!(!plan.disable_image_input, "{class:?}");
+                assert!(!plan.compact_history, "{class:?}");
+                assert!(!plan.continue_generation, "{class:?}");
+                assert!(plan.model_override.is_none(), "{class:?}");
+                assert!(plan.terminal_reason.is_none(), "{class:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn non_403_auth_and_local_failures_keep_existing_policy() {
+        let (_store, coordinator) = setup_coordinator().await;
+        for (class, status, hint, action, max_attempts) in [
+            (
+                ProviderFailureClass::AuthExpired,
+                Some(401),
+                true,
+                RecoveryAction::RefreshProviderAuth,
+                1,
+            ),
+            (
+                ProviderFailureClass::AuthOrPermission,
+                Some(401),
+                true,
+                RecoveryAction::RefreshProviderAuth,
+                1,
+            ),
+            (
+                ProviderFailureClass::AuthOrPermission,
+                None,
+                true,
+                RecoveryAction::RefreshProviderAuth,
+                1,
+            ),
+            (
+                ProviderFailureClass::PermissionDenied,
+                None,
+                true,
+                RecoveryAction::RefreshProviderAuth,
+                1,
+            ),
+            (
+                ProviderFailureClass::PermissionDenied,
+                None,
+                false,
+                RecoveryAction::MarkFailed,
+                0,
+            ),
+            (
+                ProviderFailureClass::Unknown,
+                None,
+                false,
+                RecoveryAction::MarkFailed,
+                0,
+            ),
+        ] {
+            // Neither legacy prose nor a public error code establishes an HTTP status.
+            let mut failure = provider_failure(class, "Unavailable: HTTP 403");
+            failure.http_status = status;
+            failure.is_recoverable_hint = hint;
+            let policy = coordinator.provider_recovery_policy(&failure);
+            assert_eq!(policy.action, action);
+            assert_eq!(policy.max_attempts, max_attempts);
+            let mut job = provider_plan_job(class, "stream");
+            job.reason = failure.message.clone();
+            job.diagnostic = Some(pioneer_protocol::RecoveryDiagnostic::provider(&failure));
+            let plan = coordinator.build_attempt_plan(&job, 2).await.unwrap();
+            if class == ProviderFailureClass::Unknown {
+                assert!(plan.terminal_reason.is_some());
+            } else {
+                assert!(plan.refresh_provider_auth);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn last_provider_failure_is_durable_without_replacing_initial_policy() {
         let (store, coordinator) = setup_coordinator().await;
-        let initial = provider_failure(ProviderFailureClass::StreamTruncated, "raw stream secret");
+        let mut initial =
+            provider_failure(ProviderFailureClass::StreamTruncated, "raw stream secret");
+        initial.transport = ProviderTransportKind::Stream;
         let job = coordinator
             .enqueue_provider_failure_job(
                 &ProviderFailureCandidate {
@@ -8988,6 +9480,7 @@ mod tests {
             "HTTP 401 raw response https://secret.example/token /private/key",
         );
         last.http_status = Some(403);
+        last.is_recoverable_hint = false;
         last.stage = ProviderFailureStage::Connect;
         last.provider_code = Some("credential=secret".to_owned());
         let events = coordinator
@@ -9010,6 +9503,13 @@ mod tests {
             pending.diagnostic.as_ref().unwrap().last_failure,
             Some(pioneer_protocol::RecoveryProviderFailure::from(&last))
         );
+        let plan = coordinator.build_attempt_plan(&pending, 2).await.unwrap();
+        assert!(
+            plan.force_non_stream,
+            "latest NonStream HTTP 403 must remain NonStream"
+        );
+        assert!(!plan.refresh_provider_auth);
+        assert!(plan.terminal_reason.is_none());
         let claimed = store
             .claim_due_recovery_jobs(pending.next_run_at_unix, 45, 1)
             .await
@@ -9144,6 +9644,138 @@ mod tests {
             .unwrap();
         assert_eq!(reloaded.status, RecoveryJobStatus::Pending);
         assert_eq!(reloaded.run_count, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_http_403_cooldown_replay_and_reload_preserve_attempt_budget() {
+        let (store, coordinator) = setup_coordinator().await;
+        let now = 1_700_000_000;
+        let mut failure = provider_failure(ProviderFailureClass::AuthOrPermission, "forbidden");
+        failure.http_status = Some(403);
+        failure.is_recoverable_hint = false;
+        failure.retry_after_ms = Some(1_501);
+        let candidate = ProviderFailureCandidate {
+            turn_id: "turn_http_403_budget".into(),
+            item_id: "reasoning_403_budget".into(),
+            item_type: TurnItemType::Reasoning,
+            failure,
+        };
+        let mut job = coordinator
+            .enqueue_provider_failure_job(&candidate, now)
+            .await
+            .unwrap()
+            .into_job();
+        assert_eq!(job.next_run_at_unix, now + 2);
+        assert_eq!(job.scheduled_at_unix, now + 2);
+        let restarted = Arc::new(CrudStore::new(store.database_connection()));
+        for run in 1..=3 {
+            // Recreate the coordinator between attempts: only durable state
+            // may carry the consumed budget and the provider status forward.
+            let coordinator = RecoveryCoordinator::new(
+                restarted.clone(),
+                coordinator.agent_manager.clone(),
+                Arc::new(ProviderRegistry::with_provider(
+                    "echo",
+                    Arc::new(EchoProvider::new()),
+                )),
+                RecoveryPolicyRegistry::default(),
+                test_tool_loop_config().normalized(),
+            );
+            let due = job.next_run_at_unix;
+            assert!(
+                restarted
+                    .claim_due_recovery_jobs(due - 1, 45, 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let claimed = restarted.claim_due_recovery_jobs(due, 45, 1).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].id, job.id);
+            let attempt = format!("http_403_attempt_{run}");
+            assert!(matches!(
+                restarted
+                    .mark_claimed_recovery_job_active(
+                        &job.id,
+                        claimed[0].claim_token.as_deref().unwrap(),
+                        &attempt,
+                        due,
+                    )
+                    .await
+                    .unwrap(),
+                ClaimedRecoveryActivation::Activated
+            ));
+            let mut renewed = candidate.failure.clone();
+            renewed.retry_after_ms = Some(3_201);
+            let events = coordinator
+                .record_recovery_provider_failure(&job.id, &attempt, renewed.clone(), due + 1, None)
+                .await
+                .unwrap();
+            let saved = restarted.get_recovery_job(&job.id).await.unwrap().unwrap();
+            assert_eq!(saved.run_count, run);
+            assert_eq!(saved.provider_attempt_number, run);
+            assert_eq!(saved.max_attempts, 3);
+            assert_eq!(saved.policy_snapshot, job.policy_snapshot);
+            assert_eq!(
+                saved.diagnostic.as_ref().unwrap().last_failure,
+                Some(pioneer_protocol::RecoveryProviderFailure::from(&renewed))
+            );
+            assert!(
+                coordinator
+                    .record_recovery_provider_failure(&job.id, &attempt, renewed, due + 2, None,)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "duplicate failure must not consume budget twice"
+            );
+            if run < 3 {
+                assert!(matches!(
+                    events.as_slice(),
+                    [RecoveryCoordinatorEvent::RetryScheduled { .. }]
+                ));
+                assert_eq!(saved.next_run_at_unix, due + 5);
+                assert_eq!(
+                    saved.scheduled_at_unix,
+                    job.scheduled_at_unix + 4,
+                    "cooldown pauses the budget without discarding consumed time"
+                );
+                let reused = coordinator
+                    .enqueue_provider_failure_job(&candidate, due + 2)
+                    .await
+                    .unwrap();
+                assert!(!reused.is_created());
+                let reused = reused.into_job();
+                assert_eq!(reused.id, job.id);
+                assert_eq!(reused.run_count, run);
+                assert_eq!(reused.scheduled_at_unix, saved.scheduled_at_unix);
+                assert_eq!(reused.next_run_at_unix, saved.next_run_at_unix);
+            } else {
+                assert!(matches!(
+                    events.as_slice(),
+                    [RecoveryCoordinatorEvent::RecoveryExhausted(_)]
+                ));
+                assert_eq!(saved.status, RecoveryJobStatus::Exhausted);
+                assert_eq!(
+                    saved.diagnostic.as_ref().unwrap().stop_reason,
+                    Some(pioneer_protocol::RecoveryStopReason::AttemptsExhausted)
+                );
+                assert!(
+                    restarted
+                        .claim_due_recovery_jobs(due + 100, 45, 1)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            job = saved;
+        }
+        assert_eq!(
+            restarted
+                .count_recovery_jobs_for_turn(&candidate.turn_id)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -10677,7 +11309,8 @@ mod tests {
             ProviderFailureClass::UnsupportedCapability,
             ProviderFailureClass::Unknown,
         ] {
-            let job = provider_plan_job(class, "stream");
+            let mut job = provider_plan_job(class, "stream");
+            job.reason = Some("legacy HTTP 403 without structured status".into());
             let plan = coordinator
                 .build_attempt_plan(&job, 1)
                 .await

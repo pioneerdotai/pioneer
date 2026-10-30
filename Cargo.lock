@@ -10705,7 +10705,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "tiktoken-rs",
 ]
 
 [[package]]
@@ -10731,6 +10730,7 @@ dependencies = [
  "pioneer-entity",
  "pioneer-hooks",
  "pioneer-migration",
+ "pioneer-observability",
  "pioneer-protocol",
  "pioneer-sqlite",
  "sea-orm",
@@ -10742,6 +10742,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "zstd 0.14.3",
 ]
 
 [[package]]
@@ -11036,7 +11037,6 @@ dependencies = [
  "subtle",
  "tar",
  "tempfile",
- "tiktoken-rs",
  "tokenizers",
  "tokio",
  "tokio-tungstenite 0.30.0",
@@ -11251,6 +11251,7 @@ dependencies = [
  "lopdf 0.45.0",
  "mime_guess",
  "mp4parse",
+ "pioneer-compaction",
  "pioneer-observability",
  "pioneer-protocol",
  "reqwest",
@@ -11259,7 +11260,6 @@ dependencies = [
  "sha2 0.11.1",
  "symphonia",
  "tempfile",
- "tiktoken-rs",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -15869,20 +15869,6 @@ dependencies = [
  "quick-error 2.0.1",
  "weezl 0.1.12",
  "zune-jpeg 0.5.15",
-]
-
-[[package]]
-name = "tiktoken-rs"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2aeff724640cfe13037336ddf35befdffd2909cbdb65cf041cc8a4cf8c584cfa"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bstr",
- "fancy-regex 0.19.2",
- "regex",
- "rustc-hash 2.1.3",
 ]
 
 [[package]]

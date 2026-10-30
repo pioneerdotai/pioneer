@@ -1854,19 +1854,55 @@ fn infer_failure_classification(
 
 fn merge_failure_classification(
     classification: Option<ProviderFailureClassification>,
-    inferred: ProviderFailureClassification,
+    mut inferred: ProviderFailureClassification,
 ) -> ProviderFailureClassification {
+    // Display text can retain legacy transient hints, but must never authorize
+    // history reduction. Both adapter translation and final failure creation
+    // merge here, so a second fallback cannot restore an unconfirmed overflow.
+    if matches!(
+        inferred.class,
+        ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+    ) {
+        inferred.class = ProviderFailureClass::Unknown;
+    }
     match classification {
-        Some(classification) => ProviderFailureClassification {
-            is_network_error: classification.is_network_error,
-            raw_response: classification.raw_response,
-            error_reason: classification.error_reason,
-            request_id: classification.request_id,
-            class: classification.class,
-            http_status: classification.http_status.or(inferred.http_status),
-            provider_code: classification.provider_code.or(inferred.provider_code),
-            retry_after_ms: classification.retry_after_ms.or(inferred.retry_after_ms),
-        },
+        Some(mut classification) => {
+            if matches!(
+                classification.class,
+                ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+            ) {
+                // A few adapters classify a typed HTTP rejection's body using
+                // legacy text rules. Auth/transient HTTP evidence vetoes that
+                // body's misleading size claim; other typed classes stay authoritative.
+                classification.class = match classification.http_status {
+                    Some(401) => ProviderFailureClass::AuthExpired,
+                    Some(403) => ProviderFailureClass::AuthOrPermission,
+                    Some(408 | 425) => ProviderFailureClass::NetworkTransient,
+                    Some(429) => ProviderFailureClass::RateLimit,
+                    Some(500..=599) => ProviderFailureClass::Provider5xx,
+                    _ => classification.class,
+                };
+            }
+            ProviderFailureClassification {
+                is_network_error: classification.is_network_error,
+                raw_response: classification.raw_response,
+                error_reason: classification.error_reason,
+                request_id: classification.request_id,
+                class: classification.class,
+                // Do not promote a Display-only number to HTTP authority for
+                // the second merge of a confirmed overflow classification.
+                http_status: if matches!(
+                    classification.class,
+                    ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+                ) {
+                    classification.http_status
+                } else {
+                    classification.http_status.or(inferred.http_status)
+                },
+                provider_code: classification.provider_code.or(inferred.provider_code),
+                retry_after_ms: classification.retry_after_ms.or(inferred.retry_after_ms),
+            }
+        }
         None => inferred,
     }
 }
@@ -4234,6 +4270,7 @@ mod terminal_boundary_tests {
         chunks: Vec<StreamChunk>,
         fail: bool,
         attempts: Arc<AtomicUsize>,
+        non_stream_attempts: Arc<AtomicUsize>,
     }
     #[async_trait]
     impl Provider for FixtureProvider {
@@ -4247,6 +4284,7 @@ mod terminal_boundary_tests {
             }
         }
         async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            self.non_stream_attempts.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("unexpected fallback/retry")
         }
         async fn stream_chat(
@@ -4308,6 +4346,7 @@ mod terminal_boundary_tests {
             }])],
             fail: true,
             attempts: attempts.clone(),
+            non_stream_attempts: Arc::new(AtomicUsize::new(0)),
         });
         let hub = AgentEventHub::new();
         let (result, events) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -4356,6 +4395,7 @@ mod terminal_boundary_tests {
             chunks: vec![terminal],
             fail: false,
             attempts: Arc::new(AtomicUsize::new(0)),
+            non_stream_attempts: Arc::new(AtomicUsize::new(0)),
         });
         let hub = AgentEventHub::new();
         let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -4378,6 +4418,58 @@ mod terminal_boundary_tests {
         .expect("provider round and all durable acknowledgements must finish");
         let result = result.unwrap();
         assert_eq!(result.text, "terminal text");
+    }
+
+    #[tokio::test]
+    async fn forced_non_stream_round_preserves_transport_on_streaming_capable_provider() {
+        // The recovery owner tests choose the flag from durable transport.
+        // Exercise its consumer here, observing actual Provider entry points.
+        for force_non_stream in [false, true] {
+            let stream_attempts = Arc::new(AtomicUsize::new(0));
+            let non_stream_attempts = Arc::new(AtomicUsize::new(0));
+            let provider: Arc<dyn Provider> = Arc::new(FixtureProvider {
+                chunks: vec![
+                    StreamChunk::delta("streamed response"),
+                    StreamChunk::final_chunk_with(ProviderTermination::Complete),
+                ],
+                fail: false,
+                attempts: stream_attempts.clone(),
+                non_stream_attempts: non_stream_attempts.clone(),
+            });
+            let hub = AgentEventHub::new();
+            let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    request_agent_round(
+                        &provider,
+                        request(),
+                        "ws",
+                        "thread",
+                        "turn",
+                        "item",
+                        force_non_stream,
+                        ProviderTimeoutPolicy::default(),
+                        &hub,
+                    ),
+                    acknowledge_round_events(&hub),
+                )
+            })
+            .await
+            .expect("provider round and durable acknowledgements must finish");
+            if force_non_stream {
+                assert_eq!(non_stream_attempts.load(Ordering::SeqCst), 1);
+                assert_eq!(stream_attempts.load(Ordering::SeqCst), 0);
+                // chat deliberately fails in this fixture; the failure must
+                // still describe the actual NonStream call, without fallback.
+                let Err(ChatTurnError::ProviderFailure { failure, .. }) = result else {
+                    panic!("expected the fixture's non-stream failure");
+                };
+                assert_eq!(failure.transport, ProviderTransportKind::NonStream);
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(stream_attempts.load(Ordering::SeqCst), 1);
+                assert_eq!(non_stream_attempts.load(Ordering::SeqCst), 0);
+            }
+        }
     }
 }
 

@@ -1,5 +1,8 @@
 use crate::query_scope::{DiagnosticStream, ScopedFuture, observe_control, open_stream};
 use async_trait::async_trait;
+use pioneer_observability::portable_payload::{
+    Family as PortableFamily, NativeOutcome, NativeRead,
+};
 use pioneer_observability::query_cpu::{self, QueryScope};
 use sea_orm::{
     AccessMode, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr,
@@ -154,6 +157,104 @@ impl SqliteReadPool {
                 .await
         }
         .await;
+        operation.finish(if result.is_ok() {
+            SqliteReadOutcome::Ok
+        } else {
+            SqliteReadOutcome::Error
+        });
+        result
+    }
+
+    async fn read_blob_range(
+        &self,
+        class: SqliteReadClass,
+        source: crate::SqliteBlobSource,
+        mut guard: Statement,
+        offset: u64,
+        count: usize,
+        expected_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, DbErr> {
+        Self::ensure_read_statement(&guard)?;
+        if count > 65536
+            || offset
+                .checked_add(count as u64)
+                .is_none_or(|end| end > expected_bytes)
+        {
+            return Err(crate::blob_range::error("invalid SQLite blob range"));
+        }
+        let bindings = crate::blob_range::bindings(&mut guard)?;
+        let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+        // Attribute only the five portable source columns. Frozen-history and
+        // other native readers keep their existing read/admission/pool signals.
+        let mut native = match (source.table, source.column) {
+            ("tool_output_chunk", "text") => Some(NativeRead::new(PortableFamily::ToolText)),
+            ("tool_output_chunk", "metadata") => {
+                Some(NativeRead::new(PortableFamily::ToolMetadata))
+            }
+            ("turn_cli_runtime_binding", "input_mapping_json") => {
+                Some(NativeRead::new(PortableFamily::CliMapping))
+            }
+            ("task_run_conversation_snapshot", "history_json") => {
+                Some(NativeRead::new(PortableFamily::TaskHistory))
+            }
+            ("task_event", "payload_json") => Some(NativeRead::new(PortableFamily::TaskEvent)),
+            _ => None,
+        };
+        // Keep the recorder outside the resource-owning future. On Ready and
+        // cancellation, observe destroys that future (and its borrowed handle,
+        // pool connection and permit) before NativeRead can finish/export.
+        // This scope has no SeaORM callback: query_cpu retains its existing
+        // no-callback coverage and does not measure this runtime thread's CPU.
+        let result = query_cpu::observe(async {
+            let _permit = self.acquire(class).await?;
+            let _startup_execute = pioneer_observability::turn_startup::current_stage(
+                pioneer_observability::turn_startup::Stage::DbExecute,
+            );
+            let mut connection = self
+                .connection
+                .get_sqlite_connection_pool()
+                .acquire()
+                .await
+                .map_err(|_| crate::blob_range::error("SQLite blob reader acquisition failed"))?;
+            if let Some(native) = &mut native {
+                native.waiting_for_handle();
+            }
+            let mut locked = connection
+                .lock_handle()
+                .await
+                .map_err(|_| crate::blob_range::error("SQLite blob reader handle lock failed"))?;
+            if let Some(native) = &mut native {
+                native.executing();
+            }
+            // SAFETY: SQLx's LockedSqliteHandle excludes its worker from all
+            // native calls. rusqlite uses the same linked libsqlite3-sys and
+            // from_handle borrows rather than closes this physical handle.
+            // No wrapper, statement, row or blob escapes this synchronous block.
+            let borrowed =
+                unsafe { rusqlite::Connection::from_handle(locked.as_raw_handle().as_ptr()) }
+                    .map_err(crate::blob_range::native_error)?;
+            crate::blob_range::read(
+                &borrowed,
+                source,
+                &guard.sql,
+                &bindings,
+                offset,
+                count,
+                expected_bytes,
+            )
+        })
+        .instrument(reader_pool_span(class))
+        .await;
+        if let Some(native) = native {
+            let (outcome, bytes) = match &result {
+                Ok(Some(bytes)) => (NativeOutcome::Ok, bytes.len() as u64),
+                Ok(None) => (NativeOutcome::Missing, 0),
+                Err(_) => (NativeOutcome::Error, 0),
+            };
+            // One native operation includes PRAGMA/guard/blob work. It is not
+            // an ordinary SQL query count or fingerprint, nor measured CPU.
+            native.finish(outcome, bytes);
+        }
         operation.finish(if result.is_ok() {
             SqliteReadOutcome::Ok
         } else {
@@ -508,6 +609,39 @@ impl SqliteDatabase {
     /// [`TransactionTrait::begin`] intentionally remains the write boundary.
     pub async fn begin_read(&self) -> Result<SqliteReadTransaction, DbErr> {
         self.reader.begin(self.read_class).await
+    }
+
+    /// Read <=64 KiB of legacy TEXT/BLOB without materializing its full value.
+    /// `guard` must be a bounded Entity SELECT of only the target rowid (LIMIT
+    /// 1), with the caller's identity/revision/ownership/physical-state fences.
+    /// The guard and read share one snapshot. All native/reader resources are
+    /// released before return; a miss is None, other failures remain errors.
+    ///
+    /// This removes the full-column OP_Column allocation of SQL substr/CAST.
+    /// It does not promise constant native workspace or linear total I/O:
+    /// SQLite allocates an overflow-page-number map proportional to record
+    /// pages (currently up to 2*sizeof(Pgno) per page), and reopening the cursor
+    /// can walk the overflow prefix again. No cursor survives between ranges.
+    /// Cancellation drops admission/pool/handle waits; the synchronous native
+    /// call finishes before cancellation can be observed, without detached work.
+    pub async fn read_blob_range(
+        &self,
+        source: crate::SqliteBlobSource,
+        guard: Statement,
+        offset: u64,
+        count: usize,
+        expected_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, DbErr> {
+        self.reader
+            .read_blob_range(
+                self.read_class,
+                source,
+                guard,
+                offset,
+                count,
+                expected_bytes,
+            )
+            .await
     }
 
     /// Execute a row-returning statement on the serialized writer. This is
@@ -927,6 +1061,246 @@ mod tests {
                 Err(error) => panic!("remove test database {}: {error}", candidate.display()),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_text_ranges_avoid_full_allocations_and_release_maintenance_reader() {
+        use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
+
+        // SQLITE_STATUS_MALLOC_SIZE is process-global. This owner runs in its
+        // own nextest process, as required by AGENTS, never parallel cargo test.
+        fn allocation_peak(reset: bool) -> i64 {
+            let (mut current, mut peak) = (0, 0);
+            // SAFETY: SQLite status accepts valid output pointers, performs
+            // its own synchronization and returns no borrowed memory.
+            let result = unsafe {
+                rusqlite::ffi::sqlite3_status64(
+                    rusqlite::ffi::SQLITE_STATUS_MALLOC_SIZE,
+                    &mut current,
+                    &mut peak,
+                    i32::from(reset),
+                )
+            };
+            assert_eq!(result, rusqlite::ffi::SQLITE_OK);
+            peak
+        }
+
+        let (base, path) = file_backed_test_database().await;
+        base.execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
+        base.execute_unprepared(
+            "CREATE TABLE legacy_range_probe (id TEXT PRIMARY KEY, revision INTEGER NOT NULL, identity TEXT NOT NULL, created_at TEXT NOT NULL, payload TEXT NOT NULL, adjacent TEXT NOT NULL)",
+        ).await.unwrap();
+        let original = "é🦀Ж".repeat(2 * 1024 * 1024);
+        let created_at =
+            chrono::DateTime::parse_from_rfc3339("2026-10-27T13:24:44.123+03:00").unwrap();
+        base.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO legacy_range_probe VALUES (?,?,?,?,?,?)",
+            [
+                "legacy".into(),
+                7i64.into(),
+                "incarnation".into(),
+                created_at.into(),
+                original.clone().into(),
+                original.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        let mut reader_options =
+            ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
+        reader_options
+            .max_connections(1)
+            .map_sqlx_sqlite_opts(|options| {
+                options
+                    .pragma("query_only", "ON")
+                    .pragma("foreign_keys", "OFF")
+            });
+        let reader = Database::connect(reader_options).await.unwrap();
+        let observer = Arc::new(RecordingReadObserver::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            base.writer.clone(),
+            observer.clone(),
+        )
+        .maintenance();
+        assert!(database.reader_query_only_enabled().await.unwrap());
+        let guard_query = |revision: i64| {
+            Query::select()
+                .column(Alias::new("rowid"))
+                .from(Alias::new("legacy_range_probe"))
+                .and_where(Expr::col(Alias::new("id")).eq("legacy"))
+                .and_where(Expr::col(Alias::new("revision")).eq(revision))
+                .and_where(Expr::col(Alias::new("identity")).eq("incarnation"))
+                .and_where(Expr::col(Alias::new("created_at")).eq(created_at))
+                // Prepared LIMIT has the same u64 bind as production guards.
+                .limit(1)
+                .to_owned()
+        };
+        let guard = |revision| DbBackend::Sqlite.build(&guard_query(revision));
+        let source = crate::SqliteBlobSource {
+            table: "legacy_range_probe",
+            column: "payload",
+        };
+        let offset = original.len() - 65536 - 3;
+        let events_before = observer.events().len();
+        allocation_peak(true);
+        let fragment = database
+            .read_blob_range(
+                source,
+                guard(7),
+                offset as u64,
+                65536,
+                original.len() as u64,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let native_peak = allocation_peak(false);
+        // A far, deliberately misaligned Unicode range is physical UTF-8, not
+        // a character substring. The adjacent large field must not be loaded.
+        assert_eq!(fragment, original.as_bytes()[offset..offset + 65536]);
+        assert!(
+            native_peak < original.len() as i64 / 4,
+            "native peak {native_peak}"
+        );
+        let events = observer.events();
+        assert!(matches!(
+            events.last(),
+            Some(SqliteReadEvent::OperationFinished {
+                class: SqliteReadClass::Maintenance,
+                outcome: SqliteReadOutcome::Ok,
+                ..
+            })
+        ));
+        assert!(events[events_before..].iter().any(|event| matches!(
+            event,
+            SqliteReadEvent::AdmissionReleased {
+                class: SqliteReadClass::Maintenance,
+                active: 0,
+                ..
+            }
+        )));
+        // A second maintenance operation with the sole reader proves neither
+        // its connection nor its limiter permit survives in the returned Vec.
+        assert!(database.reader_query_only_enabled().await.unwrap());
+        assert!(
+            database
+                .read_blob_range(source, guard(8), 0, 8, original.len() as u64)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            database
+                .read_blob_range(source, guard(7), 0, 65537, original.len() as u64)
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .read_blob_range(
+                    source,
+                    guard(7),
+                    original.len() as u64,
+                    1,
+                    original.len() as u64
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .read_blob_range(source, guard(7), 0, 8, original.len() as u64 - 1)
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .read_blob_range(
+                    source,
+                    guard(7),
+                    original.len() as u64,
+                    0,
+                    original.len() as u64
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+
+        // Exercise unsigned SQL semantics at the public storage boundary,
+        // including NULL and the largest SQLite integer, without another suite.
+        for (value, expected) in [
+            (None, None),
+            (Some(0u64), Some(0i64)),
+            (Some(i64::MAX as u64), Some(i64::MAX)),
+        ] {
+            let mut query = guard_query(7);
+            query.and_where(match expected {
+                None => Expr::val(value).is_null(),
+                Some(expected) => Expr::val(value).eq(expected),
+            });
+            assert_eq!(
+                database
+                    .read_blob_range(
+                        source,
+                        DbBackend::Sqlite.build(&query),
+                        0,
+                        8,
+                        original.len() as u64
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                original.as_bytes()[..8]
+            );
+        }
+        let mut overflow = guard_query(7);
+        overflow.and_where(Expr::val(i64::MAX as u64 + 1).is_not_null());
+        let events_before_overflow = observer.events().len();
+        let error = database
+            .read_blob_range(
+                source,
+                DbBackend::Sqlite.build(&overflow),
+                0,
+                8,
+                original.len() as u64,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, sea_orm::DbErr::Custom(message) if message == "SQLite blob guard unsigned integer overflow")
+        );
+        assert_eq!(
+            observer.events().len(),
+            events_before_overflow,
+            "overflow must fail before reader admission"
+        );
+
+        // Independent negative control: the former SQL shape returns the same
+        // small bytes but allocates the full TEXT before invoking substr.
+        allocation_peak(true);
+        let control = database.query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT substr(CAST(payload AS BLOB),?,?) AS fragment FROM legacy_range_probe WHERE id=? LIMIT 1",
+            [(offset as i64 + 1).into(), 65536i64.into(), "legacy".into()],
+        )).await.unwrap().unwrap();
+        let materialized_peak = allocation_peak(false);
+        assert_eq!(
+            control.try_get::<Vec<u8>>("", "fragment").unwrap(),
+            fragment
+        );
+        assert!(
+            materialized_peak >= original.len() as i64,
+            "negative control peak {materialized_peak}, native peak {native_peak}"
+        );
+        assert!(database.reader_query_only_enabled().await.unwrap());
+        database.close().await.unwrap();
+        close_file_backed_test_database(base, path).await;
     }
 
     #[test]

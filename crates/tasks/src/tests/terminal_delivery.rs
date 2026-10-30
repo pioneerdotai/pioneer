@@ -869,12 +869,39 @@ impl pioneer_sqlite::SqliteWriteObserver for TerminalQueueObserver {
 #[tokio::test]
 async fn cancelling_queued_terminal_commit_releases_capacity_without_partial_events() {
     use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor, SqliteWriteQueueSnapshot};
-    let connection = Database::connect("sqlite::memory:").await.unwrap();
+    // Commit refreshes event preflight through a reader before queuing its
+    // writer. A shared in-memory connection would stall that read behind the
+    // blocker, so it could never exercise queued-writer cancellation.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("terminal-cancellation.sqlite");
+    let mut options = sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+    options
+        .max_connections(1)
+        .min_connections(1)
+        .map_sqlx_sqlite_opts(|options| {
+            options
+                .pragma("journal_mode", "WAL")
+                .pragma("foreign_keys", "OFF")
+        });
+    let connection = Database::connect(options).await.unwrap();
     Migrator::up(&connection, None).await.unwrap();
     seed_task_test_workspace(&connection).await;
+    let mut options =
+        sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+    options
+        .max_connections(1)
+        .min_connections(1)
+        .map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+                .pragma("foreign_keys", "OFF")
+        });
+    let reader = Database::connect(options).await.unwrap();
     let observer = Arc::new(TerminalQueueObserver::default());
     let database = SqliteDatabase::from_executor(
-        connection.clone(),
+        reader,
         SqliteWriteExecutor::with_observer(connection, observer.clone()),
     );
     let (runtime, run, _, result) =
