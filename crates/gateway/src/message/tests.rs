@@ -26545,6 +26545,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         }))
         .unwrap();
         let source_turn = Turn {
+            work_owner: pioneer_protocol::TurnWorkOwner::DetachedTask,
             id: source_turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
