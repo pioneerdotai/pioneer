@@ -4931,28 +4931,35 @@ done
                 },
                 &event,
             );
+            if item.native_item_id == "call-b" {
+                assert!(
+                    projected.durable.is_empty(),
+                    "an error response must not acknowledge the task outcome"
+                );
+                continue;
+            }
+            assert_eq!(projected.durable.len(), 1);
             let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
-                panic!("durable completion");
+                panic!("durable observation receipt");
             };
-            let TurnItem::DynamicToolCall {
-                storage: pioneer_protocol::ToolStoragePayload::Metadata { metadata },
+            let TurnItem::SystemEvent {
+                code,
+                details: Some(details),
                 ..
             } = &notification.item
             else {
-                panic!("stored metadata");
+                panic!("task observation receipt");
             };
-            let metadata = metadata.to_json();
-            let ids = pioneer_agent::observed_terminal_task_outcomes_from_payload(
-                "task_accept",
-                &metadata["taskResult"],
-            );
+            assert_eq!(code.as_deref(), Some("task.terminal.observed"));
+            assert_eq!(item.native_item_id, "call-a");
             assert_eq!(
-                ids.contains(&pioneer_agent::ObservedTaskOutcome::AcceptedCandidate {
-                    task_id: "accepted_task".into(),
-                    run_id: "run".into(),
-                    candidate_id: "candidate".into()
-                }),
-                item.native_item_id == "call-a"
+                details["outcomes"],
+                json!([{
+                    "kind": "acceptedCandidate",
+                    "taskId": "accepted_task",
+                    "runId": "run",
+                    "candidateId": "candidate"
+                }])
             );
         }
         child.kill().await.unwrap();
