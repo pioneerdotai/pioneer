@@ -1,3 +1,7 @@
+pub mod portable_payload_codec;
+#[doc(hidden)]
+pub use repositories::portable_payload::PayloadReadHold;
+pub use repositories::portable_payload::PortablePayloadProgress;
 mod cli_mcp_call;
 mod codex_retry_notice;
 pub use cli_mcp_call::{CliMcpCallIdentity, is_managed_cli_mcp_item};
@@ -1016,6 +1020,86 @@ impl CliRuntimeTurnTerminalGuard {
     }
 }
 
+// These typed boundaries run only after repository reads have released reader
+// capacity or writer closures have committed. Repository records inside a
+// transaction retain the SQL projection and storage provenance.
+async fn hydrate_cli_binding_optional(
+    db: &SqliteDatabase,
+    record: Option<CliRuntimeTurnBindingRecord>,
+) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+    match record {
+        Some(record) => Ok(Some(cli_runtime_binding::hydrate_record(db, record).await?)),
+        None => Ok(None),
+    }
+}
+async fn hydrate_cli_binding_list(
+    db: &SqliteDatabase,
+    records: Vec<CliRuntimeTurnBindingRecord>,
+) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
+    let mut output = Vec::with_capacity(records.len());
+    for record in records {
+        output.push(cli_runtime_binding::hydrate_record(db, record).await?);
+    }
+    Ok(output)
+}
+async fn hydrate_cli_binding_pair(
+    db: &SqliteDatabase,
+    (binding, attempt): (CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord),
+) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+    Ok((
+        cli_runtime_binding::hydrate_record(db, binding).await?,
+        attempt,
+    ))
+}
+async fn hydrate_cli_binding_triple(
+    db: &SqliteDatabase,
+    (binding, attempt, segment): (
+        CliRuntimeTurnBindingRecord,
+        CliRuntimeTurnAttemptRecord,
+        CliRuntimeExecutionSegmentRecord,
+    ),
+) -> Result<(
+    CliRuntimeTurnBindingRecord,
+    CliRuntimeTurnAttemptRecord,
+    CliRuntimeExecutionSegmentRecord,
+)> {
+    Ok((
+        cli_runtime_binding::hydrate_record(db, binding).await?,
+        attempt,
+        segment,
+    ))
+}
+async fn hydrate_cli_binding_optional_triple(
+    db: &SqliteDatabase,
+    record: Option<(
+        CliRuntimeTurnBindingRecord,
+        CliRuntimeTurnAttemptRecord,
+        CliRuntimeExecutionSegmentRecord,
+    )>,
+) -> Result<
+    Option<(
+        CliRuntimeTurnBindingRecord,
+        CliRuntimeTurnAttemptRecord,
+        CliRuntimeExecutionSegmentRecord,
+    )>,
+> {
+    match record {
+        Some(record) => Ok(Some(hydrate_cli_binding_triple(db, record).await?)),
+        None => Ok(None),
+    }
+}
+async fn hydrate_cli_binding_owner(
+    db: &SqliteDatabase,
+    record: Option<CliRuntimeNativeTurnOwner>,
+) -> Result<Option<CliRuntimeNativeTurnOwner>> {
+    if let Some(mut owner) = record {
+        owner.binding = cli_runtime_binding::hydrate_record(db, owner.binding).await?;
+        Ok(Some(owner))
+    } else {
+        Ok(None)
+    }
+}
+
 async fn cli_runtime_turn_terminal_snapshot<C: ConnectionTrait>(
     connection: &C,
     turn_id: &str,
@@ -1589,6 +1673,7 @@ fn terminal_turn_execution_status_for_event(
     }
 }
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
+use crate::task_events::{DeferredAppendedTaskEvent, materialize_task_events};
 use crate::task_projector::TaskProjector;
 pub use crate::timeline_projection::{
     ProjectionPlacement, ProjectionVisibility, TurnItemProjectionClassification,
@@ -3041,6 +3126,8 @@ pub struct CrudStore {
     episodic_claim_discoveries: std::sync::Arc<std::sync::atomic::AtomicU64>,
     episodic_work: std::sync::Arc<tokio::sync::Notify>,
     frozen_readers: frozen_lifetime::ReaderCounts,
+    legacy_task_text_cursors:
+        std::sync::Arc<std::sync::Mutex<repositories::portable_payload_legacy_text::Cursors>>,
     connection: SqliteDatabase,
     projector: TurnProjector,
     task_projector: TaskProjector,
@@ -4634,6 +4721,7 @@ impl CrudStore {
             connection: connection.into(),
             episodic_work: std::sync::Arc::new(tokio::sync::Notify::new()),
             frozen_readers: Default::default(),
+            legacy_task_text_cursors: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             episodic_claim_fault: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
@@ -4892,9 +4980,13 @@ impl CrudStore {
         Fut: Future<Output = Result<T>>,
     {
         retry_with_backoff(
-            || operation(),
+            || repositories::portable_payload::after_database_owners(operation()),
             |error| {
-                is_anyhow_sqlite_lock(error) || task_event::is_idempotency_preflight_race(error)
+                is_anyhow_sqlite_lock(error)
+                    || task_event::is_idempotency_preflight_race(error)
+                    || error
+                        .downcast_ref::<repositories::portable_payload::PreflightRace>()
+                        .is_some()
             },
             DEFAULT_LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
@@ -5708,27 +5800,38 @@ impl CrudStore {
         binding: NewCliRuntimeTurnBinding,
     ) -> Result<CliRuntimeTurnBindingRecord> {
         let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.input_mapping_json, false)?;
-        self.run_serialized_write(|| async {
-            let transaction = self.connection.begin().await?;
-            let result = async {
-                let stored =
-                    cli_runtime_binding::upsert_turn_binding(&transaction, binding.clone(), &root)
-                        .await?;
-                Ok::<_, anyhow::Error>(stored)
-            }
+        let result = self
+            .run_serialized_write(|| async {
+                let prepared_binding = binding.clone();
+                let transaction = self.connection.begin().await?;
+                let result = async {
+                    let stored = cli_runtime_binding::upsert_turn_binding(
+                        &transaction,
+                        prepared_binding,
+                        &root,
+                    )
+                    .await?;
+                    Ok::<_, anyhow::Error>(stored)
+                }
+                .await?;
+                transaction.commit().await?;
+                Ok(result)
+            })
             .await?;
-            transaction.commit().await?;
-            Ok(result)
-        })
-        .await
+        cli_runtime_binding::hydrate_record(&self.connection, result).await
     }
 
     pub async fn get_cli_runtime_turn_binding(
         &self,
         turn_id: &str,
     ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
-        let turn_id = turn_id.to_owned();
-        cli_runtime_binding::find_turn_binding(&self.connection, turn_id.as_str()).await
+        self.run_scoped_database_quantum(|| async {
+            let turn_id = turn_id.to_owned();
+            let result =
+                cli_runtime_binding::find_turn_binding(&self.connection, turn_id.as_str()).await?;
+            hydrate_cli_binding_optional(&self.connection, result).await
+        })
+        .await
     }
 
     pub async fn has_cli_runtime_dispatch_at_or_after(
@@ -5744,15 +5847,17 @@ impl CrudStore {
         metadata: Option<CliRuntimeTurnMcpMetadata>,
     ) -> Result<CliRuntimeTurnBindingRecord> {
         let turn_id = turn_id.to_owned();
-        self.run_serialized_write(|| async {
-            cli_runtime_binding::set_turn_mcp_metadata(
-                &self.connection,
-                turn_id.as_str(),
-                metadata.clone(),
-            )
-            .await
-        })
-        .await
+        let result = self
+            .run_serialized_write(|| async {
+                cli_runtime_binding::set_turn_mcp_metadata(
+                    &self.connection,
+                    turn_id.as_str(),
+                    metadata.clone(),
+                )
+                .await
+            })
+            .await?;
+        cli_runtime_binding::hydrate_record(&self.connection, result).await
     }
 
     pub async fn set_cli_runtime_turn_native_goal_state(
@@ -5765,40 +5870,43 @@ impl CrudStore {
         execution_owner_id: &str,
     ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
         let turn_id = turn_id.to_owned();
-        self.run_serialized_write(|| async {
-            let transaction = self.connection.begin().await?;
-            if let Some(expected) = &expected {
-                let current = cli_runtime_turn_terminal_snapshot(&transaction, &turn_id).await?;
-                if let Some(owner) = turn_execution::find(&transaction, &turn_id).await?
-                    && (owner.owner_id != execution_owner_id
-                        || !owner.status.is_active()
-                        || owner.lease_until <= chrono::Utc::now().fixed_offset())
-                {
-                    transaction.rollback().await?;
-                    return Ok(None);
+        let result = self
+            .run_serialized_write(|| async {
+                let transaction = self.connection.begin().await?;
+                if let Some(expected) = &expected {
+                    let current =
+                        cli_runtime_turn_terminal_snapshot(&transaction, &turn_id).await?;
+                    if let Some(owner) = turn_execution::find(&transaction, &turn_id).await?
+                        && (owner.owner_id != execution_owner_id
+                            || !owner.status.is_active()
+                            || owner.lease_until <= chrono::Utc::now().fixed_offset())
+                    {
+                        transaction.rollback().await?;
+                        return Ok(None);
+                    }
+                    if !current.as_ref().is_some_and(|current| {
+                        expected
+                            .terminal_event_source()
+                            .zip(current.terminal_event_source())
+                            .is_some_and(|(selected, actual)| selected.same_execution(&actual))
+                    }) {
+                        transaction.rollback().await?;
+                        return Ok(None);
+                    }
                 }
-                if !current.as_ref().is_some_and(|current| {
-                    expected
-                        .terminal_event_source()
-                        .zip(current.terminal_event_source())
-                        .is_some_and(|(selected, actual)| selected.same_execution(&actual))
-                }) {
-                    transaction.rollback().await?;
-                    return Ok(None);
-                }
-            }
-            let binding = cli_runtime_binding::set_turn_native_goal_state(
-                &transaction,
-                turn_id.as_str(),
-                status.clone(),
-                native_goal_turn_id.clone(),
-                observed_at,
-            )
+                let binding = cli_runtime_binding::set_turn_native_goal_state(
+                    &transaction,
+                    turn_id.as_str(),
+                    status.clone(),
+                    native_goal_turn_id.clone(),
+                    observed_at,
+                )
+                .await?;
+                transaction.commit().await?;
+                Ok(Some(binding))
+            })
             .await?;
-            transaction.commit().await?;
-            Ok(Some(binding))
-        })
-        .await
+        hydrate_cli_binding_optional(&self.connection, result).await
     }
 
     /// Atomically binds the runtime turn metadata and the same activation
@@ -5809,7 +5917,7 @@ impl CrudStore {
         metadata: CliRuntimeTurnMcpMetadata,
     ) -> Result<CliRuntimeTurnBindingRecord> {
         let turn_id = turn_id.to_owned();
-        self.run_serialized_write(|| async {
+        let result = self.run_serialized_write(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -5849,16 +5957,24 @@ impl CrudStore {
                 .context("failed to commit CLI MCP activation binding transaction")?;
             Ok(binding)
         })
-        .await
+        .await?;
+        cli_runtime_binding::hydrate_record(&self.connection, result).await
     }
 
     pub async fn get_cli_runtime_turn_binding_by_request(
         &self,
         request_id: &str,
     ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
-        let request_id = request_id.to_owned();
-        cli_runtime_binding::find_turn_binding_by_request(&self.connection, request_id.as_str())
-            .await
+        self.run_scoped_database_quantum(|| async {
+            let request_id = request_id.to_owned();
+            let result = cli_runtime_binding::find_turn_binding_by_request(
+                &self.connection,
+                request_id.as_str(),
+            )
+            .await?;
+            hydrate_cli_binding_optional(&self.connection, result).await
+        })
+        .await
     }
 
     pub async fn get_cli_runtime_turn_binding_by_native_turn(
@@ -5866,13 +5982,17 @@ impl CrudStore {
         runtime_id: &str,
         native_turn_id: &str,
     ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
-        let runtime_id = runtime_id.to_owned();
-        let native_turn_id = native_turn_id.to_owned();
-        cli_runtime_binding::find_turn_binding_by_native_turn(
-            &self.connection,
-            runtime_id.as_str(),
-            native_turn_id.as_str(),
-        )
+        self.run_scoped_database_quantum(|| async {
+            let runtime_id = runtime_id.to_owned();
+            let native_turn_id = native_turn_id.to_owned();
+            let result = cli_runtime_binding::find_turn_binding_by_native_turn(
+                &self.connection,
+                runtime_id.as_str(),
+                native_turn_id.as_str(),
+            )
+            .await?;
+            hydrate_cli_binding_optional(&self.connection, result).await
+        })
         .await
     }
 
@@ -5880,9 +6000,16 @@ impl CrudStore {
         &self,
         thread_id: &str,
     ) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
-        let thread_id = thread_id.to_owned();
-        cli_runtime_binding::list_turn_bindings_for_thread(&self.connection, thread_id.as_str())
-            .await
+        self.run_scoped_database_quantum(|| async {
+            let thread_id = thread_id.to_owned();
+            let result = cli_runtime_binding::list_turn_bindings_for_thread(
+                &self.connection,
+                thread_id.as_str(),
+            )
+            .await?;
+            hydrate_cli_binding_list(&self.connection, result).await
+        })
+        .await
     }
 
     /// Bounded global background discovery. Foreground listing retains its API.
@@ -5891,14 +6018,25 @@ impl CrudStore {
         status: CliRuntimeActiveTurnBindingStatus,
         after: Option<&(sea_orm::entity::prelude::DateTimeWithTimeZone, String)>,
     ) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
-        cli_runtime_binding::list_active_turn_binding_page(&self.connection, status, after).await
+        self.run_scoped_database_quantum(|| async {
+            let result =
+                cli_runtime_binding::list_active_turn_binding_page(&self.connection, status, after)
+                    .await?;
+            hydrate_cli_binding_list(&self.connection, result).await
+        })
+        .await
     }
 
     pub async fn list_cli_runtime_turn_bindings(
         &self,
         filter: CliRuntimeTurnBindingListFilter,
     ) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
-        cli_runtime_binding::list_turn_bindings(&self.connection, filter).await
+        self.run_scoped_database_quantum(|| async {
+            let filter = filter.clone();
+            let result = cli_runtime_binding::list_turn_bindings(&self.connection, filter).await?;
+            hydrate_cli_binding_list(&self.connection, result).await
+        })
+        .await
     }
 
     pub async fn get_cli_runtime_turn_attempt(
@@ -5957,8 +6095,16 @@ impl CrudStore {
         runtime_id: &str,
         native_turn_id: &str,
     ) -> Result<Option<CliRuntimeNativeTurnOwner>> {
-        cli_runtime_binding::resolve_native_turn_owner(&self.connection, runtime_id, native_turn_id)
-            .await
+        self.run_scoped_database_quantum(|| async {
+            let result = cli_runtime_binding::resolve_native_turn_owner(
+                &self.connection,
+                runtime_id,
+                native_turn_id,
+            )
+            .await?;
+            hydrate_cli_binding_owner(&self.connection, result).await
+        })
+        .await
     }
 
     pub async fn latest_cli_runtime_execution_segment_for_attempt(
@@ -5992,7 +6138,7 @@ impl CrudStore {
         let native_thread_id = native_thread_id.to_owned();
         let native_turn_id = native_turn_id.to_owned();
         let segment_id = pioneer_protocol::generate_id(DB_ID_LEN);
-        self.run_serialized_write(|| {
+        let result = self.run_serialized_write(|| {
             let segment_id = segment_id.clone();
             let turn_id = turn_id.clone();
             let native_thread_id = native_thread_id.clone();
@@ -6091,7 +6237,8 @@ impl CrudStore {
                 Ok((binding, attempt, segment))
             }
         })
-        .await
+        .await?;
+        hydrate_cli_binding_triple(&self.connection, result).await
     }
 
     pub async fn terminalize_cli_runtime_execution_segment(
@@ -6110,61 +6257,64 @@ impl CrudStore {
     > {
         let runtime_id = runtime_id.to_owned();
         let native_turn_id = native_turn_id.to_owned();
-        self.run_serialized_write(|| async {
-            let transaction =
-                self.connection.begin().await.context(
+        let result = self
+            .run_serialized_write(|| async {
+                let transaction = self.connection.begin().await.context(
                     "failed to begin CLI runtime execution segment terminal transaction",
                 )?;
-            let Some(segment) = cli_runtime_binding::find_execution_segment_by_native_turn(
-                &transaction,
-                runtime_id.as_str(),
-                native_turn_id.as_str(),
-            )
-            .await?
-            else {
-                transaction.rollback().await.ok();
-                return Ok(None);
-            };
-            let binding =
-                cli_runtime_binding::find_turn_binding(&transaction, segment.turn_id.as_str())
-                    .await?
-                    .context("execution segment turn binding is missing")?;
-            let attempt =
-                cli_runtime_binding::find_turn_attempt(&transaction, segment.attempt_id.as_str())
-                    .await?
-                    .context("execution segment owning attempt is missing")?;
-            if attempt.id != segment.attempt_id || !attempt.status.is_active() {
-                transaction.rollback().await.ok();
-                bail!("execution segment does not belong to the active CLI runtime attempt");
-            }
-            if segment.status == CliRuntimeExecutionSegmentStatus::Running {
-                if !cli_runtime_binding::mark_execution_segment_terminal(
+                let Some(segment) = cli_runtime_binding::find_execution_segment_by_native_turn(
                     &transaction,
-                    segment.id.as_str(),
-                    status,
-                    failure_reason.clone(),
-                    completed_at,
+                    runtime_id.as_str(),
+                    native_turn_id.as_str(),
                 )
                 .await?
-                {
+                else {
                     transaction.rollback().await.ok();
-                    bail!("CLI runtime execution segment changed during terminalization");
+                    return Ok(None);
+                };
+                let binding =
+                    cli_runtime_binding::find_turn_binding(&transaction, segment.turn_id.as_str())
+                        .await?
+                        .context("execution segment turn binding is missing")?;
+                let attempt = cli_runtime_binding::find_turn_attempt(
+                    &transaction,
+                    segment.attempt_id.as_str(),
+                )
+                .await?
+                .context("execution segment owning attempt is missing")?;
+                if attempt.id != segment.attempt_id || !attempt.status.is_active() {
+                    transaction.rollback().await.ok();
+                    bail!("execution segment does not belong to the active CLI runtime attempt");
                 }
-            } else if segment.status != status {
-                transaction.rollback().await.ok();
-                bail!("CLI runtime execution segment received conflicting terminal states");
-            }
-            let stored =
-                cli_runtime_binding::find_execution_segment(&transaction, segment.id.as_str())
+                if segment.status == CliRuntimeExecutionSegmentStatus::Running {
+                    if !cli_runtime_binding::mark_execution_segment_terminal(
+                        &transaction,
+                        segment.id.as_str(),
+                        status,
+                        failure_reason.clone(),
+                        completed_at,
+                    )
                     .await?
-                    .context("terminalized CLI runtime execution segment is missing")?;
-            transaction
-                .commit()
-                .await
-                .context("failed to commit execution segment terminal transaction")?;
-            Ok(Some((binding, attempt, stored)))
-        })
-        .await
+                    {
+                        transaction.rollback().await.ok();
+                        bail!("CLI runtime execution segment changed during terminalization");
+                    }
+                } else if segment.status != status {
+                    transaction.rollback().await.ok();
+                    bail!("CLI runtime execution segment received conflicting terminal states");
+                }
+                let stored =
+                    cli_runtime_binding::find_execution_segment(&transaction, segment.id.as_str())
+                        .await?
+                        .context("terminalized CLI runtime execution segment is missing")?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit execution segment terminal transaction")?;
+                Ok(Some((binding, attempt, stored)))
+            })
+            .await?;
+        hydrate_cli_binding_optional_triple(&self.connection, result).await
     }
 
     pub async fn mark_cli_runtime_turn_attempt_terminal(
@@ -6222,7 +6372,8 @@ impl CrudStore {
         execution_window_index: u32,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
         let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.input_mapping_json, false)?;
-        self.run_serialized_write(|| async {
+        let result = self.run_serialized_write(|| async {
+            let prepared_binding=binding.clone();
             let transaction = self
                 .connection
                 .begin()
@@ -6292,7 +6443,7 @@ impl CrudStore {
                     }
                     let stored_binding = cli_runtime_binding::upsert_turn_binding(
                         &transaction,
-                        binding.clone(),
+                        prepared_binding,
                         &root,
                     )
                     .await?;
@@ -6336,7 +6487,8 @@ impl CrudStore {
                 .context("failed to commit CLI runtime initial attempt transaction")?;
             Ok((stored_binding, attempt))
         })
-        .await
+        .await?;
+        hydrate_cli_binding_pair(&self.connection, result).await
     }
 
     /// Transfer a completed native attempt to task orchestration without
@@ -6353,178 +6505,187 @@ impl CrudStore {
         let source_terminal_id = source.terminal_delivery_id();
         let expected_ack_id = format!("{source_terminal_id}:ack");
         let expected_continuation_id = format!("{attempt_id}:task-continuation");
-        self.run_serialized_write(|| {
-            let source = source.clone();
-            let source_terminal_id = source_terminal_id.clone();
-            let expected_ack_id = expected_ack_id.clone();
-            let expected_continuation_id = expected_continuation_id.clone();
-            let owner_id = owner_id.clone();
-            let attempt_id = attempt_id.clone();
-            let continuation = continuation.clone();
-            let ack = ack.clone();
-            async move {
-                let tx = self.connection.begin().await?;
-                let now = continuation.created_at;
-                let binding = cli_runtime_binding::find_turn_binding(&tx, &source.turn_id)
-                    .await?
-                    .context("task continuation binding disappeared")?;
-                let latest = cli_runtime_binding::latest_turn_attempt(&tx, &source.turn_id)
-                    .await?
-                    .context("task continuation attempt disappeared")?;
-                let owner = turn_execution::find(&tx, &source.turn_id)
-                    .await?
-                    .context("task continuation owner disappeared")?;
-                anyhow::ensure!(
-                    owner.owner_id == owner_id
-                        && owner.executor_kind == TurnExecutorKind::CliRuntime
-                        && owner.executor_key.as_deref() == Some(source.runtime_id.as_str())
-                        && owner.status.is_active()
-                        && owner.lease_until > chrono::Utc::now().fixed_offset(),
-                    "task continuation execution authority unavailable"
-                );
-                let turn =
-                    turn::find_turn_by_thread_and_id(&tx, &binding.thread_id, &source.turn_id)
+        let result = self
+            .run_serialized_write(|| {
+                let source = source.clone();
+                let source_terminal_id = source_terminal_id.clone();
+                let expected_ack_id = expected_ack_id.clone();
+                let expected_continuation_id = expected_continuation_id.clone();
+                let owner_id = owner_id.clone();
+                let attempt_id = attempt_id.clone();
+                let continuation = continuation.clone();
+                let ack = ack.clone();
+                async move {
+                    let tx = self.connection.begin().await?;
+                    let now = continuation.created_at;
+                    let binding = cli_runtime_binding::find_turn_binding(&tx, &source.turn_id)
                         .await?
-                        .context("task continuation Turn disappeared")?;
-                anyhow::ensure!(
-                    turn_status_from_db(&turn.status) == Some(TurnStatus::InProgress)
-                        && binding.workspace_id == source.workspace_id
-                        && binding.thread_id == source.thread_id
-                        && binding.continuation_thread_id == source.continuation_thread_id
-                        && binding.runtime_id == source.runtime_id
-                        && binding.runtime_kind == source.runtime_kind
-                        && binding.native_thread_id == source.native_thread_id,
-                    "task continuation execution is no longer current"
-                );
-                if latest.id == attempt_id {
-                    tx.commit().await?;
-                    return Ok((binding, latest));
-                }
-                let snapshot = cli_runtime_turn_terminal_snapshot(&tx, &source.turn_id).await?;
-                let current = snapshot.as_ref().and_then(|snapshot| {
-                    cli_runtime_continuation_guard_from_snapshot(snapshot, true)
-                });
-                anyhow::ensure!(
-                    current
+                        .context("task continuation binding disappeared")?;
+                    let latest = cli_runtime_binding::latest_turn_attempt(&tx, &source.turn_id)
+                        .await?
+                        .context("task continuation attempt disappeared")?;
+                    let owner = turn_execution::find(&tx, &source.turn_id)
+                        .await?
+                        .context("task continuation owner disappeared")?;
+                    anyhow::ensure!(
+                        owner.owner_id == owner_id
+                            && owner.executor_kind == TurnExecutorKind::CliRuntime
+                            && owner.executor_key.as_deref() == Some(source.runtime_id.as_str())
+                            && owner.status.is_active()
+                            && owner.lease_until > chrono::Utc::now().fixed_offset(),
+                        "task continuation execution authority unavailable"
+                    );
+                    let turn =
+                        turn::find_turn_by_thread_and_id(&tx, &binding.thread_id, &source.turn_id)
+                            .await?
+                            .context("task continuation Turn disappeared")?;
+                    anyhow::ensure!(
+                        turn_status_from_db(&turn.status) == Some(TurnStatus::InProgress)
+                            && binding.workspace_id == source.workspace_id
+                            && binding.thread_id == source.thread_id
+                            && binding.continuation_thread_id == source.continuation_thread_id
+                            && binding.runtime_id == source.runtime_id
+                            && binding.runtime_kind == source.runtime_kind
+                            && binding.native_thread_id == source.native_thread_id,
+                        "task continuation execution is no longer current"
+                    );
+                    if latest.id == attempt_id {
+                        tx.commit().await?;
+                        return Ok((binding, latest));
+                    }
+                    let snapshot = cli_runtime_turn_terminal_snapshot(&tx, &source.turn_id).await?;
+                    let current = snapshot.as_ref().and_then(|snapshot| {
+                        cli_runtime_continuation_guard_from_snapshot(snapshot, true)
+                    });
+                    anyhow::ensure!(
+                        current
+                            .as_ref()
+                            .is_some_and(|current| current.same_execution(&source)),
+                        "CLI source changed before task continuation"
+                    );
+                    let snapshot = snapshot
                         .as_ref()
-                        .is_some_and(|current| current.same_execution(&source)),
-                    "CLI source changed before task continuation"
-                );
-                let snapshot = snapshot
-                    .as_ref()
-                    .context("task continuation snapshot disappeared")?;
-                anyhow::ensure!(
-                    snapshot.turn_status == TurnStatus::InProgress,
-                    "task continuation Turn is no longer active"
-                );
-                anyhow::ensure!(
-                    latest.status == CliRuntimeTurnAttemptStatus::Completed
-                        || cli_runtime_terminal_outcome_pending(&tx, snapshot, &source_terminal_id)
+                        .context("task continuation snapshot disappeared")?;
+                    anyhow::ensure!(
+                        snapshot.turn_status == TurnStatus::InProgress,
+                        "task continuation Turn is no longer active"
+                    );
+                    anyhow::ensure!(
+                        latest.status == CliRuntimeTurnAttemptStatus::Completed
+                            || cli_runtime_terminal_outcome_pending(
+                                &tx,
+                                snapshot,
+                                &source_terminal_id
+                            )
                             .await?,
-                    "task continuation has no pending accepted terminal outcome"
-                );
-                anyhow::ensure!(
-                    latest.id == source.attempt_id,
-                    "task continuation source attempt changed"
-                );
-                anyhow::ensure!(
-                    ack.id == expected_ack_id
-                        && ack.native_method == "gateway/terminal_ack"
-                        && continuation.id == expected_continuation_id
-                        && continuation.turn_id.as_deref() == Some(source.turn_id.as_str()),
-                    "invalid task continuation identity"
-                );
-                // The saved terminal outcome remains durable, but this ACK
-                // records that its effect is a continuation, never TurnCompleted.
-                cli_runtime_binding::append_native_event_if_absent(&tx, continuation).await?;
-                if cli_runtime_binding::find_native_event(&tx, &source_terminal_id)
-                    .await?
-                    .is_some()
-                    && cli_runtime_binding::find_native_event(&tx, &expected_ack_id)
+                        "task continuation has no pending accepted terminal outcome"
+                    );
+                    anyhow::ensure!(
+                        latest.id == source.attempt_id,
+                        "task continuation source attempt changed"
+                    );
+                    anyhow::ensure!(
+                        ack.id == expected_ack_id
+                            && ack.native_method == "gateway/terminal_ack"
+                            && continuation.id == expected_continuation_id
+                            && continuation.turn_id.as_deref() == Some(source.turn_id.as_str()),
+                        "invalid task continuation identity"
+                    );
+                    // The saved terminal outcome remains durable, but this ACK
+                    // records that its effect is a continuation, never TurnCompleted.
+                    cli_runtime_binding::append_native_event_if_absent(&tx, continuation).await?;
+                    if cli_runtime_binding::find_native_event(&tx, &source_terminal_id)
                         .await?
-                        .is_none()
-                {
-                    cli_runtime_binding::append_native_event_if_absent(&tx, ack).await?;
-                }
-                if latest.status.is_active() {
-                    anyhow::ensure!(
-                        cli_runtime_binding::mark_turn_attempt_terminal(
-                            &tx,
-                            &latest.id,
-                            CliRuntimeTurnAttemptStatus::Completed,
-                            None,
-                            now
-                        )
-                        .await?,
-                        "source attempt changed"
-                    );
-                } else {
-                    anyhow::ensure!(
-                        latest.status == CliRuntimeTurnAttemptStatus::Completed,
-                        "task continuation requires a completed attempt"
-                    );
-                }
-                let next_index = latest
-                    .attempt_index
-                    .checked_add(1)
-                    .context("task continuation attempt overflow")?;
-                let attempt = cli_runtime_binding::create_turn_attempt(
-                    &tx,
-                    NewCliRuntimeTurnAttempt {
-                        id: attempt_id,
-                        turn_id: source.turn_id.clone(),
-                        attempt_index: next_index,
-                        runtime_id: binding.runtime_id.clone(),
-                        runtime_kind: binding.runtime_kind.clone(),
-                        native_thread_id: binding.native_thread_id.clone(),
-                        native_turn_id: None,
-                        recovery_job_id: None,
-                        recovery_attempt_id: None,
-                        // Orchestration continues the current execution window;
-                        // waiting for children is not budget exhaustion or failure.
-                        execution_window_index: latest.execution_window_index,
-                        status: CliRuntimeTurnAttemptStatus::Starting,
-                        failure_reason: None,
-                        started_at: None,
-                        completed_at: None,
-                        created_at: now,
-                        updated_at: now,
-                    },
-                )
-                .await?;
-                cli_runtime_binding::update_turn_control(
-                    &tx,
-                    NewCliRuntimeTurnBinding {
-                        turn_id: binding.turn_id.clone(),
-                        thread_id: binding.thread_id,
-                        continuation_thread_id: binding.continuation_thread_id,
-                        workspace_id: binding.workspace_id,
-                        runtime_id: binding.runtime_id,
-                        runtime_kind: binding.runtime_kind,
-                        native_thread_id: binding.native_thread_id,
-                        native_turn_id: None,
-                        request_id: binding.request_id,
-                        status: "starting".to_owned(),
-                        model: binding.model,
-                        cwd: binding.cwd,
-                        sandbox_json: binding.sandbox_json,
-                        approval_policy: binding.approval_policy,
-                        input_mapping_json: binding.input_mapping_json,
-                        created_at: binding.created_at,
-                        updated_at: now,
-                    },
-                )
-                .await?;
-                let binding =
-                    cli_runtime_binding::clear_turn_native_goal_state(&tx, &source.turn_id, now)
-                        .await?;
-                self.project_cli_runtime_turn_binding_state(&tx, &source.turn_id, now)
+                        .is_some()
+                        && cli_runtime_binding::find_native_event(&tx, &expected_ack_id)
+                            .await?
+                            .is_none()
+                    {
+                        cli_runtime_binding::append_native_event_if_absent(&tx, ack).await?;
+                    }
+                    if latest.status.is_active() {
+                        anyhow::ensure!(
+                            cli_runtime_binding::mark_turn_attempt_terminal(
+                                &tx,
+                                &latest.id,
+                                CliRuntimeTurnAttemptStatus::Completed,
+                                None,
+                                now
+                            )
+                            .await?,
+                            "source attempt changed"
+                        );
+                    } else {
+                        anyhow::ensure!(
+                            latest.status == CliRuntimeTurnAttemptStatus::Completed,
+                            "task continuation requires a completed attempt"
+                        );
+                    }
+                    let next_index = latest
+                        .attempt_index
+                        .checked_add(1)
+                        .context("task continuation attempt overflow")?;
+                    let attempt = cli_runtime_binding::create_turn_attempt(
+                        &tx,
+                        NewCliRuntimeTurnAttempt {
+                            id: attempt_id,
+                            turn_id: source.turn_id.clone(),
+                            attempt_index: next_index,
+                            runtime_id: binding.runtime_id.clone(),
+                            runtime_kind: binding.runtime_kind.clone(),
+                            native_thread_id: binding.native_thread_id.clone(),
+                            native_turn_id: None,
+                            recovery_job_id: None,
+                            recovery_attempt_id: None,
+                            // Orchestration continues the current execution window;
+                            // waiting for children is not budget exhaustion or failure.
+                            execution_window_index: latest.execution_window_index,
+                            status: CliRuntimeTurnAttemptStatus::Starting,
+                            failure_reason: None,
+                            started_at: None,
+                            completed_at: None,
+                            created_at: now,
+                            updated_at: now,
+                        },
+                    )
                     .await?;
-                tx.commit().await?;
-                Ok((binding, attempt))
-            }
-        })
-        .await
+                    cli_runtime_binding::update_turn_control(
+                        &tx,
+                        NewCliRuntimeTurnBinding {
+                            turn_id: binding.turn_id.clone(),
+                            thread_id: binding.thread_id,
+                            continuation_thread_id: binding.continuation_thread_id,
+                            workspace_id: binding.workspace_id,
+                            runtime_id: binding.runtime_id,
+                            runtime_kind: binding.runtime_kind,
+                            native_thread_id: binding.native_thread_id,
+                            native_turn_id: None,
+                            request_id: binding.request_id,
+                            status: "starting".to_owned(),
+                            model: binding.model,
+                            cwd: binding.cwd,
+                            sandbox_json: binding.sandbox_json,
+                            approval_policy: binding.approval_policy,
+                            input_mapping_json: binding.input_mapping_json,
+                            created_at: binding.created_at,
+                            updated_at: now,
+                        },
+                    )
+                    .await?;
+                    let binding = cli_runtime_binding::clear_turn_native_goal_state(
+                        &tx,
+                        &source.turn_id,
+                        now,
+                    )
+                    .await?;
+                    self.project_cli_runtime_turn_binding_state(&tx, &source.turn_id, now)
+                        .await?;
+                    tx.commit().await?;
+                    Ok((binding, attempt))
+                }
+            })
+            .await?;
+        hydrate_cli_binding_pair(&self.connection, result).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6544,7 +6705,7 @@ impl CrudStore {
         }
         let turn_id = turn_id.to_owned();
         let legacy_attempt_id = pioneer_protocol::generate_id(DB_ID_LEN);
-        self.run_serialized_write(|| {
+        let result = self.run_serialized_write(|| {
             let legacy_attempt_id = legacy_attempt_id.clone();
             let turn_id = turn_id.clone();
             let attempt_id = attempt_id.clone();
@@ -6738,7 +6899,8 @@ impl CrudStore {
             Ok((stored_binding, attempt))
         }
         })
-        .await
+        .await?;
+        hydrate_cli_binding_pair(&self.connection, result).await
     }
 
     pub async fn activate_cli_runtime_turn_attempt(
@@ -6797,7 +6959,7 @@ impl CrudStore {
         let attempt_id = attempt_id.to_owned();
         let native_turn_id = native_turn_id.to_owned();
         let execution_owner_id = execution_owner_id.map(str::to_owned);
-        self.run_serialized_write(|| async {
+        let result = self.run_serialized_write(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -6960,7 +7122,8 @@ impl CrudStore {
                 .context("failed to commit CLI runtime attempt activation transaction")?;
             Ok((stored_binding, stored_attempt))
         })
-        .await
+        .await?;
+        hydrate_cli_binding_pair(&self.connection, result).await
     }
 
     pub async fn cli_runtime_turn_terminal_guard(
@@ -6970,15 +7133,29 @@ impl CrudStore {
         Ok(self
             .cli_runtime_turn_terminal_guard_by_id(&expected_binding.turn_id)
             .await?
-            .filter(|snapshot| &snapshot.binding == expected_binding))
+            .filter(|snapshot| {
+                cli_runtime_binding::same_binding_version(&snapshot.binding, expected_binding)
+                    && snapshot.binding.input_mapping_json == expected_binding.input_mapping_json
+            }))
     }
 
     pub async fn cli_runtime_turn_terminal_guard_by_id(
         &self,
         turn_id: &str,
     ) -> Result<Option<CliRuntimeTurnTerminalGuard>> {
-        let snapshot = self.connection.begin_read().await?;
-        cli_runtime_turn_terminal_snapshot(&snapshot, turn_id).await
+        self.run_scoped_database_quantum(|| async {
+            let snapshot = self.connection.begin_read().await?;
+            let result = cli_runtime_turn_terminal_snapshot(&snapshot, turn_id).await?;
+            snapshot.commit().await?;
+            if let Some(mut guard) = result {
+                guard.binding =
+                    cli_runtime_binding::hydrate_record(&self.connection, guard.binding).await?;
+                Ok(Some(guard))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
     }
 
     /// A previously completed native attempt can still belong to an unfinished
@@ -7440,108 +7617,124 @@ impl CrudStore {
         {
             bail!("terminal binding projection does not match its canonical Turn decision");
         }
-        let turn_id = turn_id.to_owned();
-        let binding_status = binding_status.to_owned();
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin CLI runtime terminal binding transaction")?;
-            let Some(binding) =
-                cli_runtime_binding::find_turn_binding(&transaction, turn_id.as_str()).await?
-            else {
-                transaction.rollback().await.ok();
+        // Preserve the original mapping comparison outside writer capacity.
+        // A logical update after preflight increments the revision checked in
+        // the transaction; physical compression leaves that revision intact.
+        if let Some(expected) = expected {
+            let Some(current) = self.get_cli_runtime_turn_binding(turn_id).await? else {
                 return Ok(None);
             };
-            let attempt =
-                cli_runtime_binding::latest_turn_attempt(&transaction, turn_id.as_str()).await?;
-            if let Some(expected) = expected {
-                let turn = turn::find_turn_by_thread_and_id(
-                    &transaction,
-                    expected.binding.thread_id.as_str(),
-                    turn_id.as_str(),
-                )
-                .await?;
-                let segment = if let Some(attempt) = attempt.as_ref() {
-                    cli_runtime_binding::latest_execution_segment_for_attempt(
+            if !cli_runtime_binding::same_binding_version(&current, &expected.binding)
+                || current.input_mapping_json != expected.binding.input_mapping_json
+            {
+                return Ok(None);
+            }
+        }
+        let turn_id = turn_id.to_owned();
+        let binding_status = binding_status.to_owned();
+        let result = self
+            .run_serialized_write(|| async {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin CLI runtime terminal binding transaction")?;
+                let Some(binding) =
+                    cli_runtime_binding::find_turn_binding(&transaction, turn_id.as_str()).await?
+                else {
+                    transaction.rollback().await.ok();
+                    return Ok(None);
+                };
+                let attempt =
+                    cli_runtime_binding::latest_turn_attempt(&transaction, turn_id.as_str())
+                        .await?;
+                if let Some(expected) = expected {
+                    let turn = turn::find_turn_by_thread_and_id(
                         &transaction,
-                        &attempt.id,
+                        expected.binding.thread_id.as_str(),
+                        turn_id.as_str(),
+                    )
+                    .await?;
+                    let segment = if let Some(attempt) = attempt.as_ref() {
+                        cli_runtime_binding::latest_execution_segment_for_attempt(
+                            &transaction,
+                            &attempt.id,
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
+                    let execution_owner = turn_execution::find(&transaction, turn_id.as_str())
+                        .await?
+                        .map(|execution| (execution.owner_id, execution.owner_generation));
+                    if expected.turn_status == TurnStatus::InProgress
+                        || !cli_runtime_binding::same_binding_version(&binding, &expected.binding)
+                        || attempt != expected.attempt
+                        || segment != expected.segment
+                        || execution_owner != expected.execution_owner
+                        || turn
+                            .as_ref()
+                            .and_then(|turn| turn_status_from_db(&turn.status))
+                            != Some(expected.turn_status)
+                    {
+                        transaction.rollback().await?;
+                        return Ok(None);
+                    }
+                }
+                if let Some(attempt) = attempt
+                    && attempt.status.is_active()
+                    && !cli_runtime_binding::mark_turn_attempt_terminal(
+                        &transaction,
+                        attempt.id.as_str(),
+                        attempt_status,
+                        failure_reason.clone(),
+                        completed_at,
                     )
                     .await?
-                } else {
-                    None
-                };
-                let execution_owner = turn_execution::find(&transaction, turn_id.as_str())
-                    .await?
-                    .map(|execution| (execution.owner_id, execution.owner_generation));
-                if expected.turn_status == TurnStatus::InProgress
-                    || binding != expected.binding
-                    || attempt != expected.attempt
-                    || segment != expected.segment
-                    || execution_owner != expected.execution_owner
-                    || turn
-                        .as_ref()
-                        .and_then(|turn| turn_status_from_db(&turn.status))
-                        != Some(expected.turn_status)
                 {
-                    transaction.rollback().await?;
-                    return Ok(None);
+                    transaction.rollback().await.ok();
+                    bail!(
+                        "CLI runtime turn attempt `{}` changed while its binding was terminalized",
+                        attempt.id
+                    );
                 }
-            }
-            if let Some(attempt) = attempt
-                && attempt.status.is_active()
-                && !cli_runtime_binding::mark_turn_attempt_terminal(
+                let stored_binding = cli_runtime_binding::update_turn_control(
                     &transaction,
-                    attempt.id.as_str(),
-                    attempt_status,
-                    failure_reason.clone(),
+                    NewCliRuntimeTurnBinding {
+                        turn_id: binding.turn_id,
+                        thread_id: binding.thread_id,
+                        continuation_thread_id: binding.continuation_thread_id,
+                        workspace_id: binding.workspace_id,
+                        runtime_id: binding.runtime_id,
+                        runtime_kind: binding.runtime_kind,
+                        native_thread_id: binding.native_thread_id,
+                        native_turn_id: binding.native_turn_id,
+                        request_id: binding.request_id,
+                        status: binding_status.clone(),
+                        model: binding.model,
+                        cwd: binding.cwd,
+                        sandbox_json: binding.sandbox_json,
+                        approval_policy: binding.approval_policy,
+                        input_mapping_json: binding.input_mapping_json,
+                        created_at: binding.created_at,
+                        updated_at: completed_at,
+                    },
+                )
+                .await?;
+                self.project_cli_runtime_turn_binding_state(
+                    &transaction,
+                    stored_binding.turn_id.as_str(),
                     completed_at,
                 )
-                .await?
-            {
-                transaction.rollback().await.ok();
-                bail!(
-                    "CLI runtime turn attempt `{}` changed while its binding was terminalized",
-                    attempt.id
-                );
-            }
-            let stored_binding = cli_runtime_binding::update_turn_control(
-                &transaction,
-                NewCliRuntimeTurnBinding {
-                    turn_id: binding.turn_id,
-                    thread_id: binding.thread_id,
-                    continuation_thread_id: binding.continuation_thread_id,
-                    workspace_id: binding.workspace_id,
-                    runtime_id: binding.runtime_id,
-                    runtime_kind: binding.runtime_kind,
-                    native_thread_id: binding.native_thread_id,
-                    native_turn_id: binding.native_turn_id,
-                    request_id: binding.request_id,
-                    status: binding_status.clone(),
-                    model: binding.model,
-                    cwd: binding.cwd,
-                    sandbox_json: binding.sandbox_json,
-                    approval_policy: binding.approval_policy,
-                    input_mapping_json: binding.input_mapping_json,
-                    created_at: binding.created_at,
-                    updated_at: completed_at,
-                },
-            )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit CLI runtime terminal binding transaction")?;
+                Ok(Some(stored_binding))
+            })
             .await?;
-            self.project_cli_runtime_turn_binding_state(
-                &transaction,
-                stored_binding.turn_id.as_str(),
-                completed_at,
-            )
-            .await?;
-            transaction
-                .commit()
-                .await
-                .context("failed to commit CLI runtime terminal binding transaction")?;
-            Ok(Some(stored_binding))
-        })
-        .await
+        hydrate_cli_binding_optional(&self.connection, result).await
     }
 
     pub async fn create_cli_runtime_pending_request(
@@ -7560,8 +7753,11 @@ impl CrudStore {
                 .project_cli_runtime_pending_request(&transaction, &record)
                 .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -7588,8 +7784,11 @@ impl CrudStore {
                 .project_cli_runtime_pending_request(&transaction, &record)
                 .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -7633,8 +7832,11 @@ impl CrudStore {
                 .project_cli_runtime_pending_request(&transaction, &record)
                 .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -7814,8 +8016,11 @@ impl CrudStore {
                     .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -7846,8 +8051,11 @@ impl CrudStore {
                     .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -7878,8 +8086,11 @@ impl CrudStore {
                     .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -7915,8 +8126,11 @@ impl CrudStore {
                     .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -7952,8 +8166,11 @@ impl CrudStore {
                     .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
             transaction
                 .commit()
@@ -14975,10 +15192,11 @@ impl CrudStore {
                         .context(NativeFinalizationPhase::WriterCommit)?;
                     Ok(outcome)
                 }
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    Err(error)
-                }
+                Err(error) => Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await),
             }
         })
         .await
@@ -15135,8 +15353,7 @@ impl CrudStore {
                         .await
                         .context("failed to commit item snapshot update transaction"),
                     Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
+                        Err(repositories::portable_payload::rollback_with_hold_refusal(transaction, error).await)
                     }
                 }
             }
@@ -15851,18 +16068,32 @@ impl CrudStore {
     ) -> Result<TaskRunConversationSnapshotRecord> {
         let root = frozen_lifetime::PreparedFrozenRoot::history(&snapshot.history_json)?;
         self.run_serialized_write(|| async {
-            let transaction = self.connection.begin().await?;
-            let result = async {
-                task_run_conversation_snapshot::insert_if_absent(
-                    &transaction,
-                    snapshot.clone(),
-                    &root,
-                )
-                .await
+            // An already accepted winner is a complete logical read. Do not
+            // acquire/replace its root or replay a committed write to hydrate.
+            if let Some(winner) = self
+                .get_task_run_conversation_snapshot(&snapshot.run_id)
+                .await?
+            {
+                return Ok(winner);
             }
-            .await?;
+            let insertion = snapshot.clone();
+            let transaction = self.connection.begin().await?;
+            if task_run_conversation_snapshot::find_by_run(&transaction, &snapshot.run_id)
+                .await?
+                .is_some()
+            {
+                return Err(repositories::portable_payload::PreflightRace.into());
+            }
+            let stored =
+                task_run_conversation_snapshot::insert_if_absent(&transaction, insertion, &root)
+                    .await?;
             transaction.commit().await?;
-            Ok(result)
+            // This transaction inserted the winner. Its original bytes are
+            // already prepared, so deletion immediately after commit is safe.
+            task_run_conversation_snapshot::record_from_insert(
+                stored,
+                snapshot.history_json.clone(),
+            )
         })
         .await
     }
@@ -15871,7 +16102,16 @@ impl CrudStore {
         &self,
         run_id: &str,
     ) -> Result<Option<TaskRunConversationSnapshotRecord>> {
-        task_run_conversation_snapshot::find_by_run(&self.connection, run_id).await
+        self.run_scoped_database_quantum(|| async {
+            match task_run_conversation_snapshot::find_by_run(&self.connection, run_id).await? {
+                Some(record) => Ok(Some(
+                    task_run_conversation_snapshot::hydrate_record(&self.connection, record)
+                        .await?,
+                )),
+                None => Ok(None),
+            }
+        })
+        .await
     }
 
     pub async fn get_task_execution_admission(
@@ -16178,7 +16418,8 @@ impl CrudStore {
         for row in rows {
             let mut event =
                 task_event::appended_task_event_from_model(row, TaskEventAppendStatus::Inserted)?;
-            hydrate_task_event_metadata(&self.connection, &mut event).await?;
+            (event.workspace_id, event.root_task_id, event.parent_task_id) =
+                load_task_event_metadata(&self.connection, &event.task_id).await?;
             events.push(event);
         }
 
@@ -17578,22 +17819,24 @@ impl CrudStore {
     pub async fn load_task_runtime_invariant_snapshot(
         &self,
     ) -> Result<TaskRuntimeInvariantSnapshot> {
-        let task_events = pioneer_entity::task_event::Entity::find()
-            .order_by_asc(pioneer_entity::task_event::Column::TaskId)
-            .order_by_asc(pioneer_entity::task_event::Column::Sequence)
-            .all(&self.connection)
-            .await
-            .context("failed to load task events for runtime invariant scan")?
-            .into_iter()
-            .map(|row| TaskRuntimeInvariantEventRecord {
-                id: row.id,
-                task_id: row.task_id,
-                run_id: row.run_id,
-                sequence: row.sequence,
-                event_type: row.event_type,
-                payload_json: row.payload_json,
-            })
-            .collect::<Vec<_>>();
+        let task_events = task_event::load_rows(
+            &self.connection,
+            pioneer_entity::task_event::Entity::find()
+                .order_by_asc(pioneer_entity::task_event::Column::TaskId)
+                .order_by_asc(pioneer_entity::task_event::Column::Sequence),
+        )
+        .await
+        .context("failed to load task events for runtime invariant scan")?
+        .into_iter()
+        .map(|row| TaskRuntimeInvariantEventRecord {
+            id: row.id,
+            task_id: row.task_id,
+            run_id: row.run_id,
+            sequence: row.sequence,
+            event_type: row.event_type,
+            payload_json: row.payload_json,
+        })
+        .collect::<Vec<_>>();
 
         let task_runs_by_id = pioneer_entity::task_run::Entity::find()
             .all(&self.connection)
@@ -18018,7 +18261,7 @@ impl CrudStore {
                 if let Some((run, _)) = run.as_mut() {
                     run.trigger_input = trigger_input;
                 }
-                Ok(run)
+                Ok(run.map(|(run, event)| (run, event.into_owned())))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -18051,7 +18294,9 @@ impl CrudStore {
             run_id: run_id.clone(),
             started_at,
         };
-        let prepared_event = task_event::PreparedTaskEvent::prepare(payload)?;
+        let prepared_event = task_event::PreparedTaskEvent::prepare(payload)?
+            .preflight_idempotency(&self.connection)
+            .await?;
         let transaction = self
             .connection
             .begin()
@@ -18098,8 +18343,6 @@ impl CrudStore {
             return Ok(None);
         }
 
-        let prepared_event = prepared_event.preflight_idempotency(&transaction).await?;
-
         let mut appended_event =
             match task_event::append_prepared_event(&transaction, prepared_event, created_at).await
             {
@@ -18122,20 +18365,27 @@ impl CrudStore {
             }
         }
 
-        if let Err(error) = hydrate_task_event_metadata(&transaction, &mut appended_event)
+        (
+            appended_event.workspace_id,
+            appended_event.root_task_id,
+            appended_event.parent_task_id,
+        ) = match load_task_event_metadata(&transaction, &appended_event.task_id)
             .await
             .context("failed to hydrate task run started event metadata")
         {
-            let _ = transaction.rollback().await;
-            return Err(error);
-        }
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
 
         transaction
             .commit()
             .await
             .context("failed to commit task run started transaction")?;
 
-        Ok(Some(appended_event))
+        Ok(Some(appended_event.into_owned()))
     }
 
     pub async fn list_task_runs_by_status(
@@ -18834,10 +19084,11 @@ impl CrudStore {
                     .context("failed to commit Turn message edit transaction")?;
                 Ok(event)
             }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
+            Err(error) => Err(repositories::portable_payload::rollback_with_hold_refusal(
+                transaction,
+                error,
+            )
+            .await),
         }
     }
 
@@ -19041,10 +19292,11 @@ impl CrudStore {
                     .context("failed to commit Turn message delete transaction")?;
                 Ok(result)
             }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
+            Err(error) => Err(repositories::portable_payload::rollback_with_hold_refusal(
+                transaction,
+                error,
+            )
+            .await),
         }
     }
 
@@ -29543,8 +29795,7 @@ impl CrudStore {
                     Ok(RecoveryTerminalizationApplyOutcome::Applied(applied))
                 }
                 Err(error) => {
-                    let _ = transaction.rollback().await;
-                    Err(error)
+                    Err(repositories::portable_payload::rollback_with_hold_refusal(transaction, error).await)
                 }
             }
         })
@@ -31130,8 +31381,11 @@ impl CrudStore {
                 )
                 .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await);
             }
         }
 
@@ -31860,8 +32114,11 @@ impl CrudStore {
                 .await
                 .context("failed to project turn event to semantic timeline")
         {
-            let _ = transaction.rollback().await;
-            return Err(error);
+            return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                transaction,
+                error,
+            )
+            .await);
         }
 
         let projected = match turn_event_projection_state::mark_projected_claimed(
@@ -32631,6 +32888,7 @@ impl CrudStore {
 
         appended_events
             .pop()
+            .map(DeferredAppendedTaskEvent::into_owned)
             .context("single Task event materialization returned no event")
     }
 
@@ -32667,7 +32925,7 @@ impl CrudStore {
                 .commit()
                 .await
                 .context("failed to commit task event batch materialization transaction")?;
-            appended_events.extend(chunk_events);
+            appended_events.extend(materialize_task_events(chunk_events));
         }
 
         Ok(appended_events)
@@ -32699,7 +32957,7 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit Task action materialization transaction")?;
-                Ok(appended)
+                Ok(materialize_task_events(appended))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -32823,7 +33081,7 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit Task creation admission transaction")?;
-                Ok(appended_events)
+                Ok(materialize_task_events(appended_events))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -32859,7 +33117,7 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit blocked Task readmission transaction")?;
-                Ok(appended_events)
+                Ok(materialize_task_events(appended_events))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -32896,7 +33154,7 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit Task action readmission transaction")?;
-                Ok(appended)
+                Ok(materialize_task_events(appended))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -32913,6 +33171,38 @@ impl CrudStore {
         let prepared_events = self
             .prepare_task_events_for_write(input.events.clone())
             .await?;
+        // Capture and compare the immutable winner before reserving the writer.
+        // Inside the writer, identity/revision/domain CAS revalidates this exact
+        // capture. A winner arriving with the Task events forces a full retry.
+        let snapshot_preflight = if let Some(expected) = &input.conversation_snapshot {
+            let winner =
+                task_run_conversation_snapshot::find_by_run(&self.connection, &expected.run_id)
+                    .await?;
+            let winner = match winner {
+                Some(record) => Some(
+                    task_run_conversation_snapshot::hydrate_record(&self.connection, record)
+                        .await?,
+                ),
+                None => None,
+            };
+            if let Some(persisted) = &winner {
+                if persisted.run_id != expected.run_id
+                    || persisted.task_id != expected.task_id
+                    || persisted.workspace_id != expected.workspace_id
+                    || persisted.conversation_thread_id != expected.conversation_thread_id
+                    || persisted.source_turn_id != expected.source_turn_id
+                    || persisted.history_json != expected.history_json
+                {
+                    bail!(
+                        "task run `{}` conversation snapshot conflicts with Task creation",
+                        expected.run_id
+                    );
+                }
+            }
+            winner
+        } else {
+            None
+        };
         let transaction = self
             .connection
             .begin()
@@ -32928,25 +33218,21 @@ impl CrudStore {
                 .await?;
 
             if let Some(snapshot) = input.conversation_snapshot {
-                let expected = snapshot.clone();
-                let persisted = task_run_conversation_snapshot::insert_if_absent(
+                let current =
+                    task_run_conversation_snapshot::find_by_run(&transaction, &snapshot.run_id)
+                        .await?;
+                match (&current, &snapshot_preflight) {
+                    (None, None) => {}
+                    (Some(stored), Some(captured))
+                        if task_run_conversation_snapshot::same_version(stored, captured) => {}
+                    _ => return Err(repositories::portable_payload::PreflightRace.into()),
+                }
+                task_run_conversation_snapshot::insert_if_absent(
                     &transaction,
                     snapshot,
                     root.as_ref().context("missing prepared Task root")?,
                 )
                 .await?;
-                if persisted.run_id != expected.run_id
-                    || persisted.task_id != expected.task_id
-                    || persisted.workspace_id != expected.workspace_id
-                    || persisted.conversation_thread_id != expected.conversation_thread_id
-                    || persisted.source_turn_id != expected.source_turn_id
-                    || persisted.history_json != expected.history_json
-                {
-                    bail!(
-                        "task run `{}` conversation snapshot conflicts with Task creation",
-                        expected.run_id
-                    );
-                }
             }
             if let Some(admission) = input.execution_admission {
                 task_execution_admission::insert_immutable(&transaction, admission).await?;
@@ -32979,12 +33265,13 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit atomic Task creation transaction")?;
-                Ok(appended_events)
+                Ok(materialize_task_events(appended_events))
             }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
+            Err(error) => Err(repositories::portable_payload::rollback_with_hold_refusal(
+                transaction,
+                error,
+            )
+            .await),
         }
     }
 
@@ -33143,13 +33430,13 @@ impl CrudStore {
                 Vec::new()
             };
 
-            Ok(Some(DueTaskTriggerReconciliation {
+            Ok(Some((
                 task_id,
-                trigger_id: trigger.id,
+                trigger.id,
                 task_status,
                 trigger_status,
                 appended_events,
-            }))
+            )))
         }
         .await;
 
@@ -33159,7 +33446,17 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit due Task trigger reconciliation transaction")?;
-                Ok(outcome)
+                Ok(outcome.map(
+                    |(task_id, trigger_id, task_status, trigger_status, events)| {
+                        DueTaskTriggerReconciliation {
+                            task_id,
+                            trigger_id,
+                            task_status,
+                            trigger_status,
+                            appended_events: materialize_task_events(events),
+                        }
+                    },
+                ))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -33249,7 +33546,7 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit due task trigger materialization transaction")?;
-                Ok(appended_events)
+                Ok(materialize_task_events(appended_events))
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -33341,9 +33638,24 @@ impl CrudStore {
                     .await?,
                 );
             }
-            prepared.push(event);
+            prepared.push(event.preflight_idempotency(&self.connection).await?);
         }
+        task_event::prepare_batch_idempotency(&mut prepared);
         Ok(prepared)
+    }
+
+    /// Refresh only portable/idempotency facts. Preserve every domain fence,
+    /// projection and delivery boundary of a caller-owned prepared transition.
+    async fn refresh_task_event_preflight(
+        &self,
+        events: Vec<task_event::PreparedTaskEvent>,
+    ) -> Result<Vec<task_event::PreparedTaskEvent>> {
+        let mut refreshed = Vec::with_capacity(events.len());
+        for event in events {
+            refreshed.push(event.preflight_idempotency(&self.connection).await?);
+        }
+        task_event::prepare_batch_idempotency(&mut refreshed);
+        Ok(refreshed)
     }
 
     async fn prepare_candidate_writes_for_task_event<C: ConnectionTrait>(
@@ -33499,7 +33811,7 @@ impl CrudStore {
         db: &C,
         events: Vec<task_event::PreparedTaskEvent>,
         event_timestamp_secs: i64,
-    ) -> Result<Vec<AppendedTaskEvent>> {
+    ) -> Result<Vec<DeferredAppendedTaskEvent>> {
         self.append_task_events_in_connection_with_delivery_policy(
             db,
             events,
@@ -33514,7 +33826,7 @@ impl CrudStore {
         db: &C,
         events: Vec<task_event::PreparedTaskEvent>,
         at: i64,
-    ) -> Result<Vec<AppendedTaskEvent>> {
+    ) -> Result<Vec<DeferredAppendedTaskEvent>> {
         self.append_task_events_in_connection_with_delivery_policy(db, events, at, true)
             .await
     }
@@ -33525,10 +33837,11 @@ impl CrudStore {
         events: Vec<task_event::PreparedTaskEvent>,
         event_timestamp_secs: i64,
         delivery_cancellation: bool,
-    ) -> Result<Vec<AppendedTaskEvent>> {
+    ) -> Result<Vec<DeferredAppendedTaskEvent>> {
         let created_at = unix_to_datetime(event_timestamp_secs);
         let mut appended_events = Vec::with_capacity(events.len());
         let mut batch_run_turns = HashMap::<String, PreparedLegacyTaskRunTurn>::new();
+        let mut batch_identities = task_event::TaskEventBatchIdentities::new();
 
         for event in events {
             let mut event = if delivery_cancellation {
@@ -33588,7 +33901,6 @@ impl CrudStore {
                     _ => None,
                 }
             };
-            let event = event.preflight_idempotency(db).await?;
             let gate_resolution = self
                 .prepare_candidate_writes_for_task_event(
                     db,
@@ -33605,8 +33917,13 @@ impl CrudStore {
             let event = event
                 .with_candidate_gate_resolution(gate_resolution)
                 .with_delivery_authority(delivery_authority);
-            let mut appended_event =
-                task_event::append_prepared_event(db, event, created_at).await?;
+            let mut appended_event = task_event::append_prepared_event_with_batch(
+                db,
+                event,
+                created_at,
+                &mut batch_identities,
+            )
+            .await?;
 
             if appended_event.append_status.is_inserted() {
                 self.task_projector
@@ -33614,7 +33931,7 @@ impl CrudStore {
                     .await
                     .context("failed to project task event to read models")?;
                 if matches!(
-                    &appended_event.payload,
+                    appended_event.payload.as_ref(),
                     TaskEventPayload::TaskCompleted { .. }
                         | TaskEventPayload::TaskFailed { .. }
                         | TaskEventPayload::TaskBlocked { .. }
@@ -33640,7 +33957,11 @@ impl CrudStore {
                 .context("failed to initialize task event fanout cursor")?;
             }
 
-            hydrate_task_event_metadata(db, &mut appended_event)
+            (
+                appended_event.workspace_id,
+                appended_event.root_task_id,
+                appended_event.parent_task_id,
+            ) = load_task_event_metadata(db, &appended_event.task_id)
                 .await
                 .context("failed to hydrate task event metadata")?;
             appended_events.push(appended_event);
@@ -33660,9 +33981,13 @@ impl CrudStore {
         // future; it may perform reader work and retry backoff.
         let mut operation = operation;
         retry_with_backoff(
-            || operation(),
+            || repositories::portable_payload::after_database_owners(operation()),
             |error| {
-                is_anyhow_sqlite_lock(error) || task_event::is_idempotency_preflight_race(error)
+                is_anyhow_sqlite_lock(error)
+                    || task_event::is_idempotency_preflight_race(error)
+                    || error
+                        .downcast_ref::<repositories::portable_payload::PreflightRace>()
+                        .is_some()
             },
             DEFAULT_LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
@@ -34175,16 +34500,18 @@ async fn task_finalization_revision_for_connection<C: ConnectionTrait>(
     })
 }
 
-async fn hydrate_task_event_metadata<C: ConnectionTrait>(
+async fn load_task_event_metadata<C: ConnectionTrait>(
     db: &C,
-    event: &mut AppendedTaskEvent,
-) -> Result<()> {
-    if let Some(task) = task_repository::find_task_by_id(db, event.task_id.as_str()).await? {
-        event.workspace_id = Some(task.workspace_id);
-        event.root_task_id = task.root_task_id;
-        event.parent_task_id = task.parent_task_id;
-    }
-    Ok(())
+    task_id: &str,
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    Ok(match task_repository::find_task_by_id(db, task_id).await? {
+        Some(task) => (
+            Some(task.workspace_id),
+            task.root_task_id,
+            task.parent_task_id,
+        ),
+        None => (None, None, None),
+    })
 }
 
 fn task_trigger_from_db_model(model: pioneer_entity::task_trigger::Model) -> Result<TaskTrigger> {
@@ -35422,7 +35749,7 @@ mod tests {
 
     fn migrations_through(name: &str) -> Vec<Box<dyn migration::MigrationTrait>> {
         let mut found = false;
-        let migrations = Migrator::migrations()
+        let mut migrations = Migrator::migrations()
             .into_iter()
             .take_while(|migration| {
                 let include = !found;
@@ -35433,6 +35760,28 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(found, "target migration {name} must remain registered");
+        if let Some(tracker) = migrations.iter().position(|migration| {
+            migration.name() == "m20261002_000001_task_run_occurrence_reconcile"
+        }) {
+            // Tracker fixtures use current TaskEvent CRUD. Its physical storage
+            // columns are independent of tracking installation/history policy.
+            // Install only that projection (and its shared tables) before the
+            // earliest tracker so tracker down/up never removes these columns.
+            // Earlier exact-schema fixtures retain their original prefix.
+            let storage = Migrator::migrations()
+                .into_iter()
+                .filter(|candidate| {
+                    matches!(
+                        candidate.name(),
+                        "m20261027_000001_portable_payload"
+                            | "m20261027_000005_portable_task_event"
+                    ) && !migrations
+                        .iter()
+                        .any(|migration| migration.name() == candidate.name())
+                })
+                .collect::<Vec<_>>();
+            migrations.splice(tracker..tracker, storage);
+        }
         migrations
     }
 

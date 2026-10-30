@@ -6,7 +6,9 @@ async fn progress_fixture(correction: bool) -> (Fixture, PreparedOperation) {
     let text = if correction {
         "small".into()
     } else {
-        "漢字🌍".repeat(4_000)
+        // Leave source text after both accepted portions so the next portion
+        // reaches invalid completion instead of finishing the whole input.
+        "漢字🌍".repeat(12_000)
     };
     let mut replies = if correction {
         vec![Reply::Success]
@@ -887,7 +889,7 @@ async fn historical_invalid_completion_does_not_block_admission_after_head_advan
             turn_id: "new-turn".into(),
             item: pioneer_protocol::TurnItem::AgentMessage {
                 id: "next-source".into(),
-                text: "漢字🌍".repeat(4_000),
+                text: "漢字🌍".repeat(12_000),
                 phase: Default::default(),
                 markdown: None,
                 markdown_version: None,

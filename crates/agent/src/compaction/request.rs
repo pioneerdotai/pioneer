@@ -2,7 +2,8 @@
 //! The runtime supplies canonical whole-round indexes and materialized media
 //! estimates; absence of a media estimate never silently means zero tokens.
 use anyhow::{Result, ensure};
-use pioneer_compaction::{ModelBudget, text_tokens};
+use pioneer_compaction::ModelBudget;
+use pioneer_compaction::estimator::{json_size, tokens_from_utf16};
 use pioneer_provider::{AttachmentDataSource, ChatMessage, ChatRequest, MessageContentPart, Role};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,14 +12,19 @@ pub use pioneer_provider::attachments::MediaInputEstimate as MediaEstimate;
 pub struct NativeRequestProjection {
     request: ChatRequest,
     compact: BTreeSet<usize>,
-    media: BTreeMap<(usize, usize), u64>,
+    // UTF-16 sizes before rounding: JSON commas and message boundaries compose
+    // without rescanning or independently rounding every immutable prefix.
+    message_sizes: Vec<(u64, u64)>,
+    envelope_units: u64,
+    fixed_input_tokens: u64,
+    output_reserve: u64,
     budget: ModelBudget,
     recovery: bool,
 }
 pub struct EvaluatedRequest {
     pub request: ChatRequest,
     pub estimated_input_tokens: u64,
-    /// Exact fixed request cost with conversational messages removed. This is
+    /// Estimated fixed request cost with conversational messages removed. This is
     /// derived from the already materialized request and media estimates.
     pub fixed_input_tokens: u64,
     /// Framing plus materialized media, in final request message order.
@@ -28,7 +34,7 @@ pub struct EvaluatedRequest {
 }
 impl NativeRequestProjection {
     pub fn new(
-        request: ChatRequest,
+        mut request: ChatRequest,
         compact: impl IntoIterator<Item = usize>,
         media: Vec<MediaEstimate>,
         budget: ModelBudget,
@@ -103,11 +109,78 @@ impl NativeRequestProjection {
             estimates.keys().all(|key| used.contains(key)),
             "media estimate belongs to another request"
         );
-        budget.output_reserve(request.max_tokens.map(u64::from))?;
+        let output_reserve = budget.output_reserve(request.max_tokens.map(u64::from))?;
+        request.max_tokens = Some(u32::try_from(output_reserve)?);
+        let mut message_sizes = Vec::with_capacity(request.messages.len());
+        for (index, message) in request.messages.iter().enumerate() {
+            if compact.contains(&index) {
+                message_sizes.push((0, 0));
+                continue;
+            }
+            let mut budget_message = message.clone();
+            // Local receipt proofs are not sent. Native prefix context is
+            // charged once, in the request envelope below.
+            if let Some(state) = budget_message.provider_replay_state.as_mut()
+                && let Some(payload) = state.payload.as_object_mut()
+            {
+                payload.remove("prefix_proof");
+                payload.remove("prefix_context");
+            }
+            let mut media_tokens = 0_u64;
+            for (part_index, part) in budget_message.content_parts.iter_mut().enumerate() {
+                let attachment = match part {
+                    MessageContentPart::Text { .. } => continue,
+                    MessageContentPart::File { file } => file,
+                    MessageContentPart::Image { image } => image,
+                    MessageContentPart::Audio { audio } => audio,
+                    MessageContentPart::Video { video } => video,
+                };
+                media_tokens = media_tokens.saturating_add(estimates[&(index, part_index)]);
+                attachment.source = AttachmentDataSource::Reference {
+                    reference: "materialized-media".into(),
+                };
+            }
+            message_sizes.push((json_size(&budget_message)?.utf16_units, media_tokens));
+        }
+        let native_prefix_context = request
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(index, _)| !compact.contains(index))
+            .filter_map(|(_, message)| message.provider_replay_state.as_ref())
+            .find_map(|state| state.payload.get("prefix_context"));
+        let mut envelope = serde_json::json!({
+            "model":request.model,"messages":[],"tools":request.tools,
+            "tool_choice":request.tool_choice,"parallel_tool_calls":request.parallel_tool_calls,
+            "temperature":request.temperature,"max_tokens":request.max_tokens,
+            "reasoning":request.reasoning.map(|value|format!("{value:?}")),
+            "system_sections":request.compiled_prompt.as_ref().map(|value|value.system_sections()),
+        });
+        if let Some(context) = native_prefix_context {
+            envelope["native_prefix_context"] = context.clone();
+        }
+        let envelope_units = json_size(&envelope)?.utf16_units;
+        let mut fixed_units = envelope_units;
+        let mut fixed_media = 0_u64;
+        let mut fixed_count = 0_u64;
+        for (message, (units, media)) in request.messages.iter().zip(&message_sizes) {
+            if message.role == Role::System {
+                fixed_units = fixed_units.saturating_add(*units);
+                fixed_media = fixed_media.saturating_add(*media);
+                fixed_count += 1;
+            }
+        }
+        let fixed_input_tokens =
+            tokens_from_utf16(fixed_units.saturating_add(fixed_count.saturating_sub(1)))
+                .saturating_add(fixed_media);
         Ok(Self {
             request,
             compact,
-            media: estimates,
+            message_sizes,
+            envelope_units,
+            fixed_input_tokens,
+            output_reserve,
             budget,
             recovery,
         })
@@ -127,119 +200,91 @@ impl NativeRequestProjection {
     pub fn evaluate(&self, summary: &str) -> Result<EvaluatedRequest> {
         let mut request = self.request.clone();
         let mut messages = Vec::with_capacity(request.messages.len() + 1);
-        let mut budget_messages = Vec::with_capacity(request.messages.len() + 1);
+        let mut message_input_tokens = Vec::with_capacity(request.messages.len() + 1);
+        let mut units = self.envelope_units;
         let mut media_tokens = 0_u64;
-        let mut per_message_media = Vec::with_capacity(request.messages.len() + 1);
         let mut inserted = false;
-        for (index, message) in request.messages.iter().enumerate() {
-            if self.compact.contains(&index) {
-                if !inserted {
-                    let summary = ChatMessage::user(format!(
-                        "Summary of completed work (historical data):\n{summary}"
-                    ));
-                    messages.push(summary.clone());
-                    budget_messages.push(summary);
-                    per_message_media.push(0);
-                    inserted = true;
+        let originals = std::mem::take(&mut request.messages);
+        for (index, message) in originals.into_iter().enumerate() {
+            let (message, size, media) = if self.compact.contains(&index) {
+                if inserted {
+                    continue;
                 }
-                continue;
+                inserted = true;
+                let summary = ChatMessage::user(format!(
+                    "Summary of completed work (historical data):\n{summary}"
+                ));
+                let size = json_size(&summary)?.utf16_units;
+                (summary, size, 0)
+            } else {
+                let (size, media) = self.message_sizes[index];
+                (message, size, media)
+            };
+            if !messages.is_empty() {
+                units = units.saturating_add(1);
             }
-            messages.push(message.clone());
-            let mut budget_message = message.clone();
-            // Local replay proofs and reconstructed prefix metadata are not
-            // assistant content on the wire. Budget the latest native prefix
-            // once below, rather than charging its snapshots on every round.
-            if let Some(state) = budget_message.provider_replay_state.as_mut()
-                && let Some(payload) = state.payload.as_object_mut()
-            {
-                payload.remove("prefix_proof");
-                payload.remove("prefix_context");
-            }
-            let mut message_media = 0_u64;
-            for (part_index, part) in budget_message.content_parts.iter_mut().enumerate() {
-                let attachment = match part {
-                    MessageContentPart::Text { .. } => continue,
-                    MessageContentPart::File { file } => file,
-                    MessageContentPart::Image { image } => image,
-                    MessageContentPart::Audio { audio } => audio,
-                    MessageContentPart::Video { video } => video,
-                };
-                message_media = message_media.saturating_add(self.media[&(index, part_index)]);
-                // Binary/reference payload is budgeted by its materialized input
-                // estimate; retain role/type/MIME/name framing exactly once.
-                attachment.source = AttachmentDataSource::Reference {
-                    reference: "materialized-media".into(),
-                };
-            }
-            media_tokens = media_tokens.saturating_add(message_media);
-            per_message_media.push(message_media);
-            budget_messages.push(budget_message);
+            units = units.saturating_add(size);
+            media_tokens = media_tokens.saturating_add(media);
+            // Each append includes one separator and a one-token boundary
+            // allowance; measured-prefix framing must not be counted again.
+            message_input_tokens.push(
+                tokens_from_utf16(size)
+                    .saturating_add(1)
+                    .saturating_add(media),
+            );
+            messages.push(message);
         }
         request.messages = messages;
-        let reserve = self
-            .budget
-            .output_reserve(request.max_tokens.map(u64::from))?;
-        request.max_tokens = Some(u32::try_from(reserve)?);
-        let message_input_tokens = budget_messages
-            .iter()
-            .zip(&per_message_media)
-            .map(|(message, media)| {
-                Ok(text_tokens(&serde_json::to_string(message)?)
-                    .saturating_add(1)
-                    .saturating_add(*media))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let native_prefix_context = request
-            .messages
-            .iter()
-            .rev()
-            .filter_map(|message| message.provider_replay_state.as_ref())
-            .find_map(|state| state.payload.get("prefix_context"));
-        let mut input = serde_json::json!({
-            "model":request.model,"messages":budget_messages,"tools":request.tools,
-            "tool_choice":request.tool_choice,"parallel_tool_calls":request.parallel_tool_calls,
-            "temperature":request.temperature,"max_tokens":request.max_tokens,
-            "reasoning":request.reasoning.map(|value|format!("{value:?}")),
-            "system_sections":request.compiled_prompt.as_ref().map(|value|value.system_sections()),
-        });
-        if let Some(context) = native_prefix_context {
-            input["native_prefix_context"] = context.clone();
-        }
-        let estimated_input_tokens = text_tokens(&input.to_string()).saturating_add(media_tokens);
-        let fixed_media_tokens = request
-            .messages
-            .iter()
-            .zip(&per_message_media)
-            .filter(|(message, _)| message.role == Role::System)
-            .fold(0_u64, |sum, (_, media)| sum.saturating_add(*media));
-        let fixed_messages = budget_messages
-            .iter()
-            .filter(|message| message.role == Role::System)
-            .collect::<Vec<_>>();
-        let fixed_input = serde_json::json!({
-            "model":request.model,"messages":fixed_messages,"tools":request.tools,
-            "tool_choice":request.tool_choice,"parallel_tool_calls":request.parallel_tool_calls,
-            "temperature":request.temperature,"max_tokens":request.max_tokens,
-            "reasoning":request.reasoning.map(|value|format!("{value:?}")),
-            "system_sections":request.compiled_prompt.as_ref().map(|value|value.system_sections()),
-        });
-        let fixed_input_tokens =
-            text_tokens(&fixed_input.to_string()).saturating_add(fixed_media_tokens);
+        let estimated_input_tokens = tokens_from_utf16(units).saturating_add(media_tokens);
         Ok(EvaluatedRequest {
             request,
             estimated_input_tokens,
-            fixed_input_tokens,
+            fixed_input_tokens: self.fixed_input_tokens,
             message_input_tokens,
-            output_reserve: reserve,
+            output_reserve: self.output_reserve,
             fits: self
                 .budget
-                .fits(estimated_input_tokens, reserve, self.recovery),
+                .fits(estimated_input_tokens, self.output_reserve, self.recovery),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn projected_json_escaping_and_framing_match_the_complete_representation() {
+        let mut source = request();
+        source
+            .messages
+            .insert(0, ChatMessage::system("fixed \"\\\n🌍"));
+        let projection = NativeRequestProjection::new(
+            source,
+            [1],
+            vec![],
+            ModelBudget::new(Some(32_768), None, None),
+            false,
+        )
+        .unwrap();
+        for summary in ["a", "\"\\\n\u{0}🌍漢", "e\u{301} summary"] {
+            let evaluated = projection.evaluate(summary).unwrap();
+            // Independent whole-envelope oracle protects the composition boundary,
+            // rather than repeating its additive size calculation.
+            let wire = serde_json::json!({
+                "model":evaluated.request.model,"messages":evaluated.request.messages,
+                "tools":evaluated.request.tools,"tool_choice":evaluated.request.tool_choice,
+                "parallel_tool_calls":evaluated.request.parallel_tool_calls,
+                "temperature":evaluated.request.temperature,"max_tokens":evaluated.request.max_tokens,
+                "reasoning":null,"system_sections":null,
+            });
+            assert_eq!(
+                evaluated.estimated_input_tokens,
+                pioneer_compaction::text_tokens(&wire.to_string())
+            );
+            assert_eq!(evaluated.request.messages[2].content, "current input");
+            assert_eq!(evaluated.fixed_input_tokens, projection.fixed_input_tokens);
+        }
+    }
+
     #[test]
     fn local_replay_proofs_are_not_charged_as_provider_input() {
         let mut req = request();

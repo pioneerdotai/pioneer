@@ -72,7 +72,12 @@ impl ClaudeService {
                 .len()
                 .saturating_add(request.instructions.len())
                 <= MAX_BYTES,
-            "service input exceeds capacity"
+            // Local hard payload overflow is typed, just like a confirmed
+            // provider context rejection. Callers must not parse raw messages.
+            ServiceFailure {
+                class: ProviderFailureClass::ContextTooLarge,
+                retry_after_ms: None,
+            }
         );
         ensure!(request.output_cap > 0, "missing service output cap");
         ensure!(

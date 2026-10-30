@@ -143,7 +143,6 @@ terminal = { path = "crates/terminal" }
 markdown = "1"
 
 # Tokenization
-tiktoken-rs = "0.12"
 syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-onig", "dump-load"] }
 two-face = { version = "=0.5.1", default-features = false, features = ["syntect-onig"] }
 unicode-width = "0.2"
