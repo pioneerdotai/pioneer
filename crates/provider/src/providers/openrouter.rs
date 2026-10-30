@@ -467,7 +467,7 @@ impl OpenRouterFailure {
         stage: ProviderFailureStage,
         retry_after_ms: Option<u64>,
     ) -> Self {
-        let status = error
+        let native_status = error
             .code
             .as_ref()
             .and_then(|code| {
@@ -477,7 +477,18 @@ impl OpenRouterFailure {
             .and_then(|code| u16::try_from(code).ok())
             .filter(|code| (100..=599).contains(code));
         let description = error.description();
-        Self::from_envelope(Some(error), id, status, retry_after_ms, &description, stage)
+        let mut failure = Self::from_envelope(
+            Some(error),
+            id,
+            native_status,
+            retry_after_ms,
+            &description,
+            stage,
+        );
+        // A native event code retains its established classification meaning,
+        // but is not an HTTP failure status: generation runs after HTTP success.
+        failure.classification.http_status = None;
+        failure
     }
 
     // Classify the original transport failure before discarding its text and
@@ -1400,6 +1411,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         error
             .downcast_ref::<OpenRouterFailure>()
             .map(|failure| failure.classification.clone())
+            .or_else(|| crate::failure::classify_http_error(error))
     }
 
     fn name(&self) -> &str {
@@ -1515,8 +1527,8 @@ impl crate::traits::Provider for OpenRouterProvider {
                 .with_reported_model(body.get("model").and_then(serde_json::Value::as_str));
             observed.update(&usage);
             // Chat Completions can report generation failure inside HTTP 200,
-            // either at the top level or in a choice. The envelope code, not 200,
-            // is the failure status in this case.
+            // either at the top level or in a choice. Its native code is a
+            // classification hint, never an HTTP failure status.
             if let Some(error) = body
                 .get("error")
                 .filter(|error| !error.is_null())
@@ -1674,7 +1686,25 @@ impl crate::traits::Provider for OpenRouterProvider {
             .list_model_entries(self.models_request())
             .await?
             .into_iter()
-            .map(provider_model_from_openrouter_model_entry)
+            .map(|entry| {
+                let mut model = provider_model_from_openrouter_model_entry(entry);
+                // The default OpenRouter list is filtered to text output and
+                // served by /chat/completions. Explicit native modalities can
+                // narrow that operation-scoped evidence, including private URLs.
+                model.capabilities.chat = Some(
+                    model
+                        .capabilities
+                        .input_modalities
+                        .as_ref()
+                        .is_none_or(|input| input.iter().any(|kind| kind == "text"))
+                        && model
+                            .capabilities
+                            .output_modalities
+                            .as_ref()
+                            .is_none_or(|output| output.iter().any(|kind| kind == "text")),
+                );
+                model
+            })
             .collect())
     }
 
@@ -1814,7 +1844,15 @@ fn openrouter_embedding_model_from_openrouter_model_entry(
     m: OpenRouterModelEntry,
 ) -> ProviderModelInfo {
     let mut model = provider_model_from_openrouter_model_entry(m);
-    model.capabilities.embeddings = Some(true);
+    // The server filter proves the operation when modalities are absent, but
+    // cannot erase an explicit narrower native output list.
+    model.capabilities.embeddings = Some(model.capabilities.output_modalities.as_ref().is_none_or(
+        |output| {
+            output
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "embedding" | "embeddings"))
+        },
+    ));
     model.family = Some("embedding".to_owned());
     model
 }

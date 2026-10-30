@@ -385,6 +385,7 @@ pub(crate) async fn prepare_named_reviewer_launch(
         &identity,
         &source.source_id,
         &authority,
+        false,
     )
     .await?
     {
@@ -611,6 +612,7 @@ async fn identity_models_catalog(
     identity: &pioneer_protocol::AgentIdentityProjection,
     source_id: &str,
     authority: &crate::authorization::ExecutionAuthorizationContext,
+    selectable_only: bool,
 ) -> anyhow::Result<Vec<pioneer_protocol::AgentToolExecutorModels>> {
     use pioneer_protocol::{
         AgentIdentitySourceKind, AgentToolBackendKind, AgentToolExecutorModels,
@@ -639,10 +641,18 @@ async fn identity_models_catalog(
                     default_model_id: None,
                     unavailable_reason: None,
                 };
-                match processor
-                    .provider_models_catalog(workspace_id, definition.name)
-                    .await
-                {
+                // Only the externally offered choices use picker policy.
+                // Execution-bound defaulting and saved profiles keep raw discovery.
+                let models = if selectable_only {
+                    processor
+                        .provider_chat_models_for_selection(workspace_id, definition.name)
+                        .await
+                } else {
+                    processor
+                        .provider_models_catalog(workspace_id, definition.name)
+                        .await
+                };
+                match models {
                     Ok(models) => {
                         executor.models = models
                             .into_iter()
@@ -1560,6 +1570,7 @@ async fn selected_launch_profile(
             &identity,
             &source.source_id,
             authority,
+            false,
         )
         .await
         .map_err(|_| ToolError::execution_failed("agent_execution_profile_unavailable"))?;
@@ -4259,6 +4270,7 @@ impl ToolHandler for AgentActionToolHandler {
                     &catalog_identity,
                     catalog_source_id.as_deref().unwrap_or(&source.source_id),
                     &authority,
+                    true,
                 )
                 .await
                 .map_err(|_| ToolError::execution_failed("agent_execution_profile_unavailable"))?;

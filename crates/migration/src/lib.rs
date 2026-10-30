@@ -11,6 +11,7 @@ mod m20261026_000002_frozen_proof_discovery_index;
 
 mod m20261026_000001_agent_start_reconciliation_index;
 mod m20261026_000002_agent_action_immediate_terminal_index;
+mod m20261029_000001_thread_read_creation_order;
 
 pub struct Migrator;
 
@@ -217,6 +218,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261026_000002_frozen_proof_discovery_index::Migration),
             Box::new(m20261026_000001_agent_start_reconciliation_index::Migration),
             Box::new(m20261026_000002_agent_action_immediate_terminal_index::Migration),
+            Box::new(m20261029_000001_thread_read_creation_order::Migration),
         ]
     }
 }

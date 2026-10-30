@@ -343,6 +343,9 @@ impl VercelAiGatewayProvider {
             };
             if eligible {
                 let mut info = model_info(raw, &model);
+                // Eligibility was established by the existing operation-specific
+                // native discovery above, including the actual Responses route.
+                info.capabilities.chat = Some(!embeddings);
                 if self.root == BASE_URL
                     && let Ok(catalog) = crate::catalog::model_catalog()
                 {

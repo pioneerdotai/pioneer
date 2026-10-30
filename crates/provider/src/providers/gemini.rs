@@ -809,18 +809,7 @@ impl GeminiProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("Gemini API error ({status}): {body}")
+        crate::http::provider_api_error(response, "Gemini").await
     }
 }
 
@@ -1244,6 +1233,13 @@ fn provider_model_from_gemini_model_entry(m: GeminiModelEntry) -> ProviderModelI
             },
         },
         capabilities: ProviderModelCapabilities {
+            // generateContent is also used by audio/image products. Its
+            // presence alone cannot prove text chat; source modalities must
+            // fill that gap. An explicit operation denial remains final.
+            chat_operation: m
+                .supported_generation_methods
+                .as_ref()
+                .map(|methods| methods.iter().any(|method| method == "generateContent")),
             streaming: supports_streaming,
             thinking: m.thinking.flatten(),
             reasoning,

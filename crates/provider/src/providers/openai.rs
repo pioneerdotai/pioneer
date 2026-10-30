@@ -1213,18 +1213,7 @@ impl OpenAiProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("OpenAI API error ({status}): {body}")
+        crate::http::provider_api_error(response, "OpenAI").await
     }
 }
 
@@ -1488,6 +1477,7 @@ impl crate::traits::Provider for OpenAiProvider {
             })
             .or_else(|| super::responses_api_compatible::classify_failure(error))
             .or_else(|| crate::failure::classify_stream_error(error))
+            .or_else(|| crate::failure::classify_http_error(error))
     }
 
     async fn prepare_input_budget(

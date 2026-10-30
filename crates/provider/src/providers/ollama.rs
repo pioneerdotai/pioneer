@@ -247,6 +247,9 @@ fn apply_show_input(model: &mut ProviderModelInfo, response: OllamaShowResponse)
         });
     }
     if let Some(capabilities) = response.capabilities {
+        // The existing /api/show read supplies this closed capability list.
+        // /api/tags membership alone says nothing about the /api/chat route.
+        model.capabilities.chat = Some(capabilities.iter().any(|v| v == "completion"));
         let vision = capabilities.iter().any(|v| v == "vision");
         model.capabilities.vision = Some(vision);
         // This native Chat renderer accepts text and images; audio products
@@ -569,18 +572,7 @@ impl OllamaProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("Ollama API error ({status}): {body}")
+        crate::http::provider_api_error(response, "Ollama").await
     }
 }
 
@@ -1234,6 +1226,25 @@ mod tests {
                 OllamaProvider::resolve_think_with_catalog(&request, show.thinking.as_ref(), None)
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn show_completion_proves_chat_without_inferring_it_from_vision_or_tools() {
+        for (capabilities, expected) in [
+            (serde_json::Value::Null, None),
+            (serde_json::json!(["embedding"]), Some(false)),
+            (serde_json::json!(["vision", "tools"]), Some(false)),
+            (serde_json::json!(["completion"]), Some(true)),
+        ] {
+            let mut model: ProviderModelInfo = serde_json::from_value(serde_json::json!({
+                "id":"local-model", "provider":"ollama", "limits":{}, "capabilities":{}
+            }))
+            .unwrap();
+            let response =
+                serde_json::from_value(serde_json::json!({"capabilities":capabilities})).unwrap();
+            apply_show_input(&mut model, response);
+            assert_eq!(model.capabilities.chat, expected);
         }
     }
 

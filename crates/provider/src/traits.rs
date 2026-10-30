@@ -104,6 +104,7 @@ pub trait Provider: Send + Sync {
     /// shared provider-neutral fallback before endpoint errors are redacted.
     fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
         crate::failure::classify_stream_error(error)
+            .or_else(|| crate::failure::classify_http_error(error))
     }
 
     /// Materialize and locally budget the media that this request will send.
@@ -165,6 +166,28 @@ pub trait Provider: Send + Sync {
             "provider '{}' does not support listing transcription models",
             self.name()
         )
+    }
+
+    /// Purpose-filtered picker list. Raw discovery methods retain their existing
+    /// execution/catalog semantics. Registry wrappers add only scoped fallback.
+    async fn list_models_for_selection(
+        &self,
+        purpose: crate::selection::ModelPurpose,
+    ) -> Result<Vec<ProviderModelInfo>> {
+        use crate::selection::ModelPurpose;
+        let models = match purpose {
+            ModelPurpose::Chat => self.list_models().await?,
+            ModelPurpose::Embeddings => self.list_embedding_models().await?,
+            ModelPurpose::Transcription => self.list_transcription_models().await?,
+        };
+        Ok(crate::selection::filter_models(
+            self.name(),
+            self.usage_api(),
+            &self.capabilities(),
+            purpose,
+            models,
+            None,
+        ))
     }
 
     /// Create embeddings for one or more input texts.

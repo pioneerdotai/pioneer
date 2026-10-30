@@ -749,18 +749,7 @@ impl AnthropicProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("Anthropic API error ({status}): {body}")
+        crate::http::provider_api_error(response, "Anthropic").await
     }
 }
 
@@ -1536,6 +1525,9 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
             .map(|dt| dt.timestamp())
     });
     let mut capabilities = ProviderModelCapabilities::default();
+    // This API lists Claude models available to the Messages API, rather than
+    // a mixed inventory of unrelated inference operations.
+    capabilities.chat = Some(true);
     if let Some(native) = m.capabilities.as_ref() {
         let mut facts = std::collections::BTreeMap::new();
         if let Some(effort) = native.get("effort") {
