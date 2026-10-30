@@ -931,3 +931,430 @@ async fn api_task_rotates_connection_only_after_current_authorization_and_keeps_
             .is_err()
     );
 }
+
+// Shared with the executor's regressions so they can exercise real private
+// reviewer recovery and public delivery entry points on the same full fixture.
+pub(in crate::message) struct HistoricalTaskFixture {
+    pub processor: Arc<MessageProcessor>,
+    pub response: pioneer_protocol::TaskGetResponse,
+    pub run: TaskRun,
+    pub execution: pioneer_protocol::TaskRunExecution,
+    pub facts: crate::authorization::AgentExecutionPersistenceFacts,
+    provider: Arc<CaptureSummaryProvider>,
+}
+
+pub(in crate::message) async fn historical_task_fixture(
+    mode: TaskDeliveryMode,
+) -> HistoricalTaskFixture {
+    historical_task_fixture_with_delivery_target(mode, "continuity-root").await
+}
+
+pub(in crate::message) async fn historical_task_fixture_with_delivery_target(
+    mode: TaskDeliveryMode,
+    destination_thread_id: &str,
+) -> HistoricalTaskFixture {
+    let provider = Arc::new(
+        CaptureSummaryProvider::new("unexpected model execution")
+            .named("openai")
+            .with_native_attachments(),
+    );
+    let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let (processor, workspace) = processor_with_registry(registry).await;
+    if mode == TaskDeliveryMode::Thread && destination_thread_id != "continuity-root" {
+        ensure_test_superuser_execution_turn(
+            &processor,
+            &workspace,
+            destination_thread_id,
+            "historical-delivery-target-turn",
+        )
+        .await;
+    }
+    let mut params = test_task_create_params(
+        &workspace,
+        "continuity-root",
+        "continuity-parent",
+        "historical delivery",
+        3,
+    );
+    params.delivery_policy = Some(TaskDeliveryPolicy {
+        mode,
+        thread_target: (mode == TaskDeliveryMode::Thread)
+            .then_some(pioneer_protocol::TaskDeliveryThreadTarget::ExactThread),
+        thread_id: (mode == TaskDeliveryMode::Thread).then(|| destination_thread_id.to_owned()),
+        webhook_url: None,
+        include_result: true,
+        format: TaskDeliveryFormat::Summary,
+    });
+    let created = create_task_for_test(&processor, params).await.unwrap();
+    let run = created.run.unwrap();
+    let execution = processor
+        .crud_store
+        .reserve_execution_for_run(&run.id, TaskExecutorKind::Agent, run.created_at)
+        .await
+        .unwrap();
+    let response = processor
+        .crud_store
+        .get_task(&run.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let facts = prepared(&processor, &response, &run, &execution)
+        .await
+        .unwrap();
+    let admitted = commit(&processor, &response, &run, &facts).await.unwrap();
+    assert!(!admitted.queued);
+    HistoricalTaskFixture {
+        processor,
+        response,
+        run,
+        execution,
+        facts,
+        provider,
+    }
+}
+
+impl HistoricalTaskFixture {
+    pub fn assert_no_provider_requests(&self) {
+        assert!(
+            self.provider.snapshot_requests().is_empty(),
+            "delivery/rejected recovery must not call a provider"
+        );
+    }
+
+    pub async fn complete(&self) -> pioneer_protocol::TaskDelivery {
+        let now = now_timestamp_secs();
+        self.processor
+            .crud_store
+            .claim_execution_at(&self.execution.id, "historical-fixture", now, now + 600)
+            .await
+            .unwrap()
+            .expect("fixture owns its Task attempt");
+        let handle = pioneer_tasks::TaskExecutionHandle::new(
+            self.processor.crud_store.clone(),
+            self.processor.task_runtime.event_bus(),
+            self.response.task.id.clone(),
+            self.run.id.clone(),
+        );
+        handle.mark_started(now).await.unwrap();
+        handle
+            .complete_run(
+                Some(pioneer_protocol::TaskResult {
+                    summary: Some("saved historical answer".into()),
+                    data: None,
+                    artifacts: vec![],
+                    completed_by_run_id: Some(self.run.id.clone()),
+                }),
+                now,
+            )
+            .await
+            .unwrap();
+        let deliveries = self
+            .processor
+            .crud_store
+            .list_task_deliveries(pioneer_protocol::TaskDeliveriesParams {
+                workspace_id: self.response.task.workspace_id.clone(),
+                task_id: Some(self.response.task.id.clone()),
+                run_id: Some(self.run.id.clone()),
+                statuses: vec![],
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        assert_eq!(deliveries.deliveries.len(), 1);
+        assert_eq!(
+            deliveries.deliveries[0]
+                .result_snapshot
+                .as_ref()
+                .unwrap()
+                .summary
+                .as_deref(),
+            Some("saved historical answer")
+        );
+        deliveries.deliveries.into_iter().next().unwrap()
+    }
+
+    pub async fn add_delivery_route(&self) -> (String, String, String, i64) {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel};
+        let store = &self.processor.crud_store;
+        let db = store.database_connection();
+        let actor = store
+            .get_task_actor_contract(&self.response.task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let destination_thread_id = actor.delivery.destination_thread_id.clone().unwrap();
+        assert_ne!(destination_thread_id, self.facts.home_root_thread_id);
+        let admission = store
+            .get_task_execution_admission(&self.response.task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let context = crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
+            &admission.authorization_context_json,
+        )
+        .unwrap();
+        let policy_fingerprint = context.policy_fingerprint().to_owned();
+        let authority = serde_json::to_string(&actor.creator).unwrap();
+        assert!(matches!(
+            actor.creator,
+            pioneer_protocol::PersistedActorRef::Principal(_)
+        ));
+        let generation = self
+            .processor
+            .current_authorization_revision()
+            .await
+            .unwrap() as i64;
+        let now = pioneer_crud::utc_now();
+        let expires = now + chrono::Duration::hours(1);
+        let id = pioneer_crud::canonical_agent_id('R', "historical-delivery-route");
+        let route = store
+            .create_agent_delegation_route(pioneer_crud::AgentDelegationRouteInput {
+                id: id.clone(),
+                source_execution_id: self.execution.id.clone(),
+                destination_thread_id: destination_thread_id.clone(),
+                source_capsule_id: Some(self.facts.home_root_thread_id.clone()),
+                destination_capsule_id: Some(destination_thread_id),
+                source_workspace_id: Some(self.response.task.workspace_id.clone()),
+                destination_workspace_id: Some(self.response.task.workspace_id.clone()),
+                source_gateway_id: Some("local".into()),
+                destination_gateway_id: Some("local".into()),
+                source_identity_id: Some("A00000000000000000001".into()),
+                destination_agent_identity_id: None,
+                destination_profile_id: None,
+                home_capsule_id: Some(self.facts.home_root_thread_id.clone()),
+                route_kind: "execution_bound".into(),
+                authority_actor_json: authority.clone(),
+                authority_fingerprint: policy_fingerprint.clone(),
+                allowed_actions_json: serde_json::to_string(&[
+                    pioneer_protocol::AgentRouteAction::DeliverResult,
+                ])
+                .unwrap(),
+                disclosure_json: serde_json::to_string(
+                    &pioneer_protocol::AgentRouteDisclosurePolicy {
+                        result_return: pioneer_protocol::AgentResultReturnPolicy::SummaryOnly,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+                route_generation: 1,
+                source_policy_generation: generation,
+                destination_policy_generation: generation,
+                hop_count: 0,
+                max_hops: 1,
+                return_route_id: None,
+                grant_fingerprint: policy_fingerprint.clone(),
+                status: "active".into(),
+                updated_at: now,
+                expires_at: Some(expires),
+                now,
+            })
+            .await
+            .unwrap();
+        let mut actor = actor;
+        actor.delivery.route_id = Some(id.clone());
+        actor.delivery.route_expires_at_millis = Some(expires.timestamp_millis());
+        actor.delivery.route_receipt_json = Some(json!({
+            "routeId":id,"routeGeneration":route.route_generation,"sourcePolicyGeneration":route.source_policy_generation,
+            "destinationPolicyGeneration":route.destination_policy_generation,"action":"deliver_result",
+        }).to_string());
+        actor.validate().unwrap();
+        let mut row =
+            pioneer_entity::task_actor_contract::Entity::find_by_id(&self.response.task.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active_model();
+        row.delivery_json = Set(serde_json::to_string(&actor.delivery).unwrap());
+        row.update(&db).await.unwrap();
+        (id, authority, policy_fingerprint, generation)
+    }
+
+    /// Install a fixed released V2 snapshot, not a checksum generated by the
+    /// verifier under test. All graph/permit/occurrence facts were admitted by
+    /// the normal fixture. Only the historical source/snapshots are substituted.
+    pub async fn install_historical_grants(&self, execution_ids: &[&str]) {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel};
+        let child = json!({
+            "version":2,
+            "identities":[{"id":"A00000000000000000001","source_kind":"native_agent",
+                "display_name":"Pioneer","nickname":"pioneer","source_revision":3,"source_fingerprint":"generation-a"}],
+            "allowInheritParentIdentity":false,"allowServerDerivedEphemeral":false,
+            "profiles":[{"id":"P00000000000000000003","compatibleAgentIdentityIds":["A00000000000000000001"],
+                "backend":"api_provider","providerId":"provider-opaque","modelId":"model-opaque",
+                "providerDisplayName":"Provider","modelDisplayName":"Model","allowedReasoning":[{"effort":"medium"}],
+                "allowedPermissionProfiles":["full_access"],"catalogGeneration":4,"policyGeneration":5,"fingerprint":"profile-fingerprint"}],
+            "allowInheritParentProfile":false,"skillIds":[],"mcpServerIds":[],
+            "maxPermissionProfile":{"mode":"supervised","effective_policy":{
+                "default_behavior":"ask","file_read":"allow","file_write":"ask","shell_command":"ask","network":"ask",
+                "mcp_read":"allow","mcp_write_or_unknown":"ask","dynamic_skill_tool":"ask","computer_use":"ask",
+                "task_subagent":"ask","memory_write":"ask","agent_action":"ask"}},
+            "maxReasoning":{"allowed":[{"effort":"medium"}]},
+            "fingerprint":"1620c8eca0ca3eace03dc7d614e3af348b2f77224cde1064bcf7f492c3177047"
+        });
+        // The checksum above is pinned by the historical writer in d907644f.
+        let identity: pioneer_protocol::AgentIdentityProjection =
+            serde_json::from_value(child["identities"][0].clone()).unwrap();
+        let profile: pioneer_protocol::AgentExecutionProfileProjection =
+            serde_json::from_value(child["profiles"][0].clone()).unwrap();
+        let db = self.processor.crud_store.database_connection();
+        let now = pioneer_crud::utc_now();
+        let source_id = pioneer_crud::canonical_agent_id('N', "historical-grant-source");
+        pioneer_crud::ensure_native_agent_config(
+            &db,
+            &pioneer_crud::NativeAgentConfigInput {
+                id: source_id.clone(),
+                workspace_id: self.response.task.workspace_id.clone(),
+                system_key: None,
+                display_name: "Historical source".into(),
+                nickname: "historical-source".into(),
+                enabled: true,
+                avatar_revision: None,
+                config_revision: 3,
+                now,
+            },
+        )
+        .await
+        .unwrap();
+        pioneer_crud::ensure_agent_identity(
+            &db,
+            &pioneer_crud::AgentIdentityInput {
+                id: identity.id.to_string(),
+                workspace_id: self.response.task.workspace_id.clone(),
+                source_kind: pioneer_crud::SOURCE_NATIVE_AGENT.into(),
+                source_id,
+                source_revision: 3,
+                source_fingerprint: "generation-a".into(),
+                now,
+            },
+        )
+        .await
+        .unwrap();
+        let snapshot_id = pioneer_crud::canonical_agent_id('S', "historical-grant-presentation");
+        pioneer_crud::insert_presentation_snapshot(
+            &db,
+            &pioneer_crud::PresentationSnapshotInput {
+                id: snapshot_id.clone(),
+                agent_identity_id: identity.id.to_string(),
+                source_revision: 3,
+                source_fingerprint: "generation-a".into(),
+                display_name: identity.display_name.clone(),
+                nickname: identity.nickname.clone(),
+                avatar_revision: None,
+                role_label: None,
+                now,
+            },
+        )
+        .await
+        .unwrap();
+        let launch = pioneer_protocol::AgentLaunchSelection {
+            agent: pioneer_protocol::AgentIdentitySelection::Exact {
+                agent_identity_id: identity.id.clone(),
+            },
+            execution: pioneer_protocol::AgentExecutionSelection {
+                profile: pioneer_protocol::AgentExecutionProfileSelection::Exact {
+                    profile_id: profile.id.clone(),
+                },
+                reasoning: None,
+                permission_profile: None,
+                skill_ids: vec![],
+                mcp_server_ids: vec![],
+                selected_capabilities: vec![],
+            },
+        };
+        let seed = |role: &str, home: &str| {
+            crate::authorization::derive_task_agent_authorization_grant_seed(
+                identity.id.clone(),
+                home,
+                role,
+                self.facts.agent_authorization_policy_generation,
+                pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![identity.clone()]).unwrap(),
+            )
+            .unwrap()
+        };
+        let authorization = seed(
+            &self.facts.agent_authorization_role_key,
+            &self.facts.home_root_thread_id,
+        );
+        let mut actor =
+            pioneer_entity::task_actor_contract::Entity::find_by_id(&self.response.task.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active_model();
+        actor.launch_selection_json = Set(Some(serde_json::to_string(&launch).unwrap()));
+        actor.requested_identity_json = Set(Some(serde_json::to_string(&launch.agent).unwrap()));
+        actor.resolved_identity_id = Set(Some(identity.id.to_string()));
+        actor.resolved_profile_id = Set(Some(profile.id.to_string()));
+        actor.source_config_fingerprint = Set(Some("generation-a".into()));
+        actor.derived_child_launch_grant_json = Set(Some(json!({
+            "kind":"resolved_task_launch","identity":identity,"profile":profile,
+            "role_key":authorization.role_key,"agent_policy_generation":authorization.policy_generation,
+            "allowed_actions":authorization.allowed_actions,"agent_authorization_fingerprint":authorization.fingerprint,
+            "child_launch_grant":child,
+        }).to_string()));
+        actor.update(&db).await.unwrap();
+        for execution_id in execution_ids {
+            let row = pioneer_crud::load_agent_execution(&db, execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let grant = pioneer_crud::load_agent_execution_grant(&db, execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut value: serde_json::Value = serde_json::from_str(&grant.grant_json).unwrap();
+            let authorization = seed(
+                value["role_key"].as_str().unwrap(),
+                &row.home_root_thread_id,
+            );
+            value["identity"] = serde_json::to_value(&identity).unwrap();
+            value["profile"] = serde_json::to_value(&profile).unwrap();
+            value["child_launch_grant"] = child.clone();
+            value["agent_policy_generation"] = json!(authorization.policy_generation);
+            value["allowed_actions"] = json!(authorization.allowed_actions);
+            value["agent_authorization_fingerprint"] = json!(authorization.fingerprint);
+            let grant_json = value.to_string();
+            let fingerprint = pioneer_crud::agent_execution_grant_fingerprint(&grant_json).unwrap();
+            let mut grant = grant.into_active_model();
+            grant.child_identity_id = Set(identity.id.to_string());
+            grant.grant_json = Set(grant_json);
+            grant.grant_fingerprint = Set(fingerprint);
+            grant.update(&db).await.unwrap();
+            let mut row = row.into_active_model();
+            row.agent_identity_id = Set(identity.id.to_string());
+            row.identity_source_revision = Set(3);
+            row.identity_source_fingerprint = Set("generation-a".into());
+            row.resolved_profile_id = Set(Some(profile.id.to_string()));
+            row.resolved_profile_fingerprint = Set(Some(profile.fingerprint.clone()));
+            row.presentation_snapshot_id = Set(Some(snapshot_id.clone()));
+            row.requested_identity_selection_json =
+                Set(serde_json::to_string(&launch.agent).unwrap());
+            row.requested_profile_selection_json =
+                Set(serde_json::to_string(&launch.execution).unwrap());
+            row.update(&db).await.unwrap();
+            // Prove the fixture has reached supported, active current source
+            // fences rather than relying on an unrelated delivery error.
+            crate::message::agent_action_tools::current_agent_identity_source_fence(
+                &self.processor,
+                execution_id,
+            )
+            .await
+            .unwrap();
+            pioneer_crud::load_agent_execution_grant(&db, execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        self.processor
+            .crud_store
+            .get_task_actor_contract(&self.response.task.id)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}

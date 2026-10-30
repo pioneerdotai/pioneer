@@ -343,8 +343,11 @@ impl StreamError {
 // ── List models response types ─────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-struct ModelsListResponse {
-    data: Vec<CompatModelEntry>,
+#[serde(untagged)]
+enum ModelsListResponse {
+    Wrapped { data: Vec<CompatModelEntry> },
+    // Together's existing /models operation returns a top-level array.
+    Flat(Vec<CompatModelEntry>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -354,6 +357,10 @@ struct CompatModelEntry {
     created: Option<i64>,
     #[serde(default)]
     owned_by: Option<String>,
+    #[serde(default)]
+    capabilities: serde_json::Value,
+    #[serde(default, rename = "type")]
+    model_type: serde_json::Value,
 }
 
 /// Strip `<think>...</think>` tags from content returned by some thinking models.
@@ -473,13 +480,75 @@ impl ChatCompletionsApiCompatibleProvider {
 
     /// Resolve the models endpoint URL.
     fn models_url(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
+        Self::models_url_for_base(&self.base_url)
+    }
+
+    fn models_url_for_base(base: &str) -> String {
+        let base = base.trim_end_matches('/');
         // Strip /chat/completions if the base_url points directly there
         let base = base.strip_suffix("/chat/completions").unwrap_or(base);
         let base = base.trim_end_matches('/');
         format!("{base}/models")
     }
 
+    fn normalize_models(&self, api_response: ModelsListResponse) -> Vec<ProviderModelInfo> {
+        let provider_name = self.name.clone();
+        // These stock endpoints document a chat/text-only default list. A
+        // custom URL using the same adapter name cannot inherit that fact.
+        let chat_only_list = matches!(provider_name.as_str(), "huggingface" | "venice")
+            && crate::provider_definition(&provider_name)
+                .and_then(|definition| definition.default_base_url)
+                .is_some_and(|stock| Self::models_url_for_base(stock) == self.models_url());
+        let entries = match api_response {
+            ModelsListResponse::Wrapped { data } => data,
+            ModelsListResponse::Flat(data) => data,
+        };
+
+        entries
+            .into_iter()
+            .map(|m| ProviderModelInfo {
+                id: m.id.clone(),
+                name: None,
+                description: None,
+                created: m.created,
+                provider: provider_name.clone(),
+                owned_by: m.owned_by,
+                limits: ProviderModelLimits::default(),
+                capabilities: ProviderModelCapabilities {
+                    // These are documented operation facts, not shared defaults
+                    // for all APIs that happen to use the OpenAI list envelope.
+                    chat: match provider_name.as_str() {
+                        "mistral" => m.capabilities["completion_chat"].as_bool(),
+                        "together" => match m.model_type.as_str() {
+                            Some("chat") => Some(true),
+                            Some(
+                                "language" | "code" | "image" | "embedding" | "moderation"
+                                | "rerank" | "audio" | "transcribe" | "video",
+                            ) => Some(false),
+                            _ => None,
+                        },
+                        "venice" => match m.model_type.as_str() {
+                            Some("text") => Some(true),
+                            Some(
+                                "asr" | "decision" | "embedding" | "image" | "music" | "tts"
+                                | "upscale" | "inpaint" | "video",
+                            ) => Some(false),
+                            None if m.model_type.is_null() => chat_only_list.then_some(true),
+                            _ => None,
+                        },
+                        "huggingface" => chat_only_list.then_some(true),
+                        _ => None,
+                    },
+                    ..Default::default()
+                },
+                transcription: None,
+                pricing: None,
+                active: Some(true),
+                family: None,
+                lifecycle_status: None,
+            })
+            .collect()
+    }
     /// Build a GET request builder with the correct auth and extra headers applied.
     fn authorized_get(&self, url: &str) -> reqwest::RequestBuilder {
         let mut builder = self.client.get(url);
@@ -1109,18 +1178,7 @@ impl ChatCompletionsApiCompatibleProvider {
     }
 
     async fn api_error(&self, response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("{} API error ({status}): {body}", self.name)
+        crate::http::provider_api_error(response, &self.name).await
     }
 }
 
@@ -1512,27 +1570,7 @@ impl crate::traits::Provider for ChatCompletionsApiCompatibleProvider {
             "provider_response",
         )
         .await?;
-        let provider_name = self.name.clone();
-
-        Ok(api_response
-            .data
-            .into_iter()
-            .map(|m| ProviderModelInfo {
-                id: m.id.clone(),
-                name: None,
-                description: None,
-                created: m.created,
-                provider: provider_name.clone(),
-                owned_by: m.owned_by,
-                limits: ProviderModelLimits::default(),
-                capabilities: ProviderModelCapabilities::default(),
-                transcription: None,
-                pricing: None,
-                active: Some(true),
-                family: None,
-                lifecycle_status: None,
-            })
-            .collect())
+        Ok(self.normalize_models(api_response))
     }
 
     async fn warmup(&self) -> Result<crate::ProviderWarmupOutcome> {
@@ -1543,6 +1581,51 @@ impl crate::traits::Provider for ChatCompletionsApiCompatibleProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stock_chat_discovery_accepts_equivalent_completion_urls_only() {
+        use super::*;
+        use crate::traits::Provider;
+        for name in ["huggingface", "venice"] {
+            let base = crate::provider_definition(name)
+                .unwrap()
+                .default_base_url
+                .unwrap();
+            for (url, expected) in [
+                (base.to_owned(), true),
+                (format!("{base}/chat/completions"), true),
+                (format!("{base}/chat/completions/"), true),
+                (format!("{base}/foreign"), false),
+                ("https://foreign.example/v1".into(), false),
+            ] {
+                let provider =
+                    ChatCompletionsApiCompatibleProvider::new(name, url, "", AuthStyle::Bearer);
+                let response =
+                    serde_json::from_str(r#"{"data":[{"id":"private-model"}]}"#).unwrap();
+                let rows = provider.normalize_models(response);
+                assert_eq!(rows[0].capabilities.chat, expected.then_some(true));
+                let selected = crate::selection::filter_models(
+                    name,
+                    "chat_completions",
+                    &provider.capabilities(),
+                    crate::selection::ModelPurpose::Chat,
+                    rows,
+                    None,
+                );
+                assert_eq!(
+                    selected
+                        .iter()
+                        .map(|row| row.id.as_str())
+                        .collect::<Vec<_>>(),
+                    if expected {
+                        vec!["private-model"]
+                    } else {
+                        vec![]
+                    }
+                );
+            }
+        }
+    }
+
     #[test]
     fn vendor_formats_cannot_bypass_explicit_negative_effort_capability() {
         for format in [
@@ -1594,6 +1677,16 @@ mod tests {
             let model = catalog.model("nvidia", id).unwrap();
             assert_eq!(model.metadata["compat"]["supportsReasoningEffort"], false);
             let discovered = crate::generation::test_discovery(&catalog, "nvidia", id);
+            assert_eq!(
+                discovered
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .effort_options
+                    .contains(&"none".into()),
+                fresh
+            );
             for effort in ["high", "max"] {
                 assert!(
                     !discovered
@@ -1628,17 +1721,27 @@ mod tests {
                         prepared,
                         Some(&catalog),
                     );
-                    assert_eq!(result.is_ok(), reasoning.is_none());
-                    if reasoning.is_none() {
+                    // Fresh source metadata explicitly lists none. The saved
+                    // snapshot has no verified off control; high/max stay denied
+                    // by supportsReasoningEffort=false in both snapshots.
+                    let off = crate::generation::selected_off(reasoning);
+                    let supported = reasoning.is_none() || fresh && off;
+                    assert_eq!(result.is_ok(), supported);
+                    if supported {
                         let body = serde_json::to_value(result.unwrap()).unwrap();
                         assert!(body.get("reasoning_effort").is_none());
-                        assert!(body.get("thinking").is_none());
+                        if off {
+                            assert_eq!(body["thinking"]["type"], "disabled");
+                        } else {
+                            assert!(body.get("thinking").is_none());
+                        }
                         assert_eq!(body["max_tokens"], 1024);
+                        assert_eq!(body["stream"], stream);
                     } else {
                         let error = result.unwrap_err().to_string();
                         assert!(
                             error.contains(if crate::generation::selected_off(reasoning) {
-                                "no verified thinking off control"
+                                "no confirmed mapping for selected reasoning"
                             } else {
                                 "explicitly does not support"
                             })
@@ -1651,56 +1754,70 @@ mod tests {
 
     #[test]
     fn native_deepseek_source_profiles_preserve_caps_and_selected_controls() {
-        let catalog = crate::generation::test_catalog(true);
         let provider = ChatCompletionsApiCompatibleProvider::new(
             "deepseek",
             "https://example.test/v1",
             "",
             AuthStyle::Bearer,
         );
-        for id in ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-flash"] {
-            let model = catalog.model("deepseek", id).unwrap();
-            assert_ne!(model.metadata["compat"]["supportsReasoningEffort"], false);
-            let discovered = crate::generation::test_discovery(&catalog, "deepseek", id);
-            assert!(
-                discovered
-                    .capabilities
-                    .reasoning
-                    .as_ref()
-                    .unwrap()
-                    .effort_options
-                    .contains(&"high".into())
-            );
-            for reasoning in [
-                None,
-                Some(ReasoningConfig::Disabled),
-                Some(ReasoningConfig::Effort(ReasoningEffort::None)),
-                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
-            ] {
-                let mut request = crate::generation::test_request(id);
-                request.reasoning = reasoning;
-                for stream in [false, true] {
-                    let body = serde_json::to_value(
-                        provider
-                            .build_chat_request_with_catalog(
-                                request.clone(),
-                                stream,
-                                prepared_for(&provider, &request.messages),
-                                Some(&catalog),
-                            )
-                            .unwrap(),
-                    )
-                    .unwrap();
-                    assert_eq!(body["max_tokens"], 1024);
-                    assert_eq!(body["stream"], stream);
-                    if reasoning.is_none() {
-                        assert!(body.get("thinking").is_none());
-                    } else if crate::generation::selected_off(reasoning) {
-                        assert_eq!(body["thinking"]["type"], "disabled");
-                        assert!(body.get("reasoning_effort").is_none());
-                    } else {
-                        assert_eq!(body["thinking"]["type"], "enabled");
-                        assert_eq!(body["reasoning_effort"], "high");
+        for fresh in [false, true] {
+            let catalog = crate::generation::test_catalog(fresh);
+            let ids: &[&str] = if fresh {
+                &["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-flash"]
+            } else {
+                &["deepseek-v4-flash", "deepseek-v4-pro"]
+            };
+            for &id in ids {
+                let model = catalog.model("deepseek", id).unwrap();
+                assert_ne!(model.metadata["compat"]["supportsReasoningEffort"], false);
+                let discovered = crate::generation::test_discovery(&catalog, "deepseek", id);
+                assert!(
+                    discovered
+                        .capabilities
+                        .reasoning
+                        .as_ref()
+                        .unwrap()
+                        .effort_options
+                        .contains(&"high".into())
+                );
+                for reasoning in [
+                    None,
+                    Some(ReasoningConfig::Disabled),
+                    Some(ReasoningConfig::Effort(ReasoningEffort::None)),
+                    Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                ] {
+                    let mut request = crate::generation::test_request(id);
+                    request.reasoning = reasoning;
+                    for stream in [false, true] {
+                        let result = provider.build_chat_request_with_catalog(
+                            request.clone(),
+                            stream,
+                            prepared_for(&provider, &request.messages),
+                            Some(&catalog),
+                        );
+                        // The saved snapshot has neither an off mapping nor the
+                        // fresh source's toggle metadata. A model name proves neither.
+                        if !fresh && crate::generation::selected_off(reasoning) {
+                            assert!(
+                                result
+                                    .unwrap_err()
+                                    .to_string()
+                                    .contains("no confirmed mapping for selected reasoning")
+                            );
+                            continue;
+                        }
+                        let body = serde_json::to_value(result.unwrap()).unwrap();
+                        assert_eq!(body["max_tokens"], 1024);
+                        assert_eq!(body["stream"], stream);
+                        if reasoning.is_none() {
+                            assert!(body.get("thinking").is_none());
+                        } else if crate::generation::selected_off(reasoning) {
+                            assert_eq!(body["thinking"]["type"], "disabled");
+                            assert!(body.get("reasoning_effort").is_none());
+                        } else {
+                            assert_eq!(body["thinking"]["type"], "enabled");
+                            assert_eq!(body["reasoning_effort"], "high");
+                        }
                     }
                 }
             }
@@ -1806,9 +1923,7 @@ mod tests {
                         Some(&catalog),
                     );
                     let off = crate::generation::selected_off(reasoning);
-                    let supported = reasoning.is_none()
-                        || (id == "toggle" && off)
-                        || (id == "instruct" && (off || reasoning.is_none()));
+                    let supported = reasoning.is_none() || (id == "toggle" && off);
                     if supported {
                         let body = serde_json::to_value(result.unwrap()).unwrap();
                         if id != "instruct" && reasoning.is_none() {
@@ -2067,7 +2182,7 @@ mod tests {
                 serde_json::json!({"thinking":{"type":"enabled"},"reasoning_effort":"high"}),
             ),
             (
-                "glm",
+                "zai-coding",
                 "glm-5.2",
                 serde_json::json!({"thinking":{"type":"enabled"},"reasoning_effort":"high"}),
             ),
@@ -3091,7 +3206,7 @@ mod tests {
         };
 
         let error = provider.build_chat_request(request, false).unwrap_err();
-        assert!(error.to_string().contains("no documented mapping"));
+        assert!(error.to_string().contains("no confirmed mapping"));
     }
 
     #[test]

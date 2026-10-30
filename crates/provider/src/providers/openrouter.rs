@@ -467,7 +467,7 @@ impl OpenRouterFailure {
         stage: ProviderFailureStage,
         retry_after_ms: Option<u64>,
     ) -> Self {
-        let status = error
+        let native_status = error
             .code
             .as_ref()
             .and_then(|code| {
@@ -477,7 +477,18 @@ impl OpenRouterFailure {
             .and_then(|code| u16::try_from(code).ok())
             .filter(|code| (100..=599).contains(code));
         let description = error.description();
-        Self::from_envelope(Some(error), id, status, retry_after_ms, &description, stage)
+        let mut failure = Self::from_envelope(
+            Some(error),
+            id,
+            native_status,
+            retry_after_ms,
+            &description,
+            stage,
+        );
+        // A native event code retains its established classification meaning,
+        // but is not an HTTP failure status: generation runs after HTTP success.
+        failure.classification.http_status = None;
+        failure
     }
 
     // Classify the original transport failure before discarding its text and
@@ -1400,6 +1411,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         error
             .downcast_ref::<OpenRouterFailure>()
             .map(|failure| failure.classification.clone())
+            .or_else(|| crate::failure::classify_http_error(error))
     }
 
     fn name(&self) -> &str {
@@ -1515,8 +1527,8 @@ impl crate::traits::Provider for OpenRouterProvider {
                 .with_reported_model(body.get("model").and_then(serde_json::Value::as_str));
             observed.update(&usage);
             // Chat Completions can report generation failure inside HTTP 200,
-            // either at the top level or in a choice. The envelope code, not 200,
-            // is the failure status in this case.
+            // either at the top level or in a choice. Its native code is a
+            // classification hint, never an HTTP failure status.
             if let Some(error) = body
                 .get("error")
                 .filter(|error| !error.is_null())
@@ -1674,7 +1686,25 @@ impl crate::traits::Provider for OpenRouterProvider {
             .list_model_entries(self.models_request())
             .await?
             .into_iter()
-            .map(provider_model_from_openrouter_model_entry)
+            .map(|entry| {
+                let mut model = provider_model_from_openrouter_model_entry(entry);
+                // The default OpenRouter list is filtered to text output and
+                // served by /chat/completions. Explicit native modalities can
+                // narrow that operation-scoped evidence, including private URLs.
+                model.capabilities.chat = Some(
+                    model
+                        .capabilities
+                        .input_modalities
+                        .as_ref()
+                        .is_none_or(|input| input.iter().any(|kind| kind == "text"))
+                        && model
+                            .capabilities
+                            .output_modalities
+                            .as_ref()
+                            .is_none_or(|output| output.iter().any(|kind| kind == "text")),
+                );
+                model
+            })
             .collect())
     }
 
@@ -1731,7 +1761,7 @@ impl crate::traits::Provider for OpenRouterProvider {
     }
 }
 
-const OPENROUTER_GATEWAY_REASONING_EFFORTS: &[&str] =
+const OPENROUTER_REASONING_EFFORT_VALUES: &[&str] =
     &["max", "xhigh", "high", "medium", "low", "minimal", "none"];
 
 fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> ProviderModelInfo {
@@ -1814,7 +1844,15 @@ fn openrouter_embedding_model_from_openrouter_model_entry(
     m: OpenRouterModelEntry,
 ) -> ProviderModelInfo {
     let mut model = provider_model_from_openrouter_model_entry(m);
-    model.capabilities.embeddings = Some(true);
+    // The server filter proves the operation when modalities are absent, but
+    // cannot erase an explicit narrower native output list.
+    model.capabilities.embeddings = Some(model.capabilities.output_modalities.as_ref().is_none_or(
+        |output| {
+            output
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "embedding" | "embeddings"))
+        },
+    ));
     model.family = Some("embedding".to_owned());
     model
 }
@@ -1827,22 +1865,9 @@ fn openrouter_reasoning_capabilities(
     let efforts = fields.get("supported_efforts");
     let values = efforts.and_then(serde_json::Value::as_array);
     let complete = values.is_some_and(|v| v.iter().all(serde_json::Value::is_string));
-    // Documented null = generic gateway vocabulary; omitted within a reasoning
-    // object = no effort selection. Neither is a confirmed per-model enum.
-    // https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
-    native.insert(
-        "effort.enum".into(),
-        if efforts.is_none() {
-            Some(false)
-        } else if complete {
-            Some(true)
-        } else {
-            None
-        },
-    );
-    if efforts.is_some_and(serde_json::Value::is_null) {
-        native.insert("effort.gateway".into(), Some(true));
-    }
+    // Missing, null and malformed selectors remain unknown; only an actual
+    // string array (including []) establishes a closed enum.
+    native.insert("effort.enum".into(), complete.then_some(true));
     let mut options = Vec::new();
     if complete {
         for value in values.unwrap() {
@@ -1853,14 +1878,9 @@ fn openrouter_reasoning_capabilities(
                 options.push(value.to_owned());
             }
         }
-    } else if native.get("effort.gateway") == Some(&Some(true)) {
-        options = OPENROUTER_GATEWAY_REASONING_EFFORTS
-            .iter()
-            .map(|v| (*v).into())
-            .collect();
     }
-    if complete || native.get("effort.gateway") == Some(&Some(true)) {
-        for value in OPENROUTER_GATEWAY_REASONING_EFFORTS {
+    if complete {
+        for value in OPENROUTER_REASONING_EFFORT_VALUES {
             native
                 .entry(format!("effort.{value}"))
                 .or_insert(Some(options.iter().any(|v| v == value)));
@@ -1914,9 +1934,8 @@ fn openrouter_reasoning_capabilities(
 pub(crate) fn preserve_native_reasoning(reasoning: &mut ProviderModelReasoningCapabilities) {
     let native = &reasoning.native;
     let complete = native.get("effort.enum") == Some(&Some(true));
-    let gateway = native.get("effort.gateway") == Some(&Some(true));
-    if complete || gateway {
-        reasoning.effort_options = OPENROUTER_GATEWAY_REASONING_EFFORTS
+    if complete {
+        reasoning.effort_options = OPENROUTER_REASONING_EFFORT_VALUES
             .iter()
             .filter(|e| native.get(&format!("effort.{e}")) == Some(&Some(true)))
             .map(|e| (*e).to_owned())
@@ -1930,8 +1949,8 @@ pub(crate) fn preserve_native_reasoning(reasoning: &mut ProviderModelReasoningCa
     // default_enabled/mandatory alone do not establish either capability.
     if native.get("supports_token_budget") == Some(&Some(true))
         || native.iter().any(|(k, v)| {
-            k.starts_with("effort.")
-                && !matches!(k.as_str(), "effort.enum" | "effort.gateway")
+            k.strip_prefix("effort.")
+                .is_some_and(|effort| ReasoningEffort::from_str(effort).is_some())
                 && *v == Some(true)
         })
     {
@@ -2241,26 +2260,97 @@ mod tests {
         );
     }
 
-    #[test]
-    fn model_reasoning_metadata_null_efforts_uses_gateway_values() {
-        let model = model_from_json(
-            r#"{
-                "data": [{
-                    "id": "anthropic/claude",
-                    "reasoning": {
-                        "supported_efforts": null,
-                        "supports_max_tokens": true
+    #[tokio::test]
+    async fn unknown_router_selector_uses_catalog_but_closed_lists_are_not_widened() {
+        let id = "quartz-router-901";
+        let catalog = crate::generation::test_catalog_model(
+            "openrouter",
+            id,
+            "openai/gpt-5.4",
+            serde_json::json!({"reasoning":true,"thinkingLevelMap":{"low":"low","high":"high"}}),
+        );
+        for (selector, expected, native_expected) in [
+            (None, vec!["low", "high"], vec![]),
+            (Some(serde_json::Value::Null), vec!["low", "high"], vec![]),
+            (Some(serde_json::json!({})), vec!["low", "high"], vec![]),
+            (
+                Some(serde_json::json!(["high", 42])),
+                vec!["low", "high"],
+                vec![],
+            ),
+            (Some(serde_json::json!([])), vec![], vec![]),
+            (Some(serde_json::json!(["low"])), vec!["low"], vec!["low"]),
+        ] {
+            let mut metadata = serde_json::json!({"supported":true,"supports_max_tokens":true});
+            if let Some(selector) = selector {
+                metadata["supported_efforts"] = selector;
+            }
+            let parsed = model_from_json(
+                &serde_json::json!({"data":[{"id":id,"reasoning":metadata}]}).to_string(),
+            );
+            let native = parsed
+                .capabilities
+                .reasoning
+                .as_ref()
+                .unwrap()
+                .native
+                .clone();
+            for snapshot in [None, Some(&catalog)] {
+                let mut models = vec![parsed.clone()];
+                if let Some(catalog) = snapshot {
+                    catalog.enrich("openrouter", &mut models);
+                }
+                let reasoning = models[0].capabilities.reasoning.as_ref().unwrap();
+                let expected_options = if snapshot.is_some() {
+                    expected.clone()
+                } else {
+                    native_expected.clone()
+                };
+                assert_eq!(reasoning.effort_options, expected_options);
+                assert_eq!(reasoning.default_effort, None);
+                for effort in [
+                    None,
+                    Some(ReasoningEffort::Low),
+                    Some(ReasoningEffort::High),
+                ] {
+                    let mut request = crate::generation::test_request(id);
+                    request.reasoning = effort.map(ReasoningConfig::Effort);
+                    for stream in [false, true] {
+                        let result = crate::generation::with_native_reasoning(
+                            "openrouter",
+                            true,
+                            [(id.into(), native.clone())].into_iter().collect(),
+                            async {
+                                OpenRouterProvider::build_chat_request_with_catalog(
+                                    &request,
+                                    vec![],
+                                    stream,
+                                    snapshot,
+                                )
+                            },
+                        )
+                        .await;
+                        let directly_confirmed = effort.is_some_and(|effort| {
+                            native.get(&format!("effort.{}", effort.as_str())) == Some(&Some(true))
+                        });
+                        let catalog_confirmed = snapshot.is_some()
+                            && effort.is_some_and(|effort| expected.contains(&effort.as_str()));
+                        assert_eq!(
+                            result.is_ok(),
+                            effort.is_none() || directly_confirmed || catalog_confirmed
+                        );
+                        if let Ok(body) = result {
+                            let body = serde_json::to_value(body).unwrap();
+                            if let Some(effort) = effort {
+                                assert_eq!(body["reasoning"]["effort"], effort.as_str());
+                            } else {
+                                assert!(body.get("reasoning").is_none());
+                            }
+                        }
                     }
-                }]
-            }"#,
-        );
-
-        let reasoning = model.capabilities.reasoning.expect("reasoning metadata");
-        assert_eq!(
-            reasoning.effort_options,
-            vec!["max", "xhigh", "high", "medium", "low", "minimal", "none"]
-        );
-        assert_eq!(reasoning.supports_token_budget, Some(true));
+                }
+            }
+        }
     }
 
     #[test]

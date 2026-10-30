@@ -1,3 +1,6 @@
+#[path = "tests/detached_work_projection.rs"]
+mod detached_work_projection;
+
 #[path = "tests/workspace_scope.rs"]
 mod workspace_scope;
 
@@ -63,7 +66,7 @@ mod memory_post_turn_response;
 mod task_capsule;
 
 #[path = "tests/task_launch_continuity.rs"]
-mod task_launch_continuity;
+pub(super) mod task_launch_continuity;
 #[path = "tests/task_webhooks.rs"]
 mod task_webhooks;
 
@@ -3968,6 +3971,7 @@ impl pioneer_sqlite::SqliteWriteObserver for NativeSchedulingObserver {
 struct PreflightCaptureProvider {
     text: String,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
+    native_media: Option<CaptureSummaryProvider>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3985,6 +3989,7 @@ struct PromptParityCaptureProvider {
 
 struct HangingChildProvider {
     child_main_calls: AtomicUsize,
+    hang_any_compiled_request: bool,
 }
 
 struct ConcurrentComposerHistoryProvider {
@@ -4371,7 +4376,17 @@ impl PreflightCaptureProvider {
         Self {
             text: text.into(),
             requests: std::sync::Mutex::new(Vec::new()),
+            native_media: None,
         }
+    }
+
+    fn with_native_attachments(mut self) -> Self {
+        self.native_media = Some(
+            CaptureSummaryProvider::new("")
+                .with_native_attachments()
+                .named("openai"),
+        );
+        self
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
@@ -4408,7 +4423,15 @@ impl HangingChildProvider {
     fn new() -> Self {
         Self {
             child_main_calls: AtomicUsize::new(0),
+            hang_any_compiled_request: false,
         }
+    }
+
+    fn including_composer(mut self) -> Self {
+        // Composer carries the original input instead of the rendered Task
+        // prompt, so identify its main call by the compiled prompt boundary.
+        self.hang_any_compiled_request = true;
+        self
     }
 
     fn child_main_call_count(&self) -> usize {
@@ -4584,10 +4607,18 @@ impl Provider for CaptureSummaryProvider {
 #[async_trait::async_trait]
 impl Provider for PreflightCaptureProvider {
     fn name(&self) -> &str {
-        "preflight-capture"
+        self.native_media
+            .as_ref()
+            .map_or("preflight-capture", |provider| provider.name())
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
+        if let Some(provider) = &self.native_media {
+            return ProviderCapabilities {
+                tool_calling: true,
+                ..provider.capabilities()
+            };
+        }
         ProviderCapabilities {
             streaming: false,
             vision: false,
@@ -4595,6 +4626,13 @@ impl Provider for PreflightCaptureProvider {
             embeddings: false,
             transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
+        match &self.native_media {
+            Some(provider) => provider.list_models().await,
+            None => anyhow::bail!("preflight capture does not expose model discovery"),
         }
     }
 
@@ -4688,6 +4726,7 @@ impl Provider for PromptParityCaptureProvider {
             owned_by: Some("openai".to_owned()),
             limits: pioneer_protocol::ProviderModelLimits::default(),
             capabilities: pioneer_protocol::ProviderModelCapabilities {
+                chat: Some(true),
                 tool_calling: Some(true),
                 thinking: Some(true),
                 reasoning: Some(pioneer_protocol::ProviderModelReasoningCapabilities {
@@ -4702,7 +4741,7 @@ impl Provider for PromptParityCaptureProvider {
                     default_effort: Some("medium".to_owned()),
                     mandatory: Some(false),
                     supports_token_budget: None,
-                    source: Some(pioneer_protocol::ReasoningCapabilitySource::StaticRegistry),
+                    source: Some(pioneer_protocol::ReasoningCapabilitySource::ProviderMetadata),
                 }),
                 ..pioneer_protocol::ProviderModelCapabilities::default()
             },
@@ -4734,7 +4773,8 @@ impl Provider for HangingChildProvider {
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         let preflight = is_turn_preflight_request(&request);
-        let child_main = is_child_task_main_request(&request);
+        let child_main = is_child_task_main_request(&request)
+            || (self.hang_any_compiled_request && request.compiled_prompt.is_some());
         if preflight {
             return Ok(test_turn_preflight_response());
         }
@@ -15080,12 +15120,20 @@ async fn detached_composer_live_ordering_impl() {
     sessions
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
+    let provider = Arc::new(
+        PreflightCaptureProvider::new(
+            r#"<task_result>{"summary":"detached result","data":{}}</task_result>"#,
+        )
+        .with_native_attachments(),
+    );
+    let providers = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    discover_native_capture_models(&providers, &workspace).await;
     let processor = Arc::new(MessageProcessor::new(
         threads.clone(),
-        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-            "openai",
-            Arc::new(CaptureSummaryProvider::new("detached result")),
-        )),
+        providers,
         sessions,
         workspaces,
         store.clone(),
@@ -15131,6 +15179,90 @@ async fn detached_composer_live_ordering_impl() {
         .await
         .unwrap();
 
+    // Both requests fit the Turn envelope. The latter is small in raw UTF-8
+    // but exceeds the Task budget after JSON escaping. Neither may be accepted.
+    for oversized_text in ["x".repeat(524_288), "Ж\\\"\u{0001}".repeat(60_000)] {
+        let rejected_id = generate_test_request_id("composer", "oversized");
+        processor
+            .process_request_for_connection(
+                connection,
+                &json!({
+                    "jsonrpc":"2.0", "id":rejected_id, "method":"turn/start", "params":{
+                        "thread_id":parent, "turn_id":turn_id,
+                        "input":[{"type":"text", "text":oversized_text}],
+                        "model":"test-model", "model_provider":"openai", "mode":"Agent"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let mut messages = Vec::new();
+        while let Ok(Message::Text(text)) = rx.try_recv() {
+            messages.push(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+        }
+        let error: JsonRpcErrorResponse = serde_json::from_value(
+            messages
+                .iter()
+                .find(|value| value["id"] == rejected_id)
+                .expect("oversized admission must return a response")
+                .clone(),
+        )
+        .expect("oversized admission must return an error");
+        assert_public_error(
+            &error,
+            PublicErrorCode::InvalidInput,
+            PublicErrorStage::Admission,
+        );
+        assert!(
+            messages.iter().all(|value| {
+                value["params"]["turn_id"] != turn_id
+                    || (value["method"] != events::ITEM_STARTED
+                        && value["method"] != events::ITEM_COMPLETED)
+            }),
+            "oversized input must not publish a user message"
+        );
+        assert!(store.get_turn(parent, turn_id).await.unwrap().is_none());
+        assert!(
+            store
+                .get_turn_item_events(parent, turn_id)
+                .await
+                .unwrap()
+                .expect("parent thread must exist")
+                .events
+                .is_empty()
+        );
+        assert!(
+            processor
+                .task_runtime
+                .service()
+                .list_tasks(TaskListParams {
+                    workspace_id: workspace.clone(),
+                    owner_kind: Some(TaskOwnerKind::Thread),
+                    owner_id: Some(parent.into()),
+                    limit: Some(10),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
+        assert!(provider.snapshot_requests().is_empty());
+    }
+    // Reuse the rejected Turn id below: early failure must also roll back the
+    // in-memory admission, allowing a corrected request to be accepted.
+    // Native OpenAI file inputs use the documented PDF contract.
+    let artifact = ingest_typed_test_artifact_for_thread(
+        &processor,
+        &workspace,
+        Some(parent),
+        "large-composer-context.pdf",
+        crate::media_test_fixtures::pdf(),
+        pioneer_protocol::ArtifactKind::File,
+        "application/pdf",
+    )
+    .await;
+
     // An already-owned optional outbox worker cannot deliver during admission.
     // The controlled barrier pauses after live publication, before Task creation.
     for owner in [
@@ -15140,16 +15272,30 @@ async fn detached_composer_live_ordering_impl() {
         owner.running.store(true, Ordering::SeqCst);
     }
     processor.arm_completed_history_preparation_barrier("__detached_composer_before_task_create__");
-    // Keep the full message longer than the Task title without depending on
-    // whitespace that the existing UserMessage materialization normalizes.
-    let full_text = ["Full Composer message"; 12].join(" ");
+    // About 270 KB of UTF-8, with escaping: one launch fits, three full-text
+    // copies exceed the unchanged 512 KiB Task create budget.
+    let full_text = format!(
+        "Full Composer message {}END",
+        "Composer payload Ж\\\" segment ".repeat(9_000)
+    );
+    let exact_input = vec![
+        UserInput::Text {
+            text: full_text.clone(),
+            text_elements: Vec::new(),
+        },
+        UserInput::Artifact {
+            artifact_id: artifact.artifact_id.clone(),
+            version_id: artifact.version_id.clone(),
+        },
+    ];
     let request_id = generate_test_request_id("composer", "live-order");
     let request = json!({"jsonrpc":"2.0", "id":request_id, "method":"turn/start", "params":{
-        "thread_id":parent, "turn_id":turn_id, "input":[{"type":"text", "text":full_text}],
+        "thread_id":parent, "turn_id":turn_id, "input":exact_input,
         "model":"test-model", "model_provider":"openai", "mode":"Agent"
     }})
     .to_string();
     let request_processor = processor.clone();
+    let retry_request = request.clone();
     let request_task = tokio::spawn(async move {
         request_processor
             .process_request_for_connection(connection, &request)
@@ -15284,6 +15430,365 @@ async fn detached_composer_live_ordering_impl() {
         })
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(user_ids.len(), 1);
+    let tasks = processor
+        .task_runtime
+        .service()
+        .list_tasks(TaskListParams {
+            workspace_id: workspace.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent.into()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .tasks;
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0];
+    assert_eq!(task.goal, task.title);
+    assert!(task.goal.chars().count() <= 96);
+    let saved = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(saved.agent_specs.first().unwrap().prompt.goal, task.title);
+    let launch = &task
+        .metadata
+        .as_ref()
+        .unwrap()
+        .composer_work
+        .as_ref()
+        .unwrap()
+        .launch;
+    assert_eq!(launch.input, exact_input);
+    assert_eq!(launch.thread_id, parent);
+    assert_eq!(launch.turn_id, turn_id);
+    let status = wait_for_task_status(store.clone(), &task.id, TaskStatus::Completed).await;
+    let terminal = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(
+        status,
+        TaskStatus::Completed,
+        "large Composer execution failed: {:?}",
+        terminal
+            .runs
+            .iter()
+            .map(|run| &run.error)
+            .collect::<Vec<_>>()
+    );
+    let lineage = wait_for_child_lineage_for_run(store.clone(), &saved.runs[0].id).await;
+    assert_eq!(
+        store.get_turn_inputs(&lineage.child_turn_id).await.unwrap(),
+        exact_input
+    );
+    let requests = provider.snapshot_requests();
+    let main = requests
+        .iter()
+        .find(|request| !is_turn_preflight_request(request))
+        .expect("large Composer input must reach the recording provider");
+    let user = main.messages.last().unwrap();
+    assert_eq!(user.content, full_text);
+    assert!(matches!(user.content_parts.as_slice(),
+        [pioneer_provider::MessageContentPart::File { file }]
+            if file.name.as_deref() == Some("large-composer-context.pdf")));
+
+    // Simulate a lost admission response by retrying the exact logical Turn.
+    // The existing admission guard may replay or refuse; it must never create
+    // another Task/child or replace the saved original input.
+    processor
+        .process_request_for_connection(connection, &retry_request)
+        .await;
+    let tasks_after = processor
+        .task_runtime
+        .service()
+        .list_tasks(TaskListParams {
+            workspace_id: workspace.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent.into()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .tasks;
+    assert_eq!(tasks_after.len(), 1);
+    assert_eq!(tasks_after[0].id, task.id);
+    let saved_after = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(saved_after.runs.len(), saved.runs.len());
+    assert_eq!(
+        store.get_turn_inputs(&lineage.child_turn_id).await.unwrap(),
+        exact_input
+    );
+    assert_eq!(saved_after.task.metadata, saved.task.metadata);
+    assert_eq!(store.get_turn_inputs(turn_id).await.unwrap(), exact_input);
+    assert_eq!(
+        store
+            .list_task_run_turns(&saved.runs[0].id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_composer_durable_size_admission(&processor, connection, &mut rx, &saved_after).await;
+}
+
+// Calibrate at the real TaskService boundary using the already-created Composer
+// task as the fixture. No second Task/Trigger/AgentSpec constructor or artificial
+// reserve is needed: preparation serializes the actual normalized contract.
+async fn assert_composer_durable_size_admission(
+    processor: &Arc<MessageProcessor>,
+    connection: ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    prototype: &pioneer_protocol::TaskGetResponse,
+) {
+    let task = &prototype.task;
+    let workspace = &task.workspace_id;
+    let parent = task.created_by_thread_id.as_deref().unwrap();
+    let turn_id = "detached-size-admission";
+    assert_eq!(
+        turn_id.len(),
+        task.created_by_turn_id.as_ref().unwrap().len()
+    );
+    let mut params = test_task_create_params(workspace, parent, turn_id, &task.title, 3);
+    // The durable spec round-trips to its input type; reset only the input depth
+    // which ordinary Composer admission supplies before service normalization.
+    let mut spec: TaskAgentSpecInput = serde_json::from_value(
+        serde_json::to_value(prototype.agent_specs.first().unwrap()).unwrap(),
+    )
+    .unwrap();
+    spec.depth = 0;
+    params.agent_spec = Some(spec);
+    params.launch = processor
+        .crud_store
+        .get_task_actor_contract(&task.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .launch;
+    params.lifecycle_policy = task.lifecycle_policy.clone();
+    params.delivery_policy = task.delivery_policy.clone();
+    params.retry_policy = None;
+    params.metadata = task.metadata.clone();
+    params
+        .metadata
+        .as_mut()
+        .unwrap()
+        .composer_work
+        .as_mut()
+        .unwrap()
+        .launch
+        .turn_id = turn_id.into();
+    let text = match &params
+        .metadata
+        .as_ref()
+        .unwrap()
+        .composer_work
+        .as_ref()
+        .unwrap()
+        .launch
+        .input[0]
+    {
+        UserInput::Text { text, .. } => text.clone(),
+        _ => panic!("Composer fixture must start with text"),
+    };
+    let with_padding = |padding: usize| {
+        let mut candidate = params.clone();
+        let launch = &mut candidate
+            .metadata
+            .as_mut()
+            .unwrap()
+            .composer_work
+            .as_mut()
+            .unwrap()
+            .launch;
+        let UserInput::Text {
+            text: input_text, ..
+        } = &mut launch.input[0]
+        else {
+            unreachable!()
+        };
+        *input_text = format!("{text}{}", "x".repeat(padding));
+        candidate
+    };
+    let service = processor.task_runtime.service();
+    assert!(service.prepare_composer_task(params.clone()).is_ok());
+    let mut allowed = 0;
+    let mut rejected = 524_288 - serde_json::to_vec(&params).unwrap().len();
+    let request_at_limit = with_padding(rejected);
+    assert_eq!(
+        serde_json::to_vec(&request_at_limit).unwrap().len(),
+        524_288
+    );
+    let error = service
+        .prepare_composer_task(request_at_limit)
+        .err()
+        .expect("a Composer DTO at its input limit must exceed the expanded durable contract");
+    assert!(
+        error.to_string().contains("durable task contract"),
+        "{error:#}"
+    );
+    // Find the adjacent accepted/rejected normalized sizes, without writes.
+    // Generated IDs are fixed-length ASCII; timestamps have the same width.
+    while rejected - allowed > 1 {
+        let middle = allowed + (rejected - allowed) / 2;
+        match service.prepare_composer_task(with_padding(middle)) {
+            Ok(_) => allowed = middle,
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("durable task contract"),
+                    "{error:#}"
+                );
+                rejected = middle;
+            }
+        }
+    }
+    let rejected_params = with_padding(rejected);
+    assert!(serde_json::to_vec(&rejected_params).unwrap().len() <= 524_288);
+    let request_id = generate_test_request_id("composer", "durable-limit");
+    let rejected_launch = &rejected_params
+        .metadata
+        .as_ref()
+        .unwrap()
+        .composer_work
+        .as_ref()
+        .unwrap()
+        .launch;
+    processor
+        .process_request_for_connection(
+            connection,
+            &json!({
+                "jsonrpc":"2.0", "id":request_id, "method":"turn/start", "params":rejected_launch,
+            })
+            .to_string(),
+        )
+        .await;
+    let mut notifications = Vec::new();
+    while let Ok(Message::Text(text)) = rx.try_recv() {
+        notifications.push(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+    }
+    let error: JsonRpcErrorResponse = serde_json::from_value(
+        notifications
+            .iter()
+            .find(|value| value["id"] == request_id)
+            .unwrap()
+            .clone(),
+    )
+    .expect("durable-only overflow must return an error before accepting the message");
+    assert_public_error(
+        &error,
+        PublicErrorCode::InvalidInput,
+        PublicErrorStage::Admission,
+    );
+    assert!(
+        notifications
+            .iter()
+            .all(|value| value["params"]["turn_id"] != turn_id
+                || (value["method"] != events::ITEM_STARTED
+                    && value["method"] != events::ITEM_COMPLETED))
+    );
+    assert!(
+        processor
+            .crud_store
+            .get_turn(parent, turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        processor
+            .crud_store
+            .get_turn_item_events(parent, turn_id)
+            .await
+            .unwrap()
+            .expect("parent thread must exist")
+            .events
+            .is_empty()
+    );
+    let tasks = service
+        .list_tasks(TaskListParams {
+            workspace_id: workspace.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent.into()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .tasks;
+    assert_eq!(
+        tasks.len(),
+        1,
+        "durable-only overflow must not create a Task/run/child"
+    );
+    assert_eq!(tasks[0].id, task.id);
+
+    // A one-ASCII-byte correction reaches the nearest admitted durable size and
+    // reuses the same Turn id, proving rollback and the unchanged effective limit.
+    let accepted_params = with_padding(allowed);
+    let accepted_launch = &accepted_params
+        .metadata
+        .as_ref()
+        .unwrap()
+        .composer_work
+        .as_ref()
+        .unwrap()
+        .launch;
+    let corrected_id = generate_test_request_id("composer", "durable-corrected");
+    processor
+        .process_request_for_connection(
+            connection,
+            &json!({
+                "jsonrpc":"2.0", "id":corrected_id, "method":"turn/start", "params":accepted_launch,
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(rx, &corrected_id).await;
+    assert!(
+        processor
+            .crud_store
+            .get_turn(parent, turn_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        !processor
+            .crud_store
+            .get_turn_item_events(parent, turn_id)
+            .await
+            .unwrap()
+            .expect("parent thread must exist")
+            .events
+            .is_empty()
+    );
+    assert_eq!(
+        processor.crud_store.get_turn_inputs(turn_id).await.unwrap(),
+        accepted_launch.input
+    );
+    let tasks = service
+        .list_tasks(TaskListParams {
+            workspace_id: workspace.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent.into()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .tasks;
+    assert_eq!(tasks.len(), 2);
+    let corrected = tasks
+        .iter()
+        .find(|task| task.created_by_turn_id.as_deref() == Some(turn_id))
+        .unwrap();
+    assert_eq!(
+        processor
+            .crud_store
+            .get_task(&corrected.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16806,7 +17311,10 @@ fn owned_voice_ingress_case(
         )
         .await;
         let mut entered_rx = Some(entered_rx);
-        let initial_chunks = if early { 30 } else { 1 };
+        // Feed the first backlog packet before waiting for the 3 s preview:
+        // 48,000 samples leave an incomplete 512-sample VAD frame. This packet
+        // completes it without changing the source PCM or its total duration.
+        let initial_chunks = if early { 31 } else { 1 };
         for sequence in 0..initial_chunks {
             processor
                 .process_binary_frame_for_connection(
@@ -16815,7 +17323,15 @@ fn owned_voice_ingress_case(
                         &session.session_id,
                         sequence,
                         if early { 1600 } else { 960 },
-                        if terminal == "silence" { 0 } else { 12000 },
+                        if terminal == "silence"
+                            || (sequence == 30 && terminal == "sealed_tail_error")
+                        {
+                            0
+                        } else if sequence == 30 {
+                            6000
+                        } else {
+                            12000
+                        },
                     ),
                 )
                 .await
@@ -16847,7 +17363,7 @@ fn owned_voice_ingress_case(
                     .state,
                 crate::voice::session_store::GatewayVoiceSessionState::Recording
             );
-            // Duplicate accepted sequence is ACKed without replay. Keep a full
+            // Duplicate accepted sequences are ACKed without replay. Keep a full
             // second source span and a seven-sample tail behind native work.
             let last_sequence = match terminal {
                 "long_context" | "long_tail_error" | "buffered_long" => 200,
@@ -17238,12 +17754,14 @@ fn owned_voice_ingress_case(
             } else if terminal == "sealed_tail_error" {
                 assert_eq!(
                     calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, 55200, 7687]
+                    vec![48000, 55296, 7943]
                 );
                 let mut confirmed_source = vec![12000.0 / 32768.0; 48000];
-                confirmed_source.extend([0.0; 7200]);
+                // The mixed 512-sample frame ends at 48128, followed by
+                // fourteen real hangover frames before the span is sealed.
+                confirmed_source.extend([0.0; 7296]);
                 assert_eq!(calls[1], confirmed_source);
-                let mut tail = vec![0.0; 7680];
+                let mut tail = vec![0.0; 7936];
                 tail.extend([3000.0 / 32768.0; 7]);
                 assert_eq!(calls[2], tail);
             } else if matches!(terminal, "closed_13" | "closed_17") {
@@ -20004,6 +20522,13 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
     gateway_secrets
         .set_workspace_provider_base_url(MEMBER_WORKSPACE_ID, "vllm", &local_url)
         .unwrap();
+    // Keep vLLM URL-only availability coverage; use explicit operation facts for choices.
+    gateway_secrets
+        .set_workspace_provider_api_key(MEMBER_WORKSPACE_ID, "mistral", "member-test-secret")
+        .unwrap();
+    gateway_secrets
+        .set_workspace_provider_base_url(MEMBER_WORKSPACE_ID, "mistral", &local_url)
+        .unwrap();
     let model_server = tokio::spawn(async move {
         let (mut stream, _) = model_listener.accept().await.unwrap();
         let mut bytes = [0u8; 8192];
@@ -20013,7 +20538,8 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
             .next()
             .unwrap()
             .to_owned();
-        let body = r#"{"data":[{"id":"member-local-model"}]}"#;
+        let body =
+            r#"{"data":[{"id":"member-local-model","capabilities":{"completion_chat":true}}]}"#;
         stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         request
     });
@@ -20026,17 +20552,24 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
         .set_workspace_provider_base_url(MEMBER_WORKSPACE_ID, "ollama", &ollama_url)
         .unwrap();
     let ollama_server = tokio::spawn(async move {
-        let (mut stream, _) = ollama_listener.accept().await.unwrap();
-        let mut bytes = [0u8; 8192];
-        let count = stream.read(&mut bytes).await.unwrap();
-        let request = String::from_utf8_lossy(&bytes[..count])
-            .lines()
-            .next()
-            .unwrap()
-            .to_owned();
-        let body = r#"{"models":[{"name":"member-ollama-model"}]}"#;
-        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-        request
+        let mut requests = Vec::new();
+        for body in [
+            r#"{"models":[{"name":"member-ollama-model"}]}"#,
+            r#"{"capabilities":["completion"]}"#,
+        ] {
+            let (mut stream, _) = ollama_listener.accept().await.unwrap();
+            let mut bytes = [0u8; 8192];
+            let count = stream.read(&mut bytes).await.unwrap();
+            requests.push(
+                String::from_utf8_lossy(&bytes[..count])
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned(),
+            );
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+        requests
     });
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
         {
@@ -20276,7 +20809,7 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
             member_connection_id,
             &json!({
                 "jsonrpc":"2.0", "id":models_id, "method":"provider/models/list",
-                "params":{"workspace_id":MEMBER_WORKSPACE_ID,"provider":"vllm"}
+                "params":{"workspace_id":MEMBER_WORKSPACE_ID,"provider":"mistral"}
             })
             .to_string(),
         )
@@ -20316,7 +20849,10 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
     );
     assert_eq!(
         ollama_server.await.unwrap(),
-        "GET /member-ollama-private/api/tags HTTP/1.1"
+        vec![
+            "GET /member-ollama-private/api/tags HTTP/1.1",
+            "POST /member-ollama-private/api/show HTTP/1.1",
+        ]
     );
 
     let configure_id = generate_test_request_id("memberws", "urlconfigure");
@@ -25866,7 +26402,12 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     attachment: TaskAttachmentMode,
     stop_before_prompt: bool,
 ) {
-    let initial_provider = Arc::new(HangingChildProvider::new());
+    let composer_recovery = attachment == TaskAttachmentMode::Detached && !stop_before_prompt;
+    let initial_provider = Arc::new(if composer_recovery {
+        HangingChildProvider::new().including_composer()
+    } else {
+        HangingChildProvider::new()
+    });
     let initial_provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         initial_provider.clone(),
@@ -25966,6 +26507,69 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         on_parent_failure: TaskParentTerminalAction::KeepRunning,
         completion: TaskCompletionBehavior::CompleteOnTerminalRun,
     });
+    // Cover Composer recovery in the existing detached recovery scenario.
+    // Its short Task objective must never replace the full original input.
+    let composer_text = composer_recovery.then(|| {
+        format!(
+            "Exact Composer recovery request {}END",
+            "Composer payload Ж\\\" segment ".repeat(9_000)
+        )
+    });
+    if let Some(text) = composer_text.as_ref() {
+        let launch: pioneer_protocol::TurnStartParams = serde_json::from_value(json!({
+            "thread_id": parent_thread_id, "turn_id": source_turn_id,
+            "input": [{"type":"text", "text":text}],
+            "model":"test-model", "model_provider":"openai", "mode":"Agent"
+        }))
+        .unwrap();
+        let source_turn = Turn {
+            id: source_turn_id.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            mode: ThreadMode::Agent,
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: default_test_permission_profile(),
+        };
+        crud_store
+            .materialize_turn_start(
+                &parent_thread,
+                SandboxMode::FullAccess,
+                &source_turn,
+                &launch.input,
+                pioneer_protocol::PersistedActorRef::Principal(
+                    authenticated_test_superuser().principal_id.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        crud_store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: parent_thread_id.to_owned(),
+                    turn: Turn {
+                        status: TurnStatus::Completed,
+                        ..source_turn
+                    },
+                },
+                created_at.saturating_add(1),
+            )
+            .await
+            .unwrap();
+        task_params.metadata = Some(pioneer_protocol::TaskMetadata {
+            labels: vec!["composer".to_owned()],
+            data: None,
+            finish_request: None,
+            composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch)),
+        });
+    }
     let response = create_task_for_test(&initial_processor, task_params)
         .await
         .expect("task_create should start hidden child task");
@@ -26004,6 +26608,19 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         initial_provider.child_main_call_count() > 0,
         "initial child task provider should be hanging in the main child request"
     );
+    let original_input = crud_store
+        .get_turn_inputs(&lineage.child_turn_id)
+        .await
+        .unwrap();
+    if let Some(text) = composer_text.as_ref() {
+        assert_eq!(
+            original_input,
+            vec![UserInput::Text {
+                text: text.clone(),
+                text_elements: Vec::new(),
+            }]
+        );
+    }
     let saved_manifest = crud_store
         .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
         .await
@@ -26470,7 +27087,13 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .expect("recovered hidden child task should call preflight");
     let child_main_pos = requests
         .iter()
-        .position(is_child_task_main_request)
+        .position(|request| {
+            if composer_recovery {
+                !is_turn_preflight_request(request) && request.compiled_prompt.is_some()
+            } else {
+                is_child_task_main_request(request)
+            }
+        })
         .expect("recovered hidden child task should call main provider after prompt compile");
     assert!(
         preflight_pos < child_main_pos,
@@ -26515,6 +27138,34 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
             .all(|message| { message.content != "LATE PARENT MESSAGE MUST NOT ENTER RECOVERY" }),
         "recovery must not reread parent messages that arrived after the child start snapshot"
     );
+    if let Some(text) = composer_text.as_ref() {
+        assert!(
+            recovered_main_request
+                .messages
+                .iter()
+                .any(|message| &message.content == text),
+            "recovery must send the entire Composer request, not its short Task goal"
+        );
+        assert_eq!(
+            crud_store
+                .get_turn_inputs(&lineage.child_turn_id)
+                .await
+                .unwrap(),
+            original_input
+        );
+        assert_eq!(
+            crud_store.list_task_run_turns(&run.id).await.unwrap().len(),
+            1,
+            "recovery must retain the same child Turn"
+        );
+        let saved = crud_store
+            .get_task(&response.task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.runs.len(), 1, "recovery must retain the same run");
+        assert_eq!(saved.task.metadata, response.task.metadata);
+    }
 }
 
 #[test]
@@ -66633,11 +67284,23 @@ async fn setup_live_semantic_timeline_harness_with_thread_id(
     case_id: &str,
     thread_id: String,
 ) -> LiveSemanticTimelineHarness {
+    setup_live_semantic_timeline_harness_on_store(
+        case_id,
+        thread_id,
+        setup_workspace_manager().await,
+    )
+    .await
+}
+
+async fn setup_live_semantic_timeline_harness_on_store(
+    case_id: &str,
+    thread_id: String,
+    (workspace_manager, crud_store, workspace_id): (Arc<WorkspaceManager>, Arc<CrudStore>, String),
+) -> LiveSemanticTimelineHarness {
     let (tx, rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
@@ -85275,9 +85938,10 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
     let mut enabled_budget = None;
     let mut enabled_reserve = None;
     for (effort, reasoning, thinking) in [
-        // V4's server default enables thinking; only explicit off keeps this
-        // completed non-thinking tool round native instead of portable.
-        (None, None, true),
+        // Without confirmed default metadata or reasoning in history, omission
+        // keeps the completed non-thinking tool round native. Explicit high
+        // still exercises portable history and the compaction token boundary.
+        (None, None, false),
         (Some("none"), Some(ReasoningConfig::Disabled), false),
         (
             Some("high"),

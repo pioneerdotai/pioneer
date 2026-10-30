@@ -626,6 +626,18 @@ mod tests {
             reasoning_effort_rows_for_model(&reasoning_model(Vec::new(), Some(true)), None)
                 .is_empty()
         );
+        assert!(
+            reasoning_effort_rows_for_model(&reasoning_model(vec!["high"], None), Some("high"))
+                .is_empty()
+        );
+        let mut default_only = reasoning_model(Vec::new(), Some(true));
+        default_only
+            .capabilities
+            .reasoning
+            .as_mut()
+            .unwrap()
+            .default_effort = Some("high".into());
+        assert!(reasoning_effort_rows_for_model(&default_only, Some("high")).is_empty());
     }
 
     #[test]

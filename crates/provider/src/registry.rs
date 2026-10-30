@@ -223,13 +223,7 @@ fn endpoint_error_status(error: &anyhow::Error) -> Option<u16> {
             return Some(status.as_u16());
         }
     }
-    // The supported adapters format non-success responses as `API error
-    // (429 Too Many Requests): ...`. Parse only that fixed prefix, never an
-    // arbitrary three-digit sequence in a provider-controlled body or URL.
-    let message = format!("{error:#}");
-    let rest = message.split_once("API error (")?.1;
-    let status = rest.get(..3)?.parse::<u16>().ok()?;
-    (100..600).contains(&status).then_some(status)
+    None
 }
 
 fn redacted_endpoint_error(
@@ -349,6 +343,37 @@ impl AuthorityBoundProvider {
         }
     }
 
+    fn select_discovery(
+        &self,
+        purpose: crate::selection::ModelPurpose,
+        models: Vec<ProviderModelInfo>,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Vec<ProviderModelInfo> {
+        use crate::selection::ModelPurpose;
+        // Preserve the same full authority-local discovery snapshot as the raw
+        // chat path. Other purposes must never replace that snapshot.
+        if purpose == ModelPurpose::Chat {
+            self.remember_discovery(&models);
+        }
+        let fallback =
+            catalog.filter(|_| self.use_public_catalog && self.inner.name() != "vercel-ai-gateway");
+        let mut models = crate::selection::filter_models(
+            self.inner.name(),
+            self.inner.usage_api(),
+            &self.inner.capabilities(),
+            purpose,
+            models,
+            fallback,
+        );
+        if purpose == ModelPurpose::Chat
+            && self.inner.name() != "vercel-ai-gateway"
+            && let Some(catalog) = catalog
+        {
+            catalog.enrich_for_tool_scope(self.inner.name(), &mut models, self.use_public_catalog);
+        }
+        models
+    }
+
     fn remember_discovery(&self, models: &[ProviderModelInfo]) {
         // Keep raw media evidence before any catalog enrichment, in this same
         // authority instance. A refresh replaces both capability snapshots.
@@ -365,11 +390,46 @@ impl AuthorityBoundProvider {
             .expect("discovery reasoning lock") = models
             .iter()
             .filter_map(|m| {
-                m.capabilities
+                let mut facts = m
+                    .capabilities
                     .reasoning
                     .as_ref()
-                    .filter(|r| !r.native.is_empty())
-                    .map(|r| (m.id.clone(), r.native.clone()))
+                    .map(|r| r.native.clone())
+                    .unwrap_or_default();
+                let raw_facts_present = !facts.is_empty();
+                if let Some(reasoning) = m
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .filter(|_| !raw_facts_present)
+                {
+                    if let Some(supported) = reasoning.supported {
+                        facts
+                            .entry("reasoning.supported".into())
+                            .or_insert(Some(supported));
+                    }
+                    // Adapters with a raw map keep that evidence verbatim.
+                    // DTO-only discovery is normalized before enrichment.
+                    if reasoning.native.is_empty() && !reasoning.effort_options.is_empty() {
+                        facts.insert("effort.enum".into(), Some(true));
+                    }
+                    if !reasoning.effort_options.is_empty() {
+                        for effort in &reasoning.effort_options {
+                            facts
+                                .entry(format!("effort.{effort}"))
+                                .or_insert(Some(true));
+                        }
+                    }
+                    if let Some(mandatory) = reasoning.mandatory {
+                        facts.entry("mandatory".into()).or_insert(Some(mandatory));
+                    }
+                }
+                if let Some(thinking) = m.capabilities.thinking.filter(|_| !raw_facts_present) {
+                    facts
+                        .entry("thinking.supported".into())
+                        .or_insert(Some(thinking));
+                }
+                (!facts.is_empty()).then(|| (m.id.clone(), facts))
             })
             .collect();
     }
@@ -600,7 +660,36 @@ impl Provider for AuthorityBoundProvider {
 
     async fn model_limits(&self, model: &str) -> Result<crate::catalog::CatalogLimits> {
         self.ensure_not_revoked()?;
-        self.public_result(self.inner.model_limits(model).await)
+        let discovery = self.input_admission.model(model);
+        let result = match self.inner.model_limits(model).await {
+            Err(error) if error.is::<crate::catalog::ModelCatalogUnavailable>() => {
+                // A known native context can form this budget without the
+                // unavailable fallback. Keep all other unknown fields unknown.
+                // Match the typed local error before endpoint redaction.
+                discovery
+                    .as_ref()
+                    .and_then(|model| {
+                        Some(crate::catalog::CatalogLimits {
+                            context_window: model.limits.context_window?,
+                            context_origin: crate::catalog::OriginKind::Source,
+                            max_input: model.limits.max_input_tokens,
+                            max_output: model.limits.max_output_tokens,
+                        })
+                    })
+                    .ok_or(error)
+            }
+            result => result,
+        };
+        let mut limits = self.public_result(result)?;
+        if let Some(model) = discovery {
+            if let Some(context) = model.limits.context_window {
+                limits.context_window = context;
+                limits.context_origin = crate::catalog::OriginKind::Source;
+            }
+            limits.max_input = model.limits.max_input_tokens.or(limits.max_input);
+            limits.max_output = model.limits.max_output_tokens.or(limits.max_output);
+        }
+        Ok(limits)
     }
     fn model_catalog_entry(&self, model: &str) -> Option<crate::catalog::CatalogModel> {
         if self.ensure_not_revoked().is_err() {
@@ -630,6 +719,21 @@ impl Provider for AuthorityBoundProvider {
     async fn list_transcription_models(&self) -> Result<Vec<ProviderModelInfo>> {
         self.ensure_not_revoked()?;
         self.public_result(self.inner.list_transcription_models().await)
+    }
+
+    async fn list_models_for_selection(
+        &self,
+        purpose: crate::selection::ModelPurpose,
+    ) -> Result<Vec<ProviderModelInfo>> {
+        use crate::selection::ModelPurpose;
+        self.ensure_not_revoked()?;
+        let models = self.public_result(match purpose {
+            ModelPurpose::Chat => self.inner.list_models().await,
+            ModelPurpose::Embeddings => self.inner.list_embedding_models().await,
+            ModelPurpose::Transcription => self.inner.list_transcription_models().await,
+        })?;
+        let catalog = crate::catalog::model_catalog().ok();
+        Ok(self.select_discovery(purpose, models, catalog.as_deref()))
     }
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
@@ -1475,6 +1579,110 @@ mod tests {
     }
 
     #[test]
+    fn selection_fallback_is_scoped_and_non_chat_lists_preserve_chat_discovery() {
+        use crate::selection::ModelPurpose;
+        let catalog = crate::catalog::ModelCatalog::parse(
+            &serde_json::json!({"openai":{"fixture-native-model":{
+                "id":"fixture-native-model","name":"Fixture","provider":"openai",
+                "api":"openai-responses","baseUrl":"https://api.openai.com/v1",
+                "contextWindow":4096,"maxTokens":1024,"reasoning":false,"input":["text"],"cost":{},
+                "sourceMetadata":{"type":"chat","api":{"chat-completions":{}},
+                    "modalities":{"input":["text"],"output":["text"]}}
+            }}})
+            .to_string(),
+            &serde_json::json!({"openai":{"fixture-native-model":{
+                "contextWindow":{"kind":"source","expression":"fixture"},
+                "maxTokens":{"kind":"source","expression":"fixture"}
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let wrapper = |public| AuthorityBoundProvider {
+            inner: Arc::new(NativeListFixture("openai")),
+            authority_fingerprint: ProviderAuthorityFingerprint(format!("selection-{public}")),
+            revoked: Arc::new(AtomicBool::new(false)),
+            redact_endpoint_errors: false,
+            input_admission: Arc::new(Default::default()),
+            use_public_catalog: public,
+            discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
+        };
+        let public = wrapper(true);
+        let private = wrapper(false);
+        let mut model = crate::catalog::tool_tests::discovered("fixture-native-model", Some(false));
+        assert_eq!(
+            public
+                .select_discovery(ModelPurpose::Chat, vec![model.clone()], Some(&catalog))
+                .len(),
+            1
+        );
+        assert!(
+            private
+                .select_discovery(ModelPurpose::Chat, vec![model.clone()], Some(&catalog))
+                .is_empty()
+        );
+        // Partial operation evidence must not borrow modalities across authority.
+        model.capabilities.chat_operation = Some(true);
+        assert_eq!(
+            public
+                .select_discovery(ModelPurpose::Chat, vec![model.clone()], Some(&catalog))
+                .len(),
+            1
+        );
+        assert!(
+            private
+                .select_discovery(ModelPurpose::Chat, vec![model.clone()], Some(&catalog))
+                .is_empty()
+        );
+        model.capabilities.chat = Some(true);
+        assert_eq!(
+            private
+                .select_discovery(ModelPurpose::Chat, vec![model.clone()], None)
+                .len(),
+            1
+        );
+        model.capabilities.chat = Some(false);
+        assert!(
+            public
+                .select_discovery(ModelPurpose::Chat, vec![model.clone()], Some(&catalog))
+                .is_empty()
+        );
+        // A hidden row stays in the full raw snapshot used by execution.
+        assert_eq!(
+            public
+                .input_admission
+                .model(&model.id)
+                .unwrap()
+                .capabilities
+                .chat,
+            Some(false)
+        );
+        let mut vectors = model.clone();
+        vectors.id = "vectors".into();
+        vectors.capabilities.embeddings = Some(true);
+        public.select_discovery(ModelPurpose::Embeddings, vec![vectors], Some(&catalog));
+        assert!(public.input_admission.model("vectors").is_none());
+        assert!(public.input_admission.model(&model.id).is_some());
+        // Refresh replaces discovery and does not cache a prior classification.
+        model.capabilities.chat = Some(true);
+        assert_eq!(
+            public
+                .select_discovery(ModelPurpose::Chat, vec![model], None)
+                .len(),
+            1
+        );
+        assert_eq!(
+            private
+                .input_admission
+                .model("fixture-native-model")
+                .unwrap()
+                .capabilities
+                .chat,
+            Some(true)
+        );
+    }
+
+    #[test]
     fn endpoint_redaction_preserves_local_catalog_category_without_raw_context() {
         let error = anyhow::Error::new(crate::catalog::ModelCatalogUnavailable)
             .context("sensitive endpoint and credential context");
@@ -1529,6 +1737,7 @@ mod tests {
         discovery: String,
         catalog: Arc<crate::catalog::ModelCatalog>,
         bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        limits_error: Option<fn() -> anyhow::Error>,
     }
     #[async_trait]
     impl Provider for RouterReasoningFixture {
@@ -1540,6 +1749,12 @@ mod tests {
         }
         async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
             Ok(crate::providers::openrouter::models_from_native_discovery_fixture(&self.discovery))
+        }
+        async fn model_limits(&self, model: &str) -> Result<crate::catalog::CatalogLimits> {
+            if let Some(error) = self.limits_error {
+                return Err(error());
+            }
+            Ok(self.catalog.limits(self.name(), model))
         }
         async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
             let body = crate::providers::openrouter::render_chat_request_mode_for_test(
@@ -1575,9 +1790,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authority_budget_limits_preserve_raw_discovery_over_catalog() {
+        let id = "openai/gpt-5.4";
+        let catalog = Arc::new(crate::generation::test_catalog_model(
+            "openrouter",
+            id,
+            id,
+            serde_json::json!({"contextWindow":32000,"maxTokens":4000}),
+        ));
+        let mut wrapper = AuthorityBoundProvider {
+            inner: Arc::new(RouterReasoningFixture {
+                discovery: serde_json::json!({"data":[{
+                    "id":id,"context_length":64000,"max_completion_tokens":8000
+                }]})
+                .to_string(),
+                catalog: catalog.clone(),
+                bodies: Arc::new(Default::default()),
+                limits_error: None,
+            }),
+            authority_fingerprint: ProviderAuthorityFingerprint("limit-facts-fixture".into()),
+            revoked: Arc::new(AtomicBool::new(false)),
+            redact_endpoint_errors: false,
+            input_admission: Arc::new(Default::default()),
+            use_public_catalog: true,
+            discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
+        };
+        let mut models = wrapper.inner.list_models().await.unwrap();
+        wrapper.enrich_discovery(&catalog, &mut models);
+        let limits = wrapper.model_limits(id).await.unwrap();
+        assert_eq!(limits.context_window, 64000);
+        assert_eq!(limits.max_input, Some(64000));
+        assert_eq!(limits.max_output, Some(8000));
+        let mut request = chat_request();
+        request.model = id.into();
+        request.max_tokens = Some(6000);
+        crate::attachments::admission::scope(wrapper.input_admission.clone(), async {
+            assert!(
+                crate::generation::validate_cap_with_catalog(
+                    Some(&catalog),
+                    "openrouter",
+                    &request
+                )
+                .is_ok()
+            );
+            request.max_tokens = Some(9000);
+            assert!(
+                crate::generation::validate_cap_with_catalog(
+                    Some(&catalog),
+                    "openrouter",
+                    &request
+                )
+                .is_err()
+            );
+        })
+        .await;
+        // A defined zero limit is not a missing field or a free fallback.
+        let mut raw = wrapper.input_admission.model(id).unwrap();
+        raw.limits.max_output_tokens = Some(0);
+        wrapper.input_admission.replace_discovery(vec![raw]);
+        assert_eq!(wrapper.model_limits(id).await.unwrap().max_output, Some(0));
+        request.max_tokens = None;
+        crate::attachments::admission::scope(wrapper.input_admission.clone(), async {
+            assert!(
+                crate::generation::required_cap_with_catalog(
+                    Some(&catalog),
+                    "openrouter",
+                    &request,
+                    1024
+                )
+                .is_err()
+            );
+        })
+        .await;
+
+        let failures: [(fn() -> anyhow::Error, bool); 2] = [
+            (|| crate::catalog::ModelCatalogUnavailable.into(), true),
+            (
+                || {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "sensitive fixture provider auth failure",
+                    )
+                    .into()
+                },
+                false,
+            ),
+        ];
+        for (failure, unavailable_catalog) in failures {
+            wrapper.inner = Arc::new(RouterReasoningFixture {
+                discovery: String::new(),
+                catalog: catalog.clone(),
+                bodies: Arc::new(Default::default()),
+                limits_error: Some(failure),
+            });
+            for redact in [false, true] {
+                wrapper.redact_endpoint_errors = redact;
+                for (context, input, output) in [
+                    (Some(64000), Some(24000), Some(8000)),
+                    (Some(64000), None, Some(0)),
+                    (Some(64000), Some(24000), None),
+                    (None, Some(24000), Some(8000)),
+                ] {
+                    let mut raw = wrapper.input_admission.model(id).unwrap();
+                    raw.limits = pioneer_protocol::ProviderModelLimits {
+                        context_window: context,
+                        max_input_tokens: input,
+                        max_output_tokens: output,
+                    };
+                    // Same raw snapshot boundary used when list_models cannot
+                    // enrich discovery because the catalog is unavailable.
+                    wrapper.remember_discovery(&[raw]);
+                    let result = wrapper.model_limits(id).await;
+                    if unavailable_catalog && context.is_some() {
+                        assert_eq!(
+                            result.unwrap(),
+                            crate::catalog::CatalogLimits {
+                                context_window: 64000,
+                                context_origin: crate::catalog::OriginKind::Source,
+                                max_input: input,
+                                max_output: output,
+                            }
+                        );
+                    } else {
+                        let error = result.unwrap_err();
+                        if unavailable_catalog {
+                            assert!(error.is::<crate::catalog::ModelCatalogUnavailable>());
+                        } else if redact {
+                            assert!(error.is::<RedactedEndpointError>());
+                            assert!(!format!("{error:#}").contains("sensitive"));
+                        } else {
+                            assert!(error.is::<std::io::Error>());
+                        }
+                    }
+                }
+            }
+        }
+        wrapper.revoked.store(true, Ordering::Release);
+        assert!(
+            wrapper
+                .model_limits(id)
+                .await
+                .unwrap_err()
+                .is::<ProviderAuthorityRevoked>()
+        );
+    }
+
+    #[tokio::test]
     async fn router_native_fields_survive_catalog_conflicts_and_actual_authority_requests() {
         use crate::{ReasoningConfig, ReasoningEffort};
-        let id = "openai/gpt-5.4";
+        let id = "aurora/router-special-983";
         // Each case has a distinct real authority instance/cache. These facts
         // enter through the production parser, never with_native_reasoning.
         for (metadata, expected, supported, mandatory, default, budget) in [
@@ -1614,11 +1976,11 @@ mod tests {
                 None,
                 None,
             ),
-            // Documented omission within the object denies effort selection,
-            // but does not turn budget support or a default into effort support.
+            // Missing effort metadata permits catalog fallback; budget/default
+            // facts alone still do not establish native effort support.
             (
                 serde_json::json!({"default_effort":"high","supports_max_tokens":true}),
-                vec![],
+                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"],
                 Some(true),
                 Some(false),
                 Some("high"),
@@ -1659,7 +2021,7 @@ mod tests {
             let catalog = Arc::new(crate::generation::test_catalog_model(
                 "openrouter",
                 id,
-                id,
+                "openai/gpt-5.4",
                 catalog_metadata,
             ));
             let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1669,6 +2031,7 @@ mod tests {
                         .to_string(),
                     catalog: catalog.clone(),
                     bodies: bodies.clone(),
+                    limits_error: None,
                 }),
                 authority_fingerprint: ProviderAuthorityFingerprint(
                     "router-reasoning-fixture".into(),
@@ -1754,7 +2117,10 @@ mod tests {
                         }
                     } else {
                         let error = result.unwrap_err().to_string();
-                        assert!(error.contains("native OpenRouter"), "{error}");
+                        assert!(
+                            error.contains("reasoning") || error.contains("effort"),
+                            "{error}"
+                        );
                     }
                 }
             }
@@ -1764,11 +2130,11 @@ mod tests {
     #[tokio::test]
     async fn router_budget_support_is_independent_of_effort_selection_and_catalog() {
         use crate::{ReasoningConfig, ReasoningEffort};
-        let id = "openai/gpt-5.4";
+        let id = "aurora/router-budget-984";
         for (enum_case, enum_value) in [
             ("empty", serde_json::json!([])),
             ("omitted", serde_json::Value::Null),
-            ("gateway", serde_json::Value::Null),
+            ("null", serde_json::Value::Null),
             ("malformed", serde_json::json!([null])),
         ] {
             for budget in [
@@ -1792,7 +2158,7 @@ mod tests {
                         let catalog = Arc::new(crate::generation::test_catalog_model(
                             "openrouter",
                             id,
-                            id,
+                            "openai/gpt-5.4",
                             serde_json::json!({"reasoning":catalog_support,"thinkingLevelMap":{"off":"none","low":"low","high":"high"}}),
                         ));
                         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1803,6 +2169,7 @@ mod tests {
                                         .to_string(),
                                 catalog: catalog.clone(),
                                 bodies: bodies.clone(),
+                                limits_error: None,
                             }),
                             authority_fingerprint: ProviderAuthorityFingerprint(
                                 "router-budget-fixture".into(),
@@ -1820,7 +2187,7 @@ mod tests {
                             budget.as_ref().and_then(serde_json::Value::as_bool) == Some(true);
                         let native_support = if aggregate_negative {
                             Some(false)
-                        } else if positive_budget || enum_case == "gateway" {
+                        } else if positive_budget {
                             Some(true)
                         } else {
                             None
@@ -1853,13 +2220,13 @@ mod tests {
                             budget.as_ref().map(serde_json::Value::as_bool)
                         );
                         let effort_allowed = !aggregate_negative
-                            && (enum_case == "gateway"
-                                || enum_case == "malformed" && catalog_support);
+                            && matches!(enum_case, "omitted" | "null" | "malformed")
+                            && (catalog_support || positive_budget);
                         assert_eq!(
                             effective.effort_options.iter().any(|e| e == "high"),
                             effort_allowed
                         );
-                        if matches!(enum_case, "empty" | "omitted") || aggregate_negative {
+                        if enum_case == "empty" || aggregate_negative {
                             assert!(effective.effort_options.is_empty());
                         }
                         for setting in [
@@ -1893,10 +2260,7 @@ mod tests {
                                 } else {
                                     let error = result.unwrap_err().to_string();
                                     assert!(
-                                        error.contains("native OpenRouter")
-                                            || error.contains(
-                                                "selected catalog model does not support reasoning"
-                                            ),
+                                        error.contains("reasoning") || error.contains("effort"),
                                         "{error}"
                                     );
                                 }
@@ -3257,6 +3621,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn picker_discovery_uses_native_operation_contracts_and_preserves_raw_lists() {
+        use crate::selection::ModelPurpose;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let cases = [
+            (
+                "openai",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"text-embedding-fixture"},{"id":"chat-looking"},{"id":"image-looking"}]}"#,
+                vec![],
+                "/models",
+            ),
+            (
+                "anthropic",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"brand-new-private"}]}"#,
+                vec!["brand-new-private"],
+                "/models",
+            ),
+            (
+                "mistral",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"native","capabilities":{"completion_chat":true}},{"id":"no","capabilities":{"completion_chat":false}},{"id":"unknown","capabilities":{"completion_chat":null}},{"id":"malformed","capabilities":{"completion_chat":"true"}}]}"#,
+                vec!["native"],
+                "/models",
+            ),
+            (
+                "copilot",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"native","supported_endpoints":["/chat/completions"]},{"id":"default-chat","capabilities":{"type":"chat"}},{"id":"responses-only","capabilities":{"type":"chat"},"supported_endpoints":["/responses"]},{"id":"websocket-only","capabilities":{"type":"chat"},"supported_endpoints":["ws:/responses"]},{"id":"unknown"},{"id":"null","capabilities":{"type":"chat"},"supported_endpoints":null},{"id":"malformed","capabilities":{"type":"chat"},"supported_endpoints":[null]},{"id":"future","capabilities":{"type":"future"}},{"id":"bad-type","capabilities":{"type":true}},{"id":"negative","capabilities":{"type":"embeddings"},"supported_endpoints":["/chat/completions"]}]}"#,
+                vec!["native", "default-chat"],
+                "/models",
+            ),
+            (
+                "together",
+                ModelPurpose::Chat,
+                r#"[{"id":"native","type":"chat"},{"id":"vectors","type":"embedding"},{"id":"unknown","type":null},{"id":"future","type":"future-value"}]"#,
+                vec!["native"],
+                "/models",
+            ),
+            (
+                "venice",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"native","type":"text"},{"id":"vectors","type":"embedding"},{"id":"unknown","type":null},{"id":"future","type":"future-value"}]}"#,
+                vec!["native"],
+                "/models",
+            ),
+            (
+                "huggingface",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"private","owned_by":"huggingface"}]}"#,
+                vec![],
+                "/models",
+            ),
+            (
+                "gemini",
+                ModelPurpose::Chat,
+                r#"{"models":[{"name":"models/generate-only","supportedGenerationMethods":["generateContent"]},{"name":"models/vectors","supportedGenerationMethods":["embedContent"]},{"name":"models/unknown"}]}"#,
+                vec![],
+                "/models",
+            ),
+            (
+                "openrouter",
+                ModelPurpose::Chat,
+                r#"{"data":[{"id":"native"},{"id":"vectors","architecture":{"input_modalities":["text"],"output_modalities":["embeddings"]}},{"id":"multi","architecture":{"input_modalities":["text"],"output_modalities":["text","embeddings"]}}]}"#,
+                vec!["native", "multi"],
+                "/models",
+            ),
+            (
+                "openrouter",
+                ModelPurpose::Embeddings,
+                r#"{"data":[{"id":"native"},{"id":"text","architecture":{"output_modalities":["text"]}},{"id":"multi","architecture":{"output_modalities":["text","embeddings"]}}]}"#,
+                vec!["native", "multi"],
+                "/models?output_modalities=embeddings",
+            ),
+        ];
+        for (name, purpose, body, expected, route) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/private/v1", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let count = socket.read(&mut buffer).await.unwrap();
+                        assert!(count > 0);
+                        request.extend_from_slice(&buffer[..count]);
+                    }
+                    assert!(
+                        String::from_utf8_lossy(&request)
+                            .lines()
+                            .next()
+                            .unwrap()
+                            .contains(route)
+                    );
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let registry =
+                ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+                    |_, _| Ok("fixture-key".into()),
+                    |_, _| Ok(None),
+                    move |_, _| Ok(Some(url.clone())),
+                    ProviderTimeoutPolicy::default(),
+                );
+            let provider = registry
+                .get_or_create_for_workspace("workspace", name)
+                .unwrap();
+            let selected = provider.list_models_for_selection(purpose).await.unwrap();
+            assert_eq!(
+                selected.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+                expected,
+                "{name}/{purpose:?}"
+            );
+            let raw = match purpose {
+                ModelPurpose::Embeddings => provider.list_embedding_models().await.unwrap(),
+                _ => provider.list_models().await.unwrap(),
+            };
+            if name == "gemini" {
+                assert_eq!(
+                    raw.iter()
+                        .map(|model| model.capabilities.chat_operation)
+                        .collect::<Vec<_>>(),
+                    vec![Some(true), Some(false), None]
+                );
+            }
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            let entries = if value.is_array() {
+                &value
+            } else {
+                &value[if name == "gemini" { "models" } else { "data" }]
+            };
+            let count = entries.as_array().unwrap().len();
+            assert_eq!(
+                raw.len(),
+                count,
+                "selection must not narrow raw execution discovery"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn picker_discovery_errors_remain_errors_with_endpoint_redaction() {
+        use crate::selection::ModelPurpose;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/private-picker/v1",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 4096];
+            socket.read(&mut buffer).await.unwrap();
+            let body = r#"{"error":{"message":"denied private-picker fixture-key"}}"#;
+            socket.write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let registry = ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok("fixture-key".into()),
+            |_, _| Ok(None),
+            move |_, _| Ok(Some(url.clone())),
+            ProviderTimeoutPolicy::default(),
+        );
+        let provider = registry
+            .get_or_create_for_workspace("workspace", "openai")
+            .unwrap();
+        let error = provider
+            .list_models_for_selection(ModelPurpose::Chat)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            provider.classify_failure(&error).unwrap().http_status,
+            Some(403)
+        );
+        assert!(!format!("{error:#}").contains("private-picker"));
+        assert!(!format!("{error:#}").contains("fixture-key"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn workspace_base_urls_route_real_requests_to_their_own_servers() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -3316,6 +3861,69 @@ mod tests {
             assert_eq!(b.chat(chat_request()).await.unwrap().text, "fixture reply");
             assert_eq!(server_a.await.unwrap(), expected_path);
             assert_eq!(server_b.await.unwrap(), expected_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_facts_survive_private_context_before_endpoint_redaction() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            socket.read(&mut request).await.unwrap();
+            let body = "private_body says 403; retry-after: 99";
+            socket.write_all(format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nRetry-After: 3\r\nConnection: close\r\n\r\n{body}", body.len()
+            ).as_bytes()).await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client.get(url).send().await.unwrap();
+        let status_error = response.error_for_status_ref().unwrap_err();
+        assert_eq!(
+            crate::providers::OpenRouterProvider::new("fixture")
+                .classify_failure(&status_error.into())
+                .unwrap()
+                .http_status,
+            Some(429),
+        );
+        let raw = crate::http::provider_api_error(response, "OpenAI")
+            .await
+            .context("private_context API error (403 Forbidden)");
+        server.await.unwrap();
+        let inner = crate::providers::OpenAiProvider::new("fixture");
+        let before = inner.classify_failure(&raw).unwrap();
+        assert_eq!(before.http_status, Some(429));
+        assert_eq!(before.retry_after_ms, Some(3000));
+        let safe = redacted_endpoint_error(&inner, raw, ProviderFailureStage::Connect)
+            .context("safe caller context");
+        let registry = ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok("fixture".into()),
+            |_, _| Ok(None),
+            |_, _| Ok(Some("http://127.0.0.1/private_endpoint/v1".into())),
+            ProviderTimeoutPolicy::default(),
+        );
+        let consumer = registry.get_or_create("openai").unwrap();
+        assert_eq!(consumer.classify_failure(&safe).unwrap(), before);
+        assert!(!format!("{safe:#} {safe:#?}").contains("private_"));
+        assert!(
+            !safe
+                .chain()
+                .any(|cause| cause.is::<crate::failure::ProviderHttpFailure>())
+        );
+
+        // A reqwest failure before a response, and a local diagnostic that
+        // imitates the old adapter prefix, provide no HTTP status evidence.
+        let transport = client.get("http://[403").send().await.unwrap_err();
+        for raw in [
+            anyhow::Error::from(transport),
+            anyhow::anyhow!("API error (403 Forbidden): private_body"),
+        ] {
+            let safe = redacted_endpoint_error(&inner, raw, ProviderFailureStage::Connect);
+            assert_eq!(consumer.classify_failure(&safe).unwrap().http_status, None);
+            assert!(!format!("{safe:#} {safe:#?}").contains("private_"));
         }
     }
 

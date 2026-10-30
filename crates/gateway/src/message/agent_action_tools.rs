@@ -385,6 +385,7 @@ pub(crate) async fn prepare_named_reviewer_launch(
         &identity,
         &source.source_id,
         &authority,
+        false,
     )
     .await?
     {
@@ -422,6 +423,12 @@ async fn load_execution_child_launch_ceiling<C: sea_orm::ConnectionTrait>(
         .context("AgentExecution has no immutable launch grant")?;
     let grant: serde_json::Value = serde_json::from_str(grant.grant_json.as_str())
         .context("AgentExecution launch grant is invalid")?;
+    execution_child_launch_ceiling(&grant)
+}
+
+pub(super) fn execution_child_launch_ceiling(
+    grant: &serde_json::Value,
+) -> anyhow::Result<pioneer_protocol::ChildAgentLaunchGrantSet> {
     let ceiling: pioneer_protocol::ChildAgentLaunchGrantSet = serde_json::from_value(
         grant
             .get("child_launch_grant")
@@ -429,7 +436,7 @@ async fn load_execution_child_launch_ceiling<C: sea_orm::ConnectionTrait>(
             .context("AgentExecution has no immutable child launch ceiling")?,
     )
     .context("AgentExecution child launch ceiling is invalid")?;
-    ceiling.validate().map_err(|error| {
+    ceiling.validate_for_execution().map_err(|error| {
         anyhow::anyhow!("AgentExecution child launch ceiling failed validation: {error:?}")
     })?;
     Ok(ceiling)
@@ -611,6 +618,7 @@ async fn identity_models_catalog(
     identity: &pioneer_protocol::AgentIdentityProjection,
     source_id: &str,
     authority: &crate::authorization::ExecutionAuthorizationContext,
+    selectable_only: bool,
 ) -> anyhow::Result<Vec<pioneer_protocol::AgentToolExecutorModels>> {
     use pioneer_protocol::{
         AgentIdentitySourceKind, AgentToolBackendKind, AgentToolExecutorModels,
@@ -639,10 +647,18 @@ async fn identity_models_catalog(
                     default_model_id: None,
                     unavailable_reason: None,
                 };
-                match processor
-                    .provider_models_catalog(workspace_id, definition.name)
-                    .await
-                {
+                // Only the externally offered choices use picker policy.
+                // Execution-bound defaulting and saved profiles keep raw discovery.
+                let models = if selectable_only {
+                    processor
+                        .provider_chat_models_for_selection(workspace_id, definition.name)
+                        .await
+                } else {
+                    processor
+                        .provider_models_catalog(workspace_id, definition.name)
+                        .await
+                };
+                match models {
                     Ok(models) => {
                         executor.models = models
                             .into_iter()
@@ -1560,6 +1576,7 @@ async fn selected_launch_profile(
             &identity,
             &source.source_id,
             authority,
+            false,
         )
         .await
         .map_err(|_| ToolError::execution_failed("agent_execution_profile_unavailable"))?;
@@ -2128,6 +2145,7 @@ async fn restore_persisted_agent_action_binding(
         .await?
         .ok_or_else(|| anyhow::anyhow!("persisted AgentExecution grant is missing"))?;
     let grant: serde_json::Value = serde_json::from_str(grant.grant_json.as_str())?;
+    execution_child_launch_ceiling(&grant)?;
     let profile: pioneer_protocol::AgentExecutionProfileProjection = serde_json::from_value(
         grant
             .get("profile")
@@ -3969,6 +3987,7 @@ async fn dispatch_agent_action_outbox_row_inner(
         .map_err(|error| anyhow::anyhow!("invalid durable StartAgent execution: {error:?}"))?;
     let execution_generation = u64::try_from(dispatch.execution_generation)
         .map_err(|_| anyhow::anyhow!("invalid durable StartAgent generation"))?;
+    execution_child_launch_ceiling(&grant)?;
     let (adapter, options, capabilities) =
         crate::authorization::materialize_persisted_task_agent_action_binding(
             execution_id,
@@ -4259,6 +4278,7 @@ impl ToolHandler for AgentActionToolHandler {
                     &catalog_identity,
                     catalog_source_id.as_deref().unwrap_or(&source.source_id),
                     &authority,
+                    true,
                 )
                 .await
                 .map_err(|_| ToolError::execution_failed("agent_execution_profile_unavailable"))?;

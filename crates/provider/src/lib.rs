@@ -21,8 +21,8 @@ pub use messages::{
     ProviderMessageMetadata, ProviderRoundUiCopy, ProviderRoundUiCopyKind,
 };
 pub mod providers;
-pub mod reasoning_registry;
 pub mod registry;
+pub mod selection;
 pub mod tools;
 pub mod traits;
 pub mod types;
