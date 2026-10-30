@@ -1,7 +1,9 @@
 //! Unrun owner-boundary regressions. The stream supplies frames; the production
 //! pump owns classification/admission and every domain request uses dispatch.
 use super::*;
-use crate::transport::{ConnectionAccessLease, ConnectionHandlers, process_with_access_renewals};
+use crate::transport::{
+    ConnectionAccessLease, ConnectionHandlers, IngressMode, process_with_access_renewals,
+};
 use futures_util::FutureExt;
 use pioneer_protocol::{JsonRpcRequest, constants::methods};
 use pioneer_provider::ProviderRegistry;
@@ -238,6 +240,7 @@ async fn blocked_ordinary_allows_exact_cancel_and_wait_without_reordering_binary
             async {
                 ordinary.join().await.unwrap();
             },
+            IngressMode::Serial,
             &mut reader,
             &mut deferred,
             &f.auth,
@@ -337,10 +340,21 @@ async fn blocked_ordinary_allows_exact_cancel_and_wait_without_reordering_binary
 async fn deferred_count_bytes_single_message_and_control_capacity_close_boundedly() {
     // Cases share the actual blocked domain handler and pump, not a copy of its
     // scheduler. The gate only holds a real dispatcher future before admission.
-    for case in ["count", "bytes", "byte-control", "single", "cancel", "wait"] {
+    for (mode, case) in [IngressMode::Serial, IngressMode::ReadGroup]
+        .into_iter()
+        .flat_map(|mode| {
+            ["count", "bytes", "byte-control", "single", "cancel", "wait"]
+                .into_iter()
+                .map(move |case| (mode, case))
+        })
+    {
         tokio::time::timeout(Duration::from_secs(10), async {
             let mut f = Fixture::new().await;
-            let mut ordinary = f.ordinary().await;
+            let mut ordinary = if mode == IngressMode::Serial {
+                Some(f.ordinary().await)
+            } else {
+                None
+            };
             let (input, mut reader) = incoming();
             match case {
                 "count" => {
@@ -427,7 +441,11 @@ async fn deferred_count_bytes_single_message_and_control_capacity_close_boundedl
                 Duration::from_secs(60),
             ));
             let mut handlers = ConnectionHandlers::default();
-            let mut deferred = VecDeque::new();
+            let mut deferred = if mode == IngressMode::ReadGroup {
+                VecDeque::from([get_thread("overflow-block")])
+            } else {
+                VecDeque::new()
+            };
             let gate = Arc::new(Notify::new());
             if matches!(case, "count" | "byte-control") {
                 gate.notify_one();
@@ -438,14 +456,27 @@ async fn deferred_count_bytes_single_message_and_control_capacity_close_boundedl
                 let gate = gate.clone();
                 let processor = processor.clone();
                 async move {
+                    if serde_json::from_str::<JsonRpcRequest>(&payload)
+                        .unwrap()
+                        .id
+                        .as_str()
+                        == id("overflow-block")
+                    {
+                        std::future::pending::<()>().await;
+                    }
                     gate.notified().await;
                     processor.process_request(&context, &payload).await;
                 }
             };
             let pump = process_with_access_renewals(
                 async {
-                    ordinary.join().await.unwrap();
+                    if let Some(ordinary) = ordinary.as_mut() {
+                        ordinary.join().await.unwrap();
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
                 },
+                mode,
                 &mut reader,
                 &mut deferred,
                 &f.auth,
@@ -486,7 +517,9 @@ async fn deferred_count_bytes_single_message_and_control_capacity_close_boundedl
                 .sum();
             assert!(bytes <= 4 * 1024 * 1024);
             handlers.shutdown().await;
-            ordinary.abort_and_join().await;
+            if let Some(ordinary) = ordinary.as_mut() {
+                ordinary.abort_and_join().await;
+            }
             f.assert_task_running().await;
         })
         .await
@@ -797,4 +830,428 @@ async fn durable_session_revocation_during_wait_is_not_hidden_by_original_princi
     })
     .await
     .expect("durable lease checked after wait");
+}
+
+// These gates delay execution only. The production pump classifies/adopts the
+// frames and the real dispatcher supplies every result/error and domain effect.
+struct ReadDispatchGate {
+    blocked: HashSet<String>,
+    entered: mpsc::UnboundedSender<String>,
+    dropped: mpsc::UnboundedSender<String>,
+    release: tokio::sync::Semaphore,
+}
+struct ReadDispatchDrop {
+    id: String,
+    gate: Arc<ReadDispatchGate>,
+}
+impl Drop for ReadDispatchDrop {
+    fn drop(&mut self) {
+        let _ = self.gate.dropped.send(self.id.clone());
+    }
+}
+fn gated_read_dispatch(
+    processor: Arc<MessageProcessor>,
+    gate: Arc<ReadDispatchGate>,
+) -> impl Fn(crate::request_context::ConnectionContext, String) -> MessageFuture<'static, ()> {
+    move |context, payload| {
+        let processor = processor.clone();
+        let gate = gate.clone();
+        message_future(async move {
+            let request: JsonRpcRequest = serde_json::from_str(&payload).unwrap();
+            let request_id = request.id.as_str().to_owned();
+            if gate.blocked.contains(&request_id) {
+                let _drop = ReadDispatchDrop {
+                    id: request_id.clone(),
+                    gate: gate.clone(),
+                };
+                gate.entered.send(request_id).unwrap();
+                gate.release.acquire().await.unwrap().forget();
+                processor.process_request(&context, &payload).await;
+            } else {
+                processor.process_request(&context, &payload).await;
+            }
+        })
+    }
+}
+fn read_gate(
+    labels: &[&str],
+) -> (
+    Arc<ReadDispatchGate>,
+    mpsc::UnboundedReceiver<String>,
+    mpsc::UnboundedReceiver<String>,
+) {
+    let (entered, entries) = mpsc::unbounded_channel();
+    let (dropped, drops) = mpsc::unbounded_channel();
+    (
+        Arc::new(ReadDispatchGate {
+            blocked: labels.iter().map(|label| id(label)).collect(),
+            entered,
+            dropped,
+            release: tokio::sync::Semaphore::new(0),
+        }),
+        entries,
+        drops,
+    )
+}
+fn get_thread(label: &str) -> Message {
+    Message::Text(rpc(label, methods::THREAD_GET, json!({"thread_id":THREAD})).into())
+}
+
+#[tokio::test]
+async fn independent_read_finishes_before_blocked_peer_and_serial_head_fences_later_reads() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut f = Fixture::new().await;
+        let mut context = f
+            .processor
+            .session_manager
+            .connection_context(f.connection)
+            .await
+            .unwrap();
+        let (renewals, _) = watch::channel(ConnectionAccessLease::new(
+            context.principal().clone(),
+            Duration::from_secs(60),
+        ));
+        let (gate, mut entries, mut drops) = read_gate(&["read-a"]);
+        let dispatch = gated_read_dispatch(f.processor.clone(), gate.clone());
+        let mut handlers = ConnectionHandlers::default();
+        let mut deferred = VecDeque::from([get_thread("read-a")]);
+        let (input, mut reader) = incoming();
+        let update = Message::Text(
+            rpc(
+                "rename",
+                methods::THREAD_UPDATE,
+                json!({"workspace_id":f.workspace,"thread_id":THREAD,"name":"After barrier"}),
+            )
+            .into(),
+        );
+        let read_c = get_thread("read-c");
+        let binary = Message::Binary(vec![4, 5].into());
+        let malformed = Message::Text("{broken".into());
+        let pump = process_with_access_renewals(
+            std::future::pending(),
+            IngressMode::ReadGroup,
+            &mut reader,
+            &mut deferred,
+            &f.auth,
+            &f.processor.session_manager,
+            &mut context,
+            &renewals,
+            &f.outbound,
+            &mut handlers,
+            &dispatch,
+        );
+        let driver = async {
+            assert_eq!(entries.recv().await.unwrap(), id("read-a"));
+            // Sustained reads and controls must both progress with A held.
+            for round in 0..32 {
+                let read = format!("read-b-{round:02}");
+                let (method, params, field) = match round % 5 {
+                    0 => (methods::THREAD_TREE, json!({"workspace_id":f.workspace}), "threads"),
+                    1 => (methods::THREAD_GET, json!({"thread_id":THREAD}), "thread"),
+                    2 => (methods::THREAD_TIMELINE_PAGE, json!({"threadId":THREAD,"anchor":{"kind":"newest"},"limit":5}), "blocks"),
+                    3 => (methods::TURN_WORK_PAGE, json!({"threadId":THREAD,"turnId":TURN,"anchor":{"kind":"oldest"},"limit":5}), "items"),
+                    _ => (methods::TURN_WORK_ITEMS_GET, json!({"threadId":THREAD,"turnId":TURN,"workItemIds":["missing"]}), "removedWorkItemIds"),
+                };
+                input.send(Message::Text(rpc(&read, method, params).into())).unwrap();
+                let b = recv_response_by_id(&mut f.responses, &id(&read)).await;
+                assert!(if field == "thread" { b.result[field].is_object() } else { b.result[field].is_array() }, "{method}: {b:?}");
+                let cancel = format!("rc-{round:02}");
+                input.send(Message::Text(rpc(&cancel, methods::TURN_CANCEL,
+                    json!({"thread_id":THREAD,"turn_id":TURN})).into())).unwrap();
+                recv_response_by_id(&mut f.responses, &id(&cancel)).await;
+            }
+            // This is an observable independent completion while A has no permit.
+            assert!(drops.try_recv().is_err());
+            input.send(update.clone()).unwrap();
+            input.send(read_c.clone()).unwrap();
+            input.send(binary.clone()).unwrap();
+            input.send(malformed.clone()).unwrap();
+            input
+                .send(Message::Text(
+                    rpc(
+                        "read-marker",
+                        methods::TURN_CANCEL,
+                        json!({"thread_id":THREAD,"turn_id":TURN}),
+                    )
+                    .into(),
+                ))
+                .unwrap();
+            recv_response_by_id(&mut f.responses, &id("read-marker")).await;
+            assert!(
+                f.responses.try_recv().is_err(),
+                "no serial or later-read reply before A completes"
+            );
+            gate.release.add_permits(1);
+            recv_response_by_id(&mut f.responses, &id("read-a")).await;
+        };
+        let (alive, ()) = tokio::join!(pump, driver);
+        assert!(alive);
+        assert_eq!(
+            deferred,
+            VecDeque::from([update, read_c, binary, malformed])
+        );
+        handlers.shutdown().await;
+        assert_eq!(drops.recv().await.unwrap(), id("read-a"));
+    })
+    .await
+    .expect("independent completion and conservative serial/Binary barrier");
+}
+
+#[tokio::test]
+async fn full_read_slots_defer_and_reuse_capacity_without_spending_cancel_or_wait_slots() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut f = Fixture::new().await;
+        let mut context = f
+            .processor
+            .session_manager
+            .connection_context(f.connection)
+            .await
+            .unwrap();
+        let (renewals, _) = watch::channel(ConnectionAccessLease::new(
+            context.principal().clone(),
+            Duration::from_secs(60),
+        ));
+        let (gate, mut entries, mut drops) =
+            read_gate(&["slot0", "slot1", "slot2", "slot3", "slot4"]);
+        let dispatch = gated_read_dispatch(f.processor.clone(), gate.clone());
+        let mut handlers = ConnectionHandlers::default();
+        let mut deferred = VecDeque::from([get_thread("slot0")]);
+        let (input, mut reader) = incoming();
+        let pump = process_with_access_renewals(
+            std::future::pending(),
+            IngressMode::ReadGroup,
+            &mut reader,
+            &mut deferred,
+            &f.auth,
+            &f.processor.session_manager,
+            &mut context,
+            &renewals,
+            &f.outbound,
+            &mut handlers,
+            &dispatch,
+        );
+        let driver = async {
+            for label in ["slot1", "slot2", "slot3"] {
+                input.send(get_thread(label)).unwrap();
+            }
+            let mut started = HashSet::new();
+            for _ in 0..4 {
+                started.insert(entries.recv().await.unwrap());
+            }
+            assert_eq!(started.len(), 4);
+            input.send(get_thread("slot4")).unwrap();
+            input
+                .send(Message::Text(
+                    rpc("slot-wait", methods::TASK_WAIT, json!({"run_ids":[RUN]})).into(),
+                ))
+                .unwrap();
+            input
+                .send(Message::Text(
+                    rpc(
+                        "slot-cancel",
+                        methods::TURN_CANCEL,
+                        json!({"thread_id":THREAD,"turn_id":TURN}),
+                    )
+                    .into(),
+                ))
+                .unwrap();
+            recv_response_by_id(&mut f.responses, &id("slot-cancel")).await;
+            assert!(entries.try_recv().is_err(), "fifth read must stay queued");
+            gate.release.add_permits(1);
+            assert_eq!(
+                entries.recv().await.unwrap(),
+                id("slot4"),
+                "completion must reclaim a read slot"
+            );
+            // Close while the other read children and no-timeout wait are blocked.
+            input.send(Message::Close(None)).unwrap();
+        };
+        let (alive, ()) = tokio::join!(pump, driver);
+        assert!(!alive);
+        handlers.shutdown().await;
+        let mut finished = HashSet::new();
+        for _ in 0..5 {
+            finished.insert(drops.recv().await.unwrap());
+        }
+        assert_eq!(
+            finished.len(),
+            5,
+            "all started children joined before resources retire"
+        );
+        f.assert_task_running().await;
+    })
+    .await
+    .expect("bounded read capacity, control reserve, slot reuse and disconnect cleanup");
+}
+
+#[tokio::test]
+async fn read_classification_keeps_actual_dispatcher_validation_and_target_authorization() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut f = Fixture::new().await;
+        let mut context = f
+            .processor
+            .session_manager
+            .connection_context(f.connection)
+            .await
+            .unwrap();
+        let (renewals, _) = watch::channel(ConnectionAccessLease::new(
+            context.principal().clone(),
+            Duration::from_secs(60),
+        ));
+        let (gate, mut entries, _) = read_gate(&["validation-block"]);
+        let dispatch = gated_read_dispatch(f.processor.clone(), gate.clone());
+        let mut handlers = ConnectionHandlers::default();
+        let mut deferred = VecDeque::from([get_thread("validation-block")]);
+        let (input, mut reader) = incoming();
+        let pump = process_with_access_renewals(
+            std::future::pending(),
+            IngressMode::ReadGroup,
+            &mut reader,
+            &mut deferred,
+            &f.auth,
+            &f.processor.session_manager,
+            &mut context,
+            &renewals,
+            &f.outbound,
+            &mut handlers,
+            &dispatch,
+        );
+        let driver = async {
+            entries.recv().await.unwrap();
+            for (label, payload) in [
+                (
+                    "read-version",
+                    rpc(
+                        "read-version",
+                        methods::THREAD_GET,
+                        json!({"thread_id":THREAD}),
+                    )
+                    .replace("2.0", "1.0"),
+                ),
+                (
+                    "read-params",
+                    rpc("read-params", methods::THREAD_GET, json!({})),
+                ),
+                (
+                    "read-target",
+                    rpc(
+                        "read-target",
+                        methods::THREAD_GET,
+                        json!({"thread_id":"missing"}),
+                    ),
+                ),
+            ] {
+                input.send(Message::Text(payload.into())).unwrap();
+                recv_error_by_id(&mut f.responses, &id(label)).await;
+            }
+            input.send(Message::Close(None)).unwrap();
+        };
+        let (alive, ()) = tokio::join!(pump, driver);
+        assert!(!alive);
+        handlers.shutdown().await;
+    })
+    .await
+    .expect("allowlist cannot supply authority or bypass validation");
+}
+
+#[tokio::test]
+async fn socket_serial_predecessors_finish_before_explicit_and_implicit_reads() {
+    use axum::{Router, extract::ws::WebSocketUpgrade, routing::get};
+    use futures_util::SinkExt;
+    use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let f = Fixture::new().await;
+        let workspace_b = f.processor.workspace_manager.create_workspace("read_barrier_b", Some("B")).await.unwrap().id;
+        let (stop, stop_rx) = watch::channel(false);
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let finished = Arc::new(std::sync::Mutex::new(Some(finished)));
+        let runtime_home = tempfile::tempdir().unwrap();
+        let processor = Arc::new((*f.processor).clone().with_runtime_home_for_tests(runtime_home.path().to_path_buf()));
+        let auth = f.auth.clone();
+        let router = Router::new().route("/ws", get(move |upgrade: WebSocketUpgrade| {
+            let processor = processor.clone();
+            let auth = auth.clone();
+            let stop_rx = stop_rx.clone();
+            let finished = finished.clone();
+            async move {
+                upgrade.on_upgrade(move |socket| async move {
+                    let mut principal = (*authenticated_test_superuser()).clone();
+                    principal.access_expires_at_unix = crate::helpers::unix_timestamp_secs().unwrap() + 3600;
+                    let result = crate::transport::run_normal_connection(socket,
+                        toml::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/default.toml"))).unwrap(),
+                        Arc::new(principal), auth, processor.clone(), processor.session_manager.clone(), stop_rx).await;
+                    let _ = finished.lock().unwrap().take().unwrap().send(result);
+                })
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut server = crate::message::spawn_message_task(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (mut socket, _) = connect_async(format!("ws://{address}/ws")).await.unwrap();
+        socket.send(ClientMessage::Text(rpc("socket-block", methods::PROVIDER_MODELS_LIST,
+            json!({"workspace_id":f.workspace,"provider":"openai"})).into())).await.unwrap();
+        f.gate.entered.notified().await;
+        for frame in [
+            rpc("socket-write", methods::THREAD_UPDATE, json!({"workspace_id":f.workspace,"thread_id":THREAD,"name":"Committed before read"})),
+            rpc("socket-select", methods::WORKSPACE_SELECT, json!({"workspace_id":workspace_b,"make_current":false})),
+            rpc("socket-implicit", methods::SETTINGS_GET, json!({})),
+            rpc("socket-read", methods::THREAD_GET, json!({"thread_id":THREAD})),
+            rpc("socket-page", methods::THREAD_TIMELINE_PAGE, json!({"threadId":THREAD,"anchor":{"kind":"newest"},"limit":10})),
+            rpc("socket-marker", methods::TURN_CANCEL, json!({"thread_id":THREAD,"turn_id":TURN})),
+        ] { socket.send(ClientMessage::Text(frame.into())).await.unwrap(); }
+        // Read without filtering away early replies: a read bypassing a serial
+        // predecessor would be a failure even if its final contents looked right.
+        loop {
+            let frame = socket.next().await.unwrap().unwrap();
+            if let ClientMessage::Text(text) = frame {
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                if value.get("id").is_some() {
+                    assert_eq!(value["id"], id("socket-marker"), "ordinary FIFO must remain blocked");
+                    assert!(value.get("error").is_none(), "{value}");
+                    break;
+                }
+            }
+        }
+        f.gate.release.notify_one();
+        // Keep a control producer active until ordinary/read completion, rather
+        // than ending the input stream to let the FIFO drain. One outstanding
+        // Cancel respects its distinct capacity even on a slow domain handler.
+        let mut flood_round = 0;
+        socket.send(ClientMessage::Text(rpc("flood000000", methods::TURN_CANCEL,
+            json!({"thread_id":THREAD,"turn_id":TURN})).into())).await.unwrap();
+        let mut replies = Vec::new();
+        while replies.len() < 6 {
+            if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                if let Some(request) = value.get("id").and_then(JsonValue::as_str) {
+                    assert!(value.get("error").is_none(), "{value}");
+                    if request == id(&format!("flood{flood_round:06}")) {
+                        flood_round += 1;
+                        socket.send(ClientMessage::Text(rpc(&format!("flood{flood_round:06}"), methods::TURN_CANCEL,
+                            json!({"thread_id":THREAD,"turn_id":TURN})).into())).await.unwrap();
+                        continue;
+                    }
+                    if request == id("socket-implicit") {
+                        assert_eq!(value["result"]["settings"]["self_improvement_status"]["workspace_id"], workspace_b);
+                    }
+                    if request == id("socket-read") {
+                        assert_eq!(value["result"]["thread"]["name"], "Committed before read");
+                    }
+                    replies.push(request.to_owned());
+                }
+            }
+        }
+        assert_eq!(&replies[..4], &[id("socket-block"), id("socket-write"), id("socket-select"), id("socket-implicit")]);
+        assert_eq!(replies[4..].iter().cloned().collect::<HashSet<_>>(), HashSet::from([id("socket-read"), id("socket-page")]));
+        let selected = f.processor.session_manager.connection_ids().await.into_iter().filter(|id| *id != f.connection).collect::<Vec<_>>();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(f.processor.session_manager.connection_workspace_id(selected[0]).await.as_deref(), Some(workspace_b.as_str()), "late resource A page must preserve selected B");
+        stop.send(true).unwrap();
+        completion.await.unwrap().unwrap();
+        assert_eq!(f.processor.session_manager.connection_ids().await, vec![f.connection]);
+        drop(socket);
+        server.abort_and_join().await;
+    }).await.expect("actual connection FIFO, selection freshness and write/read barrier");
 }
