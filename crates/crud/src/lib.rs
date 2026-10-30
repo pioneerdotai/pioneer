@@ -40571,6 +40571,7 @@ mod tests {
             .unwrap();
         let initial = RecoveryDiagnostic {
             last_failure: Some(RecoveryProviderFailure {
+                raw_response: None,
                 error_reason: None,
                 request_id: None,
                 class: ProviderFailureClass::StreamTruncated,
@@ -40621,6 +40622,10 @@ mod tests {
             .unwrap();
         let final_diagnostic = RecoveryDiagnostic {
             last_failure: Some(RecoveryProviderFailure {
+                raw_response: Some(pioneer_protocol::ProviderErrorResponse::from_bytes(
+                    b"{\"error\":\"original provider diagnostic body\"}",
+                    false,
+                )),
                 error_reason: Some(pioneer_protocol::ProviderErrorReason::PermissionDenied),
                 request_id: Some(
                     pioneer_protocol::ProviderRequestId::try_from("gen-atomic_fixture".to_owned())

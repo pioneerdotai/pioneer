@@ -2068,6 +2068,7 @@ impl Provider for ProviderFixture {
     fn classify_failure(&self, _: &anyhow::Error) -> Option<ProviderFailureClassification> {
         Some(ProviderFailureClassification {
             is_network_error: false,
+            raw_response: None,
             error_reason: None,
             request_id: None,
             class: ProviderFailureClass::RateLimit,

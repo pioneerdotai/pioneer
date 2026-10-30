@@ -24,6 +24,7 @@ pub struct ProviderFailureClassification {
     /// Retains the registry's network fallback after the unsafe source is dropped.
     /// Internal transport fact, never serialized into public diagnostics.
     pub is_network_error: bool,
+    pub raw_response: Option<pioneer_protocol::ProviderErrorResponse>,
     pub error_reason: Option<pioneer_protocol::ProviderErrorReason>,
     pub request_id: Option<pioneer_protocol::ProviderRequestId>,
     pub class: ProviderFailureClass,
@@ -36,6 +37,7 @@ impl ProviderFailureClassification {
     pub fn new(class: ProviderFailureClass) -> Self {
         Self {
             is_network_error: false,
+            raw_response: None,
             error_reason: None,
             request_id: None,
             class,

@@ -5676,6 +5676,7 @@ async fn execute_agent_provider_response(
                                 item_id: current_thinking_id.clone(),
                                 item_type: TurnItemType::Reasoning,
                                 failure: ProviderFailureDetails {
+                                    raw_response: None,
                                     error_reason: None,
                                     request_id: None,
                                     provider: provider.name().to_owned(),

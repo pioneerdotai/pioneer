@@ -6504,6 +6504,7 @@ mod tests {
 
     fn provider_failure(class: ProviderFailureClass, message: &str) -> ProviderFailureDetails {
         ProviderFailureDetails {
+            raw_response: None,
             error_reason: None,
             request_id: None,
             provider: "test-provider".to_owned(),

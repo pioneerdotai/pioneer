@@ -1320,25 +1320,244 @@ async fn registry_audio_text_continuation_records_actual_chat_route() {
     }
 }
 
-#[test]
-fn replay_uses_input_supported_message_fields_and_preserves_native_phase() {
-    for phase in [Value::Null, json!("commentary"), json!("final_answer")] {
-        let mut item = message("msg-original", phase.clone(), "readable");
-        item["content"][0]["annotations"] = json!([{"type":"synthetic_annotation"}]);
-        let input = replay::input_items(&[item.clone()]).unwrap();
-        assert_eq!(input[0]["phase"], phase);
-        assert_eq!(
-            input[0]["content"][0],
-            json!({"type":"input_text","text":"readable"})
+#[tokio::test]
+async fn assistant_history_preserves_output_parts_and_plain_text_in_rendered_requests() {
+    let operation = async {
+        let provider = ResponsesApiCompatibleProvider::new(
+            "openai",
+            "https://synthetic.invalid",
+            "fixture",
+            AuthStyle::Bearer,
         );
-        assert!(input[0].get("id").is_none());
-        assert!(input[0].get("status").is_none());
-        item.as_object_mut().unwrap().remove("phase");
-        assert!(
-            replay::input_items(&[item]).unwrap()[0]
-                .get("phase")
-                .is_none()
+        for phase in [
+            None,
+            Some(Value::Null),
+            Some(json!("commentary")),
+            Some(json!("final_answer")),
+        ] {
+            let mut item = message("msg-original", Value::Null, "readable");
+            item["content"] = json!([
+                {"type":"output_text","text":"readable","annotations":[
+                    {"type":"url_citation","start_index":0,"end_index":8,"title":"Fixture","url":"https://example.com"}
+                ],"logprobs":[]},
+                {"type":"output_text","text":"more text"},
+                {"type":"refusal","refusal":"Cannot help"}
+            ]);
+            match &phase {
+                Some(phase) => item["phase"] = phase.clone(),
+                None => {
+                    item.as_object_mut().unwrap().remove("phase");
+                }
+            }
+            let mut expected = item.clone();
+            expected["content"][1]["annotations"] = json!([]);
+            let mut req = request();
+            let mut assistant = ChatMessage::assistant("common aggregate must not be duplicated");
+            assistant.provider_replay_state = Some(ProviderReplayState::for_model(
+                provider.name(),
+                &req.model,
+                json!({"schema_version":1,"wire_api":"responses","authority_scope":provider.authority,"output":[item]}),
+            ));
+            req.messages = vec![
+                ChatMessage::user("before"),
+                assistant,
+                ChatMessage::user("continue"),
+            ];
+            let prepared = provider
+                .prepare(req, &provider.capabilities())
+                .await
+                .unwrap();
+            for stream in [false, true] {
+                let body = provider.render(&prepared, stream).unwrap();
+                let input = body["input"].as_array().unwrap();
+                assert_eq!(input.len(), 3);
+                assert_eq!(input[1], expected);
+                assert_eq!(input[0]["content"][0]["type"], "input_text");
+                assert_eq!(input[2]["content"][0]["type"], "input_text");
+                assert!(!body.to_string().contains("common aggregate"));
+            }
+            if phase.is_none() {
+                let mut nullable = prepared.request.clone();
+                let part = &mut nullable.messages[1]
+                    .provider_replay_state
+                    .as_mut()
+                    .unwrap()
+                    .payload["output"][0]["content"][0];
+                part["annotations"] = Value::Null;
+                part["logprobs"] = Value::Null;
+                let nullable = provider
+                    .prepare(nullable, &provider.capabilities())
+                    .await
+                    .unwrap();
+                let body = provider.render(&nullable, false).unwrap();
+                assert_eq!(body["input"][1]["content"][0]["annotations"], json!([]));
+                assert!(body["input"][1]["content"][0].get("logprobs").is_none());
+                for field in ["annotations", "logprobs"] {
+                    let mut invalid = prepared.request.clone();
+                    invalid.messages[1]
+                        .provider_replay_state
+                        .as_mut()
+                        .unwrap()
+                        .payload["output"][0]["content"][0][field] =
+                        json!("invalid metadata shape");
+                    assert!(
+                        provider
+                            .prepare(invalid, &provider.capabilities())
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+        }
+        let mut req = request();
+        let mut assistant = ChatMessage::assistant("previous answer");
+        assistant.reasoning_content = Some("readable reasoning".into());
+        req.messages = vec![
+            ChatMessage::user("before"),
+            assistant,
+            ChatMessage::user("continue"),
+        ];
+        let prepared = provider
+            .prepare(req, &provider.capabilities())
+            .await
+            .unwrap();
+        for stream in [false, true] {
+            let body = provider.render(&prepared, stream).unwrap();
+            let input = body["input"].as_array().unwrap();
+            assert_eq!(input.len(), 4);
+            assert_eq!(
+                input[1],
+                json!({"role":"assistant","content":"[Historical assistant reasoning]\nreadable reasoning"})
+            );
+            assert_eq!(
+                input[2],
+                json!({"role":"assistant","content":"previous answer"})
+            );
+            assert_eq!(input[0]["content"][0]["type"], "input_text");
+            assert_eq!(input[3]["content"][0]["type"], "input_text");
+        }
+    };
+    crate::attachments::runtime::with_async_authority_scope(
+        "responses-history-fixture".into(),
+        operation,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn responses_output_caps_do_not_require_model_specific_control_metadata() {
+    crate::attachments::runtime::with_async_authority_scope(
+        "responses-cap-fixture".into(),
+        async {
+            for name in ["openai", "synthetic-responses", "vercel-ai-gateway"] {
+                let provider = ResponsesApiCompatibleProvider::new(
+                    name,
+                    "https://synthetic.invalid",
+                    "fixture",
+                    AuthStyle::Bearer,
+                );
+                let mut req = request();
+                req.model = "unlisted-cap-fixture".into();
+                req.tools = None;
+                req.tool_choice = None;
+                req.max_tokens = Some(123);
+                let budget = provider.prepare_input_budget(req.clone()).await.unwrap();
+                let prepared = provider
+                    .prepare(budget.request, &provider.capabilities())
+                    .await
+                    .unwrap();
+                for stream in [false, true] {
+                    let body = provider.render(&prepared, stream).unwrap();
+                    assert_eq!(body["max_output_tokens"], 123);
+                    assert!(body.get("reasoning").is_none());
+                    assert!(body.get("temperature").is_none());
+                }
+                req.max_tokens = Some(0);
+                assert!(provider.prepare_input_budget(req.clone()).await.is_err());
+                assert!(
+                    provider
+                        .prepare(req.clone(), &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+                req.max_tokens = None;
+                let prepared = provider
+                    .prepare(req.clone(), &provider.capabilities())
+                    .await
+                    .unwrap();
+                assert!(
+                    provider
+                        .render(&prepared, false)
+                        .unwrap()
+                        .get("max_output_tokens")
+                        .is_none()
+                );
+                req.reasoning = Some(crate::ReasoningConfig::Effort(crate::ReasoningEffort::High));
+                assert!(
+                    provider
+                        .prepare(req.clone(), &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+                req.reasoning = None;
+                req.temperature = Some(0.5);
+                assert!(
+                    provider
+                        .prepare(req, &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn responses_sampling_rejects_non_finite_and_out_of_range_values_for_all_services() {
+    use crate::attachments::{admission::AdmissionState, regression::scoped};
+    use std::sync::Arc;
+    for name in ["openai", "synthetic-responses", "vercel-ai-gateway"] {
+        let provider = ResponsesApiCompatibleProvider::new(
+            name,
+            "https://synthetic.invalid",
+            "fixture",
+            AuthStyle::Bearer,
         );
+        let mut req = request();
+        req.model = "gpt-4.1-sampling-fixture".into();
+        req.tools = None;
+        req.tool_choice = None;
+        let state = Arc::new(AdmissionState::for_test(Arc::new(compatible_catalog(
+            name,
+            &req.model,
+            json!({"reasoning":false,"compat":{"supportsTemperature":true}}),
+        ))));
+        scoped(state, async {
+            for temperature in [0.0, 2.0] {
+                req.temperature = Some(temperature);
+                let budget = provider.prepare_input_budget(req.clone()).await.unwrap();
+                let prepared = provider
+                    .prepare(budget.request, &provider.capabilities())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    provider.render(&prepared, false).unwrap()["temperature"],
+                    json!(temperature)
+                );
+            }
+            for temperature in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.1, 2.1] {
+                req.temperature = Some(temperature);
+                assert!(provider.prepare_input_budget(req.clone()).await.is_err());
+                assert!(
+                    provider
+                        .prepare(req.clone(), &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+            }
+        })
+        .await;
     }
 }
 
@@ -1677,6 +1896,7 @@ async fn generic_responses_replay_survives_budget_media_and_render_for_chat_poli
                             "SYNTHETIC_COMPLETED_CIPHERTEXT"
                         );
                         assert_eq!(input[1]["phase"], "commentary");
+                        assert_eq!(input[1]["content"][0]["type"], "output_text");
                         assert_eq!(input[1]["content"][0]["text"], "native commentary");
                         assert_eq!(
                             input

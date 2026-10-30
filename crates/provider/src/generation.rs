@@ -437,6 +437,12 @@ fn responses_fields_from_catalog(
     provider: &str,
     request: &ChatRequest,
 ) -> Result<Fields> {
+    ensure!(
+        request
+            .temperature
+            .is_none_or(|value| value.is_finite() && (0.0..=2.0).contains(&value)),
+        "Responses temperature must be finite and within 0..=2"
+    );
     validate_cap_with_catalog(catalog, provider, request)?;
     let native = native_model(provider, &request.model);
     let model = native.as_ref().or_else(|| {
@@ -465,16 +471,17 @@ fn responses_fields_with_model(
     }
     validate_temperature(model, request)?;
     let mut fields = Fields::new();
-    if request.max_tokens.is_none() && request.reasoning.is_none() && request.temperature.is_none()
-    {
-        return Ok(fields); // Omission leaves the compatible service's defaults.
+    // This is a Responses protocol field, independent of model-specific
+    // sampling/reasoning support. Known output ceilings were checked above.
+    if let Some(cap) = request.max_tokens {
+        fields.insert("max_output_tokens".into(), json!(cap));
+    }
+    if request.reasoning.is_none() && request.temperature.is_none() {
+        return Ok(fields); // Omitted sampling/reasoning use the service defaults.
     }
     let model = model
         .filter(|m| m.api == "openai-responses")
         .ok_or_else(|| anyhow::anyhow!("unverified Responses generation contract"))?;
-    if let Some(cap) = request.max_tokens {
-        fields.insert("max_output_tokens".into(), json!(cap));
-    }
     if let Some(reasoning) = request.reasoning {
         ensure!(model.reasoning, "selected model does not support reasoning");
         let toggle_off = provider == "vercel-ai-gateway"
@@ -567,6 +574,7 @@ fn openai_api_fields(
         || super::providers::openai::chat_only_audio_model(id);
     ensure!(
         known
+            || responses && request.temperature.is_none() && request.reasoning.is_none()
             || request.max_tokens.is_none()
                 && request.temperature.is_none()
                 && request.reasoning.is_none(),

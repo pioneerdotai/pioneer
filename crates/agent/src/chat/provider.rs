@@ -1803,6 +1803,7 @@ fn provider_failure_error_with_classification(
     );
     let ProviderFailureClassification {
         is_network_error: _,
+        raw_response,
         error_reason,
         request_id,
         class,
@@ -1816,6 +1817,7 @@ fn provider_failure_error_with_classification(
         item_id: item_id.to_owned(),
         item_type,
         failure: ProviderFailureDetails {
+            raw_response,
             error_reason,
             request_id,
             provider: provider.to_owned(),
@@ -1838,6 +1840,7 @@ fn infer_failure_classification(
 ) -> ProviderFailureClassification {
     ProviderFailureClassification {
         is_network_error: false,
+        raw_response: None,
         error_reason: None,
         request_id: None,
         class: classify_provider_failure_message(message, stage),
@@ -1856,6 +1859,7 @@ fn merge_failure_classification(
     match classification {
         Some(classification) => ProviderFailureClassification {
             is_network_error: classification.is_network_error,
+            raw_response: classification.raw_response,
             error_reason: classification.error_reason,
             request_id: classification.request_id,
             class: classification.class,
@@ -2005,6 +2009,7 @@ mod tests {
                 message,
                 classification: typed.then(|| ProviderFailureClassification {
                     is_network_error: false,
+                    raw_response: None,
                     error_reason: None,
                     request_id: None,
                     class,
@@ -2233,6 +2238,188 @@ mod tests {
         .await
     }
 
+    #[tokio::test]
+    async fn responses_failures_retain_original_responses_separately_from_public_messages() {
+        use pioneer_protocol::{ProviderErrorReason as Reason, RecoveryDiagnostic};
+        for (code, message, reason) in [
+            (
+                "invalid_request_error",
+                "Item 'rs_private_payload' of type 'reasoning' was provided without its required following item.",
+                Reason::ResponsesMissingRequiredItem,
+            ),
+            (
+                "invalid_request_error",
+                "No tool call found for function call output with call_id private_payload.",
+                Reason::ResponsesUnpairedToolCall,
+            ),
+            (
+                "invalid_request_error",
+                "Missing required parameter: 'private_payload'.",
+                Reason::MissingRequiredParameter,
+            ),
+            (
+                "invalid_request_error",
+                "Unsupported parameter: 'private_payload'.",
+                Reason::UnsupportedParameter,
+            ),
+            (
+                "unsupported_value",
+                "private_payload https://private.example/?key=secret",
+                Reason::InvalidParameterValue,
+            ),
+            (
+                "invalid_type",
+                "private_payload https://private.example/?key=secret",
+                Reason::InvalidParameterType,
+            ),
+            (
+                "private_payload",
+                "private_payload https://private.example/?key=secret",
+                Reason::Unmapped,
+            ),
+        ] {
+            for stream in [false, true] {
+                let body = format!(
+                    "  {}\n",
+                    serde_json::json!({"error":{
+                        "type":"invalid_request_error", "code":code,
+                        "message":message, "param":"private_payload"
+                    }})
+                );
+                let failure = failure_from_local_endpoint(
+                    "openai",
+                    400,
+                    "",
+                    stream,
+                    Some(body.clone()),
+                    true,
+                    "X-Request-Id: req_diag_fixture\r\n",
+                    false,
+                )
+                .await;
+                assert_eq!(
+                    failure.class,
+                    ProviderFailureClass::MalformedProviderRequest
+                );
+                assert_eq!(failure.http_status, Some(400));
+                assert!(!failure.is_recoverable_hint);
+                assert_eq!(failure.error_reason, Some(reason));
+                assert_eq!(
+                    failure.request_id.clone().map(String::from).as_deref(),
+                    Some("req_diag_fixture")
+                );
+                let diagnostic = RecoveryDiagnostic::provider(&failure);
+                let raw = diagnostic
+                    .last_failure
+                    .as_ref()
+                    .unwrap()
+                    .raw_response
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(raw.body, body);
+                assert!(!raw.truncated);
+                assert_eq!(failure.raw_response.as_ref(), Some(raw));
+                let stored = serde_json::to_string(&diagnostic).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<RecoveryDiagnostic>(&stored).unwrap(),
+                    diagnostic
+                );
+                assert!(
+                    diagnostic
+                        .public_message()
+                        .contains(reason.public_description())
+                );
+                for safe in [
+                    diagnostic.public_message(),
+                    format!("{failure:?} {diagnostic:?}"),
+                ] {
+                    assert!(!safe.contains("private_payload"));
+                    assert!(!safe.contains("private.example"));
+                    assert!(!safe.contains("key=secret"));
+                }
+            }
+        }
+        // Distinct transport shapes must retain the actual body/event rather
+        // than reconstructing JSON or retaining only recognized error fields.
+        let native = r#"{ "type":"error", "message":"unknown private_payload", "extra":42 }"#;
+        let failed = r#"{ "status":"failed", "error":{"message":"private_payload"} }"#;
+        let failed_event = format!(r#"{{ "type":"response.failed", "response":{failed} }}"#);
+        let oversized = "x".repeat(pioneer_protocol::ProviderErrorResponse::MAX_BYTES + 1);
+        for (status, stream, body, expected, truncated, interrupted) in [
+            (
+                400,
+                false,
+                "upstream private_payload".to_owned(),
+                "upstream private_payload".to_owned(),
+                false,
+                false,
+            ),
+            (
+                400,
+                true,
+                oversized.clone(),
+                oversized[..oversized.len() - 1].to_owned(),
+                true,
+                false,
+            ),
+            (
+                400,
+                false,
+                "partial private_payload".to_owned(),
+                "partial private_payload".to_owned(),
+                true,
+                true,
+            ),
+            (
+                200,
+                false,
+                failed.to_owned(),
+                failed.to_owned(),
+                false,
+                false,
+            ),
+            (
+                200,
+                true,
+                format!("data: {native}\n\n"),
+                native.to_owned(),
+                false,
+                false,
+            ),
+            (
+                200,
+                true,
+                format!("data: {failed_event}\n\n"),
+                failed_event,
+                false,
+                false,
+            ),
+        ] {
+            let failure = failure_from_local_endpoint(
+                "openai",
+                status,
+                "",
+                stream,
+                Some(body),
+                true,
+                "",
+                interrupted,
+            )
+            .await;
+            let diagnostic = RecoveryDiagnostic::provider(&failure);
+            let raw = diagnostic
+                .last_failure
+                .as_ref()
+                .unwrap()
+                .raw_response
+                .as_ref()
+                .unwrap();
+            assert_eq!(raw.body, expected);
+            assert_eq!(raw.truncated, truncated);
+            assert!(!diagnostic.public_message().contains("private_payload"));
+        }
+    }
+
     // Injected adapter fixtures use the required authority wrapper without
     // custom-endpoint redaction masking leaks in standard diagnostics.
     async fn failure_from_local_endpoint(
@@ -2446,7 +2633,14 @@ mod tests {
         ) else {
             panic!("expected provider failure")
         };
-        assert!(!serde_json::to_string(&failure).unwrap().contains(secret));
+        assert!(!format!("{failure:?}").contains(secret));
+        let mut public_fields = failure.clone();
+        public_fields.raw_response = None;
+        assert!(
+            !serde_json::to_string(&public_fields)
+                .unwrap()
+                .contains(secret)
+        );
         failure
     }
 
@@ -3287,7 +3481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_path_is_absent_from_durable_failure_details() {
+    async fn endpoint_path_is_retained_only_in_the_original_error_response() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3332,7 +3526,9 @@ mod tests {
         ) else {
             panic!("expected provider failure")
         };
-        assert!(!serde_json::to_string(&failure).unwrap().contains(secret));
+        assert!(failure.raw_response.as_ref().unwrap().body.contains(secret));
+        assert!(!format!("{failure:?}").contains(secret));
+        assert!(!failure.message.as_deref().unwrap().contains(secret));
         assert_eq!(failure.class, ProviderFailureClass::RateLimit);
         assert_eq!(failure.http_status, Some(429));
         assert!(failure.is_recoverable_hint);
@@ -3415,6 +3611,7 @@ mod tests {
                 "provider error: HTTP 400 opaque rejection".to_owned(),
                 Some(ProviderFailureClassification {
                     is_network_error: false,
+                    raw_response: None,
                     error_reason: None,
                     request_id: None,
                     class: ProviderFailureClass::UnsupportedStreaming,

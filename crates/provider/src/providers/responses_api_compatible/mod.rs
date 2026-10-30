@@ -30,7 +30,7 @@ pub struct ResponsesApiCompatibleProvider {
     provisional_messages: bool,
 }
 
-/// Contains only allowlisted classification facts, never native message/body.
+/// Public formatting omits the original response retained for local diagnostics.
 #[derive(Debug)]
 struct SafeError(ProviderFailureClassification);
 impl std::fmt::Display for SafeError {
@@ -88,7 +88,60 @@ impl SafeError {
         let mut facts = ProviderFailureClassification::new(class);
         facts.http_status = status;
         facts.provider_code = code.map(str::to_owned);
+        facts.error_reason = Self::reason(value, &message);
         Self(facts)
+    }
+
+    /// Public descriptions use controlled reasons; raw responses stay separate.
+    /// These diagnostics never participate in classification or retry policy.
+    fn reason(value: &Value, message: &str) -> Option<pioneer_protocol::ProviderErrorReason> {
+        use pioneer_protocol::ProviderErrorReason as Reason;
+        let code = value["code"].as_str().or_else(|| value["type"].as_str());
+        let specific = match code {
+            Some("missing_required_parameter") => Some(Reason::MissingRequiredParameter),
+            Some("unsupported_parameter" | "unknown_parameter") => {
+                Some(Reason::UnsupportedParameter)
+            }
+            Some("invalid_value" | "unsupported_value") => Some(Reason::InvalidParameterValue),
+            Some("invalid_type") => Some(Reason::InvalidParameterType),
+            _ => None,
+        };
+        if specific.is_some() {
+            return specific;
+        }
+        if message.contains("item") && message.contains("without its required") {
+            return Some(Reason::ResponsesMissingRequiredItem);
+        }
+        if message.starts_with("no tool output found")
+            || message.starts_with("no tool call found for function call output")
+        {
+            return Some(Reason::ResponsesUnpairedToolCall);
+        }
+        if message.starts_with("missing required parameter") {
+            return Some(Reason::MissingRequiredParameter);
+        }
+        if message.starts_with("unsupported parameter")
+            || message.starts_with("unknown parameter")
+            || message.starts_with("unrecognized request argument")
+        {
+            return Some(Reason::UnsupportedParameter);
+        }
+        if message.starts_with("invalid value") || message.starts_with("unsupported value") {
+            return Some(Reason::InvalidParameterValue);
+        }
+        if message.starts_with("invalid type") {
+            return Some(Reason::InvalidParameterType);
+        }
+        match code {
+            Some("invalid_api_key" | "authentication_error") => Some(Reason::Authentication),
+            Some("insufficient_quota") => Some(Reason::PaymentRequired),
+            Some("invalid_request_error") => Some(Reason::InvalidRequest),
+            Some("model_not_found") => Some(Reason::NotFound),
+            Some("server_error" | "internal_server_error" | "overloaded") => Some(Reason::Server),
+            Some(code) => Reason::from_openrouter_code(code).or(Some(Reason::Unmapped)),
+            None if !message.is_empty() => Some(Reason::Unmapped),
+            None => None,
+        }
     }
     fn protocol(error: anyhow::Error) -> anyhow::Error {
         if error.downcast_ref::<SafeError>().is_some()
@@ -104,6 +157,14 @@ impl SafeError {
         );
         facts.provider_code = Some("responses_protocol_error".into());
         SafeError(facts).into()
+    }
+    fn with_response(mut error: anyhow::Error, body: &[u8]) -> anyhow::Error {
+        if let Some(failure) = error.downcast_mut::<Self>() {
+            failure.0.raw_response = Some(pioneer_protocol::ProviderErrorResponse::from_bytes(
+                body, false,
+            ));
+        }
+        error
     }
     fn transport(error: anyhow::Error) -> anyhow::Error {
         if error
@@ -252,19 +313,35 @@ impl ResponsesApiCompatibleProvider {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .map(|s| s.saturating_mul(1000));
-        let bytes =
-            crate::http::read_response_bytes_bounded(response, 16 * 1024, "provider_error_body")
-                .await;
-        let body_retry = bytes
-            .as_ref()
-            .ok()
-            .and_then(|body| std::str::from_utf8(body).ok())
+        // Keep the bounded original body even if it is not JSON or the read
+        // fails partway through. This payload is not used in public error prose.
+        let mut bytes = Vec::new();
+        let mut incomplete = false;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let Ok(chunk) = chunk else {
+                incomplete = true;
+                break;
+            };
+            let remaining = pioneer_protocol::ProviderErrorResponse::MAX_BYTES - bytes.len();
+            bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            if chunk.len() > remaining {
+                incomplete = true;
+                break;
+            }
+        }
+        let body_retry = (!incomplete)
+            .then(|| std::str::from_utf8(&bytes).ok())
+            .flatten()
             .and_then(crate::failure::extract_retry_after_ms);
-        let value = bytes
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        let value = (!incomplete)
+            .then(|| serde_json::from_slice::<Value>(&bytes).ok())
+            .flatten()
             .unwrap_or(Value::Null);
         let mut failure = SafeError::native(value.get("error").unwrap_or(&value), Some(status));
+        failure.0.raw_response = Some(pioneer_protocol::ProviderErrorResponse::from_bytes(
+            &bytes, incomplete,
+        ));
         failure.0.retry_after_ms = retry.or(body_retry);
         let mut usage = crate::TokenUsage::default().with_request_id(id.as_deref());
         usage.api = Some("responses".into());
@@ -304,15 +381,24 @@ impl ResponsesApiCompatibleProvider {
             .parse_budget(bytes.len())
             .map_err(|error| crate::usage::with_error_usage(error, &reducer.usage))?;
         let (value, retained) = wire::parse(&bytes, budget).map_err(|error| {
-            crate::usage::with_error_usage(SafeError::protocol(error), &reducer.usage)
+            crate::usage::with_error_usage(
+                SafeError::with_response(SafeError::protocol(error), &bytes),
+                &reducer.usage,
+            )
         })?;
+        let raw_response = (value["status"] == "failed")
+            .then(|| pioneer_protocol::ProviderErrorResponse::from_bytes(&bytes, false));
         drop(bytes);
         reducer
             .stage(retained)
             .map_err(|error| crate::usage::with_error_usage(error, &reducer.usage))?;
-        reducer
-            .snapshot(&value)
-            .map_err(|e| crate::usage::with_error_usage(SafeError::protocol(e), &reducer.usage))?;
+        reducer.snapshot(&value).map_err(|e| {
+            let mut error = SafeError::protocol(e);
+            if let Some(failure) = error.downcast_mut::<SafeError>() {
+                failure.0.raw_response = raw_response;
+            }
+            crate::usage::with_error_usage(error, &reducer.usage)
+        })?;
         drop(value);
         reducer
             .stage(0)
@@ -413,7 +499,15 @@ impl ResponsesApiCompatibleProvider {
                         let (value, retained) =
                             wire::parse(event.data.as_bytes(), reducer.parse_budget(buffers)?)?;
                         reducer.stage(buffers.saturating_add(retained))?;
-                        let chunks = reducer.event(event.event.as_deref(), &value)?;
+                        let chunks =
+                            reducer
+                                .event(event.event.as_deref(), &value)
+                                .map_err(|error| {
+                                    SafeError::with_response(
+                                        SafeError::protocol(error),
+                                        event.data.as_bytes(),
+                                    )
+                                })?;
                         for chunk in chunks {
                             if tx.send(Ok(chunk)).await.is_err() {
                                 return Ok(true);

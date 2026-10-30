@@ -89,10 +89,10 @@ impl ResponsesApiCompatibleProvider {
                 if let Some(reasoning) =
                     message.reasoning_content.as_ref().filter(|s| !s.is_empty())
                 {
-                    input.push(json!({"role":"assistant","content":[{"type":"input_text","text":format!("[Historical assistant reasoning]\n{reasoning}")}]}));
+                    input.push(json!({"role":"assistant","content":format!("[Historical assistant reasoning]\n{reasoning}")}));
                 }
                 if !message.content.is_empty() {
-                    input.push(json!({"role":"assistant","content":[{"type":"input_text","text":message.content}]}));
+                    input.push(json!({"role":"assistant","content":message.content}));
                 }
                 for call in message.tool_calls.iter().flatten() {
                     input.push(json!({"type":"function_call","call_id":call.id,"name":call.name,"arguments":call.arguments}));

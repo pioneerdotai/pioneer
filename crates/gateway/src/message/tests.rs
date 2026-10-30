@@ -45414,6 +45414,7 @@ async fn invalid_request_provider_failure_is_terminal_without_retry() {
             item_id.to_owned(),
             TurnItemType::Reasoning,
             ProviderFailureDetails {
+                raw_response: None,
                 error_reason: None,
                 request_id: None,
                 provider: "test-provider".to_owned(),
@@ -45655,6 +45656,7 @@ async fn durable_recovery_events_reject_ack_without_canonical_persistence() {
             item_id: "item_missing_provider_failure".to_owned(),
             item_type: TurnItemType::AgentMessage,
             failure: ProviderFailureDetails {
+                raw_response: None,
                 error_reason: None,
                 request_id: None,
                 provider: "openai".to_owned(),
@@ -85581,6 +85583,7 @@ async fn blocked_provider_task_consumers_impl(scenario: &str, path: &str) {
         http_status: Some(502),
         provider_code: None,
         retry_after_ms: Some(2000),
+        raw_response: None,
         error_reason: Some(pioneer_protocol::ProviderErrorReason::ProviderUnavailable),
         request_id: Some(
             pioneer_protocol::ProviderRequestId::try_from("gen-task_fixture".to_owned()).unwrap(),
@@ -85966,6 +85969,7 @@ async fn recovery_failure_task_consumers_impl(
     let now = super::now_timestamp_secs();
     let private = "private-response-body https://secret.example?token=credential /private/provider-key HTTP 401";
     let mut initial = ProviderFailureDetails {
+        raw_response: None,
         error_reason: None,
         request_id: None,
         provider: "test-provider".to_owned(),
@@ -86006,6 +86010,7 @@ async fn recovery_failure_task_consumers_impl(
         );
     }
     let last = ProviderFailureDetails {
+        raw_response: None,
         error_reason: None,
         request_id: None,
         class: ProviderFailureClass::AuthOrPermission,
@@ -86013,6 +86018,7 @@ async fn recovery_failure_task_consumers_impl(
         http_status: Some(403),
         provider_code: Some(private.to_owned()),
         ..ProviderFailureDetails {
+            raw_response: None,
             error_reason: None,
             request_id: None,
             provider: private.to_owned(),
@@ -86341,6 +86347,7 @@ fn provider_replay_is_fenced_after_retryable_recovery_start_error() {
         let (processor, store, _) = setup_execution_window_terminal_turn(thread, turn).await;
         let now = super::now_timestamp_secs();
         let failure = ProviderFailureDetails {
+            raw_response: None,
             error_reason: None,
             request_id: None,
             provider: "test-provider".to_owned(),

@@ -45,6 +45,7 @@ fn http_403_failure(class: ProviderFailureClass) -> ScriptedProviderFailure {
         http_status: Some(403),
         retry_after_ms: Some(30_001),
         is_recoverable_hint: false,
+        raw_response: None,
         error_reason: None,
         request_id: None,
         provider_code: None,

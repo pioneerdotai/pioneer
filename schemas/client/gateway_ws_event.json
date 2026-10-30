@@ -6007,13 +6007,19 @@
       ]
     },
     "ProviderErrorReason": {
-      "description": "Allowlisted OpenRouter Chat Completions metadata.error_type values.\nDiagnostic only: these values must not drive recovery policy.",
+      "description": "Allowlisted provider error reasons, never raw provider messages or values.\nDiagnostic only: these values must not drive recovery policy.",
       "type": "string",
       "enum": [
         "context_length_exceeded",
         "max_tokens_exceeded",
         "token_limit_exceeded",
         "string_too_long",
+        "missing_required_parameter",
+        "unsupported_parameter",
+        "invalid_parameter_value",
+        "invalid_parameter_type",
+        "responses_missing_required_item",
+        "responses_unpaired_tool_call",
         "authentication",
         "permission_denied",
         "payment_required",
@@ -6037,6 +6043,23 @@
         "server",
         "timeout",
         "unmapped"
+      ]
+    },
+    "ProviderErrorResponse": {
+      "description": "Original provider error response, bounded for local diagnostic storage.\nDebug output deliberately omits the body; public prose never uses it.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "body",
+        "truncated"
       ]
     },
     "ProviderFailureClass": {
@@ -6366,6 +6389,16 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0
+        },
+        "rawResponse": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderErrorResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "requestId": {
           "anyOf": [
@@ -9201,6 +9234,13 @@
         "run"
       ]
     },
+    "TaskRunInputEncoding": {
+      "type": "string",
+      "enum": [
+        "utf8",
+        "base64"
+      ]
+    },
     "TaskRunStartedNotification": {
       "type": "object",
       "properties": {
@@ -9229,6 +9269,27 @@
         "blocked",
         "cancelled",
         "timed_out"
+      ]
+    },
+    "TaskRunTriggerInput": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "contentType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "encoding": {
+          "$ref": "#/$defs/TaskRunInputEncoding"
+        }
+      },
+      "required": [
+        "encoding",
+        "body"
       ]
     },
     "TaskScheduledNotification": {
@@ -14838,34 +14899,6 @@
       "required": [
         "revision",
         "workspace_id"
-      ]
-    },
-    "TaskRunTriggerInput": {
-      "type": "object",
-      "properties": {
-        "body": {
-          "type": "string"
-        },
-        "contentType": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "encoding": {
-          "$ref": "#/$defs/TaskRunInputEncoding"
-        }
-      },
-      "required": [
-        "encoding",
-        "body"
-      ]
-    },
-    "TaskRunInputEncoding": {
-      "type": "string",
-      "enum": [
-        "utf8",
-        "base64"
       ]
     }
   }
