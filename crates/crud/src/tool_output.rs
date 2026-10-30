@@ -55,9 +55,12 @@ impl CrudStore {
         item: &str,
         after: i64,
     ) -> anyhow::Result<Vec<(i64, pioneer_entity::tool_output_chunk::Model)>> {
-        crate::repositories::tool_output::tool_output_page(
-            self, workspace, thread, turn, item, after,
-        )
+        self.run_scoped_database_quantum(|| async {
+            crate::repositories::tool_output::tool_output_page(
+                self, workspace, thread, turn, item, after,
+            )
+            .await
+        })
         .await
     }
 }

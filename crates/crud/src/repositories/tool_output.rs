@@ -1,3 +1,4 @@
+use super::portable_payload::{self, Family};
 use crate::CrudStore;
 use anyhow::{Result, ensure};
 use pioneer_entity::{thread, tool_output_chunk, turn};
@@ -32,6 +33,25 @@ pub(crate) async fn record_tool_output(
         .run_serialized_write(|| {
             let row = row.clone();
             async move {
+                let preflight = tool_output_chunk::Entity::find()
+                    .filter(tool_output_chunk::Column::Id.eq(id))
+                    .one(&store.connection)
+                    .await?;
+                let expected = if let Some(old) = preflight {
+                    let revision = (old.ordinal, old.portable_revision);
+                    let old = hydrate(store, old).await?;
+                    ensure!(
+                        old.turn_id == n.turn_id
+                            && old.item_id == n.item_id
+                            && old.text == n.delta
+                            && old.stream == *row.stream.as_ref()
+                            && old.metadata == *row.metadata.as_ref(),
+                        "tool output identity conflict"
+                    );
+                    Some(revision)
+                } else {
+                    None
+                };
                 let tx = store.connection.begin().await?;
                 ensure!(
                     thread::Entity::find_by_id(&n.thread_id)
@@ -55,19 +75,20 @@ pub(crate) async fn record_tool_output(
                         .is_some(),
                     "tool output turn mismatch"
                 );
-                if let Some(old) = tool_output_chunk::Entity::find()
+                if let Some(actual) = tool_output_chunk::Entity::find()
+                    .select_only()
+                    .columns([
+                        tool_output_chunk::Column::Ordinal,
+                        tool_output_chunk::Column::PortableRevision,
+                    ])
                     .filter(tool_output_chunk::Column::Id.eq(id))
+                    .into_tuple::<(i64, i64)>()
                     .one(&tx)
                     .await?
                 {
-                    ensure!(
-                        old.turn_id == n.turn_id
-                            && old.item_id == n.item_id
-                            && old.text == n.delta
-                            && old.stream == *row.stream.as_ref()
-                            && old.metadata == *row.metadata.as_ref(),
-                        "tool output identity conflict"
-                    );
+                    if expected != Some(actual) {
+                        return Err(portable_payload::PreflightRace.into());
+                    }
                 } else {
                     tool_output_chunk::Entity::insert(row).exec(&tx).await?;
                 }
@@ -110,5 +131,42 @@ pub(crate) async fn tool_output_page(
         .limit(128)
         .all(&store.connection)
         .await?;
-    Ok(rows.into_iter().map(|row| (row.ordinal, row)).collect())
+    let mut decoded = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row = hydrate(store, row).await?;
+        decoded.push((row.ordinal, row));
+    }
+    Ok(decoded)
+}
+
+async fn hydrate(
+    store: &CrudStore,
+    mut row: tool_output_chunk::Model,
+) -> Result<tool_output_chunk::Model> {
+    row.text = portable_payload::hydrate(
+        &store.connection,
+        Family::ToolText,
+        row.text_payload_id.as_deref(),
+        row.text,
+    )
+    .await?;
+    if let Some(metadata) = row.metadata.take() {
+        row.metadata = Some(
+            portable_payload::hydrate(
+                &store.connection,
+                Family::ToolMetadata,
+                row.metadata_payload_id.as_deref(),
+                metadata,
+            )
+            .await?,
+        );
+    } else {
+        ensure!(
+            row.metadata_payload_id.is_none(),
+            "NULL metadata references stored payload"
+        );
+    }
+    row.text_payload_id = None;
+    row.metadata_payload_id = None;
+    Ok(row)
 }

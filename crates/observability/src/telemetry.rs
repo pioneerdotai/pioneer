@@ -1557,3 +1557,12 @@ mod export_health_source_tests {
         assert!(successful.last_success_traces.is_some());
     }
 }
+
+// Test-only bridge across module privacy to the real exporter epoch filter.
+#[cfg(test)]
+pub(crate) fn portable_summary_epoch_allowed(
+    attributes: &[opentelemetry::KeyValue],
+    epoch: i64,
+) -> bool {
+    observation_span_epoch_allowed(attributes, epoch)
+}

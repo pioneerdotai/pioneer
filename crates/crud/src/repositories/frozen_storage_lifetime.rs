@@ -1,7 +1,10 @@
 //! Bounded progress for the existing frozen-storage worker. Physical eligibility
 //! is durable; no connection or capacity permit is retained between quanta.
 use super::{checkpoint_proofs, compaction, frozen_sweep_work};
-use crate::{CrudStore, frozen_lifetime::PreparedFrozenRoot};
+use crate::{
+    CrudStore,
+    frozen_lifetime::{FrozenRootStream, PreparedFrozenRoot},
+};
 use anyhow::{Result, ensure};
 use pioneer_compaction::runner::{RunnerPhase, RunnerState};
 use pioneer_entity::{
@@ -12,6 +15,7 @@ use pioneer_entity::{
     compaction_runner_plan as plan, compaction_runner_state as runner, task,
     task_run_conversation_snapshot as task_input,
 };
+use pioneer_observability::portable_payload as observe;
 use sea_orm::sea_query::{
     Alias, Expr, ExprTrait, Func, JoinType, Order, Query, SimpleExpr, UnionType,
 };
@@ -30,10 +34,6 @@ const META_ROWS: u64 = 64;
 // above this policy uses the original full-key single seek outside the page.
 // At most META_ROWS * SCOPE_PAGE_KEY_BYTES key bytes are retained in its page.
 const SCOPE_PAGE_KEY_BYTES: i64 = FRAGMENT_BYTES;
-// Legacy JSON has no producer byte cap. An oversized record remains unknown
-// (and blocks only its retaining scope), rather than allowing one worker job
-// to grow without bound. A normal authorized root replacement can verify it.
-const LEGACY_LOCATOR_BYTES: i64 = FRAGMENT_BYTES * 128;
 
 /// Owned by one existing maintenance worker, and dropped on cancellation.
 /// Each discovery family reaches EOF once per pass; completed families yield
@@ -85,42 +85,113 @@ struct LocatorRead {
     id: String,
     workspace: String,
     size: i64,
-    bytes: Vec<u8>,
+    offset: i64,
+    stream: Option<FrozenRootStream>,
+    prepared: Option<PreparedFrozenRoot>,
 }
 impl LocatorRead {
+    fn new(kind: usize, id: String, workspace: String, size: i64) -> Self {
+        let stream = match kind {
+            0 | 1 => FrozenRootStream::new_history(),
+            2 => FrozenRootStream::new_cli(true),
+            3 => FrozenRootStream::new_cli(false),
+            _ => unreachable!(),
+        };
+        Self {
+            kind,
+            id,
+            workspace,
+            size,
+            offset: 0,
+            stream: Some(stream),
+            prepared: None,
+        }
+    }
     async fn step(&mut self, store: &CrudStore) -> Result<bool> {
+        let family = match self.kind {
+            0 => observe::Family::TaskHistory,
+            3 => observe::Family::CliMapping,
+            _ => return self.step_inner(store).await,
+        };
+        // Root preparation is a prerequisite of these two portable fields.
+        // Preserve the existing frozen-storage caller/workload and scope.
+        observe::scope_result(family, observe::Mode::Background, self.step_inner(store)).await
+    }
+    async fn step_inner(&mut self, store: &CrudStore) -> Result<bool> {
+        let portable = matches!(self.kind, 0 | 3);
         let (table, key, field) = ROOTS[self.kind];
         // SQLite BLOB fragment, fixed actual-byte budget; sentinel/identity CAS
-        // below stays typed and never compares the accumulated JSON in writer.
-        if i64::try_from(self.bytes.len())? < self.size {
-            let row = store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                format!("SELECT substr(CAST({field} AS BLOB),?3,?4) AS fragment FROM {table} WHERE {key}=?1 AND workspace_id=?2 AND frozen_manifest_id='' AND length(CAST({field} AS BLOB))=?5 LIMIT 1"),
-                [self.id.clone().into(),self.workspace.clone().into(),(self.bytes.len() as i64+1).into(),FRAGMENT_BYTES.into(),self.size.into()])).await?;
-            let Some(row) = row else {
+        // below stays typed and never compares source JSON in the writer.
+        if self.offset < self.size {
+            let guard = Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!(
+                    "SELECT rowid FROM {table} WHERE {key}=?1 AND workspace_id=?2 AND frozen_manifest_id='' AND octet_length({field})=?3 LIMIT 1"
+                ),
+                [
+                    self.id.clone().into(),
+                    self.workspace.clone().into(),
+                    self.size.into(),
+                ],
+            );
+            let read = portable.then(|| observe::stage(observe::Stage::SourceRead));
+            let bytes = store
+                .connection
+                .read_blob_range(
+                    pioneer_sqlite::SqliteBlobSource {
+                        table,
+                        column: field,
+                    },
+                    guard,
+                    u64::try_from(self.offset)?,
+                    usize::try_from(std::cmp::min(FRAGMENT_BYTES, self.size - self.offset))?,
+                    u64::try_from(self.size)?,
+                )
+                .await?;
+            drop(read);
+            let Some(bytes) = bytes else {
+                if portable {
+                    observe::outcome(observe::Outcome::Stale);
+                }
                 return Ok(true);
             };
-            let bytes: Vec<u8> = row.try_get("", "fragment")?;
+            if portable {
+                observe::bytes(observe::ByteKind::ReadOriginal, bytes.len() as u64);
+            }
+            let _verify = portable.then(|| observe::stage(observe::Stage::VerifyAssemble));
             ensure!(
-                !bytes.is_empty() && bytes.len() <= FRAGMENT_BYTES as usize,
+                bytes.len() as i64 == std::cmp::min(FRAGMENT_BYTES, self.size - self.offset),
                 "legacy locator fragment missing"
             );
-            self.bytes.extend(bytes);
+            // The query has released database capacity before decoding. Only
+            // this fragment and the bounded semantic projection are retained.
+            self.stream
+                .as_mut()
+                .expect("legacy root stream")
+                .feed(&bytes)?;
+            self.offset += bytes.len() as i64;
             return Ok(false);
         }
         ensure!(
-            self.bytes.len() as i64 == self.size,
+            self.offset == self.size,
             "legacy locator exact size mismatch"
         );
-        let json = std::str::from_utf8(&self.bytes)?;
-        let prepared = match self.kind {
-            0 | 1 => PreparedFrozenRoot::history(json)?,
-            2 => PreparedFrozenRoot::cli(json, true)?,
-            3 => PreparedFrozenRoot::cli(json, false)?,
-            _ => unreachable!(),
-        };
+        if self.prepared.is_none() {
+            let _verify = portable.then(|| observe::stage(observe::Stage::VerifyAssemble));
+            self.prepared = Some(
+                self.stream
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("legacy root stream already failed"))?
+                    .finish()?,
+            );
+        }
+        // Keep the prepared projection in progress across cancellation while
+        // queued for the writer; a later quantum must not consume it twice.
+        let prepared = self.prepared.as_ref().expect("prepared legacy root");
         // All JSON/root-identity mutations have already cut over to ID/NULL.
         // Metadata-only changes keep ''. Delete/recreate cannot regain ''.
         // No updated_at comparison or large JSON comparison under writer.
+        let _publish = portable.then(|| observe::stage(observe::Stage::Publish));
         store
             .run_serialized_write(|| async {
                 let tx = store.connection.begin().await?;
@@ -175,6 +246,10 @@ impl LocatorRead {
                             .to_owned(),
                     )
                     .await?;
+                } else {
+                    if portable {
+                        observe::outcome(observe::Outcome::Stale);
+                    }
                 }
                 tx.commit().await?;
                 Ok(())
@@ -1813,13 +1888,19 @@ impl FrozenStorageLifetimeProgress {
         if self.locator_pending[kind].is_empty() {
             // Seek only unknown roots through (frozen_manifest_id, PK), so
             // verified ID/NULL rows do not consume this bounded metadata page.
-            let query = Query::select().from(Alias::new(table))
+            let query = Query::select()
+                .from(Alias::new(table))
                 .expr_as(Expr::col(Alias::new(key)), Alias::new("id"))
                 .columns([Alias::new("workspace_id"), Alias::new("frozen_manifest_id")])
-                .expr_as(Expr::cust(format!("CASE WHEN frozen_manifest_id='' THEN length(CAST({field} AS BLOB)) ELSE 0 END")), Alias::new("size"))
+                .expr_as(
+                    Expr::cust(format!("octet_length({field})")),
+                    Alias::new("size"),
+                )
                 .and_where(Expr::col(Alias::new("frozen_manifest_id")).eq(""))
                 .and_where(Expr::col(Alias::new(key)).gt(&self.locators[kind]))
-                .order_by(Alias::new(key), Order::Asc).limit(META_ROWS).to_owned();
+                .order_by(Alias::new(key), Order::Asc)
+                .limit(META_ROWS)
+                .to_owned();
             let page = store.connection.query_all(&query).await?;
             if page.is_empty() {
                 self.locators[kind].clear();
@@ -1847,16 +1928,10 @@ impl FrozenStorageLifetimeProgress {
             .pop_front()
             .expect("locator page");
         ensure!(
-            (0..=LEGACY_LOCATOR_BYTES).contains(&size) && !workspace.is_empty(),
+            size >= 0 && !workspace.is_empty(),
             "legacy locator scope/size unsupported"
         );
-        self.locator = Some(LocatorRead {
-            kind,
-            id,
-            workspace,
-            size,
-            bytes: Vec::new(),
-        });
+        self.locator = Some(LocatorRead::new(kind, id, workspace, size));
         Ok(true)
     }
 
@@ -3543,7 +3618,9 @@ mod tests {
     async fn locator_sparse_pending_seek_revisits_poison_without_blocking_later_keys() {
         for poison in [
             "malformed retaining legacy receipt".to_owned(),
-            serde_json::json!({"padding":"я".repeat(LEGACY_LOCATOR_BYTES as usize / 2)})
+            // Oversized valid padding is supported now. This candidate is
+            // poison because of its malformed receipt, independently of size.
+            serde_json::json!({"padding":"я".repeat(4 * 1024 * 1024),"pioneerContext":{"version":99}})
                 .to_string(),
         ] {
             let (store, h) = legacy_locator_fixture_with_poison(63, &poison).await;
@@ -3580,10 +3657,10 @@ mod tests {
                     .collect::<Vec<_>>(),
                 ["root-0002", "root-0063", "root-0064", "root-0127"]
             );
-            // Use the public error/refusal handling, rather than treating an
-            // oversize or malformed candidate as a successful locator EOF.
+            // Use the public error/refusal handling, rather than treating a
+            // malformed candidate as a successful locator EOF.
             let mut finished = false;
-            for _ in 0..100 {
+            for _ in 0..1000 {
                 progress.pass_done[1..].fill(true);
                 let more = progress.quantum(&store).await.unwrap();
                 assert!(
@@ -3752,7 +3829,7 @@ mod tests {
             if progress
                 .locator
                 .as_ref()
-                .is_some_and(|read| read.id == "root-0002" && !read.bytes.is_empty())
+                .is_some_and(|read| read.id == "root-0002" && read.offset != 0)
             {
                 break;
             }
@@ -3772,10 +3849,10 @@ mod tests {
             Some("")
         );
 
-        // Restart after an unfinished fragment: no promise to keep RAM bytes.
+        // Restart after an unfinished fragment: parser progress is memory-only.
         let read = progress.locator.as_ref().unwrap();
         assert_eq!(read.id, "root-0002");
-        assert_eq!(read.bytes.len(), FRAGMENT_BYTES as usize);
+        assert_eq!(read.offset, FRAGMENT_BYTES);
         drop(progress);
         assert!(store.frozen_readers.lock().unwrap().is_empty());
         let mut restart = FrozenStorageLifetimeProgress::default();
@@ -3786,7 +3863,7 @@ mod tests {
             }
         }
         assert_eq!(restart.locator.as_ref().unwrap().id, "root-0002");
-        assert!(restart.locator.as_ref().unwrap().bytes.is_empty());
+        assert_eq!(restart.locator.as_ref().unwrap().offset, 0);
         assert!(
             restart
                 .locator_pending
@@ -3909,6 +3986,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn locator_final_writer_cancel_preserves_prepared_root_for_retry() {
+        let (store, descriptor) = legacy_locator_fixture().await;
+        let size: i64 = store.connection.query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT octet_length(resume_cursor_json) AS bytes FROM thread_cli_runtime_binding WHERE thread_id='root-0002'",
+        )).await.unwrap().unwrap().try_get("", "bytes").unwrap();
+        let mut read = LocatorRead::new(2, "root-0002".into(), "ws".into(), size);
+        while read.offset < size {
+            assert!(!read.step(&store).await.unwrap());
+        }
+        assert_eq!(
+            locator_marker(&store, "root-0002").await.as_deref(),
+            Some("")
+        );
+
+        // Every source fragment is already fed. This step finishes the stream
+        // synchronously, then waits for the final writer reservation held by
+        // this real transaction. Cancellation must retain the prepared root.
+        let holder = store.connection.begin().await.unwrap();
+        let mut attempt = Box::pin(read.step(&store));
+        assert!(futures_util::poll!(attempt.as_mut()).is_pending());
+        drop(attempt);
+        holder.rollback().await.unwrap();
+
+        // A retry must publish through the ordinary verification/CAS path;
+        // consuming stream.finish a second time would fail before this commit.
+        assert!(read.step(&store).await.unwrap());
+        assert_eq!(
+            locator_marker(&store, "root-0002").await,
+            Some(descriptor.manifest_id)
+        );
+    }
+
+    #[tokio::test]
     async fn locator_fragment_cancel_and_foreground_mutation_preserve_scope_and_capacity() {
         for mutation in ["workspace", "json", "delete"] {
             let (store, _) = legacy_locator_fixture().await;
@@ -3929,17 +4040,14 @@ mod tests {
             progress.locator_quantum(&store).await.unwrap();
             let read = progress.locator.as_ref().unwrap();
             assert_eq!(read.id, "root-0002");
-            assert_eq!(read.bytes.len(), FRAGMENT_BYTES as usize);
+            assert_eq!(read.offset, FRAGMENT_BYTES);
             // Existing single-connection fixture: cancel a fragment while it
             // waits for DB capacity, then prove a foreground write can proceed.
             let holder = store.connection.begin_read().await.unwrap();
             let mut attempt = Box::pin(progress.locator_quantum(&store));
             assert!(futures_util::poll!(attempt.as_mut()).is_pending());
             drop(attempt);
-            assert_eq!(
-                progress.locator.as_ref().unwrap().bytes.len(),
-                FRAGMENT_BYTES as usize
-            );
+            assert_eq!(progress.locator.as_ref().unwrap().offset, FRAGMENT_BYTES);
             holder.rollback().await.unwrap();
             let foreground = store.with_interactive_writes();
             match mutation {
@@ -5687,25 +5795,19 @@ mod tests {
             db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO thread_cli_runtime_binding(thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,resume_cursor_json,status) VALUES('thread','ws','runtime','claude','native',?1,'active')",[json.clone().into()])).await.unwrap();
             Migrator::up(&db, None).await.unwrap();
             let store = CrudStore::new(db);
-            let mut read = LocatorRead {
-                kind: 2,
-                id: "thread".into(),
-                workspace: "ws".into(),
-                size: json.len() as i64,
-                bytes: vec![],
-            };
+            let mut read = LocatorRead::new(2, "thread".into(), "ws".into(), json.len() as i64);
             assert!(!read.step(&store).await.unwrap());
-            assert_eq!(read.bytes.len(), FRAGMENT_BYTES as usize);
+            assert_eq!(read.offset, FRAGMENT_BYTES);
             if mutation == "metadata" {
                 store.connection.execute_unprepared("UPDATE thread_cli_runtime_binding SET status='active',updated_at=created_at WHERE thread_id='thread'").await.unwrap();
-                while read.bytes.len() < json.len() {
+                while read.offset < json.len() as i64 {
                     assert!(!read.step(&store).await.unwrap());
                 }
                 assert!(read.step(&store).await.unwrap());
             } else {
                 // Finish the old fragments before the authoritative write, so
                 // final CAS, rather than a size mismatch, must lose the race.
-                while read.bytes.len() < json.len() {
+                while read.offset < json.len() as i64 {
                     assert!(!read.step(&store).await.unwrap());
                 }
                 if mutation == "recreate" {
