@@ -115,6 +115,9 @@ impl ResponsesApiCompatibleProvider {
             }
         }
         let mut body = json!({"model":request.model,"input":input,"store":true,"truncation":"disabled","include":["reasoning.encrypted_content"],"stream":stream});
+        if self.gateway_caching {
+            body["caching"] = json!("auto");
+        }
         if let Some(id) = prepared
             .comparison
             .as_ref()

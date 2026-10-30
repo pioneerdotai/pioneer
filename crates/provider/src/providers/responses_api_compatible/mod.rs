@@ -28,6 +28,7 @@ pub struct ResponsesApiCompatibleProvider {
     client: reqwest::Client,
     input_types: ProviderInputCapabilities,
     provisional_messages: bool,
+    gateway_caching: bool,
 }
 
 /// Public formatting omits the original response retained for local diagnostics.
@@ -264,6 +265,7 @@ impl ResponsesApiCompatibleProvider {
             client: crate::http::build_client(policy),
             input_types: ProviderInputCapabilities::disabled_for_all_file_types(),
             provisional_messages: false,
+            gateway_caching: false,
         }
     }
     /// Publish unresolved message text through StartProvisional/Resolve events.
@@ -271,6 +273,11 @@ impl ResponsesApiCompatibleProvider {
     /// buffers unresolved text until its phase is known.
     pub fn with_provisional_messages(mut self, enabled: bool) -> Self {
         self.provisional_messages = enabled;
+        self
+    }
+    /// Gateway extensions are selected by its provider wrapper, not model names.
+    pub(crate) fn with_gateway_caching(mut self) -> Self {
+        self.gateway_caching = true;
         self
     }
     pub fn with_input_capabilities(mut self, mut input_types: ProviderInputCapabilities) -> Self {
@@ -305,6 +312,7 @@ impl ResponsesApiCompatibleProvider {
             client,
             input_types,
             provisional_messages: false,
+            gateway_caching: false,
         }
     }
     fn endpoint(&self) -> String {
@@ -314,19 +322,33 @@ impl ResponsesApiCompatibleProvider {
             format!("{}/responses", self.root)
         }
     }
-    fn builder(&self, body: &Value) -> reqwest::RequestBuilder {
-        let builder = self.client.post(self.endpoint()).json(body);
+    fn builder(
+        &self,
+        body: &Value,
+        comparison: Option<&crate::prompt_cache::Comparison>,
+    ) -> reqwest::RequestBuilder {
+        let mut builder = self.client.post(self.endpoint()).json(body);
+        if self.gateway_caching
+            && let Some(key) = comparison.and_then(crate::prompt_cache::Comparison::affinity_key)
+        {
+            builder = builder.header("x-session-affinity", key);
+        }
         match &self.auth {
             AuthStyle::Bearer => builder.bearer_auth(&self.credential),
             AuthStyle::XApiKey => builder.header("x-api-key", &self.credential),
             AuthStyle::Custom(header) => builder.header(header.as_str(), &self.credential),
         }
     }
-    async fn send(&self, body: &Value, stream: bool) -> Result<reqwest::Response> {
+    async fn send(
+        &self,
+        body: &Value,
+        stream: bool,
+        comparison: Option<&crate::prompt_cache::Comparison>,
+    ) -> Result<reqwest::Response> {
         let result = if stream {
-            crate::http::send_stream_request(self.builder(body), self.policy).await
+            crate::http::send_stream_request(self.builder(body, comparison), self.policy).await
         } else {
-            crate::http::non_stream_request(self.builder(body), self.policy)
+            crate::http::non_stream_request(self.builder(body, comparison), self.policy)
                 .send()
                 .await
                 .map_err(Into::into)
@@ -392,7 +414,9 @@ impl ResponsesApiCompatibleProvider {
         prepared: request::PreparedRequest,
     ) -> Result<ChatResponse> {
         let body = self.render(&prepared, false)?;
-        let response = self.send(&body, false).await?;
+        let response = self
+            .send(&body, false, prepared.comparison.as_ref())
+            .await?;
         let id = crate::usage::native_id(
             response
                 .headers()
@@ -456,7 +480,7 @@ impl ResponsesApiCompatibleProvider {
         prepared: request::PreparedRequest,
     ) -> Result<ProviderStream> {
         let body = self.render(&prepared, true)?;
-        let response = self.send(&body, true).await?;
+        let response = self.send(&body, true, prepared.comparison.as_ref()).await?;
         let id = crate::usage::native_id(
             response
                 .headers()

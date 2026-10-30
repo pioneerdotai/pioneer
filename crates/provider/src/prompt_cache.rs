@@ -70,6 +70,20 @@ pub(crate) struct Comparison {
     pub(crate) response_id: Option<String>,
 }
 impl Comparison {
+    /// Stable routing identity, independent of response IDs, models and turns.
+    pub(crate) fn affinity_key(&self) -> Option<String> {
+        use sha2::Digest;
+        let identity = serde_json::to_vec(&(
+            "pioneer-gateway-session-v1",
+            &self.key.authority,
+            &self.key.workspace,
+            &self.key.thread,
+            self.key.purpose,
+        ))
+        .ok()?;
+        Some(hex::encode(sha2::Sha256::digest(identity)))
+    }
+
     pub(crate) fn begin(authority: &str) -> Option<Self> {
         let scope = SCOPE.try_with(Clone::clone).ok()?;
         if scope.workspace.is_empty() || scope.thread.is_empty() {
