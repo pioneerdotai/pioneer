@@ -5980,6 +5980,7 @@ mod tests {
 
         let (store, coordinator) = setup_coordinator().await;
         let misleading = "maximum context length exceeded";
+        let display_only_unavailable = "API error (503 Service Unavailable): unavailable";
         let cases = [
             (
                 misleading,
@@ -6108,7 +6109,7 @@ mod tests {
                 RecoveryAction::RetryWithBackoff,
             ),
             (
-                "API error (503 Service Unavailable): unavailable",
+                display_only_unavailable,
                 None,
                 None,
                 ProviderFailureClass::Provider5xx,
@@ -6119,6 +6120,15 @@ mod tests {
             for (index, (message, typed_class, status, expected_class, expected_action)) in
                 cases.iter().copied().enumerate()
             {
+                // Endpoint redaction keeps typed HTTP facts, not a status
+                // written only in Display text. The public legacy path can
+                // still infer a transient hint from that text.
+                let (expected_class, expected_action) =
+                    if redacted && message == display_only_unavailable {
+                        (ProviderFailureClass::Unknown, RecoveryAction::MarkFailed)
+                    } else {
+                        (expected_class, expected_action)
+                    };
                 // Use the real scoped registry, including custom-endpoint error
                 // redaction. Its fallback must not masquerade as typed evidence.
                 let registry = Arc::new(

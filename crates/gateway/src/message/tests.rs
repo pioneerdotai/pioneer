@@ -32811,22 +32811,22 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             .insert("openai", summary_provider.clone())
             .expect("CLI test provider should register");
         discover_native_capture_models(&provider_registry, workspace_id.as_str()).await;
-        let mut processor = Arc::new(with_enabled_test_cli_runtime_catalog(
-            MessageProcessor::new(
-                thread_manager,
-                provider_registry.clone(),
-                session_manager.clone(),
-                workspace_manager.clone(),
-                crud_store.clone(),
-                test_gateway_secrets(),
-                test_summary_config(),
-                test_tool_loop_config(),
-            )
-            .with_cli_runtime_manager_for_tests(cli_manager.clone())
-            .with_cli_mcp_readiness_override_for_tests(
-                supported_test_cli_mcp_readiness(runtime_kind),
-            ),
-        ));
+        let processor = MessageProcessor::new(
+            thread_manager,
+            provider_registry.clone(),
+            session_manager.clone(),
+            workspace_manager.clone(),
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone())
+        .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(runtime_kind));
+        // The CLI settings helper changes the configuration home, but the
+        // artifact service still owns the blob directory from construction.
+        let artifact_store_home = processor.artifact_runtime_home.clone();
+        let mut processor = Arc::new(with_enabled_test_cli_runtime_catalog(processor));
         processor
             .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
             .await
@@ -34039,7 +34039,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 // skill receipts and identity source fingerprints intact.
                 let runtime_home = processor.artifact_runtime_home.clone();
                 processor = Arc::new(
-                    MessageProcessor::new(
+                    MessageProcessor::new_with_memory_runtime(
                         cold_thread_manager.clone(),
                         provider_registry.clone(),
                         session_manager.clone(),
@@ -34048,6 +34048,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         test_gateway_secrets(),
                         test_summary_config(),
                         test_tool_loop_config(),
+                        Arc::new(GatewayMemoryRuntime::disabled(crud_store.clone())),
+                        artifact_store_home.clone(),
+                        pioneer_config::GatewayArtifactsConfig::default(),
                     )
                     .with_cli_runtime_manager_for_tests(cli_manager.clone())
                     .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
