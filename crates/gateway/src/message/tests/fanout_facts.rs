@@ -265,6 +265,39 @@ impl Fixture {
         serializations.load(Ordering::SeqCst)
     }
 
+    async fn assert_candidate_denied_before_serialization(&self, connection_id: ConnectionId) {
+        let subscribers = self
+            .processor
+            .thread_manager
+            .subscribed_connections(THREAD)
+            .await
+            .into_iter()
+            .filter(|subscriber| subscriber.connection_id == connection_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            subscribers.len(),
+            1,
+            "the sole original candidate must be an actual subscriber"
+        );
+        let serializations = Arc::new(AtomicUsize::new(0));
+        self.processor
+            .send_notification_to_authorized_thread_subscribers(
+                THREAD,
+                METHOD,
+                &NotificationSerializationProbe {
+                    serializations: serializations.clone(),
+                    on_serialize: || {},
+                },
+                subscribers,
+            )
+            .await;
+        assert_eq!(
+            serializations.load(Ordering::SeqCst),
+            0,
+            "the sole candidate must be rejected before serialization"
+        );
+    }
+
     fn clear_observation(&self) {
         self.statements.lock().unwrap().clear();
         self.observer.reads.lock().unwrap().clear();
@@ -400,7 +433,7 @@ async fn ordinary_fanout_durable_leases_private_acl_and_fresh_final_subset() {
     let denied = f.member(12, false).await;
     let (_, mut allowed_rx) = f.connect(allowed.clone()).await;
     let (_, mut revoked_rx) = f.connect(revoked.clone()).await;
-    let (_, mut denied_rx) = f.connect(denied.clone()).await;
+    let (denied_connection, mut denied_rx) = f.connect(denied.clone()).await;
     pioneer_entity::device::Entity::update_many()
         .col_expr(
             pioneer_entity::device::Column::Status,
@@ -428,6 +461,14 @@ async fn ordinary_fanout_durable_leases_private_acl_and_fresh_final_subset() {
     delivered(&mut allowed_rx);
     assert!(revoked_rx.try_recv().is_err());
     assert!(denied_rx.try_recv().is_err());
+
+    f.assert_candidate_denied_before_serialization(denied_connection).await;
+    assert!(denied_rx.try_recv().is_err());
+    assert!(
+        allowed_rx.try_recv().is_err(),
+        "valid connection outside the original list must receive nothing"
+    );
+    assert!(revoked_rx.try_recv().is_err());
 
     // A fresh event observes workspace visibility through the same canonical
     // policy, while the second device's revoked lease still excludes it.
@@ -546,6 +587,12 @@ async fn ordinary_fanout_rejects_missing_corrupt_and_cross_linked_lease_facts_be
         assert_eq!(f.emit(|| {}).await, 1);
         delivered(&mut rx);
         assert!(invalid_rx.try_recv().is_err());
+        f.assert_candidate_denied_before_serialization(connection).await;
+        assert!(invalid_rx.try_recv().is_err());
+        assert!(
+            rx.try_recv().is_err(),
+            "valid connection outside the original list must receive nothing"
+        );
         f.processor
             .session_manager
             .unregister_connection(connection)
