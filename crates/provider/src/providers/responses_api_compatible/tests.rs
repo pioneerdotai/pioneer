@@ -3056,3 +3056,42 @@ async fn vercel_unknown_controls_leave_defaults_and_fallback_limits_are_not_nati
     )
     .await;
 }
+
+#[test]
+fn vercel_routing_outcomes_survive_json_and_sse_without_session_identifiers() {
+    let mut value = snapshot(vec![message("m", json!("final_answer"), "answer")]);
+    value["provider_metadata"] = json!({"gateway":{"routing":{
+        "clientSessionId":"private-session", "clientSessionIdSource":"explicit",
+        "affinity":{"outcome":"promoted","pinnedProvider":"anthropic","displacedProvider":"bedrock","secret":"discard"},
+        "unknown":"discard"}}});
+    value["prompt_cache_diagnostics"] = json!({"type":"cache_miss","reason":"input_changed"});
+    for provider in ["vercel-ai-gateway", "openai"] {
+        let mut json_reducer = reducer_for(provider);
+        json_reducer.snapshot(&value).unwrap();
+        let json_usage = json_reducer.response().unwrap().usage.unwrap();
+        let mut sse_reducer = reducer_for(provider);
+        event(
+            &mut sse_reducer,
+            json!({"type":"response.completed","response":value}),
+        );
+        let sse_usage = sse_reducer.response().unwrap().usage.unwrap();
+        assert_eq!(
+            json_usage.prompt_cache_diagnostics,
+            sse_usage.prompt_cache_diagnostics
+        );
+        let metadata = json_usage.prompt_cache_diagnostics.unwrap();
+        assert_eq!(metadata["type"], "cache_miss");
+        assert_eq!(
+            metadata.get("gateway_routing").is_some(),
+            provider == "vercel-ai-gateway"
+        );
+        assert!(!metadata.to_string().contains("private-session"));
+        assert!(!metadata.to_string().contains("secret"));
+        if provider == "vercel-ai-gateway" {
+            assert_eq!(
+                metadata["gateway_routing"]["affinity"]["outcome"],
+                "promoted"
+            );
+        }
+    }
+}

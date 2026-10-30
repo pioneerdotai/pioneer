@@ -97,8 +97,13 @@ pub fn bounded_usage(value: &Value) -> Value {
                                 | "cached_tokens"
                                 | "cache_write_tokens"
                                 | "cache_creation_input_tokens"
+                                | "cache_creation_tokens"
+                                | "created_cache_tokens"
                                 | "cache_read_input_tokens"
                                 | "cache_creation"
+                                | "claude_cache_tokens_details"
+                                | "cache_write_5_minutes_input_tokens"
+                                | "cache_write_1_hour_input_tokens"
                                 | "ephemeral_5m_input_tokens"
                                 | "ephemeral_1h_input_tokens"
                                 | "reasoning_tokens"
@@ -218,6 +223,7 @@ impl<const API: u8> WireUsage<API> {
                 n("completion_tokens"),
                 raw["prompt_tokens_details"]["cached_tokens"]
                     .as_u64()
+                    .or_else(|| n("cached_tokens"))
                     .or_else(|| n("prompt_cache_hit_tokens"))
                     .or_else(|| n("cached_prompt_tokens"))
                     .or_else(|| n("num_cached_tokens")),
@@ -261,6 +267,60 @@ impl<const API: u8> WireUsage<API> {
             raw_usage: Some(raw.clone()),
             ..Default::default()
         }
+    }
+}
+
+/// Apply envelope semantics after cumulative SSE fields have been merged by
+/// the existing registry. Provider identity and the actual endpoint are captured
+/// before dispatch, rather than inferred from model names or usage payloads.
+fn apply_chat_usage_policy(usage: &mut TokenUsage, provider: &str, actual_route: Option<&str>) {
+    if !matches!(provider, "aihubmix" | "venice") {
+        return;
+    }
+    let expected = crate::definition::provider_definition(provider)
+        .and_then(|d| d.default_base_url)
+        .and_then(|base| route(base, "/chat/completions"));
+    if expected.is_none() || expected.as_deref() != actual_route {
+        return;
+    }
+    let Some(raw) = usage.raw_usage.as_ref() else {
+        return;
+    };
+    if provider == "aihubmix" {
+        let Some(details) = raw
+            .get("claude_cache_tokens_details")
+            .filter(|v| v.is_object())
+        else {
+            return;
+        };
+        // The documented Chat example has prompt_tokens=22 and cache read=6266.
+        // It does not explicitly define Chat prompt_tokens as exclusive input.
+        // Keep observed native categories, but do not invent a complete total
+        // by either treating 22 as inclusive or summing unproven categories.
+        // https://docs.aihubmix.com/cn/blogs/aihubmix-openai-upgrade-claude
+        usage.input_tokens = None;
+        usage.uncached_input_tokens = None;
+        usage.cache_read_input_tokens = details["cache_read_input_tokens"]
+            .as_u64()
+            .or_else(|| raw["prompt_tokens_details"]["cached_tokens"].as_u64())
+            .or(usage.cache_read_input_tokens);
+        usage.cache_write_input_tokens = details["cache_creation_input_tokens"]
+            .as_u64()
+            .or(usage.cache_write_input_tokens);
+        usage.semantics = Some("aihubmix_claude_input_unresolved".into());
+    } else {
+        // Venice's paid-write alias is nested and part of inclusive input.
+        // Canonical field wins even when explicitly zero. Never add aliases.
+        // https://docs.venice.ai/guides/features/prompt-caching
+        usage.cache_write_input_tokens = raw["prompt_tokens_details"]["cache_write_tokens"]
+            .as_u64()
+            .or_else(|| raw["prompt_tokens_details"]["cache_creation_input_tokens"].as_u64())
+            .or(usage.cache_write_input_tokens);
+        usage.uncached_input_tokens = usage.input_tokens.and_then(|input| {
+            input
+                .checked_sub(usage.cache_read_input_tokens?)?
+                .checked_sub(usage.cache_write_input_tokens?)
+        });
     }
 }
 
@@ -630,22 +690,70 @@ fn estimate(
     })
 }
 
-/// Explicit catalog compatibility takes precedence for matching Chat profiles.
+/// Authority-native facts precede permitted public-catalog facts per field.
 /// Unknown/private profiles receive no speculative OpenAI extension. Sources:
 /// Groq API reference; Fireworks/Venice/Friendli chat reference;
 /// HF inference-providers chat task; DeepSeek create-chat-completion.
-pub(crate) fn stream_options(provider: &str, model: &str) -> Option<Value> {
-    let override_value = crate::catalog::model_catalog().ok().and_then(|c| {
-        c.model(provider, model)
-            .filter(|m| m.api == "openai-completions")
-            .and_then(|m| m.metadata.get("compat"))
-            .and_then(|v| v.get("supportsUsageInStreaming"))
-            .and_then(Value::as_bool)
-    });
-    let documented = matches!(
+pub(crate) fn stream_options(provider: &str, model: &str, base: &str) -> Option<Value> {
+    let catalog = crate::generation::uses_public_catalog(provider)
+        .then(|| crate::catalog::model_catalog().ok())
+        .flatten();
+    stream_options_in_catalog(provider, model, base, catalog.as_deref())
+}
+
+fn chat_root(base: &str) -> &str {
+    let base = base.trim_end_matches('/');
+    base.strip_suffix("/chat/completions")
+        .unwrap_or(base)
+        .trim_end_matches('/')
+}
+
+fn compat_bool(entry: &crate::catalog::CatalogModel, field: &str) -> Option<bool> {
+    entry.metadata.get("compat")?.get(field)?.as_bool()
+}
+
+fn stream_options_in_catalog(
+    provider: &str,
+    model: &str,
+    base: &str,
+    catalog: Option<&crate::catalog::ModelCatalog>,
+) -> Option<Value> {
+    let native = crate::generation::native_model(provider, model);
+    let source = crate::generation::uses_public_catalog(provider)
+        .then(|| catalog.and_then(|c| c.model(provider, model)))
+        .flatten();
+    let api = native
+        .as_ref()
+        .map(|m| m.api.as_str())
+        .filter(|api| !api.is_empty())
+        .or_else(|| source.map(|m| m.api.as_str()));
+    if api.is_some_and(|api| api != "openai-completions") {
+        return None;
+    }
+    let override_value = native
+        .as_ref()
+        .and_then(|m| compat_bool(m, "supportsUsageInStreaming"))
+        .or_else(|| {
+            source.and_then(|m| {
+                let supported = compat_bool(m, "supportsUsageInStreaming")?;
+                // Negative evidence remains authoritative. A positive public fact
+                // cannot admit a different endpoint; full Chat URLs are equivalent.
+                (!supported || chat_root(&m.base_url) == chat_root(base)).then_some(supported)
+            })
+        });
+    let existing_default = matches!(
         provider,
         "groq" | "fireworks" | "venice" | "huggingface" | "friendli" | "deepseek" | "novita"
     );
+    // Explicit server profiles select these protocols even at operator URLs.
+    // Custom endpoints do not inherit that admission. Hosted additions stay
+    // on the exact documented route; Nebius Studio is not Token Factory.
+    let documented = existing_default
+        || matches!(provider, "sglang" | "vllm" | "litellm")
+        || (matches!(provider, "baseten" | "nscale")
+            && crate::definition::provider_definition(provider)
+                .and_then(|d| d.default_base_url)
+                .is_some_and(|stock| chat_root(stock) == chat_root(base)));
     override_value
         .unwrap_or(documented)
         .then(|| json!({"include_usage":true}))
@@ -726,6 +834,9 @@ impl UsageContext {
         usage.api_version = self.api_version.clone();
         usage.route = self.route.clone();
         usage.physical_attempt_id = Some(self.attempt.clone());
+        if self.api == "chat_completions" {
+            apply_chat_usage_policy(usage, &self.provider, self.route.as_deref());
+        }
         usage.accounting = Some(accounting_with_entry(
             usage,
             &self.provider,
@@ -736,39 +847,40 @@ impl UsageContext {
     }
 }
 
-/// Native Claude only, default retention. Profile and catalog model must agree;
+/// Native Claude only, default retention. Available facts must agree with Messages;
 /// custom proxies and other vendors are not assumed to accept Claude markers.
 /// https://platform.claude.com/docs/en/build-with-claude/prompt-caching
 pub(crate) fn anthropic_cache_control(base: &str, model: &str) -> Option<Value> {
-    let catalog = crate::catalog::model_catalog().ok()?;
-    anthropic_cache_control_in_catalog(base, model, &catalog)
+    let catalog = crate::generation::uses_public_catalog("anthropic")
+        .then(|| crate::catalog::model_catalog().ok())
+        .flatten();
+    anthropic_cache_control_in_catalog(base, model, catalog.as_deref())
 }
 
 fn anthropic_cache_control_in_catalog(
     base: &str,
     model: &str,
-    catalog: &crate::catalog::ModelCatalog,
+    catalog: Option<&crate::catalog::ModelCatalog>,
 ) -> Option<Value> {
     if base.trim_end_matches('/') != crate::providers::anthropic::BASE_URL {
         return None;
     }
-    let entry = catalog.model("anthropic", model)?;
-    if entry
-        .metadata
-        .get("pricingEvidenceVersion")
-        .and_then(Value::as_u64)
-        != Some(1)
-        || entry.api != "anthropic-messages"
-        || !entry.cost["cacheRead"]
-            .as_f64()
-            .is_some_and(|rate| rate.is_finite() && rate > 0.)
-        || entry
-            .metadata
-            .get("compat")
-            .and_then(|v| v.get("supportsPromptCaching"))
-            .and_then(Value::as_bool)
-            == Some(false)
-    {
+    let native = crate::generation::native_model("anthropic", model);
+    let source = crate::generation::uses_public_catalog("anthropic")
+        .then(|| catalog.and_then(|c| c.model("anthropic", model)))
+        .flatten();
+    let api = native
+        .as_ref()
+        .map(|m| m.api.as_str())
+        .filter(|api| !api.is_empty())
+        .or_else(|| source.map(|m| m.api.as_str()));
+    let supported = native
+        .as_ref()
+        .and_then(|m| compat_bool(m, "supportsPromptCaching"))
+        .or_else(|| source.and_then(|m| compat_bool(m, "supportsPromptCaching")));
+    // The native API documents caching on all active Claude models. Pricing
+    // evidence is a separate accounting contract, never capability evidence.
+    if api.is_some_and(|api| api != "anthropic-messages") || supported == Some(false) {
         return None;
     }
     Some(json!({"type":"ephemeral"}))

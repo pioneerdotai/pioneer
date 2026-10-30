@@ -159,6 +159,8 @@ struct ApiChatResponse {
     model: Option<String>,
     #[serde(default)]
     id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_cache_diagnostics")]
+    diagnostics: Option<serde_json::Value>,
     content: Vec<ContentBlock>,
     #[serde(default)]
     stop_reason: Option<String>,
@@ -189,6 +191,64 @@ struct ContentBlock {
 }
 
 type ApiUsage = crate::usage::AnthropicUsage;
+
+// Native Messages has a different diagnostics union from OpenAI Responses.
+// Preserve absence versus explicit null; retain no arbitrary provider strings.
+fn deserialize_cache_diagnostics<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+    use serde_json::{Value, json};
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(Some(Value::Null));
+    }
+    let Some(reason) = value.get("cache_miss_reason") else {
+        return Ok(None);
+    };
+    if reason.is_null() {
+        return Ok(Some(json!({"cache_miss_reason":null})));
+    }
+    let Some(kind) = reason.get("type").and_then(Value::as_str).filter(|kind| {
+        matches!(
+            *kind,
+            "model_changed"
+                | "system_changed"
+                | "tools_changed"
+                | "messages_changed"
+                | "previous_message_not_found"
+                | "unavailable"
+        )
+    }) else {
+        return Ok(None);
+    };
+    let mut reason_out = json!({"type":kind});
+    if let Some(count) = reason
+        .get("cache_missed_input_tokens")
+        .and_then(Value::as_u64)
+    {
+        reason_out["cache_missed_input_tokens"] = json!(count);
+    }
+    Ok(Some(json!({"cache_miss_reason":reason_out})))
+}
+
+fn cache_diagnostic_usage(
+    comparison: Option<&crate::prompt_cache::Comparison>,
+    diagnostics: Option<&serde_json::Value>,
+) -> TokenUsage {
+    let mut usage = TokenUsage::default();
+    if comparison.is_some() || diagnostics.is_some() {
+        let mut metadata = serde_json::json!({"protocol":"anthropic_messages"});
+        if let Some(comparison) = comparison {
+            metadata["previous_message_id"] = serde_json::json!(comparison.response_id);
+            usage.prompt_cache_comparison_response_id = comparison.response_id.clone();
+        }
+        if let Some(diagnostics) = diagnostics {
+            metadata["response"] = diagnostics.clone();
+        }
+        usage.prompt_cache_diagnostics = Some(metadata);
+    }
+    usage
+}
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
@@ -224,6 +284,8 @@ struct StreamMessage {
     model: Option<String>,
     #[serde(default)]
     id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_cache_diagnostics")]
+    diagnostics: Option<serde_json::Value>,
     #[serde(default)]
     usage: Option<ApiUsage>,
 }
@@ -397,14 +459,16 @@ impl AnthropicProvider {
             .as_deref()
             .map(ProviderTermination::from_openai_reason)
             .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
-        let usage = Some(
-            api_response
+        let mut normalized = cache_diagnostic_usage(None, api_response.diagnostics.as_ref());
+        normalized.update(
+            &api_response
                 .usage
                 .map(|u| u.normalized())
                 .unwrap_or_default()
                 .with_native_id(api_response.id.as_deref())
                 .with_reported_model(api_response.model.as_deref()),
         );
+        let usage = Some(normalized);
 
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
@@ -480,6 +544,7 @@ impl AnthropicProvider {
         request: &ChatRequest,
         prepared: &PreparedProviderMessages,
         stream: bool,
+        comparison: Option<&crate::prompt_cache::Comparison>,
     ) -> Result<serde_json::Value> {
         let (system, messages) = Self::prepare_messages(prepared)?;
         let mut body = Self::build_chat_request(request, system, messages, stream)?;
@@ -520,7 +585,65 @@ impl AnthropicProvider {
             &request.model,
             &self.replay_authority,
         )?;
+        if let Some(comparison) = comparison {
+            body["diagnostics"] = serde_json::json!({"previous_message_id":comparison.response_id});
+        }
         Ok(body)
+    }
+
+    /// Decode the successful JSON envelope and commit its diagnostic baseline
+    /// only after native replay has been bound to the actual sent prefix.
+    fn finish_native_response(
+        &self,
+        api_response: ApiChatResponse,
+        requested_model: &str,
+        prefix_body: &serde_json::Value,
+        comparison: Option<&crate::prompt_cache::Comparison>,
+        native_request_id: Option<&str>,
+    ) -> Result<ChatResponse> {
+        let diagnostics = api_response.diagnostics.clone();
+        let mut response = Self::parse_response(api_response)?;
+        // Retain request opt-in state even if the server omits diagnostics.
+        response
+            .usage
+            .get_or_insert_with(Default::default)
+            .update(&cache_diagnostic_usage(comparison, diagnostics.as_ref()));
+        response
+            .usage
+            .get_or_insert_with(Default::default)
+            .request_id = crate::usage::native_id(native_request_id);
+        if let Some(state) = response.provider_replay_state.as_mut() {
+            crate::continuation::bind_prefix(
+                state,
+                requested_model,
+                &self.replay_authority,
+                prefix_body,
+            )?;
+        }
+        if let Some(comparison) = comparison {
+            comparison.completed(&serde_json::json!({"id":response.usage.as_ref().and_then(|u| u.generation_id.as_ref())}));
+        }
+        Ok(response)
+    }
+
+    fn cache_comparison(&self) -> Option<crate::prompt_cache::Comparison> {
+        if self.base_url != BASE_URL {
+            return None;
+        }
+        // Replay authority intentionally survives credential rotation. Diagnostic
+        // fingerprints belong to the current connection/account instead.
+        let authority = crate::attachments::runtime::current_authority_fingerprint()
+            .unwrap_or_else(|_| {
+                crate::continuation::replay_authority(
+                    "anthropic-diagnostics",
+                    &[&self.base_url, &self.api_key],
+                )
+            });
+        let authority = crate::continuation::replay_authority(
+            "anthropic-diagnostics",
+            &[&authority, &self.base_url],
+        );
+        crate::prompt_cache::Comparison::begin(&authority)
     }
 
     fn prepare_messages(
@@ -813,13 +936,14 @@ impl AnthropicProvider {
     pub(super) fn decode_stream(
         byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
     ) -> BoxStream<'static, Result<StreamChunk>> {
-        Self::decode_stream_with_replay(byte_stream, None, None)
+        Self::decode_stream_with_replay(byte_stream, None, None, None)
     }
 
     fn decode_stream_with_replay(
         byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
         replay_context: Option<StreamReplayContext>,
         native_request_id: Option<String>,
+        comparison: Option<crate::prompt_cache::Comparison>,
     ) -> BoxStream<'static, Result<StreamChunk>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
@@ -844,6 +968,7 @@ impl AnthropicProvider {
             let mut used_blocks = HashSet::new();
             let mut block_types = HashMap::new();
             let mut message_started = false;
+            let mut native_message_id = None;
             let mut active_blocks = HashSet::new();
             let mut thinking_blocks = HashSet::new();
             let mut replay_blocks: BTreeMap<usize, serde_json::Value> = BTreeMap::new();
@@ -907,15 +1032,17 @@ impl AnthropicProvider {
                                 .as_ref()
                                 .filter(|_| event.event_type == "message_start")
                             {
-                                if tx
-                                    .send(Ok(StreamChunk::usage(
-                                        TokenUsage::default()
-                                            .with_native_id(message.id.as_deref())
-                                            .with_reported_model(message.model.as_deref()),
-                                    )))
-                                    .await
-                                    .is_err()
-                                {
+                                native_message_id = crate::usage::native_id(message.id.as_deref());
+                                let mut usage = cache_diagnostic_usage(
+                                    comparison.as_ref(),
+                                    message.diagnostics.as_ref(),
+                                );
+                                usage.update(
+                                    &TokenUsage::default()
+                                        .with_native_id(message.id.as_deref())
+                                        .with_reported_model(message.model.as_deref()),
+                                );
+                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
                                     return;
                                 }
                             }
@@ -1116,6 +1243,10 @@ impl AnthropicProvider {
                                     {
                                         return;
                                     }
+                                }
+                                if let Some(comparison) = &comparison {
+                                    comparison
+                                        .completed(&serde_json::json!({"id":native_message_id}));
                                 }
                                 if tx
                                     .send(Ok(StreamChunk::final_chunk_with(
@@ -1376,7 +1507,9 @@ impl crate::traits::Provider for AnthropicProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = self.build_native_request(&request, &prepared, false)?;
+        let comparison = self.cache_comparison();
+        let api_request =
+            self.build_native_request(&request, &prepared, false, comparison.as_ref())?;
         let prefix_body = serde_json::to_value(&api_request)?;
 
         crate::attachments::validate_inline_payload("anthropic", &api_request)?;
@@ -1410,20 +1543,13 @@ impl crate::traits::Provider for AnthropicProvider {
             "provider_response",
         )
         .await?;
-        let mut response = Self::parse_response(api_response)?;
-        response
-            .usage
-            .get_or_insert_with(Default::default)
-            .request_id = crate::usage::native_id(native_request_id.as_deref());
-        if let Some(state) = response.provider_replay_state.as_mut() {
-            crate::continuation::bind_prefix(
-                state,
-                &request.model,
-                &self.replay_authority,
-                &prefix_body,
-            )?;
-        }
-        Ok(response)
+        self.finish_native_response(
+            api_response,
+            &request.model,
+            &prefix_body,
+            comparison.as_ref(),
+            native_request_id.as_deref(),
+        )
     }
 
     async fn stream_chat(
@@ -1440,7 +1566,9 @@ impl crate::traits::Provider for AnthropicProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = self.build_native_request(&request, &prepared, true)?;
+        let comparison = self.cache_comparison();
+        let api_request =
+            self.build_native_request(&request, &prepared, true, comparison.as_ref())?;
         let prefix_body = serde_json::to_value(&api_request)?;
 
         crate::attachments::validate_inline_payload("anthropic", &api_request)?;
@@ -1481,6 +1609,7 @@ impl crate::traits::Provider for AnthropicProvider {
                 prefix_body,
             }),
             native_request_id,
+            comparison,
         ))
     }
 
@@ -1784,7 +1913,7 @@ mod tests {
                 &p.capabilities(),
                 &r.rendered_messages_with_compiled_prompt(),
             )?;
-            p.build_native_request(r, &prepared, false)
+            p.build_native_request(r, &prepared, false, None)
                 .map(|body| serde_json::to_value(body).unwrap())
         };
         let sent = build(&provider, &req).unwrap();
@@ -1942,7 +2071,7 @@ mod tests {
             )
             .unwrap();
             provider
-                .build_native_request(request, &prepared, stream)
+                .build_native_request(request, &prepared, stream, None)
                 .unwrap()
         };
         let mut previous_wire = build(&req, false);
@@ -2148,7 +2277,7 @@ mod tests {
         .unwrap();
         let sent = serde_json::to_value(
             provider
-                .build_native_request(&req, &prepared, true)
+                .build_native_request(&req, &prepared, true, None)
                 .unwrap(),
         )
         .unwrap();
@@ -2166,6 +2295,7 @@ mod tests {
                 prefix_body: sent.clone(),
             }),
             Some("native-header-request".into()),
+            None,
         )
         .collect::<Vec<_>>()
         .await
@@ -2705,3 +2835,156 @@ mod media_contract_tests {
 #[cfg(test)]
 #[path = "wire_tests/anthropic.rs"]
 mod wire_contract_tests;
+
+#[cfg(test)]
+mod cache_diagnostics_tests {
+    use super::*;
+    use crate::ChatMessage;
+    use crate::traits::Provider;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn native_diagnostic_union_preserves_null_pending_and_bounded_reasons() {
+        for diagnostic in [
+            None,
+            Some(Value::Null),
+            Some(json!({"cache_miss_reason":null})),
+            Some(
+                json!({"cache_miss_reason":{"type":"system_changed", "cache_missed_input_tokens":42, "raw":"private"},"raw":"private"}),
+            ),
+            Some(json!({"cache_miss_reason":{"type":"unavailable"}})),
+            Some(json!({"cache_miss_reason":{"type":"unknown_vendor_reason","raw":"private"}})),
+        ] {
+            let mut wire = json!({"id":"msg_native","content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":2}});
+            if let Some(diagnostic) = diagnostic.as_ref() {
+                wire["diagnostics"] = diagnostic.clone();
+            }
+            let response =
+                AnthropicProvider::decode_response(serde_json::from_value(wire).unwrap()).unwrap();
+            let usage = response.usage.unwrap();
+            assert_eq!(usage.input_tokens, Some(1));
+            let result = usage
+                .prompt_cache_diagnostics
+                .as_ref()
+                .and_then(|v| v.get("response"));
+            match diagnostic {
+                None => assert!(result.is_none()),
+                Some(Value::Null) => assert_eq!(result, Some(&Value::Null)),
+                Some(value) if value["cache_miss_reason"]["type"] == "unknown_vendor_reason" => {
+                    assert!(result.is_none())
+                }
+                Some(value) => {
+                    assert_eq!(
+                        result.unwrap()["cache_miss_reason"]["type"],
+                        value["cache_miss_reason"]["type"]
+                    );
+                    assert!(!result.unwrap().to_string().contains("private"));
+                    if value["cache_miss_reason"].is_null() {
+                        assert!(result.unwrap()["cache_miss_reason"].is_null());
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_json_message_becomes_next_request_comparison() {
+        let provider = AnthropicProvider::new("native-json-comparison-fixture-key");
+        crate::prompt_cache::scope("native-json-diag-workspace", "owner", "main", async {
+            let request = super::super::history_test_support::request(vec![ChatMessage::user("hello")]);
+            let prepared = crate::attachments::prepare_messages_for_provider(
+                provider.name(), &provider.capabilities(), &request.messages).unwrap();
+            for (id, diagnostic, expected_previous) in [
+                ("msg_json_first", Value::Null, None),
+                ("msg_json_second", json!({"cache_miss_reason":{"type":"messages_changed","cache_missed_input_tokens":7}}), Some("msg_json_first")),
+            ] {
+                let comparison = provider.cache_comparison().unwrap();
+                let body = provider.build_native_request(&request, &prepared, false, Some(&comparison)).unwrap();
+                assert_eq!(body["diagnostics"]["previous_message_id"], json!(expected_previous));
+                let wire = json!({"id":id,"content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn",
+                    "diagnostics":diagnostic,"usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":2}});
+                let response = provider.finish_native_response(serde_json::from_value(wire).unwrap(),
+                    &request.model, &body, Some(&comparison), Some("native-json-header")).unwrap();
+                let usage = response.usage.unwrap();
+                assert_eq!(usage.request_id.as_deref(), Some("native-json-header"));
+                assert_eq!(usage.prompt_cache_comparison_response_id.as_deref(), expected_previous);
+                assert_eq!(usage.prompt_cache_diagnostics, Some(json!({"protocol":"anthropic_messages",
+                    "previous_message_id":expected_previous,"response":diagnostic})));
+                let next = AnthropicProvider::new("native-json-comparison-fixture-key").cache_comparison().unwrap();
+                let next_body = provider.build_native_request(&request, &prepared, false, Some(&next)).unwrap();
+                assert_eq!(next_body["diagnostics"]["previous_message_id"], id);
+            }
+            // An invalid native JSON answer cannot replace a successful baseline.
+            let previous = provider.cache_comparison().unwrap();
+            let body = provider.build_native_request(&request, &prepared, false, Some(&previous)).unwrap();
+            let invalid = serde_json::from_value(json!({"id":"msg_json_invalid","content":[],"stop_reason":"end_turn"})).unwrap();
+            assert!(provider.finish_native_response(invalid, &request.model, &body, Some(&previous), None).is_err());
+            assert_eq!(provider.cache_comparison().unwrap().response_id.as_deref(), Some("msg_json_second"));
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn diagnostics_follow_completed_native_message_and_trusted_scope() {
+        let provider = AnthropicProvider::new("native-diagnostic-fixture-key");
+        assert!(provider.cache_comparison().is_none());
+        crate::prompt_cache::scope("native-diag-workspace", "owner", "main", async {
+            let comparison = provider.cache_comparison().unwrap();
+            assert!(comparison.response_id.is_none());
+            let request = super::super::history_test_support::request(vec![ChatMessage::user("hello")]);
+            let prepared = crate::attachments::prepare_messages_for_provider(
+                provider.name(), &provider.capabilities(), &request.messages).unwrap();
+            for stream in [false, true] {
+                let body = provider.build_native_request(&request, &prepared, stream, Some(&comparison)).unwrap();
+                assert_eq!(body["diagnostics"], json!({"previous_message_id":null}));
+                assert!(body.get("previous_response_id").is_none());
+                assert_eq!(body["messages"][0]["role"], "user");
+            }
+            let events = [
+                json!({"type":"message_start","message":{"id":"msg_completed_cache_fixture","model":"fixture","diagnostics":{"cache_miss_reason":null}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"answer"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+                json!({"type":"message_stop"}),
+            ];
+            let bytes = events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>();
+            let stream = futures_util::stream::iter(vec![Ok(bytes::Bytes::from(bytes))]);
+            let chunks = AnthropicProvider::decode_stream_with_replay(
+                Box::pin(stream), None, None, Some(comparison)).collect::<Vec<_>>().await
+                .into_iter().collect::<Result<Vec<_>>>().unwrap();
+            let mut usage = TokenUsage::default();
+            for chunk in chunks {
+                if let Some(snapshot) = chunk.usage {
+                    usage.update(&snapshot);
+                }
+            }
+            assert_eq!(usage.prompt_cache_diagnostics, Some(json!({"protocol":"anthropic_messages", "previous_message_id":null, "response":{"cache_miss_reason":null}})));
+            assert_eq!(usage.output_tokens, Some(1));
+            let stored = serde_json::to_string(&usage).unwrap();
+            let loaded: TokenUsage = serde_json::from_str(&stored).unwrap();
+            assert_eq!(loaded.prompt_cache_diagnostics, usage.prompt_cache_diagnostics);
+            let next = AnthropicProvider::new("native-diagnostic-fixture-key").cache_comparison().unwrap();
+            assert_eq!(next.response_id.as_deref(), Some("msg_completed_cache_fixture"));
+            let body = provider.build_native_request(&request, &prepared, false, Some(&next)).unwrap();
+            assert_eq!(body["diagnostics"]["previous_message_id"], "msg_completed_cache_fixture");
+            assert!(AnthropicProvider::new("other-key").cache_comparison().unwrap().response_id.is_none());
+            assert!(AnthropicProvider::with_base_url("native-diagnostic-fixture-key", "https://proxy.example").cache_comparison().is_none());
+            for (workspace, owner, purpose) in [
+                ("native-diag-workspace", "child", "main"),
+                ("native-diag-workspace", "owner", "preflight"),
+                ("native-diag-workspace", "owner", "compaction"),
+                ("other-workspace", "owner", "main"),
+            ] {
+                crate::prompt_cache::scope(workspace, owner, purpose, async {
+                    assert!(provider.cache_comparison().unwrap().response_id.is_none());
+                }).await;
+            }
+            // A partial message_start is evidence, but never a new baseline.
+            let bytes = bytes::Bytes::from_static(b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_partial\"}}\n\n");
+            let failed = AnthropicProvider::decode_stream_with_replay(
+                Box::pin(futures_util::stream::iter(vec![Ok(bytes)])), None, None,
+                provider.cache_comparison()).collect::<Vec<_>>().await;
+            assert!(failed.iter().any(Result::is_err));
+            assert_eq!(provider.cache_comparison().unwrap().response_id, next.response_id);
+        }).await;
+    }
+}

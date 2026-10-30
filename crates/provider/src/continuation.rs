@@ -193,6 +193,38 @@ pub fn retention(state: &ProviderReplayState) -> Retention {
                 Retention::Unsupported
             }
         }
+        "aihubmix" if p["assistant_message"].get("reasoning_details").is_some() => {
+            // AIHubMix owns the exact native object. Preserve signed thinking
+            // through compaction; compatibility remains the existing scoped
+            // provider/model policy and the producing Chat endpoint authority.
+            if p["schema_version"] == 1
+                && p.as_object().is_some_and(|object| {
+                    object.keys().all(|key| {
+                        matches!(
+                            key.as_str(),
+                            "schema_version" | "authority_scope" | "assistant_message"
+                        )
+                    })
+                })
+                && p["assistant_message"].as_object().is_some_and(|object| {
+                    object.keys().all(|key| {
+                        matches!(
+                            key.as_str(),
+                            "content" | "reasoning_content" | "reasoning_details" | "tool_calls"
+                        )
+                    })
+                })
+                && p["authority_scope"].as_str().is_some_and(|s| !s.is_empty())
+                && matches!(
+                    p["assistant_message"]["reasoning_details"],
+                    Value::Object(_) | Value::Array(_)
+                )
+            {
+                Retention::Prefix
+            } else {
+                Retention::Unsupported
+            }
+        }
         _ if p["schema_version"] == 1 && p["assistant_message"].is_object() => {
             // Version 1 is the existing compatible producer's readable schema,
             // not a license to discard unknown signed/native extensions.

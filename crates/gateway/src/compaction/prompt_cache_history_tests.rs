@@ -436,3 +436,120 @@ fn retry_non_retryable_resolution_remains_model_visible() {
             .contains("non_retryable")
     );
 }
+
+#[tokio::test]
+async fn aihubmix_signed_tool_round_survives_cold_and_accepted_history_storage() {
+    use pioneer_crud::NewTurnLlmContextEntry;
+    use std::collections::BTreeSet;
+    let f = fixture("unused", vec![], true, false).await;
+    let call = ProviderToolCall {
+        id: "signed-call".into(),
+        name: "lookup".into(),
+        arguments: "{}".into(),
+    };
+    let details = json!({"type":"thinking","thinking":"lookup first","signature":"synthetic-native-signature"});
+    let state = ProviderReplayState::for_model(
+        "aihubmix",
+        "fixture",
+        json!({"schema_version":1,
+        "authority_scope":"synthetic-endpoint-authority", "assistant_message":{
+            "content":null,"reasoning_content":null,"reasoning_details":details,
+            "tool_calls":[{"id":"signed-call","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}),
+    );
+    let mut assistant = ChatMessage::assistant_tool_calls(None::<String>, vec![call]);
+    assistant.provider_replay_state = Some(state.clone());
+    let envelope = CanonicalProviderRoundEnvelope {
+        ui_copies: None,
+        version: 1,
+        round_id: "signed-round".into(),
+        termination: ProviderTermination::ToolCalls,
+        message: assistant,
+        calls: vec![ProviderCallIdentity {
+            provider_call_id: "signed-call".into(),
+            turn_item_id: "signed-item".into(),
+            ordinal: 0,
+        }],
+    };
+    let result = ChatMessage::tool_result("signed-call", "lookup", "found");
+    let view = pioneer_tools::ToolResultView::Json {
+        value: serde_json::to_value(result).unwrap(),
+        truncated: false,
+    };
+    let time = chrono::Utc::now().fixed_offset();
+    for (sequence, source, item, payload) in [
+        (
+            11,
+            "assistant_round",
+            "signed-round",
+            serde_json::to_string(&envelope).unwrap(),
+        ),
+        (
+            12,
+            "tool_result_v2",
+            "signed-item",
+            serde_json::to_string(&view).unwrap(),
+        ),
+    ] {
+        f.store
+            .insert_turn_llm_context(NewTurnLlmContextEntry {
+                turn_id: "turn".into(),
+                item_id: Some(item.into()),
+                attempt_id: None,
+                sequence,
+                source: source.into(),
+                tool_name: (source == "tool_result_v2").then(|| "lookup".into()),
+                payload,
+                output_policy_snapshot: "{}".into(),
+                created_at: time + chrono::Duration::seconds(sequence),
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+    }
+    drop(envelope);
+    let cold = super::super::frozen::capture_execution_basis_prepared(
+        &f.store, "ws", "thread", None, None, None,
+    )
+    .await
+    .unwrap();
+    let allowed = BTreeSet::from(["thread".into()]);
+    let descriptor =
+        super::super::frozen::capture(&f.store, "ws", "thread", &allowed, &cold.messages)
+            .await
+            .unwrap();
+    let accepted = super::super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "thread",
+        &allowed,
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    for messages in [cold.messages, accepted.messages] {
+        let projected = pioneer_provider::history::project_messages_for_provider(
+            "aihubmix", "fixture", &messages,
+        )
+        .unwrap();
+        let index = projected
+            .iter()
+            .position(|m| m.provider_replay_state.as_ref() == Some(&state))
+            .expect("stored signed round must be loaded");
+        assert_eq!(
+            projected[index]
+                .provider_replay_state
+                .as_ref()
+                .unwrap()
+                .payload["assistant_message"]["reasoning_details"],
+            details
+        );
+        let result_index = projected
+            .iter()
+            .position(|m| m.tool_call_id.as_deref() == Some("signed-call"))
+            .unwrap();
+        assert!(index < result_index);
+        assert_eq!(projected[result_index].role, pioneer_provider::Role::Tool);
+        assert_eq!(projected[result_index].content, "found");
+    }
+}

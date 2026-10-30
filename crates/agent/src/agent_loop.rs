@@ -2080,6 +2080,7 @@ async fn execute_turn_flow(
     let cache_conversation = hook_runtime_context
         .effective_conversation_thread_id(&thread_id)
         .to_owned();
+    let cache_task_group = hook_runtime_context.cache_task_group_id.clone();
     match mode {
         ThreadMode::Message => TurnTaskCompletion {
             result: Err(TurnTaskFailure::Terminal(
@@ -2091,9 +2092,10 @@ async fn execute_turn_flow(
         ThreadMode::Chat | ThreadMode::Agent => turn_flow_future(
             pioneer_observability::turn_startup::scope(
                 Some(turn_id.clone()),
-                pioneer_provider::prompt_cache::conversation_scope(
+                pioneer_provider::prompt_cache::conversation_task_scope(
                     cache_workspace,
                     cache_conversation,
+                    cache_task_group,
                     chat::execute_chat_turn_flow(
                         context_session,
                         thread_id,

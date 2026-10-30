@@ -49,6 +49,8 @@ pub struct OpenRouterProvider {
 #[derive(Debug, Serialize)]
 struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<serde_json::Value>,
     model: String,
     messages: Vec<ApiMessage>,
@@ -675,6 +677,7 @@ impl OpenRouterProvider {
         let generation =
             crate::generation::chat_fields_from_catalog(catalog, "openrouter", request)?;
         Ok(ApiChatRequest {
+            session_id: None,
             cache_control: None,
             generation,
             model: request.model.clone(),
@@ -1036,6 +1039,36 @@ impl OpenRouterProvider {
 
     fn embeddings_url(&self) -> String {
         format!("{}/embeddings", self.base_url)
+    }
+
+    fn build_native_request(
+        &self,
+        request: &ChatRequest,
+        prepared: &PreparedProviderMessages,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let mut body = Self::build_request_from_prepared(request, prepared, stream)?;
+        body.cache_control = crate::usage::openrouter_cache_control(&self.base_url, &request.model);
+        body.session_id = self.cache_session_id();
+        Ok(body)
+    }
+
+    fn cache_session_id(&self) -> Option<String> {
+        if self.base_url != BASE_URL {
+            return None;
+        }
+        let authority = crate::attachments::runtime::current_authority_fingerprint()
+            .unwrap_or_else(|_| {
+                crate::continuation::replay_authority(
+                    "openrouter-cache-routing",
+                    &[&self.base_url, &self.api_key],
+                )
+            });
+        let authority = crate::continuation::replay_authority(
+            "openrouter-cache-routing",
+            &[&authority, &self.base_url],
+        );
+        crate::prompt_cache::Comparison::begin(&authority)?.affinity_key()
     }
 
     fn with_app_attribution(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -1489,9 +1522,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let mut api_request = Self::build_request_from_prepared(&request, &prepared, false)?;
-        api_request.cache_control =
-            crate::usage::openrouter_cache_control(&self.base_url, &request.model);
+        let api_request = self.build_native_request(&request, &prepared, false)?;
 
         let request_builder = Self::with_app_attribution(
             self.client
@@ -1648,9 +1679,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let mut api_request = Self::build_request_from_prepared(&request, &prepared, true)?;
-        api_request.cache_control =
-            crate::usage::openrouter_cache_control(&self.base_url, &request.model);
+        let api_request = self.build_native_request(&request, &prepared, true)?;
 
         let request_builder = Self::with_app_attribution(
             self.client
@@ -2866,6 +2895,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            session_id: None,
             cache_control: None,
             generation: Default::default(),
             model: "anthropic/claude-sonnet-4".into(),
@@ -3746,5 +3776,70 @@ mod merged_stream_boundary_tests {
                 assert!(crate::failure::provider_stream_incomplete(error).is_some());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_session_tests {
+    use super::*;
+    use crate::{ChatMessage, traits::Provider};
+
+    #[tokio::test]
+    async fn native_session_wire_is_stable_and_scope_bound() {
+        let provider = OpenRouterProvider::new("session-fixture-key");
+        assert!(provider.cache_session_id().is_none());
+        crate::prompt_cache::scope("router-session-workspace", "owner", "main", async {
+            let key = provider.cache_session_id().unwrap();
+            assert_eq!(key.len(), 64);
+            assert_eq!(
+                OpenRouterProvider::new("session-fixture-key").cache_session_id(),
+                Some(key.clone())
+            );
+            for stream in [false, true] {
+                for (model, text) in [("fixture-one", "first"), ("fixture-two", "next turn")] {
+                    let mut request =
+                        super::super::history_test_support::request(vec![ChatMessage::user(text)]);
+                    request.model = model.into();
+                    let prepared = crate::attachments::prepare_messages_for_provider(
+                        provider.name(),
+                        &provider.capabilities(),
+                        &request.messages,
+                    )
+                    .unwrap();
+                    let request = provider
+                        .build_native_request(&request, &prepared, stream)
+                        .unwrap();
+                    let wire = serde_json::to_value(request).unwrap();
+                    assert_eq!(wire["session_id"], key);
+                    assert_eq!(wire["stream"], stream);
+                    assert_eq!(wire["model"], model);
+                    assert_eq!(wire["messages"][0]["content"], text);
+                }
+            }
+            assert_ne!(
+                OpenRouterProvider::new("changed-key").cache_session_id(),
+                Some(key.clone())
+            );
+            assert!(
+                OpenRouterProvider::with_base_url(
+                    "session-fixture-key",
+                    "https://proxy.example/api/v1"
+                )
+                .cache_session_id()
+                .is_none()
+            );
+            for (workspace, owner, purpose) in [
+                ("other-router-workspace", "owner", "main"),
+                ("router-session-workspace", "child", "main"),
+                ("router-session-workspace", "owner", "preflight"),
+                ("router-session-workspace", "owner", "compaction"),
+            ] {
+                crate::prompt_cache::scope(workspace, owner, purpose, async {
+                    assert_ne!(provider.cache_session_id(), Some(key.clone()));
+                })
+                .await;
+            }
+        })
+        .await;
     }
 }

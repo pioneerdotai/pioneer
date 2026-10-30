@@ -10,10 +10,11 @@ struct Scope {
     workspace: String,
     thread: String,
     purpose: &'static str,
+    task_owner: Option<String>,
 }
 tokio::task_local! {
     static SCOPE: Scope;
-    static CONVERSATION: (String, String);
+    static CONVERSATION: (String, String, Option<String>);
 }
 
 /// The runtime already knows the logical conversation owner. Attached agents
@@ -24,7 +25,20 @@ pub async fn conversation_scope<T>(
     thread: String,
     future: impl Future<Output = T>,
 ) -> T {
-    CONVERSATION.scope((workspace, thread), future).await
+    conversation_task_scope(workspace, thread, None, future).await
+}
+
+/// A runtime-owned task tree may share affinity where the vendor explicitly
+/// groups subagents. This does not change ordinary conversation/comparison IDs.
+pub async fn conversation_task_scope<T>(
+    workspace: String,
+    thread: String,
+    task_owner: Option<String>,
+    future: impl Future<Output = T>,
+) -> T {
+    CONVERSATION
+        .scope((workspace, thread, task_owner), future)
+        .await
 }
 
 /// Explicit execution identity keeps concurrent agents and preflight separate.
@@ -35,7 +49,7 @@ pub async fn scope<T>(
     future: impl Future<Output = T>,
 ) -> T {
     let owner = CONVERSATION
-        .try_with(|(w, t)| (w == workspace).then(|| t.clone()))
+        .try_with(|(w, t, _)| (w == workspace).then(|| t.clone()))
         .ok()
         .flatten()
         .unwrap_or_else(|| thread.to_owned());
@@ -45,6 +59,10 @@ pub async fn scope<T>(
                 workspace: workspace.into(),
                 thread: owner,
                 purpose,
+                task_owner: CONVERSATION
+                    .try_with(|(w, _, owner)| (w == workspace).then(|| owner.clone()).flatten())
+                    .ok()
+                    .flatten(),
             },
             future,
         )
@@ -82,6 +100,28 @@ impl Comparison {
         ))
         .ok()?;
         Some(hex::encode(sha2::Sha256::digest(identity)))
+    }
+
+    /// Baseten groups one task and its related subagents. Other vendor policies
+    /// continue using the separate conversation owner in `affinity_key`.
+    pub(crate) fn task_affinity_key(authority: &str) -> Option<String> {
+        let scope = SCOPE.try_with(Clone::clone).ok()?;
+        let conversation_owner = format!("conversation:{}", scope.thread);
+        let owner = scope.task_owner.as_deref().unwrap_or(&conversation_owner);
+        if scope.workspace.is_empty() || scope.thread.is_empty() || owner.is_empty() {
+            return None;
+        }
+        use sha2::Digest;
+        Some(hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&(
+                "pioneer-baseten-task-session-v1",
+                authority,
+                &scope.workspace,
+                owner,
+                scope.purpose,
+            ))
+            .ok()?,
+        )))
     }
 
     pub(crate) fn begin(authority: &str) -> Option<Self> {
@@ -150,4 +190,36 @@ pub(crate) fn diagnostics(value: &Value) -> Option<Value> {
         }
     }
     Some(result)
+}
+
+/// Routing outcomes are bounded diagnostics, never session IDs or hit counters.
+pub(crate) fn gateway_routing(response: &Value) -> Option<Value> {
+    let routing = response
+        .get("provider_metadata")?
+        .get("gateway")?
+        .get("routing")?;
+    let mut result = serde_json::Map::new();
+    if let Some(source) = routing["clientSessionIdSource"]
+        .as_str()
+        .filter(|s| matches!(*s, "explicit" | "agent" | "fingerprint"))
+    {
+        result.insert("clientSessionIdSource".into(), json!(source));
+    }
+    let affinity = &routing["affinity"];
+    let mut outcome = serde_json::Map::new();
+    for key in ["outcome", "pinnedProvider", "displacedProvider"] {
+        if let Some(value) = affinity[key].as_str().filter(|s| {
+            !s.is_empty()
+                && s.len() <= 96
+                && s.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-')
+                })
+        }) {
+            outcome.insert(key.into(), json!(value));
+        }
+    }
+    if !outcome.is_empty() {
+        result.insert("affinity".into(), Value::Object(outcome));
+    }
+    (!result.is_empty()).then_some(Value::Object(result))
 }

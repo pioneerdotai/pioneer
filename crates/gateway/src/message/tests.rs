@@ -87690,11 +87690,15 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     use futures_util::StreamExt;
     struct LateUsage {
         fail_after_usage: bool,
+        authority: Option<&'static str>,
     }
     #[async_trait::async_trait]
     impl pioneer_provider::Provider for LateUsage {
         fn name(&self) -> &str {
             "fixture"
+        }
+        fn authority_fingerprint(&self) -> Option<&str> {
+            self.authority
         }
         async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
             anyhow::bail!("unexpected non-stream fixture")
@@ -87711,6 +87715,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
                 Ok(StreamChunk::usage(pioneer_provider::TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(2),
+                    prompt_cache_diagnostics: Some(json!({"reason":"fixture"})),
                     ..Default::default()
                 })),
             ];
@@ -87726,6 +87731,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     let provider = crate::usage_journal::observe(
         Arc::new(LateUsage {
             fail_after_usage: false,
+            authority: Some("authority-a"),
         }),
         &background,
         &workspace,
@@ -87746,6 +87752,13 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
         })
         .await
         .unwrap();
+    let started = background
+        .provider_usage_page(&workspace, "late-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(started[0].status, "started");
+    let metadata: serde_json::Value = serde_json::from_str(&started[0].usage_json).unwrap();
+    assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-a");
     assert!(stream.next().await.unwrap().unwrap().is_final);
     assert_eq!(
         stream
@@ -87768,14 +87781,21 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
     assert_eq!(retained.input_tokens, Some(10));
     assert_eq!(retained.output_tokens, Some(2));
+    assert_eq!(
+        retained.prompt_cache_diagnostics,
+        Some(json!({"reason":"fixture"}))
+    );
+    let metadata: serde_json::Value = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-a");
     let failed = crate::usage_journal::observe(
         Arc::new(LateUsage {
             fail_after_usage: true,
+            authority: Some("authority-b"),
         }),
         &background,
         &workspace,
         "memory_extraction",
-        "late-failed-owner",
+        "late-owner",
     );
     let mut stream = failed
         .stream_chat(ChatRequest {
@@ -87796,14 +87816,63 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     assert!(stream.next().await.unwrap().is_err());
     assert!(stream.next().await.is_none());
     let rows = background
-        .provider_usage_page(&workspace, "late-failed-owner", "", 100)
+        .provider_usage_page(&workspace, "late-owner", "", 100)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].status, "failed");
-    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(rows.len(), 2);
+    let failed_row = rows.iter().find(|row| row.status == "failed").unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&failed_row.usage_json).unwrap();
+    assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-b");
+    let retained: pioneer_provider::TokenUsage =
+        serde_json::from_str(&failed_row.usage_json).unwrap();
     assert_eq!(retained.input_tokens, Some(10));
     assert_eq!(retained.output_tokens, Some(2));
+    assert_eq!(
+        retained.prompt_cache_diagnostics,
+        Some(json!({"reason":"fixture"}))
+    );
+    // An otherwise identical unlabelled call remains unknown, including after enrichment.
+    let legacy = crate::usage_journal::observe(
+        Arc::new(LateUsage {
+            fail_after_usage: false,
+            authority: None,
+        }),
+        &background,
+        &workspace,
+        "memory_extraction",
+        "late-owner",
+    );
+    let mut stream = legacy
+        .stream_chat(ChatRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        })
+        .await
+        .unwrap();
+    while let Some(chunk) = stream.next().await {
+        chunk.unwrap();
+    }
+    let rows = background
+        .provider_usage_page(&workspace, "late-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let unlabelled = rows
+        .iter()
+        .filter(|row| {
+            let value: serde_json::Value = serde_json::from_str(&row.usage_json).unwrap();
+            value.get("_pioneer_journal").is_none()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(unlabelled.len(), 1);
+    assert_eq!(unlabelled[0].status, "completed");
 }
 
 #[tokio::test]

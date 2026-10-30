@@ -102,8 +102,52 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
     execution_security_snapshot: TurnExecutionSecuritySnapshot,
     agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
 ) -> Result<RestoredRecoveryTurnRequest> {
-    let (hook_runtime_context, history) =
+    let (mut hook_runtime_context, history) =
         restored_conversation_scope_from_snapshot(store, snapshot).await?;
+    if hook_runtime_context.cache_task_group_id.is_none() {
+        // A hook's task_id alone is not proof of Task ownership. Recover that
+        // identity only from the exact durable execution binding, within the
+        // snapshot's workspace. Existing recovery authorization stays outside
+        // this routing-only normalization.
+        let routing_store = crate::message::ordinary_history_store(store);
+        if let Some(binding) = routing_store
+            .get_task_run_turn_by_turn(&snapshot.thread_id, &snapshot.turn_id)
+            .await?
+        {
+            let task = routing_store
+                .get_task_record(&binding.task_id)
+                .await?
+                .context("recovery Task execution has no canonical Task")?;
+            anyhow::ensure!(
+                binding.thread_id == snapshot.thread_id
+                    && binding.turn_id == snapshot.turn_id
+                    && task.workspace_id == snapshot.workspace_id
+                    && hook_runtime_context
+                        .task_id
+                        .as_deref()
+                        .is_none_or(|id| id == task.id),
+                "recovery Task routing identity does not match its snapshot"
+            );
+            let parent_thread = hook_runtime_context
+                .conversation_thread_id
+                .as_deref()
+                .or(task.created_by_thread_id.as_deref())
+                .or_else(|| {
+                    (task.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
+                        .then_some(task.owner_id.as_deref())
+                        .flatten()
+                })
+                .unwrap_or(&snapshot.thread_id)
+                .to_owned();
+            hook_runtime_context = crate::message::task_cache_routing_context(
+                &routing_store,
+                &task,
+                &parent_thread,
+                hook_runtime_context,
+            )
+            .await?;
+        }
+    }
     Ok(RestoredRecoveryTurnRequest {
         turn_id: snapshot.turn_id.clone(),
         execution_window_index: 1,

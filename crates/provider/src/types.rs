@@ -1099,6 +1099,9 @@ impl TokenUsage {
     /// Stream fields are cumulative snapshots. Duplicate events replace values;
     /// partial native deltas preserve previously reported categories.
     pub fn update(&mut self, snapshot: &Self) {
+        let unresolved_native_input = self.semantics.as_deref()
+            == Some("aihubmix_claude_input_unresolved")
+            || snapshot.semantics.as_deref() == Some("aihubmix_claude_input_unresolved");
         macro_rules! update {
             ($($field:ident),*) => {$(if snapshot.$field.is_some() {
                 self.$field = snapshot.$field.clone();
@@ -1135,6 +1138,11 @@ impl TokenUsage {
                     raw: &serde_json::Map<String, serde_json::Value>,
                 ) {
                     for (key, value) in raw {
+                        // A partial usage envelope may explicitly omit a whole
+                        // details object. It cannot erase earlier observations.
+                        if value.is_null() && target.contains_key(key) {
+                            continue;
+                        }
                         if let (Some(existing), Some(incoming)) = (
                             target
                                 .get_mut(key)
@@ -1167,6 +1175,23 @@ impl TokenUsage {
                     _ => None,
                 };
             }
+        }
+        if matches!(
+            self.semantics.as_deref(),
+            Some("inclusive_cache_and_reasoning" | "inclusive_cache_separate_thoughts")
+        ) {
+            self.uncached_input_tokens = self.input_tokens.and_then(|input| {
+                input
+                    .checked_sub(self.cache_read_input_tokens?)?
+                    .checked_sub(self.cache_write_input_tokens?)
+            });
+        }
+        if unresolved_native_input {
+            self.semantics = Some("aihubmix_claude_input_unresolved".into());
+            // Later native evidence can invalidate an earlier prompt-only
+            // partial total. Preserve observed categories, not that guess.
+            self.input_tokens = None;
+            self.uncached_input_tokens = None;
         }
         if self.semantics.as_deref() == Some("exclusive_cache") {
             self.input_tokens = self.uncached_input_tokens.and_then(|i| {
@@ -1861,5 +1886,75 @@ mod provenance_tests {
         wire["provenance"] = serde_json::to_value(provenance).unwrap();
         let received: ChatMessage = serde_json::from_value(wire).unwrap();
         assert_eq!(received.provenance, None);
+    }
+}
+
+#[cfg(test)]
+mod cache_partial_update_regression {
+    use super::TokenUsage;
+    #[test]
+    fn unresolved_native_envelope_invalidates_prior_prompt_only_total() {
+        let mut usage = TokenUsage {
+            input_tokens: Some(22),
+            uncached_input_tokens: Some(22),
+            output_tokens: Some(7),
+            ..Default::default()
+        };
+        let native = TokenUsage {
+            cache_read_input_tokens: Some(6266),
+            cache_write_input_tokens: Some(0),
+            semantics: Some("aihubmix_claude_input_unresolved".into()),
+            ..Default::default()
+        };
+        usage.update(&native);
+        usage.update(&native);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.uncached_input_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, Some(6266));
+        assert_eq!(usage.cache_write_input_tokens, Some(0));
+        assert_eq!(usage.output_tokens, Some(7));
+        usage.raw_usage = Some(
+            serde_json::json!({"claude_cache_tokens_details":{"cache_read_input_tokens":6266}}),
+        );
+        usage.update(&TokenUsage {
+            input_tokens: Some(22),
+            output_tokens: Some(9),
+            semantics: Some("inclusive_cache_and_reasoning".into()),
+            raw_usage: Some(serde_json::json!({"claude_cache_tokens_details":null})),
+            ..Default::default()
+        });
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, Some(6266));
+        assert_eq!(
+            usage.raw_usage.unwrap()["claude_cache_tokens_details"]["cache_read_input_tokens"],
+            6266
+        );
+    }
+
+    #[test]
+    fn partial_inclusive_totals_recompute_uncached_with_checked_categories() {
+        let mut usage = TokenUsage {
+            input_tokens: Some(100),
+            cache_read_input_tokens: Some(60),
+            cache_write_input_tokens: Some(10),
+            uncached_input_tokens: Some(30),
+            semantics: Some("inclusive_cache_and_reasoning".into()),
+            ..Default::default()
+        };
+        usage.update(&TokenUsage {
+            input_tokens: Some(120),
+            ..Default::default()
+        });
+        assert_eq!(usage.uncached_input_tokens, Some(50));
+        usage.update(&TokenUsage {
+            cache_read_input_tokens: Some(111),
+            ..Default::default()
+        });
+        assert_eq!(usage.uncached_input_tokens, None);
+        usage.update(&TokenUsage {
+            cache_write_input_tokens: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(usage.uncached_input_tokens, Some(9));
     }
 }

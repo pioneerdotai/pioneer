@@ -134,6 +134,17 @@ impl Reducer {
         .with_reported_model(response["model"].as_str())
         .with_service_tier(response["service_tier"].as_str());
         snapshot.api = Some("responses".into());
+        if self.provider == "vercel-ai-gateway"
+            && let Some(routing) = crate::prompt_cache::gateway_routing(response)
+        {
+            let mut metadata = self
+                .usage
+                .prompt_cache_diagnostics
+                .clone()
+                .unwrap_or_else(|| json!({}));
+            metadata["gateway_routing"] = routing;
+            snapshot.prompt_cache_diagnostics = Some(metadata);
+        }
         self.usage.update(&snapshot);
         Ok(())
     }
@@ -572,8 +583,19 @@ impl Reducer {
     pub(super) fn snapshot(&mut self, response: &Value) -> Result<Vec<StreamChunk>> {
         ensure!(self.terminal.is_none(), "Responses duplicate terminal");
         self.observe(response)?;
-        self.usage.prompt_cache_diagnostics =
-            crate::prompt_cache::diagnostics(&response["prompt_cache_diagnostics"]);
+        if let Some(mut diagnostics) =
+            crate::prompt_cache::diagnostics(&response["prompt_cache_diagnostics"])
+        {
+            if let Some(routing) = self
+                .usage
+                .prompt_cache_diagnostics
+                .as_ref()
+                .and_then(|v| v.get("gateway_routing"))
+            {
+                diagnostics["gateway_routing"] = routing.clone();
+            }
+            self.usage.prompt_cache_diagnostics = Some(diagnostics);
+        }
         let status = response["status"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing Responses status"))?;
