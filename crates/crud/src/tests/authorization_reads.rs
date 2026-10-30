@@ -109,13 +109,21 @@ async fn authorization_scalar_and_binding_reads_preserve_absence_and_reject_corr
         ("origin", "user"),
         ("work_owner", "detached_task"),
     ] {
-        store
-            .connection
-            .execute_unprepared(&format!(
-                "UPDATE turn SET {column}='unknown' WHERE id='turn'"
-            ))
+        // Seed legacy corruption on one pinned connection, then restore CHECK
+        // enforcement before exercising the authorization reader.
+        let tx = store.connection.begin().await.unwrap();
+        tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
             .await
             .unwrap();
+        tx.execute_unprepared(&format!(
+            "UPDATE turn SET {column}='unknown' WHERE id='turn'"
+        ))
+        .await
+        .unwrap();
+        tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
         assert!(
             store
                 .get_turn_execution_binding("thread", "turn")

@@ -5811,6 +5811,13 @@ async fn fresh_detached_rpc_completes_after_task_commit_when_authority_reload_fa
     let connection =
         register_authenticated_test_connection(processor.session_manager.as_ref(), tx).await;
     let turn_id = "fresh-lease-admission";
+    subscribe_test_connection_to_materialized_thread(
+        &processor,
+        connection,
+        &context.workspace_id,
+        &thread_id,
+    )
+    .await;
     let request_id = generate_test_request_id("fresh", "lease");
     let request = json!({"jsonrpc":"2.0","id":request_id,"method":"turn/start","params":{
         "thread_id":thread_id,"turn_id":turn_id,"input":[{"type":"text","text":"Accept this work once"}],
@@ -6061,6 +6068,13 @@ async fn replaced_gateway_resolves_detached_admission_before_commit_and_after_us
                 register_authenticated_test_connection(processor.session_manager.as_ref(), tx)
                     .await;
             turn_id = "recovery-user-admission".to_owned();
+            subscribe_test_connection_to_materialized_thread(
+                &processor,
+                connection,
+                &context.workspace_id,
+                &thread_id,
+            )
+            .await;
             let request_id = generate_test_request_id("review", "user-admission");
             let request = json!({"jsonrpc":"2.0","id":request_id,"method":"turn/start","params":{
                 "thread_id":thread_id,"turn_id":turn_id,"input":[{"type":"text","text":"User crash window"}],
