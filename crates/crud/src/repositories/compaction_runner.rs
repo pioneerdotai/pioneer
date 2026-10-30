@@ -860,6 +860,8 @@ pub(crate) async fn compaction_activate_runner(
             && initial.attempts == 0
             && initial.retries == 0
             && initial.portion_attempts == 0
+            && initial.overflow_rejections == 0
+            && initial.overflow_input_ceiling.is_none()
             && initial.corrections == 0,
         "invalid initial runner state"
     );
@@ -1501,7 +1503,11 @@ pub(crate) async fn compaction_runner_transition(
     ensure!(
         !matches!(next.phase, RunnerPhase::Applied { .. })
             && next.retries <= 2
-            && next.portion_attempts <= 3
+            && next.overflow_rejections <= 4
+            // Total claims include rejected overflows. Preserve the independent
+            // ordinary allowance, rejecting inconsistent counters before subtracting.
+            && next.portion_attempts.checked_sub(next.overflow_rejections)
+                .is_some_and(|ordinary| ordinary <= 3)
             && next.corrections <= 1,
         "invalid state transition"
     );

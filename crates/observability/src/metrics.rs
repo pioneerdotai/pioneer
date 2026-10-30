@@ -133,6 +133,7 @@ pub struct DatabaseReadAdmissionMetric {
 }
 
 pub(crate) struct GatewayMetrics {
+    pub(crate) portable_payload: crate::portable_payload::Metrics,
     pub(crate) meter: Meter,
     pub(crate) database_operations: Counter<u64>,
     pub(crate) database_operation_duration: Histogram<f64>,
@@ -411,6 +412,7 @@ impl GatewayMetrics {
             .build();
         register_patch_telemetry_observables(&meter);
         Self {
+            portable_payload: crate::portable_payload::Metrics::new(&meter),
             meter,
             database_operations,
             database_operation_duration,

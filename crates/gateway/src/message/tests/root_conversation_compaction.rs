@@ -220,10 +220,9 @@ async fn published_human_answer_prepares_root_once_and_next_cli_and_native_reuse
         "warm-root",
         "warm-root-answer",
         at,
-        // Keep the history over budget without making checkpoint reuse depend
-        // on processing megabytes through incremental fragment tokenization.
-        // Spaces bound tokenizer pieces; the marker still detects raw replay.
-        &format!("covered-root-raw-work {}", "🧪 ".repeat(60_000)),
+        // Exceed the 128k model window with UTF-16 estimation as well as the
+        // previous tokenizer. The marker still detects raw history replay.
+        &format!("covered-root-raw-work {}", "🧪 ".repeat(200_000)),
     )
     .await;
     let due = harness
@@ -1059,8 +1058,15 @@ async fn accepted_deliveries_coalesce_keep_frozen_outputs_and_preserve_work_arri
     );
 }
 
-#[tokio::test]
-async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered() {
+#[test]
+fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered() {
+    run_large_history_message_test(
+        "hidden-composer-root-warmup",
+        hidden_composer_defers_root_warmup_until_its_answer_is_delivered_impl(),
+    );
+}
+
+async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered_impl() {
     let provider = Arc::new(CaptureSummaryProvider::new(
         r#"<task_result>{"summary":"composer and ordinary work","data":{"answer":"ready"}}</task_result>"#,
     ));

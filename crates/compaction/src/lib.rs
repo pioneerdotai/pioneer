@@ -1,6 +1,7 @@
 //! Deterministic working-context rules. No database, Gateway, network or process ownership.
 pub mod budget;
 pub mod canonical;
+pub mod estimator;
 pub mod frozen;
 pub mod history;
 pub mod projection;
@@ -19,15 +20,15 @@ pub const REPLAY_ALIAS_LIMIT: usize = 256;
 pub const TAIL_TOKENS: u64 = 20_000;
 pub const ATTEMPT_MILLIS: u64 = 5 * 60 * 1_000;
 pub const OPERATION_MILLIS: u64 = 60 * 60 * 1_000;
+/// Estimated text-token cap; RESULT_BYTES remains a hard serialized byte cap.
 pub const RESULT_TOKENS: u64 = 8_192;
 pub const RESULT_BYTES: usize = 64 * 1_024;
+/// Estimated page-token cap, including JSON framing.
 pub const PAGE_TOKENS: u64 = 4_096;
 pub const PAGE_BYTES: usize = 32 * 1_024;
 
 pub fn text_tokens(text: &str) -> u64 {
-    tiktoken_rs::cl100k_base_singleton()
-        .encode_ordinary(text)
-        .len() as u64
+    estimator::tokens_from_utf16(estimator::utf16_units(text))
 }
 
 /// Immutable input to one bounded operation; append-only history is not its basis.

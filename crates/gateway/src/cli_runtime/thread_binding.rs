@@ -2762,6 +2762,10 @@ mod tests {
     fn confirmed_child_fork_remains_usable_before_its_first_new_turn() {
         let at = unix_to_datetime(100);
         let source = CliRuntimeTurnBindingRecord {
+            input_mapping_payload_id: None,
+            input_mapping_read_hold: None,
+            input_mapping_revision: 0,
+            input_mapping_identity: String::new(),
             turn_id: "child-first-answer".into(),
             thread_id: "child".into(),
             continuation_thread_id: "parent".into(),
