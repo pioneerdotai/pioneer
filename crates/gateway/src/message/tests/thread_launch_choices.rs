@@ -5672,6 +5672,19 @@ async fn detached_admission_early_stop_preserves_live_source_graph_on_both_sides
             "stop-detached-thread",
         )
         .await;
+        let (tx, mut rx) = mpsc::channel(128);
+        let connection =
+            register_authenticated_test_connection(processor.session_manager.as_ref(), tx).await;
+        // Model Stop from an open conversation. Keep its subscription alive
+        // through cancellation so normal orphan cleanup does not unload it
+        // before the RPC reads back the interrupted admission.
+        subscribe_test_connection_to_materialized_thread(
+            &processor,
+            connection,
+            &context.workspace_id,
+            &thread_id,
+        )
+        .await;
         processor.arm_completed_history_preparation_barrier(if accepted {
             "__detached_thread_after_task_commit__"
         } else {
@@ -5700,9 +5713,6 @@ async fn detached_admission_early_stop_preserves_live_source_graph_on_both_sides
             .into_iter()
             .find(|t| t.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask)
             .unwrap();
-        let (tx, mut rx) = mpsc::channel(128);
-        let connection =
-            register_authenticated_test_connection(processor.session_manager.as_ref(), tx).await;
         let request_id = generate_test_request_id("detached", "stop");
         processor
             .process_request_for_connection(
