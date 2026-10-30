@@ -434,15 +434,15 @@ async fn ordinary_fanout_durable_leases_private_acl_and_fresh_final_subset() {
     let (_, mut allowed_rx) = f.connect(allowed.clone()).await;
     let (_, mut revoked_rx) = f.connect(revoked.clone()).await;
     let (denied_connection, mut denied_rx) = f.connect(denied.clone()).await;
-    pioneer_entity::device::Entity::update_many()
-        .col_expr(
-            pioneer_entity::device::Column::Status,
-            Expr::value("revoked"),
+    assert!(
+        pioneer_crud::mark_device_revoked(
+            &f.database,
+            &revoked.device_id,
+            chrono::Utc::now().fixed_offset(),
         )
-        .filter(pioneer_entity::device::Column::Id.eq(revoked.device_id.to_string()))
-        .exec(&f.database)
         .await
-        .unwrap();
+        .unwrap()
+    );
     // Even the creator needs private participant proof.
     pioneer_entity::thread::Entity::update_many()
         .col_expr(
@@ -515,15 +515,20 @@ async fn ordinary_fanout_durable_leases_private_acl_and_fresh_final_subset() {
                     .build()
                     .unwrap()
                     .block_on(async move {
-                        pioneer_entity::auth_session::Entity::update_many()
-                            .col_expr(
-                                pioneer_entity::auth_session::Column::Status,
-                                Expr::value("revoked"),
-                            )
-                            .filter(pioneer_entity::auth_session::Column::Id.eq(allowed_session))
-                            .exec(&db)
-                            .await
-                            .unwrap();
+                        let session =
+                            pioneer_entity::auth_session::Entity::find_by_id(allowed_session)
+                                .one(&db)
+                                .await
+                                .unwrap()
+                                .unwrap();
+                        pioneer_crud::mark_session_revoked(
+                            &db,
+                            session,
+                            pioneer_protocol::AuthSessionRevokeReason::SelfRevoke,
+                            chrono::Utc::now().fixed_offset(),
+                        )
+                        .await
+                        .unwrap();
                         let tx = db.begin().await.unwrap();
                         insert_thread_membership(
                             &tx,
