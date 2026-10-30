@@ -560,103 +560,106 @@ async fn wait_reauthorizes_original_task_and_run_targets_after_initial_proof() {
                     .processor
                     .task_wait(&context, Some(&proofs), request.id, params);
                 tokio::pin!(waiting);
-                // The genuine handler has consumed its initial scoped proof and
-                // entered the genuine service wait. No result can yet be ready.
+                // Start the genuine handler while its target is still running.
+                // Its first Pending may be a database read, not the wait loop.
                 assert!(waiting.as_mut().now_or_never().is_none());
-                match loss {
-                    Loss::Target => {
-                        pioneer_entity::thread_membership::Entity::delete_many()
-                            .filter(
-                                pioneer_entity::thread_membership::Column::PrincipalId
-                                    .eq(TEST_COLLABORATOR_PRINCIPAL_ID),
-                            )
-                            .exec(&f.processor.crud_store.database_connection())
-                            .await
-                            .unwrap();
-                        pioneer_entity::workspace_membership::Entity::delete_many()
-                            .filter(
-                                pioneer_entity::workspace_membership::Column::PrincipalId
-                                    .eq(TEST_COLLABORATOR_PRINCIPAL_ID),
-                            )
-                            .exec(&f.processor.crud_store.database_connection())
-                            .await
-                            .unwrap();
+                // Keep both sides live when they share the fixture's connection.
+                let (_, replacement) = tokio::join!(waiting, async {
+                    match loss {
+                        Loss::Target => {
+                            pioneer_entity::thread_membership::Entity::delete_many()
+                                .filter(
+                                    pioneer_entity::thread_membership::Column::PrincipalId
+                                        .eq(TEST_COLLABORATOR_PRINCIPAL_ID),
+                                )
+                                .exec(&f.processor.crud_store.database_connection())
+                                .await
+                                .unwrap();
+                            pioneer_entity::workspace_membership::Entity::delete_many()
+                                .filter(
+                                    pioneer_entity::workspace_membership::Column::PrincipalId
+                                        .eq(TEST_COLLABORATOR_PRINCIPAL_ID),
+                                )
+                                .exec(&f.processor.crud_store.database_connection())
+                                .await
+                                .unwrap();
+                        }
+                        Loss::SessionRevoke => {
+                            f.processor
+                                .session_manager
+                                .disconnect_session(
+                                    &authenticated_test_member_collaborator().session_id,
+                                    pioneer_protocol::AuthSessionTerminationReason::SessionRevoked,
+                                )
+                                .await;
+                        }
+                        Loss::Disconnect => {
+                            f.processor
+                                .session_manager
+                                .unregister_connection(connection)
+                                .await;
+                        }
+                        Loss::Expiry => {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                        Loss::Renew => {
+                            let current = f
+                                .processor
+                                .session_manager
+                                .connection_context(connection)
+                                .await
+                                .unwrap();
+                            let mut renewed = current.principal().clone();
+                            renewed.access_jti = "renewed-wait-access".into();
+                            renewed.access_expires_at_unix += 600;
+                            // Preserve the same session/role, while changing access.
+                            f.processor
+                                .session_manager
+                                .renew_connection_principal(
+                                    connection,
+                                    current.principal(),
+                                    Arc::new(renewed),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        Loss::None => {}
                     }
-                    Loss::SessionRevoke => {
-                        f.processor
-                            .session_manager
-                            .disconnect_session(
-                                &authenticated_test_member_collaborator().session_id,
-                                pioneer_protocol::AuthSessionTerminationReason::SessionRevoked,
-                            )
-                            .await;
-                    }
-                    Loss::Disconnect => {
-                        f.processor
-                            .session_manager
-                            .unregister_connection(connection)
-                            .await;
-                    }
-                    Loss::Expiry => {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                    Loss::Renew => {
-                        let current = f
+                    let replacement = if matches!(loss, Loss::Disconnect) {
+                        let (new_tx, new_rx) = mpsc::channel(4);
+                        let new = f
                             .processor
                             .session_manager
-                            .connection_context(connection)
+                            .register_connection(new_tx, authenticated_test_member_collaborator())
                             .await
                             .unwrap();
-                        let mut renewed = current.principal().clone();
-                        renewed.access_jti = "renewed-wait-access".into();
-                        renewed.access_expires_at_unix += 600;
-                        // Preserve the same session/role, while changing access.
-                        f.processor
-                            .session_manager
-                            .renew_connection_principal(
-                                connection,
-                                current.principal(),
-                                Arc::new(renewed),
-                            )
-                            .await
-                            .unwrap();
-                    }
-                    Loss::None => {}
-                }
-                let replacement = if matches!(loss, Loss::Disconnect) {
-                    let (new_tx, new_rx) = mpsc::channel(4);
-                    let new = f
-                        .processor
-                        .session_manager
-                        .register_connection(new_tx, authenticated_test_member_collaborator())
+                        assert_ne!(new, connection);
+                        Some(new_rx)
+                    } else {
+                        None
+                    };
+                    // Complete the actual persisted target. Service rescan, not an
+                    // injected authorized reply, releases the no-timeout wait.
+                    pioneer_entity::task_run::Entity::update_many()
+                        .col_expr(
+                            pioneer_entity::task_run::Column::Status,
+                            Expr::value("succeeded"),
+                        )
+                        .filter(pioneer_entity::task_run::Column::Id.eq(RUN))
+                        .exec(&f.processor.crud_store.database_connection())
                         .await
                         .unwrap();
-                    assert_ne!(new, connection);
-                    Some(new_rx)
-                } else {
-                    None
-                };
-                // Complete the actual persisted target. Service rescan, not an
-                // injected authorized reply, releases the no-timeout wait.
-                pioneer_entity::task_run::Entity::update_many()
-                    .col_expr(
-                        pioneer_entity::task_run::Column::Status,
-                        Expr::value("succeeded"),
-                    )
-                    .filter(pioneer_entity::task_run::Column::Id.eq(RUN))
-                    .exec(&f.processor.crud_store.database_connection())
-                    .await
-                    .unwrap();
-                pioneer_entity::task::Entity::update_many()
-                    .col_expr(
-                        pioneer_entity::task::Column::Status,
-                        Expr::value("completed"),
-                    )
-                    .filter(pioneer_entity::task::Column::Id.eq(TASK))
-                    .exec(&f.processor.crud_store.database_connection())
-                    .await
-                    .unwrap();
-                waiting.await;
+                    pioneer_entity::task::Entity::update_many()
+                        .col_expr(
+                            pioneer_entity::task::Column::Status,
+                            Expr::value("completed"),
+                        )
+                        .filter(pioneer_entity::task::Column::Id.eq(TASK))
+                        .exec(&f.processor.crud_store.database_connection())
+                        .await
+                        .unwrap();
+                    replacement
+                });
                 let mut successful = false;
                 while let Ok(message) = responses.try_recv() {
                     if let Message::Text(text) = message {
@@ -742,39 +745,42 @@ async fn durable_session_revocation_during_wait_is_not_hidden_by_original_princi
         );
         tokio::pin!(waiting);
         assert!(waiting.as_mut().now_or_never().is_none());
-        // Persist revoke without the runtime disconnect hook: final authorization
-        // must discover it through the existing durable lease validator itself.
-        pioneer_entity::auth_session::Entity::update_many()
-            .col_expr(
-                pioneer_entity::auth_session::Column::Status,
-                Expr::value("revoked"),
-            )
-            .filter(
-                pioneer_entity::auth_session::Column::Id
-                    .eq(context.principal().session_id.as_str()),
-            )
-            .exec(&processor.crud_store.database_connection())
-            .await
-            .unwrap();
-        pioneer_entity::task_run::Entity::update_many()
-            .col_expr(
-                pioneer_entity::task_run::Column::Status,
-                Expr::value("succeeded"),
-            )
-            .filter(pioneer_entity::task_run::Column::Id.eq(RUN))
-            .exec(&processor.crud_store.database_connection())
-            .await
-            .unwrap();
-        pioneer_entity::task::Entity::update_many()
-            .col_expr(
-                pioneer_entity::task::Column::Status,
-                Expr::value("completed"),
-            )
-            .filter(pioneer_entity::task::Column::Id.eq(TASK))
-            .exec(&processor.crud_store.database_connection())
-            .await
-            .unwrap();
-        waiting.await;
+        // Keep polling the handler while mutating the shared single-connection
+        // fixture: its first Pending may still hold a database connection.
+        tokio::join!(waiting, async {
+            // Persist revoke without the runtime disconnect hook: final authorization
+            // must discover it through the existing durable lease validator itself.
+            pioneer_entity::auth_session::Entity::update_many()
+                .col_expr(
+                    pioneer_entity::auth_session::Column::Status,
+                    Expr::value("revoked"),
+                )
+                .filter(
+                    pioneer_entity::auth_session::Column::Id
+                        .eq(context.principal().session_id.as_str()),
+                )
+                .exec(&processor.crud_store.database_connection())
+                .await
+                .unwrap();
+            pioneer_entity::task_run::Entity::update_many()
+                .col_expr(
+                    pioneer_entity::task_run::Column::Status,
+                    Expr::value("succeeded"),
+                )
+                .filter(pioneer_entity::task_run::Column::Id.eq(RUN))
+                .exec(&processor.crud_store.database_connection())
+                .await
+                .unwrap();
+            pioneer_entity::task::Entity::update_many()
+                .col_expr(
+                    pioneer_entity::task::Column::Status,
+                    Expr::value("completed"),
+                )
+                .filter(pioneer_entity::task::Column::Id.eq(TASK))
+                .exec(&processor.crud_store.database_connection())
+                .await
+                .unwrap();
+        });
         let _ = recv_error_by_id(&mut f.responses, &id("durable-revoke")).await;
         assert!(
             f.responses.try_recv().is_err(),
