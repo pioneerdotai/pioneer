@@ -3725,6 +3725,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renewal_is_admitted_while_read_group_is_blocked() {
+        use axum::extract::ws::Message;
+        use futures_util::StreamExt;
+        let (service, _) = fixture().await;
+        let grant = service
+            .create_initial_session_with_ids(
+                params("read-renewal-installation", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .unwrap();
+        let now = unix_timestamp_secs().unwrap();
+        let credential = service
+            .access_issuer
+            .validate(grant.access_token.expose_secret(), now)
+            .unwrap();
+        let old_token = service
+            .access_issuer
+            .issue(&credential.subject, now - 120, None)
+            .unwrap();
+        let old = authenticate_access_token(&service, &old_token).await;
+        let sessions = crate::session::SessionManager::new();
+        let (outbound, mut responses) = tokio::sync::mpsc::channel(4);
+        let id = sessions
+            .register_connection(outbound.clone(), old.clone())
+            .await
+            .unwrap();
+        let mut context = sessions.connection_context(id).await.unwrap();
+        let (renewal, receipt) =
+            tokio::sync::watch::channel(crate::transport::ConnectionAccessLease::new(
+                (*old).clone(),
+                std::time::Duration::from_secs(old.access_expires_at_unix - now),
+            ));
+        let request = pioneer_protocol::JsonRpcRequest {
+            jsonrpc: pioneer_protocol::JSONRPC_VERSION.into(),
+            id: RequestId::new("R00000000000000000001").unwrap(),
+            method: pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW.into(),
+            params: Some(
+                serde_json::to_value(pioneer_protocol::AuthAccessRenewParams {
+                    access_token: grant.access_token.clone(),
+                    refresh_generation: grant.refresh_generation,
+                })
+                .unwrap(),
+            ),
+        };
+        let mut incoming = Box::pin(
+            futures_util::stream::once(async {
+                Ok::<_, axum::Error>(Message::Text(
+                    serde_json::to_string(&request).unwrap().into(),
+                ))
+            })
+            .chain(futures_util::stream::pending()),
+        );
+        let mut deferred = std::collections::VecDeque::from([Message::Text(serde_json::json!({
+            "jsonrpc":"2.0", "id":"R00000000000000000002", "method":"thread/get", "params":{"thread_id":"blocked"}
+        }).to_string().into())]);
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let read_release = release.clone();
+        // Only the read body is a gate. Transport renewal uses the real service,
+        // durable admission, principal CAS, response enqueue and lease publisher.
+        let dispatch = move |_, _| {
+            let release = read_release.clone();
+            async move {
+                release.notified().await;
+            }
+        };
+        let outbound = crate::session::SessionOutbound::from(outbound);
+        let mut handlers = crate::transport::ConnectionHandlers::default();
+        let pump = crate::transport::process_with_access_renewals(
+            std::future::pending(),
+            crate::transport::IngressMode::ReadGroup,
+            &mut incoming,
+            &mut deferred,
+            &service,
+            &sessions,
+            &mut context,
+            &renewal,
+            &outbound,
+            &mut handlers,
+            &dispatch,
+        );
+        let driver = async {
+            let Message::Text(text) = responses.recv().await.unwrap() else {
+                panic!()
+            };
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(value.get("error").is_none(), "{value}");
+            assert_eq!(
+                value["result"]["access_expires_at_unix"],
+                grant.access_expires_at_unix
+            );
+            release.notify_one();
+        };
+        let (alive, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(pump, driver)
+        })
+        .await
+        .expect("read barrier must continue renewal admission");
+        assert!(alive);
+        assert_eq!(receipt.borrow().principal, *context.principal());
+        assert_eq!(
+            context.principal().access_expires_at_unix,
+            grant.access_expires_at_unix
+        );
+        handlers.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn renewal_during_writer_rpc_keeps_connection_and_checks_durable_admission() {
         use axum::extract::ws::Message;
         use futures_util::StreamExt;
@@ -3790,6 +3898,7 @@ mod tests {
                 admitted_rx.await.unwrap();
                 transaction.commit().await.unwrap();
             },
+            crate::transport::IngressMode::Serial,
             &mut incoming,
             &mut deferred,
             &service,
