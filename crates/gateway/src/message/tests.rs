@@ -1,3 +1,6 @@
+#[path = "tests/detached_work_projection.rs"]
+mod detached_work_projection;
+
 #[path = "tests/workspace_scope.rs"]
 mod workspace_scope;
 
@@ -66633,11 +66636,23 @@ async fn setup_live_semantic_timeline_harness_with_thread_id(
     case_id: &str,
     thread_id: String,
 ) -> LiveSemanticTimelineHarness {
+    setup_live_semantic_timeline_harness_on_store(
+        case_id,
+        thread_id,
+        setup_workspace_manager().await,
+    )
+    .await
+}
+
+async fn setup_live_semantic_timeline_harness_on_store(
+    case_id: &str,
+    thread_id: String,
+    (workspace_manager, crud_store, workspace_id): (Arc<WorkspaceManager>, Arc<CrudStore>, String),
+) -> LiveSemanticTimelineHarness {
     let (tx, rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
