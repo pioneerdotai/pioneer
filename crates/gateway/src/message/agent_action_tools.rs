@@ -3154,16 +3154,7 @@ pub(crate) async fn process_due_agent_action_outbox(
     Ok(
         process_claimed_agent_action_outbox(&database, batch, |row| {
             let processor = processor.clone();
-            async move {
-                // CLI preparation and terminal reconciliation must not inherit
-                // the caller's nested poll stack. Keep dispatch owned and
-                // awaited so cancellation still aborts its in-flight work.
-                super::message_fresh_task(super::message_future(async move {
-                    dispatch_agent_action_outbox_row(&processor, &row).await
-                }))
-                .await
-                .context("agent action outbox dispatch task did not finish")?
-            }
+            async move { dispatch_agent_action_outbox_row(&processor, &row).await }
         })
         .await,
     )

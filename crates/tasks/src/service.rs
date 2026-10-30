@@ -4074,17 +4074,7 @@ impl TaskService {
         Ok(())
     }
 
-    // Recovery composes several large storage futures. Keep its state on the
-    // heap even when one caller runs several bounded quanta in sequence.
-    pub fn recover_stuck_deliveries(
-        &self,
-        now: i64,
-        limit: u64,
-    ) -> TaskServiceFuture<'_, TaskRuntimeResult<TaskDeliveryRecoveryResult>> {
-        task_service_future(self.recover_stuck_deliveries_inner(now, limit))
-    }
-
-    async fn recover_stuck_deliveries_inner(
+    pub async fn recover_stuck_deliveries(
         &self,
         now: i64,
         limit: u64,
