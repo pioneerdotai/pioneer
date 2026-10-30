@@ -45912,13 +45912,14 @@ async fn setup_execution_window_terminal_turn(
     thread_id: &str,
     turn_id: &str,
 ) -> (MessageProcessor, Arc<CrudStore>, String) {
-    setup_execution_window_terminal_turn_with_input(thread_id, turn_id, &[]).await
+    setup_execution_window_terminal_turn_with_input_and_mode(thread_id, turn_id, &[], None).await
 }
 
-async fn setup_execution_window_terminal_turn_with_input(
+async fn setup_execution_window_terminal_turn_with_input_and_mode(
     thread_id: &str,
     turn_id: &str,
     input: &[UserInput],
+    mode: Option<ThreadMode>,
 ) -> (MessageProcessor, Arc<CrudStore>, String) {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -45974,7 +45975,7 @@ async fn setup_execution_window_terminal_turn_with_input(
                 model: None,
                 model_provider: None,
                 sandbox_policy: None,
-                mode: None,
+                mode,
                 agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),

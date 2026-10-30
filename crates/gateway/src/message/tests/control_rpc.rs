@@ -51,10 +51,16 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        // Message mode intentionally discards Work on completion. Admit an
+        // Agent turn so the visible item below survives terminal projection.
         let (mut processor, store, workspace) =
-            setup_execution_window_terminal_turn(THREAD, TURN).await;
-        // Completed message-only turns have no Work projection. Persist actual
-        // visible work so every allowlisted read exercises a successful result.
+            setup_execution_window_terminal_turn_with_input_and_mode(
+                THREAD,
+                TURN,
+                &[],
+                Some(ThreadMode::Agent),
+            )
+            .await;
         store
             .materialize_item_completed(
                 pioneer_protocol::ItemCompletedNotification {

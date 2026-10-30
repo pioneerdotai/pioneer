@@ -263,6 +263,20 @@ async fn wait_for_task_cli_activation(processor: &MessageProcessor, turn_id: &st
     .expect("CLI task fixture activation");
 }
 
+// Keep construction of the large dispatch future out of the fixture poll
+// frame. Boxing at each call site still leaves that temporary in the caller.
+#[inline(never)]
+fn process_cli_fixture_outbox(
+    processor: &Arc<MessageProcessor>,
+) -> MessageFuture<
+    '_,
+    anyhow::Result<crate::message::agent_action_tools::AgentActionOutboxProcessingBatch>,
+> {
+    message_future(
+        crate::message::agent_action_tools::process_due_agent_action_outbox(processor, 64),
+    )
+}
+
 #[test]
 fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
     run_standard_stack_message_test("Threads committed CLI first dispatch", async {
@@ -408,11 +422,7 @@ fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
             .await;
         // Keep the dispatcher state out of this already large fixture future.
         // The production runtime's bounded worker stack still applies.
-        let batch = message_future(
-            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64),
-        )
-        .await
-        .unwrap();
+        let batch = process_cli_fixture_outbox(&processor).await.unwrap();
         assert!(batch.errors.is_empty(), "{:#?}", batch.errors);
         wait_for_task_cli_activation(&processor, child).await;
         let starts = harness.cli_session.turn_starts.lock().await.clone();
@@ -517,11 +527,7 @@ fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
         .await
         .unwrap();
         assert!(!replay.is_error, "{replay:?}");
-        message_future(
-            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64),
-        )
-        .await
-        .unwrap();
+        process_cli_fixture_outbox(&processor).await.unwrap();
         assert_eq!(
             harness.cli_session.turn_starts.lock().await.len(),
             starts_before + 1
@@ -5653,11 +5659,7 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 .cli_session
                 .set_next_native_turn_id("threads-facade-explicit-child")
                 .await;
-            message_future(
-                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64),
-            )
-            .await
-            .unwrap();
+            process_cli_fixture_outbox(&processor).await.unwrap();
             let calls = wait_for_cli_runtime_turn_starts(&harness.cli_session, 2).await;
             assert_eq!(calls[1].model.as_deref(), model["id"].as_str());
             assert_eq!(calls[1].effort.as_deref(), effort.as_str());
@@ -6213,15 +6215,7 @@ fn ordinary_cli_delegated_root_dispatch_uses_cli_attempt_and_replays_without_nat
                     );
                     let dispatch = tokio::spawn({
                         let processor = processor.clone();
-                        async move {
-                            message_future(
-                                crate::message::agent_action_tools::process_due_agent_action_outbox(
-                                    &processor, 64,
-                                ),
-                            )
-                            .await
-                            .unwrap()
-                        }
+                        async move { process_cli_fixture_outbox(&processor).await.unwrap() }
                     });
                     timeout(
                         Duration::from_secs(10),
@@ -6301,13 +6295,7 @@ fn ordinary_cli_delegated_root_dispatch_uses_cli_attempt_and_replays_without_nat
                         Set(Some(pioneer_crud::utc_now() - chrono::Duration::seconds(1)));
                     retry.update(&db).await.unwrap();
                 }
-                message_future(
-                    crate::message::agent_action_tools::process_due_agent_action_outbox(
-                        &processor, 64,
-                    ),
-                )
-                .await
-                .unwrap();
+                process_cli_fixture_outbox(&processor).await.unwrap();
                 wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
                 wait_for_task_cli_activation(&processor, &params.turn_id).await;
                 assert!(
@@ -6338,13 +6326,7 @@ fn ordinary_cli_delegated_root_dispatch_uses_cli_attempt_and_replays_without_nat
                 pending.delivered_at = Set(None);
                 pending.next_attempt_at = Set(None);
                 pending.update(&db).await.unwrap();
-                message_future(
-                    crate::message::agent_action_tools::process_due_agent_action_outbox(
-                        &processor, 64,
-                    ),
-                )
-                .await
-                .unwrap();
+                process_cli_fixture_outbox(&processor).await.unwrap();
                 assert_eq!(harness.cli_session.turn_starts.lock().await.len(), 2);
             }
         }
