@@ -1058,8 +1058,15 @@ async fn accepted_deliveries_coalesce_keep_frozen_outputs_and_preserve_work_arri
     );
 }
 
-#[tokio::test]
-async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered() {
+#[test]
+fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered() {
+    run_large_history_message_test(
+        "hidden-composer-root-warmup",
+        hidden_composer_defers_root_warmup_until_its_answer_is_delivered_impl(),
+    );
+}
+
+async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered_impl() {
     let provider = Arc::new(CaptureSummaryProvider::new(
         r#"<task_result>{"summary":"composer and ordinary work","data":{"answer":"ready"}}</task_result>"#,
     ));
