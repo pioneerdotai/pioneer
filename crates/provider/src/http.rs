@@ -148,6 +148,64 @@ pub(crate) async fn read_response_text_bounded(
     String::from_utf8(body).context("provider response body was not valid UTF-8")
 }
 
+/// Capture response facts before the bounded error-body read can fail. All
+/// legacy text adapters use this boundary; successful responses never enter it.
+pub(crate) async fn provider_api_error(response: Response, provider: &str) -> anyhow::Error {
+    let status = response.status();
+    let retry_after_ms = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1000));
+    let result = read_response_text_bounded(response, 16 * 1024, "provider_error_body").await;
+    let (source, mut classification) = match result {
+        Ok(body) => {
+            let lower = body.to_ascii_lowercase();
+            let code = crate::failure::extract_provider_code(&body);
+            let class = crate::failure::classify_provider_failure_class(
+                &lower,
+                pioneer_protocol::ProviderFailureStage::Connect,
+                Some(status.as_u16()),
+                code.as_deref(),
+            );
+            let mut classification = crate::types::ProviderFailureClassification::new(class);
+            classification.provider_code = code;
+            classification.retry_after_ms = crate::failure::extract_retry_after_ms(&lower);
+            (
+                anyhow!("{provider} API error ({status}): {body}"),
+                classification,
+            )
+        }
+        Err(error) => {
+            let mut classification = if error.is::<ProviderHttpErrorBodyTooLarge>() {
+                crate::failure::classify_http_error_body_too_large(status.as_u16())
+            } else {
+                crate::types::ProviderFailureClassification::new(
+                    crate::failure::classify_provider_failure_class(
+                        "",
+                        pioneer_protocol::ProviderFailureStage::Connect,
+                        Some(status.as_u16()),
+                        None,
+                    ),
+                )
+            };
+            // Preserve the registry's existing network fallback for Unknown
+            // without treating local decode/size failures as network errors.
+            classification.is_network_error =
+                error.chain().any(|cause| cause.is::<reqwest::Error>());
+            (error, classification)
+        }
+    };
+    classification.http_status = Some(status.as_u16());
+    classification.retry_after_ms = retry_after_ms.or(classification.retry_after_ms);
+    crate::failure::ProviderHttpFailure {
+        classification,
+        source,
+    }
+    .into()
+}
+
 pub(crate) async fn read_response_json_bounded<T: DeserializeOwned>(
     response: Response,
     limits: ProviderResponseLimits,

@@ -246,6 +246,7 @@ pub(crate) struct ThreadEpisodicIndexResolutionError {
     pub kind: ThreadEpisodicIndexResolutionFailureKind,
     pub message: String,
     pub source_payload: Option<String>,
+    pub retry_after_ms: Option<u64>,
 }
 
 impl ThreadEpisodicIndexResolutionError {
@@ -254,6 +255,7 @@ impl ThreadEpisodicIndexResolutionError {
             kind: ThreadEpisodicIndexResolutionFailureKind::Retryable,
             message: message.into(),
             source_payload: None,
+            retry_after_ms: None,
         }
     }
 
@@ -262,6 +264,7 @@ impl ThreadEpisodicIndexResolutionError {
             kind: ThreadEpisodicIndexResolutionFailureKind::NonRetryable,
             message: message.into(),
             source_payload: None,
+            retry_after_ms: None,
         }
     }
 
@@ -270,6 +273,7 @@ impl ThreadEpisodicIndexResolutionError {
             kind: ThreadEpisodicIndexResolutionFailureKind::SourceChanged,
             message: message.into(),
             source_payload: None,
+            retry_after_ms: None,
         }
     }
 
@@ -908,10 +912,16 @@ fn attach_embedding_to_resolved_request(
 fn embedding_resolution_error(
     error: ThreadEpisodicEmbeddingError,
 ) -> ThreadEpisodicIndexResolutionError {
-    if error.is_retryable() {
-        ThreadEpisodicIndexResolutionError::retryable(error.message)
-    } else {
-        ThreadEpisodicIndexResolutionError::non_retryable(error.message)
+    let retryable = error.is_retryable();
+    ThreadEpisodicIndexResolutionError {
+        kind: if retryable {
+            ThreadEpisodicIndexResolutionFailureKind::Retryable
+        } else {
+            ThreadEpisodicIndexResolutionFailureKind::NonRetryable
+        },
+        message: error.message,
+        source_payload: None,
+        retry_after_ms: error.retry_after_ms,
     }
 }
 
@@ -3114,6 +3124,7 @@ impl ThreadEpisodicIndexExecutor {
                         job,
                         job.attempt_count < config.max_attempts,
                         false,
+                        None,
                         Some(format!("failed to complete index job: {error}")),
                         Some(source_payload.as_str()),
                         now_unix,
@@ -3207,6 +3218,7 @@ impl ThreadEpisodicIndexExecutor {
                     job,
                     false,
                     false,
+                    None,
                     Some(
                         "thread episodic source changed repeatedly while resolving the same claim"
                             .to_owned(),
@@ -3222,6 +3234,7 @@ impl ThreadEpisodicIndexExecutor {
                     job,
                     false,
                     false,
+                    None,
                     Some(
                         "thread episodic index item disappeared during source reconciliation"
                             .to_owned(),
@@ -3259,6 +3272,7 @@ impl ThreadEpisodicIndexExecutor {
                     job,
                     retryable,
                     false,
+                    None,
                     Some(format!(
                         "failed to reconcile changed thread episodic source: {error:#}"
                     )),
@@ -3288,6 +3302,7 @@ impl ThreadEpisodicIndexExecutor {
                 job,
                 retryable,
                 true,
+                None,
                 Some(sanitized_error.clone()),
                 Some(resolved.source_payload.as_str()),
                 now_unix,
@@ -3334,6 +3349,7 @@ impl ThreadEpisodicIndexExecutor {
             kind,
             message,
             source_payload,
+            retry_after_ms,
         } = error;
         let retryable = matches!(kind, ThreadEpisodicIndexResolutionFailureKind::Retryable)
             && job.attempt_count < config.max_attempts;
@@ -3342,6 +3358,7 @@ impl ThreadEpisodicIndexExecutor {
                 job,
                 retryable,
                 false,
+                retry_after_ms,
                 Some(message),
                 source_payload.as_deref(),
                 now_unix,
@@ -3379,6 +3396,7 @@ impl ThreadEpisodicIndexExecutor {
                 job,
                 retryable,
                 capacity_error,
+                None,
                 Some(error.message),
                 Some(resolved.source_payload.as_str()),
                 now_unix,
@@ -3398,6 +3416,7 @@ impl ThreadEpisodicIndexExecutor {
         job: &ThreadEpisodicIndexJobRecord,
         retryable: bool,
         capacity_error: bool,
+        retry_after_ms: Option<u64>,
         error_message: Option<String>,
         expected_source_payload: Option<&str>,
         now_unix: i64,
@@ -3406,7 +3425,13 @@ impl ThreadEpisodicIndexExecutor {
         let next_run_at_unix = if retryable && capacity_error {
             Some(now_unix)
         } else {
-            retryable.then(|| self.next_retry_at(job, now_unix))
+            retryable.then(|| {
+                embedding_retry_at(
+                    self.next_retry_at(job, now_unix),
+                    self.now_unix().max(now_unix),
+                    retry_after_ms,
+                )
+            })
         };
         let sanitized_error =
             error_message.map(|message| sanitize_thread_episodic_index_error(&message));
@@ -3458,7 +3483,13 @@ impl ThreadEpisodicIndexExecutor {
                 );
                 let recovery_update = ThreadEpisodicIndexJobFailureUpdate {
                     retryable,
-                    next_run_at_unix: retryable.then(|| self.next_retry_at(job, now_unix)),
+                    next_run_at_unix: retryable.then(|| {
+                        embedding_retry_at(
+                            self.next_retry_at(job, now_unix),
+                            self.now_unix().max(now_unix),
+                            retry_after_ms,
+                        )
+                    }),
                     last_error: Some(persistence_error),
                     capacity_error: false,
                     last_attempt_latency_ms: Some(elapsed_ms(attempt_started_at)),
@@ -3659,6 +3690,29 @@ impl ThreadEpisodicIndexExecutor {
             .min(config.retry_max_delay_secs);
         now_unix.saturating_add(delay)
     }
+}
+
+/// Respect provider cooldowns independently of the configured backoff ceiling.
+/// Round up to the durable scheduler's seconds and keep the result representable
+/// by the durable ISO datetime: out-of-range Chrono values fall back to now in
+/// CRUD, and expanded years do not preserve SQLite's chronological text ordering.
+pub(crate) fn embedding_retry_at(
+    backoff_at: i64,
+    cooldown_now_unix: i64,
+    retry_after_ms: Option<u64>,
+) -> i64 {
+    let Some(retry_after_ms) = retry_after_ms else {
+        return backoff_at;
+    };
+    // Last second of year 9999, the largest four-digit ISO year.
+    const MAX_RETRY_AT_UNIX: i64 = 253_402_300_799;
+    let delay_secs = retry_after_ms.div_ceil(1000) as i64;
+    // The completion clock is in whole seconds. Include its fractional second
+    // conservatively so even a fast request cannot shorten the received cooldown.
+    let cooldown_at = cooldown_now_unix
+        .saturating_add(if retry_after_ms > 0 { 1 } else { 0 })
+        .saturating_add(delay_secs);
+    backoff_at.max(cooldown_at).min(MAX_RETRY_AT_UNIX)
 }
 
 #[derive(Debug)]
@@ -4216,6 +4270,8 @@ mod tests {
         name: &'static str,
         list_calls: AtomicUsize,
         embed_calls: AtomicUsize,
+        embedding_failures: AtomicUsize,
+        embedding_failure: Option<pioneer_provider::ProviderFailureClassification>,
     }
 
     impl CatalogEmbeddingProvider {
@@ -4224,12 +4280,22 @@ mod tests {
                 name,
                 list_calls: AtomicUsize::new(0),
                 embed_calls: AtomicUsize::new(0),
+                embedding_failures: AtomicUsize::new(0),
+                embedding_failure: None,
             }
         }
     }
 
     #[async_trait]
     impl pioneer_provider::Provider for CatalogEmbeddingProvider {
+        fn classify_failure(
+            &self,
+            error: &anyhow::Error,
+        ) -> Option<pioneer_provider::ProviderFailureClassification> {
+            error.downcast_ref::<std::io::Error>()?;
+            self.embedding_failure.clone()
+        }
+
         fn name(&self) -> &str {
             self.name
         }
@@ -4295,6 +4361,19 @@ mod tests {
             request: pioneer_provider::EmbeddingRequest,
         ) -> anyhow::Result<pioneer_provider::EmbeddingResponse> {
             self.embed_calls.fetch_add(1, Ordering::SeqCst);
+            if self
+                .embedding_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "opaque denial; retryable=false",
+                )
+                .into());
+            }
             Ok(pioneer_provider::EmbeddingResponse {
                 usage: None,
                 embeddings: vec![vec![0.5; 4]; request.input.len()],
@@ -5121,26 +5200,37 @@ mod tests {
             ThreadEpisodicIndexAttemptOutcome::StaleAttempt
         );
 
-        let stale_failure = crud_store
-            .fail_thread_episodic_index_attempt(
-                w1.id.as_str(),
-                w1.attempt_count,
-                source_payload.as_str(),
-                ThreadEpisodicIndexJobFailureUpdate {
-                    retryable: false,
-                    next_run_at_unix: None,
-                    last_error: Some("delayed W1 failure".to_owned()),
-                    capacity_error: false,
-                    last_attempt_latency_ms: Some(10),
-                },
-                1_700_010_009,
-            )
-            .await
-            .expect("stale W1 failure should be handled");
-        assert_eq!(
-            stale_failure,
-            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
-        );
+        for retryable in [false, true] {
+            let stale_failure = crud_store
+                .fail_thread_episodic_index_attempt(
+                    w1.id.as_str(),
+                    w1.attempt_count,
+                    source_payload.as_str(),
+                    ThreadEpisodicIndexJobFailureUpdate {
+                        retryable,
+                        next_run_at_unix: retryable.then_some(1_700_010_100),
+                        last_error: Some("delayed W1 HTTP 403 failure".to_owned()),
+                        capacity_error: false,
+                        last_attempt_latency_ms: Some(10),
+                    },
+                    1_700_010_009,
+                )
+                .await
+                .expect("stale W1 failure should be handled");
+            assert_eq!(
+                stale_failure,
+                ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+            );
+
+            assert_eq!(
+                crud_store
+                    .find_thread_episodic_index_job(&w2.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                w2
+            );
+        }
 
         let item_update = ThreadEpisodicItemIndexedUpdate {
             capsule_id: "capsule-a".to_owned(),
@@ -12900,6 +12990,206 @@ mod tests {
             .expect("item exists");
         assert_eq!(stored_item.status, ThreadEpisodicItemStatus::PendingIndex);
         assert!(stored_item.frame_id.is_none());
+    }
+
+    #[test]
+    fn embedding_cooldown_preserves_backoff_rounds_up_and_saturates() {
+        let now = 1_700_000_000;
+        assert_eq!(embedding_retry_at(now + 30, now, None), now + 30);
+        assert_eq!(embedding_retry_at(now + 30, now, Some(0)), now + 30);
+        assert_eq!(embedding_retry_at(now + 30, now, Some(1200)), now + 30);
+        assert_eq!(embedding_retry_at(now + 30, now, Some(60_001)), now + 62);
+        // Completion may be later than the frozen discovery/claim time.
+        assert_eq!(
+            embedding_retry_at(now + 30, now + 100, Some(1000)),
+            now + 102
+        );
+        let last = 253_402_300_799;
+        assert_eq!(embedding_retry_at(now + 30, now, Some(u64::MAX)), last);
+        assert_eq!(embedding_retry_at(i64::MAX, i64::MAX, Some(u64::MAX)), last);
+        assert!(chrono::DateTime::from_timestamp(last, 0).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_embedding_403_uses_durable_attempt_budget() {
+        use pioneer_protocol::ProviderFailureClass as Class;
+        for (failures, cooldown, class) in [
+            (1, None, Class::AuthOrPermission),
+            (5, None, Class::Unknown),
+            (5, Some(60_001), Class::PermissionDenied),
+        ] {
+            let database_root = TempDir::new().unwrap();
+            let (store, workspace) =
+                physical_runner_store_for_test(&database_root.path().join("embedding-403.sqlite"))
+                    .await;
+            let item = seed_pending_thread_episodic_item(
+                &store,
+                &workspace,
+                "thread_403",
+                "turn_403",
+                "item_403",
+            )
+            .await;
+            let mut now = 1_700_000_010;
+            let job =
+                seed_thread_episodic_job(&store, &workspace, &item.thread_id, &item.id, now).await;
+            let mut facts = pioneer_provider::ProviderFailureClassification::new(class);
+            facts.http_status = Some(403);
+            facts.retry_after_ms = cooldown;
+            let mut api = CatalogEmbeddingProvider::new("openrouter");
+            api.embedding_failure = Some(facts);
+            api.embedding_failures = AtomicUsize::new(failures);
+            let api = Arc::new(api);
+            let remote = Arc::new(
+                RemoteEmbeddingProvider::openrouter(
+                    "vendor/custom-embed",
+                    Some(4),
+                    false,
+                    false,
+                    api.clone(),
+                )
+                .unwrap(),
+            );
+            let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+            resolver.set_active_provider(Some(remote));
+            let request = static_index_request(
+                "file:///tmp/episodic-403.mv2".to_owned(),
+                "capsule_403",
+                "mv2://pioneer/thread_episodic/test/capsules/403",
+                &item.id,
+            );
+            let payload = Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                static_index_payload_provider(&store, &item, request, 1).await,
+                resolver,
+                store.clone(),
+            ));
+            let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+            let mut executor =
+                ThreadEpisodicIndexExecutor::new(store.clone(), backend.clone(), payload.clone());
+            // Use the existing worker clock so provider completion time is deterministic.
+            *executor.clock_origin.lock().unwrap() = Some(now);
+            let expected_attempts = if failures == 1 { 2 } else { 5 };
+            for attempt in 1..=expected_attempts {
+                *executor.clock_origin.lock().unwrap() = Some(now);
+                if attempt == 1 && cooldown.is_some() {
+                    executor
+                        .inject_primary_persistence_failure(
+                            "controlled 403 result write failure",
+                            None,
+                        )
+                        .await;
+                }
+                let summary = executor.run_once(now).await.unwrap();
+                assert_eq!(summary.claimed, 1);
+                assert_eq!(api.embed_calls.load(Ordering::SeqCst), attempt);
+                let saved = store
+                    .find_thread_episodic_index_job(&job.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.attempt_count, attempt as i64);
+                if attempt > failures {
+                    assert_eq!(summary.completed, 1);
+                    assert_eq!(saved.status, ThreadEpisodicIndexJobStatus::Completed);
+                    assert_eq!(backend.requests().await.len(), 1);
+                    let indexed = store
+                        .find_thread_episodic_item(&item.id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(indexed.status, ThreadEpisodicItemStatus::Active);
+                    assert_eq!(indexed.frame_id, Some(99));
+                    break;
+                }
+                assert!(
+                    saved
+                        .last_error
+                        .as_deref()
+                        .unwrap()
+                        .contains(&format!("class={class:?},"))
+                );
+                assert!(backend.requests().await.is_empty());
+                if attempt == 5 {
+                    assert_eq!(summary.failed_terminal, 1);
+                    assert_eq!(saved.status, ThreadEpisodicIndexJobStatus::Canceled);
+                    assert!(saved.completed_at.is_some());
+                    let exhausted_item = store
+                        .find_thread_episodic_item(&item.id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(exhausted_item.status, ThreadEpisodicItemStatus::Failed);
+                } else {
+                    assert_eq!(summary.failed_retryable, 1);
+                    assert_eq!(saved.status, ThreadEpisodicIndexJobStatus::Failed);
+                    assert!(saved.completed_at.is_none());
+                    let backoff = [30, 60, 120, 240][attempt - 1];
+                    let delay = if cooldown.is_some() {
+                        backoff.max(62)
+                    } else {
+                        backoff
+                    };
+                    assert_eq!(saved.next_run_at.timestamp(), now + delay);
+                    // A recreated executor must read the durable budget and cooldown.
+                    executor = ThreadEpisodicIndexExecutor::new(
+                        store.clone(),
+                        backend.clone(),
+                        payload.clone(),
+                    );
+                    *executor.clock_origin.lock().unwrap() = Some(now);
+                    assert_eq!(
+                        executor
+                            .run_once(saved.next_run_at.timestamp() - 1)
+                            .await
+                            .unwrap()
+                            .claimed,
+                        0
+                    );
+                    assert_eq!(api.embed_calls.load(Ordering::SeqCst), attempt);
+                    // Duplicate failure completion from the settled claim is fenced.
+                    assert_eq!(
+                        store
+                            .fail_thread_episodic_index_attempt_without_source_validation(
+                                &job.id,
+                                saved.attempt_count,
+                                ThreadEpisodicIndexJobFailureUpdate {
+                                    retryable: false,
+                                    next_run_at_unix: None,
+                                    last_error: Some("late duplicate 403".to_owned()),
+                                    capacity_error: false,
+                                    last_attempt_latency_ms: None,
+                                },
+                                now
+                            )
+                            .await
+                            .unwrap(),
+                        ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+                    );
+                    now = saved.next_run_at.timestamp();
+                }
+            }
+            executor =
+                ThreadEpisodicIndexExecutor::new(store.clone(), backend.clone(), payload.clone());
+            assert_eq!(executor.run_once(now + 10_000).await.unwrap().claimed, 0);
+            assert_eq!(api.embed_calls.load(Ordering::SeqCst), expected_attempts);
+            let terminal = store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal.attempt_count, expected_attempts as i64);
+            let retried = store
+                .retry_failed_or_stale_thread_episodic_index_job(
+                    &job.id,
+                    now + 10_000,
+                    now + 10_000,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retried.status, terminal.status);
+            assert_eq!(retried.attempt_count, terminal.attempt_count);
+        }
     }
 
     #[tokio::test]
