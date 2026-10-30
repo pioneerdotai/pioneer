@@ -462,7 +462,8 @@ async fn ordinary_fanout_durable_leases_private_acl_and_fresh_final_subset() {
     assert!(revoked_rx.try_recv().is_err());
     assert!(denied_rx.try_recv().is_err());
 
-    f.assert_candidate_denied_before_serialization(denied_connection).await;
+    f.assert_candidate_denied_before_serialization(denied_connection)
+        .await;
     assert!(denied_rx.try_recv().is_err());
     assert!(
         allowed_rx.try_recv().is_err(),
@@ -587,7 +588,8 @@ async fn ordinary_fanout_rejects_missing_corrupt_and_cross_linked_lease_facts_be
         assert_eq!(f.emit(|| {}).await, 1);
         delivered(&mut rx);
         assert!(invalid_rx.try_recv().is_err());
-        f.assert_candidate_denied_before_serialization(connection).await;
+        f.assert_candidate_denied_before_serialization(connection)
+            .await;
         assert!(invalid_rx.try_recv().is_err());
         assert!(
             rx.try_recv().is_err(),
