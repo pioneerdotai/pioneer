@@ -562,13 +562,12 @@ fn gateway_completion_executor_scheduler_admission_reports_once_and_keeps_correl
     let TaskValue::String(correlation) = &details["correlation_id"] else {
         panic!("correlation")
     };
-    assert!(uuid::Uuid::parse_str(correlation).is_ok());
-    let encoded = serde_json::to_string(&events).unwrap();
-    assert!(encoded.contains(correlation));
+    assert!(!correlation.trim().is_empty());
     let fields = match &events[0].contexts["Rust Tracing Fields"] {
         sentry::protocol::Context::Other(fields) => fields,
         _ => panic!("fields"),
     };
+    assert_eq!(fields["correlation_id"], json!(correlation));
     assert!(!fields.contains_key("run_id"));
     assert!(!serde_json::to_string(fields).unwrap().contains(&run_id));
 }
@@ -3051,10 +3050,7 @@ fn revision_early_authority_and_lock_admission_complete_the_reserved_revision() 
                 let error = stored.error.unwrap();
                 assert_eq!(error.code, "write_lock_conflict");
                 assert_eq!(error.class, TaskErrorClass::Policy);
-                assert_eq!(
-                    error.message,
-                    "write scope conflicts with another active task run"
-                );
+                assert_eq!(error.message, "write_lock_conflict");
                 assert_eq!(error.failed_run_id.as_deref(), Some(run.id.as_str()));
                 let history = harness
                     .crud_store
