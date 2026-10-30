@@ -10,6 +10,9 @@ mod workspace_scope;
 #[path = "tests/authorization_reads.rs"]
 mod authorization_reads;
 
+#[path = "tests/fanout_facts.rs"]
+mod fanout_facts;
+
 #[cfg(unix)]
 #[path = "tests/title_recovery.rs"]
 mod title_recovery;

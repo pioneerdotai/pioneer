@@ -136,9 +136,9 @@ pub use repositories::auth_session::{
     load_active_device_by_installation, load_active_session_by_device, load_current_refresh,
     load_device, load_pending_local_session, load_pending_session_by_activation_locator_hash,
     load_pending_session_for_creator, load_session, load_session_by_activation_hash,
-    load_session_lease, mark_device_revoked, mark_session_revoked, record_failed_device_activation,
-    replace_current_refresh, revoke_principal_credentials, revoke_reason_to_db,
-    revoke_session_family_for_refresh_reuse, scan_auth_persistence_invariants,
+    load_session_lease, load_session_leases, mark_device_revoked, mark_session_revoked,
+    record_failed_device_activation, replace_current_refresh, revoke_principal_credentials,
+    revoke_reason_to_db, revoke_session_family_for_refresh_reuse, scan_auth_persistence_invariants,
     touch_active_auth_session, touch_active_device,
 };
 pub use repositories::authorization_persistence::{
@@ -184,18 +184,19 @@ pub use repositories::invitation::{
     transition_pending_to_expired, transition_pending_to_revoked,
 };
 pub use repositories::membership::{
-    MemberDirectoryCursor, MemberDirectoryPage, NewThreadMembership, NewWorkspaceMembership,
-    PersistedThreadAccessClass, PrincipalMembershipDeletion, PrivateThreadParticipantMutation,
-    WorkspaceMembershipDeletion, delete_all_memberships_for_principal, delete_thread_membership,
-    delete_workspace_membership, find_accessible_thread_for_principal,
-    find_active_workspace_for_principal, find_shared_workspace_principal_for_principal,
-    find_thread_membership, find_workspace_membership, insert_thread_membership,
-    insert_workspace_membership, list_accessible_threads_for_principal,
-    list_active_workspaces_for_principal, list_member_directory_page,
-    list_thread_memberships_for_principal, list_thread_memberships_for_thread,
-    list_workspace_member_principals_page, list_workspace_memberships_for_principal,
-    list_workspace_memberships_for_workspace, persisted_thread_access_class_from_db,
-    persisted_thread_access_class_to_db,
+    AUTHORIZATION_FACTS_BATCH_LIMIT, MemberDirectoryCursor, MemberDirectoryPage,
+    NewThreadMembership, NewWorkspaceMembership, PersistedThreadAccessClass,
+    PrincipalMembershipDeletion, PrivateThreadParticipantMutation, WorkspaceMembershipDeletion,
+    delete_all_memberships_for_principal, delete_thread_membership, delete_workspace_membership,
+    find_accessible_thread_for_principal, find_active_workspace_for_principal,
+    find_shared_workspace_principal_for_principal, find_thread_membership,
+    find_workspace_membership, insert_thread_membership, insert_workspace_membership,
+    list_accessible_threads_for_principal, list_active_workspaces_for_principal,
+    list_member_directory_page, list_thread_memberships_for_principal,
+    list_thread_memberships_for_thread, list_workspace_member_principals_page,
+    list_workspace_memberships_for_principal, list_workspace_memberships_for_workspace,
+    load_thread_membership_principal_ids, load_workspace_membership_principal_ids,
+    persisted_thread_access_class_from_db, persisted_thread_access_class_to_db,
 };
 pub use repositories::patch_history;
 pub use repositories::patch_history::{

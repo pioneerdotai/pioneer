@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use pioneer_crud::{
     CrudStore, PersistedCapabilityScopeKind, PersistedThreadAccessClass,
@@ -31,6 +33,32 @@ pub(crate) struct CapabilityThreadFacts {
     pub(crate) access: ThreadAccessFacts,
     pub(crate) internal_child: bool,
     pub(crate) parent_execution_actions: Option<Vec<String>>,
+}
+
+/// Stage-local authoritative classification. Only a validated persisted
+/// workspace/private scope can enter the shared evaluator. Missing resources
+/// can authorize only an exact runtime draft, never fabricated ordinary facts.
+pub(crate) struct ThreadNotificationScope {
+    scope: Option<pioneer_crud::ThreadAuthorizationScope>,
+}
+
+impl ThreadNotificationScope {
+    pub(crate) fn is_internal(&self) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|scope| scope.access_class == PersistedThreadAccessClass::Internal)
+    }
+
+    pub(crate) fn is_missing(&self) -> bool {
+        self.scope.is_none()
+    }
+}
+
+pub(crate) struct ThreadNotificationMemberships<'a> {
+    scope: &'a pioneer_crud::ThreadAuthorizationScope,
+    requested: HashSet<PrincipalId>,
+    workspace_members: HashSet<String>,
+    thread_members: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -518,6 +546,85 @@ impl AuthorizationResolver {
                 proof.collaboration_root_thread_id = collaboration_root_thread_id;
                 AuthorizedThread(proof)
             }))
+    }
+
+    pub(crate) async fn load_thread_notification_scope(
+        &self,
+        thread_id: &str,
+    ) -> Result<ThreadNotificationScope> {
+        let scope =
+            resolve_thread_authorization_scope(&self.store.database_connection(), thread_id, None)
+                .await?;
+        Ok(ThreadNotificationScope { scope })
+    }
+
+    pub(crate) async fn load_thread_notification_memberships<'a>(
+        &self,
+        scope: &'a ThreadNotificationScope,
+        principal_ids: &[PrincipalId],
+    ) -> Result<ThreadNotificationMemberships<'a>> {
+        let scope = scope
+            .scope
+            .as_ref()
+            .filter(|scope| scope.access_class != PersistedThreadAccessClass::Internal)
+            .context("ordinary notification requires a persisted workspace/private scope")?;
+        let workspace_members = pioneer_crud::load_workspace_membership_principal_ids(
+            &self.store.database_connection(),
+            &scope.workspace_id,
+            principal_ids,
+        )
+        .await?;
+        let thread_members = pioneer_crud::load_thread_membership_principal_ids(
+            &self.store.database_connection(),
+            &scope.thread_id,
+            principal_ids,
+        )
+        .await?;
+        // Both bounded materializations have released their physical readers.
+        Ok(ThreadNotificationMemberships {
+            scope,
+            requested: principal_ids.iter().cloned().collect(),
+            workspace_members: workspace_members.into_iter().collect(),
+            thread_members: thread_members.into_iter().collect(),
+        })
+    }
+
+    pub(crate) fn authorize_thread_notification(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+        memberships: &ThreadNotificationMemberships<'_>,
+    ) -> ProofResolution<AuthorizedThread> {
+        let action = ResourceAction::ThreadRead;
+        if let Some(denied) = self.preflight(action_gate, action) {
+            return ProofResolution::Denied(denied);
+        }
+        if !action_gate.is_final_allow() && !memberships.requested.contains(&principal.principal_id)
+        {
+            return ProofResolution::Denied(missing_resource());
+        }
+        let scope = memberships.scope;
+        let Some(resource) = thread_resource(&scope.workspace_id, &scope.thread_id) else {
+            return ProofResolution::Denied(missing_resource());
+        };
+        let facts = self.thread_facts_from_memberships(
+            principal,
+            scope,
+            memberships
+                .workspace_members
+                .contains(principal.principal_id.as_str()),
+            memberships
+                .thread_members
+                .contains(principal.principal_id.as_str()),
+        );
+        self.finish(
+            principal,
+            action_gate,
+            action,
+            resource,
+            ResolvedResourceAccess::Thread(facts),
+        )
+        .map(AuthorizedThread)
     }
 
     /// Authorizes an exact connection-owned draft without pretending that it
@@ -1401,17 +1508,41 @@ impl AuthorizationResolver {
             .context("failed to resolve thread authorization membership")?
             .is_some(),
         };
-        Ok(ThreadAccessFacts {
-            workspace,
+        Ok(self.thread_facts_from_memberships(
+            principal,
+            scope,
+            workspace.workspace_member,
+            thread_member,
+        ))
+    }
+
+    /// Fact assembly is shared by the single and bounded notification loaders;
+    /// `finish` / AuthorizationService remain the only ACL evaluator.
+    fn thread_facts_from_memberships(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        scope: &pioneer_crud::ThreadAuthorizationScope,
+        workspace_member: bool,
+        thread_member: bool,
+    ) -> ThreadAccessFacts {
+        let scoped = self
+            .service
+            .runtime_principal_policy(principal.kind, principal.role_key.as_ref())
+            == Some(super::RuntimePrincipalPolicy::ScopedCollaboration);
+        ThreadAccessFacts {
+            workspace: WorkspaceAccessFacts {
+                workspace_active: scope.workspace_is_active,
+                workspace_member: scoped && workspace_member,
+            },
             access_class: match scope.access_class {
                 PersistedThreadAccessClass::Private => ThreadAccessClass::Private,
                 PersistedThreadAccessClass::Workspace => ThreadAccessClass::Workspace,
                 PersistedThreadAccessClass::Internal => ThreadAccessClass::Internal,
             },
             resource_class: ThreadResourceClass::Root,
-            thread_member,
+            thread_member: scoped && thread_member,
             thread_creator: scope.creator_principal_id.as_ref() == Some(&principal.principal_id),
-        })
+        }
     }
 
     fn finish(

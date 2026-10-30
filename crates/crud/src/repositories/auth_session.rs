@@ -419,8 +419,9 @@ pub async fn load_active_device_by_installation<C: ConnectionTrait>(
 
 /// Current lease inputs, excluding credentials and principal presentation.
 /// Ownership is deliberately returned, not trusted through unenforced FKs.
-#[derive(Debug, sea_orm::FromQueryResult)]
+#[derive(Debug, Clone, sea_orm::FromQueryResult)]
 pub struct AuthSessionLeaseRow {
+    pub session_id: String,
     pub session_gateway_id: String,
     pub session_principal_id: String,
     pub session_device_id: String,
@@ -446,11 +447,40 @@ pub async fn load_session_lease<C: ConnectionTrait>(
     db: &C,
     id: &AuthSessionId,
 ) -> Result<Option<AuthSessionLeaseRow>> {
-    // Missing related rows previously failed before status/expiry validation.
-    // INNER JOIN preserves that InvalidCredential result; the service still
-    // compares every ownership field with the authenticated context.
-    auth_session::Entity::find_by_id(id.to_string())
+    session_lease_query()
+        .filter(auth_session::Column::Id.eq(id.to_string()))
+        .into_model::<AuthSessionLeaseRow>()
+        .one(db)
+        .await
+        .context("failed to load session lease facts")
+}
+
+/// Each row is keyed by session; a joined row is still unvalidated input.
+pub async fn load_session_leases<C: ConnectionTrait>(
+    db: &C,
+    ids: &[AuthSessionId],
+) -> Result<Vec<AuthSessionLeaseRow>> {
+    if ids.len() > super::membership::AUTHORIZATION_FACTS_BATCH_LIMIT {
+        anyhow::bail!("session authorization facts batch exceeds limit");
+    }
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    session_lease_query()
+        .filter(auth_session::Column::Id.is_in(ids.iter().map(ToString::to_string)))
+        .limit(super::membership::AUTHORIZATION_FACTS_BATCH_LIMIT as u64)
+        .into_model::<AuthSessionLeaseRow>()
+        .all(db)
+        .await
+        .context("failed to load bounded session lease facts")
+}
+
+fn session_lease_query() -> sea_orm::Select<auth_session::Entity> {
+    // INNER JOIN preserves missing-related-row failure. Ownership is checked
+    // explicitly by the service because SQLite foreign keys are disabled.
+    auth_session::Entity::find()
         .select_only()
+        .column_as(auth_session::Column::Id, "session_id")
         .column_as(auth_session::Column::GatewayId, "session_gateway_id")
         .column_as(auth_session::Column::PrincipalId, "session_principal_id")
         .column_as(auth_session::Column::DeviceId, "session_device_id")
@@ -484,10 +514,6 @@ pub async fn load_session_lease<C: ConnectionTrait>(
                 .to(gateway_principal::Column::Id)
                 .into(),
         )
-        .into_model::<AuthSessionLeaseRow>()
-        .one(db)
-        .await
-        .context("failed to load session lease facts")
 }
 
 pub async fn load_session<C: ConnectionTrait>(

@@ -1,6 +1,8 @@
 use super::*;
 use std::time::Instant;
 
+mod pre_serialization;
+
 fn markdown_notification_stream(
     method: &str,
 ) -> Option<pioneer_observability::GatewayMarkdownStreamKind> {
@@ -1292,8 +1294,9 @@ impl MessageProcessor {
                 identities.get(&subscriber.connection_id) == Some(&subscriber.identity)
             })
             .collect();
+        // The awaited stage owns all shared facts; only IDs cross serialization.
         let serialization_connection_ids = self
-            .authorized_thread_notification_recipients(thread_id, serialization_subscribers)
+            .pre_serialization_thread_notification_recipients(thread_id, serialization_subscribers)
             .await;
         if serialization_connection_ids.is_empty() {
             return;
