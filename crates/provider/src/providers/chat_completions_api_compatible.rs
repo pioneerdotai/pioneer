@@ -343,8 +343,11 @@ impl StreamError {
 // ── List models response types ─────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-struct ModelsListResponse {
-    data: Vec<CompatModelEntry>,
+#[serde(untagged)]
+enum ModelsListResponse {
+    Wrapped { data: Vec<CompatModelEntry> },
+    // Together's existing /models operation returns a top-level array.
+    Flat(Vec<CompatModelEntry>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -354,6 +357,10 @@ struct CompatModelEntry {
     created: Option<i64>,
     #[serde(default)]
     owned_by: Option<String>,
+    #[serde(default)]
+    capabilities: serde_json::Value,
+    #[serde(default, rename = "type")]
+    model_type: serde_json::Value,
 }
 
 /// Strip `<think>...</think>` tags from content returned by some thinking models.
@@ -473,13 +480,75 @@ impl ChatCompletionsApiCompatibleProvider {
 
     /// Resolve the models endpoint URL.
     fn models_url(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
+        Self::models_url_for_base(&self.base_url)
+    }
+
+    fn models_url_for_base(base: &str) -> String {
+        let base = base.trim_end_matches('/');
         // Strip /chat/completions if the base_url points directly there
         let base = base.strip_suffix("/chat/completions").unwrap_or(base);
         let base = base.trim_end_matches('/');
         format!("{base}/models")
     }
 
+    fn normalize_models(&self, api_response: ModelsListResponse) -> Vec<ProviderModelInfo> {
+        let provider_name = self.name.clone();
+        // These stock endpoints document a chat/text-only default list. A
+        // custom URL using the same adapter name cannot inherit that fact.
+        let chat_only_list = matches!(provider_name.as_str(), "huggingface" | "venice")
+            && crate::provider_definition(&provider_name)
+                .and_then(|definition| definition.default_base_url)
+                .is_some_and(|stock| Self::models_url_for_base(stock) == self.models_url());
+        let entries = match api_response {
+            ModelsListResponse::Wrapped { data } => data,
+            ModelsListResponse::Flat(data) => data,
+        };
+
+        entries
+            .into_iter()
+            .map(|m| ProviderModelInfo {
+                id: m.id.clone(),
+                name: None,
+                description: None,
+                created: m.created,
+                provider: provider_name.clone(),
+                owned_by: m.owned_by,
+                limits: ProviderModelLimits::default(),
+                capabilities: ProviderModelCapabilities {
+                    // These are documented operation facts, not shared defaults
+                    // for all APIs that happen to use the OpenAI list envelope.
+                    chat: match provider_name.as_str() {
+                        "mistral" => m.capabilities["completion_chat"].as_bool(),
+                        "together" => match m.model_type.as_str() {
+                            Some("chat") => Some(true),
+                            Some(
+                                "language" | "code" | "image" | "embedding" | "moderation"
+                                | "rerank" | "audio" | "transcribe" | "video",
+                            ) => Some(false),
+                            _ => None,
+                        },
+                        "venice" => match m.model_type.as_str() {
+                            Some("text") => Some(true),
+                            Some(
+                                "asr" | "decision" | "embedding" | "image" | "music" | "tts"
+                                | "upscale" | "inpaint" | "video",
+                            ) => Some(false),
+                            None if m.model_type.is_null() => chat_only_list.then_some(true),
+                            _ => None,
+                        },
+                        "huggingface" => chat_only_list.then_some(true),
+                        _ => None,
+                    },
+                    ..Default::default()
+                },
+                transcription: None,
+                pricing: None,
+                active: Some(true),
+                family: None,
+                lifecycle_status: None,
+            })
+            .collect()
+    }
     /// Build a GET request builder with the correct auth and extra headers applied.
     fn authorized_get(&self, url: &str) -> reqwest::RequestBuilder {
         let mut builder = self.client.get(url);
@@ -1109,18 +1178,7 @@ impl ChatCompletionsApiCompatibleProvider {
     }
 
     async fn api_error(&self, response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("{} API error ({status}): {body}", self.name)
+        crate::http::provider_api_error(response, &self.name).await
     }
 }
 
@@ -1512,27 +1570,7 @@ impl crate::traits::Provider for ChatCompletionsApiCompatibleProvider {
             "provider_response",
         )
         .await?;
-        let provider_name = self.name.clone();
-
-        Ok(api_response
-            .data
-            .into_iter()
-            .map(|m| ProviderModelInfo {
-                id: m.id.clone(),
-                name: None,
-                description: None,
-                created: m.created,
-                provider: provider_name.clone(),
-                owned_by: m.owned_by,
-                limits: ProviderModelLimits::default(),
-                capabilities: ProviderModelCapabilities::default(),
-                transcription: None,
-                pricing: None,
-                active: Some(true),
-                family: None,
-                lifecycle_status: None,
-            })
-            .collect())
+        Ok(self.normalize_models(api_response))
     }
 
     async fn warmup(&self) -> Result<crate::ProviderWarmupOutcome> {
@@ -1543,6 +1581,51 @@ impl crate::traits::Provider for ChatCompletionsApiCompatibleProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stock_chat_discovery_accepts_equivalent_completion_urls_only() {
+        use super::*;
+        use crate::traits::Provider;
+        for name in ["huggingface", "venice"] {
+            let base = crate::provider_definition(name)
+                .unwrap()
+                .default_base_url
+                .unwrap();
+            for (url, expected) in [
+                (base.to_owned(), true),
+                (format!("{base}/chat/completions"), true),
+                (format!("{base}/chat/completions/"), true),
+                (format!("{base}/foreign"), false),
+                ("https://foreign.example/v1".into(), false),
+            ] {
+                let provider =
+                    ChatCompletionsApiCompatibleProvider::new(name, url, "", AuthStyle::Bearer);
+                let response =
+                    serde_json::from_str(r#"{"data":[{"id":"private-model"}]}"#).unwrap();
+                let rows = provider.normalize_models(response);
+                assert_eq!(rows[0].capabilities.chat, expected.then_some(true));
+                let selected = crate::selection::filter_models(
+                    name,
+                    "chat_completions",
+                    &provider.capabilities(),
+                    crate::selection::ModelPurpose::Chat,
+                    rows,
+                    None,
+                );
+                assert_eq!(
+                    selected
+                        .iter()
+                        .map(|row| row.id.as_str())
+                        .collect::<Vec<_>>(),
+                    if expected {
+                        vec!["private-model"]
+                    } else {
+                        vec![]
+                    }
+                );
+            }
+        }
+    }
+
     #[test]
     fn vendor_formats_cannot_bypass_explicit_negative_effort_capability() {
         for format in [
