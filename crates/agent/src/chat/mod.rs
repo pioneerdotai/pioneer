@@ -2192,20 +2192,9 @@ async fn run_agent_turn_preflight_stage(
             .then(|| hook_runtime_context.actor_id.clone())
             .flatten(),
     };
-    let episodic_capabilities = MemoryEpisodicRecallCapabilities {
-        current_thread_search: !memory_context
-            .effective_conversation_thread_id()
-            .trim()
-            .is_empty(),
-        related_thread_search: false,
-        workspace_thread_search: false,
-        full_input_query: false,
-        current_task_context: hook_runtime_context
-            .task_id
-            .as_ref()
-            .is_some_and(|task_id| !task_id.trim().is_empty()),
-        completed_task_summary: false,
-    };
+    // The production Memory hook runtime has no episodic provider. Keep
+    // preflight aligned; conversation history remains available via Threads.
+    let episodic_capabilities = MemoryEpisodicRecallCapabilities::default();
     let thread_episodic_summary = active_recall_thread_episodic_summary(
         &hook_prompt_context_set,
         &memory_context,

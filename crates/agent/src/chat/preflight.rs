@@ -3245,6 +3245,123 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn turn_preflight_stage_offers_active_memory_without_history_capabilities() {
+        use crate::hooks::{EffectiveTurnPolicySet, EffectiveTurnPromptContextSet};
+        use pioneer_hooks::*;
+
+        let mut policy = BTreeMap::new();
+        for (key, value) in [
+            ("recall", "allow"),
+            ("prompt", "full"),
+            ("read_tools", "allow"),
+            ("remember_tool", "allow"),
+            ("forget_tool", "allow"),
+            ("post_turn_extraction", "allow"),
+            ("active_memory", "allow"),
+            ("reason_code", "default_allow_read"),
+            ("source", "pre_memory_classifier"),
+        ] {
+            policy.insert(
+                HookMetadataKey::new(key).unwrap(),
+                HookValue::Text(value.into()),
+            );
+        }
+        for key in ["explicit_remember", "explicit_forget"] {
+            policy.insert(HookMetadataKey::new(key).unwrap(), HookValue::Bool(false));
+        }
+        policy.insert(
+            HookMetadataKey::new("confidence").unwrap(),
+            HookValue::F64(1.0),
+        );
+        let policies =
+            EffectiveTurnPolicySet::from_hook_policy_set(HookPolicySet::merge_contributions([
+                PolicyContribution {
+                    domain: HookDomain::new("memory").unwrap(),
+                    key: HookPolicyKey::new("turn_policy").unwrap(),
+                    value: HookValue::Object(policy),
+                    priority: 500,
+                    diagnostics: Vec::new(),
+                },
+            ]));
+
+        let mut config = crate::manager_tests::test_tool_loop_config();
+        config.memory.active_recall.mode = MemoryActiveRecallMode::Hybrid;
+        for task_context in [false, true] {
+            let provider = if task_context {
+                FakePreflightProvider::failing("thread-provider", "planner unavailable")
+            } else {
+                FakePreflightProvider::text(
+                    "thread-provider",
+                    sample_provider_plan_json().to_string(),
+                )
+            };
+            let events = Arc::new(crate::AgentEventHub::new());
+            let mut durable = events.take_durable_receiver().await.unwrap();
+            let prompt_context = EffectiveTurnPromptContextSet::empty();
+            let runtime_context = crate::AgentTurnHookRuntimeContext {
+                task_id: task_context.then(|| "task_1".to_owned()),
+                conversation_thread_id: Some("conversation_1".to_owned()),
+                ..Default::default()
+            };
+            let stage = super::super::run_agent_turn_preflight_stage(
+                events.clone(),
+                Arc::new(ProviderRegistry::new(|_| "unused".to_owned())),
+                provider.clone(),
+                "thread-model",
+                true,
+                &config,
+                &policies,
+                &prompt_context,
+                sample_tool_index(),
+                "ws_1",
+                "thr_1",
+                "turn_1",
+                &runtime_context,
+                "как меня зовут?",
+            );
+            // Preflight waits for durable usage observations to be committed.
+            // Supply the consumer normally owned by the Gateway event loop.
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::pin!(stage);
+                loop {
+                    tokio::select! {
+                        result = &mut stage => break result,
+                        event = durable.recv() => {
+                            event.expect("preflight durable lane must stay open");
+                            durable.acknowledge_last(Ok(()));
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("preflight and durable usage acknowledgements must finish");
+            let TurnPreflightLocalActiveRecallState::ProviderNeeded { input, .. } =
+                &result.local_modules.memory.active_recall
+            else {
+                panic!("identity lookup must retain active-memory provider planning");
+            };
+            let request = &input.decision_request;
+            assert_eq!(
+                request.available_modes,
+                vec!["profile", "project", "durable"]
+            );
+            assert!(request.available_episodic_modes.is_empty());
+            assert!(!request.episodic_capabilities.any());
+            assert!(!request.thread_episodic.current_thread_recall_available);
+            assert!(
+                !provider.requests().is_empty(),
+                "real preflight stage must call the fake provider"
+            );
+            let decision = &result.plan.memory.active_recall.decision;
+            assert!(decision.episodic.queries.is_empty(), "{decision:?}");
+            assert!(
+                !decision.durable.modes.is_empty(),
+                "active-memory planning and fallback must remain available: {decision:?}"
+            );
+        }
+    }
+
     #[test]
     fn preflight_prompt_omits_provider_episodic_section_when_host_owns_full_input_recall() {
         let local_plan = sample_memory_local_plan_with_current_thread_episodic_capability(

@@ -655,90 +655,103 @@ async fn provisional_delivery_is_explicit_and_independent_of_provider_name() {
 
 #[tokio::test]
 async fn compiled_prompt_tool_controls_and_responses_generation_policy() {
-    crate::attachments::runtime::with_async_authority_scope(
-        "responses-generation-fixture".into(),
-        async {
-            let provider = ResponsesApiCompatibleProvider::new(
-                "openai",
-                "https://synthetic.invalid/prefix",
-                "fixture",
-                AuthStyle::Bearer,
-            );
-            for choice in [
-                ToolChoice::Auto,
-                ToolChoice::None,
-                ToolChoice::Required,
-                ToolChoice::Tool {
-                    name: "lookup".into(),
-                },
-            ] {
-                let mut req = request();
-                req.tool_choice = Some(choice.clone());
-                req.compiled_prompt = Some(crate::CompiledPromptPayload {
-                    stable_system_text: "compiled".into(),
-                    dynamic_system_text: String::new(),
-                    boundary_marker: String::new(),
-                    full_system_text: "compiled".into(),
-                });
-                req.messages
-                    .insert(0, ChatMessage::system("must not duplicate"));
-                let prepared = provider
-                    .prepare(req, &provider.capabilities())
-                    .await
-                    .unwrap();
-                let body = provider.render(&prepared, true).unwrap();
-                assert_eq!(body["instructions"], "compiled");
-                assert!(!body["input"].to_string().contains("must not duplicate"));
-                assert_eq!(body["max_output_tokens"], 100);
-                assert_eq!(body["parallel_tool_calls"], json!(false));
-                assert!(body["tools"][0]["parameters"].get("required").is_none());
-                match choice {
-                    ToolChoice::Auto => assert_eq!(body["tool_choice"], "auto"),
-                    ToolChoice::None => assert_eq!(body["tool_choice"], "none"),
-                    ToolChoice::Required => assert_eq!(body["tool_choice"], "required"),
-                    ToolChoice::Tool { name } => {
-                        assert_eq!(body["tool_choice"], json!({"type":"function","name":name}))
+    let state = std::sync::Arc::new(crate::attachments::admission::AdmissionState::for_test(
+        std::sync::Arc::new(compatible_catalog(
+            "openai",
+            "gpt-6.1-sol",
+            json!({
+                "compat":{"supportsReasoningEffort":true,"supportsTemperature":false},
+                "thinkingLevelMap":{"max":"max","off":null}
+            }),
+        )),
+    ));
+    crate::attachments::regression::scoped(
+        state,
+        crate::attachments::runtime::with_async_authority_scope(
+            "responses-generation-fixture".into(),
+            async {
+                let provider = ResponsesApiCompatibleProvider::new(
+                    "openai",
+                    "https://synthetic.invalid/prefix",
+                    "fixture",
+                    AuthStyle::Bearer,
+                );
+                for choice in [
+                    ToolChoice::Auto,
+                    ToolChoice::None,
+                    ToolChoice::Required,
+                    ToolChoice::Tool {
+                        name: "lookup".into(),
+                    },
+                ] {
+                    let mut req = request();
+                    req.tool_choice = Some(choice.clone());
+                    req.compiled_prompt = Some(crate::CompiledPromptPayload {
+                        stable_system_text: "compiled".into(),
+                        dynamic_system_text: String::new(),
+                        boundary_marker: String::new(),
+                        full_system_text: "compiled".into(),
+                    });
+                    req.messages
+                        .insert(0, ChatMessage::system("must not duplicate"));
+                    let prepared = provider
+                        .prepare(req, &provider.capabilities())
+                        .await
+                        .unwrap();
+                    let body = provider.render(&prepared, true).unwrap();
+                    assert_eq!(body["instructions"], "compiled");
+                    assert!(!body["input"].to_string().contains("must not duplicate"));
+                    assert_eq!(body["max_output_tokens"], 100);
+                    assert_eq!(body["parallel_tool_calls"], json!(false));
+                    assert!(body["tools"][0]["parameters"].get("required").is_none());
+                    match choice {
+                        ToolChoice::Auto => assert_eq!(body["tool_choice"], "auto"),
+                        ToolChoice::None => assert_eq!(body["tool_choice"], "none"),
+                        ToolChoice::Required => assert_eq!(body["tool_choice"], "required"),
+                        ToolChoice::Tool { name } => {
+                            assert_eq!(body["tool_choice"], json!({"type":"function","name":name}))
+                        }
                     }
                 }
-            }
-            let mut req = request();
-            req.temperature = Some(0.7);
-            assert!(
-                provider
+                let mut req = request();
+                req.temperature = Some(0.7);
+                assert!(
+                    provider
+                        .prepare(req.clone(), &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+                req.temperature = None;
+                req.reasoning = Some(crate::ReasoningConfig::Disabled);
+                assert!(
+                    provider
+                        .prepare(req.clone(), &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+                req.reasoning = Some(crate::ReasoningConfig::Effort(crate::ReasoningEffort::Max));
+                let prepared = provider
                     .prepare(req.clone(), &provider.capabilities())
                     .await
-                    .is_err()
-            );
-            req.temperature = None;
-            req.reasoning = Some(crate::ReasoningConfig::Disabled);
-            assert!(
-                provider
-                    .prepare(req.clone(), &provider.capabilities())
-                    .await
-                    .is_err()
-            );
-            req.reasoning = Some(crate::ReasoningConfig::Effort(crate::ReasoningEffort::Max));
-            let prepared = provider
-                .prepare(req.clone(), &provider.capabilities())
-                .await
-                .unwrap();
-            assert_eq!(
-                provider.render(&prepared, false).unwrap()["reasoning"]["effort"],
-                "max"
-            );
-            assert!(crate::generation::chat_fields("azure-openai", &req).is_err());
-            assert!(crate::tools::policy::prepare_request("azure-openai", req).is_err());
-            let mut req = request();
-            req.tool_choice = Some(ToolChoice::Tool {
-                name: "missing".into(),
-            });
-            assert!(
-                provider
-                    .prepare(req, &provider.capabilities())
-                    .await
-                    .is_err()
-            );
-        },
+                    .unwrap();
+                assert_eq!(
+                    provider.render(&prepared, false).unwrap()["reasoning"]["effort"],
+                    "max"
+                );
+                assert!(crate::generation::chat_fields("azure-openai", &req).is_err());
+                assert!(crate::tools::policy::prepare_request("azure-openai", req).is_err());
+                let mut req = request();
+                req.tool_choice = Some(ToolChoice::Tool {
+                    name: "missing".into(),
+                });
+                assert!(
+                    provider
+                        .prepare(req, &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+            },
+        ),
     )
     .await;
 }
@@ -1716,7 +1729,7 @@ async fn generic_responses_controls_use_other_provider_model_contract_before_net
 }
 
 #[tokio::test]
-async fn generic_responses_sampling_and_off_need_positive_noncontradictory_facts() {
+async fn generic_responses_sampling_preserves_unknown_and_explicit_denials() {
     use crate::ReasoningConfig;
     use crate::attachments::{admission::AdmissionState, regression::scoped};
     use std::sync::Arc;
@@ -1733,7 +1746,7 @@ async fn generic_responses_sampling_and_off_need_positive_noncontradictory_facts
     req.reasoning = Some(ReasoningConfig::Disabled);
     req.temperature = Some(0.5);
     for (overrides, allowed) in [
-        (json!({}), false),
+        (json!({}), true),
         (json!({"compat":{"supportsTemperature":true}}), true),
         (json!({"sourceGeneration":{"temperature":true}}), true),
         (
@@ -2796,7 +2809,7 @@ async fn vercel_unknown_controls_leave_defaults_and_fallback_limits_are_not_nati
                 req.model = model.id;
                 req.max_tokens = Some(5000);
                 // 4096 in normalized storage is a conservative fallback, not evidence
-                // of a Vercel output ceiling. Explicit unknown controls still fail.
+                // of a Vercel output ceiling. Unknown effort still fails.
                 let prepared = provider
                     .prepare(req.clone(), &provider.capabilities())
                     .await
@@ -2813,12 +2826,17 @@ async fn vercel_unknown_controls_leave_defaults_and_fallback_limits_are_not_nati
                 );
                 req.reasoning = None;
                 req.temperature = Some(0.5);
-                assert!(
-                    provider
-                        .prepare(req, &provider.capabilities())
-                        .await
-                        .is_err()
-                );
+                let prepared = provider
+                    .prepare(req, &provider.capabilities())
+                    .await
+                    .unwrap();
+                for stream in [false, true] {
+                    let body = provider.render(&prepared, stream).unwrap();
+                    assert_eq!(body["temperature"], 0.5);
+                    assert!(body.get("reasoning").is_none());
+                    assert_eq!(body["max_output_tokens"], 5000);
+                    assert_eq!(body["stream"], stream);
+                }
             },
         ),
     )

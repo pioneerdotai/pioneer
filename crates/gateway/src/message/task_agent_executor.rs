@@ -193,7 +193,7 @@ fn task_saved_child_launch_grant(
         ..
     } = serde_json::from_str(grant_json).context("Task resolved child launch grant is invalid")?;
     child_launch_grant
-        .validate()
+        .validate_for_execution()
         .map_err(|error| anyhow!("Task child launch ceiling failed validation: {error:?}"))?;
     Ok(child_launch_grant)
 }
@@ -896,10 +896,16 @@ pub(super) type TaskAgentActionBinding = (
     std::collections::BTreeSet<pioneer_protocol::AgentToolCapability>,
 );
 
-/// Restore the exact identity/profile snapshot stored with an admitted Task
-/// execution, or materialize the exact launch frozen in the Task actor
-/// contract. Current Task, workspace, and runtime defaults are never used to
-/// widen or rewrite that admitted launch.
+// Purpose is independent of terminal liveness: reviewer recovery may resume an
+// existing InProgress Turn while allowing an already terminal execution row.
+#[derive(Clone, Copy)]
+enum TaskAgentBindingPurpose {
+    ModelExecution { allow_terminal_execution: bool },
+    ResultDelivery,
+}
+
+/// Restore/materialize a binding that may be registered with a model runtime.
+/// Historical launch ceilings must remain executable even during recovery.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn materialize_task_agent_action_binding_for_execution(
     processor: &MessageProcessor,
@@ -911,6 +917,66 @@ pub(super) async fn materialize_task_agent_action_binding_for_execution(
     policy_generation: u64,
     allow_terminal_execution: bool,
 ) -> Result<TaskAgentActionBinding> {
+    restore_task_agent_action_binding(
+        processor,
+        task,
+        agent_spec,
+        execution_id,
+        run_id,
+        root_capsule_id,
+        policy_generation,
+        TaskAgentBindingPurpose::ModelExecution {
+            allow_terminal_execution,
+        },
+    )
+    .await
+}
+
+/// Restore only the existing author for DeliverResult. Tool options and model
+/// capabilities never leave this path; it cannot materialize a missing launch.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn restore_task_delivery_agent_action_binding(
+    processor: &MessageProcessor,
+    task: &Task,
+    agent_spec: &TaskAgentSpec,
+    execution_id: &str,
+    run_id: &str,
+    root_capsule_id: &str,
+    policy_generation: u64,
+) -> Result<crate::authorization::BoundAgentActionAdapter> {
+    let (adapter, _, _) = restore_task_agent_action_binding(
+        processor,
+        task,
+        agent_spec,
+        execution_id,
+        run_id,
+        root_capsule_id,
+        policy_generation,
+        TaskAgentBindingPurpose::ResultDelivery,
+    )
+    .await?;
+    Ok(adapter)
+}
+
+// Both paths authenticate the immutable Task/execution documents and current
+// source/role fences. Only actual model execution requires runnable ceilings.
+#[allow(clippy::too_many_arguments)]
+async fn restore_task_agent_action_binding(
+    processor: &MessageProcessor,
+    task: &Task,
+    agent_spec: &TaskAgentSpec,
+    execution_id: &str,
+    run_id: &str,
+    root_capsule_id: &str,
+    policy_generation: u64,
+    purpose: TaskAgentBindingPurpose,
+) -> Result<TaskAgentActionBinding> {
+    let allow_terminal_execution = match purpose {
+        TaskAgentBindingPurpose::ModelExecution {
+            allow_terminal_execution,
+        } => allow_terminal_execution,
+        TaskAgentBindingPurpose::ResultDelivery => true,
+    };
     scope_current_stage(Stage::ChildAction, async {
         let database = processor.crud_store.database_connection();
         let actor_contract = processor
@@ -918,6 +984,11 @@ pub(super) async fn materialize_task_agent_action_binding_for_execution(
             .get_task_actor_contract(task.id.as_str())
             .await?
             .context("agent Task is missing its durable actor contract")?;
+        if matches!(purpose, TaskAgentBindingPurpose::ModelExecution { .. })
+            && actor_contract.derived_child_launch_grant_json.is_some()
+        {
+            task_saved_child_launch_grant(&actor_contract)?;
+        }
         let effective_home_root_thread_id =
             if let Some(route_id) = actor_contract.execution_route_id.as_deref() {
                 let route = pioneer_crud::load_agent_delegation_route(&database, route_id)
@@ -995,6 +1066,9 @@ pub(super) async fn materialize_task_agent_action_binding_for_execution(
                     .context("persisted Task execution grant is missing")?;
             let grant: serde_json::Value = serde_json::from_str(execution_grant.grant_json.as_str())
                 .context("persisted Task execution grant is invalid")?;
+            if matches!(purpose, TaskAgentBindingPurpose::ModelExecution { .. }) {
+                super::agent_action_tools::execution_child_launch_ceiling(&grant)?;
+            }
             let grant_kind = grant.get("kind").and_then(serde_json::Value::as_str);
             let profile: pioneer_protocol::AgentExecutionProfileProjection = serde_json::from_value(
                 grant
@@ -1075,6 +1149,9 @@ pub(super) async fn materialize_task_agent_action_binding_for_execution(
             .map_err(|error| anyhow!("failed to restore exact Task agent binding: {error:?}"));
         }
 
+        if matches!(purpose, TaskAgentBindingPurpose::ResultDelivery) {
+            bail!("Task result delivery requires an existing source execution");
+        }
         if let Some(grant_json) = actor_contract.derived_child_launch_grant_json.as_deref() {
             let pioneer_protocol::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
                 identity,
@@ -13011,5 +13088,404 @@ mod tests {
             panic!("diagnostics should be a list");
         };
         assert!(!diagnostics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn historical_grant_cannot_start_a_task_model_execution() {
+        use crate::message::tests::task_launch_continuity::historical_task_fixture;
+        use sea_orm::{EntityTrait, PaginatorTrait};
+        let fixture = historical_task_fixture(pioneer_protocol::TaskDeliveryMode::None).await;
+        fixture
+            .install_historical_grants(&[&fixture.execution.id])
+            .await;
+        let processor = &fixture.processor;
+        let before = pioneer_entity::agent_execution::Entity::find()
+            .count(&processor.crud_store.database_connection())
+            .await
+            .unwrap();
+        let executor = TaskAgentExecutor::new();
+        executor.bind(Arc::downgrade(processor));
+        let handle = TaskExecutionHandle::new(
+            processor.crud_store.clone(),
+            processor.task_runtime.event_bus(),
+            fixture.response.task.id.clone(),
+            fixture.run.id.clone(),
+        );
+        let error = executor
+            .start_run(
+                TaskExecutionContext {
+                    workspace_id: fixture.response.task.workspace_id.clone(),
+                    task_id: fixture.response.task.id.clone(),
+                    execution_id: Some(fixture.execution.id.clone()),
+                    worker_id: "historical-start".into(),
+                },
+                fixture.run.clone(),
+                handle,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("InvalidProfile"), "{error:#}");
+        assert_eq!(
+            pioneer_entity::agent_execution::Entity::find()
+                .count(&processor.crud_store.database_connection())
+                .await
+                .unwrap(),
+            before
+        );
+        fixture.assert_no_provider_requests();
+    }
+
+    #[tokio::test]
+    async fn historical_reviewer_recovery_with_an_existing_in_progress_turn_remains_execution() {
+        use crate::message::tests::task_launch_continuity::historical_task_fixture;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, PaginatorTrait, Set};
+        let fixture = historical_task_fixture(pioneer_protocol::TaskDeliveryMode::None).await;
+        let processor = &fixture.processor;
+        let db = processor.crud_store.database_connection();
+        let mut response = fixture.response.clone();
+        let reviewer = TaskResultReviewerSpec {
+            reviewer_kind: TaskResultReviewerKind::ReviewAgent,
+            agent_nickname: Some(fixture.facts.identity.nickname.clone()),
+            agent_role: Some("agent_reviewer".into()),
+            required: true,
+            weight: None,
+        };
+        let policy = TaskAgentReviewPolicy {
+            mode: pioneer_protocol::TaskAgentReviewMode::ParentAgentWithReviewers, max_revision_rounds: 1,
+            require_explicit_acceptance: true, reviewers: vec![reviewer.clone()],
+            resolution_strategy: pioneer_protocol::TaskResultReviewResolutionStrategy::RequireAllRequiredReviewersThenParent,
+        };
+        response.agent_specs[0].review_policy = Some(policy.clone());
+        let mut spec_row =
+            pioneer_entity::task_agent_spec::Entity::find_by_id(&response.agent_specs[0].id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active_model();
+        spec_row.review_policy_json = Set(Some(serde_json::to_string(&policy).unwrap()));
+        spec_row.update(&db).await.unwrap();
+        let parent = resolve_parent_context(processor, &response.task)
+            .await
+            .unwrap();
+        let now = now_timestamp_secs();
+        let handle = TaskExecutionHandle::new(
+            processor.crud_store.clone(),
+            processor.task_runtime.event_bus(),
+            response.task.id.clone(),
+            fixture.run.id.clone(),
+        );
+        handle.mark_started(now).await.unwrap();
+        let mut candidate_turn = initial_task_run_turn_from_execution(
+            &response.task,
+            &fixture.run,
+            &fixture.execution,
+            now,
+        );
+        handle
+            .link_child_thread_with_runtime(
+                lineage_from_task_run_turn(
+                    &response.task,
+                    &fixture.run,
+                    &response.agent_specs[0],
+                    &parent,
+                    &candidate_turn,
+                    now,
+                ),
+                task_run_primary_binding_from_turn(
+                    &response.task,
+                    &fixture.run,
+                    &fixture.execution,
+                    &candidate_turn,
+                    now,
+                ),
+                candidate_turn.clone(),
+                now,
+            )
+            .await
+            .unwrap();
+        let mut candidate_thread = processor
+            .crud_store
+            .get_thread_model("continuity-root")
+            .await
+            .unwrap()
+            .unwrap();
+        candidate_thread.id = candidate_turn.thread_id.clone();
+        candidate_thread.turns.clear();
+        candidate_thread.origin_kind = ThreadOriginKind::TaskRun;
+        candidate_thread.sidebar_visibility = ThreadSidebarVisibility::Hidden;
+        let mut source_turn = Turn {
+            id: candidate_turn.turn_id.clone(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::TaskRun,
+            origin: TurnOrigin::DetachedTask,
+            mode: Default::default(),
+            author: Some(
+                exact_agent_execution_author(processor, &fixture.execution.id)
+                    .await
+                    .unwrap(),
+            ),
+            reply_to_turn_id: None,
+            mentions: vec![],
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        processor
+            .crud_store
+            .materialize_turn_start(
+                &candidate_thread,
+                pioneer_protocol::SandboxMode::FullAccess,
+                &source_turn,
+                &[],
+                source_turn.author.as_ref().unwrap().actor.clone(),
+            )
+            .await
+            .unwrap();
+        processor
+            .crud_store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: response.task.workspace_id.clone(),
+                    thread_id: candidate_turn.thread_id.clone(),
+                    turn_id: candidate_turn.turn_id.clone(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: "saved-review-candidate".into(),
+                        text: "already saved candidate".into(),
+                        markdown: None,
+                        markdown_version: None,
+                        phase: Default::default(),
+                    },
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        source_turn.status = TurnStatus::Completed;
+        processor
+            .crud_store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: response.task.workspace_id.clone(),
+                    thread_id: candidate_turn.thread_id.clone(),
+                    turn: source_turn,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        candidate_turn.status = TaskRunTurnStatus::CandidateCreated;
+        candidate_turn.completed_at = Some(now);
+        let candidate = TaskResultCandidate {
+            id: canonical_agent_id('C', "historical-review-candidate"),
+            task_id: response.task.id.clone(),
+            run_id: fixture.run.id.clone(),
+            task_run_turn_id: candidate_turn.id.clone(),
+            thread_id: candidate_turn.thread_id.clone(),
+            turn_id: candidate_turn.turn_id.clone(),
+            round: 0,
+            status: TaskResultCandidateStatus::PendingReview,
+            result: Some(TaskResult {
+                summary: Some("already saved candidate".into()),
+                data: None,
+                artifacts: vec![],
+                completed_by_run_id: Some(fixture.run.id.clone()),
+            }),
+            extraction_error: None,
+            summary: Some("already saved candidate".into()),
+            diagnostics: vec![],
+            final_review_event_id: None,
+            created_at: now,
+            updated_at: now,
+            resolved_at: None,
+        };
+        handle
+            .record_pending_review_result_candidate(candidate_turn, candidate.clone(), now)
+            .await
+            .unwrap();
+        let key = task_result_reviewer_spec_key(0, &reviewer);
+        let reviewer_context = processor
+            .task_runtime
+            .service()
+            .create_task_result_reviewer_context(CreateTaskResultReviewerContextParams {
+                candidate_id: candidate.id.clone(),
+                reviewer_index: 0,
+                reviewer_spec: reviewer.clone(),
+                reviewer_thread_id: stable_review_thread_id(&candidate.id, &key),
+                reviewer_turn_id: stable_review_turn_id(&candidate.id, &key),
+                created_at: Some(now),
+            })
+            .await
+            .unwrap();
+        let review_turn = reviewer_context.task_run_turn;
+        let review_execution_id = review_turn.execution_id.as_deref().unwrap();
+        let (candidate_adapter, _, _) = materialize_task_agent_action_binding_for_execution(
+            processor,
+            &response.task,
+            &response.agent_specs[0],
+            &fixture.execution.id,
+            &fixture.run.id,
+            &fixture.facts.home_root_thread_id,
+            processor.current_authorization_revision().await.unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        let (adapter, _, _) = crate::authorization::materialize_selected_task_agent_action_binding(
+            AgentExecutionId::new(review_execution_id.to_owned()).unwrap(),
+            &fixture.facts.home_root_thread_id,
+            fixture.facts.root_execution_id.clone(),
+            &format!("{}:reviewer:{key}", response.agent_specs[0].id),
+            fixture.facts.identity.clone(),
+            fixture.facts.profile.clone(),
+            fixture.facts.execution_generation,
+            1,
+            response.agent_specs[0].depth as u16,
+            "agent_reviewer",
+            processor.current_authorization_revision().await.unwrap(),
+            &candidate_adapter,
+        )
+        .unwrap();
+        let facts = adapter.persistence_facts();
+        let (authorization, _, _) = resolve_task_child_execution_authorization_context(
+            processor,
+            &response.task,
+            &parent,
+            &facts.profile.provider_id,
+            &facts.profile.model_id,
+            Some(&AgentExecutionBackend::ApiProvider {
+                provider: facts.profile.provider_id.clone(),
+            }),
+            &[],
+            &pioneer_protocol::task_permission_cap_snapshot(
+                response.agent_specs[0].permission_cap.as_ref().unwrap(),
+            ),
+            &review_turn.turn_id,
+            &fixture.run.id,
+            review_execution_id,
+        )
+        .await
+        .unwrap();
+        persist_task_reviewer_execution_graph(
+            processor,
+            &response,
+            &fixture.run,
+            &key,
+            &parent,
+            &facts,
+            &authorization.context.authorization_fingerprint().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut thread = processor
+            .crud_store
+            .get_thread_model("continuity-root")
+            .await
+            .unwrap()
+            .unwrap();
+        thread.id = review_turn.thread_id.clone();
+        thread.turns.clear();
+        thread.origin_kind = ThreadOriginKind::TaskRun;
+        thread.sidebar_visibility = ThreadSidebarVisibility::Hidden;
+        let turn = Turn {
+            id: review_turn.turn_id.clone(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::TaskRun,
+            origin: TurnOrigin::DetachedTask,
+            mode: Default::default(),
+            author: Some(
+                exact_agent_execution_author(processor, review_execution_id)
+                    .await
+                    .unwrap(),
+            ),
+            reply_to_turn_id: None,
+            mentions: vec![],
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        processor
+            .crud_store
+            .materialize_turn_start(
+                &thread,
+                pioneer_protocol::SandboxMode::FullAccess,
+                &turn,
+                &[],
+                turn.author.as_ref().unwrap().actor.clone(),
+            )
+            .await
+            .unwrap();
+        let actor_before =
+            pioneer_entity::task_actor_contract::Entity::find_by_id(&response.task.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+        fixture
+            .install_historical_grants(&[&fixture.execution.id, review_execution_id])
+            .await;
+        let count = pioneer_entity::agent_execution::Entity::find()
+            .count(&db)
+            .await
+            .unwrap();
+        let executor = TaskAgentExecutor::new();
+        executor.bind(Arc::downgrade(processor));
+        // Both the Task and execution gates matter. With the current Task
+        // restored, the same real recovery caller must still reject the old
+        // reviewer grant. existing_turn.is_some() passes true in both cases.
+        for restore_current_task in [false, true] {
+            if restore_current_task {
+                actor_before
+                    .clone()
+                    .into_active_model()
+                    .reset_all()
+                    .update(&db)
+                    .await
+                    .unwrap();
+            }
+            let error = executor
+                .dispatch_or_recover_reviewer_turn(
+                    processor,
+                    &response,
+                    &response.agent_specs[0],
+                    &policy,
+                    &candidate,
+                    0,
+                    &reviewer,
+                    review_turn.clone(),
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("InvalidProfile"), "{error:#}");
+            assert_eq!(
+                processor
+                    .crud_store
+                    .get_turn(&review_turn.thread_id, &review_turn.turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .status,
+                TurnStatus::InProgress
+            );
+            assert!(
+                processor
+                    .agent_action_binding(&review_turn.turn_id)
+                    .await
+                    .is_none()
+            );
+            fixture.assert_no_provider_requests();
+        }
+        assert_eq!(
+            pioneer_entity::agent_execution::Entity::find()
+                .count(&db)
+                .await
+                .unwrap(),
+            count
+        );
     }
 }

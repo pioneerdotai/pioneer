@@ -390,11 +390,46 @@ impl AuthorityBoundProvider {
             .expect("discovery reasoning lock") = models
             .iter()
             .filter_map(|m| {
-                m.capabilities
+                let mut facts = m
+                    .capabilities
                     .reasoning
                     .as_ref()
-                    .filter(|r| !r.native.is_empty())
-                    .map(|r| (m.id.clone(), r.native.clone()))
+                    .map(|r| r.native.clone())
+                    .unwrap_or_default();
+                let raw_facts_present = !facts.is_empty();
+                if let Some(reasoning) = m
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .filter(|_| !raw_facts_present)
+                {
+                    if let Some(supported) = reasoning.supported {
+                        facts
+                            .entry("reasoning.supported".into())
+                            .or_insert(Some(supported));
+                    }
+                    // Adapters with a raw map keep that evidence verbatim.
+                    // DTO-only discovery is normalized before enrichment.
+                    if reasoning.native.is_empty() && !reasoning.effort_options.is_empty() {
+                        facts.insert("effort.enum".into(), Some(true));
+                    }
+                    if !reasoning.effort_options.is_empty() {
+                        for effort in &reasoning.effort_options {
+                            facts
+                                .entry(format!("effort.{effort}"))
+                                .or_insert(Some(true));
+                        }
+                    }
+                    if let Some(mandatory) = reasoning.mandatory {
+                        facts.entry("mandatory".into()).or_insert(Some(mandatory));
+                    }
+                }
+                if let Some(thinking) = m.capabilities.thinking.filter(|_| !raw_facts_present) {
+                    facts
+                        .entry("thinking.supported".into())
+                        .or_insert(Some(thinking));
+                }
+                (!facts.is_empty()).then(|| (m.id.clone(), facts))
             })
             .collect();
     }
@@ -625,7 +660,36 @@ impl Provider for AuthorityBoundProvider {
 
     async fn model_limits(&self, model: &str) -> Result<crate::catalog::CatalogLimits> {
         self.ensure_not_revoked()?;
-        self.public_result(self.inner.model_limits(model).await)
+        let discovery = self.input_admission.model(model);
+        let result = match self.inner.model_limits(model).await {
+            Err(error) if error.is::<crate::catalog::ModelCatalogUnavailable>() => {
+                // A known native context can form this budget without the
+                // unavailable fallback. Keep all other unknown fields unknown.
+                // Match the typed local error before endpoint redaction.
+                discovery
+                    .as_ref()
+                    .and_then(|model| {
+                        Some(crate::catalog::CatalogLimits {
+                            context_window: model.limits.context_window?,
+                            context_origin: crate::catalog::OriginKind::Source,
+                            max_input: model.limits.max_input_tokens,
+                            max_output: model.limits.max_output_tokens,
+                        })
+                    })
+                    .ok_or(error)
+            }
+            result => result,
+        };
+        let mut limits = self.public_result(result)?;
+        if let Some(model) = discovery {
+            if let Some(context) = model.limits.context_window {
+                limits.context_window = context;
+                limits.context_origin = crate::catalog::OriginKind::Source;
+            }
+            limits.max_input = model.limits.max_input_tokens.or(limits.max_input);
+            limits.max_output = model.limits.max_output_tokens.or(limits.max_output);
+        }
+        Ok(limits)
     }
     fn model_catalog_entry(&self, model: &str) -> Option<crate::catalog::CatalogModel> {
         if self.ensure_not_revoked().is_err() {
@@ -1673,6 +1737,7 @@ mod tests {
         discovery: String,
         catalog: Arc<crate::catalog::ModelCatalog>,
         bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        limits_error: Option<fn() -> anyhow::Error>,
     }
     #[async_trait]
     impl Provider for RouterReasoningFixture {
@@ -1684,6 +1749,12 @@ mod tests {
         }
         async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
             Ok(crate::providers::openrouter::models_from_native_discovery_fixture(&self.discovery))
+        }
+        async fn model_limits(&self, model: &str) -> Result<crate::catalog::CatalogLimits> {
+            if let Some(error) = self.limits_error {
+                return Err(error());
+            }
+            Ok(self.catalog.limits(self.name(), model))
         }
         async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
             let body = crate::providers::openrouter::render_chat_request_mode_for_test(
@@ -1719,9 +1790,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authority_budget_limits_preserve_raw_discovery_over_catalog() {
+        let id = "openai/gpt-5.4";
+        let catalog = Arc::new(crate::generation::test_catalog_model(
+            "openrouter",
+            id,
+            id,
+            serde_json::json!({"contextWindow":32000,"maxTokens":4000}),
+        ));
+        let mut wrapper = AuthorityBoundProvider {
+            inner: Arc::new(RouterReasoningFixture {
+                discovery: serde_json::json!({"data":[{
+                    "id":id,"context_length":64000,"max_completion_tokens":8000
+                }]})
+                .to_string(),
+                catalog: catalog.clone(),
+                bodies: Arc::new(Default::default()),
+                limits_error: None,
+            }),
+            authority_fingerprint: ProviderAuthorityFingerprint("limit-facts-fixture".into()),
+            revoked: Arc::new(AtomicBool::new(false)),
+            redact_endpoint_errors: false,
+            input_admission: Arc::new(Default::default()),
+            use_public_catalog: true,
+            discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
+        };
+        let mut models = wrapper.inner.list_models().await.unwrap();
+        wrapper.enrich_discovery(&catalog, &mut models);
+        let limits = wrapper.model_limits(id).await.unwrap();
+        assert_eq!(limits.context_window, 64000);
+        assert_eq!(limits.max_input, Some(64000));
+        assert_eq!(limits.max_output, Some(8000));
+        let mut request = chat_request();
+        request.model = id.into();
+        request.max_tokens = Some(6000);
+        crate::attachments::admission::scope(wrapper.input_admission.clone(), async {
+            assert!(
+                crate::generation::validate_cap_with_catalog(
+                    Some(&catalog),
+                    "openrouter",
+                    &request
+                )
+                .is_ok()
+            );
+            request.max_tokens = Some(9000);
+            assert!(
+                crate::generation::validate_cap_with_catalog(
+                    Some(&catalog),
+                    "openrouter",
+                    &request
+                )
+                .is_err()
+            );
+        })
+        .await;
+        // A defined zero limit is not a missing field or a free fallback.
+        let mut raw = wrapper.input_admission.model(id).unwrap();
+        raw.limits.max_output_tokens = Some(0);
+        wrapper.input_admission.replace_discovery(vec![raw]);
+        assert_eq!(wrapper.model_limits(id).await.unwrap().max_output, Some(0));
+        request.max_tokens = None;
+        crate::attachments::admission::scope(wrapper.input_admission.clone(), async {
+            assert!(
+                crate::generation::required_cap_with_catalog(
+                    Some(&catalog),
+                    "openrouter",
+                    &request,
+                    1024
+                )
+                .is_err()
+            );
+        })
+        .await;
+
+        let failures: [(fn() -> anyhow::Error, bool); 2] = [
+            (|| crate::catalog::ModelCatalogUnavailable.into(), true),
+            (
+                || {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "sensitive fixture provider auth failure",
+                    )
+                    .into()
+                },
+                false,
+            ),
+        ];
+        for (failure, unavailable_catalog) in failures {
+            wrapper.inner = Arc::new(RouterReasoningFixture {
+                discovery: String::new(),
+                catalog: catalog.clone(),
+                bodies: Arc::new(Default::default()),
+                limits_error: Some(failure),
+            });
+            for redact in [false, true] {
+                wrapper.redact_endpoint_errors = redact;
+                for (context, input, output) in [
+                    (Some(64000), Some(24000), Some(8000)),
+                    (Some(64000), None, Some(0)),
+                    (Some(64000), Some(24000), None),
+                    (None, Some(24000), Some(8000)),
+                ] {
+                    let mut raw = wrapper.input_admission.model(id).unwrap();
+                    raw.limits = pioneer_protocol::ProviderModelLimits {
+                        context_window: context,
+                        max_input_tokens: input,
+                        max_output_tokens: output,
+                    };
+                    // Same raw snapshot boundary used when list_models cannot
+                    // enrich discovery because the catalog is unavailable.
+                    wrapper.remember_discovery(&[raw]);
+                    let result = wrapper.model_limits(id).await;
+                    if unavailable_catalog && context.is_some() {
+                        assert_eq!(
+                            result.unwrap(),
+                            crate::catalog::CatalogLimits {
+                                context_window: 64000,
+                                context_origin: crate::catalog::OriginKind::Source,
+                                max_input: input,
+                                max_output: output,
+                            }
+                        );
+                    } else {
+                        let error = result.unwrap_err();
+                        if unavailable_catalog {
+                            assert!(error.is::<crate::catalog::ModelCatalogUnavailable>());
+                        } else if redact {
+                            assert!(error.is::<RedactedEndpointError>());
+                            assert!(!format!("{error:#}").contains("sensitive"));
+                        } else {
+                            assert!(error.is::<std::io::Error>());
+                        }
+                    }
+                }
+            }
+        }
+        wrapper.revoked.store(true, Ordering::Release);
+        assert!(
+            wrapper
+                .model_limits(id)
+                .await
+                .unwrap_err()
+                .is::<ProviderAuthorityRevoked>()
+        );
+    }
+
+    #[tokio::test]
     async fn router_native_fields_survive_catalog_conflicts_and_actual_authority_requests() {
         use crate::{ReasoningConfig, ReasoningEffort};
-        let id = "openai/gpt-5.4";
+        let id = "aurora/router-special-983";
         // Each case has a distinct real authority instance/cache. These facts
         // enter through the production parser, never with_native_reasoning.
         for (metadata, expected, supported, mandatory, default, budget) in [
@@ -1758,11 +1976,11 @@ mod tests {
                 None,
                 None,
             ),
-            // Documented omission within the object denies effort selection,
-            // but does not turn budget support or a default into effort support.
+            // Missing effort metadata permits catalog fallback; budget/default
+            // facts alone still do not establish native effort support.
             (
                 serde_json::json!({"default_effort":"high","supports_max_tokens":true}),
-                vec![],
+                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"],
                 Some(true),
                 Some(false),
                 Some("high"),
@@ -1803,7 +2021,7 @@ mod tests {
             let catalog = Arc::new(crate::generation::test_catalog_model(
                 "openrouter",
                 id,
-                id,
+                "openai/gpt-5.4",
                 catalog_metadata,
             ));
             let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1813,6 +2031,7 @@ mod tests {
                         .to_string(),
                     catalog: catalog.clone(),
                     bodies: bodies.clone(),
+                    limits_error: None,
                 }),
                 authority_fingerprint: ProviderAuthorityFingerprint(
                     "router-reasoning-fixture".into(),
@@ -1898,7 +2117,10 @@ mod tests {
                         }
                     } else {
                         let error = result.unwrap_err().to_string();
-                        assert!(error.contains("native OpenRouter"), "{error}");
+                        assert!(
+                            error.contains("reasoning") || error.contains("effort"),
+                            "{error}"
+                        );
                     }
                 }
             }
@@ -1908,11 +2130,11 @@ mod tests {
     #[tokio::test]
     async fn router_budget_support_is_independent_of_effort_selection_and_catalog() {
         use crate::{ReasoningConfig, ReasoningEffort};
-        let id = "openai/gpt-5.4";
+        let id = "aurora/router-budget-984";
         for (enum_case, enum_value) in [
             ("empty", serde_json::json!([])),
             ("omitted", serde_json::Value::Null),
-            ("gateway", serde_json::Value::Null),
+            ("null", serde_json::Value::Null),
             ("malformed", serde_json::json!([null])),
         ] {
             for budget in [
@@ -1936,7 +2158,7 @@ mod tests {
                         let catalog = Arc::new(crate::generation::test_catalog_model(
                             "openrouter",
                             id,
-                            id,
+                            "openai/gpt-5.4",
                             serde_json::json!({"reasoning":catalog_support,"thinkingLevelMap":{"off":"none","low":"low","high":"high"}}),
                         ));
                         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1947,6 +2169,7 @@ mod tests {
                                         .to_string(),
                                 catalog: catalog.clone(),
                                 bodies: bodies.clone(),
+                                limits_error: None,
                             }),
                             authority_fingerprint: ProviderAuthorityFingerprint(
                                 "router-budget-fixture".into(),
@@ -1964,7 +2187,7 @@ mod tests {
                             budget.as_ref().and_then(serde_json::Value::as_bool) == Some(true);
                         let native_support = if aggregate_negative {
                             Some(false)
-                        } else if positive_budget || enum_case == "gateway" {
+                        } else if positive_budget {
                             Some(true)
                         } else {
                             None
@@ -1997,13 +2220,13 @@ mod tests {
                             budget.as_ref().map(serde_json::Value::as_bool)
                         );
                         let effort_allowed = !aggregate_negative
-                            && (enum_case == "gateway"
-                                || enum_case == "malformed" && catalog_support);
+                            && matches!(enum_case, "omitted" | "null" | "malformed")
+                            && (catalog_support || positive_budget);
                         assert_eq!(
                             effective.effort_options.iter().any(|e| e == "high"),
                             effort_allowed
                         );
-                        if matches!(enum_case, "empty" | "omitted") || aggregate_negative {
+                        if enum_case == "empty" || aggregate_negative {
                             assert!(effective.effort_options.is_empty());
                         }
                         for setting in [
@@ -2037,10 +2260,7 @@ mod tests {
                                 } else {
                                     let error = result.unwrap_err().to_string();
                                     assert!(
-                                        error.contains("native OpenRouter")
-                                            || error.contains(
-                                                "selected catalog model does not support reasoning"
-                                            ),
+                                        error.contains("reasoning") || error.contains("effort"),
                                         "{error}"
                                     );
                                 }

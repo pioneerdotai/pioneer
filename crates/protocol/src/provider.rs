@@ -94,7 +94,6 @@ pub struct ProviderModelLimits {
 pub enum ReasoningCapabilitySource {
     ProviderMetadata,
     CliMetadata,
-    StaticRegistry,
     ConfigOverride,
     Unknown,
 }
