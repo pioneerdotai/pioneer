@@ -4706,7 +4706,7 @@ impl Provider for PromptParityCaptureProvider {
                     default_effort: Some("medium".to_owned()),
                     mandatory: Some(false),
                     supports_token_budget: None,
-                    source: Some(pioneer_protocol::ReasoningCapabilitySource::StaticRegistry),
+                    source: Some(pioneer_protocol::ReasoningCapabilitySource::ProviderMetadata),
                 }),
                 ..pioneer_protocol::ProviderModelCapabilities::default()
             },
@@ -85322,9 +85322,10 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
     let mut enabled_budget = None;
     let mut enabled_reserve = None;
     for (effort, reasoning, thinking) in [
-        // V4's server default enables thinking; only explicit off keeps this
-        // completed non-thinking tool round native instead of portable.
-        (None, None, true),
+        // Without confirmed default metadata or reasoning in history, omission
+        // keeps the completed non-thinking tool round native. Explicit high
+        // still exercises portable history and the compaction token boundary.
+        (None, None, false),
         (Some("none"), Some(ReasoningConfig::Disabled), false),
         (
             Some("high"),

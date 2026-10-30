@@ -12382,7 +12382,6 @@ fn reasoning_capability_source_label(source: Option<ReasoningCapabilitySource>) 
     match source {
         Some(ReasoningCapabilitySource::ProviderMetadata) => "provider_metadata",
         Some(ReasoningCapabilitySource::CliMetadata) => "cli_metadata",
-        Some(ReasoningCapabilitySource::StaticRegistry) => "static_registry",
         Some(ReasoningCapabilitySource::ConfigOverride) => "config_override",
         Some(ReasoningCapabilitySource::Unknown) | None => "unknown",
     }
@@ -12479,7 +12478,7 @@ fn resolve_reasoning_effort_for_model(
         ));
     }
 
-    if reasoning.effort_options.is_empty() {
+    if reasoning.supported.is_none() || reasoning.effort_options.is_empty() {
         return Err(format!(
             "reasoning effort `{effort}` cannot be used with {backend_label} model `{model_id}` because supported reasoning efforts are unknown; capability source: {capability_source}"
         ));
@@ -13127,144 +13126,76 @@ mod tests {
     }
 
     #[test]
-    fn documented_claude_off_survives_catalog_selector_and_admission() {
+    fn catalog_reasoning_choices_survive_wire_selector_and_admission() {
         use pioneer_provider::catalog::ModelCatalog;
-        for (provider, key, id, template, optional) in [
+
+        // An arbitrary ID exercises data-driven support without a model-family rule.
+        let id = "aurora-unlisted-927";
+        let catalog = ModelCatalog::parse(
+            &serde_json::json!({"openai":{(id):{
+                "id":id, "name":"Aurora", "provider":"openai",
+                "api":"openai-responses", "baseUrl":"https://api.openai.com/v1",
+                "contextWindow":32000, "maxTokens":4000, "reasoning":true,
+                "input":["text"], "cost":{"input":2.0,"output":8.0},
+                "thinkingLevelMap":{"low":"low","high":"high"}
+            }}}).to_string(),
+            &serde_json::json!({"openai":{(id):{
+                "contextWindow":{"kind":"source","expression":"provider context"},
+                "maxTokens":{"kind":"source","expression":"provider output"},
+                "inputLimit":{"value":24000,"origin":{"kind":"source","expression":"provider input"}}
+            }}}).to_string(),
+        ).unwrap();
+
+        for (case, model_id, native, expected) in [
+            ("catalog fallback", id, None, vec!["low", "high"]),
             (
-                "anthropic",
-                "anthropic",
-                "claude-opus-4-5-20251101",
-                "claude-opus-4-5",
-                true,
+                "provider enum wins",
+                id,
+                Some(reasoning_capabilities(Some(true), &["medium"])),
+                vec!["medium"],
             ),
             (
-                "anthropic",
-                "anthropic",
-                "claude-opus-4-6",
-                "claude-opus-4-6",
-                true,
+                "provider denial wins",
+                id,
+                Some(reasoning_capabilities(Some(false), &["high"])),
+                vec![],
             ),
-            (
-                "anthropic",
-                "anthropic",
-                "claude-sonnet-5",
-                "claude-opus-4-6",
-                true,
-            ),
-            (
-                "anthropic",
-                "anthropic",
-                "claude-opus-5",
-                "claude-opus-4-6",
-                true,
-            ),
-            (
-                "anthropic",
-                "anthropic",
-                "claude-fable-5-1",
-                "claude-opus-4-6",
-                false,
-            ),
-            (
-                "anthropic",
-                "anthropic",
-                "claude-sonnet-5-5",
-                "claude-opus-4-6",
-                false,
-            ),
-            (
-                "bedrock",
-                "amazon-bedrock",
-                "us.anthropic.claude-opus-4-6-v1",
-                "anthropic.claude-opus-4-6-v1",
-                true,
-            ),
-            (
-                "bedrock",
-                "amazon-bedrock",
-                "anthropic.claude-opus-4-5-20251101-v1:0",
-                "anthropic.claude-opus-4-6-v1",
-                true,
-            ),
-            (
-                "bedrock",
-                "amazon-bedrock",
-                "anthropic.claude-fable-5",
-                "anthropic.claude-opus-4-6-v1",
-                false,
-            ),
+            ("unknown model", "another-unlisted-928", None, vec![]),
         ] {
-            for kind in [
-                "saved",
-                "missing",
-                "partial",
-                "catalog-veto",
-                "native-veto",
-                "capability-veto",
-            ] {
-                let mut models: serde_json::Value = serde_json::from_str(include_str!(
-                    "../../../provider/tests/fixtures/catalog/models.json"
-                ))
-                .unwrap();
-                let mut provenance: serde_json::Value = serde_json::from_str(include_str!(
-                    "../../../provider/tests/fixtures/catalog/provenance.json"
-                ))
-                .unwrap();
-                if kind == "missing" {
-                    models[key].as_object_mut().unwrap().remove(id);
-                } else if kind != "saved" {
-                    let mut entry = models[key][template].clone();
-                    assert!(entry.get("api").is_some());
-                    entry["id"] = serde_json::json!(id);
-                    entry["thinkingLevelMap"] = if kind == "catalog-veto" {
-                        serde_json::json!({"off":null})
-                    } else {
-                        serde_json::json!({"max":"max"})
-                    };
-                    if kind == "capability-veto" {
-                        entry["reasoning"] = serde_json::json!(false);
-                    }
-                    models[key][id] = entry;
-                    provenance[key][id] = provenance[key][template].clone();
-                }
-                // Saved profiles can explicitly veto off too (Opus 5 has
-                // off:null). A documented optional mode only fills missing
-                // metadata; it cannot override that catalog denial.
-                let catalog_off_veto = models[key][id]["reasoning"] == false
-                    || models[key][id]
-                        .get("thinkingLevelMap")
-                        .and_then(|map| map.get("off"))
-                        .is_some_and(serde_json::Value::is_null);
-                let catalog =
-                    ModelCatalog::parse(&models.to_string(), &provenance.to_string()).unwrap();
-                let mut model = reasoning_test_model(None);
-                model.id = id.into();
-                model.provider = provider.into();
-                if kind == "native-veto" {
-                    model.capabilities.reasoning = Some(ProviderModelReasoningCapabilities {
-                        native: [("thinking.types.disabled".into(), Some(false))]
-                            .into_iter()
-                            .collect(),
-                        ..Default::default()
-                    });
-                }
-                catalog.enrich(provider, std::slice::from_mut(&mut model));
-                let rows = pioneer_client::providers::presentation::reasoning_effort_rows_for_model(
-                    &model, None,
-                );
-                let off_allowed = optional && !catalog_off_veto && kind != "native-veto";
-                assert_eq!(
-                    rows.iter().any(|r| r.effort == "none"),
-                    off_allowed,
-                    "{provider}/{id}/{kind}"
+            let mut discovered = reasoning_test_model(native);
+            discovered.id = model_id.into();
+            discovered.provider = "openai".into();
+            catalog.enrich("openai", std::slice::from_mut(&mut discovered));
+            // UI and admission must agree on the serialized public facts, without
+            // depending on discovery-only native metadata or a source registry.
+            let model: ProviderModelInfo =
+                serde_json::from_value(serde_json::to_value(discovered).unwrap()).unwrap();
+            let rows = pioneer_client::providers::presentation::reasoning_effort_rows_for_model(
+                &model,
+                Some("high"),
+            );
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.effort.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{case}"
+            );
+            for effort in ["none", "low", "medium", "high"] {
+                let accepted = resolve_reasoning_effort_for_model(
+                    ReasoningEffortValidationPolicy::KnownOnly,
+                    "provider `openai`",
+                    model_id,
+                    effort,
+                    Some(&model),
                 );
                 assert_eq!(
-                    validate_reasoning_effort_for_model(provider, id, "none", Some(&model)).is_ok(),
-                    off_allowed
+                    accepted.is_ok(),
+                    expected.contains(&effort),
+                    "{case}/{effort}"
                 );
-                for row in rows {
-                    validate_reasoning_effort_for_model(provider, id, &row.effort, Some(&model))
-                        .unwrap();
+                if expected.contains(&effort) {
+                    assert_eq!(accepted.unwrap(), effort, "{case}");
                 }
             }
         }
@@ -13284,7 +13215,7 @@ mod tests {
             default_effort: None,
             mandatory: None,
             supports_token_budget: None,
-            source: Some(ReasoningCapabilitySource::StaticRegistry),
+            source: Some(ReasoningCapabilitySource::ProviderMetadata),
         }
     }
 
@@ -13445,6 +13376,17 @@ mod tests {
                 "model-a",
                 "high",
                 Some(reasoning_test_model(Some(reasoning_capabilities(
+                    None,
+                    &["high"],
+                )))),
+                "unconfirmed support should reject an advertised effort",
+                "supported reasoning efforts are unknown",
+            ),
+            (
+                "provider `openai`",
+                "model-a",
+                "high",
+                Some(reasoning_test_model(Some(reasoning_capabilities(
                     Some(false),
                     &["low", "high"],
                 )))),
@@ -13491,7 +13433,7 @@ mod tests {
                 reasoning_test_model(Some(reasoning_capabilities(Some(true), &["low", "medium"]))),
                 "high",
                 "unsupported value should reject selected effort",
-                "reasoning effort `high` is not supported by provider `openai` model `model-a`; supported efforts: low, medium; capability source: static_registry",
+                "reasoning effort `high` is not supported by provider `openai` model `model-a`; supported efforts: low, medium; capability source: provider_metadata",
             ),
             (
                 model,
