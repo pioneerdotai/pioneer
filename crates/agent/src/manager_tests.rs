@@ -104,7 +104,7 @@ fn test_tool_loop_config_with_computer_use() -> ToolLoopConfig {
     config
 }
 
-fn test_tool_loop_config() -> ToolLoopConfig {
+pub(super) fn test_tool_loop_config() -> ToolLoopConfig {
     crate::chat::preflight::load_test_catalog();
     ToolLoopConfig {
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
