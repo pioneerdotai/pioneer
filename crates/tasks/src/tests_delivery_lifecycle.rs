@@ -1963,7 +1963,9 @@ async fn recovery_local_retry_insert_failure_first_source_candidate_still_repair
 
 #[tokio::test]
 async fn recovery_failed_bookkeeping_preserves_healthy_rows_and_uses_quantum_cooldown() {
-    let (runtime, poison, observer, _directory) = physical_recovery_fixture().await;
+    // Keep the large physical fixture and repeated recovery futures off the
+    // current-thread test runner's stack without changing its stack budget.
+    let (runtime, poison, observer, _directory) = Box::pin(physical_recovery_fixture()).await;
     let before = queue_delivery(&runtime).await;
     started(&runtime, &before.id, DELIVERY_TIME).await;
     let (_, missing) = started(&runtime, &poison.id, DELIVERY_TIME + 1).await;
@@ -1973,8 +1975,7 @@ async fn recovery_failed_bookkeeping_preserves_healthy_rows_and_uses_quantum_coo
     reject_retry_for(&runtime, &poison.id).await;
     let service = runtime.background_control_service();
     let clock_guard = pause_recovery_clock();
-    let report = service
-        .recover_stuck_deliveries(DELIVERY_TIME + 302, 64)
+    let report = Box::pin(service.recover_stuck_deliveries(DELIVERY_TIME + 302, 64))
         .await
         .unwrap();
     assert_eq!(
@@ -1997,8 +1998,7 @@ async fn recovery_failed_bookkeeping_preserves_healthy_rows_and_uses_quantum_coo
     assert!(source.attempt.is_none());
     assert_eq!(source.delivery.status, "delivering");
     observer.clear();
-    let skipped = service
-        .recover_stuck_deliveries(DELIVERY_TIME + 303, 64)
+    let skipped = Box::pin(service.recover_stuck_deliveries(DELIVERY_TIME + 303, 64))
         .await
         .unwrap();
     assert_eq!(skipped.selected, 0);
@@ -2009,8 +2009,7 @@ async fn recovery_failed_bookkeeping_preserves_healthy_rows_and_uses_quantum_coo
     assert!(observer.reads.lock().unwrap().is_empty());
     assert!(observer.writes.lock().unwrap().is_empty());
     tokio::time::advance(Duration::from_secs(5)).await;
-    let again = service
-        .recover_stuck_deliveries(DELIVERY_TIME + 307, 64)
+    let again = Box::pin(service.recover_stuck_deliveries(DELIVERY_TIME + 307, 64))
         .await
         .unwrap();
     assert_eq!((again.selected, again.failed, again.undurable), (1, 1, 1));
@@ -2019,8 +2018,7 @@ async fn recovery_failed_bookkeeping_preserves_healthy_rows_and_uses_quantum_coo
     observer.clear();
     tokio::time::advance(Duration::from_secs(9)).await;
     assert_eq!(
-        service
-            .recover_stuck_deliveries(DELIVERY_TIME + 316, 64)
+        Box::pin(service.recover_stuck_deliveries(DELIVERY_TIME + 316, 64))
             .await
             .unwrap()
             .selected,
