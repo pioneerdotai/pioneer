@@ -286,7 +286,7 @@ async fn blocked_ordinary_allows_exact_cancel_and_wait_without_reordering_binary
                 .unwrap();
             let ack = recv_response_by_id(&mut f.responses, &id("cancel")).await;
             assert_eq!(ack.result["turn"]["id"], TURN);
-            assert_eq!(ack.result["turn"]["status"], "completed");
+            assert_eq!(ack.result["turn"]["status"], "Completed");
             let next = rpc("short", methods::WORKSPACE_LIST, json!({}));
             input.send(Message::Text(next.clone().into())).unwrap();
             input.send(Message::Binary(vec![4, 5].into())).unwrap();
@@ -754,6 +754,14 @@ async fn durable_session_revocation_during_wait_is_not_hidden_by_original_princi
                 .col_expr(
                     pioneer_entity::auth_session::Column::Status,
                     Expr::value("revoked"),
+                )
+                .col_expr(
+                    pioneer_entity::auth_session::Column::RevokedAt,
+                    Expr::current_timestamp(),
+                )
+                .col_expr(
+                    pioneer_entity::auth_session::Column::RevokeReason,
+                    Expr::value("self_revoke"),
                 )
                 .filter(
                     pioneer_entity::auth_session::Column::Id
