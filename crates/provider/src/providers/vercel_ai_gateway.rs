@@ -116,6 +116,7 @@ impl VercelAiGatewayProvider {
             client.clone(),
             inputs,
         )
+        .with_gateway_caching()
         .with_provisional_messages(true);
         Self {
             adapter,
@@ -1404,8 +1405,149 @@ mod tests {
         assert_eq!(body["model"], "private/agent");
         assert_eq!(body["max_output_tokens"], 200);
         assert_eq!(body["temperature"], 0.5);
-        assert_eq!(body["store"], false);
+        assert_eq!(body["store"], true);
         assert!(body.get("reasoning").is_none());
+    }
+
+    #[tokio::test]
+    async fn automatic_caching_and_affinity_reach_both_wires_without_leaking_to_other_providers() {
+        use futures_util::StreamExt;
+        let replies = (0..9)
+            .map(|index| {
+                let response = json!({"id":format!("resp_gateway_cache_{index}"),"status":"completed",
+                    "output":[{"id":"message-fixture","type":"message","role":"assistant","phase":"final_answer",
+                        "content":[{"type":"output_text","text":"reply"}]}]});
+                let (kind, body) = if index == 1 {
+                    ("text/event-stream", format!("data: {}\n\n", json!({"type":"response.completed","response":response})))
+                } else {
+                    ("application/json", response.to_string())
+                };
+                format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            })
+            .collect();
+        let (root, server) = server_frames(replies).await;
+        for index in 0..9 {
+            // Reconstruct the provider between requests; identity belongs to
+            // the conversation, not a provider instance or latest response ID.
+            let provider = VercelAiGatewayProvider::with_base_url(
+                if index == 6 { "other-key" } else { "fixture" },
+                &root,
+            );
+            let models = ["private/agent", "private/other"].map(|id| {
+                json!({"id":id,"type":"language","tags":["tool-use"],
+                    "modalities":{"input":["text"],"output":["text"]},
+                    "context_window":16000,"max_tokens":1000,
+                    "model_eligibility":{"status":"eligible","evaluated_runtime":"http"}})
+            });
+            provider
+                .apply_snapshot(&json!({"data":models}), false)
+                .await
+                .unwrap();
+            let request = ChatRequest {
+                model: if index == 1 {
+                    "private/other"
+                } else {
+                    "private/agent"
+                }
+                .into(),
+                messages: vec![crate::ChatMessage::user("cache contract")],
+                temperature: None,
+                max_tokens: Some(100),
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            };
+            let operation = async {
+                if index == 7 {
+                    // Even the same name/URL does not opt the generic adapter
+                    // into a wrapper's gateway-specific policy.
+                    let plain = ResponsesApiCompatibleProvider::new(
+                        NAME,
+                        &root,
+                        "fixture",
+                        AuthStyle::Bearer,
+                    );
+                    assert_eq!(plain.chat(request).await.unwrap().text, "reply");
+                } else if index == 1 {
+                    let mut stream = provider.stream_chat(request).await.unwrap();
+                    while let Some(chunk) = stream.next().await {
+                        chunk.unwrap();
+                    }
+                } else {
+                    assert_eq!(provider.chat(request).await.unwrap().text, "reply");
+                }
+            };
+            let operation = crate::attachments::runtime::with_async_authority_scope(
+                provider.authority_fingerprint().unwrap().to_owned(),
+                operation,
+            );
+            if index == 8 {
+                // No trustworthy execution identity: use gateway fingerprinting
+                // rather than inventing one shared header for unrelated calls.
+                operation.await;
+            } else {
+                let workspace = if index == 4 {
+                    format!("{root}-other")
+                } else {
+                    root.clone()
+                };
+                let execution = format!("execution-{index}");
+                crate::prompt_cache::conversation_scope(
+                    workspace.clone(),
+                    if index == 2 {
+                        "attached-child"
+                    } else {
+                        "conversation"
+                    }
+                    .into(),
+                    crate::prompt_cache::scope(
+                        &workspace,
+                        &execution,
+                        if index == 3 { "preflight" } else { "main" },
+                        operation,
+                    ),
+                )
+                .await;
+            }
+        }
+        let mut keys = Vec::new();
+        for (index, request) in server.await.unwrap().into_iter().enumerate() {
+            assert!(request.starts_with("POST /v1/responses HTTP/1.1"));
+            let (head, body) = request.split_once("\r\n\r\n").unwrap();
+            let body: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                body.get("caching"),
+                (index != 7).then(|| json!("auto")).as_ref()
+            );
+            assert!(body.get("cache_ttl").is_none());
+            assert!(body.get("cache_anchor_items").is_none());
+            assert_eq!(body["input"][0]["content"][0]["text"], "cache contract");
+            let key = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("x-session-affinity")
+                    .then(|| value.trim().to_owned())
+            });
+            if index >= 7 {
+                assert!(key.is_none());
+            } else {
+                let key = key.as_ref().unwrap();
+                assert_eq!(key.len(), 64);
+                assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
+            }
+            keys.push(key);
+        }
+        assert_eq!(keys[0], keys[1]); // changed model + JSON -> SSE
+        assert_eq!(keys[0], keys[5]); // later execution and provider instance
+        assert_eq!(
+            [0, 2, 3, 4, 6]
+                .into_iter()
+                .map(|i| keys[i].as_ref().unwrap())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            5,
+        ); // owner, purpose, workspace and credential remain isolated
     }
 
     #[tokio::test]

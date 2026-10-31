@@ -6091,7 +6091,7 @@ mod tests {
                 Some(ProviderFailureClass::ContextTooLarge),
                 Some(403),
                 ProviderFailureClass::AuthOrPermission,
-                RecoveryAction::RefreshProviderAuth,
+                RecoveryAction::RetryWithBackoff,
             ),
             (
                 misleading,
@@ -6838,6 +6838,7 @@ mod tests {
 
     fn provider_failure(class: ProviderFailureClass, message: &str) -> ProviderFailureDetails {
         ProviderFailureDetails {
+            raw_response: None,
             error_reason: None,
             request_id: None,
             provider: "test-provider".to_owned(),

@@ -56,6 +56,13 @@ fn technical_system_event(item: &TurnItem, service_filter: bool) -> bool {
                 .and_then(serde_json::Value::as_str)
                 == Some("thread/tokenUsage/updated")
         }
+        Some("agent_runtime_item") if service_filter => {
+            details
+                .as_ref()
+                .and_then(|details| details.get("nativeItemKind"))
+                .and_then(serde_json::Value::as_str)
+                == Some("tokenUsage")
+        }
         _ => false,
     }
 }
@@ -96,6 +103,14 @@ fn system_event_text(item: &TurnItem) -> Option<String> {
 
 pub fn canonical_item_model_projection(item: &TurnItem) -> CanonicalEventModelProjection {
     item_model_projection(item, true)
+}
+
+/// Historical representation of an item already accepted into a frozen or
+/// compaction manifest. New execution/admission must use the current policy.
+pub fn canonical_item_model_projection_before_service_filter(
+    item: &TurnItem,
+) -> CanonicalEventModelProjection {
+    item_model_projection(item, false)
 }
 
 fn item_model_projection(item: &TurnItem, service_filter: bool) -> CanonicalEventModelProjection {
@@ -143,7 +158,8 @@ pub fn canonical_event_model_projection(
     event_model_projection(event, true)
 }
 
-/// Historical projection used only to authenticate frozen wire messages.
+/// Historical projection for authenticating frozen wire messages and reading
+/// sources already accepted into an immutable compaction manifest.
 pub fn canonical_event_model_projection_before_service_filter(
     event: &CanonicalTurnEventPayload,
 ) -> CanonicalEventModelProjection {
@@ -172,7 +188,24 @@ fn event_model_projection(
             TurnItem::AgentMessage { text, .. } if !text.trim().is_empty() => Projection::Default,
             _ => item_model_projection(&value.item, service_filter),
         },
-        Event::ItemRetryAttemptStarted(_) if service_filter => Projection::Omit,
+        // Retry scheduling/attempt bookkeeping is not a model action. The
+        // actual tool result (including its error) and interrupted-round
+        // projection carry the outcome. Keep exhausted/non-retryable states:
+        // those change what the model may do next.
+        Event::ItemRetryScheduled(_)
+        | Event::ItemRetryAttemptStarted(_)
+        | Event::ItemToolRetryScheduled(_)
+        | Event::ItemRecoverySucceeded(_)
+            if service_filter =>
+        {
+            Projection::Omit
+        }
+        Event::ItemToolRetryResolved(value)
+            if service_filter
+                && value.resolution == pioneer_protocol::ToolRetryResolution::Succeeded =>
+        {
+            Projection::Omit
+        }
         Event::TurnExecutionWindowStarted(_)
         | Event::TurnExecutionWindowCheckpointed(_)
         | Event::TurnExecutionWindowContinued(_) => Projection::Omit,
@@ -182,6 +215,14 @@ fn event_model_projection(
         )),
         Event::TurnExecutionWindowBlocked(value) => {
             Projection::User(format!("Historical execution blocked: {}", value.reason))
+        }
+        // Automatic allows are audit receipts, not live model input. Keep the
+        // old projection available when authenticating immutable manifests.
+        Event::TurnPermissionAudit(value)
+            if service_filter
+                && value.event_kind == TurnPermissionAuditEventKind::DecisionAllowed =>
+        {
+            Projection::Omit
         }
         Event::TurnPermissionAudit(value)
             if matches!(
@@ -582,6 +623,7 @@ mod tests {
 
     #[test]
     fn service_events_only_leave_the_current_model_projection() {
+        use CanonicalTurnEventPayload as Event;
         use pioneer_protocol::{
             ItemRetryAttemptStartedNotification, TurnCompletedNotification, TurnItemType,
         };
@@ -602,7 +644,54 @@ mod tests {
                 attempt_number: 2,
             },
         );
-        for event in [completed_turn, retry] {
+        let scheduled =
+            Event::ItemRetryScheduled(pioneer_protocol::ItemRetryScheduledNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item_id: "tool".into(),
+                item_type: TurnItemType::CommandExecution,
+                recovery_job_id: "recovery".into(),
+                attempt_number: 2,
+                next_run_at_unix: 1,
+                reason: Some("retry".into()),
+            });
+        let recovered =
+            Event::ItemRecoverySucceeded(pioneer_protocol::ItemRecoverySucceededNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item_id: "tool".into(),
+                item_type: TurnItemType::CommandExecution,
+                recovery_job_id: "recovery".into(),
+                attempt_number: 2,
+            });
+        let tool_scheduled =
+            Event::ItemToolRetryScheduled(pioneer_protocol::ItemToolRetryScheduledNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item_id: "tool".into(),
+                item_type: TurnItemType::CommandExecution,
+                tool_retry_episode_id: "episode".into(),
+                tool_name: "read_file".into(),
+                attempt_number: 2,
+                error_class: pioneer_protocol::ToolRetryErrorClass::NotFound,
+                retry_hint: "retry".into(),
+                budgets: vec![],
+                failure_signature_fingerprint: "fingerprint".into(),
+                reason: "retry".into(),
+            });
+        let mut allowed = permission(TurnPermissionAuditEventKind::DecisionAllowed);
+        allowed.decision = Some(TurnPermissionAuditDecision::Allow);
+        for event in [
+            completed_turn,
+            retry,
+            scheduled,
+            recovered,
+            tool_scheduled,
+            Event::TurnPermissionAudit(allowed),
+        ] {
             assert!(canonical_event_model_projection(&event).is_omitted());
             assert!(!canonical_event_model_projection_before_service_filter(&event).is_omitted());
             assert_eq!(

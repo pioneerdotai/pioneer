@@ -1144,8 +1144,8 @@ async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_re
             use_summary
         );
         assert!(
-            wire.find("IN_BRANCH_SECOND").unwrap() < wire.find("input child").unwrap(),
-            "the admitted parent section must precede the child's own line"
+            wire.find("input child").unwrap() < wire.find("IN_BRANCH_SECOND").unwrap(),
+            "the earlier child input must precede the later admitted parent response"
         );
         let cli =
             f.h.processor
@@ -1809,6 +1809,7 @@ async fn selected_import_understated_retained_output_direct_and_shared_fails_bef
 
 #[tokio::test]
 async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_sweeps_with_fk_off() {
+    use pioneer_crud::compaction::{PublicationTestPause, arm_publication_test_hook};
     let f = fixture_with_mode(FixtureMode::WorkerLegacy).await;
     // Real timers let SQLite's external worker finish: a paused runtime can
     // auto-advance to pool timeouts while a database request is in flight.
@@ -1816,11 +1817,22 @@ async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_swee
     // Run the actual production loop, cancel it, and restart with fresh private
     // progress. No fixture calls quantum: durable markers must survive restart.
     for restart in 0..2 {
+        // Observe populated staging before sealing without racing reader polls.
+        let mut seal_pause = (restart == 0).then(|| {
+            arm_publication_test_hook(
+                &f.h.crud_store,
+                "frozen-operation",
+                PublicationTestPause::ProofSeal,
+            )
+        });
         let cancellation = tokio_util::sync::CancellationToken::new();
         let worker = tokio::spawn(crate::database::maintenance::run_frozen_worker_for_test(
             f.h.crud_store.clone(),
             cancellation.clone(),
         ));
+        if let Some(pause) = seal_pause.as_mut() {
+            pause.reached().await;
+        }
         let mut swept = false;
         let mut interrupted_staging = false;
         for iteration in 0..20_000 {
@@ -1867,6 +1879,7 @@ async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_swee
         }
         cancellation.cancel();
         worker.await.unwrap();
+        drop(seal_pause);
         if restart == 0 {
             assert!(
                 interrupted_staging,

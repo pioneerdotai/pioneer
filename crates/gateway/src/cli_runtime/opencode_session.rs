@@ -5174,19 +5174,13 @@ fn refresh_opencode_message_ownership(state: &mut OpenCodeRuntimeState, messages
 pub(crate) fn opencode_usage_metadata<'a>(
     messages: impl IntoIterator<Item = &'a JsonValue>,
 ) -> JsonValue {
-    let mut input = None;
-    let mut output = None;
-    let mut reasoning = None;
-    let mut read = None;
-    let mut write = None;
+    let mut totals = [Some(0_u64); 5];
+    let mut known_parts = [None; 5];
     let mut reported = false;
-    fn add(total: &mut Option<u64>, value: Option<u64>) {
-        if let Some(value) = value {
-            *total = Some(total.unwrap_or(0).saturating_add(value));
-        }
-    }
     fn sum(values: &[Option<u64>]) -> Option<u64> {
-        values.iter().flatten().copied().reduce(u64::saturating_add)
+        values
+            .iter()
+            .try_fold(0_u64, |total, value| total.checked_add((*value)?))
     }
     for message in messages {
         if !matches!(message["type"].as_str(), Some("assistant" | "compaction")) {
@@ -5194,12 +5188,27 @@ pub(crate) fn opencode_usage_metadata<'a>(
         }
         let tokens = &message["tokens"];
         reported |= tokens.is_object();
-        add(&mut input, tokens["input"].as_u64());
-        add(&mut output, tokens["output"].as_u64());
-        add(&mut reasoning, tokens["reasoning"].as_u64());
-        add(&mut read, tokens["cache"]["read"].as_u64());
-        add(&mut write, tokens["cache"]["write"].as_u64());
+        for (index, value) in [
+            tokens["input"].as_u64(),
+            tokens["output"].as_u64(),
+            tokens["reasoning"].as_u64(),
+            tokens["cache"]["read"].as_u64(),
+            tokens["cache"]["write"].as_u64(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            totals[index] = totals[index].and_then(|total| total.checked_add(value?));
+            if let Some(value) = value {
+                known_parts[index] =
+                    Some(known_parts[index].unwrap_or(0_u64).saturating_add(value));
+            }
+        }
     }
+    if !reported {
+        totals = [None; 5];
+    }
+    let [input, output, reasoning, read, write] = totals;
     json!({
         "input_tokens":sum(&[input, read, write]),
         "output_tokens":sum(&[output, reasoning]),
@@ -5209,6 +5218,7 @@ pub(crate) fn opencode_usage_metadata<'a>(
         "cache_read_input_tokens":read,
         "cache_creation_input_tokens":write,
         "semantics":"opencode_v2_exclusive_cache_separate_reasoning",
+        "known_partial_tokens": {"input":known_parts[0],"output":known_parts[1],"reasoning":known_parts[2],"cache_read":known_parts[3],"cache_write":known_parts[4]},
         "native_tokens":reported.then(||json!({"input":input,"output":output,"reasoning":reasoning,"cache":{"read":read,"write":write}})),
     })
 }
@@ -6254,11 +6264,27 @@ mod tests {
         let zero = opencode_usage_metadata([
             &json!({"type":"assistant","tokens":{"input":0,"output":0,"cache":{"read":0}}}),
         ]);
-        assert_eq!(zero["input_tokens"], 0);
-        assert_eq!(zero["output_tokens"], 0);
+        assert!(zero["input_tokens"].is_null());
+        assert!(zero["output_tokens"].is_null());
         assert_eq!(zero["uncached_input_tokens"], 0);
         assert!(zero["reasoning_tokens"].is_null());
         assert!(zero["cache_creation_input_tokens"].is_null());
+        let complete_zero = opencode_usage_metadata([
+            &json!({"type":"assistant","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}),
+        ]);
+        assert_eq!(complete_zero["input_tokens"], 0);
+        assert_eq!(complete_zero["output_tokens"], 0);
+        let missing_in_one_message = opencode_usage_metadata([
+            &json!({"type":"assistant","tokens":{"input":10,"output":2,"reasoning":0,"cache":{"read":80,"write":0}}}),
+            &json!({"type":"assistant","tokens":{"input":5,"output":1,"reasoning":0,"cache":{"write":0}}}),
+        ]);
+        assert!(missing_in_one_message["input_tokens"].is_null());
+        assert!(missing_in_one_message["cache_read_input_tokens"].is_null());
+        assert_eq!(
+            missing_in_one_message["known_partial_tokens"]["cache_read"],
+            80
+        );
+        assert_eq!(missing_in_one_message["uncached_input_tokens"], 15);
     }
 
     #[tokio::test]

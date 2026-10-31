@@ -88,18 +88,32 @@ fn catalog_support(
 ) -> Option<bool> {
     match purpose {
         ModelPurpose::Chat => {
-            // Do not use entry.api: it can be a provider-wide generated default.
-            // Only preserved per-model source declarations establish operation
-            // and transport. Older snapshots without them remain unknown.
-            let source = entry.metadata.get("sourceMetadata")?;
-            if source["type"].as_str() != Some("chat") {
+            let source = entry.metadata.get("sourceMetadata")?.as_object()?;
+            // The existing models.dev v1 source defaults an omitted type to
+            // chat and has no per-model API map. Apply that source contract
+            // only to rows carrying its existing provenance, not arbitrary
+            // metadata or the catalog's generated provider-wide API default.
+            let models_dev = entry
+                .metadata
+                .get("pricingSource")
+                .and_then(|s| s["url"].as_str())
+                == Some("https://models.dev/api.json");
+            let chat = match source.get("type") {
+                None => models_dev,
+                Some(kind) => kind.as_str() == Some("chat"),
+            };
+            if !chat {
                 return None;
             }
-            let api = source["api"].as_object()?;
-            if !api
-                .get(source_chat_api(adapter_api)?)
-                .is_some_and(Value::is_object)
-            {
+            if let Some(api) = source.get("api") {
+                if !api
+                    .as_object()?
+                    .get(source_chat_api(adapter_api)?)
+                    .is_some_and(Value::is_object)
+                {
+                    return None;
+                }
+            } else if !models_dev {
                 return None;
             }
             text_chat_modalities(native, Some(entry))
@@ -230,6 +244,124 @@ mod tests {
         .into_iter()
         .map(|m| m.id)
         .collect()
+    }
+
+    #[test]
+    fn models_dev_v1_catalog_rows_without_type_or_api_are_selectable() {
+        use crate::catalog::generator::{SourceSnapshot, generate};
+        let snapshot: SourceSnapshot =
+            serde_json::from_str(include_str!("../tests/fixtures/catalog/sources.json")).unwrap();
+        let generated = generate(&snapshot, false).unwrap();
+        let catalog_from = |models: &Value| {
+            ModelCatalog::parse(
+                &models.to_string(),
+                &serde_json::to_string(&generated.provenance).unwrap(),
+            )
+            .unwrap()
+        };
+        let models = serde_json::to_value(&generated.models).unwrap();
+        let catalog = catalog_from(&models);
+        for (provider, id, api) in [
+            ("openai", "gpt-5-nano", "responses"),
+            ("deepseek", "deepseek-v4-flash", "chat_completions"),
+            ("groq", "llama-3.3-70b-versatile", "chat_completions"),
+            ("gemini", "gemini-2.5-flash", "generate_content"),
+            ("anthropic", "claude-sonnet-4-6", "messages"),
+        ] {
+            let entry = catalog.model(provider, id).unwrap();
+            let source = &entry.metadata["sourceMetadata"];
+            assert!(source.get("type").is_none());
+            assert!(source.get("api").is_none());
+            let mut candidate = model(id, None, None, None);
+            candidate.provider = provider.to_owned();
+            let selected = filter_models(
+                provider,
+                api,
+                &ProviderCapabilities::default(),
+                ModelPurpose::Chat,
+                vec![candidate.clone()],
+                Some(&catalog),
+            );
+            assert_eq!(
+                selected.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+                [id]
+            );
+            candidate.capabilities.chat = Some(false);
+            assert!(
+                filter_models(
+                    provider,
+                    api,
+                    &ProviderCapabilities::default(),
+                    ModelPurpose::Chat,
+                    vec![candidate],
+                    Some(&catalog),
+                )
+                .is_empty()
+            );
+        }
+        // Omitted type means chat only under the actual source contract.
+        // Explicit other operations, malformed fields and missing text I/O
+        // must not be admitted merely because the model has a catalog row.
+        for (field, value) in [
+            ("type", json!("image")),
+            ("type", json!("embedding")),
+            ("type", json!("transcription")),
+            ("type", json!("realtime")),
+            ("type", Value::Null),
+            ("api", Value::Null),
+            ("api", json!({"realtime":{}})),
+            ("modalities", json!({"input":["audio"],"output":["text"]})),
+            ("modalities", json!({"input":["text"],"output":["image"]})),
+            ("modalities", Value::Null),
+        ] {
+            let mut changed = models.clone();
+            changed["openai"]["gpt-5-nano"]["sourceMetadata"][field] = value;
+            assert!(
+                select(
+                    ModelPurpose::Chat,
+                    vec![model("gpt-5-nano", None, None, None)],
+                    Some(&catalog_from(&changed)),
+                )
+                .is_empty(),
+                "{field}"
+            );
+        }
+        let candidate = model("gpt-5-nano", None, None, None);
+        assert!(select(ModelPurpose::Chat, vec![candidate], None).is_empty());
+        for source in [Value::Null, json!("malformed source metadata")] {
+            let mut changed = models.clone();
+            changed["openai"]["gpt-5-nano"]["sourceMetadata"] = source;
+            let mut candidate = model("gpt-5-nano", None, None, None);
+            candidate.capabilities.input_modalities = Some(vec!["text".into()]);
+            candidate.capabilities.output_modalities = Some(vec!["text".into()]);
+            assert!(
+                select(
+                    ModelPurpose::Chat,
+                    vec![candidate],
+                    Some(&catalog_from(&changed)),
+                )
+                .is_empty()
+            );
+        }
+        assert!(
+            select(
+                ModelPurpose::Chat,
+                vec![model("not-in-catalog", None, None, None)],
+                Some(&catalog),
+            )
+            .is_empty()
+        );
+        let mut unknown_source = models;
+        unknown_source["openai"]["gpt-5-nano"]["pricingSource"]["url"] =
+            json!("https://example.invalid/models");
+        assert!(
+            select(
+                ModelPurpose::Chat,
+                vec![model("gpt-5-nano", None, None, None)],
+                Some(&catalog_from(&unknown_source)),
+            )
+            .is_empty()
+        );
     }
 
     #[test]

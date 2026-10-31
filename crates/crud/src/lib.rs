@@ -80,7 +80,7 @@ pub use events::{
 pub use model_history::{
     CanonicalEventModelProjection, canonical_event_model_projection,
     canonical_event_model_projection_before_service_filter, canonical_item_model_projection,
-    portable_commentary_text,
+    canonical_item_model_projection_before_service_filter, portable_commentary_text,
 };
 pub use repositories::administrative_audit::{
     NewAdministrativeAuditEvent, audit_action_to_db, audit_domain_to_db, audit_target_kind_to_db,
@@ -40961,6 +40961,7 @@ mod tests {
             .unwrap();
         let initial = RecoveryDiagnostic {
             last_failure: Some(RecoveryProviderFailure {
+                raw_response: None,
                 error_reason: None,
                 request_id: None,
                 class: ProviderFailureClass::StreamTruncated,
@@ -41009,8 +41010,19 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut response = pioneer_protocol::ProviderErrorResponse::from_bytes(
+            format!(
+                "{} original provider diagnostic body",
+                "x".repeat(20 * 1024)
+            )
+            .as_bytes(),
+            false,
+        );
+        response.processing_error = Some("Responses completed reasoning state conflict".into());
+        response.stream_context = Some("data: original completed reasoning event\n\n".into());
         let final_diagnostic = RecoveryDiagnostic {
             last_failure: Some(RecoveryProviderFailure {
+                raw_response: Some(response),
                 error_reason: Some(pioneer_protocol::ProviderErrorReason::PermissionDenied),
                 request_id: Some(
                     pioneer_protocol::ProviderRequestId::try_from("gen-atomic_fixture".to_owned())

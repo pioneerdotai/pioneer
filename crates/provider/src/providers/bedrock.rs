@@ -2269,7 +2269,8 @@ mod tests {
             Some("Hello from Bedrock")
         );
         let usage = response.usage.unwrap().normalized();
-        assert_eq!(usage.input_tokens, Some(42));
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.uncached_input_tokens, Some(42));
         assert_eq!(usage.output_tokens, Some(15));
     }
 

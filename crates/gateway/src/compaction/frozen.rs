@@ -2539,25 +2539,15 @@ async fn compose_frozen_basis_with_resolver(
     .await
 }
 
-/// An admitted ancestor is always the prefix of the child's own line. The
-/// end-of-second rule may admit a parent row dated after the child's first
-/// input within that same second; dates must not interleave those two lines.
+/// Admission bounds which ancestor sources are available; it does not grant
+/// permission to move them ahead of earlier child messages. Use original
+/// source dates across both lines, just as accepted Task execution does.
 pub(super) async fn order_conversation_history(
     store: &CrudStore,
     workspace: &str,
     messages: &mut Vec<ChatMessage>,
 ) -> Result<()> {
-    let (mut inherited, mut own): (Vec<_>, Vec<_>) =
-        std::mem::take(messages).into_iter().partition(|message| {
-            message
-                .provenance
-                .as_ref()
-                .is_some_and(|origin| origin.inherited)
-        });
-    order_history_by_creation(store, workspace, &mut own).await?;
-    inherited.extend(own);
-    *messages = inherited;
-    Ok(())
+    order_history_by_creation(store, workspace, messages).await
 }
 
 /// Order messages by the creation time of their original rows.

@@ -42,6 +42,8 @@ pub struct AzureOpenAiProvider {
 #[derive(Debug, Serialize)]
 struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -350,6 +352,7 @@ impl AzureOpenAiProvider {
         let generation =
             crate::generation::chat_fields_from_catalog(catalog, "azure_openai", request)?;
         Ok(ApiChatRequest {
+            prompt_cache_key: None,
             model: None,
             generation,
             messages,
@@ -376,7 +379,62 @@ impl AzureOpenAiProvider {
         // Generation rules use the resolved base model; v1 routing uses the deployment.
         let mut body = Self::build_chat_request(request, messages, stream)?;
         body.model = self.deployment_model();
+        body.prompt_cache_key = self.cache_routing_key(&request.model);
         Ok(body)
+    }
+
+    fn cache_routing_key(&self, model: &str) -> Option<String> {
+        // Azure documents this hint without an API-version requirement. A
+        // configured deployment alias is routing data, never model evidence.
+        let endpoint = self.endpoint_root();
+        let url = url::Url::parse(&endpoint).ok()?;
+        if url.scheme() != "https"
+            || !url.host_str().is_some_and(|host| {
+                host.ends_with(".openai.azure.com") || host.ends_with(".services.ai.azure.com")
+            })
+            || !matches!(url.path(), "" | "/")
+        {
+            return None;
+        }
+        let native = crate::generation::native_model("azure_openai", model);
+        let catalog = crate::generation::uses_public_catalog("azure_openai")
+            .then(|| crate::catalog::model_catalog().ok())
+            .flatten();
+        for fact in ["supportsPromptCacheKey", "supportsPromptCaching"] {
+            let supported = native
+                .as_ref()
+                .and_then(|entry| entry.metadata.get("compat"))
+                .and_then(|compat| compat.get(fact))
+                .and_then(serde_json::Value::as_bool)
+                .or_else(|| {
+                    catalog
+                        .as_ref()
+                        .and_then(|catalog| catalog.model("azure-openai", model))
+                        .and_then(|entry| entry.metadata.get("compat"))
+                        .and_then(|compat| compat.get(fact))
+                        .and_then(serde_json::Value::as_bool)
+                });
+            if supported == Some(false) {
+                return None;
+            }
+        }
+        let authority = crate::attachments::runtime::current_authority_fingerprint()
+            .unwrap_or_else(|_| {
+                crate::continuation::replay_authority(
+                    "azure-chat-cache-routing",
+                    &[&endpoint, &self.api_key],
+                )
+            });
+        let authority = crate::continuation::replay_authority(
+            "azure-chat-cache-routing",
+            &[
+                &authority,
+                &endpoint,
+                &self.deployment_name,
+                &self.api_version,
+            ],
+        );
+        crate::prompt_cache::Comparison::begin(&authority)?.affinity_key()
     }
 
     pub(crate) fn with_version_override(mut self, version: Option<&str>) -> Self {
@@ -1641,4 +1699,101 @@ mod wire_contract_tests {
         WireProvider::new("fixture", "fixture-resource", "fixture-deployment")
     }
     include!("wire_tests/chat.rs");
+}
+
+#[cfg(test)]
+mod cache_routing_tests {
+    use super::*;
+    use crate::{ChatMessage, traits::Provider};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn native_chat_cache_key_respects_deployment_route_and_native_false() {
+        let provider = AzureOpenAiProvider::new("fixture-key", "fixture-resource", "opaque-alias");
+        assert!(provider.cache_routing_key("fixture-model").is_none());
+        crate::prompt_cache::scope("azure-cache-workspace", "owner", "main", async {
+            let key = provider.cache_routing_key("fixture-model").unwrap();
+            assert_eq!(
+                provider.cache_routing_key("different-base-model"),
+                Some(key.clone())
+            );
+            for version in ["v1", "2024-10-21"] {
+                let provider = AzureOpenAiProvider::with_api_version(
+                    "fixture-key",
+                    "fixture-resource",
+                    "opaque-alias",
+                    version,
+                );
+                let mut previous = None;
+                for stream in [false, true] {
+                    let request =
+                        super::super::history_test_support::request(vec![ChatMessage::user(
+                            "hello",
+                        )]);
+                    let prepared = crate::attachments::prepare_messages_for_provider(
+                        provider.name(),
+                        &provider.capabilities(),
+                        &request.messages,
+                    )
+                    .unwrap();
+                    let body = serde_json::to_value(
+                        provider
+                            .build_prepared_chat_request(request, stream, prepared)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(body["prompt_cache_key"].as_str().unwrap().len(), 64);
+                    if let Some(previous) = previous.as_ref() {
+                        assert_eq!(&body["prompt_cache_key"], previous);
+                    }
+                    previous = Some(body["prompt_cache_key"].clone());
+                    assert_eq!(body["stream"], stream);
+                    if version == "v1" {
+                        assert_eq!(body["model"], "opaque-alias");
+                    } else {
+                        assert!(body.get("model").is_none());
+                    }
+                    assert!(body.get("prompt_cache_options").is_none());
+                }
+            }
+            for changed in [
+                AzureOpenAiProvider::new("other-key", "fixture-resource", "opaque-alias"),
+                AzureOpenAiProvider::new("fixture-key", "other-resource", "opaque-alias"),
+                AzureOpenAiProvider::new("fixture-key", "fixture-resource", "other-deployment"),
+            ] {
+                assert_ne!(
+                    changed.cache_routing_key("fixture-model"),
+                    Some(key.clone())
+                );
+            }
+            let proxy = AzureOpenAiProvider::with_base_url_and_timeout_policy(
+                "fixture-key",
+                "unused",
+                "opaque-alias",
+                "https://proxy.example",
+                Default::default(),
+            );
+            assert!(proxy.cache_routing_key("fixture-model").is_none());
+            let catalog = crate::generation::test_catalog_model(
+                "azure-openai",
+                "fixture-model",
+                "gpt-4o",
+                json!({"compat":{"supportsPromptCacheKey":false}}),
+            );
+            let model = catalog
+                .model("azure-openai", "fixture-model")
+                .unwrap()
+                .clone();
+            crate::generation::with_native_models(
+                "azure_openai",
+                true,
+                [("fixture-model".into(), model)].into_iter().collect(),
+                async {
+                    assert!(provider.cache_routing_key("fixture-model").is_none());
+                },
+            )
+            .await;
+        })
+        .await;
+    }
 }

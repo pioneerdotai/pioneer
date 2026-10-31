@@ -149,6 +149,9 @@ pub struct AgentTurnHookRuntimeContext {
     pub actor_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Trusted task-tree owner for vendor routing only; never prompt authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_task_group_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,6 +170,7 @@ impl Default for AgentTurnHookRuntimeContext {
             actor_kind: HookActorKind::Agent,
             actor_id: None,
             task_id: None,
+            cache_task_group_id: None,
             agent_id: None,
             conversation_thread_id: None,
             post_turn_dispatch_mode: AgentTurnPostTurnDispatchMode::Immediate,
@@ -199,6 +203,7 @@ impl AgentTurnHookRuntimeContext {
             actor_kind: HookActorKind::Task,
             actor_id: Some(task_id.clone()),
             task_id: Some(task_id),
+            cache_task_group_id: None,
             agent_id: None,
             conversation_thread_id: None,
             post_turn_dispatch_mode: AgentTurnPostTurnDispatchMode::Immediate,

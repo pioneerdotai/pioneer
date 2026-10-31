@@ -50,6 +50,9 @@ mod agent_action_outbox;
 #[path = "tests/history_continuation.rs"]
 mod history_continuation;
 
+#[path = "tests/prompt_cache_sent_prefix.rs"]
+mod prompt_cache_sent_prefix;
+
 #[path = "tests/compaction_lifecycle_poll.rs"]
 mod compaction_lifecycle_poll;
 
@@ -36181,6 +36184,38 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
     )
     .await;
 
+    // These remain durable journal facts but must not be imported into the
+    // model-facing CLI bootstrap through a frozen Task basis.
+    crud_store
+        .materialize_item_tool_retry_resolved(
+            pioneer_protocol::ItemToolRetryResolvedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: root_thread_id.into(),
+                turn_id: root_turn_id.into(),
+                item_id: "historical-retry-item".into(),
+                item_type: pioneer_protocol::TurnItemType::DynamicToolCall,
+                tool_retry_episode_id: "historical-retry-episode".into(),
+                tool_name: "apply_patch".into(),
+                attempt_number: 2,
+                resolution: pioneer_protocol::ToolRetryResolution::Succeeded,
+                budgets: vec![],
+                reason: "CACHE_RETRY_TELEMETRY".into(),
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
+    crud_store.materialize_item_completed(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id:workspace_id.clone(), thread_id:root_thread_id.into(), turn_id:root_turn_id.into(),
+            item:pioneer_protocol::TurnItem::SystemEvent {
+                id:"historical-usage".into(), level:pioneer_protocol::SystemEventLevel::Info,
+                message:"CACHE_USAGE_TELEMETRY".into(), code:Some("agent_runtime_item".into()),
+                details:Some(json!({"nativeItemKind":"tokenUsage","input_tokens":100,"cache_read_input_tokens":80})),
+            },
+        }, phase_13_now_secs(),
+    ).await.unwrap();
+
     let mut parent_thread_id = root_thread_id.to_owned();
     let mut parent_turn_id = root_turn_id.to_owned();
     let mut lineages = Vec::new();
@@ -36224,6 +36259,8 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
         let start = &starts[level - 1];
         let input = start.input.to_string();
         assert!(input.contains(root_marker));
+        assert!(!input.contains("CACHE_RETRY_TELEMETRY"));
+        assert!(!input.contains("CACHE_USAGE_TELEMETRY"));
         for earlier in &output_markers {
             assert!(
                 input.contains(earlier),
@@ -46300,6 +46337,7 @@ async fn invalid_request_provider_failure_is_terminal_without_retry() {
             item_id.to_owned(),
             TurnItemType::Reasoning,
             ProviderFailureDetails {
+                raw_response: None,
                 error_reason: None,
                 request_id: None,
                 provider: "test-provider".to_owned(),
@@ -46541,6 +46579,7 @@ async fn durable_recovery_events_reject_ack_without_canonical_persistence() {
             item_id: "item_missing_provider_failure".to_owned(),
             item_type: TurnItemType::AgentMessage,
             failure: ProviderFailureDetails {
+                raw_response: None,
                 error_reason: None,
                 request_id: None,
                 provider: "openai".to_owned(),
@@ -86487,6 +86526,7 @@ async fn blocked_provider_task_consumers_impl(scenario: &str, path: &str) {
         http_status: Some(502),
         provider_code: None,
         retry_after_ms: Some(2000),
+        raw_response: None,
         error_reason: Some(pioneer_protocol::ProviderErrorReason::ProviderUnavailable),
         request_id: Some(
             pioneer_protocol::ProviderRequestId::try_from("gen-task_fixture".to_owned()).unwrap(),
@@ -86872,6 +86912,7 @@ async fn recovery_failure_task_consumers_impl(
     let now = super::now_timestamp_secs();
     let private = "private-response-body https://secret.example?token=credential /private/provider-key HTTP 401";
     let mut initial = ProviderFailureDetails {
+        raw_response: None,
         error_reason: None,
         request_id: None,
         provider: "test-provider".to_owned(),
@@ -86912,6 +86953,7 @@ async fn recovery_failure_task_consumers_impl(
         );
     }
     let last = ProviderFailureDetails {
+        raw_response: None,
         error_reason: None,
         request_id: None,
         class: ProviderFailureClass::AuthOrPermission,
@@ -86919,6 +86961,7 @@ async fn recovery_failure_task_consumers_impl(
         http_status: Some(403),
         provider_code: Some(private.to_owned()),
         ..ProviderFailureDetails {
+            raw_response: None,
             error_reason: None,
             request_id: None,
             provider: private.to_owned(),
@@ -87247,6 +87290,7 @@ fn provider_replay_is_fenced_after_retryable_recovery_start_error() {
         let (processor, store, _) = setup_execution_window_terminal_turn(thread, turn).await;
         let now = super::now_timestamp_secs();
         let failure = ProviderFailureDetails {
+            raw_response: None,
             error_reason: None,
             request_id: None,
             provider: "test-provider".to_owned(),
@@ -87646,11 +87690,15 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     use futures_util::StreamExt;
     struct LateUsage {
         fail_after_usage: bool,
+        authority: Option<&'static str>,
     }
     #[async_trait::async_trait]
     impl pioneer_provider::Provider for LateUsage {
         fn name(&self) -> &str {
             "fixture"
+        }
+        fn authority_fingerprint(&self) -> Option<&str> {
+            self.authority
         }
         async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
             anyhow::bail!("unexpected non-stream fixture")
@@ -87667,6 +87715,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
                 Ok(StreamChunk::usage(pioneer_provider::TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(2),
+                    prompt_cache_diagnostics: Some(json!({"reason":"fixture"})),
                     ..Default::default()
                 })),
             ];
@@ -87682,6 +87731,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     let provider = crate::usage_journal::observe(
         Arc::new(LateUsage {
             fail_after_usage: false,
+            authority: Some("authority-a"),
         }),
         &background,
         &workspace,
@@ -87702,6 +87752,13 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
         })
         .await
         .unwrap();
+    let started = background
+        .provider_usage_page(&workspace, "late-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(started[0].status, "started");
+    let metadata: serde_json::Value = serde_json::from_str(&started[0].usage_json).unwrap();
+    assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-a");
     assert!(stream.next().await.unwrap().unwrap().is_final);
     assert_eq!(
         stream
@@ -87724,14 +87781,21 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
     assert_eq!(retained.input_tokens, Some(10));
     assert_eq!(retained.output_tokens, Some(2));
+    assert_eq!(
+        retained.prompt_cache_diagnostics,
+        Some(json!({"reason":"fixture"}))
+    );
+    let metadata: serde_json::Value = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-a");
     let failed = crate::usage_journal::observe(
         Arc::new(LateUsage {
             fail_after_usage: true,
+            authority: Some("authority-b"),
         }),
         &background,
         &workspace,
         "memory_extraction",
-        "late-failed-owner",
+        "late-owner",
     );
     let mut stream = failed
         .stream_chat(ChatRequest {
@@ -87752,14 +87816,63 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     assert!(stream.next().await.unwrap().is_err());
     assert!(stream.next().await.is_none());
     let rows = background
-        .provider_usage_page(&workspace, "late-failed-owner", "", 100)
+        .provider_usage_page(&workspace, "late-owner", "", 100)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].status, "failed");
-    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(rows.len(), 2);
+    let failed_row = rows.iter().find(|row| row.status == "failed").unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&failed_row.usage_json).unwrap();
+    assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-b");
+    let retained: pioneer_provider::TokenUsage =
+        serde_json::from_str(&failed_row.usage_json).unwrap();
     assert_eq!(retained.input_tokens, Some(10));
     assert_eq!(retained.output_tokens, Some(2));
+    assert_eq!(
+        retained.prompt_cache_diagnostics,
+        Some(json!({"reason":"fixture"}))
+    );
+    // An otherwise identical unlabelled call remains unknown, including after enrichment.
+    let legacy = crate::usage_journal::observe(
+        Arc::new(LateUsage {
+            fail_after_usage: false,
+            authority: None,
+        }),
+        &background,
+        &workspace,
+        "memory_extraction",
+        "late-owner",
+    );
+    let mut stream = legacy
+        .stream_chat(ChatRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        })
+        .await
+        .unwrap();
+    while let Some(chunk) = stream.next().await {
+        chunk.unwrap();
+    }
+    let rows = background
+        .provider_usage_page(&workspace, "late-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let unlabelled = rows
+        .iter()
+        .filter(|row| {
+            let value: serde_json::Value = serde_json::from_str(&row.usage_json).unwrap();
+            value.get("_pioneer_journal").is_none()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(unlabelled.len(), 1);
+    assert_eq!(unlabelled[0].status, "completed");
 }
 
 #[tokio::test]

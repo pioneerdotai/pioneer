@@ -11,6 +11,8 @@ mod html_preview_retention_tests;
 mod invalid_completion_resume_tests;
 #[path = "invalid_completion_tests.rs"]
 mod invalid_completion_tests;
+#[path = "prompt_cache_history_tests.rs"]
+mod prompt_cache_history_tests;
 use migration::{Migrator, MigratorTrait};
 use pioneer_agent::compaction::composition::ScopedHistorySource;
 use pioneer_compaction::summary::{HEADINGS, SummaryInput};
@@ -2081,6 +2083,7 @@ impl Provider for ProviderFixture {
         let overflow = error.downcast_ref::<ConfirmedInputOverflow>().is_some();
         Some(ProviderFailureClassification {
             is_network_error: false,
+            raw_response: None,
             error_reason: None,
             request_id: None,
             class: if overflow {
@@ -6034,6 +6037,342 @@ async fn saved_candidate_survives_restart_without_regenerating() {
         CompactionExit::Applied(_)
     ));
     assert_eq!(*f.provider.count.borrow(), 1);
+}
+
+#[tokio::test]
+async fn accepted_service_sources_resume_with_cursor_and_reference_material() {
+    use pioneer_crud::CanonicalTurnEventPayload as Event;
+    use pioneer_protocol::{
+        ItemCompletedNotification, SystemEventLevel, ToolRetryResolution, TurnItem,
+    };
+    let mut retry = prompt_cache_history_tests::resolved(ToolRetryResolution::Succeeded);
+    if let Event::ItemToolRetryResolved(value) = &mut retry {
+        value.reason = "accepted retry 漢字🌍 ".repeat(5_000);
+    }
+    let usage = Event::ItemCompleted(ItemCompletedNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        item: TurnItem::SystemEvent {
+            id: "old-native-usage".into(),
+            level: SystemEventLevel::Info,
+            message: "saved native counters".into(),
+            code: Some("agent_runtime_item".into()),
+            details: Some(serde_json::json!({"nativeItemKind":"tokenUsage","input_tokens":100})),
+        },
+    });
+    let retry_raw = serde_json::to_string(&retry).unwrap();
+    let usage_raw = serde_json::to_string(&usage).unwrap();
+    let usage_text = format!(
+        "Recorded historical system event:\n{}",
+        serde_json::json!({
+            "level":"info", "message":"saved native counters", "code":"agent_runtime_item",
+            "details":{"nativeItemKind":"tokenUsage","input_tokens":100}
+        })
+    );
+    // The owner fixture persists raw sources and an immutable manifest directly,
+    // without calling today's admission (which correctly omits these events).
+    let f = fixture_with_canonical_payloads(
+        vec![
+            retry_raw.clone(),
+            usage_raw.clone(),
+            retry_raw.clone(),
+            usage_raw,
+        ],
+        vec![Reply::Success, Reply::Hang],
+        true,
+        false,
+    )
+    .await;
+    let manifest = f
+        .store
+        .compaction_manifest_page("operation", false, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(manifest.len(), 4);
+    f.store
+        .database_connection()
+        .execute_unprepared(
+            "DELETE FROM compaction_manifest WHERE operation_id='operation' AND ordinal>=2;
+             UPDATE compaction_runner_plan SET source_count=2,reference_count=2 WHERE operation_id='operation'",
+        )
+        .await
+        .unwrap();
+    let references = manifest[2..]
+        .iter()
+        .cloned()
+        .map(|mut entry| {
+            entry.reference_only = true;
+            entry
+        })
+        .collect::<Vec<_>>();
+    seed_active_manifest_entries(&f.store, &references).await;
+    let manifest_before = f
+        .store
+        .compaction_manifest_page("operation", false, 0, 0)
+        .await
+        .unwrap();
+    let references_before = f
+        .store
+        .compaction_manifest_page("operation", true, 0, 0)
+        .await
+        .unwrap();
+    let operation_before = f
+        .store
+        .compaction_operation("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    assert!(
+        super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let task = tokio::spawn({
+        let runner = f.runner.clone();
+        async move { runner.run(CancellationToken::new()).await }
+    });
+    f.provider.wait_calls(2).await;
+    let saved = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.cursor.source, 0);
+    assert!(
+        saved.cursor.character > 0,
+        "restart must drain a partially read historical retry fragment"
+    );
+    let checkpoint_id = saved.previous_checkpoint.clone().unwrap();
+    let checkpoint = f
+        .store
+        .compaction_checkpoint(&checkpoint_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!checkpoint.summary.is_empty());
+    assert!(
+        checkpoint.coverage.is_empty(),
+        "partial source cannot acquire coverage"
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let restarted = Arc::new(CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "thread".into(),
+        f.runner.snapshot.clone(),
+        f.runner.summarizer.clone(),
+        f.runner.target.clone(),
+        f.observer.clone(),
+        f.clock.clone(),
+    ));
+    // Read at the exact persisted character cursor before resuming the driver.
+    let fragment = restarted
+        .active_payload_fragment_with_projection(
+            "thread",
+            &manifest[0].source,
+            saved.cursor.character,
+            saved.source_text_projection_version,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fragment.text,
+        retry_raw
+            .chars()
+            .skip(saved.cursor.character as usize)
+            .take(RUNNER_FRAGMENT_CHARACTERS as usize)
+            .collect::<String>()
+    );
+    let excerpts = restarted.reference_excerpts().await.unwrap();
+    assert_eq!(excerpts.len(), 2);
+    assert_eq!(
+        excerpts[0].text,
+        format!(
+            "{}\n[Reference-only excerpt; remaining source not included.]",
+            retry_raw
+                .chars()
+                .take(RUNNER_FRAGMENT_CHARACTERS as usize)
+                .collect::<String>()
+        )
+    );
+    assert_eq!(excerpts[1].text, usage_text);
+    let resumed_task = tokio::spawn({
+        let runner = restarted.clone();
+        async move { runner.run(CancellationToken::new()).await }
+    });
+    wait_backoff(&f.store).await;
+    let retry_state = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry_state.cursor, saved.cursor);
+    assert_eq!(retry_state.previous_checkpoint, saved.previous_checkpoint);
+    let RunnerPhase::Backoff { not_before_ms, .. } = retry_state.phase else {
+        panic!("expected retry backoff")
+    };
+    f.clock.advance(not_before_ms);
+    let CompactionExit::Applied(head) = resumed_task.await.unwrap().unwrap() else {
+        panic!("accepted work must continue")
+    };
+    let calls = f.provider.calls.lock().unwrap();
+    let inputs = calls
+        .iter()
+        .map(|call| serde_json::from_str::<SummaryInput>(&call.messages[1].content).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(inputs[1].previous_summary, checkpoint.summary);
+    assert_eq!(
+        serde_json::to_value(&inputs[1]).unwrap(),
+        serde_json::to_value(&inputs[2]).unwrap()
+    );
+    let texts = inputs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 1)
+        .flat_map(|(_, input)| &input.compact_units)
+        .map(|part| part.text.as_str())
+        .collect::<String>();
+    assert_eq!(texts, retry_raw + &usage_text);
+    drop(calls);
+    assert_eq!(
+        f.store
+            .compaction_checkpoint(&head)
+            .await
+            .unwrap()
+            .unwrap()
+            .coverage,
+        manifest_before
+            .iter()
+            .map(|entry| entry.source.clone())
+            .collect::<Vec<_>>()
+    );
+    let identity = |entries: &[ManifestEntry]| {
+        entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.ordinal,
+                    entry.unit,
+                    entry.reference_only,
+                    entry.thread_id.clone(),
+                    entry.source.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        identity(
+            &f.store
+                .compaction_manifest_page("operation", false, 0, 0)
+                .await
+                .unwrap()
+        ),
+        identity(&manifest_before)
+    );
+    assert_eq!(
+        identity(
+            &f.store
+                .compaction_manifest_page("operation", true, 0, 0)
+                .await
+                .unwrap()
+        ),
+        identity(&references_before)
+    );
+    assert_eq!(
+        f.store
+            .compaction_operation("operation")
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot,
+        operation_before.snapshot
+    );
+    let plan_after = f
+        .store
+        .compaction_runner_plan("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (plan_after.source_count, plan_after.reference_count),
+        (2, 2)
+    );
+    assert_eq!(
+        f.store
+            .compaction_checkpoint(&checkpoint_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .summary,
+        checkpoint.summary
+    );
+    // Even a materialized active cache must not bypass source authenticity.
+    restarted
+        .active_payload_fragment_with_projection(
+            "thread",
+            &manifest[0].source,
+            saved.cursor.character,
+            saved.source_text_projection_version,
+        )
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_unprepared("UPDATE turn_event SET payload='{}' WHERE id='source'")
+        .await
+        .unwrap();
+    assert!(
+        restarted
+            .active_payload_fragment_with_projection(
+                "thread",
+                &manifest[0].source,
+                saved.cursor.character,
+                saved.source_text_projection_version
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        CompactionRunner::new(
+            f.store.clone(),
+            "ws".into(),
+            "thread".into(),
+            f.runner.snapshot.clone(),
+            f.runner.summarizer.clone(),
+            f.runner.target.clone(),
+            f.observer.clone(),
+            f.clock.clone()
+        )
+        .reference_excerpts()
+        .await
+        .is_ok()
+    );
+    f.store
+        .database_connection()
+        .execute_unprepared("UPDATE turn_event SET payload='{}' WHERE id='source-2'")
+        .await
+        .unwrap();
+    assert!(
+        CompactionRunner::new(
+            f.store.clone(),
+            "ws".into(),
+            "thread".into(),
+            f.runner.snapshot.clone(),
+            f.runner.summarizer.clone(),
+            f.runner.target.clone(),
+            f.observer.clone(),
+            f.clock.clone()
+        )
+        .reference_excerpts()
+        .await
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -14138,8 +14477,8 @@ async fn check_nested_task_basis(legacy: bool) {
         .position(|message| message.content == "child own command")
         .unwrap();
     assert!(
-        parent_pos < own_pos,
-        "native preparation must preserve the ancestor prefix despite .800 > .100"
+        own_pos < parent_pos,
+        "admission must not move a .800 ancestor ahead of a .100 child source"
     );
     if !legacy {
         // The same canonical .100 own / .800 inherited messages belong to an
@@ -28865,6 +29204,9 @@ async fn frozen_service_event_authenticates_old_wire_before_execution_omits_it()
             },
         ),
     );
+    extra.push(prompt_cache_history_tests::resolved(
+        pioneer_protocol::ToolRetryResolution::Succeeded,
+    ));
     for (index, event) in extra.iter().enumerate() {
         f.store.database_connection().execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,

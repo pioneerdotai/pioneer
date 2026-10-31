@@ -43,8 +43,8 @@ mod provider;
 mod public_error;
 mod recovery_diagnostic;
 pub use recovery_diagnostic::{
-    ProviderErrorReason, ProviderRequestId, RecoveryDiagnostic, RecoveryProviderFailure,
-    RecoveryStopReason,
+    ProviderErrorReason, ProviderErrorResponse, ProviderRequestId, RecoveryDiagnostic,
+    RecoveryProviderFailure, RecoveryStopReason,
 };
 mod schema;
 mod scoped_push;
