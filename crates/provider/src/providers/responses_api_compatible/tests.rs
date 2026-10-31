@@ -156,7 +156,7 @@ async fn cache_diagnostics_follow_conversation_and_purpose_at_http_boundary() {
             "main"
         };
         let execution = format!("execution-{index}");
-        let (usage, replay) = crate::prompt_cache::conversation_scope(
+        let operation = crate::prompt_cache::conversation_scope(
             workspace.clone(),
             owner.into(),
             crate::prompt_cache::scope(&workspace, &execution, purpose, async {
@@ -180,6 +180,10 @@ async fn cache_diagnostics_follow_conversation_and_purpose_at_http_boundary() {
                     (response.usage.unwrap(), response.provider_replay_state)
                 }
             }),
+        );
+        let (usage, replay) = crate::attachments::runtime::with_async_authority_scope(
+            provider.authority_fingerprint().unwrap().to_owned(),
+            operation,
         )
         .await;
         assert_eq!(usage.cache_read_input_tokens, Some(80));
@@ -1739,11 +1743,13 @@ async fn responses_output_caps_do_not_require_model_specific_control_metadata() 
                 );
                 req.reasoning = None;
                 req.temperature = Some(0.5);
-                assert!(
-                    provider
-                        .prepare(req, &provider.capabilities())
-                        .await
-                        .is_err()
+                let prepared = provider
+                    .prepare(req, &provider.capabilities())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    provider.render(&prepared, false).unwrap()["temperature"],
+                    0.5
                 );
             }
         },

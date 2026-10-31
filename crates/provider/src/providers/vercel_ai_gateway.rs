@@ -1479,6 +1479,10 @@ mod tests {
                     assert_eq!(provider.chat(request).await.unwrap().text, "reply");
                 }
             };
+            let operation = crate::attachments::runtime::with_async_authority_scope(
+                provider.authority_fingerprint().unwrap().to_owned(),
+                operation,
+            );
             if index == 8 {
                 // No trustworthy execution identity: use gateway fingerprinting
                 // rather than inventing one shared header for unrelated calls.

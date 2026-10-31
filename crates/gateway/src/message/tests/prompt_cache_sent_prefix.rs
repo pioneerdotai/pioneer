@@ -9,7 +9,7 @@ use pioneer_tools::{
     ToolExtensionBundle, ToolHandler, ToolInvocation, ToolSpec,
 };
 
-const MODEL: &str = "gpt-6.1-sol";
+const MODEL: &str = "gpt-5.1";
 const NAMES: [&str; 2] = ["cache_slow", "cache_error"];
 
 struct ParallelTools(Arc<tokio::sync::Semaphore>);
@@ -388,11 +388,14 @@ async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wire
         let bounded_item_id = bounded_item_id.expect("the large result must have a durable source");
         let initial = wire.recv().await.unwrap();
         let sent = wire.recv().await.unwrap();
+        let retry_final = wire.recv().await.unwrap();
         let requests = provider.requests.lock().unwrap().clone();
+        // The recoverable error leaves a retry instruction. The first no-tool
+        // reply clears it before the loop can accept the terminal reply.
         assert_eq!(
             requests.len(),
-            2,
-            "both real loop dispatches must be observed"
+            3,
+            "tool, retry, and terminal rounds must be observed"
         );
         let sent_request = &requests[1];
         assert!(
@@ -436,6 +439,22 @@ async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wire
             })
             .collect::<Vec<_>>();
         assert_eq!(results.len(), 2, "non-vacuous full ordered result proof");
+        let retry_results = retry_final[input_key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| {
+                if responses {
+                    item["type"] == "function_call_output"
+                } else {
+                    item["role"] == "tool"
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retry_results, results,
+            "the terminal retry must retain both bounded results"
+        );
         let call_key = if responses { "call_id" } else { "tool_call_id" };
         assert_eq!(
             results
@@ -588,13 +607,23 @@ async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wire
         )
         .await
         .unwrap();
+        let replay_provider = registry
+            .get_or_create_for_workspace(workspace, "openai")
+            .unwrap();
         for restored in [cold.messages, accepted.messages] {
             // This is the exact unchanged instruction/tool configuration sent
             // by the loop, rather than a second manually invented oracle.
             let mut next = sent_request.clone();
             next.messages = restored;
-            let next = provider.prepare_input_budget(next).await.unwrap().request;
-            provider.chat(next).await.unwrap();
+            pioneer_provider::prompt_cache::scope(workspace, &thread.id, "main", async {
+                let next = replay_provider
+                    .prepare_input_budget(next)
+                    .await
+                    .unwrap()
+                    .request;
+                replay_provider.chat(next).await.unwrap();
+            })
+            .await;
             let actual = wire.recv().await.unwrap();
             let actual_input = actual[input_key].as_array().unwrap();
             assert!(actual_input.len() > prefix.len());

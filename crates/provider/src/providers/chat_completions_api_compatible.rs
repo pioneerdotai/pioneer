@@ -3699,6 +3699,14 @@ mod prompt_cache_tests {
 
     #[tokio::test]
     async fn native_chat_cache_affinity_is_stable_and_endpoint_scoped_at_wire_boundary() {
+        crate::attachments::runtime::with_async_authority_scope(
+            "chat-cache-affinity-fixture".into(),
+            native_chat_cache_affinity_fixture(),
+        )
+        .await;
+    }
+
+    async fn native_chat_cache_affinity_fixture() {
         for (name, root) in [
             ("mistral", "https://api.mistral.ai/v1"),
             ("xai", "https://api.x.ai/v1"),
@@ -3860,6 +3868,14 @@ mod cache_extension_regressions {
 
     #[tokio::test]
     async fn documented_routing_is_scoped_stable_and_shared_by_json_and_sse() {
+        crate::attachments::runtime::with_async_authority_scope(
+            "cache-routing-fixture".into(),
+            documented_routing_fixture(),
+        )
+        .await;
+    }
+
+    async fn documented_routing_fixture() {
         for name in [
             "together",
             "venice",
@@ -4088,6 +4104,14 @@ mod cache_extension_regressions {
 
     #[tokio::test]
     async fn aihubmix_signed_json_and_sse_survive_canonical_disk_history_and_next_tool_request() {
+        crate::attachments::runtime::with_async_authority_scope(
+            "aihubmix-replay-fixture".into(),
+            aihubmix_signed_round_trip_fixture(),
+        )
+        .await;
+    }
+
+    async fn aihubmix_signed_round_trip_fixture() {
         let p = provider("aihubmix", "a");
         let details = json!({"type":"thinking","thinking":"look up","signature":"sig-part-two","vendor":{"opaque":true}});
         let call =

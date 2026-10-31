@@ -41,7 +41,7 @@ async fn wire_server() -> (
             let tx = tx.clone();
             async move {
                 tx.send(body).unwrap();
-                axum::Json(json!({"id":"response","status":"completed","model":"gpt-6.1-sol",
+                axum::Json(json!({"id":"response","status":"completed","model":"gpt-5.1",
                     "output":[{"type":"message","id":"answer","role":"assistant","status":"completed",
                     "phase":"final_answer","content":[{"type":"output_text","text":"done","annotations":[]}]}]}))
             }
@@ -62,10 +62,17 @@ async fn retry_resolution_between_call_and_result_survives_cold_accepted_and_res
         let (root, mut wire, server) = wire_server().await;
         let mut input_types = ProviderInputCapabilities::disabled_for_all_file_types();
         input_types.image = InputTypeSupport::data_url_inline_only();
-        let provider = Arc::new(
+        // Use a catalogued vision model so media admission and accounting run.
+        let adapter = Arc::new(
             ResponsesApiCompatibleProvider::new("openai", root, "fixture", AuthStyle::Bearer)
                 .with_input_capabilities(input_types),
         );
+        let replay_authority = adapter.authority_fingerprint().unwrap().to_owned();
+        let wire_providers =
+            pioneer_provider::ProviderRegistry::with_provider("wire-fixture", adapter);
+        let provider = wire_providers
+            .get_or_create_for_workspace("ws", "wire-fixture")
+            .unwrap();
         let f = fixture_with_canonical_payload(
             serde_json::to_string(&resolved(ToolRetryResolution::Succeeded)).unwrap(),
             vec![],
@@ -106,9 +113,9 @@ async fn retry_resolution_between_call_and_result_survives_cold_accepted_and_res
         let mut assistant = ChatMessage::assistant_tool_calls(None::<String>, calls.clone());
         assistant.provider_replay_state = Some(ProviderReplayState::for_model(
             "openai",
-            "gpt-6.1-sol",
+            "gpt-5.1",
             json!({
-                "wire_api":"responses","schema_version":1,"authority_scope":provider.authority_fingerprint().unwrap(),"output":output
+                "wire_api":"responses","schema_version":1,"authority_scope":replay_authority,"output":output
             }),
         ));
         let round = CanonicalProviderRoundEnvelope {
@@ -213,7 +220,7 @@ async fn retry_resolution_between_call_and_result_survives_cold_accepted_and_res
         .await
         .unwrap();
         let request = |messages| ChatRequest {
-            model: "gpt-6.1-sol".into(),
+            model: "gpt-5.1".into(),
             messages,
             temperature: None,
             max_tokens: Some(100),

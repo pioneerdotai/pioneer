@@ -6091,7 +6091,7 @@ mod tests {
                 Some(ProviderFailureClass::ContextTooLarge),
                 Some(403),
                 ProviderFailureClass::AuthOrPermission,
-                RecoveryAction::RefreshProviderAuth,
+                RecoveryAction::RetryWithBackoff,
             ),
             (
                 misleading,

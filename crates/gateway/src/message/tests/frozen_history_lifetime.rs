@@ -1144,8 +1144,8 @@ async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_re
             use_summary
         );
         assert!(
-            wire.find("IN_BRANCH_SECOND").unwrap() < wire.find("input child").unwrap(),
-            "the admitted parent section must precede the child's own line"
+            wire.find("input child").unwrap() < wire.find("IN_BRANCH_SECOND").unwrap(),
+            "the earlier child input must precede the later admitted parent response"
         );
         let cli =
             f.h.processor
