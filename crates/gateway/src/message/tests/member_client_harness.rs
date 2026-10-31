@@ -442,6 +442,7 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
             &child_root,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: child_parent_turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,

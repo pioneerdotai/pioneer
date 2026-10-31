@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnWorkOwner",
+  "description": "Canonical work ownership, persisted at admission independently of authorship.",
+  "type": "string",
+  "enum": [
+    "turn",
+    "detached_task"
+  ]
+}

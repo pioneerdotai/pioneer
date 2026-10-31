@@ -1327,7 +1327,14 @@ pub fn apply_conversation_event_to_semantic_timeline(
         | ConversationEvent::TurnFailed { thread_id, turn }
         | ConversationEvent::TurnBlocked {
             thread_id, turn, ..
-        } => retain_task_run_context(state.thread_mut(thread_id.clone()), workspace_id, turn),
+        } => {
+            let thread = state.thread_mut(thread_id.clone());
+            if turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask {
+                project_admission_turn(thread, workspace_id, turn, now_unix_ms)
+            } else {
+                retain_task_run_context(thread, workspace_id, turn)
+            }
+        }
         _ => false,
     };
     let changed = match event {
@@ -6245,12 +6252,13 @@ mod tests {
             },
             20,
         ));
-        assert!(!apply_conversation_event_to_semantic_timeline(
+        assert!(apply_conversation_event_to_semantic_timeline(
             &mut state,
             "workspace_a",
             &ConversationEvent::TurnStarted {
                 thread_id: "thread_a".to_owned(),
                 turn: Turn {
+                    work_owner: pioneer_protocol::TurnWorkOwner::DetachedTask,
                     id: turn_id.to_owned(),
                     status: TurnStatus::InProgress,
                     turn_kind: TurnKind::Conversation,
@@ -6278,6 +6286,65 @@ mod tests {
                 .is_none(),
             "turn/start acknowledgement must not resurrect the suppressed foreground work row"
         );
+    }
+
+    #[test]
+    fn persisted_agent_admission_suppresses_live_and_recovered_work_without_hiding_old_direct_turns()
+     {
+        for owner in [
+            pioneer_protocol::TurnWorkOwner::Turn,
+            pioneer_protocol::TurnWorkOwner::DetachedTask,
+        ] {
+            let turn: Turn = serde_json::from_value(serde_json::json!({
+                "id":"agent-parent", "status":"InProgress", "mode":"Agent", "work_owner":owner,
+                "author":{"actor":{"kind":"agent_execution","id":"E0000000000000000000A"},"display_name":"Agent","nickname":"agent"},
+                "permission_profile":pioneer_protocol::default_turn_permission_profile_snapshot(),
+            })).unwrap();
+            let mut live = SemanticTimelineState::default();
+            let event = ConversationEvent::TurnStarted {
+                thread_id: "thread_a".into(),
+                turn: turn.clone(),
+            };
+            apply_conversation_event_to_semantic_timeline(&mut live, "workspace_a", &event, 10);
+            apply_conversation_event_to_semantic_timeline(&mut live, "workspace_a", &event, 11);
+            let block = live
+                .thread("thread_a")
+                .unwrap()
+                .top_level
+                .block("turn:agent-parent:work");
+            assert_eq!(
+                block.is_some(),
+                owner == pioneer_protocol::TurnWorkOwner::Turn
+            );
+            let mut recovered = SemanticTimelineState::default();
+            // A reconnect can receive cached ordinary work before the full
+            // snapshot. The saved owner removes that stale projection.
+            let mut old = turn.clone();
+            old.work_owner = pioneer_protocol::TurnWorkOwner::Turn;
+            apply_conversation_event_to_semantic_timeline(
+                &mut recovered,
+                "workspace_a",
+                &ConversationEvent::TurnStarted {
+                    thread_id: "thread_a".into(),
+                    turn: old,
+                },
+                1,
+            );
+            let snapshot: pioneer_protocol::Thread = serde_json::from_value(serde_json::json!({
+                "workspace_id":"workspace_a","id":"thread_a","preview":"","mode":"Agent","model":"fixture","model_provider":"fixture",
+                "created_at":1,"updated_at":2,"status":"Active","origin_kind":"collaborative","sidebar_visibility":"visible","turns":[turn]
+            })).unwrap();
+            apply_thread_context_to_semantic_timeline(&mut recovered, &snapshot);
+            assert_eq!(
+                recovered
+                    .thread("thread_a")
+                    .unwrap()
+                    .top_level
+                    .block("turn:agent-parent:work")
+                    .is_some(),
+                owner == pioneer_protocol::TurnWorkOwner::Turn
+            );
+        }
     }
 
     #[test]
@@ -6311,6 +6378,7 @@ mod tests {
             &ConversationEvent::TurnCompleted {
                 thread_id: "thread_a".to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: "turn_message_only".to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
@@ -7276,6 +7344,7 @@ mod tests {
             &ConversationEvent::TurnFailed {
                 thread_id: "thread_a".to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: "turn_a".to_owned(),
                     status: TurnStatus::Failed,
                     turn_kind: pioneer_protocol::TurnKind::Conversation,
@@ -7361,6 +7430,7 @@ mod tests {
             &ConversationEvent::TurnFailed {
                 thread_id: "thread_a".to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: "turn_a".to_owned(),
                     status: TurnStatus::Failed,
                     turn_kind: pioneer_protocol::TurnKind::Conversation,
@@ -7926,6 +7996,7 @@ mod tests {
 
     fn detached_task_turn(turn_id: &str) -> Turn {
         Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,

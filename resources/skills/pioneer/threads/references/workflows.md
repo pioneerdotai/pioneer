@@ -82,7 +82,7 @@ Create using the sequence above. From that confirmed creation result select the 
 {"targetOptionId":"CREATION_RESULT_START_TARGET_ID","input":[{"type":"text","text":"Review the supplied question and explain the findings in this conversation."}]}
 ```
 
-No launch catalog is needed solely for inheritance. `targetOptionId` is still required. The input itself carries the task text; do not add Task fields such as goal or instructions. Accepted/queued start confirms admission/queuing, not a completed answer. This operation creates no durable Task and no attached review candidate.
+No launch catalog is needed solely for inheritance. `targetOptionId` is still required. The input itself carries the task text; do not add Task fields such as goal or instructions. Accepted/queued start confirms admission/queuing, not a completed answer. The server follows the target thread’s execution rules. Collaborative conversations use an internal detached Task with normal result delivery; an executable TaskRun child continues in that same child without another Task or child thread. This creates no attached review candidate. Do not call task_create yourself or add Task goal/instructions fields to the Threads payload.
 
 ## Explicit Identity, Executor, Model, And Reasoning
 

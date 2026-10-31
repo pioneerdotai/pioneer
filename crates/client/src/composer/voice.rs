@@ -1096,6 +1096,7 @@ mod tests {
             workspace_id: context.workspace_id.clone(),
             thread_id: context.thread_id.clone(),
             turn: Turn {
+                work_owner: Default::default(),
                 id: context.turn_id.clone(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,

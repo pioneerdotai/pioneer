@@ -28882,6 +28882,7 @@ fn service_events_leave_current_summarizer_material() {
         workspace_id: "ws".into(),
         thread_id: "thread".into(),
         turn: pioneer_protocol::Turn {
+            work_owner: Default::default(),
             id: "turn".into(),
             status: TurnStatus::Completed,
             turn_kind: Default::default(),

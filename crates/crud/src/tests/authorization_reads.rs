@@ -81,6 +81,21 @@ async fn authorization_scalar_and_binding_reads_preserve_absence_and_reject_corr
     assert_eq!(binding.id, "turn");
     assert_eq!(binding.turn_kind, TurnKind::Conversation);
     assert_eq!(binding.origin, pioneer_protocol::TurnOrigin::User);
+    assert_eq!(binding.work_owner, TurnWorkOwner::Turn);
+    store
+        .connection
+        .execute_unprepared("UPDATE turn SET work_owner='detached_task' WHERE id='turn'")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_turn_execution_binding("thread", "turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .work_owner,
+        TurnWorkOwner::DetachedTask
+    );
     assert_eq!(
         store
             .get_turn_execution_status("thread", "turn")
@@ -92,14 +107,23 @@ async fn authorization_scalar_and_binding_reads_preserve_absence_and_reject_corr
         ("status", "in_progress"),
         ("turn_kind", "conversation"),
         ("origin", "user"),
+        ("work_owner", "detached_task"),
     ] {
-        store
-            .connection
-            .execute_unprepared(&format!(
-                "UPDATE turn SET {column}='unknown' WHERE id='turn'"
-            ))
+        // Seed legacy corruption on one pinned connection, then restore CHECK
+        // enforcement before exercising the authorization reader.
+        let tx = store.connection.begin().await.unwrap();
+        tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
             .await
             .unwrap();
+        tx.execute_unprepared(&format!(
+            "UPDATE turn SET {column}='unknown' WHERE id='turn'"
+        ))
+        .await
+        .unwrap();
+        tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
         assert!(
             store
                 .get_turn_execution_binding("thread", "turn")
@@ -275,7 +299,7 @@ async fn authorization_projections_use_only_required_columns_on_scoped_physical_
         // Count and column assertions detect a second full lookup as well.
         let columns = [
             "\"turn\".\"execution_authorization_context_json\"",
-            "\"turn\".\"id\", \"turn\".\"status\", \"turn\".\"turn_kind\", \"turn\".\"origin\"",
+            "\"turn\".\"id\", \"turn\".\"status\", \"turn\".\"turn_kind\", \"turn\".\"origin\", \"turn\".\"work_owner\"",
             "\"turn\".\"status\"",
             "\"turn\".\"initiated_by_actor_kind\", \"turn\".\"initiated_by_actor_id\"",
             "\"turn\".\"id\", \"turn\".\"thread_id\"",

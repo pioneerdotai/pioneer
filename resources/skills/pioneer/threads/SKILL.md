@@ -16,7 +16,7 @@ Use Threads for conversation discovery, source reading, and permitted conversati
 
 - `thread_create` creates a thread; it does not run a model.
 - `thread_message_send` adds a message; it does not run a model.
-- `threads_turn_start` starts a turn at a permitted destination with agent-authored input. It does not create a durable Task or enter the attached-subagent protocol.
+- `threads_turn_start` starts a turn at a permitted destination with agent-authored input. It follows the target thread’s execution rules: Collaborative conversations use an internal detached Task; an executable TaskRun child continues in that same child thread. This does not enter the attached-subagent protocol.
 
 Tasks and attached subagents have separate skills, `system:pioneer/tasks` and `system:pioneer/subagents`. Do not apply their wait, review, or accept protocol to a thread turn.
 

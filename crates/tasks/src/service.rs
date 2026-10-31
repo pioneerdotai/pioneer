@@ -2333,13 +2333,23 @@ impl TaskService {
         if let Some(action) = context.agent_action_commit.as_mut() {
             let mut response: serde_json::Value =
                 serde_json::from_str(action.receipt_response_json.as_deref().unwrap_or("{}"))?;
-            if response.get("pioneerTaskToolCall").is_some() {
+            let mut outbox: serde_json::Value = serde_json::from_str(&action.outbox_payload_json)?;
+            let detached_start = action.action.action_kind == "start_agent"
+                && outbox
+                    .get("execution_mode")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("detached_task");
+            if response.get("pioneerTaskToolCall").is_some() || detached_start {
                 response["taskCreation"] = serde_json::json!({
                     "taskId": task_id, "triggerId": trigger_id, "runId": immediate_run.as_ref().map(|run| &run.id),
                 });
                 let response = serde_json::to_string(&response)?;
                 action.action_response_json = Some(response.clone());
                 action.receipt_response_json = Some(response);
+            }
+            if detached_start {
+                outbox["task_id"] = serde_json::json!(task_id);
+                action.outbox_payload_json = outbox.to_string();
             }
         }
         let appended = self

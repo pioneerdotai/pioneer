@@ -1571,6 +1571,7 @@ mod tests {
         Turn {
             id: turn_id.to_owned(),
             status,
+            work_owner: Default::default(),
             turn_kind,
             origin,
             mode: Default::default(),

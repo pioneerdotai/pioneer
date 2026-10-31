@@ -9157,6 +9157,7 @@ async fn ensure_task_run_occurrence_turn(
     let occurrence_author = exact_agent_execution_author(processor, execution.id.as_str()).await?;
     let occurrence_actor = occurrence_author.actor.clone();
     let occurrence_turn = Turn {
+        work_owner: Default::default(),
         id: run.id.clone(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::TaskRun,
@@ -13856,6 +13857,7 @@ mod tests {
         candidate_thread.origin_kind = ThreadOriginKind::TaskRun;
         candidate_thread.sidebar_visibility = ThreadSidebarVisibility::Hidden;
         let mut source_turn = Turn {
+            work_owner: pioneer_protocol::TurnWorkOwner::Turn,
             id: candidate_turn.turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,
@@ -14031,6 +14033,7 @@ mod tests {
         thread.origin_kind = ThreadOriginKind::TaskRun;
         thread.sidebar_visibility = ThreadSidebarVisibility::Hidden;
         let turn = Turn {
+            work_owner: pioneer_protocol::TurnWorkOwner::Turn,
             id: review_turn.turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,

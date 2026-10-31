@@ -1804,6 +1804,107 @@ impl RecoveryCoordinator {
         execution: &TurnExecutionRecord,
         now_unix: i64,
     ) -> Result<()> {
+        if let Some((workspace_id, mut turn)) = self
+            .crud_store
+            .get_turn(&execution.thread_id, &execution.turn_id)
+            .await?
+            && turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask
+        {
+            anyhow::ensure!(
+                workspace_id == execution.workspace_id,
+                "detached admission execution scope changed"
+            );
+            if turn.status != TurnStatus::InProgress {
+                return Ok(());
+            }
+            // The ownership CAS has fenced late Task creation in its existing
+            // atomic commit. Read the exact creator binding, never provider state
+            // or a nearby Task, to distinguish the two admission crash windows.
+            let tasks = self
+                .crud_store
+                .list_tasks_created_by_turn(&workspace_id, &execution.thread_id, &execution.turn_id)
+                .await?;
+            if tasks.is_empty() {
+                turn.status = TurnStatus::Failed;
+                turn.error = Some("Gateway replaced before detached Task acceptance".to_owned());
+                return self
+                    .crud_store
+                    .materialize_native_agent_turn_event_owned(
+                        pioneer_crud::CanonicalTurnEventPayload::TurnFailed(
+                            pioneer_protocol::TurnFailedNotification {
+                                workspace_id,
+                                thread_id: execution.thread_id.clone(),
+                                turn,
+                            },
+                        ),
+                        now_unix,
+                        None,
+                        self.turn_execution_owner_id.as_ref(),
+                    )
+                    .await;
+            }
+            anyhow::ensure!(
+                tasks.len() == 1,
+                "detached admission has ambiguous Task ownership"
+            );
+            let task = &tasks[0];
+            let contract = self
+                .crud_store
+                .get_task_actor_contract(&task.id)
+                .await?
+                .context("detached admission Task has no actor contract")?;
+            let launch = &task
+                .metadata
+                .as_ref()
+                .and_then(|m| m.composer_work.as_ref())
+                .context("detached admission Task has no pinned launch")?
+                .launch;
+            anyhow::ensure!(
+                task.owner_kind == pioneer_protocol::TaskOwnerKind::Thread
+                    && task.owner_id.as_deref() == Some(execution.thread_id.as_str())
+                    && task.parent_task_id.is_none()
+                    && task.lifecycle_policy.as_ref().is_some_and(
+                        |p| p.attachment == pioneer_protocol::TaskAttachmentMode::Detached
+                    )
+                    && launch.thread_id == execution.thread_id
+                    && launch.turn_id == execution.turn_id
+                    && contract.task_id == task.id
+                    && contract.workspace_id == workspace_id
+                    && contract.work_graph_root_execution_id.is_none()
+                    && turn
+                        .author
+                        .as_ref()
+                        .is_some_and(|a| a.actor == contract.creator),
+                "detached admission differs from its accepted Task binding"
+            );
+            if matches!(
+                contract.creator,
+                pioneer_protocol::PersistedActorRef::AgentExecution(_)
+            ) {
+                // The Task/action receipt and outbox were committed atomically.
+                // That existing outbox publishes the accepted agent admission.
+                return Ok(());
+            }
+            // User admissions have no agent-action outbox. Accept their terminal
+            // event through the ordinary durable projection/delivery pipeline.
+            turn.status = TurnStatus::Completed;
+            turn.error = None;
+            return self
+                .crud_store
+                .materialize_native_agent_turn_event_owned(
+                    pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(
+                        pioneer_protocol::TurnCompletedNotification {
+                            workspace_id,
+                            thread_id: execution.thread_id.clone(),
+                            turn,
+                        },
+                    ),
+                    now_unix,
+                    None,
+                    self.turn_execution_owner_id.as_ref(),
+                )
+                .await;
+        }
         if execution.executor_kind == TurnExecutorKind::CliRuntime
             && self
                 .crud_store
@@ -6983,6 +7084,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = pioneer_protocol::Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -10243,6 +10345,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = pioneer_protocol::Turn {
+            work_owner: Default::default(),
             id: "turn_terminal_backfill".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -10318,6 +10421,7 @@ mod tests {
                     workspace_id: thread.workspace_id.clone(),
                     thread_id: thread.id.clone(),
                     turn: pioneer_protocol::Turn {
+                        work_owner: Default::default(),
                         id: turn.id.clone(),
                         status: TurnStatus::Completed,
                         turn_kind: Default::default(),
@@ -10387,6 +10491,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = pioneer_protocol::Turn {
+            work_owner: Default::default(),
             id: "turn_timeout_liveness".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
