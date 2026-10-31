@@ -216,6 +216,14 @@ fn event_model_projection(
         Event::TurnExecutionWindowBlocked(value) => {
             Projection::User(format!("Historical execution blocked: {}", value.reason))
         }
+        // Automatic allows are audit receipts, not live model input. Keep the
+        // old projection available when authenticating immutable manifests.
+        Event::TurnPermissionAudit(value)
+            if service_filter
+                && value.event_kind == TurnPermissionAuditEventKind::DecisionAllowed =>
+        {
+            Projection::Omit
+        }
         Event::TurnPermissionAudit(value)
             if matches!(
                 value.event_kind,
@@ -674,7 +682,16 @@ mod tests {
                 failure_signature_fingerprint: "fingerprint".into(),
                 reason: "retry".into(),
             });
-        for event in [completed_turn, retry, scheduled, recovered, tool_scheduled] {
+        let mut allowed = permission(TurnPermissionAuditEventKind::DecisionAllowed);
+        allowed.decision = Some(TurnPermissionAuditDecision::Allow);
+        for event in [
+            completed_turn,
+            retry,
+            scheduled,
+            recovered,
+            tool_scheduled,
+            Event::TurnPermissionAudit(allowed),
+        ] {
             assert!(canonical_event_model_projection(&event).is_omitted());
             assert!(!canonical_event_model_projection_before_service_filter(&event).is_omitted());
             assert_eq!(
