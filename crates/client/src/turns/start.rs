@@ -556,6 +556,7 @@ mod tests {
     #[test]
     fn turn_start_send_success_reduction_accepts_local_turn_and_applies_protocol_turn() {
         let turn = Turn {
+            work_owner: Default::default(),
             id: "turn".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
@@ -643,6 +644,7 @@ mod tests {
     #[test]
     fn completed_turn_start_response_reduces_to_completed_event() {
         let turn = Turn {
+            work_owner: Default::default(),
             id: "turn".to_owned(),
             status: TurnStatus::Completed,
             turn_kind: TurnKind::Conversation,

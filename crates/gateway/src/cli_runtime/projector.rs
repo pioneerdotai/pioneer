@@ -2795,6 +2795,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: context.turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),

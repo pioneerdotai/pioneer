@@ -542,6 +542,7 @@ pub(crate) async fn prepare_completed_history_owned(
             &store,
             Some(processor),
             workspace,
+            thread,
             selection,
         )
         .await?;

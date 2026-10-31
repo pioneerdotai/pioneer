@@ -16,26 +16,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Declares which durable object owns the execution UI associated with a Turn.
-///
-/// This is an immutable admission fact. It must not be inferred later from the
-/// Turn author, send mode, timing, or the eventual presence of a child Task.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnWorkOwner {
-    #[default]
-    Turn,
-    DetachedTask,
-}
-
-impl TurnWorkOwner {
-    pub(crate) const fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Turn => "turn",
-            Self::DetachedTask => "detached_task",
-        }
-    }
-}
+pub use pioneer_protocol::TurnWorkOwner;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalTurnStartedEventPayload {
@@ -128,6 +109,19 @@ impl CanonicalTurnEventPayload {
             Self::TurnFailed(_) => events::TURN_FAILED,
             Self::TurnBlocked(_) => events::TURN_BLOCKED,
         }
+    }
+
+    /// Hydrate the client projection from the immutable persisted owner. This
+    /// only changes a decoded copy; historical canonical payloads stay intact.
+    pub(crate) fn project_work_owner(&mut self, owner: TurnWorkOwner) {
+        let turn = match self {
+            Self::TurnStarted(payload) => &mut payload.turn,
+            Self::TurnCompleted(notification) => &mut notification.turn,
+            Self::TurnFailed(notification) => &mut notification.turn,
+            Self::TurnBlocked(notification) => &mut notification.turn,
+            _ => return,
+        };
+        turn.work_owner = owner;
     }
 
     pub fn thread_id(&self) -> &str {
@@ -274,6 +268,7 @@ mod tests {
             },
             sandbox_mode: SandboxMode::FullAccess,
             turn: Turn {
+                work_owner: Default::default(),
                 id: "turn".to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,

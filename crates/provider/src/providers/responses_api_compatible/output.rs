@@ -52,6 +52,7 @@ pub(super) struct Reducer {
     allowed_tools: Option<std::collections::BTreeSet<String>>,
     choice: Option<crate::ToolChoice>,
     provisional_messages: bool,
+    comparison: Option<crate::prompt_cache::Comparison>,
 }
 impl Reducer {
     pub(super) fn new(
@@ -78,11 +79,20 @@ impl Reducer {
             allowed_tools: None,
             choice: None,
             provisional_messages: false,
+            comparison: None,
         }
     }
     pub(super) fn with_provisional_messages(mut self, enabled: bool) -> Self {
         self.provisional_messages = enabled;
         self
+    }
+    pub(super) fn bind_cache_comparison(
+        &mut self,
+        comparison: Option<crate::prompt_cache::Comparison>,
+    ) {
+        self.usage.prompt_cache_comparison_response_id =
+            comparison.as_ref().and_then(|c| c.response_id.clone());
+        self.comparison = comparison;
     }
     pub(super) fn bind_request(&mut self, request: &crate::ChatRequest) {
         self.allowed_tools = Some(
@@ -124,6 +134,17 @@ impl Reducer {
         .with_reported_model(response["model"].as_str())
         .with_service_tier(response["service_tier"].as_str());
         snapshot.api = Some("responses".into());
+        if self.provider == "vercel-ai-gateway"
+            && let Some(routing) = crate::prompt_cache::gateway_routing(response)
+        {
+            let mut metadata = self
+                .usage
+                .prompt_cache_diagnostics
+                .clone()
+                .unwrap_or_else(|| json!({}));
+            metadata["gateway_routing"] = routing;
+            snapshot.prompt_cache_diagnostics = Some(metadata);
+        }
         self.usage.update(&snapshot);
         Ok(())
     }
@@ -296,14 +317,16 @@ impl Reducer {
                         .is_none_or(|v| v.len() == item.reasoning.len()),
                     "Responses completed reasoning part conflict"
                 );
-                if let (Some(completed), Some(snapshot)) = (
-                    item.raw.get("encrypted_content"),
-                    value.get("encrypted_content"),
-                ) {
-                    ensure!(
-                        completed == snapshot,
-                        "Responses completed reasoning state conflict"
-                    );
+                if !terminal {
+                    if let (Some(completed), Some(snapshot)) = (
+                        item.raw.get("encrypted_content"),
+                        value.get("encrypted_content"),
+                    ) {
+                        ensure!(
+                            completed == snapshot,
+                            "Responses completed reasoning state conflict"
+                        );
+                    }
                 }
             }
         }
@@ -323,6 +346,18 @@ impl Reducer {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("invalid Responses item snapshot"))?
         {
+            // Streaming replay uses the completed reasoning item from
+            // response.output_item.done. A terminal response can carry a
+            // different ciphertext for the same item; keep the completed one.
+            // https://developers.openai.com/api/reference/resources/responses/streaming-events#response.output_item.added
+            if key == "encrypted_content"
+                && kind == "reasoning"
+                && terminal
+                && item.done
+                && merged.get(key).is_some()
+            {
+                continue;
+            }
             merged[key] = value.clone();
         }
         if merged.get("phase").is_none() {
@@ -548,6 +583,19 @@ impl Reducer {
     pub(super) fn snapshot(&mut self, response: &Value) -> Result<Vec<StreamChunk>> {
         ensure!(self.terminal.is_none(), "Responses duplicate terminal");
         self.observe(response)?;
+        if let Some(mut diagnostics) =
+            crate::prompt_cache::diagnostics(&response["prompt_cache_diagnostics"])
+        {
+            if let Some(routing) = self
+                .usage
+                .prompt_cache_diagnostics
+                .as_ref()
+                .and_then(|v| v.get("gateway_routing"))
+            {
+                diagnostics["gateway_routing"] = routing.clone();
+            }
+            self.usage.prompt_cache_diagnostics = Some(diagnostics);
+        }
         let status = response["status"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing Responses status"))?;
@@ -645,6 +693,11 @@ impl Reducer {
         self.bounds()?;
         let mut chunks = self.publish()?;
         self.collector.finish()?;
+        if status == "completed" && outcome.permits_success() {
+            if let Some(comparison) = &self.comparison {
+                comparison.completed(response);
+            }
+        }
         if !self.calls.is_empty() {
             chunks.push(StreamChunk::tool_calls(self.calls.clone()));
         }

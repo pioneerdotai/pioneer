@@ -139,7 +139,8 @@ async fn agent_action_outbox_poison_payloads_keep_retry_contract_and_process_rem
     assert!(bad.next_attempt_at.unwrap() >= now + chrono::Duration::seconds(30));
     assert_eq!(
         bad.last_error.as_deref(),
-        Some("outbox_start_integrity_rejected")
+        // Undecodable JSON cannot prove a rejected StartAgent binding.
+        Some("outbox_start_outcome_unknown")
     );
     let final_row = agent_action_outbox::Entity::find_by_id("b-final-invalid-start")
         .one(&database)

@@ -38,6 +38,7 @@ struct JournalProvider {
 pub(crate) struct Call {
     store: CrudStore,
     record: ProviderUsageObservation,
+    connection: Option<String>,
 }
 impl Call {
     pub(crate) async fn start(
@@ -47,9 +48,22 @@ impl Call {
         owner: &str,
         usage: &TokenUsage,
     ) -> Result<Self> {
+        Self::start_with_connection(store, workspace, operation, owner, usage, None).await
+    }
+    async fn start_with_connection(
+        store: &CrudStore,
+        workspace: &str,
+        operation: &str,
+        owner: &str,
+        usage: &TokenUsage,
+        connection: Option<&str>,
+    ) -> Result<Self> {
         let now = chrono::Utc::now().timestamp();
         let call = Self {
             store: store.clone(),
+            connection: connection
+                .filter(|value| !value.is_empty() && value.len() <= 256)
+                .map(str::to_owned),
             record: ProviderUsageObservation {
                 id: pioneer_protocol::generate_id(21),
                 workspace_id: workspace.into(),
@@ -67,7 +81,16 @@ impl Call {
     pub(crate) async fn record(&self, status: &str, usage: &TokenUsage) -> Result<()> {
         let mut record = self.record.clone();
         record.status = status.into();
-        record.usage_json = serde_json::to_string(usage)?;
+        let mut value = serde_json::to_value(usage)?;
+        if let Some(connection) = &self.connection {
+            // Internal persisted envelope metadata, not model-provided usage or
+            // a public TokenUsage field. Reapply on every cumulative/terminal
+            // write so enrichment cannot erase or replace call-owned identity.
+            value["_pioneer_journal"] = serde_json::json!({
+                "schema_version":1, "connection_id":connection,
+            });
+        }
+        record.usage_json = serde_json::to_string(&value)?;
         record.updated_at = chrono::Utc::now().timestamp();
         self.store.record_provider_usage(record).await
     }
@@ -84,12 +107,13 @@ impl JournalProvider {
             route: profile.route,
             ..Default::default()
         };
-        let call = Call::start(
+        let call = Call::start_with_connection(
             &self.store,
             &self.workspace,
             self.operation,
             &self.owner,
             &usage,
+            self.authority_fingerprint(),
         )
         .await?;
         Ok((call, usage))
@@ -151,7 +175,17 @@ impl Provider for JournalProvider {
     }
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let (call, mut usage) = self.start(&request).await?;
-        let response = self.inner.chat(request).await;
+        let response = if self.operation == "summary" {
+            pioneer_provider::prompt_cache::scope(
+                &self.workspace,
+                &self.owner,
+                "compaction",
+                self.inner.chat(request),
+            )
+            .await
+        } else {
+            self.inner.chat(request).await
+        };
         if let Ok(response) = &response {
             if let Some(snapshot) = &response.usage {
                 usage.update(snapshot);

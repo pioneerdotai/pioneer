@@ -276,6 +276,7 @@ pub struct TurnExecutionBinding {
     pub id: String,
     pub turn_kind: TurnKind,
     pub origin: pioneer_protocol::TurnOrigin,
+    pub work_owner: TurnWorkOwner,
 }
 
 pub async fn find_turn_execution_binding<C: ConnectionTrait>(
@@ -291,12 +292,13 @@ pub async fn find_turn_execution_binding<C: ConnectionTrait>(
             turn::Column::Status,
             turn::Column::TurnKind,
             turn::Column::Origin,
+            turn::Column::WorkOwner,
         ])
-        .into_tuple::<(String, String, String, String)>()
+        .into_tuple::<(String, String, String, String, String)>()
         .one(db)
         .await
         .context("failed to query turn execution binding")?;
-    row.map(|(id, status, kind, origin)| {
+    row.map(|(id, status, kind, origin, work_owner)| {
         // Preserve the full Turn decoder's rejection of an unknown status even
         // for ancestor bindings, whose liveness is not otherwise required.
         crate::convention::turn_status_from_db(&status)
@@ -307,6 +309,7 @@ pub async fn find_turn_execution_binding<C: ConnectionTrait>(
                 .context("unknown execution binding turn kind")?,
             origin: crate::convention::turn_origin_from_db(&origin)
                 .context("unknown execution binding turn origin")?,
+            work_owner: TurnWorkOwner::from_db_str(&work_owner).map_err(anyhow::Error::msg)?,
         })
     })
     .transpose()
@@ -2474,6 +2477,7 @@ mod tests {
         let now = fixed_test_datetime();
         let actor = PersistedActorRef::System;
         let message = Turn {
+            work_owner: Default::default(),
             id: "T00000000000000000001".to_owned(),
             status: TurnStatus::Completed,
             turn_kind: TurnKind::Conversation,

@@ -29,6 +29,224 @@ fn message(id: &str, phase: Value, text: &str) -> Value {
 fn snapshot(output: Vec<Value>) -> Value {
     json!({"id":"resp_synthetic","status":"completed","model":"gpt-6.1-sol","output":output,"usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":80},"output_tokens_details":{"reasoning_tokens":12},"total_tokens":120}})
 }
+
+#[tokio::test]
+async fn cache_diagnostics_follow_conversation_and_purpose_at_http_boundary() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let root = format!("http://{}/v1", listener.local_addr().unwrap());
+    let workspace = root.clone();
+    let expected = [
+        None,
+        None,
+        Some("resp_diag_0"),
+        None,
+        Some("resp_diag_2"),
+        Some("resp_diag_2"),
+        Some("resp_diag_1"),
+        None,
+        None,
+        Some("resp_diag_8"),
+    ];
+    let server = tokio::spawn(async move {
+        for (index, expected) in expected.into_iter().enumerate() {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let (offset, size) = loop {
+                let mut buf = [0; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buf[..n]);
+                if let Some(i) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&bytes[..i]).to_lowercase();
+                    let size = head
+                        .lines()
+                        .find_map(|s| s.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap();
+                    assert!(head.starts_with("post /v1/responses "));
+                    break (i + 4, size);
+                }
+            };
+            while bytes.len() < offset + size {
+                let mut buf = [0; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            let body: Value = serde_json::from_slice(&bytes[offset..offset + size]).unwrap();
+            assert_eq!(
+                body["prompt_cache_options"]["comparison_response_id"].as_str(),
+                expected
+            );
+            if expected.is_none() {
+                assert!(body.get("prompt_cache_options").is_none());
+            }
+            assert!(body.get("previous_response_id").is_none());
+            assert_eq!(
+                body["input"].as_array().unwrap().last().unwrap()["role"],
+                "user"
+            );
+            let mut response = snapshot(vec![message("m", json!("final_answer"), "answer")]);
+            response["id"] = json!(format!("resp_diag_{index}"));
+            response["model"] = body["model"].clone();
+            response["prompt_cache_diagnostics"] = match index {
+                2 => {
+                    json!({"type":"cache_miss","reason":"input_changed","comparison_reusable_tokens":999,"cache_missed_tokens":999})
+                }
+                4 => json!({"type":"unavailable"}),
+                5 => json!({"type":"comparison_response_not_found"}),
+                6 => json!({"type":"cache_hit"}),
+                _ => Value::Null,
+            };
+            if index == 4 {
+                response["status"] = json!("incomplete");
+                response["incomplete_details"] = json!({"reason":"max_output_tokens"});
+            }
+            let stream = body["stream"] == true;
+            let payload = if stream {
+                format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.completed","response":response})
+                )
+            } else {
+                response.to_string()
+            };
+            let content_type = if stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let mut inherited = None;
+    for index in 0..10 {
+        let provider: Box<dyn Provider> = if index >= 8 {
+            Box::new(crate::providers::OpenAiProvider::with_base_url(
+                "fixture", &root,
+            ))
+        } else {
+            Box::new(ResponsesApiCompatibleProvider::new(
+                "gateway-proxy",
+                &root,
+                if index == 7 { "other-key" } else { "fixture" },
+                AuthStyle::Bearer,
+            ))
+        };
+        let mut req = request();
+        if index == 3 {
+            let mut previous = ChatMessage::assistant("answer");
+            previous.provider_replay_state = inherited.clone();
+            req.messages.insert(0, previous);
+        }
+        if index == 5 {
+            req.model = "gpt-6-luna".into();
+        }
+        let owner = if index == 3 {
+            "attached-child"
+        } else {
+            "conversation"
+        };
+        let purpose = if matches!(index, 1 | 6) {
+            "preflight"
+        } else {
+            "main"
+        };
+        let execution = format!("execution-{index}");
+        let operation = crate::prompt_cache::conversation_scope(
+            workspace.clone(),
+            owner.into(),
+            crate::prompt_cache::scope(&workspace, &execution, purpose, async {
+                if matches!(index, 1 | 2 | 5 | 9) {
+                    let mut stream = provider.stream_chat(req).await.unwrap();
+                    let mut usage = crate::TokenUsage::default();
+                    let mut replay = None;
+                    while let Some(chunk) = stream.next().await {
+                        let chunk = chunk.unwrap();
+                        if let Some(snapshot) = chunk.usage {
+                            usage.update(&snapshot);
+                        }
+                        if chunk.provider_replay_state.is_some() {
+                            replay = chunk.provider_replay_state;
+                        }
+                    }
+                    (usage, replay)
+                } else {
+                    let response = provider.chat(req).await.unwrap();
+                    assert_eq!(response.text, "answer");
+                    (response.usage.unwrap(), response.provider_replay_state)
+                }
+            }),
+        );
+        let (usage, replay) = crate::attachments::runtime::with_async_authority_scope(
+            provider.authority_fingerprint().unwrap().to_owned(),
+            operation,
+        )
+        .await;
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
+        let stored: crate::TokenUsage =
+            serde_json::from_value(serde_json::to_value(&usage).unwrap()).unwrap();
+        assert_eq!(stored, usage);
+        match index {
+            2 => {
+                assert_eq!(
+                    usage.prompt_cache_comparison_response_id.as_deref(),
+                    Some("resp_diag_0")
+                );
+                assert_eq!(
+                    usage.prompt_cache_diagnostics.as_ref().unwrap()["cache_missed_tokens"],
+                    999
+                );
+                inherited = replay;
+            }
+            4 => assert_eq!(
+                usage.prompt_cache_diagnostics.as_ref().unwrap()["type"],
+                "unavailable"
+            ),
+            5 => assert_eq!(
+                usage.prompt_cache_diagnostics.as_ref().unwrap()["type"],
+                "comparison_response_not_found"
+            ),
+            6 => assert_eq!(
+                usage.prompt_cache_diagnostics.as_ref().unwrap()["type"],
+                "cache_hit"
+            ),
+            8 => assert!(usage.prompt_cache_comparison_response_id.is_none()),
+            9 => assert_eq!(
+                usage.prompt_cache_comparison_response_id.as_deref(),
+                Some("resp_diag_8")
+            ),
+            _ => {}
+        }
+    }
+    server.await.unwrap();
+}
+
+#[test]
+fn malformed_cache_diagnostics_do_not_fail_responses_or_change_usage() {
+    for diagnostic in [
+        Value::Null,
+        json!([]),
+        json!({"type":"future_kind"}),
+        json!({"type":"cache_miss","reason":"private prompt text","cache_missed_tokens":-1,"comparison_reusable_tokens":true,"private":"payload"}),
+    ] {
+        let mut value = snapshot(vec![message("m", json!("final_answer"), "answer")]);
+        value["prompt_cache_diagnostics"] = diagnostic;
+        let mut r = reducer();
+        r.snapshot(&value).unwrap();
+        let response = r.response().unwrap();
+        assert_eq!(response.text, "answer");
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
+        if let Some(diagnostic) = usage.prompt_cache_diagnostics {
+            assert_eq!(diagnostic, json!({"type":"cache_miss"}));
+        }
+    }
+}
 fn reducer() -> Reducer {
     reducer_for("openai")
 }
@@ -407,6 +625,17 @@ async fn truncated_streams_and_every_byte_split_use_existing_sse_framing() {
             .collect::<Vec<_>>()
             .await;
         assert!(chunks.last().unwrap().is_err());
+        let error = chunks.last().unwrap().as_ref().unwrap_err();
+        assert!(crate::failure::provider_stream_incomplete(error).is_some());
+        let facts = super::classify_failure(error).unwrap();
+        assert_eq!(
+            facts.class,
+            pioneer_protocol::ProviderFailureClass::StreamTruncated
+        );
+        let raw = facts.raw_response.unwrap();
+        assert_eq!(raw.stream_context.as_deref(), Some(wire));
+        assert!(raw.truncated);
+        assert!(raw.processing_error.is_some());
         assert!(!chunks.iter().any(|c| c.as_ref().is_ok_and(|c| c.is_final)));
     }
     let value = json!({"type":"response.completed","response":snapshot(vec![message("m",json!("final_answer"),"Привет")])});
@@ -513,7 +742,7 @@ async fn generic_root_auth_profiles_and_openai_facade_dispatch_real_http() {
                 "authorization: bearer fixture"
             }));
             let body: Value = serde_json::from_slice(&bytes[offset..offset + size]).unwrap();
-            assert_eq!(body["store"], false);
+            assert_eq!(body["store"], true);
             assert_eq!(body["truncation"], "disabled");
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
             assert_eq!(body["max_output_tokens"], 100);
@@ -1333,25 +1562,246 @@ async fn registry_audio_text_continuation_records_actual_chat_route() {
     }
 }
 
-#[test]
-fn replay_uses_input_supported_message_fields_and_preserves_native_phase() {
-    for phase in [Value::Null, json!("commentary"), json!("final_answer")] {
-        let mut item = message("msg-original", phase.clone(), "readable");
-        item["content"][0]["annotations"] = json!([{"type":"synthetic_annotation"}]);
-        let input = replay::input_items(&[item.clone()]).unwrap();
-        assert_eq!(input[0]["phase"], phase);
-        assert_eq!(
-            input[0]["content"][0],
-            json!({"type":"input_text","text":"readable"})
+#[tokio::test]
+async fn assistant_history_preserves_output_parts_and_plain_text_in_rendered_requests() {
+    let operation = async {
+        let provider = ResponsesApiCompatibleProvider::new(
+            "openai",
+            "https://synthetic.invalid",
+            "fixture",
+            AuthStyle::Bearer,
         );
-        assert!(input[0].get("id").is_none());
-        assert!(input[0].get("status").is_none());
-        item.as_object_mut().unwrap().remove("phase");
-        assert!(
-            replay::input_items(&[item]).unwrap()[0]
-                .get("phase")
-                .is_none()
+        for phase in [
+            None,
+            Some(Value::Null),
+            Some(json!("commentary")),
+            Some(json!("final_answer")),
+        ] {
+            let mut item = message("msg-original", Value::Null, "readable");
+            item["content"] = json!([
+                {"type":"output_text","text":"readable","annotations":[
+                    {"type":"url_citation","start_index":0,"end_index":8,"title":"Fixture","url":"https://example.com"}
+                ],"logprobs":[]},
+                {"type":"output_text","text":"more text"},
+                {"type":"refusal","refusal":"Cannot help"}
+            ]);
+            match &phase {
+                Some(phase) => item["phase"] = phase.clone(),
+                None => {
+                    item.as_object_mut().unwrap().remove("phase");
+                }
+            }
+            let mut expected = item.clone();
+            expected["content"][1]["annotations"] = json!([]);
+            let mut req = request();
+            let mut assistant = ChatMessage::assistant("common aggregate must not be duplicated");
+            assistant.provider_replay_state = Some(ProviderReplayState::for_model(
+                provider.name(),
+                &req.model,
+                json!({"schema_version":1,"wire_api":"responses","authority_scope":provider.authority,"output":[item]}),
+            ));
+            req.messages = vec![
+                ChatMessage::user("before"),
+                assistant,
+                ChatMessage::user("continue"),
+            ];
+            let prepared = provider
+                .prepare(req, &provider.capabilities())
+                .await
+                .unwrap();
+            for stream in [false, true] {
+                let body = provider.render(&prepared, stream).unwrap();
+                let input = body["input"].as_array().unwrap();
+                assert_eq!(input.len(), 3);
+                assert_eq!(input[1], expected);
+                assert_eq!(input[0]["content"][0]["type"], "input_text");
+                assert_eq!(input[2]["content"][0]["type"], "input_text");
+                assert!(!body.to_string().contains("common aggregate"));
+            }
+            if phase.is_none() {
+                let mut nullable = prepared.request.clone();
+                let part = &mut nullable.messages[1]
+                    .provider_replay_state
+                    .as_mut()
+                    .unwrap()
+                    .payload["output"][0]["content"][0];
+                part["annotations"] = Value::Null;
+                part["logprobs"] = Value::Null;
+                let nullable = provider
+                    .prepare(nullable, &provider.capabilities())
+                    .await
+                    .unwrap();
+                let body = provider.render(&nullable, false).unwrap();
+                assert_eq!(body["input"][1]["content"][0]["annotations"], json!([]));
+                assert!(body["input"][1]["content"][0].get("logprobs").is_none());
+                for field in ["annotations", "logprobs"] {
+                    let mut invalid = prepared.request.clone();
+                    invalid.messages[1]
+                        .provider_replay_state
+                        .as_mut()
+                        .unwrap()
+                        .payload["output"][0]["content"][0][field] =
+                        json!("invalid metadata shape");
+                    assert!(
+                        provider
+                            .prepare(invalid, &provider.capabilities())
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+        }
+        let mut req = request();
+        let mut assistant = ChatMessage::assistant("previous answer");
+        assistant.reasoning_content = Some("readable reasoning".into());
+        req.messages = vec![
+            ChatMessage::user("before"),
+            assistant,
+            ChatMessage::user("continue"),
+        ];
+        let prepared = provider
+            .prepare(req, &provider.capabilities())
+            .await
+            .unwrap();
+        for stream in [false, true] {
+            let body = provider.render(&prepared, stream).unwrap();
+            let input = body["input"].as_array().unwrap();
+            assert_eq!(input.len(), 4);
+            assert_eq!(
+                input[1],
+                json!({"role":"assistant","content":"[Historical assistant reasoning]\nreadable reasoning"})
+            );
+            assert_eq!(
+                input[2],
+                json!({"role":"assistant","content":"previous answer"})
+            );
+            assert_eq!(input[0]["content"][0]["type"], "input_text");
+            assert_eq!(input[3]["content"][0]["type"], "input_text");
+        }
+    };
+    crate::attachments::runtime::with_async_authority_scope(
+        "responses-history-fixture".into(),
+        operation,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn responses_output_caps_do_not_require_model_specific_control_metadata() {
+    crate::attachments::runtime::with_async_authority_scope(
+        "responses-cap-fixture".into(),
+        async {
+            for name in ["openai", "synthetic-responses", "vercel-ai-gateway"] {
+                let provider = ResponsesApiCompatibleProvider::new(
+                    name,
+                    "https://synthetic.invalid",
+                    "fixture",
+                    AuthStyle::Bearer,
+                );
+                let mut req = request();
+                req.model = "unlisted-cap-fixture".into();
+                req.tools = None;
+                req.tool_choice = None;
+                req.max_tokens = Some(123);
+                let budget = provider.prepare_input_budget(req.clone()).await.unwrap();
+                let prepared = provider
+                    .prepare(budget.request, &provider.capabilities())
+                    .await
+                    .unwrap();
+                for stream in [false, true] {
+                    let body = provider.render(&prepared, stream).unwrap();
+                    assert_eq!(body["max_output_tokens"], 123);
+                    assert!(body.get("reasoning").is_none());
+                    assert!(body.get("temperature").is_none());
+                }
+                req.max_tokens = Some(0);
+                assert!(provider.prepare_input_budget(req.clone()).await.is_err());
+                assert!(
+                    provider
+                        .prepare(req.clone(), &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+                req.max_tokens = None;
+                let prepared = provider
+                    .prepare(req.clone(), &provider.capabilities())
+                    .await
+                    .unwrap();
+                assert!(
+                    provider
+                        .render(&prepared, false)
+                        .unwrap()
+                        .get("max_output_tokens")
+                        .is_none()
+                );
+                req.reasoning = Some(crate::ReasoningConfig::Effort(crate::ReasoningEffort::High));
+                assert!(
+                    provider
+                        .prepare(req.clone(), &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+                req.reasoning = None;
+                req.temperature = Some(0.5);
+                let prepared = provider
+                    .prepare(req, &provider.capabilities())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    provider.render(&prepared, false).unwrap()["temperature"],
+                    0.5
+                );
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn responses_sampling_rejects_non_finite_and_out_of_range_values_for_all_services() {
+    use crate::attachments::{admission::AdmissionState, regression::scoped};
+    use std::sync::Arc;
+    for name in ["openai", "synthetic-responses", "vercel-ai-gateway"] {
+        let provider = ResponsesApiCompatibleProvider::new(
+            name,
+            "https://synthetic.invalid",
+            "fixture",
+            AuthStyle::Bearer,
         );
+        let mut req = request();
+        req.model = "gpt-4.1-sampling-fixture".into();
+        req.tools = None;
+        req.tool_choice = None;
+        let state = Arc::new(AdmissionState::for_test(Arc::new(compatible_catalog(
+            name,
+            &req.model,
+            json!({"reasoning":false,"compat":{"supportsTemperature":true}}),
+        ))));
+        scoped(state, async {
+            for temperature in [0.0, 2.0] {
+                req.temperature = Some(temperature);
+                let budget = provider.prepare_input_budget(req.clone()).await.unwrap();
+                let prepared = provider
+                    .prepare(budget.request, &provider.capabilities())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    provider.render(&prepared, false).unwrap()["temperature"],
+                    json!(temperature)
+                );
+            }
+            for temperature in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.1, 2.1] {
+                req.temperature = Some(temperature);
+                assert!(provider.prepare_input_budget(req.clone()).await.is_err());
+                assert!(
+                    provider
+                        .prepare(req.clone(), &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+            }
+        })
+        .await;
     }
 }
 
@@ -1690,6 +2140,7 @@ async fn generic_responses_replay_survives_budget_media_and_render_for_chat_poli
                             "SYNTHETIC_COMPLETED_CIPHERTEXT"
                         );
                         assert_eq!(input[1]["phase"], "commentary");
+                        assert_eq!(input[1]["content"][0]["type"], "output_text");
                         assert_eq!(input[1]["content"][0]["text"], "native commentary");
                         assert_eq!(
                             input
@@ -1783,8 +2234,13 @@ fn completed_ciphertext_events() -> Vec<Value> {
 }
 
 #[test]
-fn completed_reasoning_ciphertext_allows_partial_completion_and_equal_or_omitted_terminal() {
-    for omit in [false, true] {
+fn completed_reasoning_ciphertext_is_authoritative_across_terminal_snapshots() {
+    for ciphertext in [
+        Some(json!("SYNTHETIC_COMPLETE_A")),
+        Some(json!("SYNTHETIC_COMPLETE_B")),
+        Some(Value::Null),
+        None,
+    ] {
         let mut r = reducer();
         let mut chunks = Vec::new();
         for e in completed_ciphertext_events() {
@@ -1797,11 +2253,14 @@ fn completed_reasoning_ciphertext_allows_partial_completion_and_equal_or_omitted
             chunks.extend(emitted);
         }
         let mut terminal = reasoning_ciphertext(json!("SYNTHETIC_COMPLETE_A"));
-        if omit {
-            terminal
-                .as_object_mut()
-                .unwrap()
-                .remove("encrypted_content");
+        match ciphertext {
+            Some(ciphertext) => terminal["encrypted_content"] = ciphertext,
+            None => {
+                terminal
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("encrypted_content");
+            }
         }
         chunks.extend(event(&mut r, json!({"type":"response.completed","response":snapshot(vec![terminal, call(json!("real_call"), "{}")])})));
         let response = r.response().unwrap();
@@ -1862,13 +2321,21 @@ fn partial_ciphertext_is_not_promoted_when_first_completed_snapshot_omits_it() {
 }
 
 #[tokio::test]
-async fn conflicting_completed_reasoning_is_safe_protocol_failure_with_usage_and_no_executable_state()
+async fn conflicting_completed_identity_is_safe_protocol_failure_with_usage_and_no_executable_state()
  {
-    for conflicting in [json!("SYNTHETIC_COMPLETE_B"), Value::Null] {
-        let terminal = snapshot(vec![
-            reasoning_ciphertext(conflicting),
+    for (field, expected_error) in [
+        ("id", "Responses item snapshot conflict"),
+        ("call_id", "Responses item identity conflict"),
+    ] {
+        let mut terminal = snapshot(vec![
+            reasoning_ciphertext(json!("SYNTHETIC_COMPLETE_B")),
             call(json!("real_call"), "{}"),
         ]);
+        // A different final ciphertext is valid; changed call identity is not.
+        terminal["output"][1][field] = json!("conflicting_identity");
+        // A real completed event can repeat a long system prompt before the
+        // output. The failure evidence must survive beyond the old 16 KiB cut.
+        terminal["instructions"] = json!("private diagnostic prompt ".repeat(1024));
         let mut events = completed_ciphertext_events();
         events.push(json!({"type":"response.completed","response":terminal}));
         let mut r = reducer();
@@ -1887,7 +2354,7 @@ async fn conflicting_completed_reasoning_is_safe_protocol_failure_with_usage_and
             .map(|e| format!("data: {e}\n\n"))
             .collect::<String>();
         let (root, server) = super::super::usage_tests::fixture_with_headers(
-            body,
+            body.clone(),
             "X-Request-Id: req_openai_native\r\n".into(),
             "200 OK",
         )
@@ -1932,6 +2399,22 @@ async fn conflicting_completed_reasoning_is_safe_protocol_failure_with_usage_and
             pioneer_protocol::ProviderFailureClass::MalformedProviderRequest
         );
         assert_eq!(classification.http_status, None);
+        let raw = classification.raw_response.as_ref().unwrap();
+        assert_eq!(raw.body, events.last().unwrap().to_string());
+        assert!(!raw.truncated);
+        assert_eq!(raw.processing_error.as_deref(), Some(expected_error));
+        assert_eq!(raw.stream_context.as_deref(), Some(body.as_str()));
+        assert!(
+            raw.stream_context
+                .as_ref()
+                .unwrap()
+                .contains("SYNTHETIC_COMPLETE_A")
+        );
+        let stored = serde_json::to_string(raw).unwrap();
+        assert_eq!(
+            serde_json::from_str::<pioneer_protocol::ProviderErrorResponse>(&stored).unwrap(),
+            *raw
+        );
         let safe = format!("{error:#} {error:?} {facts:?}");
         for secret in [
             "SYNTHETIC_COMPLETE_A",
@@ -1939,10 +2422,90 @@ async fn conflicting_completed_reasoning_is_safe_protocol_failure_with_usage_and
             "SYNTHETIC_PARTIAL",
             "encrypted_content",
             "synthetic-key",
+            "private diagnostic prompt",
+            expected_error,
         ] {
             assert!(!safe.contains(secret));
         }
         server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn json_and_sse_processing_failures_preserve_full_wire_and_cause() {
+    for stream in [false, true] {
+        for malformed_json in [false, true] {
+            let mut invalid = snapshot(vec![json!({
+                "type":"message","id":"invalid_role","role":"user","content":[]
+            })]);
+            invalid["instructions"] = json!("private long prompt ".repeat(1024));
+            let valid_json = if stream {
+                json!({"type":"response.completed","response":invalid}).to_string()
+            } else {
+                invalid.to_string()
+            };
+            let raw_body = if malformed_json {
+                format!("{valid_json} trailing_invalid_json")
+            } else {
+                valid_json
+            };
+            let body = if stream {
+                format!("data: {raw_body}\n\n")
+            } else {
+                raw_body.clone()
+            };
+            let (root, server) = super::super::usage_tests::fixture_with_headers(
+                body.clone(),
+                "X-Request-Id: req_processing_fixture\r\n".into(),
+                "200 OK",
+            )
+            .await;
+            let registry = crate::ProviderRegistry::with_provider(
+                "openai",
+                std::sync::Arc::new(super::super::OpenAiProvider::with_base_url(
+                    "synthetic-key",
+                    root,
+                )),
+            );
+            let provider = registry.get_or_create("openai").unwrap();
+            let error = if stream {
+                let chunks = provider
+                    .stream_chat(request())
+                    .await
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await;
+                assert!(
+                    chunks
+                        .iter()
+                        .filter_map(|chunk| chunk.as_ref().ok())
+                        .all(|chunk| {
+                            chunk.tool_calls.is_empty() && chunk.provider_replay_state.is_none()
+                        })
+                );
+                chunks.into_iter().find_map(|chunk| chunk.err()).unwrap()
+            } else {
+                provider.chat(request()).await.unwrap_err()
+            };
+            let classification = provider.classify_failure(&error).unwrap();
+            assert_eq!(classification.http_status, None);
+            let raw = classification.raw_response.unwrap();
+            assert_eq!(raw.body, raw_body);
+            assert!(!raw.truncated);
+            let cause = raw.processing_error.as_deref().unwrap();
+            if malformed_json {
+                assert!(cause.contains("malformed or unsupported Responses JSON"));
+                assert!(cause.contains("trailing characters"));
+            } else {
+                assert_eq!(cause, "unsupported Responses message role");
+            }
+            assert_eq!(
+                raw.stream_context.as_deref(),
+                stream.then_some(body.as_str())
+            );
+            assert!(!format!("{error:#} {error:?} {raw:?}").contains("private long prompt"));
+            server.await.unwrap();
+        }
     }
 }
 
@@ -2498,4 +3061,43 @@ async fn vercel_unknown_controls_leave_defaults_and_fallback_limits_are_not_nati
         ),
     )
     .await;
+}
+
+#[test]
+fn vercel_routing_outcomes_survive_json_and_sse_without_session_identifiers() {
+    let mut value = snapshot(vec![message("m", json!("final_answer"), "answer")]);
+    value["provider_metadata"] = json!({"gateway":{"routing":{
+        "clientSessionId":"private-session", "clientSessionIdSource":"explicit",
+        "affinity":{"outcome":"promoted","pinnedProvider":"anthropic","displacedProvider":"bedrock","secret":"discard"},
+        "unknown":"discard"}}});
+    value["prompt_cache_diagnostics"] = json!({"type":"cache_miss","reason":"input_changed"});
+    for provider in ["vercel-ai-gateway", "openai"] {
+        let mut json_reducer = reducer_for(provider);
+        json_reducer.snapshot(&value).unwrap();
+        let json_usage = json_reducer.response().unwrap().usage.unwrap();
+        let mut sse_reducer = reducer_for(provider);
+        event(
+            &mut sse_reducer,
+            json!({"type":"response.completed","response":value}),
+        );
+        let sse_usage = sse_reducer.response().unwrap().usage.unwrap();
+        assert_eq!(
+            json_usage.prompt_cache_diagnostics,
+            sse_usage.prompt_cache_diagnostics
+        );
+        let metadata = json_usage.prompt_cache_diagnostics.unwrap();
+        assert_eq!(metadata["type"], "cache_miss");
+        assert_eq!(
+            metadata.get("gateway_routing").is_some(),
+            provider == "vercel-ai-gateway"
+        );
+        assert!(!metadata.to_string().contains("private-session"));
+        assert!(!metadata.to_string().contains("secret"));
+        if provider == "vercel-ai-gateway" {
+            assert_eq!(
+                metadata["gateway_routing"]["affinity"]["outcome"],
+                "promoted"
+            );
+        }
+    }
 }

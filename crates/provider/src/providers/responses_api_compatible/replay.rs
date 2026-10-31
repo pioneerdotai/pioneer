@@ -29,14 +29,24 @@ pub(super) fn input_items(output: &[Value]) -> Result<Vec<Value>> {
                             let text = part["text"]
                                 .as_str()
                                 .ok_or_else(|| anyhow::anyhow!("invalid Responses text"))?;
-                            // EasyInputMessage accepts input_text for assistant history.
-                            content.push(json!({"type":"input_text","text":text}));
+                            let mut output =
+                                json!({"type":"output_text","text":text,"annotations":[]});
+                            for field in ["annotations", "logprobs"] {
+                                if let Some(value) = part.get(field).filter(|v| !v.is_null()) {
+                                    ensure!(
+                                        value.is_array(),
+                                        "invalid Responses output text metadata"
+                                    );
+                                    output[field] = value.clone();
+                                }
+                            }
+                            content.push(output);
                         }
                         Some("refusal") => {
                             let text = part["refusal"]
                                 .as_str()
                                 .ok_or_else(|| anyhow::anyhow!("invalid Responses refusal"))?;
-                            content.push(json!({"type":"input_text","text":text}));
+                            content.push(json!({"type":"refusal","refusal":text}));
                         }
                         _ => bail!("unsupported Responses content part"),
                     }
@@ -44,6 +54,9 @@ pub(super) fn input_items(output: &[Value]) -> Result<Vec<Value>> {
                 input.insert("type".into(), json!("message"));
                 input.insert("role".into(), json!("assistant"));
                 input.insert("content".into(), json!(content));
+                if let Some(status) = item.get("status").filter(|s| !s.is_null()) {
+                    input.insert("status".into(), status.clone());
+                }
                 if let Some(phase) = item.get("phase") {
                     input.insert("phase".into(), phase.clone());
                 }
@@ -104,9 +117,8 @@ pub(super) fn input_items(output: &[Value]) -> Result<Vec<Value>> {
             }
             _ => bail!("unsupported Responses output item"),
         }
-        // EasyInputMessage has no id field. Native IDs remain in the private
-        // replay; reasoning/function items use their own input-supported IDs.
-        if let Some(id) = item.get("id").filter(|_| item["type"] != "message") {
+        // Replay output messages as output items, including their identities.
+        if let Some(id) = item.get("id") {
             ensure!(
                 id.as_str().is_some_and(|s| !s.is_empty()),
                 "invalid Responses item identity"

@@ -33,6 +33,7 @@ mod scoped_push;
 pub(crate) mod skills;
 mod summary;
 mod task_agent_executor;
+pub(crate) use task_agent_executor::task_cache_routing_context;
 mod task_artifacts;
 mod task_completion_inbox;
 mod task_delivery;

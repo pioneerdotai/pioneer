@@ -1668,6 +1668,7 @@ mod tests {
             }
             let result = TurnStartResponse {
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: "turn".into(),
                     status: TurnStatus::InProgress,
                     turn_kind: TurnKind::Conversation,
@@ -1877,6 +1878,7 @@ mod tests {
                         let params: TurnStartParams =
                             serde_json::from_value(request["params"].clone()).unwrap();
                         let turn = Turn {
+                            work_owner: pioneer_protocol::TurnWorkOwner::Turn,
                             id: params.turn_id,
                             status: TurnStatus::InProgress,
                             turn_kind: TurnKind::Conversation,
