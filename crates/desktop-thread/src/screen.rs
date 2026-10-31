@@ -898,13 +898,23 @@ mod tests {
             );
             Root::new(screen, window, cx)
         });
+        // Mount and park the binding consumer before sending the isolated
+        // timeline publication, as in the mounted-screen fixture below.
+        cx.run_until_parked();
         let screen = root.read_with(cx, |root, _| {
             root.view().clone().downcast::<TimelineView>().unwrap()
         });
         screen.update(cx, |view, cx| {
             assert!(view.render_preparing_send(cx).is_some())
         });
-        client.complete_composer_operation(identity, ComposerOperationCompletion::Sent);
+        assert!(client.complete_composer_operation(identity, ComposerOperationCompletion::Sent));
+        assert!(
+            client
+                .composer_snapshot("a")
+                .unwrap()
+                .preparing_send()
+                .is_none()
+        );
         crate::test_support::install_thread_timeline_at_revision(
             &client,
             "a",
