@@ -10034,14 +10034,15 @@ impl MessageProcessor {
             .await
     }
 
-    pub(super) async fn mark_turn_blocked(
+    // CLI launch has many terminal error branches. Keep their large recovery
+    // futures on the heap even when the successful path never polls them.
+    pub(super) fn mark_turn_blocked(
         &self,
         thread_id: String,
         turn_id: String,
         reason: String,
-    ) -> bool {
-        self.mark_turn_blocked_with_transition(thread_id, turn_id, reason, None)
-            .await
+    ) -> MessageFuture<'_, bool> {
+        message_future(self.mark_turn_blocked_with_transition(thread_id, turn_id, reason, None))
     }
 
     pub(super) async fn mark_turn_blocked_with_transition(
