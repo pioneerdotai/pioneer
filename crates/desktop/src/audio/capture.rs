@@ -101,7 +101,7 @@ pub(crate) enum DesktopVoiceInput<'a> {
         sample_rate_hz: u32,
         captured_at_unix_ms: Option<u64>,
     },
-    /// A route discontinuity can retain the same reported sample format.
+    /// A physical stream discontinuity can retain the same reported sample format.
     Discontinuity,
 }
 
@@ -494,7 +494,7 @@ impl<G: DesktopVoiceGateway> DesktopVoiceStream<G> {
         } = input
         else {
             // Preserve old real-sample tail and sequence, but never filter across
-            // an OS route discontinuity, even when the format is unchanged.
+            // a physical stream discontinuity, even when the format is unchanged.
             return self.finish_segment();
         };
         let mono = interleaved_f32_to_mono(samples, channels)?;
@@ -1253,9 +1253,15 @@ mod cpal_audio {
 
         pub(super) fn record_stream_error(&self, error: cpal::Error) {
             match error.kind() {
-                // Device switch is a physical segment boundary. Xrun means
-                // known source loss and follows the terminal error path below.
+                // Device switch is a physical segment boundary.
                 cpal::ErrorKind::DeviceChanged => {
+                    let _ = self.deliver(DesktopVoiceInput::Discontinuity);
+                }
+                // CoreAudio reports device-global processor overload, not a
+                // count of lost samples for this capture. Order a segment boundary
+                // with accepted audio; deliver keeps admission failures sticky.
+                #[cfg(target_os = "macos")]
+                cpal::ErrorKind::Xrun => {
                     let _ = self.deliver(DesktopVoiceInput::Discontinuity);
                 }
                 cpal::ErrorKind::RealtimeDenied => {}
@@ -1901,7 +1907,12 @@ mod tests {
 
     #[test]
     fn flush_failure_prevents_finalize_and_releases_session_once() {
-        for route_boundary in [false, true] {
+        for boundary in [
+            None,
+            Some(cpal::ErrorKind::DeviceChanged),
+            #[cfg(target_os = "macos")]
+            Some(cpal::ErrorKind::Xrun),
+        ] {
             let gateway = FakeGateway::default();
             let events = gateway.events.clone();
             let chunk_error = gateway.chunk_error.clone();
@@ -1922,7 +1933,7 @@ mod tests {
                 DesktopVoiceCaptureErrorKind::GatewayChunk,
                 "tail failed",
             ));
-            if route_boundary {
+            if let Some(kind) = boundary {
                 let callbacks = flow
                     .capture
                     .backend
@@ -1932,7 +1943,7 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .clone();
-                callbacks.record_stream_error(cpal::Error::new(cpal::ErrorKind::DeviceChanged));
+                callbacks.record_stream_error(cpal::Error::new(kind));
             }
             assert_eq!(
                 flow.drain_recording().unwrap_err().kind,
@@ -2259,6 +2270,12 @@ mod tests {
         for _ in 0..CAPTURE_QUEUE_EVENTS {
             gate.deliver(DesktopVoiceInput::Discontinuity).unwrap();
         }
+        #[cfg(target_os = "macos")]
+        {
+            gate.record_stream_error(cpal::Error::new(cpal::ErrorKind::Xrun));
+            assert!(gate.wait().is_err());
+        }
+        #[cfg(not(target_os = "macos"))]
         assert!(gate.deliver(DesktopVoiceInput::Discontinuity).is_err());
         assert!(flow.stop_recording().is_err());
         resume.send(()).unwrap();
@@ -2413,6 +2430,7 @@ mod tests {
         )
         .unwrap();
         let mut ready = next.take_readiness().unwrap();
+        old_gate.record_stream_error(cpal::Error::new(cpal::ErrorKind::Xrun));
         old_gate
             .deliver(DesktopVoiceInput::Samples {
                 samples: &[0.0; 320],
@@ -2430,8 +2448,109 @@ mod tests {
         next.finalize_send(voice_context()).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn xrun_known_source_loss_cannot_finalize_successfully() {
+    fn macos_xrun_drains_ordered_segments_and_finalizes_once() {
+        let gateway = FakeGateway::default();
+        let events = gateway.events.clone();
+        let chunks = gateway.chunks.clone();
+        let (entered, resume) = gateway.block_next_chunk();
+        let backend = FakeBackend::default();
+        let input = backend.callbacks.clone();
+        let stops = backend.stops.clone();
+        let mut flow = DesktopVoiceCaptureFlow::new(backend, gateway);
+        flow.start(
+            &granted_gate(),
+            DesktopVoiceCaptureConfig::default(),
+            voice_start_context(),
+        )
+        .unwrap();
+        let ready = flow.take_readiness().unwrap();
+        emit(&input, &[-1.0, 0.5], 1, 16_000, 100).unwrap();
+        entered.recv().unwrap();
+        ready.blocking_recv().unwrap().unwrap();
+        // Both short 48 kHz segments retain their entire output until finish.
+        // Separate zero tails give an exact PCM oracle without copying the DSP.
+        emit(&input, &[0.0; 3], 1, 48_000, 101).unwrap();
+        let gate = input.lock().unwrap().as_ref().unwrap().clone();
+        gate.record_stream_error(cpal::Error::new(cpal::ErrorKind::Xrun));
+        emit(&input, &[0.0; 3], 1, 48_000, 102).unwrap();
+        flow.stop_recording().unwrap();
+        // Late notifications and audio cannot extend the closed recording.
+        gate.record_stream_error(cpal::Error::new(cpal::ErrorKind::Xrun));
+        emit(&input, &[1.0; 320], 1, 16_000, 103).unwrap();
+        resume.send(()).unwrap();
+        flow.finalize_send(voice_context()).unwrap();
+        flow.finalize_send(voice_context()).unwrap();
+        drop(flow);
+        assert_eq!(*stops.lock().unwrap(), 1);
+        let chunks = chunks.lock().unwrap();
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.pcm.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0x00, 0x80, 0x00, 0x40], vec![0, 0], vec![0, 0]]
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.timestamp)
+                .collect::<Vec<_>>(),
+            vec![Some(100), Some(101), Some(102)]
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                GatewayEvent::Start {
+                    turn_id: voice_start_context().turn_id
+                },
+                GatewayEvent::Chunk {
+                    sequence: 0,
+                    bytes: 4
+                },
+                GatewayEvent::Chunk {
+                    sequence: 1,
+                    bytes: 2
+                },
+                GatewayEvent::Chunk {
+                    sequence: 2,
+                    bytes: 2
+                },
+                GatewayEvent::Finalize {
+                    session_id: "voice_session_1".into(),
+                    turn_id: voice_context().turn_id,
+                },
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_xrun_without_audio_never_confirms_readiness() {
+        let backend = FakeBackend::default();
+        let input = backend.callbacks.clone();
+        let mut flow = DesktopVoiceCaptureFlow::new(backend, FakeGateway::default());
+        flow.start(
+            &granted_gate(),
+            DesktopVoiceCaptureConfig::default(),
+            voice_start_context(),
+        )
+        .unwrap();
+        let ready = flow.take_readiness().unwrap();
+        let gate = input.lock().unwrap().as_ref().unwrap().clone();
+        gate.record_stream_error(cpal::Error::new(cpal::ErrorKind::Xrun));
+        emit(&input, &[], 1, 48_000, 100).unwrap();
+        // Joining proves the notification was processed, avoiding timing guesses.
+        flow.drain_recording().unwrap();
+        gate.record_stream_error(cpal::Error::new(cpal::ErrorKind::Xrun));
+        emit(&input, &[0.0; 3], 1, 48_000, 101).unwrap();
+        assert!(ready.blocking_recv().is_err());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn xrun_remains_fatal_outside_macos() {
         let gateway = FakeGateway::default();
         let events = gateway.events.clone();
         let backend = FakeBackend::default();
