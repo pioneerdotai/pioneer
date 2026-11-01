@@ -6,7 +6,9 @@ mod cli_mcp_call;
 mod codex_retry_notice;
 pub use cli_mcp_call::{CliMcpCallIdentity, is_managed_cli_mcp_item};
 pub use codex_retry_notice::{CodexRetryNoticeTarget, codex_retry_notice_item_id};
+mod execution_heartbeat;
 mod frozen_lifetime;
+mod recovery_wake;
 pub use frozen_lifetime::FrozenReadHold;
 mod tool_output;
 pub use repositories::compaction;
@@ -3113,6 +3115,17 @@ pub struct TurnMcpProjectionRecord {
 
 #[derive(Clone)]
 pub struct CrudStore {
+    #[cfg(test)]
+    watchdog_preparation_gate: std::sync::Arc<
+        std::sync::Mutex<
+            Option<(
+                std::sync::Arc<tokio::sync::Notify>,
+                std::sync::Arc<tokio::sync::Notify>,
+            )>,
+        >,
+    >,
+    recovery_work: std::sync::Arc<tokio::sync::Notify>,
+    execution_heartbeats: execution_heartbeat::Registries,
     #[cfg(any(test, feature = "test-support"))]
     delivery_commit_test_gate: std::sync::Arc<
         std::sync::Mutex<Option<task_delivery_lifecycle::TaskDeliveryCommitTestGate>>,
@@ -4717,6 +4730,10 @@ impl CrudStore {
 
     pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
         Self {
+            #[cfg(test)]
+            watchdog_preparation_gate: Default::default(),
+            execution_heartbeats: Default::default(),
+            recovery_work: Default::default(),
             connection: connection.into(),
             episodic_work: std::sync::Arc::new(tokio::sync::Notify::new()),
             frozen_readers: Default::default(),
@@ -7407,6 +7424,7 @@ impl CrudStore {
         execution_owner_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
+        let _release_wake = execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone());
         anyhow::ensure!(
             notification.turn.id == expected.turn_id
                 && notification.thread_id == expected.thread_id
@@ -8242,6 +8260,8 @@ impl CrudStore {
         transition: NativeExecutionWindowTransition,
         event_timestamp_secs: i64,
     ) -> Result<()> {
+        let _release_wake = matches!(&transition, NativeExecutionWindowTransition::Blocked { .. })
+            .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
         let created_at = unix_to_datetime(event_timestamp_secs);
         let claim_expires_at =
             unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
@@ -14639,6 +14659,84 @@ impl CrudStore {
         turn_execution::find(&self.connection, turn_id).await
     }
 
+    /// Retained, owner-specific notification; scoped stores share the same registry.
+    pub fn turn_execution_heartbeat_notification(
+        &self,
+        owner_id: &str,
+    ) -> std::sync::Arc<tokio::sync::Notify> {
+        self.execution_heartbeats
+            .owner(owner_id)
+            .notification
+            .clone()
+    }
+
+    /// Returns true only when an authoritative observation permits parking.
+    /// Owned cycles perform the existing UPDATE without a preceding SELECT.
+    pub async fn supervise_turn_execution_heartbeat(
+        &self,
+        owner_id: &str,
+        lease_seconds: i64,
+    ) -> Result<bool> {
+        let registry = self.execution_heartbeats.owner(owner_id);
+        let (generation, unknown, empty) = registry.observation();
+        if empty {
+            return Ok(true);
+        }
+        if unknown {
+            // A cancelled acquisition can drop its Rust guard/permit AFTER
+            // sending COMMIT but BEFORE SQLx finishes it. A reader SELECT alone
+            // can then see empty too early. Settle through the existing writer
+            // first: the single physical writer connection processes this
+            // UPDATE only after its preceding COMMIT/rollback commands. Pool
+            // return also pings that connection before making it reusable.
+            // Acquisitions racing this settlement invalidate generation (or
+            // retain in_flight), so only the following fresh read can park us.
+            // Cancellation/error before both operations leaves Unknown.
+            if let Err(error) = self
+                .heartbeat_turn_executions_owned_by(owner_id, lease_seconds)
+                .await
+            {
+                registry.unknown();
+                return Err(error);
+            }
+            match turn_execution::list_owned_active(&self.connection, owner_id, 200).await {
+                Ok(executions) => {
+                    registry.reconstruct(generation, executions);
+                    return Ok(registry.observation().2);
+                }
+                Err(error) => {
+                    registry.unknown();
+                    // Renewal already ran; a failed read never proves Empty.
+                    return Err(error);
+                }
+            }
+        }
+        let (generation, _, _) = registry.observation();
+        match self
+            .heartbeat_turn_executions_owned_by(owner_id, lease_seconds)
+            .await
+        {
+            Ok(0) => {
+                // MySQL may report changed rather than matched rows. A zero
+                // UPDATE is therefore only a hint to revalidate, never proof
+                // of Empty. This read happens only on that exceptional path.
+                match turn_execution::list_owned_active(&self.connection, owner_id, 200).await {
+                    Ok(executions) => registry.reconstruct(generation, executions),
+                    Err(error) => {
+                        registry.unknown();
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                registry.unknown();
+                return Err(error);
+            }
+        }
+        Ok(registry.observation().2)
+    }
+
     /// Extend active receipts using SQLite's time at the physical UPDATE,
     /// including after writer admission and each storage retry.
     pub async fn heartbeat_turn_executions_owned_by(
@@ -14731,6 +14829,7 @@ impl CrudStore {
         claimed_at_unix: i64,
         lease_until_unix: i64,
     ) -> Result<Option<TurnExecutionRecord>> {
+        let _ownership_change = self.execution_heartbeats.changing(new_owner_id);
         let expected = expected.clone();
         let new_owner_id = new_owner_id.to_owned();
         self.run_serialized_write(|| async {
@@ -14751,6 +14850,9 @@ impl CrudStore {
                 .commit()
                 .await
                 .context("failed to commit Turn execution ownership claim")?;
+            if let Some(execution) = claimed.as_ref() {
+                _ownership_change.register(execution);
+            }
             Ok(claimed)
         })
         .await
@@ -14983,6 +15085,7 @@ impl CrudStore {
         turn_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<TurnFinalizationCommitOutcome> {
+        let _release_wake = execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone());
         let turn_id = turn_id.to_owned();
         self.run_serialized_write(|| async {
             // Decode the prepared item and materialize both canonical event
@@ -19681,6 +19784,8 @@ impl CrudStore {
         error: Option<&str>,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
+        let _release_wake = (!matches!(status, TurnStatus::InProgress))
+            .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
         self.run_serialized_write(|| async {
             let updated_at = unix_to_datetime(event_timestamp_secs);
             let transaction = self
@@ -26696,6 +26801,11 @@ impl CrudStore {
         .await
     }
 
+    /// Scoped clones share this retained postcommit recovery hint.
+    pub fn recovery_job_notification(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.recovery_work.clone()
+    }
+
     pub async fn enqueue_recovery_job(
         &self,
         turn_id: String,
@@ -26714,6 +26824,7 @@ impl CrudStore {
         policy_snapshot: serde_json::Value,
         now_unix: i64,
     ) -> Result<RecoveryJobRecord> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         self.run_serialized_write(|| async {
             let now = unix_to_datetime(now_unix);
             let retry_delay_secs = retry_after_ms
@@ -26816,6 +26927,7 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<AtomicRecoveryJobEnqueueOutcome> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         self.run_serialized_write(|| async {
             let tx = self
@@ -26910,21 +27022,33 @@ impl CrudStore {
         claim_lease_secs: u64,
         limit: u64,
     ) -> Result<Vec<RecoveryJobRecord>> {
-        self.run_serialized_write(|| async {
-            let now = unix_to_datetime(now_unix);
-            let claim_expires_at = i64::try_from(claim_lease_secs)
-                .ok()
-                .and_then(|secs| now_unix.checked_add(secs))
-                .map(unix_to_datetime)
-                .unwrap_or(now);
-            let jobs = recovery_job::claim_due_jobs(&self.connection, now, claim_expires_at, limit)
-                .await?;
-            Ok(jobs
-                .into_iter()
-                .map(recovery_job_record_from_model)
-                .collect::<Vec<_>>())
-        })
-        .await
+        let now = unix_to_datetime(now_unix);
+        // Bounded advisory identities only; release the reader before writer
+        // admission. A reschedule/lease change is revalidated at the UPDATE.
+        let candidates = recovery_job::list_due_job_ids(&self.connection, now, limit).await?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let claim_expires_at = i64::try_from(claim_lease_secs)
+            .ok()
+            .and_then(|secs| now_unix.checked_add(secs))
+            .map(unix_to_datetime)
+            .unwrap_or(now);
+        let jobs = self
+            .run_serialized_write(|| async {
+                recovery_job::claim_due_job_ids(
+                    &self.connection,
+                    &candidates,
+                    now,
+                    claim_expires_at,
+                )
+                .await
+            })
+            .await?;
+        Ok(jobs
+            .into_iter()
+            .map(recovery_job_record_from_model)
+            .collect())
     }
 
     pub async fn list_due_pending_recovery_jobs_by_action(
@@ -26933,20 +27057,17 @@ impl CrudStore {
         now_unix: i64,
         limit: u64,
     ) -> Result<Vec<RecoveryJobRecord>> {
-        self.run_serialized_write(|| async {
-            let jobs = recovery_job::list_due_pending_jobs_by_action(
-                &self.connection,
-                action,
-                unix_to_datetime(now_unix),
-                limit,
-            )
-            .await?;
-            Ok(jobs
-                .into_iter()
-                .map(recovery_job_record_from_model)
-                .collect::<Vec<_>>())
-        })
-        .await
+        let jobs = recovery_job::list_due_pending_jobs_by_action(
+            &self.connection,
+            action,
+            unix_to_datetime(now_unix),
+            limit,
+        )
+        .await?;
+        Ok(jobs
+            .into_iter()
+            .map(recovery_job_record_from_model)
+            .collect())
     }
 
     /// Only the diagnostic that actually produced this failed Turn may cross into Task.
@@ -27088,6 +27209,7 @@ impl CrudStore {
         now_unix: i64,
         accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<bool> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         let cli_source = self
@@ -27134,6 +27256,7 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let last_error_value = last_error.clone();
         let cli_source = self
             .prepare_cli_runtime_recovery_outcome_source(job_id)
@@ -27169,6 +27292,7 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
             recovery_job::mark_claimed_job_retrying(
@@ -27261,6 +27385,7 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<bool> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
@@ -27337,6 +27462,7 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<bool> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         let cli_source = self
@@ -27396,6 +27522,7 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let last_error_value = last_error.clone();
         let cli_source = self
             .prepare_cli_runtime_recovery_outcome_source(job_id)
@@ -27465,6 +27592,7 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<bool> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         let cli_source = self
@@ -27546,6 +27674,7 @@ impl CrudStore {
         now_unix: i64,
         accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<bool> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let last_error_value = last_error.clone();
         let cli_source = self
@@ -27648,6 +27777,7 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<bool> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         anyhow::ensure!(
             matches!(
                 status,
@@ -29582,6 +29712,7 @@ impl CrudStore {
         cleanup_plan: RecoveryTerminalCleanupPlan,
         event_timestamp_secs: i64,
     ) -> Result<RecoveryTerminalizationApplyOutcome> {
+        let _release_wake = execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone());
         let record = record.clone();
         self.run_serialized_write(|| async {
             let created_at = unix_to_datetime(event_timestamp_secs);
@@ -29882,6 +30013,8 @@ impl CrudStore {
         execution_owner_id: &str,
         execution_lease_until_unix: i64,
     ) -> Result<BlockedTurnRecoveryResumeOutcome> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
+        let _ownership_change = self.execution_heartbeats.changing(execution_owner_id);
         self.run_serialized_write(|| async {
             let now = unix_to_datetime(now_unix);
             let tx = self
@@ -30000,9 +30133,13 @@ impl CrudStore {
                 return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
             }
 
+            let acquired_execution = turn_execution::find(&tx, turn_id).await?;
             tx.commit()
                 .await
                 .context("failed to commit blocked turn resume transaction")?;
+            if let Some(execution) = acquired_execution.as_ref() {
+                _ownership_change.register(execution);
+            }
 
             Ok(
                 recovery_job::find_job_by_id(&self.connection, job.id.as_str())
@@ -30031,6 +30168,8 @@ impl CrudStore {
         execution_owner_id: &str,
         execution_lease_until_unix: i64,
     ) -> Result<Option<TaskOwnedTurnResumeOutcome>> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
+        let _ownership_change = self.execution_heartbeats.changing(execution_owner_id);
         self.run_serialized_write(|| async {
             let now = unix_to_datetime(now_unix);
             let Some(task_run_turn_model) =
@@ -30598,9 +30737,13 @@ impl CrudStore {
                 "task child Turn execution ownership changed while resume was committing"
             );
 
+            let acquired_execution = turn_execution::find(&tx, turn_id).await?;
             tx.commit()
                 .await
                 .context("failed to commit task-owned turn resume transaction")?;
+            if let Some(execution) = acquired_execution.as_ref() {
+                _ownership_change.register(execution);
+            }
 
             // Decode and assemble the response after releasing the physical
             // writer. The durable transaction above contains only SQLite
@@ -30639,15 +30782,157 @@ impl CrudStore {
         .await
     }
 
-    pub async fn list_active_recovery_jobs(&self, limit: u64) -> Result<Vec<RecoveryJobRecord>> {
-        self.run_serialized_write(|| async {
-            let jobs = recovery_job::list_active_jobs(&self.connection, limit).await?;
-            Ok(jobs
+    /// Compact reader probe; errors remain unknown rather than proving empty.
+    pub async fn active_recovery_job_upper_id(&self) -> Result<Option<String>> {
+        repositories::recovery_watchdog::active_upper(&self.connection).await
+    }
+
+    pub async fn list_active_recovery_job_page(
+        &self,
+        after: Option<&str>,
+        upper: &str,
+        limit: u64,
+    ) -> Result<Vec<RecoveryJobRecord>> {
+        Ok(
+            repositories::recovery_watchdog::active_page(&self.connection, after, upper, limit)
+                .await?
                 .into_iter()
                 .map(recovery_job_record_from_model)
-                .collect::<Vec<_>>())
+                .collect(),
+        )
+    }
+
+    /// Prepared watchdog decisions commit only if current policy, episode and
+    /// causal progress still permit them. The guard and transition are one
+    /// short writer transaction; CLI ownership proof remains independent.
+    pub async fn apply_recovery_watchdog_failure(
+        &self,
+        expected: &RecoveryJobRecord,
+        status: RecoveryJobStatus,
+        next_run_at_unix: Option<i64>,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+        observed_liveness: Option<&TurnLivenessRecord>,
+    ) -> Result<bool> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
+        let Some(raw) =
+            repositories::recovery_watchdog::raw_policy(&self.connection, &expected.id, None)
+                .await?
+        else {
+            return Ok(false);
+        };
+        // Interpret legacy values only outside DB capacity. Raw strings retain
+        // unknown non-NULL values and formatting for exact commit revalidation.
+        if !raw.agrees_with(expected) {
+            return Ok(false);
+        }
+        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
+        let token = pioneer_protocol::generate_id(21);
+        let cli_source = self
+            .prepare_cli_runtime_recovery_outcome_source(&expected.id)
+            .await?;
+        #[cfg(test)]
+        {
+            let gate = self.watchdog_preparation_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            if !cli_runtime_recovery_transition_allowed(
+                &tx,
+                &expected.id,
+                cli_source.as_ref(),
+                None,
+            )
+            .await?
+                || !repositories::recovery_watchdog::fence(
+                    &tx,
+                    expected,
+                    &raw,
+                    observed_liveness,
+                    &token,
+                )
+                .await?
+            {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            // SQL TEXT equality may use a case-insensitive collation. The
+            // successful fence owns the job's write lock; a current locked read
+            // now verifies bytes before any domain mutation. No JSON parsing.
+            if repositories::recovery_watchdog::raw_policy(&tx, &expected.id, Some(&token))
+                .await?
+                .as_ref()
+                != Some(&raw)
+            {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            let applied = if let Some(attempt) = &expected.active_attempt_id {
+                if let Some(next) = next_run_at_unix {
+                    recovery_job::mark_job_retrying(
+                        &tx,
+                        &expected.id,
+                        attempt,
+                        unix_to_datetime(next),
+                        None,
+                        last_error.clone(),
+                        diagnostic_json.clone(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?
+                } else {
+                    recovery_job::mark_job_terminal_after_attempt(
+                        &tx,
+                        &expected.id,
+                        attempt,
+                        status,
+                        last_error.clone(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?
+                }
+            } else {
+                recovery_job::mark_active_without_attempt_terminal(
+                    &tx,
+                    &expected.id,
+                    status,
+                    last_error.clone(),
+                    unix_to_datetime(now_unix),
+                )
+                .await?
+            };
+            if !applied {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            if next_run_at_unix.is_none() {
+                if let Some(value) = &diagnostic_json {
+                    recovery_job::set_diagnostic(&tx, &expected.id, value.clone()).await?;
+                }
+                enqueue_recovery_terminalization_if_required(
+                    &tx,
+                    &expected.id,
+                    unix_to_datetime(now_unix),
+                )
+                .await?;
+            }
+            tx.commit().await?;
+            Ok(true)
         })
         .await
+    }
+
+    pub async fn list_active_recovery_jobs(&self, limit: u64) -> Result<Vec<RecoveryJobRecord>> {
+        let jobs = recovery_job::list_active_jobs(&self.connection, limit).await?;
+        Ok(jobs
+            .into_iter()
+            .map(recovery_job_record_from_model)
+            .collect())
     }
 
     pub async fn find_open_recovery_jobs_for_turn(
@@ -30685,6 +30970,7 @@ impl CrudStore {
         reason: Option<String>,
         now_unix: i64,
     ) -> Result<Vec<RecoveryJobRecord>> {
+        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let reason_value = reason.clone();
         self.run_serialized_write(|| async {
             let jobs = recovery_job::cancel_open_jobs_for_turn(
@@ -31248,12 +31534,20 @@ impl CrudStore {
         execution_graph: Option<AgentExecutionGraphCommitInput>,
         agent_turn_response: Option<AgentTurnResponseInput>,
     ) -> Result<Option<AgentExecutionGraphCommitResult>> {
+        let _release_wake = (events
+            .iter()
+            .any(|event| terminal_turn_execution_status_for_event(event).is_some()))
+        .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
+        let _ownership_change = execution
+            .as_ref()
+            .map(|execution| self.execution_heartbeats.changing(&execution.owner_id));
         let created_at = unix_to_datetime(event_timestamp_secs);
         let claim_expires_at =
             unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
 
         self.run_serialized_write(|| {
             self.materialize_turn_events_atomically_once(
+                _ownership_change.as_ref(),
                 events.clone(),
                 created_at,
                 claim_expires_at,
@@ -31294,6 +31588,7 @@ impl CrudStore {
 
     async fn materialize_turn_events_atomically_once(
         &self,
+        ownership_change: Option<&execution_heartbeat::OwnershipChange>,
         events: Vec<TurnEventPayload>,
         created_at: DateTimeWithTimeZone,
         claim_expires_at: DateTimeWithTimeZone,
@@ -31450,6 +31745,7 @@ impl CrudStore {
             return Err(error);
         }
 
+        let mut acquired_execution = None;
         if let Some(execution) = execution {
             let execution = match turn_execution::insert_immutable(&transaction, execution).await {
                 Ok(execution) => execution,
@@ -31469,6 +31765,7 @@ impl CrudStore {
                 )
                 .await?;
             }
+            acquired_execution = Some(execution);
         }
 
         if let Some((turn_id, authority_envelope_json)) = authority_envelope
@@ -31547,6 +31844,9 @@ impl CrudStore {
             .commit()
             .await
             .context("failed to commit turn event batch materialization transaction")?;
+        if let (Some(change), Some(execution)) = (ownership_change, acquired_execution.as_ref()) {
+            change.register(execution);
+        }
 
         Ok(execution_graph_result)
     }
@@ -31777,6 +32077,8 @@ impl CrudStore {
         execution_owner_id: Option<&str>,
         operation_guard: Option<sea_orm::Statement>,
     ) -> Result<Option<crate::events::AppendedTurnEvent>> {
+        let _release_wake = (terminal_turn_execution_status_for_event(&event).is_some())
+            .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
         let event = prepare_turn_event_for_permanent_storage(&self.connection, event).await?;
         let projection_context_json =
             serialize_turn_event_projection_context(&projection_context, event.id())?;
@@ -32026,6 +32328,9 @@ impl CrudStore {
         claim_token: String,
         projected_at: DateTimeWithTimeZone,
     ) -> Result<TurnEventProjectionOutcome> {
+        let _release_wake = (terminal_turn_execution_status_for_event(&appended_event.payload)
+            .is_some())
+        .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
         let projection = self
             .projector
             .prepare(
@@ -50234,6 +50539,395 @@ mod tests {
         );
     }
 
+    // Recovery discovery regressions use separate physically read-only readers
+    // and the normal serialized writer, with production foreign_keys settings.
+    async fn recovery_discovery_fixture() -> (
+        CrudStore,
+        Arc<OptionalDeliveryDatabaseObserver>,
+        OptionalDeliveryDatabasePath,
+    ) {
+        recovery_discovery_fixture_with_policy_collation(false).await
+    }
+
+    async fn recovery_discovery_fixture_with_policy_collation(
+        nocase: bool,
+    ) -> (
+        CrudStore,
+        Arc<OptionalDeliveryDatabaseObserver>,
+        OptionalDeliveryDatabasePath,
+    ) {
+        use pioneer_sqlite::{
+            SqliteWriteExecutor, sqlite_connection_url, sqlite_read_only_connection_url,
+        };
+        use sea_orm::ConnectOptions;
+        let path = OptionalDeliveryDatabasePath(std::env::temp_dir().join(format!(
+            "pioneer-recovery-discovery-{}.sqlite",
+            generate_id(12)
+        )));
+        let mut options = ConnectOptions::new(sqlite_connection_url(&path.0));
+        options.max_connections(1);
+        let writer = Database::connect(options).await.unwrap();
+        Migrator::up(&writer, None).await.unwrap();
+        if nocase {
+            // Test-only variation of the normal migrated empty schema: retain
+            // its exact DDL/indexes/triggers, change only policy TEXT collation.
+            // SQLite has no ALTER COLUMN COLLATE API; this is not a migration
+            // or codegen schema and never touches application/user databases.
+            let schema = writer
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='recovery_job'",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<String>("", "sql")
+                .unwrap();
+            let dependents = writer.query_all_raw(Statement::from_string(DatabaseBackend::Sqlite,
+                "SELECT sql FROM sqlite_master WHERE tbl_name='recovery_job' AND type IN ('index','trigger') AND sql IS NOT NULL"))
+                .await.unwrap().into_iter().map(|row| row.try_get::<String>("", "sql").unwrap()).collect::<Vec<_>>();
+            assert_eq!(schema.matches(r#""policy_snapshot" text"#).count(), 1);
+            let schema = schema.replace(
+                r#""policy_snapshot" text"#,
+                r#""policy_snapshot" text COLLATE NOCASE"#,
+            );
+            writer
+                .execute_unprepared("DROP TABLE recovery_job")
+                .await
+                .unwrap();
+            writer.execute_unprepared(&schema).await.unwrap();
+            for sql in dependents {
+                writer.execute_unprepared(&sql).await.unwrap();
+            }
+        }
+
+        writer
+            .execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        let mut options = ConnectOptions::new(sqlite_read_only_connection_url(&path.0));
+        options.max_connections(2);
+        options.map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+                .pragma("foreign_keys", "OFF")
+        });
+        let reader = Database::connect(options).await.unwrap();
+        let observer = Arc::new(OptionalDeliveryDatabaseObserver::default());
+        let database = pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            observer.clone(),
+        );
+        database.validate_reader().await.unwrap();
+        (CrudStore::new(database), observer, path)
+    }
+
+    #[tokio::test]
+    async fn watchdog_rejects_case_only_policy_race_under_nocase_collation() {
+        use pioneer_entity::recovery_job as entity;
+        let (store, _observer, _path) =
+            recovery_discovery_fixture_with_policy_collation(true).await;
+        let now = 1_700_000_000;
+        let upper = serde_json::json!({"MAX_WALL_CLOCK_SECS":3600});
+        let lower = serde_json::json!({"max_wall_clock_secs":3600});
+        let job = store
+            .enqueue_recovery_job(
+                "nocase-turn".into(),
+                "item".into(),
+                TurnItemType::Reasoning,
+                None,
+                RecoveryTrigger::ProviderError,
+                RecoveryAction::RetryAttempt,
+                None,
+                None,
+                None,
+                None,
+                0,
+                3,
+                serde_json::json!({}),
+                upper.clone(),
+                now,
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_due_recovery_jobs(now + 1, 45, 1).await.unwrap();
+        assert!(matches!(
+            store
+                .mark_claimed_recovery_job_active(
+                    &job.id,
+                    claimed[0].claim_token.as_deref().unwrap(),
+                    "nocase-attempt",
+                    now + 1
+                )
+                .await
+                .unwrap(),
+            ClaimedRecoveryActivation::Activated
+        ));
+        let expected = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+        assert!(
+            expected
+                .policy_snapshot
+                .get("max_wall_clock_secs")
+                .is_none()
+        );
+        // Old Rust policy falls back to 60s; elapsed=100 would terminalize.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *store.watchdog_preparation_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+        let worker_store = store.clone();
+        let worker_expected = expected.clone();
+        let worker = tokio::spawn(async move {
+            worker_store
+                .apply_recovery_watchdog_failure(
+                    &worker_expected,
+                    RecoveryJobStatus::Exhausted,
+                    None,
+                    Some("old fallback budget".into()),
+                    None,
+                    now + 100,
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        entity::Entity::update_many()
+            .col_expr(
+                entity::Column::PolicySnapshot,
+                sea_orm::sea_query::Expr::value(lower.to_string()),
+            )
+            .filter(entity::Column::Id.eq(job.id.clone()))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        // Demonstrate the old SQL fence's actual false equality in this fixture.
+        let sql_equal = entity::Entity::find_by_id(job.id.clone())
+            .filter(entity::Column::PolicySnapshot.eq(upper.to_string()))
+            .one(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            sql_equal.is_some(),
+            "fixture must defeat ordinary TEXT equality"
+        );
+        release.notify_one();
+        assert!(!worker.await.unwrap().unwrap());
+        let retained = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(retained.status, RecoveryJobStatus::Active);
+        assert_eq!(retained.policy_snapshot, lower);
+        assert_eq!(retained.run_count, expected.run_count);
+        assert_eq!(
+            retained.claim_token, expected.claim_token,
+            "mismatch must roll back temporary token"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_recovery_discovery_and_active_reads_do_not_reserve_writer() {
+        use pioneer_sqlite::SqliteReadClass;
+        let (store, observer, _path) = recovery_discovery_fixture().await;
+        let held_writer = store.connection.begin().await.unwrap();
+        for (scoped, expected_class) in [
+            (store.clone(), SqliteReadClass::Interactive),
+            (
+                store.with_maintenance_access(),
+                SqliteReadClass::Maintenance,
+            ),
+            (
+                store.with_maintenance_reads_and_critical_writes(),
+                SqliteReadClass::Maintenance,
+            ),
+        ] {
+            observer.events.lock().unwrap().clear();
+            observer.reads.lock().unwrap().clear();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                assert!(
+                    scoped
+                        .claim_due_recovery_jobs(1_700_000_000, 45, 64)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    scoped
+                        .active_recovery_job_upper_id()
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    scoped
+                        .list_active_recovery_jobs(64)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    scoped
+                        .list_due_pending_recovery_jobs_by_action(
+                            RecoveryAction::RetryWithBackoff,
+                            1_700_000_000,
+                            64,
+                        )
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            })
+            .await
+            .expect("recovery reads must complete while writer is occupied");
+            assert!(
+                observer.events.lock().unwrap().is_empty(),
+                "empty discovery must not request writer capacity"
+            );
+            assert_eq!(*observer.reads.lock().unwrap(), vec![expected_class; 4]);
+        }
+        held_writer.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_claim_revalidates_reschedule_and_renewed_lease() {
+        use crate::repositories::recovery_job;
+        use pioneer_entity::recovery_job as entity;
+        let (store, _observer, _path) = recovery_discovery_fixture().await;
+        let now = 1_700_000_000;
+        let job = store
+            .enqueue_recovery_job(
+                "recovery_discovery_turn".into(),
+                "item".into(),
+                TurnItemType::Reasoning,
+                None,
+                RecoveryTrigger::ProviderError,
+                RecoveryAction::RetryWithBackoff,
+                None,
+                None,
+                None,
+                None,
+                0,
+                3,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .active_recovery_job_upper_id()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let ids = recovery_job::list_due_job_ids(&store.connection, unix_to_datetime(now), 1)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![job.id.clone()]);
+        // Discovery is advisory: a producer can move the due time before claim.
+        store
+            .run_serialized_write(|| async {
+                entity::Entity::update_many()
+                    .col_expr(
+                        entity::Column::NextRunAt,
+                        sea_orm::sea_query::Expr::value(unix_to_datetime(now + 10)),
+                    )
+                    .filter(entity::Column::Id.eq(job.id.clone()))
+                    .exec(&store.connection)
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let stale_claims = store
+            .run_serialized_write(|| async {
+                recovery_job::claim_due_job_ids(
+                    &store.connection,
+                    &ids,
+                    unix_to_datetime(now),
+                    unix_to_datetime(now + 45),
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        assert!(
+            stale_claims.is_empty(),
+            "stale page must respect rescheduled next_run_at"
+        );
+        let first = store
+            .claim_due_recovery_jobs(now + 10, 45, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(
+            store
+                .claim_due_recovery_jobs(now + 54, 45, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let second = store
+            .claim_due_recovery_jobs(now + 55, 45, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_ne!(first.claim_token, second.claim_token);
+        // The original candidate ID must not bypass a renewed foreign claim.
+        assert!(
+            store
+                .run_serialized_write(|| async {
+                    recovery_job::claim_due_job_ids(
+                        &store.connection,
+                        &ids,
+                        unix_to_datetime(now + 55),
+                        unix_to_datetime(now + 100),
+                    )
+                    .await
+                })
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .release_claimed_recovery_job(
+                    &job.id,
+                    first.claim_token.as_deref().unwrap(),
+                    now + 55,
+                    None,
+                    now + 55,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            store
+                .mark_claimed_recovery_job_active(
+                    &job.id,
+                    second.claim_token.as_deref().unwrap(),
+                    "attempt",
+                    now + 55,
+                )
+                .await
+                .unwrap(),
+            ClaimedRecoveryActivation::Activated
+        ));
+        assert!(
+            store
+                .active_recovery_job_upper_id()
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn claimed_recovery_job_can_be_marked_active_and_retried() {
         let connection = Database::connect("sqlite::memory:")
@@ -59240,6 +59934,319 @@ mod tests {
             permission_profile.effective_policy,
             ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
         );
+    }
+
+    #[tokio::test]
+    async fn parked_heartbeat_has_no_database_dependency_but_bootstrap_errors_are_unknown() {
+        let store = test_store_with_workspace("ws_heartbeat_empty").await;
+        assert!(
+            store
+                .supervise_turn_execution_heartbeat("empty-owner", 30)
+                .await
+                .unwrap()
+        );
+        store.database_connection().close().await.unwrap();
+        // A parked cycle must not substitute either a SELECT or UPDATE for
+        // the old heartbeat. Both would fail against this closed runtime.
+        assert!(
+            store
+                .supervise_turn_execution_heartbeat("empty-owner", 30)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .supervise_turn_execution_heartbeat("new-owner", 30)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .execution_heartbeats
+                .owner("new-owner")
+                .observation()
+                .1
+        );
+    }
+
+    /// Exercise SQLx's actual "COMMIT succeeded without acknowledgement" path,
+    /// rather than simulating cancellation by dropping an empty registry guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_sent_acquisition_commit_settles_before_owner_can_park() {
+        use pioneer_sqlite::{
+            SqliteDatabase, SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
+            sqlite_read_only_connection_url,
+        };
+        use sea_orm::ConnectOptions;
+        use std::sync::{
+            Condvar, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        #[derive(Default)]
+        struct WriterBoundary {
+            armed: AtomicBool,
+            acquired: tokio::sync::Notify,
+        }
+        impl SqliteWriteObserver for WriterBoundary {
+            fn observe(&self, event: SqliteWriteEvent) {
+                if matches!(event, SqliteWriteEvent::Acquired { .. })
+                    && self.armed.swap(false, Ordering::SeqCst)
+                {
+                    self.acquired.notify_one();
+                }
+            }
+        }
+        // Also releases the physical SQLx worker if an assertion unwinds.
+        #[derive(Default)]
+        struct CommitBarrier {
+            released: Mutex<bool>,
+            condition: Condvar,
+            entered: tokio::sync::Notify,
+            armed: AtomicBool,
+        }
+        struct ReleaseCommit(Arc<CommitBarrier>);
+        impl Drop for ReleaseCommit {
+            fn drop(&mut self) {
+                *self.0.released.lock().unwrap() = true;
+                self.0.condition.notify_all();
+            }
+        }
+
+        let path = OptionalDeliveryDatabasePath(std::env::temp_dir().join(format!(
+            "pioneer-late-acquisition-{}.sqlite",
+            uuid::Uuid::new_v4()
+        )));
+        let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.0.display()));
+        options.max_connections(1);
+        let writer = Database::connect(options).await.unwrap();
+        Migrator::up(&writer, None).await.unwrap();
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        writer
+            .execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
+        let pool = writer.get_sqlite_connection_pool().clone();
+        let mut options = ConnectOptions::new(sqlite_read_only_connection_url(&path.0));
+        options.max_connections(2);
+        options.map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+        });
+        let reader = Database::connect(options).await.unwrap();
+        let boundary = Arc::new(WriterBoundary::default());
+        let database = SqliteDatabase::from_executor(
+            reader,
+            SqliteWriteExecutor::with_observer(writer, boundary.clone()),
+        );
+        database.validate_reader().await.unwrap();
+        let store = CrudStore::new(database);
+        let now = utc_now();
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set("ws_late_commit".to_owned()),
+            name: Set("Late commit".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(&store.connection)
+        .await
+        .unwrap();
+        let (store, thread, turn) = start_test_turn(
+            store,
+            "ws_late_commit",
+            "thr_late_commit",
+            "turn_late_commit",
+        )
+        .await;
+        let owner = "late-commit-owner";
+        assert!(
+            store
+                .supervise_turn_execution_heartbeat(owner, 30)
+                .await
+                .unwrap()
+        );
+        let barrier = Arc::new(CommitBarrier::default());
+        let release = ReleaseCommit(barrier.clone());
+        {
+            // Existing SQLx instrumentation: callback runs inside SQLite COMMIT
+            // on the physical worker, before durability/ack, after command send.
+            let mut connection = pool.acquire().await.unwrap();
+            let mut handle = connection.lock_handle().await.unwrap();
+            let barrier = barrier.clone();
+            handle.set_commit_hook(move || {
+                if barrier.armed.swap(false, Ordering::SeqCst) {
+                    barrier.entered.notify_one();
+                    let mut released = barrier.released.lock().unwrap();
+                    while !*released {
+                        released = barrier.condition.wait(released).unwrap();
+                    }
+                }
+                true
+            });
+        }
+        barrier.armed.store(true, Ordering::SeqCst);
+        let receipt_lease = now + chrono::Duration::seconds(1);
+        let acquisition_store = store.clone();
+        let turn_id = turn.id.clone();
+        let acquisition = tokio::spawn(async move {
+            acquisition_store
+                .materialize_turn_events_atomically_with_optional_admission(
+                    Vec::new(),
+                    now.timestamp(),
+                    None,
+                    None,
+                    None,
+                    Some(NewTurnExecution {
+                        turn_id,
+                        thread_id: thread.id,
+                        workspace_id: thread.workspace_id,
+                        executor_kind: TurnExecutorKind::ApiProvider,
+                        executor_key: Some("openai".to_owned()),
+                        status: TurnExecutionStatus::Starting,
+                        owner_id: owner.to_owned(),
+                        lease_until: receipt_lease,
+                        created_at: now,
+                    }),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), barrier.entered.notified())
+            .await
+            .unwrap();
+        acquisition.abort();
+        assert!(acquisition.await.unwrap_err().is_cancelled());
+        assert!(store.execution_heartbeats.owner(owner).observation().1);
+        // No Rust acquisition guard remains. The independent reader really
+        // observes empty while the already-sent COMMIT is still blocked.
+        assert!(
+            turn_execution::list_owned_active(&store.connection, owner, 200)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let wake = store.turn_execution_heartbeat_notification(owner);
+        tokio::time::timeout(Duration::from_secs(5), wake.notified())
+            .await
+            .unwrap();
+        boundary.armed.store(true, Ordering::SeqCst);
+        let heartbeat = store.supervise_turn_execution_heartbeat(owner, 30);
+        tokio::pin!(heartbeat);
+        // Pre-fix heartbeat completes with Empty here, before attempting a
+        // writer operation. The repaired owner waits for physical settlement.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut heartbeat => panic!("parked before late COMMIT settled: {result:?}"),
+                _ = boundary.acquired.notified() => {}
+            }
+        })
+        .await
+        .unwrap();
+        drop(release);
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), &mut heartbeat)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        let renewed = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert_eq!(renewed.owner_id, owner);
+        assert_eq!(renewed.owner_generation, 1);
+        assert!(renewed.lease_until > receipt_lease);
+        assert!(!store.execution_heartbeats.owner(owner).observation().2);
+        // No producer registered or sent another kick after cancellation.
+        assert!(
+            tokio::time::timeout(Duration::ZERO, wake.notified())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_execution_admission_wakes_parked_owner_and_terminal_receipt_parks_again() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_heartbeat_admission",
+            "thr_heartbeat_admission",
+            "turn_heartbeat_admission",
+        )
+        .await;
+        let scoped = store.with_maintenance_reads_and_critical_writes();
+        let owner = "heartbeat-admission-owner";
+        assert!(
+            scoped
+                .supervise_turn_execution_heartbeat(owner, 30)
+                .await
+                .unwrap()
+        );
+        let wake = scoped.turn_execution_heartbeat_notification(owner);
+        let now = utc_now();
+        // Exercise the same atomic admission owner used by public Turn-start
+        // APIs. The fixture already created the Turn, so only its receipt is new.
+        store
+            .materialize_turn_events_atomically_with_optional_admission(
+                Vec::new(),
+                now.timestamp(),
+                None,
+                None,
+                None,
+                Some(NewTurnExecution {
+                    turn_id: turn.id.clone(),
+                    thread_id: thread.id.clone(),
+                    workspace_id: thread.workspace_id.clone(),
+                    executor_kind: TurnExecutorKind::ApiProvider,
+                    executor_key: Some("openai".to_owned()),
+                    status: TurnExecutionStatus::Starting,
+                    owner_id: owner.to_owned(),
+                    lease_until: now + chrono::Duration::seconds(1),
+                    created_at: now,
+                }),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), wake.notified())
+            .await
+            .unwrap();
+        assert!(
+            !scoped
+                .supervise_turn_execution_heartbeat(owner, 30)
+                .await
+                .unwrap()
+        );
+        let renewed = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert!(renewed.lease_until > now + chrono::Duration::seconds(1));
+        assert_eq!(renewed.owner_generation, 1);
+        store
+            .update_turn_status(
+                &thread.id,
+                &turn.id,
+                TurnStatus::Completed,
+                None,
+                now.timestamp(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            scoped
+                .supervise_turn_execution_heartbeat(owner, 30)
+                .await
+                .unwrap()
+        );
+        let receipt = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert_eq!(receipt.status, TurnExecutionStatus::Completed);
     }
 
     #[tokio::test]
