@@ -128,3 +128,16 @@ CrudStore → list page → metadata fragments → окончательная п
 Mock-сценарии не выполнялись. Компилируемость и прохождение тестов не
 подтверждены. Окончательная приёмка и разрешение на исполняющие проверки
 выполняются отдельно после внешнего ревью.
+
+## PR #257 CI follow-up
+
+The first CI run (`41315685491`, head `18b00363ae03bd13cc9041a5dbee0204898c7c73`)
+stopped at `rustfmt-check` in the Linux build job. Its log reports the existing
+import-order difference in `crates/observability/src/lib.rs` noted above.
+The Rust test shards were skipped because the build job failed at formatting.
+
+After the request to fix CI and push again, moved the `SentryEventKind` import
+to rustfmt's expected position in the test module. No assertions or runtime
+behavior changed. Local validation: `cargo fmt --all --check` and
+`git diff --check`. Tests and compilation were not run locally; the new push
+lets GitHub Actions perform its normal checks without skip directives.
