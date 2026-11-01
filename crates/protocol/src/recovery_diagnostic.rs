@@ -1,11 +1,11 @@
-//! Safe recovery diagnostics. Never reconstruct these facts from raw error text.
+//! Recovery diagnostics. Raw responses are stored separately from public prose.
 use crate::{
     ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage, ProviderTransportKind,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Allowlisted OpenRouter Chat Completions metadata.error_type values.
+/// Allowlisted provider error reasons, never raw provider messages or values.
 /// Diagnostic only: these values must not drive recovery policy.
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -14,6 +14,12 @@ pub enum ProviderErrorReason {
     MaxTokensExceeded,
     TokenLimitExceeded,
     StringTooLong,
+    MissingRequiredParameter,
+    UnsupportedParameter,
+    InvalidParameterValue,
+    InvalidParameterType,
+    ResponsesMissingRequiredItem,
+    ResponsesUnpairedToolCall,
     Authentication,
     PermissionDenied,
     PaymentRequired,
@@ -79,6 +85,18 @@ impl ProviderErrorReason {
             Self::MaxTokensExceeded => "The output token limit was reached.",
             Self::TokenLimitExceeded => "A provider token budget was exceeded.",
             Self::StringTooLong => "A request field exceeded the length limit.",
+            Self::MissingRequiredParameter => "A required request parameter was missing.",
+            Self::UnsupportedParameter => "A request parameter is not supported.",
+            Self::InvalidParameterValue => {
+                "A request parameter had an invalid or unsupported value."
+            }
+            Self::InvalidParameterType => "A request parameter had the wrong type.",
+            Self::ResponsesMissingRequiredItem => {
+                "A Responses input item was missing a required paired item."
+            }
+            Self::ResponsesUnpairedToolCall => {
+                "A Responses tool call and its output could not be paired."
+            }
             Self::Authentication => "Provider authentication failed.",
             Self::PermissionDenied => "The provider denied permission.",
             Self::PaymentRequired => "Provider credits were insufficient.",
@@ -150,9 +168,48 @@ impl From<ProviderRequestId> for String {
     }
 }
 
+/// Original provider error response, bounded by the transport limit for local storage.
+/// Debug output deliberately omits all payloads; public prose never uses them.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderErrorResponse {
+    pub body: String,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_context: Option<String>,
+}
+
+impl ProviderErrorResponse {
+    // Matches the provider transport ceiling, rather than cutting valid error
+    // responses or terminal events off in the middle of their JSON payload.
+    pub const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+    pub fn from_bytes(bytes: &[u8], incomplete: bool) -> Self {
+        let end = bytes.len().min(Self::MAX_BYTES);
+        Self {
+            body: String::from_utf8_lossy(&bytes[..end]).into_owned(),
+            truncated: incomplete || end < bytes.len(),
+            processing_error: None,
+            stream_context: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for ProviderErrorResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderErrorResponse")
+            .field("truncated", &self.truncated)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecoveryProviderFailure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_response: Option<ProviderErrorResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_reason: Option<crate::ProviderErrorReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,6 +227,7 @@ pub struct RecoveryProviderFailure {
 impl From<&ProviderFailureDetails> for RecoveryProviderFailure {
     fn from(failure: &ProviderFailureDetails) -> Self {
         Self {
+            raw_response: failure.raw_response.clone(),
             error_reason: failure.error_reason,
             request_id: failure.request_id.clone(),
             class: failure.class,
@@ -312,6 +370,7 @@ mod tests {
         let private =
             "https://secret.example/request?token=credential /private/provider.json body: HTTP 401";
         let failure = ProviderFailureDetails {
+            raw_response: None,
             error_reason: None,
             request_id: None,
             provider: private.to_owned(),
@@ -365,6 +424,7 @@ mod tests {
         };
         assert!(!partial.public_message().contains("HTTP"));
         partial.last_failure = Some(RecoveryProviderFailure {
+            raw_response: None,
             error_reason: None,
             request_id: None,
             class: ProviderFailureClass::Unknown,

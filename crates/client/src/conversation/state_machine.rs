@@ -59,8 +59,7 @@ impl TurnStateMachine {
     }
 
     pub(crate) fn is_detached_admission(&self, turn: &pioneer_protocol::Turn) -> bool {
-        self.detached_composer
-            && turn.mode != ThreadMode::Message
+        turn.mode != ThreadMode::Message
             && pioneer_protocol::ThreadComposerExecutionMode::DetachedTask
                 .is_detached_admission(turn)
     }

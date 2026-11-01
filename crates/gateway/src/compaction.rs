@@ -518,7 +518,7 @@ impl CompactionRunner {
                     .compaction_reference_payload(&self.workspace, thread, source)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("source unavailable or stale"))?;
-                let text = model_source_payload_for_version(source, text, projection_version)?
+                let text = accepted_manifest_source_payload(source, text, projection_version)?
                     .ok_or_else(|| {
                         anyhow::anyhow!("compaction manifest contains non-model source")
                     })?;
@@ -566,7 +566,7 @@ impl CompactionRunner {
                         )
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("reference source unavailable or stale"))?;
-                    let Some(payload) = model_source_payload_for_version(
+                    let Some(payload) = accepted_manifest_source_payload(
                         &entry.source,
                         payload,
                         COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION,
@@ -1134,7 +1134,7 @@ impl CompactionRunner {
         // Build bounded reference-only excerpts before materializing the active
         // full payload. They are reused across portions and retries.
         // Reference-only excerpts carry no cursor or coverage, so they can use
-        // the current projection even while a legacy active source drains.
+        // current portable-text rules while retaining accepted service bodies.
         let reference_excerpts = self.reference_excerpts().await?;
         let mut reference_scopes = BTreeMap::<&str, Vec<SourceRef>>::new();
         for excerpt in reference_excerpts {
@@ -1492,36 +1492,65 @@ fn model_source_payload_for_version(
     payload: String,
     projection_version: u32,
 ) -> Result<Option<String>> {
+    source_model_payload(source, payload, projection_version, false)
+}
+
+// Membership was admitted before this runner started. Preserve the historical
+// service-event representation (including character offsets) for that accepted
+// work only. Payload/version authentication still precedes this transformation.
+// New manifests and execution history continue to use the current filter.
+fn accepted_manifest_source_payload(
+    source: &SourceRef,
+    payload: String,
+    projection_version: u32,
+) -> Result<Option<String>> {
+    source_model_payload(source, payload, projection_version, true)
+}
+
+fn source_model_payload(
+    source: &SourceRef,
+    payload: String,
+    projection_version: u32,
+    accepted_manifest: bool,
+) -> Result<Option<String>> {
     use pioneer_crud::CanonicalEventModelProjection as Projection;
     if source.scope.starts_with("event:") {
         let event: pioneer_crud::CanonicalTurnEventPayload = serde_json::from_str(&payload)?;
-        return Ok(
-            match pioneer_crud::canonical_event_model_projection(&event) {
-                Projection::Omit => None,
-                Projection::Assistant(text) | Projection::User(text) => Some(text),
-                Projection::Commentary(text) => Some(
-                    if projection_version >= COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION {
-                        pioneer_crud::portable_commentary_text(&text)
-                    } else {
-                        text
-                    },
-                ),
-                Projection::Input => Some(match &event {
-                    pioneer_crud::CanonicalTurnEventPayload::TurnStarted(value) => {
-                        model_input_payload(&value.input)?
-                    }
-                    pioneer_crud::CanonicalTurnEventPayload::TurnMessageEdited(value) => {
-                        model_input_payload(&value.input)?
-                    }
-                    _ => anyhow::bail!("invalid input event model projection"),
-                }),
-                Projection::Default => Some(payload),
-            },
-        );
+        let projection = if accepted_manifest {
+            pioneer_crud::canonical_event_model_projection_before_service_filter(&event)
+        } else {
+            pioneer_crud::canonical_event_model_projection(&event)
+        };
+        return Ok(match projection {
+            Projection::Omit => None,
+            Projection::Assistant(text) | Projection::User(text) => Some(text),
+            Projection::Commentary(text) => Some(
+                if projection_version >= COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION {
+                    pioneer_crud::portable_commentary_text(&text)
+                } else {
+                    text
+                },
+            ),
+            Projection::Input => Some(match &event {
+                pioneer_crud::CanonicalTurnEventPayload::TurnStarted(value) => {
+                    model_input_payload(&value.input)?
+                }
+                pioneer_crud::CanonicalTurnEventPayload::TurnMessageEdited(value) => {
+                    model_input_payload(&value.input)?
+                }
+                _ => anyhow::bail!("invalid input event model projection"),
+            }),
+            Projection::Default => Some(payload),
+        });
     }
     if source.scope.starts_with("item:") {
         let item: pioneer_protocol::TurnItem = serde_json::from_str(&payload)?;
-        return Ok(match pioneer_crud::canonical_item_model_projection(&item) {
+        let projection = if accepted_manifest {
+            pioneer_crud::canonical_item_model_projection_before_service_filter(&item)
+        } else {
+            pioneer_crud::canonical_item_model_projection(&item)
+        };
+        return Ok(match projection {
             Projection::Omit => None,
             Projection::Assistant(text) | Projection::User(text) => Some(text),
             Projection::Commentary(text) => Some(

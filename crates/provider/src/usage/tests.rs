@@ -16,7 +16,8 @@ fn exclusive_cache_absent_read_write_and_zero_are_preserved() {
         } else {
             decode::<2>(value)
         };
-        assert_eq!(u.input_tokens, Some(10));
+        assert_eq!(u.input_tokens, None);
+        assert_eq!(u.uncached_input_tokens, Some(10));
         assert_eq!(u.output_tokens, Some(8));
         assert_eq!(u.cache_read_input_tokens, None);
     }
@@ -166,8 +167,11 @@ fn provider_cost_is_not_overwritten_by_estimate_or_unknown_tariff() {
 }
 #[test]
 fn streaming_extensions_are_not_assumed_for_unknown_profiles() {
-    for p in ["custom", "nscale", "mistral", "openrouter", "cohere"] {
-        assert!(stream_options(p, "fixture-unknown").is_none(), "{p}");
+    for p in ["custom", "nebius", "mistral", "openrouter", "cohere"] {
+        assert!(
+            stream_options(p, "fixture-unknown", "https://override.example/v1").is_none(),
+            "{p}"
+        );
     }
     for p in [
         "groq",
@@ -178,7 +182,7 @@ fn streaming_extensions_are_not_assumed_for_unknown_profiles() {
         "deepseek",
     ] {
         assert_eq!(
-            stream_options(p, "fixture-unknown").unwrap()["include_usage"],
+            stream_options(p, "fixture-unknown", "https://override.example/v1").unwrap()["include_usage"],
             true,
             "{p}"
         );
@@ -188,10 +192,14 @@ fn streaming_extensions_are_not_assumed_for_unknown_profiles() {
 #[test]
 fn cache_control_does_not_enable_paid_long_retention_or_mark_other_routes() {
     assert!(anthropic_cache_control("https://custom.example/v1", "claude-fixture").is_none());
-    assert!(anthropic_cache_control("https://api.anthropic.com", "unregistered-fixture").is_none());
-    assert!(
-        anthropic_cache_control("https://api.anthropic.com", "claude-unregistered-fixture")
-            .is_none()
+    // The native Messages contract applies without a public pricing snapshot.
+    assert_eq!(
+        anthropic_cache_control_in_catalog(
+            "https://api.anthropic.com",
+            "unregistered-fixture",
+            None
+        ),
+        Some(json!({"type":"ephemeral"}))
     );
 }
 
@@ -262,7 +270,7 @@ fn long_retention_and_modality_usage_do_not_receive_a_standard_text_estimate() {
 }
 
 #[test]
-fn native_cache_marker_requires_evidenced_model_profile_and_default_retention() {
+fn native_cache_marker_ignores_price_but_preserves_endpoint_api_and_negative_facts() {
     let model = json!({"id":"claude-fixture","name":"Fixture","provider":"anthropic","api":"anthropic-messages","baseUrl":"https://api.anthropic.com","contextWindow":1000,"maxTokens":100,"reasoning":false,"input":["text"],"cost":{"input":2,"output":10,"cacheRead":0.2,"cacheWrite":2.5},"pricingEvidenceVersion":1});
     let origin = json!({"anthropic":{"claude-fixture":{"contextWindow":{"kind":"source","expression":"fixture"},"maxTokens":{"kind":"source","expression":"fixture"}}}});
     let catalog = |model: Value| {
@@ -276,7 +284,7 @@ fn native_cache_marker_requires_evidenced_model_profile_and_default_retention() 
         anthropic_cache_control_in_catalog(
             "https://api.anthropic.com",
             "claude-fixture",
-            &catalog(model.clone())
+            Some(&catalog(model.clone()))
         ),
         Some(json!({"type":"ephemeral"}))
     );
@@ -284,24 +292,41 @@ fn native_cache_marker_requires_evidenced_model_profile_and_default_retention() 
         anthropic_cache_control_in_catalog(
             "https://private-proxy.example",
             "claude-fixture",
-            &catalog(model.clone())
+            Some(&catalog(model.clone()))
         )
         .is_none()
     );
-    for variant in [0, 1, 2] {
+    for price in [Value::Null, json!(0)] {
+        let mut unpriced = model.clone();
+        unpriced
+            .as_object_mut()
+            .unwrap()
+            .remove("pricingEvidenceVersion");
+        unpriced["cost"]["cacheRead"] = price;
+        assert_eq!(
+            anthropic_cache_control_in_catalog(
+                "https://api.anthropic.com",
+                "claude-fixture",
+                Some(&catalog(unpriced))
+            ),
+            Some(json!({"type":"ephemeral"}))
+        );
+    }
+    for variant in [0, 1] {
         let mut m = model.clone();
         match variant {
-            0 => {
+            0 => m["api"] = json!("openai-completions"),
+            _ => {
                 m.as_object_mut().unwrap().remove("pricingEvidenceVersion");
+                m["cost"]["cacheRead"] = Value::Null;
+                m["compat"] = json!({"supportsPromptCaching":false});
             }
-            1 => m["api"] = json!("openai-completions"),
-            _ => m["compat"] = json!({"supportsPromptCaching":false}),
         };
         assert!(
             anthropic_cache_control_in_catalog(
                 "https://api.anthropic.com",
                 "claude-fixture",
-                &catalog(m)
+                Some(&catalog(m))
             )
             .is_none()
         );
@@ -688,4 +713,442 @@ fn vercel_responses_fixed_tariff_is_estimated_but_conditional_tariffs_are_not() 
             assert_eq!(evidence["price_status"], "unknown_or_conditional_price");
         }
     }
+}
+
+#[test]
+fn native_cache_controls_require_endpoint_and_existing_catalog_evidence() {
+    let models = json!({"openrouter":{"supported":{"id":"supported","provider":"openrouter","name":"Fixture","api":"openai-completions","baseUrl":"https://openrouter.ai/api/v1","contextWindow":1000,"maxTokens":100,"reasoning":false,"input":["text"],"cost":{},"compat":{"cacheControlFormat":"anthropic"}}}});
+    let origins = json!({"openrouter":{"supported":{"contextWindow":{"kind":"source","expression":"fixture"},"maxTokens":{"kind":"source","expression":"fixture"}}}});
+    let catalog =
+        crate::catalog::ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap();
+    assert_eq!(
+        openrouter_cache_control_in_catalog("https://openrouter.ai/api/v1", "supported", &catalog),
+        Some(json!({"type":"ephemeral"}))
+    );
+    for endpoint in [
+        "https://proxy.example/api/v1",
+        "https://openrouter.ai/private",
+        "http://openrouter.ai/api/v1",
+    ] {
+        assert!(openrouter_cache_control_in_catalog(endpoint, "supported", &catalog).is_none());
+    }
+    assert!(
+        openrouter_cache_control_in_catalog("https://openrouter.ai/api/v1", "unknown", &catalog)
+            .is_none()
+    );
+    let mut no_fact = models.clone();
+    no_fact["openrouter"]["supported"]["compat"] = json!({});
+    let unknown =
+        crate::catalog::ModelCatalog::parse(&no_fact.to_string(), &origins.to_string()).unwrap();
+    assert!(
+        openrouter_cache_control_in_catalog("https://openrouter.ai/api/v1", "supported", &unknown)
+            .is_none()
+    );
+    let mut denied = models;
+    denied["openrouter"]["supported"]["compat"]["supportsPromptCaching"] = json!(false);
+    let denied =
+        crate::catalog::ModelCatalog::parse(&denied.to_string(), &origins.to_string()).unwrap();
+    assert!(
+        openrouter_cache_control_in_catalog("https://openrouter.ai/api/v1", "supported", &denied)
+            .is_none()
+    );
+    assert!(
+        anthropic_cache_control_in_catalog(
+            "https://api.anthropic.com/proxy",
+            "supported",
+            Some(&catalog)
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn exclusive_partial_updates_complete_only_when_every_category_is_known() {
+    let mut usage = decode::<1>(json!({"input_tokens":10,"cache_read_input_tokens":80}));
+    assert_eq!(usage.input_tokens, None);
+    assert_eq!(usage.uncached_input_tokens, Some(10));
+    usage.update(&decode::<1>(json!({"cache_creation_input_tokens":0})));
+    assert_eq!(usage.input_tokens, Some(90));
+    usage.update(&decode::<1>(json!({"output_tokens":5})));
+    assert_eq!(usage.input_tokens, Some(90));
+}
+
+#[test]
+fn chat_cached_aliases_preserve_inclusive_input_and_explicit_zero() {
+    for (raw, expected) in [
+        (json!({"prompt_tokens":591,"cached_tokens":512}), Some(512)),
+        (
+            json!({"prompt_tokens":591,"cached_tokens":512,"prompt_tokens_details":{"cached_tokens":0}}),
+            Some(0),
+        ),
+        (
+            json!({"prompt_tokens":591,"cached_tokens":512,"prompt_cache_hit_tokens":400}),
+            Some(512),
+        ),
+        (json!({"prompt_tokens":591,"cached_tokens":0}), Some(0)),
+        (json!({"prompt_tokens":591}), None),
+        (json!({"prompt_tokens":591,"cached_tokens":-1}), None),
+        (json!({"prompt_tokens":591,"cached_tokens":true}), None),
+        (
+            json!({"prompt_tokens":591,"cached_tokens":18446744073709551616_f64}),
+            None,
+        ),
+    ] {
+        let usage = decode::<0>(raw);
+        assert_eq!(usage.input_tokens, Some(591));
+        assert_eq!(usage.cache_read_input_tokens, expected);
+        assert_eq!(usage.cache_write_input_tokens, None);
+    }
+    let mut usage = decode::<0>(json!({"prompt_tokens":u64::MAX,"cached_tokens":u64::MAX}));
+    let final_usage = decode::<0>(json!({"completion_tokens":5}));
+    usage.update(&final_usage);
+    usage.update(&final_usage);
+    assert_eq!(usage.input_tokens, Some(u64::MAX));
+    assert_eq!(usage.cache_read_input_tokens, Some(u64::MAX));
+    assert_eq!(usage.output_tokens, Some(5));
+}
+
+fn native_chat_context(provider: &str, base: &str) -> UsageContext {
+    UsageContext {
+        provider: provider.into(),
+        model: "fixture".into(),
+        api: "chat_completions".into(),
+        api_version: None,
+        route: route(base, "/chat/completions"),
+        attempt: "usage-fixture-attempt".into(),
+        catalog: None,
+        native: None,
+    }
+}
+
+#[test]
+fn aihubmix_claude_envelope_retains_native_categories_without_inventing_input() {
+    let context = native_chat_context("aihubmix", "https://aihubmix.com/v1");
+    let mut usage = decode::<0>(
+        json!({"prompt_tokens":22,"completion_tokens":810,"total_tokens":832,
+        "prompt_tokens_details":{"cached_tokens":6266},
+        "claude_cache_tokens_details":{"cache_creation_input_tokens":0,"cache_read_input_tokens":6266,
+            "cache_write_5_minutes_input_tokens":0,"cache_write_1_hour_input_tokens":0,"secret":"SECRET"}}),
+    );
+    context.enrich(&mut usage);
+    assert_eq!(usage.input_tokens, None);
+    assert_eq!(usage.uncached_input_tokens, None);
+    assert_eq!(usage.cache_read_input_tokens, Some(6266));
+    assert_eq!(usage.cache_write_input_tokens, Some(0));
+    assert_eq!(usage.output_tokens, Some(810));
+    assert_eq!(usage.reported_total_tokens, Some(832));
+    assert_eq!(
+        usage.semantics.as_deref(),
+        Some("aihubmix_claude_input_unresolved")
+    );
+    assert!(usage.accounting.as_ref().unwrap()["estimated_cost"].is_null());
+    assert!(
+        !usage
+            .raw_usage
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("SECRET")
+    );
+    let output_only = decode::<0>(json!({"completion_tokens":820}));
+    usage.update(&output_only);
+    context.enrich(&mut usage);
+    usage.update(&output_only);
+    context.enrich(&mut usage);
+    let restored: TokenUsage =
+        serde_json::from_value(serde_json::to_value(&usage).unwrap()).unwrap();
+    assert_eq!(restored.input_tokens, None);
+    assert_eq!(restored.cache_read_input_tokens, Some(6266));
+    assert_eq!(restored.output_tokens, Some(820));
+    assert_eq!(
+        restored.raw_usage.unwrap()["claude_cache_tokens_details"]["cache_write_1_hour_input_tokens"],
+        0
+    );
+
+    for (provider, base) in [
+        ("custom", "https://aihubmix.com/v1"),
+        ("aihubmix", "https://proxy.example/v1"),
+    ] {
+        let mut ordinary = decode::<0>(
+            json!({"prompt_tokens":100,"claude_cache_tokens_details":{"cache_read_input_tokens":10}}),
+        );
+        native_chat_context(provider, base).enrich(&mut ordinary);
+        assert_eq!(ordinary.input_tokens, Some(100));
+        assert_eq!(ordinary.cache_read_input_tokens, None);
+    }
+    // An ordinary AIHubMix Chat envelope retains the generic inclusive contract.
+    let mut ordinary =
+        decode::<0>(json!({"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":10}}));
+    context.enrich(&mut ordinary);
+    assert_eq!(ordinary.input_tokens, Some(100));
+    assert_eq!(ordinary.cache_read_input_tokens, Some(10));
+}
+
+#[test]
+fn venice_paid_write_alias_and_technical_creation_counters_keep_distinct_semantics() {
+    let context = native_chat_context("venice", "https://api.venice.ai/api/v1");
+    for (details, expected, uncached) in [
+        (
+            json!({"cached_tokens":50,"cache_creation_input_tokens":20}),
+            Some(20),
+            Some(30),
+        ),
+        (
+            json!({"cached_tokens":50,"cache_write_tokens":0,"cache_creation_input_tokens":20}),
+            Some(0),
+            Some(50),
+        ),
+        (
+            json!({"cached_tokens":50,"cache_creation_input_tokens":60}),
+            Some(60),
+            None,
+        ),
+        (json!({"cached_tokens":50}), None, None),
+    ] {
+        let raw = json!({"prompt_tokens":100,"prompt_tokens_details":details});
+        let mut usage = decode::<0>(raw.clone());
+        context.enrich(&mut usage);
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.cache_write_input_tokens, expected);
+        assert_eq!(usage.uncached_input_tokens, uncached);
+        let mut other = decode::<0>(raw);
+        native_chat_context("custom", "https://api.venice.ai/api/v1").enrich(&mut other);
+        assert_eq!(
+            other.cache_write_input_tokens,
+            details["cache_write_tokens"].as_u64()
+        );
+    }
+    for (provider, field) in [
+        ("sambanova", "cache_creation_tokens"),
+        ("vllm", "created_cache_tokens"),
+    ] {
+        let snapshot = decode::<0>(json!({"prompt_tokens":100,"prompt_tokens_details":{
+            "cached_tokens":50,field:50}}));
+        let mut accumulated = TokenUsage::default();
+        accumulated.update(&snapshot);
+        accumulated.update(&snapshot);
+        let restored: TokenUsage =
+            serde_json::from_value(serde_json::to_value(&accumulated).unwrap()).unwrap();
+        assert_eq!(restored.input_tokens, Some(100), "{provider}");
+        assert_eq!(restored.cache_write_input_tokens, None, "{provider}");
+        assert_eq!(
+            restored.raw_usage.unwrap()["prompt_tokens_details"][field],
+            50
+        );
+    }
+}
+
+#[test]
+fn documented_stream_usage_defaults_obey_route_and_explicit_false() {
+    for provider in ["sglang", "vllm", "litellm", "baseten", "nscale"] {
+        let base = crate::provider_definition(provider)
+            .unwrap()
+            .default_base_url
+            .unwrap();
+        for root in [base.to_owned(), format!("{base}/chat/completions/")] {
+            assert_eq!(
+                stream_options_in_catalog(provider, "fixture", &root, None),
+                Some(json!({"include_usage":true}))
+            );
+        }
+        let fixture = |support: Value| {
+            let models = json!({provider:{"fixture":{"id":"fixture","name":"Fixture","provider":provider,
+                "api":"openai-completions","baseUrl":base,"contextWindow":1000,"maxTokens":100,
+                "reasoning":false,"input":["text"],"cost":{},"compat":{"supportsUsageInStreaming":support}}}});
+            let origins = json!({provider:{"fixture":{"contextWindow":{"kind":"source","expression":"fixture"},
+                "maxTokens":{"kind":"source","expression":"fixture"}}}});
+            crate::catalog::ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap()
+        };
+        assert!(
+            stream_options_in_catalog(provider, "fixture", base, Some(&fixture(json!(false))))
+                .is_none()
+        );
+        for root in [base.to_owned(), format!("{base}/chat/completions/")] {
+            assert_eq!(
+                stream_options_in_catalog(provider, "fixture", &root, Some(&fixture(json!(true)))),
+                Some(json!({"include_usage":true}))
+            );
+        }
+        if matches!(provider, "baseten" | "nscale") {
+            assert!(
+                stream_options_in_catalog(
+                    provider,
+                    "fixture",
+                    "https://unconfirmed.example/v1",
+                    Some(&fixture(json!(true)))
+                )
+                .is_none()
+            );
+        }
+    }
+    for provider in ["baseten", "nscale", "nebius", "custom"] {
+        assert!(
+            stream_options_in_catalog(provider, "fixture", "https://unconfirmed.example/v1", None)
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn aihubmix_partial_native_categories_preserve_zero_unknown_and_ttl_observations() {
+    let context = native_chat_context("aihubmix", "https://aihubmix.com/v1");
+    for (details, read, write) in [
+        (json!({}), None, None),
+        (json!({"cache_read_input_tokens":0}), Some(0), None),
+        (
+            json!({"cache_creation_input_tokens":6266,"cache_write_5_minutes_input_tokens":6000,"cache_write_1_hour_input_tokens":266}),
+            None,
+            Some(6266),
+        ),
+        (
+            json!({"cache_read_input_tokens":-1,"cache_creation_input_tokens":true}),
+            None,
+            None,
+        ),
+        (
+            json!({"cache_read_input_tokens":18446744073709551616_f64}),
+            None,
+            None,
+        ),
+    ] {
+        let mut usage =
+            decode::<0>(json!({"prompt_tokens":22,"claude_cache_tokens_details":details}));
+        context.enrich(&mut usage);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, read);
+        assert_eq!(usage.cache_write_input_tokens, write);
+        assert_eq!(
+            usage.raw_usage.as_ref().unwrap()["claude_cache_tokens_details"],
+            details
+        );
+    }
+    let mut usage = decode::<0>(json!({"prompt_tokens":22,"claude_cache_tokens_details":{
+        "cache_creation_input_tokens":0,"cache_read_input_tokens":6266}}));
+    context.enrich(&mut usage);
+    usage.update(&decode::<0>(
+        json!({"claude_cache_tokens_details":{"cache_read_input_tokens":null}}),
+    ));
+    context.enrich(&mut usage);
+    assert_eq!(usage.cache_read_input_tokens, Some(6266));
+    assert_eq!(usage.cache_write_input_tokens, Some(0));
+}
+
+fn cache_fact_model(provider: &str, api: &str, compat: Value) -> crate::catalog::CatalogModel {
+    serde_json::from_value(
+        json!({"id":"cache-facts-fixture","name":"Fixture","provider":provider,
+        "api":api,"baseUrl":crate::provider_definition(provider).unwrap().default_base_url.unwrap(),
+        "contextWindow":1000,"maxTokens":100,"reasoning":false,"input":["text"],
+        "cost":{},"compat":compat}),
+    )
+    .unwrap()
+}
+
+fn cache_fact_catalog(entry: &crate::catalog::CatalogModel) -> crate::catalog::ModelCatalog {
+    crate::catalog::ModelCatalog::parse(
+        &json!({entry.provider.clone():{entry.id.clone():entry}}).to_string(),
+        &json!({entry.provider.clone():{entry.id.clone():{
+            "contextWindow":{"kind":"source","expression":"fixture"},
+            "maxTokens":{"kind":"source","expression":"fixture"}}}})
+        .to_string(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn cache_admission_resolves_native_facts_per_field_and_respects_private_authority() {
+    // A sparse native source falls back per field only when public facts are allowed.
+    for (provider, api, field) in [
+        ("anthropic", "anthropic-messages", "supportsPromptCaching"),
+        ("baseten", "openai-completions", "supportsUsageInStreaming"),
+    ] {
+        let base = crate::provider_definition(provider)
+            .unwrap()
+            .default_base_url
+            .unwrap();
+        for (native_support, catalog_support, public, admitted) in [
+            (json!(false), json!(true), true, false),
+            (json!(true), json!(false), true, true),
+            (Value::Null, json!(false), true, false),
+            (Value::Null, json!(false), false, true),
+        ] {
+            let native = cache_fact_model(provider, api, json!({field:native_support}));
+            let source = cache_fact_catalog(&cache_fact_model(
+                provider,
+                api,
+                json!({field:catalog_support}),
+            ));
+            crate::generation::with_native_models(
+                provider,
+                public,
+                [(native.id.clone(), native)].into_iter().collect(),
+                async {
+                    let actual = if provider == "anthropic" {
+                        anthropic_cache_control_in_catalog(
+                            base,
+                            "cache-facts-fixture",
+                            Some(&source),
+                        )
+                    } else {
+                        stream_options_in_catalog(
+                            provider,
+                            "cache-facts-fixture",
+                            base,
+                            Some(&source),
+                        )
+                    };
+                    assert_eq!(actual.is_some(), admitted, "{provider}/{public}");
+                },
+            )
+            .await;
+        }
+        let source = cache_fact_catalog(&cache_fact_model(provider, api, json!({field:true})));
+        let native = cache_fact_model(provider, "unrelated-api", json!({field:true}));
+        crate::generation::with_native_models(
+            provider,
+            true,
+            [(native.id.clone(), native)].into_iter().collect(),
+            async {
+                let actual = if provider == "anthropic" {
+                    anthropic_cache_control_in_catalog(base, "cache-facts-fixture", Some(&source))
+                } else {
+                    stream_options_in_catalog(provider, "cache-facts-fixture", base, Some(&source))
+                };
+                assert!(
+                    actual.is_none(),
+                    "{provider}: native API mismatch is not overwritten"
+                );
+            },
+        )
+        .await;
+    }
+    // Native support needs neither a public snapshot nor positive pricing.
+    let native = cache_fact_model(
+        "anthropic",
+        "anthropic-messages",
+        json!({"supportsPromptCaching":true}),
+    );
+    crate::generation::with_native_models(
+        "anthropic",
+        false,
+        [(native.id.clone(), native)].into_iter().collect(),
+        async {
+            assert_eq!(
+                anthropic_cache_control_in_catalog(
+                    "https://api.anthropic.com",
+                    "cache-facts-fixture",
+                    None
+                ),
+                Some(json!({"type":"ephemeral"}))
+            );
+            assert!(
+                anthropic_cache_control_in_catalog(
+                    "https://private.example",
+                    "cache-facts-fixture",
+                    None
+                )
+                .is_none()
+            );
+        },
+    )
+    .await;
 }

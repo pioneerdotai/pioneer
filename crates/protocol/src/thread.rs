@@ -53,16 +53,10 @@ pub enum ThreadComposerExecutionMode {
 }
 
 impl ThreadComposerExecutionMode {
-    /// Only a user-authored Conversation is Composer admission. Agent child
-    /// Conversations and TaskRun occurrences retain their own execution.
+    /// The persisted admission fact is authoritative, including for historical
+    /// foreground turns in a thread whose launch policy has since changed.
     pub fn is_detached_admission(self, turn: &Turn) -> bool {
-        self == Self::DetachedTask
-            && turn.turn_kind == crate::TurnKind::Conversation
-            && turn.origin == crate::TurnOrigin::User
-            && matches!(
-                turn.author.as_ref().map(|author| &author.actor),
-                Some(crate::PersistedActorRef::Principal(_))
-            )
+        turn.work_owner == crate::TurnWorkOwner::DetachedTask
     }
 }
 

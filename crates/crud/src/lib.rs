@@ -80,7 +80,7 @@ pub use events::{
 pub use model_history::{
     CanonicalEventModelProjection, canonical_event_model_projection,
     canonical_event_model_projection_before_service_filter, canonical_item_model_projection,
-    portable_commentary_text,
+    canonical_item_model_projection_before_service_filter, portable_commentary_text,
 };
 pub use repositories::administrative_audit::{
     NewAdministrativeAuditEvent, audit_action_to_db, audit_domain_to_db, audit_target_kind_to_db,
@@ -14002,15 +14002,6 @@ impl CrudStore {
         execution_graph: Option<AgentExecutionGraphCommitInput>,
         response: Option<AgentTurnResponseInput>,
     ) -> Result<Option<AgentExecutionGraphCommitResult>> {
-        let authority_envelope_json = authority_envelope_json.trim();
-        if authority_envelope_json.is_empty() {
-            bail!("execution authority envelope must not be empty");
-        }
-        match (turn_model.author.as_ref(), &actor) {
-            (Some(author), actor) if &author.actor == actor => {}
-            (None, PersistedActorRef::System) => {}
-            _ => bail!("executable Turn actor does not match its immutable author snapshot"),
-        }
         let creation = match runtime_draft {
             Some(AuthorizedTurnRuntimeDraft::ScopedPrincipal {
                 gateway_id,
@@ -14033,10 +14024,67 @@ impl CrudStore {
             }
             None => None,
         };
+        self.materialize_admitted_thread_turn(
+            thread_model,
+            sandbox_mode,
+            turn_model,
+            input,
+            reasoning_effort,
+            work_owner,
+            actor,
+            audit_event,
+            authority_envelope_json,
+            creation,
+            admission,
+            execution,
+            execution_security_snapshot,
+            security_audit_events,
+            execution_graph,
+            response,
+            None,
+        )
+        .await
+    }
+
+    /// One canonical Turn admission write path for interactive and agent
+    /// entries. The adapters only supply their authorization/atomic action facts.
+    #[allow(clippy::too_many_arguments)]
+    async fn materialize_admitted_thread_turn(
+        &self,
+        thread_model: &Thread,
+        sandbox_mode: SandboxMode,
+        turn_model: &Turn,
+        input: &[UserInput],
+        reasoning_effort: Option<&str>,
+        work_owner: TurnWorkOwner,
+        actor: PersistedActorRef,
+        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+        authority_envelope_json: &str,
+        creation: Option<NewUserThreadCreation>,
+        admission: Option<NewTurnAdmission>,
+        execution: Option<NewTurnExecution>,
+        execution_security_snapshot: &TurnExecutionSecuritySnapshot,
+        security_audit_events: Vec<pioneer_protocol::TurnPermissionAuditEvent>,
+        execution_graph: Option<AgentExecutionGraphCommitInput>,
+        response: Option<AgentTurnResponseInput>,
+        agent_action: Option<AgentCommitInput>,
+    ) -> Result<Option<AgentExecutionGraphCommitResult>> {
+        let authority_envelope_json = authority_envelope_json.trim();
+        if authority_envelope_json.is_empty() {
+            bail!("execution authority envelope must not be empty");
+        }
+        match (turn_model.author.as_ref(), &actor) {
+            (Some(author), actor) if &author.actor == actor => {}
+            (None, PersistedActorRef::System) => {}
+            _ => bail!("executable Turn actor does not match its immutable author snapshot"),
+        }
         let started_event = TurnEventPayload::TurnStarted(TurnStartedEventPayload {
             thread: thread_model.clone(),
             sandbox_mode,
-            turn: turn_model.clone(),
+            turn: Turn {
+                work_owner,
+                ..turn_model.clone()
+            },
             input: input.to_vec(),
             actor: Some(actor),
             reasoning_effort: reasoning_effort.map(str::to_owned),
@@ -14058,7 +14106,7 @@ impl CrudStore {
             Some((turn_model.id.clone(), authority_envelope_json.to_owned())),
             execution,
             Some((turn_model.id.clone(), execution_security_snapshot.clone())),
-            None,
+            agent_action,
             execution_graph,
             response,
         )
@@ -14135,38 +14183,24 @@ impl CrudStore {
         {
             bail!("agent Turn input/response actors differ from its execution graph and action");
         }
-        let authority_envelope_json = authority_envelope_json.trim();
-        if authority_envelope_json.is_empty() {
-            bail!("agent Turn execution authority envelope must not be empty");
-        }
-        let started_event = TurnEventPayload::TurnStarted(TurnStartedEventPayload {
-            thread: thread_model.clone(),
+        self.materialize_admitted_thread_turn(
+            thread_model,
             sandbox_mode,
-            turn: turn_model.clone(),
-            input: input.to_vec(),
-            actor: Some(actor),
-            reasoning_effort: reasoning_effort.map(str::to_owned),
-            work_owner: Default::default(),
-        });
-        let mut events = Vec::with_capacity(2usize.saturating_add(security_audit_events.len()));
-        events.push(started_event);
-        events.push(TurnEventPayload::TurnPermissionAudit(audit_event));
-        events.extend(
-            security_audit_events
-                .into_iter()
-                .map(TurnEventPayload::TurnPermissionAudit),
-        );
-        self.materialize_turn_events_atomically_with_optional_admission(
-            events,
-            thread_model.updated_at,
+            turn_model,
+            input,
+            reasoning_effort,
+            TurnWorkOwner::Turn,
+            actor,
+            audit_event,
+            authority_envelope_json,
             None,
             Some(admission),
-            Some((turn_model.id.clone(), authority_envelope_json.to_owned())),
             Some(execution),
-            Some((turn_model.id.clone(), execution_security_snapshot.clone())),
-            Some(agent_action),
+            execution_security_snapshot,
+            security_audit_events,
             Some(execution_graph),
             None,
+            Some(agent_action),
         )
         .await?
         .context("agent Turn transaction did not commit its execution graph")
@@ -14986,6 +15020,8 @@ impl CrudStore {
             let permission_profile = parse_turn_permission_profile(&prepared_turn)?;
             let collaboration = turn::collaboration_from_model(&prepared_turn)?;
             let completed_turn = Turn {
+                work_owner: TurnWorkOwner::from_db_str(&prepared_turn.work_owner)
+                    .map_err(anyhow::Error::msg)?,
                 id: prepared_turn.id.clone(),
                 status: TurnStatus::Completed,
                 turn_kind: turn_kind_from_db(prepared_turn.turn_kind.as_str()).unwrap_or_default(),
@@ -19408,6 +19444,8 @@ impl CrudStore {
                     workspace_id: thread_model.workspace_id,
                     thread_id: turn_model.thread_id.clone(),
                     turn: Turn {
+                        work_owner: TurnWorkOwner::from_db_str(&turn_model.work_owner)
+                            .map_err(anyhow::Error::msg)?,
                         id: turn_model.id,
                         status: TurnStatus::Completed,
                         turn_kind: turn_kind_from_db(turn_model.turn_kind.as_str())
@@ -24664,6 +24702,7 @@ impl CrudStore {
         // replaying the immutable start event.
         let mut decoded_rows = Vec::with_capacity(event_rows.len());
         let mut message_turn_ids = HashSet::new();
+        let mut projection_turn_ids = HashSet::new();
         for row in event_rows {
             let payload = serde_json::from_str::<TurnEventPayload>(row.payload.as_str())
                 .with_context(|| format!("failed to decode turn_event payload `{}`", row.id))?;
@@ -24680,22 +24719,36 @@ impl CrudStore {
                 }
                 _ => {}
             }
+            if matches!(
+                &payload,
+                TurnEventPayload::TurnStarted(_)
+                    | TurnEventPayload::TurnCompleted(_)
+                    | TurnEventPayload::TurnFailed(_)
+                    | TurnEventPayload::TurnBlocked(_)
+            ) {
+                projection_turn_ids.insert(row.turn_id.clone());
+            }
             decoded_rows.push((row, payload));
         }
         let message_turn_ids = message_turn_ids.into_iter().collect::<Vec<_>>();
-        let current_message_turns = self
-            .get_turns_by_thread_and_ids(thread_id, message_turn_ids.as_slice())
-            .await?;
+        let projection_turn_ids = projection_turn_ids.into_iter().collect::<Vec<_>>();
+        let mut current_turns = HashMap::new();
+        for ids in projection_turn_ids.chunks(turn::THREAD_TURN_SNAPSHOT_BATCH_SIZE) {
+            current_turns.extend(self.get_turns_by_thread_and_ids(thread_id, ids).await?);
+        }
         let current_message_inputs = self
             .get_turn_inputs_for_turns(message_turn_ids.as_slice())
             .await?;
 
         let mut events = Vec::with_capacity(decoded_rows.len());
-        for (row, payload) in decoded_rows {
+        for (row, mut payload) in decoded_rows {
+            if let Some(current) = current_turns.get(row.turn_id.as_str()) {
+                payload.project_work_owner(current.work_owner);
+            }
             let mapped_payload = match payload {
                 TurnEventPayload::TurnStarted(payload) => {
                     let (turn, input) = if payload.turn.mode == ThreadMode::Message {
-                        let current = current_message_turns
+                        let current = current_turns
                             .get(row.turn_id.as_str())
                             .context("current Message history projection is unavailable")?;
                         if current.mode != ThreadMode::Message {
@@ -24918,7 +24971,7 @@ impl CrudStore {
                 | TurnEventPayload::TurnMessageDeleted(_) => continue,
                 TurnEventPayload::TurnCompleted(mut notification) => {
                     if notification.turn.mode == ThreadMode::Message {
-                        notification.turn = current_message_turns
+                        notification.turn = current_turns
                             .get(row.turn_id.as_str())
                             .filter(|turn| turn.mode == ThreadMode::Message)
                             .cloned()
@@ -29401,6 +29454,8 @@ impl CrudStore {
                 )
             })?;
             Some(Turn {
+                work_owner: TurnWorkOwner::from_db_str(&turn_model.work_owner)
+                    .map_err(anyhow::Error::msg)?,
                 id: turn_model.id.clone(),
                 status: desired_status,
                 turn_kind: turn_kind_from_db(turn_model.turn_kind.as_str()).unwrap_or_default(),
@@ -33168,6 +33223,27 @@ impl CrudStore {
         input: TaskCreationCommitInput,
         root: Option<frozen_lifetime::PreparedFrozenRoot>,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        // Prepare the bounded admission binding outside writer capacity. The
+        // status is revalidated inside the Task/action transaction below: Stop
+        // or recovery must win atomically against acceptance of new work.
+        let composer_admissions = input
+            .events
+            .iter()
+            .filter_map(|event| {
+                let TaskEventPayload::TaskCreated { task } = event else {
+                    return None;
+                };
+                let work = task.metadata.as_ref()?.composer_work.as_ref()?;
+                Some((
+                    task.workspace_id.clone(),
+                    task.owner_id.clone(),
+                    task.created_by_thread_id.clone(),
+                    task.created_by_turn_id.clone(),
+                    work.launch.thread_id.clone(),
+                    work.launch.turn_id.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
         let prepared_events = self
             .prepare_task_events_for_write(input.events.clone())
             .await?;
@@ -33209,6 +33285,47 @@ impl CrudStore {
             .await
             .context("failed to begin atomic Task creation transaction")?;
         let result = async {
+            for (workspace_id, owner_id, creator_thread, creator_turn, thread_id, turn_id) in
+                &composer_admissions
+            {
+                let (Some(creator_thread), Some(creator_turn)) = (creator_thread, creator_turn)
+                else {
+                    continue;
+                };
+                let Some(turn) =
+                    turn::find_turn_by_thread_and_id(&transaction, creator_thread, creator_turn)
+                        .await?
+                else {
+                    continue;
+                };
+                // Composer payloads also occur in historical/ordinary Task
+                // requests. Only a saved detached admission owns this fence.
+                if turn.work_owner != TurnWorkOwner::DetachedTask.as_db_str() {
+                    continue;
+                }
+                anyhow::ensure!(
+                    owner_id.as_ref() == Some(thread_id)
+                        && creator_thread == thread_id
+                        && creator_turn == turn_id,
+                    "invalid composer Task admission binding"
+                );
+                let execution = turn_execution::find(&transaction, turn_id)
+                    .await?
+                    .context("composer Task admission has no execution owner")?;
+                anyhow::ensure!(
+                    turn.work_owner == TurnWorkOwner::DetachedTask.as_db_str()
+                        && turn.status == "in_progress"
+                        && execution.workspace_id == *workspace_id
+                        && execution.thread_id == *thread_id
+                        && matches!(
+                            execution.status,
+                            TurnExecutionStatus::Queued
+                                | TurnExecutionStatus::Starting
+                                | TurnExecutionStatus::Running
+                        ),
+                    "composer Task admission was stopped or taken over before Task acceptance"
+                );
+            }
             let appended_events = self
                 .append_task_events_in_connection(
                     &transaction,
@@ -35371,6 +35488,7 @@ fn thread_snapshot_turn_from_db_model(model: pioneer_entity::turn::Model) -> Res
     let collaboration = turn::collaboration_from_model(&model)?;
 
     Ok(Some(Turn {
+        work_owner: TurnWorkOwner::from_db_str(&model.work_owner).map_err(anyhow::Error::msg)?,
         id: model.id,
         status,
         turn_kind: turn_kind_from_db(model.turn_kind.as_str()).unwrap_or_default(),
@@ -35396,6 +35514,7 @@ fn turn_from_db_model(model: pioneer_entity::turn::Model) -> Result<Option<Turn>
     let collaboration = turn::collaboration_from_model(&model)?;
 
     Ok(Some(Turn {
+        work_owner: TurnWorkOwner::from_db_str(&model.work_owner).map_err(anyhow::Error::msg)?,
         id: model.id,
         status,
         turn_kind: turn_kind_from_db(model.turn_kind.as_str()).unwrap_or_default(),
@@ -36435,6 +36554,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -36496,6 +36616,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
@@ -36541,6 +36662,48 @@ mod tests {
             .expect("detached parent should load")
             .expect("detached parent should exist");
         assert_eq!(persisted_turn.work_owner, "detached_task");
+        let (_, snapshot_turn) = store.get_turn(thread_id, turn_id).await.unwrap().unwrap();
+        assert_eq!(snapshot_turn.work_owner, TurnWorkOwner::DetachedTask);
+        let snapshot = store.get_thread_model(thread_id).await.unwrap().unwrap();
+        assert_eq!(
+            snapshot
+                .turns
+                .iter()
+                .find(|turn| turn.id == turn_id)
+                .unwrap()
+                .work_owner,
+            TurnWorkOwner::DetachedTask
+        );
+        // Old terminal payloads did not carry work_owner. Read projections
+        // must hydrate the saved fact without rewriting the canonical event.
+        let mut historical_terminal = snapshot_turn.clone();
+        historical_terminal.status = TurnStatus::Completed;
+        historical_terminal.work_owner = TurnWorkOwner::Turn;
+        store
+            .materialize_turn_completed(
+                pioneer_protocol::TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: historical_terminal,
+                },
+                timestamp + 1,
+            )
+            .await
+            .unwrap();
+        let history = store
+            .get_thread_history(thread_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        for event in history.events {
+            match event.payload {
+                pioneer_protocol::ThreadHistoryEventPayload::TurnStarted { turn, .. }
+                | pioneer_protocol::ThreadHistoryEventPayload::TurnCompleted { turn, .. } => {
+                    assert_eq!(turn.work_owner, TurnWorkOwner::DetachedTask)
+                }
+                _ => {}
+            }
+        }
         assert!(
             store
                 .get_turn_work_projection(turn_id)
@@ -40962,6 +41125,7 @@ mod tests {
             .unwrap();
         let initial = RecoveryDiagnostic {
             last_failure: Some(RecoveryProviderFailure {
+                raw_response: None,
                 error_reason: None,
                 request_id: None,
                 class: ProviderFailureClass::StreamTruncated,
@@ -41010,8 +41174,19 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut response = pioneer_protocol::ProviderErrorResponse::from_bytes(
+            format!(
+                "{} original provider diagnostic body",
+                "x".repeat(20 * 1024)
+            )
+            .as_bytes(),
+            false,
+        );
+        response.processing_error = Some("Responses completed reasoning state conflict".into());
+        response.stream_context = Some("data: original completed reasoning event\n\n".into());
         let final_diagnostic = RecoveryDiagnostic {
             last_failure: Some(RecoveryProviderFailure {
+                raw_response: Some(response),
                 error_reason: Some(pioneer_protocol::ProviderErrorReason::PermissionDenied),
                 request_id: Some(
                     pioneer_protocol::ProviderRequestId::try_from("gen-atomic_fixture".to_owned())
@@ -41968,6 +42143,7 @@ mod tests {
                 turns: Vec::new(),
             };
             let mut turn = Turn {
+                work_owner: Default::default(),
                 id: turn_id.clone(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -42141,6 +42317,7 @@ mod tests {
             turns: Vec::new(),
         };
         let second_turn = Turn {
+            work_owner: Default::default(),
             id: "turn_recovery_valid".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -45422,6 +45599,7 @@ mod tests {
                     &thread,
                     SandboxMode::FullAccess,
                     &Turn {
+                        work_owner: Default::default(),
                         id: turn_id.to_owned(),
                         status: TurnStatus::InProgress,
                         turn_kind: Default::default(),
@@ -47478,6 +47656,7 @@ mod tests {
 
     fn sample_turn(turn_id: &str) -> Turn {
         Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -49900,6 +50079,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -50250,6 +50430,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -52641,6 +52822,7 @@ mod tests {
                     workspace_id: workspace_id.to_owned(),
                     thread_id: thread_id.to_owned(),
                     turn: Turn {
+                        work_owner: Default::default(),
                         id: turn_id.to_owned(),
                         status: TurnStatus::Completed,
                         turn_kind: Default::default(),
@@ -54078,6 +54260,7 @@ mod tests {
 
         for turn_id in [active_turn_id, terminal_turn_id] {
             let turn = Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -54110,6 +54293,7 @@ mod tests {
                     workspace_id: workspace_id.to_owned(),
                     thread_id: thread_id.to_owned(),
                     turn: Turn {
+                        work_owner: Default::default(),
                         id: terminal_turn_id.to_owned(),
                         status: TurnStatus::Completed,
                         turn_kind: Default::default(),
@@ -54297,6 +54481,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -54558,6 +54743,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -56644,6 +56830,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: "turn_000000000000000001".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -56846,6 +57033,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: "turn_legacy_actor".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
@@ -57234,6 +57422,7 @@ mod tests {
             TurnPermissionProfileSource::Composer,
         );
         let turn = Turn {
+            work_owner: Default::default(),
             id: "turn_permission_profile".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -57426,6 +57615,7 @@ mod tests {
             TurnPermissionProfileSource::Composer,
         );
         let turn = Turn {
+            work_owner: Default::default(),
             id: "turn_atomic_profile".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -57747,6 +57937,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: "turn_atomic_admission_fault".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -58180,6 +58371,7 @@ mod tests {
             agent: None,
         };
         let started = Turn {
+            work_owner: Default::default(),
             id: "turn_atomic_message".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -59255,6 +59447,7 @@ mod tests {
         )
         .await;
         let complete_turn = Turn {
+            work_owner: Default::default(),
             id: "turn_security_gap_present".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -59403,6 +59596,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: "turn_reasoning_effort".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -59470,6 +59664,7 @@ mod tests {
         stale_task_thread.preview = "stale task payload".to_owned();
         stale_task_thread.status = ThreadStatus::Active;
         let turn = Turn {
+            work_owner: Default::default(),
             id: "run_0000000000000000001".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,
@@ -59530,6 +59725,7 @@ mod tests {
         assert_eq!(snapshot_turn.origin, TurnOrigin::ScheduledTask);
 
         let foreground_turn = Turn {
+            work_owner: Default::default(),
             id: "turn_0000000000000000002".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
@@ -59704,6 +59900,7 @@ mod tests {
             turns: Vec::new(),
         };
         let first_turn = Turn {
+            work_owner: Default::default(),
             id: "turn_000000000000000003".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -59737,6 +59934,7 @@ mod tests {
             ..first_thread
         };
         let second_turn = Turn {
+            work_owner: Default::default(),
             id: "turn_000000000000000004".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -59768,6 +59966,7 @@ mod tests {
             ..second_thread.clone()
         };
         let task_run_turn = Turn {
+            work_owner: Default::default(),
             id: "turn_000000000000000005".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,
@@ -59825,6 +60024,7 @@ mod tests {
             ..second_thread.clone()
         };
         let default_effort_turn = Turn {
+            work_owner: Default::default(),
             id: "turn_000000000000000006".to_owned(),
             status: TurnStatus::Completed,
             turn_kind: TurnKind::Conversation,
@@ -59863,6 +60063,7 @@ mod tests {
             ..default_effort_thread
         };
         let latest_task_run_turn = Turn {
+            work_owner: Default::default(),
             id: "turn_000000000000000007".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,
@@ -60625,6 +60826,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: "turn_000000000000000002".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
