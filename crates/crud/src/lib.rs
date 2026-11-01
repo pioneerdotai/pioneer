@@ -36031,15 +36031,17 @@ mod tests {
     mod thread_read_pages;
     mod unread_start;
     use crate::{
-        NewThreadEpisodicExclusionRecord, PROJECTION_META_STATUS_PENDING,
+        NewThreadEpisodicExclusionRecord, NewTurnExecution, PROJECTION_META_STATUS_PENDING,
         ProjectionMetaConfigRecord, ProjectionMetaRecord, THREAD_EPISODIC_PROJECTION_CHANGED_ERROR,
         THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, THREAD_EPISODIC_USER_DELETED_ERROR,
         THREAD_EPISODIC_USER_EXCLUDED_ERROR, ThreadEpisodicExclusionReason,
         ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexJobFailureUpdate,
         ThreadEpisodicIndexJobRecord, ThreadEpisodicIndexJobStatus,
-        ThreadEpisodicProjectionResetProgress, find_projection_meta,
-        thread_episodic_projection_reset_key, upsert_projection_meta_with_config,
+        ThreadEpisodicProjectionResetProgress, TurnExecutionStatus, TurnExecutorKind,
+        find_projection_meta, thread_episodic_projection_reset_key, turn_execution,
+        upsert_projection_meta_with_config, utc_now,
     };
+    use std::time::Duration;
     #[path = "cli_runtime_active_bindings.rs"]
     mod cli_runtime_active_bindings;
     #[path = "task_event_fanout.rs"]
