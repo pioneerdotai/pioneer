@@ -2,6 +2,7 @@
 //! the conditional writer statement decides whether the episode is unchanged.
 use anyhow::Result;
 use pioneer_entity::{recovery_job, turn_liveness};
+use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
 
@@ -11,6 +12,9 @@ pub(crate) struct RawPolicy {
     pub(crate) action: String,
     pub(crate) error_class: Option<String>,
     pub(crate) policy_snapshot: String,
+    pub(crate) scheduled_at: DateTimeWithTimeZone,
+    pub(crate) active_attempt_started_at: Option<DateTimeWithTimeZone>,
+    pub(crate) updated_at: DateTimeWithTimeZone,
 }
 impl RawPolicy {
     pub(crate) fn agrees_with(&self, expected: &crate::RecoveryJobRecord) -> bool {
@@ -20,7 +24,11 @@ impl RawPolicy {
             .error_class
             .as_deref()
             .and_then(crate::convention::provider_failure_class_from_db);
-        action == expected.action
+        self.scheduled_at.timestamp() == expected.scheduled_at_unix
+            && self.active_attempt_started_at.map(|at| at.timestamp())
+                == expected.active_attempt_started_at_unix
+            && self.updated_at.timestamp() == expected.updated_at_unix
+            && action == expected.action
             && error_class == expected.error_class
             && serde_json::from_str::<serde_json::Value>(&self.policy_snapshot)
                 .unwrap_or_else(|_| serde_json::json!({}))
@@ -37,7 +45,10 @@ pub(crate) async fn raw_policy<C: ConnectionTrait>(
         .select_only()
         .column(recovery_job::Column::Action)
         .column(recovery_job::Column::ErrorClass)
-        .column(recovery_job::Column::PolicySnapshot);
+        .column(recovery_job::Column::PolicySnapshot)
+        .column(recovery_job::Column::ScheduledAt)
+        .column(recovery_job::Column::ActiveAttemptStartedAt)
+        .column(recovery_job::Column::UpdatedAt);
     if let Some(token) = locked_token {
         // ORM FOR UPDATE is a current read under InnoDB Repeatable Read, not
         // the earlier CLI-proof consistent snapshot. SQLite omits this clause
@@ -47,21 +58,40 @@ pub(crate) async fn raw_policy<C: ConnectionTrait>(
             .lock_exclusive();
     }
     Ok(query
-        .into_tuple::<(String, Option<String>, String)>()
+        .into_tuple::<(
+            String,
+            Option<String>,
+            String,
+            DateTimeWithTimeZone,
+            Option<DateTimeWithTimeZone>,
+            DateTimeWithTimeZone,
+        )>()
         .one(db)
         .await?
-        .map(|(action, error_class, policy_snapshot)| RawPolicy {
-            action,
-            error_class,
-            policy_snapshot,
-        }))
+        .map(
+            |(
+                action,
+                error_class,
+                policy_snapshot,
+                scheduled_at,
+                active_attempt_started_at,
+                updated_at,
+            )| RawPolicy {
+                action,
+                error_class,
+                policy_snapshot,
+                scheduled_at,
+                active_attempt_started_at,
+                updated_at,
+            },
+        ))
 }
 
 pub(crate) async fn fence<C: ConnectionTrait>(
     db: &C,
     expected: &crate::RecoveryJobRecord,
     raw: &RawPolicy,
-    observed_liveness: Option<&crate::TurnLivenessRecord>,
+    observed_liveness: Option<&turn_liveness::Model>,
     token: &str,
 ) -> Result<bool> {
     // observe_activity changes the frontier only with a newer timestamp or
@@ -74,10 +104,7 @@ pub(crate) async fn fence<C: ConnectionTrait>(
     if let Some(observed) = observed_liveness {
         frontier = frontier
             .filter(turn_liveness::Column::LastActivitySequence.eq(observed.last_activity_sequence))
-            .filter(
-                turn_liveness::Column::LastActivityAt
-                    .eq(crate::unix_to_datetime(observed.last_activity_at_unix)),
-            );
+            .filter(turn_liveness::Column::LastActivityAt.eq(observed.last_activity_at));
     }
     let frontier = frontier.into_query();
     let mut update = recovery_job::Entity::update_many()
@@ -90,10 +117,7 @@ pub(crate) async fn fence<C: ConnectionTrait>(
         .filter(recovery_job::Column::Id.eq(expected.id.clone()))
         .filter(recovery_job::Column::Status.eq("active"))
         .filter(recovery_job::Column::Action.eq(raw.action.clone()))
-        .filter(
-            recovery_job::Column::ScheduledAt
-                .eq(crate::unix_to_datetime(expected.scheduled_at_unix)),
-        )
+        .filter(recovery_job::Column::ScheduledAt.eq(raw.scheduled_at))
         .filter(recovery_job::Column::RunCount.eq(expected.run_count))
         .filter(recovery_job::Column::MaxAttempts.eq(expected.max_attempts))
         .filter(recovery_job::Column::PolicySnapshot.eq(raw.policy_snapshot.clone()))
@@ -111,15 +135,11 @@ pub(crate) async fn fence<C: ConnectionTrait>(
         Some(id) => update.filter(recovery_job::Column::ActiveAttemptId.eq(id.clone())),
         None => update.filter(recovery_job::Column::ActiveAttemptId.is_null()),
     };
-    update = match expected.active_attempt_started_at_unix {
-        Some(at) => update
-            .filter(recovery_job::Column::ActiveAttemptStartedAt.eq(crate::unix_to_datetime(at))),
+    update = match raw.active_attempt_started_at {
+        Some(at) => update.filter(recovery_job::Column::ActiveAttemptStartedAt.eq(at)),
         None => update
             .filter(recovery_job::Column::ActiveAttemptStartedAt.is_null())
-            .filter(
-                recovery_job::Column::UpdatedAt
-                    .eq(crate::unix_to_datetime(expected.updated_at_unix)),
-            ),
+            .filter(recovery_job::Column::UpdatedAt.eq(raw.updated_at)),
     };
     Ok(update.exec(db).await?.rows_affected > 0)
 }

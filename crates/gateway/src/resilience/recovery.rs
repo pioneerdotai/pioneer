@@ -11228,7 +11228,10 @@ mod tests {
                     turn_id: "turn_independent_due".into(),
                     item_id: "reasoning".into(),
                     item_type: TurnItemType::Reasoning,
-                    failure: provider_failure(ProviderFailureClass::AuthOrPermission, "permanent"),
+                    failure: provider_failure(
+                        ProviderFailureClass::UnsupportedParameter,
+                        "permanent",
+                    ),
                 },
                 1_700_000_000,
             )

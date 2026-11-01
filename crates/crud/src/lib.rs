@@ -30827,6 +30827,27 @@ impl CrudStore {
         if !raw.agrees_with(expected) {
             return Ok(false);
         }
+        // Keep exact persisted timestamps for the fence. Public watchdog records
+        // expose seconds, while activity and legacy episode timestamps may have
+        // fractions; reconstructing their SQL values would reject unchanged rows.
+        let raw_liveness =
+            turn_liveness::find_by_turn_id(&self.connection, &expected.turn_id).await?;
+        let agrees = match (observed_liveness, raw_liveness.as_ref()) {
+            (None, None) => true,
+            (Some(observed), Some(raw)) => {
+                observed.turn_id == raw.turn_id
+                    && observed.thread_id == raw.thread_id
+                    && observed.last_activity_sequence == raw.last_activity_sequence
+                    && observed.last_activity_kind == raw.last_activity_kind
+                    && observed.last_activity_item_id == raw.last_activity_item_id
+                    && observed.last_activity_item_type == raw.last_activity_item_type
+                    && observed.last_activity_at_unix == raw.last_activity_at.timestamp()
+            }
+            _ => false,
+        };
+        if !agrees {
+            return Ok(false);
+        }
         let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
         let token = pioneer_protocol::generate_id(21);
         let cli_source = self
@@ -30853,7 +30874,7 @@ impl CrudStore {
                     &tx,
                     expected,
                     &raw,
-                    observed_liveness,
+                    raw_liveness.as_ref(),
                     &token,
                 )
                 .await?
