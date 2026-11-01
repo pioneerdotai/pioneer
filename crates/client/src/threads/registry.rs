@@ -15424,11 +15424,25 @@ impl ClientCore {
                 .map(str::to_owned)
             else {
                 reset_thread_resume_coordinator(&mut store.coordinator.resume);
+                let drafts = registry.publish(id);
+                self.transition_directory(
+                    &mut registry,
+                    &ClientMutationAuthority { _private: () },
+                    drafts,
+                    vec![],
+                );
                 return None;
             };
             if let Some(continuation) = &request.continuation {
                 if continuation.snapshot.turn.id != turn || !store.coordinator.resume.in_progress {
                     retire_moved_resume(store);
+                    let drafts = registry.publish(id);
+                    self.transition_directory(
+                        &mut registry,
+                        &ClientMutationAuthority { _private: () },
+                        drafts,
+                        vec![],
+                    );
                     return None;
                 }
             } else {
@@ -15525,6 +15539,13 @@ impl ClientCore {
                     return Some(request);
                 }
                 retire_moved_resume(store);
+                let drafts = registry.publish(id);
+                self.transition_directory(
+                    &mut registry,
+                    &ClientMutationAuthority { _private: () },
+                    drafts,
+                    vec![],
+                );
             }
             return None;
         }
@@ -15540,6 +15561,13 @@ impl ClientCore {
         }
         if store.coordinator.conversation.in_flight_turn_id() != Some(turn_id.as_str()) {
             retire_moved_resume(store);
+            let drafts = registry.publish(id);
+            self.transition_directory(
+                &mut registry,
+                &ClientMutationAuthority { _private: () },
+                drafts,
+                vec![],
+            );
             return None;
         }
         finish_turn_resume_attempt(&mut store.coordinator.resume);
