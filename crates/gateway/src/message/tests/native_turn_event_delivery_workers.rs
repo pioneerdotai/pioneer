@@ -402,11 +402,19 @@ async fn shutdown_retains_claim_and_restored_processor_recovers_with_a_new_token
     assert_eq!(after_shutdown[1].status, "pending");
     // Emulate elapsed durable lease time, without sleeping or changing the
     // claim protocol. All access still goes through the fixture's CrudStore DB.
-    let mut expired: turn_event_delivery::ActiveModel = after_shutdown[0].clone().into();
-    expired.claim_expires_at = Set(Some(
-        chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(1),
-    ));
-    expired.update(&store.database_connection()).await.unwrap();
+    // Shutdown can also interrupt LIVE after claim and before ACK. Advance
+    // every retained lease so restored workers do not wait for real lease time.
+    for consumer in [LIVE, EPISODIC] {
+        for row in rows(&store, consumer).await {
+            if row.status == "delivering" {
+                let mut expired: turn_event_delivery::ActiveModel = row.into();
+                expired.claim_expires_at = Set(Some(
+                    chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(1),
+                ));
+                expired.update(&store.database_connection()).await.unwrap();
+            }
+        }
+    }
     let restored = MessageProcessor::with_agent_manager(
         Arc::new(ThreadManager::new("test-model", "openai")),
         Arc::new(AgentManager::new(test_provider(), test_tool_loop_config())),
