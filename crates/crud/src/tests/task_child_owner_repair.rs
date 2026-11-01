@@ -1,5 +1,6 @@
 //! R10 primary lifecycle regression. Gate CLOSED; NOT_RUN.
 use super::*;
+use crate::events::TurnEventPayload;
 use pioneer_entity::{
     task_child_reconcile_pending as point, task_child_reconcile_scope as scope,
     turn_event as event, turn_event_projection_state as receipt,
