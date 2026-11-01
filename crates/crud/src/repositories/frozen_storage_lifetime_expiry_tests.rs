@@ -556,25 +556,50 @@ async fn negative_preflight_keeps_unknown_legacy_and_concurrent_expiry_availabil
 
 #[tokio::test]
 async fn expiry_prefetched_stale_header_cannot_authorize_expiration() {
+    use sea_orm::{IntoActiveModel, Set};
+
     let (_directory, store, _routes, _descriptor) = observed_fixture().await;
     let store = store.with_maintenance_access();
     let mut progress = FrozenStorageLifetimeProgress::default();
     assert!(progress.expiry_quantum(&store).await.unwrap());
-    // Change authority after discovery but before preparation/commit. The old
-    // advisory header must refuse rather than expire the new identity.
-    store.connection.execute_unprepared(
-        "UPDATE compaction_frozen_history SET owner_thread='replacement-owner' WHERE id='origin'"
-    ).await.unwrap();
+    // Completed identities cannot be updated. Recreate this unreferenced empty
+    // history atomically after discovery; the captured header must not authorize
+    // expiration of the replacement owner under the same locator.
+    let tx = store.connection.begin().await.unwrap();
+    let mut replacement = history::Entity::find_by_id("origin")
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_active_model();
+    history::Entity::delete_by_id("origin")
+        .exec(&tx)
+        .await
+        .unwrap();
+    replacement.owner_thread = Set("replacement-owner".into());
+    history::Entity::insert(replacement)
+        .exec(&tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let mut refused = false;
     for _ in 0..100 {
         match progress.expiry_quantum(&store).await {
-            Err(_) => { refused = true; break; }
+            Err(error) => {
+                assert_eq!(error.to_string(), "expiry header changed");
+                refused = true;
+                break;
+            }
             Ok(_) if progress.expiry.is_none() => break,
-            Ok(_) => {},
+            Ok(_) => {}
         }
     }
     assert!(refused, "stale header must refuse before deletion");
-    let current = history::Entity::find_by_id("origin").one(&store.connection).await.unwrap().unwrap();
+    let current = history::Entity::find_by_id("origin")
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(current.expired, 0);
     assert_eq!(current.owner_thread, "replacement-owner");
 }
