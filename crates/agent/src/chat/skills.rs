@@ -483,7 +483,10 @@ mod tests {
                 pioneer_tools::dynamic_unknown_output_policy(),
             )
         });
-        let index = pioneer_tools::build_preflight_tool_index(&specifications);
+        let index = specifications
+            .iter()
+            .map(|spec| spec.spec.name.clone())
+            .collect::<Vec<_>>();
         let visible = vec!["read_skill".to_owned(), "request_tools".to_owned()];
         let permission = pioneer_protocol::default_turn_permission_profile_snapshot();
         // No Threads operation has been opened. request_tools makes the hidden
@@ -519,9 +522,7 @@ mod tests {
                 }
                 "read-index" => candidate.runtime_plan.read_skill_index.clear(),
                 "request-tools" => visible.retain(|name| name != "request_tools"),
-                "capability" => index
-                    .candidate_tools
-                    .retain(|tool| tool.name == "threads_start_options"),
+                "capability" => index.retain(|name| name == "threads_start_options"),
                 "denied" => permission
                     .effective_policy
                     .denied_tools

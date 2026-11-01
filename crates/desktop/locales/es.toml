@@ -980,13 +980,6 @@ description = "Evita que el equipo entre en reposo por inactividad mientras el g
 label = "Enviar telemetría"
 description = "Permitir recopilar datos de diagnóstico y rendimiento."
 
-[settings.general.preflight_model]
-label = "Modelo de preflight"
-description = "Elige el proveedor y el modelo para la planificación interna previa al turno. Predeterminado usa el modelo del hilo actual."
-default = "Predeterminado"
-select_model = "Seleccionar modelo"
-dialog_title = "Seleccionar modelo de preflight"
-
 [settings.voice_input]
 label = "Entrada de voz"
 description = "Usa un modelo de transcripción local para los mensajes de voz."
@@ -1041,10 +1034,6 @@ description = "Controla cómo Pioneer usa la memoria duradera."
 [settings.memory.enabled]
 label = "Memoria"
 description = "Permitir que Pioneer use hechos guardados y decisiones del proyecto cuando sea útil."
-
-[settings.memory.active_recall]
-label = "Recuperación activa"
-description = "Ejecutar planificación adicional de recuperación de solo lectura para tareas con mucho contexto."
 
 [settings.memory.proactive_writes]
 label = "Escritura proactiva"

@@ -11,7 +11,6 @@ use std::fmt;
 pub enum HookInputKind {
     TurnPrePolicy,
     TurnPrePromptContext,
-    TurnPostPreflightPromptContext,
     TurnPreToolMaterialization,
     TurnPrePromptCompile,
     TurnPostPromptCompile,
@@ -26,7 +25,6 @@ impl HookInputKind {
         match self {
             Self::TurnPrePolicy => "turn.pre_policy",
             Self::TurnPrePromptContext => "turn.pre_prompt_context",
-            Self::TurnPostPreflightPromptContext => "turn.post_preflight_prompt_context",
             Self::TurnPreToolMaterialization => "turn.pre_tool_materialization",
             Self::TurnPrePromptCompile => "turn.pre_prompt_compile",
             Self::TurnPostPromptCompile => "turn.post_prompt_compile",
@@ -43,7 +41,6 @@ impl From<HookPhase> for HookInputKind {
         match phase {
             HookPhase::TurnPrePolicy => Self::TurnPrePolicy,
             HookPhase::TurnPrePromptContext => Self::TurnPrePromptContext,
-            HookPhase::TurnPostPreflightPromptContext => Self::TurnPostPreflightPromptContext,
             HookPhase::TurnPreToolMaterialization => Self::TurnPreToolMaterialization,
             HookPhase::TurnPrePromptCompile => Self::TurnPrePromptCompile,
             HookPhase::TurnPostPromptCompile => Self::TurnPostPromptCompile,
@@ -58,8 +55,9 @@ impl From<&str> for HookInputKind {
     fn from(value: &str) -> Self {
         match value {
             "turn.pre_policy" => Self::TurnPrePolicy,
-            "turn.pre_prompt_context" => Self::TurnPrePromptContext,
-            "turn.post_preflight_prompt_context" => Self::TurnPostPreflightPromptContext,
+            "turn.pre_prompt_context" | "turn.post_preflight_prompt_context" => {
+                Self::TurnPrePromptContext
+            }
             "turn.pre_tool_materialization" => Self::TurnPreToolMaterialization,
             "turn.pre_prompt_compile" => Self::TurnPrePromptCompile,
             "turn.post_prompt_compile" => Self::TurnPostPromptCompile,
@@ -75,8 +73,9 @@ impl From<String> for HookInputKind {
     fn from(value: String) -> Self {
         match value.as_str() {
             "turn.pre_policy" => Self::TurnPrePolicy,
-            "turn.pre_prompt_context" => Self::TurnPrePromptContext,
-            "turn.post_preflight_prompt_context" => Self::TurnPostPreflightPromptContext,
+            "turn.pre_prompt_context" | "turn.post_preflight_prompt_context" => {
+                Self::TurnPrePromptContext
+            }
             "turn.pre_tool_materialization" => Self::TurnPreToolMaterialization,
             "turn.pre_prompt_compile" => Self::TurnPrePromptCompile,
             "turn.post_prompt_compile" => Self::TurnPostPromptCompile,
@@ -148,15 +147,6 @@ impl HookInput {
         }
     }
 
-    pub fn turn_post_preflight_prompt_context(
-        payload: TurnPostPreflightPromptContextHookInput,
-    ) -> Self {
-        Self {
-            kind: HookInputKind::TurnPostPreflightPromptContext,
-            payload: HookInputPayload::TurnPostPreflightPromptContext(payload),
-        }
-    }
-
     pub fn turn_pre_prompt_compile(payload: TurnPrePromptCompileHookInput) -> Self {
         Self {
             kind: HookInputKind::TurnPrePromptCompile,
@@ -198,8 +188,9 @@ impl HookInput {
 pub enum HookInputPayload {
     Empty,
     TurnPrePolicy(TurnPrePolicyHookInput),
+    // Read old typed snapshots as ordinary context input; the retired plan is ignored.
+    #[serde(alias = "turn_post_preflight_prompt_context")]
     TurnPrePromptContext(TurnPrePromptContextHookInput),
-    TurnPostPreflightPromptContext(TurnPostPreflightPromptContextHookInput),
     TurnPreToolMaterialization(TurnPreToolMaterializationHookInput),
     TurnPrePromptCompile(TurnPrePromptCompileHookInput),
     TurnPostTurn(TurnPostTurnHookInput),
@@ -265,37 +256,6 @@ impl TurnPrePromptContextHookInput {
             model: model.map(Into::into),
             model_provider: model_provider.map(Into::into),
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TurnPostPreflightPromptContextHookInput {
-    pub input_text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_memory_recall_plan: Option<serde_json::Value>,
-}
-
-impl TurnPostPreflightPromptContextHookInput {
-    pub fn from_parts(
-        input_text: impl Into<String>,
-        model: Option<impl Into<String>>,
-        model_provider: Option<impl Into<String>>,
-    ) -> Self {
-        Self {
-            input_text: input_text.into(),
-            model: model.map(Into::into),
-            model_provider: model_provider.map(Into::into),
-            active_memory_recall_plan: None,
-        }
-    }
-
-    pub fn with_active_memory_recall_preflight_plan(mut self, plan: serde_json::Value) -> Self {
-        self.active_memory_recall_plan = Some(plan);
-        self
     }
 }
 
@@ -902,34 +862,55 @@ mod tests {
     }
 
     #[test]
-    fn hook_input_payload_distinguishes_post_preflight_prompt_context() {
-        let input = TurnPostPreflightPromptContextHookInput::from_parts(
-            "turn text",
-            Option::<String>::None,
-            Option::<String>::None,
-        )
-        .with_active_memory_recall_preflight_plan(serde_json::json!({
-            "status": "skip",
-            "reasonCode": "provider_skip",
-            "confidence": 0.9,
-            "modes": [],
-            "targets": [],
-            "diagnostics": []
-        }));
-        let hook_input = HookInput::turn_post_preflight_prompt_context(input.clone());
-
+    fn legacy_post_preflight_snapshot_reads_without_retaining_a_recall_plan() {
+        let mut stored = serde_json::to_value(crate::HookRunInputSnapshot::new(
+            HookPhase::TurnPrePromptContext,
+            HookContext::default(),
+            HookInput::turn_pre_prompt_context(TurnPrePromptContextHookInput::from_parts(
+                "preserve user text",
+                Some("model"),
+                Some("provider"),
+            )),
+            HookPolicySet::empty(),
+            HookPromptContextSet::default(),
+        ))
+        .expect("snapshot serializes");
+        stored["phase"] = serde_json::json!("turn.post_preflight_prompt_context");
+        stored["input"]["kind"] = serde_json::json!("turn.post_preflight_prompt_context");
+        stored["input"]["payload"]["type"] =
+            serde_json::json!("turn_post_preflight_prompt_context");
+        stored["input"]["payload"]["value"]["active_memory_recall_plan"] = serde_json::json!({
+            "status": "execute", "queries": ["old automatic retrieval"],
+        });
+        let decoded: crate::HookRunInputSnapshot =
+            serde_json::from_value(stored).expect("old typed input snapshot remains readable");
+        assert_eq!(decoded.phase, HookPhase::TurnPrePromptContext);
+        assert_eq!(decoded.input.kind, HookInputKind::TurnPrePromptContext);
         assert_eq!(
-            hook_input.kind,
-            HookInputKind::TurnPostPreflightPromptContext
+            HookInputKind::from("turn.post_preflight_prompt_context"),
+            decoded.input.kind
         );
+        let HookInputPayload::TurnPrePromptContext(input) = &decoded.input.payload else {
+            panic!("legacy input must normalize to ordinary context");
+        };
+        assert_eq!(input.input_text, "preserve user text");
+        assert_eq!(input.model.as_deref(), Some("model"));
+        assert_eq!(input.model_provider.as_deref(), Some("provider"));
+        let canonical = serde_json::to_value(&decoded).expect("canonical snapshot serializes");
+        assert_eq!(canonical["phase"], "turn.pre_prompt_context");
+        assert_eq!(canonical["input"]["kind"], "turn.pre_prompt_context");
         assert_eq!(
-            hook_input.payload,
-            HookInputPayload::TurnPostPreflightPromptContext(input)
+            canonical["input"]["payload"]["type"],
+            "turn_pre_prompt_context"
         );
-        assert_eq!(
-            HookInputKind::from(HookPhase::TurnPostPreflightPromptContext),
-            HookInputKind::TurnPostPreflightPromptContext
+        assert!(
+            canonical["input"]["payload"]["value"]
+                .get("active_memory_recall_plan")
+                .is_none()
         );
+        let mut invalid = canonical;
+        invalid["input"]["payload"]["type"] = serde_json::json!("unknown_phase");
+        assert!(serde_json::from_value::<crate::HookRunInputSnapshot>(invalid).is_err());
     }
 
     #[test]

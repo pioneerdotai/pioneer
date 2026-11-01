@@ -2600,7 +2600,6 @@ fn recoverable_background_input_snapshot(
         }
         HookInputPayload::TurnPrePolicy(_)
         | HookInputPayload::TurnPrePromptContext(_)
-        | HookInputPayload::TurnPostPreflightPromptContext(_)
         | HookInputPayload::TurnPreToolMaterialization(_)
         | HookInputPayload::TurnPrePromptCompile(_)
         | HookInputPayload::TurnPreCompaction(_)

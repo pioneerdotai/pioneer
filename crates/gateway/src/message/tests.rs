@@ -183,8 +183,7 @@ use pioneer_hooks::{
 };
 use pioneer_keystore::{MemorySecretStore, SecretFilter, SecretId, SecretKind, SecretStore};
 use pioneer_memory::hooks::{
-    AgentMemoryProvider, MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG, MemoryRecallRequest,
-    MemoryTurnContext,
+    AgentMemoryProvider, MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG, MemoryTurnContext,
 };
 use pioneer_protocol::{
     AgentDurableEvent, AgentExecutionBackend, AgentProgressEvent, ArtifactCapabilitiesResponse,
@@ -3886,7 +3885,6 @@ enum MemoryAgentE2eScript {
 struct MemoryAgentE2eProvider {
     name: &'static str,
     script: MemoryAgentE2eScript,
-    policy_requests: std::sync::Mutex<Vec<ChatRequest>>,
     main_requests: std::sync::Mutex<Vec<ChatRequest>>,
     next_main_index: AtomicUsize,
 }
@@ -3991,7 +3989,7 @@ impl pioneer_sqlite::SqliteWriteObserver for NativeSchedulingObserver {
     }
 }
 
-struct PreflightCaptureProvider {
+struct MainCaptureProvider {
     text: String,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     native_media: Option<CaptureSummaryProvider>,
@@ -3999,7 +3997,6 @@ struct PreflightCaptureProvider {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptParityRequestKind {
-    TurnPreflight,
     Main,
     PostTurnExtractor,
 }
@@ -4007,7 +4004,6 @@ enum PromptParityRequestKind {
 #[derive(Default)]
 struct PromptParityCaptureProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
-    visible_tools: Vec<String>,
 }
 
 struct HangingChildProvider {
@@ -4394,7 +4390,7 @@ impl CaptureSummaryProvider {
     }
 }
 
-impl PreflightCaptureProvider {
+impl MainCaptureProvider {
     fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -4415,19 +4411,12 @@ impl PreflightCaptureProvider {
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
         self.requests
             .lock()
-            .expect("preflight capture requests lock")
+            .expect("main capture requests lock")
             .clone()
     }
 }
 
 impl PromptParityCaptureProvider {
-    fn with_visible_tools(visible_tools: Vec<String>) -> Self {
-        Self {
-            requests: std::sync::Mutex::new(Vec::new()),
-            visible_tools,
-        }
-    }
-
     fn take_requests(&self) -> Vec<ChatRequest> {
         std::mem::take(&mut *self.requests.lock().expect("prompt parity requests lock"))
     }
@@ -4628,11 +4617,11 @@ impl Provider for CaptureSummaryProvider {
 }
 
 #[async_trait::async_trait]
-impl Provider for PreflightCaptureProvider {
+impl Provider for MainCaptureProvider {
     fn name(&self) -> &str {
         self.native_media
             .as_ref()
-            .map_or("preflight-capture", |provider| provider.name())
+            .map_or("main-capture", |provider| provider.name())
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4655,19 +4644,15 @@ impl Provider for PreflightCaptureProvider {
     async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
         match &self.native_media {
             Some(provider) => provider.list_models().await,
-            None => anyhow::bail!("preflight capture does not expose model discovery"),
+            None => anyhow::bail!("main capture does not expose model discovery"),
         }
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let preflight = is_turn_preflight_request(&request);
         self.requests
             .lock()
-            .expect("preflight capture requests lock")
+            .expect("main capture requests lock")
             .push(request);
-        if preflight {
-            return Ok(test_turn_preflight_response());
-        }
         Ok(text_response(self.text.clone()))
     }
 
@@ -4710,14 +4695,6 @@ impl Provider for PromptParityCaptureProvider {
             .expect("prompt parity requests lock")
             .push(request);
         Ok(match kind {
-            Some(PromptParityRequestKind::TurnPreflight) => {
-                let visible_tools = self
-                    .visible_tools
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>();
-                test_turn_preflight_response_with_visible_tools(visible_tools.as_slice())
-            }
             Some(PromptParityRequestKind::PostTurnExtractor) => text_response(r#"{"facts":[]}"#),
             Some(PromptParityRequestKind::Main) | None => {
                 text_response("PROMPT PARITY ASSISTANT RESPONSE")
@@ -4795,12 +4772,8 @@ impl Provider for HangingChildProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let preflight = is_turn_preflight_request(&request);
         let child_main = is_child_task_main_request(&request)
             || (self.hang_any_compiled_request && request.compiled_prompt.is_some());
-        if preflight {
-            return Ok(test_turn_preflight_response());
-        }
         if child_main {
             self.child_main_calls.fetch_add(1, Ordering::SeqCst);
             return futures_util::future::pending::<anyhow::Result<ChatResponse>>().await;
@@ -4841,9 +4814,6 @@ impl Provider for ConcurrentComposerHistoryProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_turn_preflight_request(&request) {
-            return Ok(test_turn_preflight_response());
-        }
         let current_command = request.messages.last().and_then(|message| {
             (message.role == pioneer_provider::Role::User).then(|| message.content.clone())
         });
@@ -4971,8 +4941,10 @@ impl Provider for GuardAwareProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_turn_preflight_request(&request) {
-            return Ok(test_task_turn_preflight_response());
+        if let Some(response) =
+            request_optional_fixture_tools(&request, &["task_create", "task_wait"])
+        {
+            return Ok(response);
         }
         if request.messages.iter().any(|message| {
             message
@@ -5115,8 +5087,8 @@ impl Provider for CreateThenHangProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_turn_preflight_request(&request) {
-            return Ok(test_task_turn_preflight_response());
+        if let Some(response) = request_optional_fixture_tools(&request, &["task_create"]) {
+            return Ok(response);
         }
         if request.messages.iter().any(|message| {
             message
@@ -5492,7 +5464,8 @@ async fn memory_settings_update_reinstalls_memory_hook_runtime() {
     let mut harness = setup_memory_gateway_harness("settings_reinstall_memory_hooks", true).await;
     harness.processor.bind_memory_bridge_if_enabled().await;
 
-    assert_memory_hook_subscription(&harness.processor, "memory.active_recall.default", true).await;
+    assert_memory_hook_subscription(&harness.processor, "memory.active_recall.default", false)
+        .await;
     assert_memory_hook_subscription(
         &harness.processor,
         "memory.post_turn_extractor.default",
@@ -5509,8 +5482,7 @@ async fn memory_settings_update_reinstalls_memory_hook_runtime() {
             "update": {
                 "memory": {
                     "enabled": true,
-                    "deterministic_recall_enabled": true,
-                    "active_recall_enabled": false,
+
                     "tools_enabled": true,
                     "proactive_writes_enabled": false,
                     "background_extraction_enabled": true,
@@ -5547,8 +5519,7 @@ async fn memory_settings_update_reinstalls_memory_hook_runtime() {
             "update": {
                 "memory": {
                     "enabled": true,
-                    "deterministic_recall_enabled": true,
-                    "active_recall_enabled": true,
+
                     "tools_enabled": true,
                     "proactive_writes_enabled": true,
                     "background_extraction_enabled": true,
@@ -5569,7 +5540,8 @@ async fn memory_settings_update_reinstalls_memory_hook_runtime() {
         .await;
     let _ = recv_response_by_id(&mut harness.rx, enable_request_id.as_str()).await;
 
-    assert_memory_hook_subscription(&harness.processor, "memory.active_recall.default", true).await;
+    assert_memory_hook_subscription(&harness.processor, "memory.active_recall.default", false)
+        .await;
     assert_memory_hook_subscription(
         &harness.processor,
         "memory.post_turn_extractor.default",
@@ -6135,9 +6107,6 @@ impl Provider for VerticalUnfinishedSiblingProvider {
             .lock()
             .expect("vertical unfinished sibling request lock poisoned")
             .push(request.clone());
-        if is_turn_preflight_request(&request) {
-            return Ok(test_turn_preflight_response());
-        }
         if request.compiled_prompt.is_some()
             && request.messages.iter().any(|message| {
                 message
@@ -6185,9 +6154,6 @@ impl Provider for VerticalCollaborativeSourceProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_turn_preflight_request(&request) {
-            return Ok(test_turn_preflight_response());
-        }
         self.requests
             .lock()
             .expect("vertical Collaborative source request lock poisoned")
@@ -6293,11 +6259,6 @@ impl Provider for VerticalReadSkillProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_turn_preflight_request(&request) {
-            return Ok(test_turn_preflight_response_with_visible_tools(&[
-                "read_skill",
-            ]));
-        }
         self.requests
             .lock()
             .expect("vertical native request lock poisoned")
@@ -6354,7 +6315,6 @@ impl MemoryAgentE2eProvider {
         Self {
             name,
             script,
-            policy_requests: std::sync::Mutex::new(Vec::new()),
             main_requests: std::sync::Mutex::new(Vec::new()),
             next_main_index: AtomicUsize::new(0),
         }
@@ -6364,13 +6324,6 @@ impl MemoryAgentE2eProvider {
         self.main_requests
             .lock()
             .expect("memory e2e provider main requests lock poisoned")
-            .clone()
-    }
-
-    fn snapshot_policy_requests(&self) -> Vec<ChatRequest> {
-        self.policy_requests
-            .lock()
-            .expect("memory e2e provider policy requests lock poisoned")
             .clone()
     }
 }
@@ -6393,22 +6346,6 @@ impl Provider for MemoryAgentE2eProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_memory_policy_classifier_request(&request) {
-            self.policy_requests
-                .lock()
-                .expect("memory e2e provider policy requests lock poisoned")
-                .push(request);
-            return Ok(ChatResponse {
-                messages: Vec::new(),
-                text: memory_policy_json_for_script(self.script),
-                usage: None,
-                reasoning_content: None,
-                provider_replay_state: None,
-                termination: pioneer_provider::ProviderTermination::Complete,
-                tool_calls: Vec::new(),
-            });
-        }
-
         self.main_requests
             .lock()
             .expect("memory e2e provider main requests lock poisoned")
@@ -6436,14 +6373,6 @@ impl Provider for MemoryAgentE2eProvider {
     }
 }
 
-fn is_memory_policy_classifier_request(request: &ChatRequest) -> bool {
-    request.messages.iter().any(|message| {
-        message
-            .content
-            .contains("Pioneer memory turn policy classifier")
-    })
-}
-
 fn is_memory_post_turn_extractor_request(request: &ChatRequest) -> bool {
     request.messages.iter().any(|message| {
         message
@@ -6453,9 +6382,7 @@ fn is_memory_post_turn_extractor_request(request: &ChatRequest) -> bool {
 }
 
 fn prompt_parity_request_kind(request: &ChatRequest) -> Option<PromptParityRequestKind> {
-    if is_turn_preflight_request(request) {
-        Some(PromptParityRequestKind::TurnPreflight)
-    } else if is_memory_post_turn_extractor_request(request) {
+    if is_memory_post_turn_extractor_request(request) {
         Some(PromptParityRequestKind::PostTurnExtractor)
     } else if request.compiled_prompt.is_some() {
         Some(PromptParityRequestKind::Main)
@@ -6794,28 +6721,6 @@ async fn wait_for_prompt_parity_request_count(
     false
 }
 
-fn memory_policy_json_for_script(script: MemoryAgentE2eScript) -> String {
-    let value = match script {
-        MemoryAgentE2eScript::ChatCapture => json!({
-            "intent": "normal",
-            "recall": "allow",
-            "prompt": "full",
-            "readTools": "allow",
-            "rememberTool": "allow",
-            "forgetTool": "allow",
-            "postTurnExtraction": "disabled",
-            "activeMemory": "disabled",
-            "explicitRemember": false,
-            "explicitForget": false,
-            "forgetTargetHint": null,
-            "language": "ru",
-            "confidence": 0.9,
-            "reasonCode": "default_allow_read"
-        }),
-    };
-    serde_json::to_string(&value).expect("policy json should serialize")
-}
-
 fn memory_agent_e2e_response(
     script: MemoryAgentE2eScript,
     _round: usize,
@@ -6838,58 +6743,29 @@ fn text_response(text: impl Into<String>) -> ChatResponse {
     }
 }
 
-fn test_turn_preflight_response() -> ChatResponse {
-    test_turn_preflight_response_with_visible_tools(&[])
-}
-
-fn test_task_turn_preflight_response() -> ChatResponse {
-    test_turn_preflight_response_with_visible_tools(&[
-        "task_create",
-        "task_wait",
-        "task_result",
-        "task_accept",
-        "task_revise",
-        "task_cancel",
-        "task_update",
-        "task_detach",
-        "task_list",
-        "task_get",
-        "task_reschedule",
-        "task_pause",
-        "task_resume",
-    ])
-}
-
-fn test_turn_preflight_response_with_visible_tools(tool_names: &[&str]) -> ChatResponse {
-    text_response(json!({ "tools": { "visibleTools": tool_names } }).to_string())
-}
-
-fn sequenced_tool_provider_preflight_response(
-    request: &ChatRequest,
-    first_tool_calls: &[ProviderToolCall],
-) -> ChatResponse {
-    let task_needed = first_tool_calls
-        .iter()
-        .any(|tool_call| tool_call.name.starts_with("task_"))
-        || request
-            .messages
-            .iter()
-            .any(|message| message.content.contains("delegate a task"));
-
-    if task_needed {
-        test_task_turn_preflight_response()
-    } else {
-        test_turn_preflight_response()
-    }
-}
-
-fn is_turn_preflight_request(request: &ChatRequest) -> bool {
-    request.tools.is_none()
-        && request.tool_choice.is_none()
-        && request.messages.iter().any(|message| {
-            message.content.contains("internal turn preflight planner")
-                && message.content.contains("Structured input JSON")
+fn request_optional_fixture_tools(request: &ChatRequest, names: &[&str]) -> Option<ChatResponse> {
+    let tools = request.tools.as_ref()?;
+    let domains = pioneer_tools::BuiltinToolDomain::ALL
+        .into_iter()
+        .filter(|domain| {
+            names.iter().any(|name| {
+                domain.tool_names().contains(name) && !tools.iter().any(|tool| tool.name == *name)
+            })
         })
+        .map(|domain| domain.as_str())
+        .collect::<Vec<_>>();
+    if domains.is_empty() || !tools.iter().any(|tool| tool.name == "request_tools") {
+        return None;
+    }
+    Some(ChatResponse {
+        tool_calls: vec![ProviderToolCall {
+            id: "fixture_request_optional_tools".into(),
+            name: "request_tools".into(),
+            arguments: json!({"domains": domains}).to_string(),
+        }],
+        termination: pioneer_provider::ProviderTermination::ToolCalls,
+        ..text_response("")
+    })
 }
 
 fn extract_task_id_from_messages(messages: &[pioneer_provider::ChatMessage]) -> Option<String> {
@@ -6959,13 +6835,19 @@ impl Provider for SequencedToolProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_turn_preflight_request(&request) {
-            return Ok(sequenced_tool_provider_preflight_response(
-                &request,
-                &self.first_tool_calls,
-            ));
+        let index = self.next_index.load(Ordering::SeqCst);
+        let next_calls = self
+            .tool_call_rounds
+            .as_ref()
+            .and_then(|rounds| rounds.get(index))
+            .unwrap_or(&self.first_tool_calls);
+        let names = next_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>();
+        if let Some(response) = request_optional_fixture_tools(&request, &names) {
+            return Ok(response);
         }
-
         self.requests
             .lock()
             .expect("sequenced tool provider lock poisoned")
@@ -7049,18 +6931,18 @@ impl Provider for DirectAgentSandboxProvider {
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         let child = Self::is_child_request(&request);
-        if is_turn_preflight_request(&request) {
-            return Ok(if child {
-                test_turn_preflight_response_with_visible_tools(&["exec_command"])
-            } else {
-                test_turn_preflight_response_with_visible_tools(&[
-                    "threads_start_options",
+        if !child
+            && let Some(response) = request_optional_fixture_tools(
+                &request,
+                &[
                     "thread_create",
                     "threads_turn_start",
-                ])
-            });
+                    "threads_start_options",
+                ],
+            )
+        {
+            return Ok(response);
         }
-
         if child {
             return Ok(match self.child_round.fetch_add(1, Ordering::SeqCst) {
                 0 => ChatResponse {
@@ -9436,7 +9318,6 @@ pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
     let web = GatewayWebToolsConfig::default();
     ToolLoopConfig {
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
-        preflight: pioneer_agent::PreflightLoopConfig::default(),
         web: WebToolsConfig {
             default_timeout_ms: web.default_timeout_ms,
             hard_max_timeout_ms: web.hard_max_timeout_ms,
@@ -9507,13 +9388,7 @@ pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
                 allow_function_proxy_tools: true,
             },
         },
-        memory: pioneer_memory::hooks::MemoryLoopConfig {
-            active_recall: pioneer_memory::hooks::MemoryActiveRecallConfig {
-                mode: pioneer_memory::hooks::MemoryActiveRecallMode::DeterministicOnly,
-                ..pioneer_memory::hooks::MemoryActiveRecallConfig::default()
-            },
-            ..pioneer_memory::hooks::MemoryLoopConfig::default()
-        },
+        memory: pioneer_memory::hooks::MemoryLoopConfig::default(),
         budget: ToolLoopBudgetConfig::default(),
         execution_windows: pioneer_tools::ExecutionWindowsConfig::default(),
         retry: ToolRetryBudgetConfig::default(),
@@ -15162,7 +15037,7 @@ async fn detached_composer_live_ordering_impl() {
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
     let provider = Arc::new(
-        PreflightCaptureProvider::new(
+        MainCaptureProvider::new(
             r#"<task_result>{"summary":"detached result","data":{}}</task_result>"#,
         )
         .with_native_attachments(),
@@ -15520,8 +15395,7 @@ async fn detached_composer_live_ordering_impl() {
     );
     let requests = provider.snapshot_requests();
     let main = requests
-        .iter()
-        .find(|request| !is_turn_preflight_request(request))
+        .first()
         .expect("large Composer input must reach the recording provider");
     let user = main.messages.last().unwrap();
     assert_eq!(user.content, full_text);
@@ -26442,15 +26316,15 @@ async fn waiting_review_detach_is_blocked_and_candidate_stays_active_impl() {
 }
 
 #[test]
-fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile() {
+fn hidden_task_agent_run_dispatches_child_main_without_planner() {
     run_standard_stack_message_test(
-        "hidden Task preflight ordering",
-        hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_body(),
+        "hidden Task main dispatch",
+        hidden_task_agent_run_dispatches_child_main_without_planner_body(),
     );
 }
 
-async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_body() {
-    let provider = Arc::new(PreflightCaptureProvider::new("hidden child completed"));
+async fn hidden_task_agent_run_dispatches_child_main_without_planner_body() {
+    let provider = Arc::new(MainCaptureProvider::new("hidden child completed"));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         provider.clone(),
@@ -26516,21 +26390,14 @@ async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_b
     );
 
     let requests = provider.snapshot_requests();
-    let preflight_pos = requests
-        .iter()
-        .position(is_turn_preflight_request)
-        .expect("hidden child task should call preflight");
     let child_main_pos = requests
         .iter()
         .position(is_child_task_main_request)
         .expect("hidden child task should call main provider after prompt compile");
-    assert!(
-        preflight_pos < child_main_pos,
-        "hidden child task preflight must run before the main child provider request"
+    assert_eq!(
+        child_main_pos, 0,
+        "main dispatch must be the first provider request"
     );
-    assert!(requests[preflight_pos].tools.is_none());
-    assert!(requests[preflight_pos].tool_choice.is_none());
-    assert!(requests[preflight_pos].compiled_prompt.is_none());
     assert!(requests[child_main_pos].compiled_prompt.is_some());
 }
 
@@ -26631,10 +26498,10 @@ fn compaction_task_admission_freezes_the_accepted_destination() {
 }
 
 #[test]
-fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile() {
+fn recovered_hidden_task_run_dispatches_restored_child_main_without_planner() {
     run_standard_stack_message_test(
-        "recovered hidden Task preflight ordering",
-        recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+        "recovered hidden Task main dispatch",
+        recovered_hidden_task_run_dispatches_restored_child_main_without_planner_body(
             TaskAttachmentMode::Detached,
             false,
         ),
@@ -26645,7 +26512,7 @@ fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_co
 fn compaction_attached_task_restores_its_frozen_basis_without_changing_hook_scope() {
     run_compaction_message_test(
         "attached Task frozen basis and recovery",
-        recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+        recovered_hidden_task_run_dispatches_restored_child_main_without_planner_body(
             TaskAttachmentMode::Attached,
             false,
         ),
@@ -26656,14 +26523,14 @@ fn compaction_attached_task_restores_its_frozen_basis_without_changing_hook_scop
 fn recovered_task_public_stop_preserves_prompt_manifest_and_canonical_identity() {
     run_standard_stack_message_test(
         "recovered Task Stop before prompt compilation",
-        recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+        recovered_hidden_task_run_dispatches_restored_child_main_without_planner_body(
             TaskAttachmentMode::Detached,
             true,
         ),
     );
 }
 
-async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+async fn recovered_hidden_task_run_dispatches_restored_child_main_without_planner_body(
     attachment: TaskAttachmentMode,
     stop_before_prompt: bool,
 ) {
@@ -27120,9 +26987,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .agent_manager
         .remove_thread(lineage.child_thread_id.as_str())
         .await;
-    let recovery_provider = Arc::new(PreflightCaptureProvider::new(
-        "recovered hidden child completed",
-    ));
+    let recovery_provider = Arc::new(MainCaptureProvider::new("recovered hidden child completed"));
     let recovery_provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         recovery_provider.clone(),
@@ -27349,25 +27214,20 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     assert_eq!(recovered_execution.id, execution.id);
 
     let requests = recovery_provider.snapshot_requests();
-    let preflight_pos = requests
-        .iter()
-        .position(is_turn_preflight_request)
-        .expect("recovered hidden child task should call preflight");
     let child_main_pos = requests
         .iter()
         .position(|request| {
             if composer_recovery {
-                !is_turn_preflight_request(request) && request.compiled_prompt.is_some()
+                request.compiled_prompt.is_some()
             } else {
                 is_child_task_main_request(request)
             }
         })
         .expect("recovered hidden child task should call main provider after prompt compile");
-    assert!(
-        preflight_pos < child_main_pos,
-        "recovered hidden child task preflight must run before the restored main child provider request"
+    assert_eq!(
+        child_main_pos, 0,
+        "main dispatch must be the first provider request"
     );
-    assert!(requests[preflight_pos].compiled_prompt.is_none());
     assert!(requests[child_main_pos].compiled_prompt.is_some());
     let restored_prompt = requests[child_main_pos]
         .compiled_prompt
@@ -29245,7 +29105,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         "composer-launch",
     )
     .await;
-    let provider = Arc::new(PreflightCaptureProvider::new(
+    let provider = Arc::new(MainCaptureProvider::new(
         r#"<task_result>{"summary":"composer payload complete","data":{"rawText":"composer payload complete"}}</task_result>"#,
     ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
@@ -29597,8 +29457,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
 
     let requests = provider.snapshot_requests();
     let main_request = requests
-        .iter()
-        .find(|request| !is_turn_preflight_request(request))
+        .first()
         .expect("child main provider request should be captured");
     assert_eq!(main_request.model, "composer-selected-model");
     assert_eq!(
@@ -35425,9 +35284,6 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         request.messages.len() > 1
                             && request.messages.first().is_none_or(|message| {
                                 message.content != pioneer_compaction::summary::INSTRUCTIONS
-                                    && !message.content.starts_with(
-                                        "You are an internal turn preflight planner for Pioneer.",
-                                    )
                             })
                             && request
                                 .messages
@@ -38278,12 +38134,6 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     }
     let child_requests = provider.take_requests();
 
-    let direct_preflight =
-        single_prompt_parity_request(&direct_requests, PromptParityRequestKind::TurnPreflight);
-    let child_preflight =
-        single_prompt_parity_request(&child_requests, PromptParityRequestKind::TurnPreflight);
-    assert_exact_chat_request_parity("turn preflight", direct_preflight, child_preflight);
-
     let direct_main = single_prompt_parity_request(&direct_requests, PromptParityRequestKind::Main);
     let child_main = single_prompt_parity_request(&child_requests, PromptParityRequestKind::Main);
     let lineage = wait_for_child_lineage_for_run(
@@ -38360,12 +38210,7 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         pioneer_protocol::SkillId::new("V".repeat(21)).expect("valid parity skill id");
     let dynamic_skill_tool_name = format!("skill.{expected_skill_id}.fetch-context");
     let mcp_capability_id = "mcp-tool:workspace:resend:send";
-    let provider = Arc::new(PromptParityCaptureProvider::with_visible_tools(vec![
-        "task_create".to_owned(),
-        "read_skill".to_owned(),
-        dynamic_skill_tool_name.clone(),
-        "mcp_resend_send".to_owned(),
-    ]));
+    let provider = Arc::new(PromptParityCaptureProvider::default());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         provider.clone(),
@@ -38751,7 +38596,6 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     let child_requests = provider.take_requests();
 
     let expected_stages = vec![
-        PromptParityRequestKind::TurnPreflight,
         PromptParityRequestKind::Main,
         PromptParityRequestKind::PostTurnExtractor,
     ];
@@ -38761,7 +38605,7 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
             .filter_map(prompt_parity_request_kind)
             .collect::<Vec<_>>(),
         expected_stages,
-        "foreground full-parity execution should issue exactly the three expected LLM stages"
+        "foreground full-parity execution should issue exactly the two expected LLM stages"
     );
     assert_eq!(
         child_requests
@@ -38769,7 +38613,7 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
             .filter_map(prompt_parity_request_kind)
             .collect::<Vec<_>>(),
         expected_stages,
-        "detached full-parity execution should issue exactly the three expected LLM stages"
+        "detached full-parity execution should issue exactly the two expected LLM stages"
     );
     assert_eq!(
         direct_requests.len(),
@@ -38782,10 +38626,6 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         "detached full-parity execution must not issue an unclassified LLM request"
     );
 
-    let direct_preflight =
-        single_prompt_parity_request(&direct_requests, PromptParityRequestKind::TurnPreflight);
-    let child_preflight =
-        single_prompt_parity_request(&child_requests, PromptParityRequestKind::TurnPreflight);
     let direct_artifact_output_root_canonical = std::fs::canonicalize(&direct_artifact_output_root)
         .expect("direct full-parity artifact output root should canonicalize")
         .to_string_lossy()
@@ -38796,26 +38636,6 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         .into_owned();
     let direct_artifact_output_root = direct_artifact_output_root.to_string_lossy().into_owned();
     let child_artifact_output_root = child_artifact_output_root.to_string_lossy().into_owned();
-    assert_exact_chat_request_parity_with_turn_private_paths(
-        "full turn preflight",
-        direct_preflight,
-        child_preflight,
-        &[
-            direct_artifact_output_root_canonical.as_str(),
-            direct_artifact_output_root.as_str(),
-        ],
-        &[
-            child_artifact_output_root_canonical.as_str(),
-            child_artifact_output_root.as_str(),
-        ],
-    );
-    for expected_tool in ["task_create", "read_skill"] {
-        assert!(
-            direct_preflight.messages[0].content.contains(expected_tool),
-            "full preflight prompt should expose indexed tool `{expected_tool}`"
-        );
-    }
-
     let direct_main = single_prompt_parity_request(&direct_requests, PromptParityRequestKind::Main);
     let child_main = single_prompt_parity_request(&child_requests, PromptParityRequestKind::Main);
     let direct_main = canonical_main_request_execution_thread_for_parity(
@@ -38867,8 +38687,12 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<HashSet<_>>();
+    assert!(
+        !tool_names.contains("task_create"),
+        "task domain starts hidden"
+    );
     for expected_tool in [
-        "task_create",
+        "request_tools",
         "read_skill",
         dynamic_skill_tool_name.as_str(),
         "mcp_resend_send",
@@ -40535,7 +40359,14 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let provider = Arc::new(SequencedToolProvider::new(Vec::new(), "done"));
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "request_task_domain".to_owned(),
+            name: "request_tools".to_owned(),
+            arguments: json!({"domains": ["task"]}).to_string(),
+        }],
+        "done",
+    ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "parent",
         provider.clone(),
@@ -40579,6 +40410,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     );
 
     let agent_requests = provider.snapshot_requests();
+    assert_eq!(
+        agent_requests.len(),
+        2,
+        "capture initial and post-discovery main requests"
+    );
     let first_agent_request = agent_requests
         .first()
         .expect("agent request should be captured");
@@ -40594,7 +40430,28 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         agent_prompt.full_system_text.contains("## Tasks"),
         "agent mode should explain durable tasks when task tools are available"
     );
-    let tool_names = first_agent_request
+    let initial_tools = first_agent_request.tools.as_ref().expect("initial tools");
+    assert!(
+        initial_tools
+            .iter()
+            .any(|tool| tool.name == "request_tools")
+    );
+    assert!(
+        initial_tools
+            .iter()
+            .all(|tool| !tool.name.starts_with("task_"))
+    );
+    let revealed_request = &agent_requests[1];
+    assert!(
+        revealed_request
+            .messages
+            .iter()
+            .any(|message| message.role == pioneer_provider::Role::Tool
+                && message.tool_call_id.as_deref() == Some("request_task_domain")
+                && message.content.contains("task_create")),
+        "the next request must contain the real discovery result"
+    );
+    let tool_names = revealed_request
         .tools
         .as_ref()
         .expect("agent mode should expose tools")
@@ -61775,16 +61632,7 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
                 release: provider_release,
             }),
         ));
-        // Preflight runs before manifest compilation and window registration.
-        // Let it finish through its own provider so the barrier gates only the
-        // main response, after the actor's durable startup events have ACKed.
-        let preflight_provider = Arc::new(PreflightCaptureProvider::new("unexpected main request"));
-        provider_registry
-            .insert("preflight-capture", preflight_provider.clone())
-            .expect("preflight provider should fit the bounded test registry");
-        let mut tool_loop_config = test_tool_loop_config();
-        tool_loop_config.preflight.provider_name = Some("preflight-capture".to_owned());
-        tool_loop_config.preflight.model = Some("test-model".to_owned());
+        let tool_loop_config = test_tool_loop_config();
         let processor = MessageProcessor::new(
             thread_manager.clone(),
             provider_registry,
@@ -61842,12 +61690,6 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
         tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
             .await
             .expect("manifest fixture provider should enter after durable startup");
-        let preflight_requests = preflight_provider.snapshot_requests();
-        assert!(
-            !preflight_requests.is_empty(),
-            "preflight should run before main provider entry"
-        );
-        assert!(preflight_requests.iter().all(is_turn_preflight_request));
         let window = crud_store
             .latest_turn_execution_window(turn_id)
             .await
@@ -79557,129 +79399,6 @@ async fn memory_provider_disabled_runtime_materializes_no_tools() {
 }
 
 #[tokio::test]
-async fn memory_provider_recall_calls_memory_service() {
-    let mut harness = setup_memory_gateway_harness("provider_recall", true).await;
-    let recall_context = memory_tool_context(&harness, "provider_recall");
-    let thread_start_id = memory_request_id("providerthread");
-    let thread_start_request = json!({
-        "jsonrpc": "2.0",
-        "id": thread_start_id.as_str(),
-        "method": "thread/start",
-        "params": {
-            "thread_id": recall_context.thread_id.clone(),
-            "workspace_id": harness.workspace_id.clone(),
-            "model": "test-model",
-            "model_provider": "openai",
-            "mode": "Agent"
-        }
-    });
-    harness
-        .processor
-        .process_request_for_connection(
-            harness.connection_id,
-            thread_start_request.to_string().as_str(),
-        )
-        .await;
-    let (thread_response, _) = recv_response_and_notification_by_id_method(
-        &mut harness.rx,
-        thread_start_id.as_str(),
-        events::THREAD_STARTED,
-    )
-    .await;
-    let thread_payload: ThreadStartResponse =
-        serde_json::from_value(thread_response.result).expect("thread start response");
-    let provider =
-        crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
-    harness
-        .crud_store
-        .materialize_turn_start(
-            &thread_payload.thread,
-            SandboxMode::FullAccess,
-            &Turn {
-                work_owner: Default::default(),
-                id: recall_context.turn_id.clone(),
-                status: TurnStatus::InProgress,
-                turn_kind: Default::default(),
-                origin: Default::default(),
-                mode: Default::default(),
-                author: None,
-                reply_to_turn_id: None,
-                mentions: Vec::new(),
-                message_revision: 0,
-                message_deleted: false,
-                error: None,
-                prompt_manifest: None,
-                permission_profile: default_test_permission_profile(),
-            },
-            &[],
-            pioneer_protocol::PersistedActorRef::Principal(
-                authenticated_test_superuser().principal_id.clone(),
-            ),
-        )
-        .await
-        .expect("turn start should persist for recall scope");
-    persist_test_execution_authorization_context(
-        harness.processor.as_ref(),
-        harness.connection_id,
-        recall_context.workspace_id.as_str(),
-        recall_context.thread_id.as_str(),
-        recall_context.turn_id.as_str(),
-    )
-    .await;
-    let remember_payload = harness
-        .processor
-        .memory_runtime()
-        .service()
-        .remember(
-            harness
-                .processor
-                .memory_runtime()
-                .operation_context_for_authorized_turn(&recall_context, None, true),
-            MemoryRememberParams {
-                provenance: Some(pioneer_protocol::MemoryProvenance {
-                    source_thread_id: Some(recall_context.thread_id.clone()),
-                    source_turn_id: Some(recall_context.turn_id.clone()),
-                    source_item_id: None,
-                    created_by: None,
-                }),
-                ..memory_remember_params(
-                    MemoryScope {
-                        kind: MemoryScopeKind::Thread,
-                        key: recall_context.effective_conversation_thread_id().to_owned(),
-                    },
-                    MemoryCategory::ProjectFact,
-                    Some("phase09_provider_recall"),
-                    "phase09 provider recall should find the green papaya preference",
-                )
-            },
-        )
-        .await
-        .expect("authorized thread-capsule memory seed should persist");
-    let snapshot = provider
-        .recall_memory(
-            recall_context,
-            MemoryRecallRequest {
-                query: "green papaya".to_owned(),
-                categories: Vec::new(),
-                top_k: Some(5),
-                max_chars: Some(500),
-            },
-        )
-        .await
-        .expect("provider recall should succeed");
-
-    assert!(snapshot.diagnostics.is_empty());
-    assert!(
-        snapshot
-            .items
-            .iter()
-            .any(|item| item.memory_id == remember_payload.record.id)
-    );
-
-    let _ = std::fs::remove_dir_all(harness.runtime_home);
-}
-
-#[tokio::test]
 async fn memory_bridge_not_bound_when_runtime_disabled() {
     let harness = setup_memory_gateway_harness("bridge_disabled", false).await;
 
@@ -79720,10 +79439,6 @@ async fn chat_mode_russian_remember_does_not_mutate_agent_memory_impl() {
     )
     .await;
 
-    assert!(
-        chat_provider.snapshot_policy_requests().is_empty(),
-        "chat mode should not run memory policy classifier"
-    );
     let chat_requests = chat_provider.snapshot_main_requests();
     assert!(
         chat_requests.iter().any(|request| request
@@ -79818,24 +79533,6 @@ async fn memory_owner_facts_survive_a_new_thread() {
             Some(&json!(
                 memory_tool_context(&harness, "owner_first").thread_id
             )),
-        );
-        let recall = provider
-            .recall_memory(
-                memory_tool_context(&harness, "owner_second"),
-                MemoryRecallRequest {
-                    query: content.to_owned(),
-                    categories: Vec::new(),
-                    top_k: Some(5),
-                    max_chars: Some(1000),
-                },
-            )
-            .await
-            .unwrap();
-        assert!(
-            recall
-                .items
-                .iter()
-                .any(|item| json!(item.memory_id) == remembered["memoryId"])
         );
         let manifest = provider
             .load_memory_manifest(
@@ -81955,11 +81652,6 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
             capabilities
         }
         async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-            if is_turn_preflight_request(&request) {
-                return Ok(sequenced_tool_provider_preflight_response(
-                    &request, &self.1,
-                ));
-            }
             let first = {
                 let mut requests = self.0.lock().unwrap();
                 requests.push(request);

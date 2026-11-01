@@ -1,73 +1,8 @@
 use super::*;
 
 #[test]
-fn memory_active_recall_config_defaults_to_bounded_hybrid() {
-    let config = MemoryLoopConfig::default().normalized();
-
-    assert_eq!(config.active_recall.mode, MemoryActiveRecallMode::Hybrid);
-    assert!(config.active_recall.timeout_ms > 0);
-    assert!(config.active_recall.max_queries > 0);
-    assert!(config.active_recall.top_k_per_query > 0);
-    assert!(config.active_recall.max_prompt_chars > 0);
-    assert!(config.active_recall.planner.enabled);
-    assert!(config.active_recall.planner.timeout_ms > 0);
-    assert!(config.active_recall.timeout_ms > config.active_recall.planner.timeout_ms);
-    assert!(config.active_recall.planner.max_input_chars > 0);
-    assert!(config.active_recall.planner.max_output_chars > 0);
-    assert_eq!(
-        config.active_recall.planner.fallback,
-        MemoryActiveRecallPlannerFallbackPolicy::Deterministic
-    );
-
-    let zero = MemoryActiveRecallConfig {
-        timeout_ms: 0,
-        max_queries: 0,
-        top_k_per_query: 0,
-        max_prompt_chars: 0,
-        ..MemoryActiveRecallConfig::default()
-    }
-    .normalized();
-    assert_eq!(zero.timeout_ms, 1);
-    assert_eq!(zero.max_queries, 1);
-    assert_eq!(zero.top_k_per_query, 1);
-    assert_eq!(zero.max_prompt_chars, 1);
-    assert!(zero.planner.enabled);
-    assert_eq!(zero.planner.timeout_ms, 60_000);
-    assert_eq!(zero.planner.max_input_chars, 4_000);
-    assert_eq!(zero.planner.max_output_chars, 2_000);
-}
-
-#[test]
-fn memory_active_recall_runtime_config_normalizes_bounds() {
-    let config = MemoryActiveRecallConfig {
-        planner: MemoryActiveRecallPlannerConfig {
-            enabled: true,
-            timeout_ms: 0,
-            max_input_chars: 0,
-            max_output_chars: 0,
-            fallback: MemoryActiveRecallPlannerFallbackPolicy::SkipActiveRecall,
-        },
-        ..MemoryActiveRecallConfig::default()
-    }
-    .normalized();
-
-    assert_eq!(
-        config.mode.as_str(),
-        MemoryActiveRecallMode::Hybrid.as_str()
-    );
-    assert_eq!(config.planner.timeout_ms, 1);
-    assert_eq!(config.planner.max_input_chars, 1);
-    assert_eq!(config.planner.max_output_chars, 1);
-    assert_eq!(
-        config.planner.fallback,
-        MemoryActiveRecallPlannerFallbackPolicy::SkipActiveRecall
-    );
-}
-
-#[test]
 fn memory_turn_policy_constructors_have_separate_controls() {
     let default_policy = MemoryTurnPolicy::normal_default_allow();
-    assert!(default_policy.allow_pre_turn_recall());
     assert!(default_policy.allows_memory_tool(MEMORY_SEARCH_TOOL));
     assert!(default_policy.allows_memory_tool(MEMORY_REMEMBER_TOOL));
     assert_eq!(default_policy.detected_language, None);
@@ -81,14 +16,12 @@ fn memory_turn_policy_constructors_have_separate_controls() {
     );
 
     let no_save = MemoryTurnPolicy::no_save();
-    assert!(no_save.allow_pre_turn_recall());
     assert!(no_save.allows_memory_tool(MEMORY_SEARCH_TOOL));
     assert!(!no_save.allows_memory_tool(MEMORY_REMEMBER_TOOL));
     assert!(no_save.allows_memory_tool(MEMORY_FORGET_TOOL));
     assert_eq!(no_save.active_memory, MemoryActiveContextPolicy::Allow);
 
     let forget = MemoryTurnPolicy::explicit_forget(Some("birthday".to_owned()));
-    assert!(!forget.allow_pre_turn_recall());
     assert!(forget.allows_memory_tool(MEMORY_SEARCH_TOOL));
     assert!(forget.allows_memory_tool(MEMORY_GET_TOOL));
     assert!(!forget.allows_memory_tool(MEMORY_REMEMBER_TOOL));
@@ -96,10 +29,9 @@ fn memory_turn_policy_constructors_have_separate_controls() {
 }
 
 #[test]
-fn permissive_classifier_fallback_contract_keeps_explicit_memory_available() {
-    let policy = MemoryTurnPolicy::permissive_classifier_fallback(
-        MemoryPolicyReasonCode::ClassifierUnavailable,
-    );
+fn default_allow_fallback_contract_keeps_explicit_memory_available() {
+    let policy =
+        MemoryTurnPolicy::default_allow_fallback(MemoryPolicyReasonCode::ClassifierUnavailable);
 
     assert_eq!(policy.source, MemoryPolicySource::DefaultFallback);
     assert_eq!(
@@ -107,7 +39,6 @@ fn permissive_classifier_fallback_contract_keeps_explicit_memory_available() {
         MemoryPolicyReasonCode::ClassifierUnavailable
     );
     assert_eq!(policy.confidence, 0.0);
-    assert!(policy.allow_pre_turn_recall());
     assert_eq!(policy.prompt, MemoryPromptPolicy::Full);
     assert!(policy.allow_memory_prompt());
     assert_eq!(policy.read_tools, MemoryReadToolPolicy::Allow);

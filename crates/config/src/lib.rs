@@ -48,8 +48,6 @@ pub struct GatewayConfig {
     #[serde(default = "default_gateway_keepawake")]
     pub keepawake: bool,
     #[serde(default)]
-    pub preflight_model: GatewayMemoryModelSelectionConfig,
-    #[serde(default)]
     pub telemetry: GatewayTelemetryConfig,
     pub thread: GatewayThreadConfig,
     #[serde(default)]
@@ -783,12 +781,6 @@ pub struct GatewayMemoryConfig {
     /// Allows agent/global memories to be used when explicitly enabled by config.
     #[serde(default = "default_gateway_memory_allow_global_agent")]
     pub allow_global_agent_by_default: bool,
-    /// Enables deterministic pre-turn recall into the prompt context.
-    #[serde(default = "default_gateway_memory_deterministic_recall_enabled")]
-    pub deterministic_recall_enabled: bool,
-    /// Enables active recall planning before prompt compilation.
-    #[serde(default = "default_gateway_memory_active_recall_enabled")]
-    pub active_recall_enabled: bool,
     /// Exposes explicit memory tools to capable model providers.
     #[serde(default = "default_gateway_memory_tools_enabled")]
     pub tools_enabled: bool,
@@ -798,9 +790,6 @@ pub struct GatewayMemoryConfig {
     /// Runs post-turn extraction as background hook work instead of blocking the user turn.
     #[serde(default = "default_gateway_memory_background_extraction_enabled")]
     pub background_extraction_enabled: bool,
-    /// Provider/model used by active recall planner. Defaults to the thread model.
-    #[serde(default)]
-    pub active_recall_model: GatewayMemoryModelSelectionConfig,
     /// Provider/model used by proactive memory writes. Defaults to the thread model.
     #[serde(default)]
     pub proactive_writes_model: GatewayMemoryModelSelectionConfig,
@@ -819,12 +808,9 @@ impl Default for GatewayMemoryConfig {
             capsules_dir: default_gateway_memory_capsules_dir(),
             allow_global_user_by_default: default_gateway_memory_allow_global_user(),
             allow_global_agent_by_default: default_gateway_memory_allow_global_agent(),
-            deterministic_recall_enabled: default_gateway_memory_deterministic_recall_enabled(),
-            active_recall_enabled: default_gateway_memory_active_recall_enabled(),
             tools_enabled: default_gateway_memory_tools_enabled(),
             proactive_writes_enabled: default_gateway_memory_proactive_writes_enabled(),
             background_extraction_enabled: default_gateway_memory_background_extraction_enabled(),
-            active_recall_model: GatewayMemoryModelSelectionConfig::default(),
             proactive_writes_model: GatewayMemoryModelSelectionConfig::default(),
             debug_trace_enabled: false,
             strict_diagnostics_enabled: false,
@@ -2051,14 +2037,6 @@ const fn default_gateway_memory_allow_global_user() -> bool {
 
 const fn default_gateway_memory_allow_global_agent() -> bool {
     false
-}
-
-const fn default_gateway_memory_deterministic_recall_enabled() -> bool {
-    true
-}
-
-const fn default_gateway_memory_active_recall_enabled() -> bool {
-    true
 }
 
 const fn default_gateway_memory_tools_enabled() -> bool {
@@ -3434,8 +3412,7 @@ fn load_profile_config(
             File::from(path.as_path()).required(explicit_required && index + 1 == paths.len()),
         );
     }
-    let mut config: AppConfig = builder.build()?.try_deserialize()?;
-    migrate_gateway_preflight_model_from_legacy_overrides(&mut config, &paths);
+    let config: AppConfig = builder.build()?.try_deserialize()?;
     if debug {
         config
             .validate_development_context()
@@ -3472,54 +3449,8 @@ fn load_config_from_sources(
         builder = builder.add_source(File::from(path.as_path()).required(false));
     }
 
-    let mut config: AppConfig = builder.build()?.try_deserialize()?;
-    migrate_gateway_preflight_model_from_legacy_overrides(&mut config, override_paths.as_slice());
+    let config: AppConfig = builder.build()?.try_deserialize()?;
     Ok(config)
-}
-
-fn migrate_gateway_preflight_model_from_legacy_overrides(
-    config: &mut AppConfig,
-    override_paths: &[PathBuf],
-) {
-    if override_paths_contain_toml_path(override_paths, &["gateway", "preflight_model"]) {
-        return;
-    }
-
-    if override_paths_contain_toml_path(
-        override_paths,
-        &["gateway", "memory", "active_recall_model"],
-    ) {
-        config.gateway.preflight_model = config.gateway.memory.active_recall_model.clone();
-    }
-}
-
-fn override_paths_contain_toml_path(override_paths: &[PathBuf], path: &[&str]) -> bool {
-    override_paths.iter().any(|override_path| {
-        let Ok(content) = std::fs::read_to_string(override_path) else {
-            return false;
-        };
-        let Ok(value) = toml::from_str::<toml::Value>(content.as_str()) else {
-            return false;
-        };
-        toml_value_has_path(&value, path)
-    })
-}
-
-fn toml_value_has_path(value: &toml::Value, path: &[&str]) -> bool {
-    if path.is_empty() {
-        return true;
-    }
-
-    for end in 1..=path.len() {
-        let key = path[..end].join(".");
-        if let Some(next) = value.get(key.as_str())
-            && toml_value_has_path(next, &path[end..])
-        {
-            return true;
-        }
-    }
-
-    false
 }
 
 fn workspace_local_config_path() -> PathBuf {
@@ -3890,7 +3821,6 @@ service_name = "com.pioneer.gateway.env"
         );
         assert_eq!(config.gateway.service_name, "com.pioneer.gateway");
         assert!(!config.gateway.keepawake);
-        assert!(config.gateway.preflight_model.is_thread_model());
         assert!(config.gateway.tasks.review.enabled);
         assert!(!config.gateway.tasks.review.allow_task_create_review_policy);
         assert!(
@@ -4403,29 +4333,6 @@ recovery_grace_secs = 1801
     }
 
     #[test]
-    fn settings_gateway_preflight_model_config_accepts_custom_override() {
-        let workspace_override = unique_temp_file_path("gateway-preflight-model-config");
-        write_file(
-            &workspace_override,
-            r#"
-[gateway]
-preflight_model = { source = "custom", model_provider = "planner-provider", model = "planner-model" }
-"#,
-        );
-
-        let config =
-            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
-                .expect("load config with preflight model override");
-
-        assert_eq!(
-            config.gateway.preflight_model,
-            GatewayMemoryModelSelectionConfig::custom("planner-provider", "planner-model")
-        );
-
-        let _ = fs::remove_file(workspace_override);
-    }
-
-    #[test]
     fn config_loader_uses_scoped_skill_path_templates_by_default() {
         let config =
             load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new()).expect("load default config");
@@ -4573,12 +4480,9 @@ preflight_model = { source = "custom", model_provider = "planner-provider", mode
         assert_eq!(config.gateway.memory.capsules_dir, "memory/capsules");
         assert!(config.gateway.memory.allow_global_user_by_default);
         assert!(!config.gateway.memory.allow_global_agent_by_default);
-        assert!(config.gateway.memory.deterministic_recall_enabled);
-        assert!(config.gateway.memory.active_recall_enabled);
         assert!(config.gateway.memory.tools_enabled);
         assert!(config.gateway.memory.proactive_writes_enabled);
         assert!(config.gateway.memory.background_extraction_enabled);
-        assert!(config.gateway.memory.active_recall_model.is_thread_model());
         assert!(
             config
                 .gateway
@@ -4737,12 +4641,9 @@ preflight_model = { source = "custom", model_provider = "planner-provider", mode
         assert!(config.enabled);
         assert!(config.allow_global_user_by_default);
         assert!(!config.allow_global_agent_by_default);
-        assert!(config.deterministic_recall_enabled);
-        assert!(config.active_recall_enabled);
         assert!(config.tools_enabled);
         assert!(config.proactive_writes_enabled);
         assert!(config.background_extraction_enabled);
-        assert!(config.active_recall_model.is_thread_model());
         assert!(config.proactive_writes_model.is_thread_model());
         assert!(!config.debug_trace_enabled);
         assert!(!config.strict_diagnostics_enabled);
@@ -5046,12 +4947,9 @@ capsules_dir = "memory/custom-capsules"
         assert_eq!(config.capsules_dir, "memory/custom-capsules");
         assert!(config.allow_global_user_by_default);
         assert!(!config.allow_global_agent_by_default);
-        assert!(config.deterministic_recall_enabled);
-        assert!(config.active_recall_enabled);
         assert!(config.tools_enabled);
         assert!(config.proactive_writes_enabled);
         assert!(config.background_extraction_enabled);
-        assert!(config.active_recall_model.is_thread_model());
         assert!(config.proactive_writes_model.is_thread_model());
         assert!(!config.debug_trace_enabled);
         assert!(!config.strict_diagnostics_enabled);
@@ -5161,15 +5059,9 @@ model = " claude-sonnet "
             capsules_dir: "memory/capsules".to_owned(),
             allow_global_user_by_default: true,
             allow_global_agent_by_default: false,
-            deterministic_recall_enabled: true,
-            active_recall_enabled: true,
             tools_enabled: false,
             proactive_writes_enabled: false,
             background_extraction_enabled: false,
-            active_recall_model: GatewayMemoryModelSelectionConfig::custom(
-                "planner-provider",
-                "planner-model",
-            ),
             proactive_writes_model: GatewayMemoryModelSelectionConfig::custom(
                 "extractor-provider",
                 "extractor-model",
@@ -5183,14 +5075,9 @@ model = " claude-sonnet "
         assert!(serialized.contains("capsules_dir = \"memory/capsules\""));
         assert!(serialized.contains("allow_global_user_by_default = true"));
         assert!(serialized.contains("allow_global_agent_by_default = false"));
-        assert!(serialized.contains("deterministic_recall_enabled = true"));
-        assert!(serialized.contains("active_recall_enabled = true"));
         assert!(serialized.contains("tools_enabled = false"));
         assert!(serialized.contains("proactive_writes_enabled = false"));
         assert!(serialized.contains("background_extraction_enabled = false"));
-        assert!(serialized.contains("active_recall_model"));
-        assert!(serialized.contains("model_provider = \"planner-provider\""));
-        assert!(serialized.contains("model = \"planner-model\""));
         assert!(serialized.contains("proactive_writes_model"));
         assert!(serialized.contains("model_provider = \"extractor-provider\""));
         assert!(serialized.contains("model = \"extractor-model\""));
@@ -5207,9 +5094,7 @@ model = " claude-sonnet "
         let serialized = toml::to_string(&GatewayMemoryConfig::default())
             .expect("gateway memory config should serialize");
 
-        assert!(serialized.contains("active_recall_model = \"thread\""));
         assert!(serialized.contains("proactive_writes_model = \"thread\""));
-        assert!(!serialized.contains("[active_recall_model]"));
         assert!(!serialized.contains("[proactive_writes_model]"));
     }
 
@@ -5496,50 +5381,5 @@ token_refresh_leeway_seconds = 300
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn legacy_preflight_model_migration_preserves_explicit_precedence_and_legacy_value() {
-        let cases = [
-            (
-                "gateway-preflight-model-migration",
-                r#"
-[gateway.memory]
-active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
-"#,
-                "legacy-provider",
-                "legacy-model",
-                "load config with legacy active recall model",
-            ),
-            (
-                "gateway-preflight-model-mixed",
-                r#"
-[gateway]
-preflight_model = { source = "custom", model_provider = "new-provider", model = "new-model" }
-
-[gateway.memory]
-active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
-"#,
-                "new-provider",
-                "new-model",
-                "load config with mixed preflight settings",
-            ),
-        ];
-        for (prefix, contents, provider, model, message) in cases {
-            let workspace_override = unique_temp_file_path(prefix);
-            write_file(&workspace_override, contents);
-            let config =
-                load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
-                    .expect(message);
-            assert_eq!(
-                config.gateway.preflight_model,
-                GatewayMemoryModelSelectionConfig::custom(provider, model)
-            );
-            assert_eq!(
-                config.gateway.memory.active_recall_model,
-                GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
-            );
-            let _ = fs::remove_file(workspace_override);
-        }
     }
 }

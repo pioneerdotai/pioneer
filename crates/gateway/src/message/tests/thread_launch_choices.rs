@@ -182,7 +182,7 @@ async fn fixture_with_principal_probe(
             name: "openai",
             probe,
             response,
-            inner: PromptParityCaptureProvider::with_visible_tools(vec![]),
+            inner: PromptParityCaptureProvider::default(),
             extra_models,
             catalog_calls,
         }),
@@ -1016,7 +1016,7 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
 }
 
 async fn api_choice_models(ids: &[&str]) -> Vec<pioneer_protocol::ProviderModelInfo> {
-    let template = PromptParityCaptureProvider::with_visible_tools(vec![])
+    let template = PromptParityCaptureProvider::default()
         .list_models()
         .await
         .unwrap()
@@ -1497,7 +1497,7 @@ async fn cli_parent_selects_only_unambiguous_api_choices_for_threads_and_tasks()
                         name: "anthropic",
                         probe: Default::default(),
                         response: response.clone(),
-                        inner: PromptParityCaptureProvider::with_visible_tools(vec![]),
+                        inner: PromptParityCaptureProvider::default(),
                         extra_models: Default::default(),
                         catalog_calls: Default::default(),
                     }),

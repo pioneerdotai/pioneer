@@ -206,8 +206,6 @@ async fn fixture_on_workspace(
                     bridge.clone(),
                     Some(write),
                     Some(bridge),
-                    None,
-                    None,
                     harness
                         .processor
                         .agent_manager

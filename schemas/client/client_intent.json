@@ -4714,16 +4714,10 @@
     "GatewayMemorySettings": {
       "type": "object",
       "properties": {
-        "active_recall_enabled": {
-          "type": "boolean"
-        },
         "background_extraction_enabled": {
           "type": "boolean"
         },
         "debug_trace_enabled": {
-          "type": "boolean"
-        },
-        "deterministic_recall_enabled": {
           "type": "boolean"
         },
         "enabled": {
@@ -4747,8 +4741,6 @@
       },
       "required": [
         "enabled",
-        "deterministic_recall_enabled",
-        "active_recall_enabled",
         "tools_enabled",
         "proactive_writes_enabled",
         "background_extraction_enabled",
@@ -5801,7 +5793,6 @@
       "type": "string",
       "enum": [
         "Enabled",
-        "ActiveRecall",
         "ProactiveWrites",
         "BackgroundExtraction",
         "DebugTrace"
@@ -7817,22 +7808,6 @@
           "required": [
             "kind",
             "enabled"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "kind": {
-              "type": "string",
-              "const": "preflight_model"
-            },
-            "selection": {
-              "$ref": "#/$defs/GatewayMemoryModelSelection"
-            }
-          },
-          "required": [
-            "kind",
-            "selection"
           ]
         },
         {

@@ -29,16 +29,6 @@
         }
       ]
     },
-    "preflight_model": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/GatewayMemoryModelSelection"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
     "telemetry_enabled": {
       "type": [
         "boolean",
@@ -47,34 +37,6 @@
     }
   },
   "$defs": {
-    "GatewayMemoryModelSelection": {
-      "type": "object",
-      "properties": {
-        "model": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "model_provider": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "source": {
-          "$ref": "#/$defs/GatewayMemoryModelSelectionSource",
-          "default": "thread"
-        }
-      }
-    },
-    "GatewayMemoryModelSelectionSource": {
-      "type": "string",
-      "enum": [
-        "thread",
-        "custom"
-      ]
-    },
     "GatewayModelCatalogProxyUpdate": {
       "type": "object",
       "properties": {

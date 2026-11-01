@@ -937,3 +937,16 @@ pub(super) fn memory_post_turn_provider_skip_diagnostic(
     );
     diagnostic
 }
+
+pub(super) fn bounded_nonempty_text(value: &str, max_chars: usize) -> Option<String> {
+    let trimmed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(trimmed.as_str(), max_chars))
+    }
+}
+
+pub(super) fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}

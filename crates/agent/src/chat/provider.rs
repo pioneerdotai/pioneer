@@ -4088,10 +4088,6 @@ impl ProviderAttemptObservation {
         observation.route = profile.route;
         Ok(observation)
     }
-    pub(super) fn with_purpose(mut self, purpose: &'static str) -> Self {
-        self.purpose = purpose;
-        self
-    }
     pub(super) fn observe(&self, snapshot: &TokenUsage) {
         self.usage
             .lock()

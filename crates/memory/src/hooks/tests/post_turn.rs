@@ -1229,7 +1229,7 @@ async fn post_turn_extractor_respects_policy_and_provider_availability() {
             && diagnostic.metadata.get(&hook_metadata_key("skip_reason"))
                 == Some(&HookValue::Text("policy_disabled".to_owned()))
             && diagnostic.metadata.get(&hook_metadata_key("policy_source"))
-                == Some(&HookValue::Text("pre_memory_classifier".to_owned()))
+                == Some(&HookValue::Text("default_fallback".to_owned()))
             && diagnostic
                 .metadata
                 .get(&hook_metadata_key("policy_reason_code"))
@@ -1272,7 +1272,7 @@ async fn post_turn_extractor_runs_for_direct_user_turns_with_runtime_events() {
 
     let response = hook
         .execute(test_post_turn_hook_request_with_events(
-            memory_policy_set(&MemoryTurnPolicy::permissive_classifier_fallback(
+            memory_policy_set(&MemoryTurnPolicy::default_allow_fallback(
                 MemoryPolicyReasonCode::ClassifierUnavailable,
             )),
             Some("direct user transcript"),
@@ -1472,9 +1472,8 @@ async fn post_turn_extractor_skips_ineligible_source_classes_before_provider_cal
 
 #[tokio::test]
 async fn permissive_fallback_does_not_override_typed_source_ineligibility() {
-    let fallback_policy = MemoryTurnPolicy::permissive_classifier_fallback(
-        MemoryPolicyReasonCode::ClassifierUnavailable,
-    );
+    let fallback_policy =
+        MemoryTurnPolicy::default_allow_fallback(MemoryPolicyReasonCode::ClassifierUnavailable);
     let mut task_owned = test_post_turn_hook_request_with_events(
         memory_policy_set(&fallback_policy),
         Some("direct user transcript"),

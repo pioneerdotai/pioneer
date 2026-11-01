@@ -1,10 +1,10 @@
 //! Gateway settings state.
 
 use pioneer_protocol::{
-    GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayRemoteAccessErrorKind,
-    GatewayRemoteAccessSettings, GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
-    GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsSnapshot,
-    GatewaySettingsUpdate, GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
+    GatewayGeneralSettingsUpdate, GatewayRemoteAccessErrorKind, GatewayRemoteAccessSettings,
+    GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState, GatewaySettingsGetParams,
+    GatewaySettingsGetResponse, GatewaySettingsSnapshot, GatewaySettingsUpdate,
+    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
     GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorLocalModelStatus,
     GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorRefillStatus,
     GatewayThreadEpisodicVectorSearchSettings, GatewayThreadEpisodicVectorSearchSettingsUpdate,
@@ -208,7 +208,6 @@ pub fn keepawake_update_plan(
                 compaction_model: None,
                 keepawake: Some(enabled),
                 telemetry_enabled: None,
-                preflight_model: None,
                 model_catalog_proxy: None,
             }),
             memory: None,
@@ -235,34 +234,6 @@ pub fn telemetry_enabled_update_plan(
                 compaction_model: None,
                 keepawake: None,
                 telemetry_enabled: Some(enabled),
-                preflight_model: None,
-                model_catalog_proxy: None,
-            }),
-            memory: None,
-            self_improvement: None,
-            thread_episodic: None,
-            cli_runtimes: None,
-            remote_access: None,
-            voice_input: None,
-        },
-    })
-}
-
-pub fn preflight_model_update_plan(
-    current: Option<&GatewaySettingsSnapshot>,
-    model_selection: GatewayMemoryModelSelection,
-) -> Option<GatewaySettingsUpdatePlan> {
-    let mut snapshot = current.cloned()?;
-    snapshot.general.preflight_model = model_selection.clone();
-
-    Some(GatewaySettingsUpdatePlan {
-        snapshot,
-        update: GatewaySettingsUpdate {
-            general: Some(GatewayGeneralSettingsUpdate {
-                compaction_model: None,
-                keepawake: None,
-                telemetry_enabled: None,
-                preflight_model: Some(model_selection),
                 model_catalog_proxy: None,
             }),
             memory: None,
@@ -692,7 +663,6 @@ mod tests {
         let general = plan.update.general.expect("general update");
         assert_eq!(general.keepawake, Some(true));
         assert!(general.telemetry_enabled.is_none());
-        assert!(general.preflight_model.is_none());
         assert!(plan.update.memory.is_none());
         assert!(plan.update.thread_episodic.is_none());
         assert!(keepawake_update_plan(None, true).is_none());
@@ -706,27 +676,9 @@ mod tests {
         let general = plan.update.general.expect("general update");
         assert!(general.keepawake.is_none());
         assert_eq!(general.telemetry_enabled, Some(false));
-        assert!(general.preflight_model.is_none());
         assert!(plan.update.memory.is_none());
         assert!(plan.update.thread_episodic.is_none());
         assert!(telemetry_enabled_update_plan(None, true).is_none());
-    }
-
-    #[test]
-    fn preflight_update_plan_updates_general_only() {
-        let model_selection = GatewayMemoryModelSelection::custom("openai", "gpt-5.4");
-        let plan = preflight_model_update_plan(Some(&snapshot(true)), model_selection.clone())
-            .expect("plan");
-
-        assert_eq!(plan.snapshot.general.preflight_model, model_selection);
-        assert!(plan.snapshot.general.keepawake);
-        let general = plan.update.general.expect("general update");
-        assert!(general.keepawake.is_none());
-        assert!(general.telemetry_enabled.is_none());
-        assert_eq!(general.preflight_model, Some(model_selection));
-        assert!(plan.update.memory.is_none());
-        assert!(plan.update.thread_episodic.is_none());
-        assert!(preflight_model_update_plan(None, GatewayMemoryModelSelection::thread()).is_none());
     }
 
     #[test]

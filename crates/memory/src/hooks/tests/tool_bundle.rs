@@ -56,9 +56,7 @@ async fn memory_tool_bundle_hook_applies_policy_visibility_matrix() {
             1,
         ),
         (
-            MemoryTurnPolicy::permissive_classifier_fallback(
-                MemoryPolicyReasonCode::ClassifierUnavailable,
-            ),
+            MemoryTurnPolicy::default_allow_fallback(MemoryPolicyReasonCode::ClassifierUnavailable),
             vec![
                 MEMORY_SEARCH_TOOL,
                 MEMORY_LIST_TOOL,
@@ -150,7 +148,21 @@ async fn memory_tool_bundle_hook_applies_policy_visibility_matrix() {
                 })
             );
         }
-        if policy.source == MemoryPolicySource::DefaultFallback {
+        if expected_materialize_calls == 0 {
+            assert!(
+                response
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code.as_str() == "memory.tools_omitted")
+            );
+        } else if !expected_tools.contains(&MEMORY_REMEMBER_TOOL) {
+            assert!(
+                response
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.as_str().contains("memory.policy.tools_filtered"))
+            );
+        } else {
             assert!(response.diagnostics.is_empty());
         }
     }
