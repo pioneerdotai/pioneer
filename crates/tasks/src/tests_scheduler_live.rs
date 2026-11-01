@@ -843,7 +843,6 @@ async fn malformed_discovery_rows_preserve_executor_dispatch_and_terminal_repair
     // Keep the large composed setup/dispatch futures off the test thread stack.
     let runtime = Box::pin(runtime()).await;
     let store = runtime.service().store();
-    let now = chrono::Utc::now().timestamp();
     let terminal = Box::pin(runtime.service().create_task(
         TaskCreateContext::default(),
         create_params(TaskTriggerSpec::Immediate),
@@ -851,6 +850,7 @@ async fn malformed_discovery_rows_preserve_executor_dispatch_and_terminal_repair
     .await
     .unwrap();
     let terminal_run = terminal.run.unwrap();
+    let now = chrono::Utc::now().timestamp();
     let setup_executors = Arc::new(TaskExecutorRegistry::new());
     setup_executors
         .register(Arc::new(CompletingSystemExecutor))
@@ -935,6 +935,9 @@ async fn malformed_discovery_rows_preserve_executor_dispatch_and_terminal_repair
     .unwrap()
     .run
     .unwrap();
+    // Immediate runs use the creation clock for ready_at. Capture the pass
+    // clock after fixture writes so a second boundary cannot leave them future-due.
+    let now = chrono::Utc::now().timestamp();
     let count = Arc::new(AtomicUsize::new(0));
     let executors = Arc::new(TaskExecutorRegistry::new());
     executors
