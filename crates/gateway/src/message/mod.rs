@@ -2552,7 +2552,7 @@ impl MessageProcessor {
                     }),
                 )
                 .await;
-                finalization_reporting.observe(&result, Instant::now());
+                finalization_reporting.observe_finalizations(&result, Instant::now());
                 match result {
                     Ok(summary) => {
                         let committed = summary.committed_count();
@@ -2595,6 +2595,8 @@ impl MessageProcessor {
             if cycle.is_err() {
                 error!("contained panic in projection/delivery resilience worker");
             }
+            // Fixed fallback also discovers foreign writes and restored streams.
+            // No second deadline SELECT and no acceleration of shared callbacks.
             sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
         }
     }

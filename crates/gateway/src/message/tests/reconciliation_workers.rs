@@ -537,7 +537,8 @@ async fn partial_durable_progress_followed_by_real_error_does_not_recover() {
             .for_background_reconciliation()
             .reconcile_prepared_native_turn_finalizations(1_700_000_101, 64)
             .await;
-        assert!(result.is_err());
+        assert_eq!(result.as_ref().unwrap().failures.len(), 1);
+        assert_eq!(result.as_ref().unwrap().committed_count(), 1);
         let (_, durable) = store
             .get_turn("diagnostic_thread", "diagnostic_turn")
             .await
@@ -546,9 +547,9 @@ async fn partial_durable_progress_followed_by_real_error_does_not_recover() {
         assert_eq!(
             durable.status,
             TurnStatus::Completed,
-            "partial durable progress preceded Err"
+            "partial durable progress is retained with its synchronization failure"
         );
-        reporting.observe(&result, std::time::Instant::now());
+        reporting.observe_finalizations(&result, std::time::Instant::now());
         tracing::error!("after partial reconciliation failure");
     }
     .with_subscriber(dispatch)
