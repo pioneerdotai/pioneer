@@ -1120,11 +1120,6 @@ pub(crate) fn appended_task_event_from_model(
         parent_task_id: None,
         created_at: model.created_at,
         append_status,
-        candidate_gate_resolution: None,
-        candidate_projection: None,
-        review_projection: None,
-        delivery_authority: None,
-        projection: Default::default(),
     })
 }
 

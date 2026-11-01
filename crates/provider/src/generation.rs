@@ -1145,18 +1145,6 @@ pub(crate) fn deepseek_effective_thinking(request: &ChatRequest) -> bool {
     )
 }
 
-/// Discovery uses the very same protocol decision as generation. This request
-/// contains no tools/sampling/cap: those per-request constraints are checked at
-/// send time; catalog limits are still read through ModelCatalog::limits.
-pub(crate) fn effort_supported_for_profile(
-    provider: &str,
-    id: &str,
-    model: Option<&CatalogModel>,
-    effort: ReasoningEffort,
-) -> bool {
-    effort_supported_with_native(provider, id, model, effort, &NativeReasoning::new())
-}
-
 pub(crate) fn effort_supported_with_native(
     provider: &str,
     id: &str,

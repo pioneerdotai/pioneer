@@ -417,9 +417,8 @@ async fn oversized_card_preserves_full_unicode_title_and_rejects_deleted_source_
 }
 
 #[tokio::test]
-async fn optional_recall_adapter_uses_indexed_sources_and_trusted_execution_identity() {
+async fn indexed_search_uses_authorized_sources_and_trusted_execution_identity() {
     use crate::message::thread_read_tools::tests::member;
-    use pioneer_memory::hooks::{AgentEpisodicRecallProvider, MemoryCurrentThreadRecallRequest};
     let (_h, p) = fixture().await;
     let temp = tempfile::tempdir().unwrap();
     let c = capsule(&p, &format!("file://{}", temp.path().display())).await;
@@ -476,34 +475,6 @@ async fn optional_recall_adapter_uses_indexed_sources_and_trusted_execution_iden
             )
             .await
             .unwrap()
-    );
-    let p = Arc::new(p);
-    // Exercise the optional adapter directly. Production Memory hooks no
-    // longer install it; explicit Threads search retains this authorization.
-    let provider =
-        crate::thread_episodic_hooks::ThreadEpisodicMemoryRecallProvider::new(Arc::downgrade(&p));
-    let output = provider
-        .recall_current_thread(MemoryCurrentThreadRecallRequest {
-            workspace_id: WORKSPACE_RED_ID.into(),
-            thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-            turn_id: turn.into(),
-            principal_id: Some(crate::tests::authorization::MEMBER_B_ID.into()),
-            query: "searchneedle".into(),
-            targets: Vec::new(),
-            top_k: 10,
-            max_chars: 1000,
-        })
-        .await
-        .unwrap();
-    assert_eq!(output.items.len(), 1);
-    assert!(output.items[0].content.contains("saved decision"));
-    assert_eq!(
-        output.items[0].provenance.item_id.as_deref(),
-        Some("recall-source")
-    );
-    assert_eq!(
-        output.items[0].provenance.thread_id.as_deref(),
-        Some(THREAD_RED_PRIVATE_A_ID)
     );
     let tool = p
         .search_threads_page(

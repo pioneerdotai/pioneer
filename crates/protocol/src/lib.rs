@@ -64,7 +64,6 @@ mod thread_file;
 mod timeline;
 mod turn;
 mod turn_permissions;
-mod versioned_contract;
 mod voice;
 pub mod voice_contract;
 mod workspace;
