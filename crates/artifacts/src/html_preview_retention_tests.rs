@@ -35,10 +35,11 @@ async fn preview_maintenance(service: &ArtifactService) {
     for _ in 0..2 {
         let mut idle = false;
         for _ in 0..128 {
-            if !service
-                .html_preview_maintenance_quantum(&mut progress)
+            if service
+                .html_preview_maintenance_outcome(&mut progress)
                 .await
                 .unwrap()
+                != crate::HtmlPreviewMaintenanceOutcome::More
             {
                 idle = true;
                 break;
@@ -397,6 +398,11 @@ async fn preview_release_after_owners(six_frames: bool) {
         }
     }
     assert!(rolled_back);
+    let copies: i64 = harness.store.database_connection().query_one_raw(
+        Statement::from_string(DbBackend::Sqlite, "SELECT COUNT(*) n FROM html_preview_io_work WHERE family='copies'")
+    ).await.unwrap().unwrap().try_get("", "n").unwrap();
+    assert_eq!(copies, 0, "release rollback must also roll back copy obligations");
+
     assert!(old_paths.iter().all(|p| p.exists()));
     let retained = harness
         .store
@@ -1005,4 +1011,121 @@ async fn html_preview_retention_preserves_mixed_duplicate_and_oversized_groups()
             );
         }
     }
+}
+
+// Owns the public service contract: contention cannot become traversal EOF,
+// and a release that happens before the worker waits must remain observable.
+#[tokio::test]
+async fn preview_contention_defers_and_release_is_retained_after_unlock() {
+    let harness = preview_fixture().await;
+    let activity = harness.service.html_preview_activity_signaled().await;
+    let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
+    assert_eq!(
+        harness
+            .service
+            .html_preview_maintenance_outcome(&mut progress)
+            .await
+            .unwrap(),
+        crate::HtmlPreviewMaintenanceOutcome::Deferred,
+    );
+    drop(activity);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        harness.service.html_preview_release_notified(),
+    )
+    .await
+    .expect("release hint survives until maintenance waits");
+    // A stale 'finished' flag would skip the retirement traversal on resume.
+    let request = preview_request("input", b"<html>deferred</html>".to_vec());
+    harness.service.ingest_bytes(request).await.unwrap();
+    assert_ne!(
+        harness
+            .service
+            .html_preview_maintenance_outcome(&mut progress)
+            .await
+            .unwrap(),
+        crate::HtmlPreviewMaintenanceOutcome::Deferred,
+    );
+}
+
+#[tokio::test]
+async fn released_copy_cleanup_without_local_root_is_deferred() {
+    let harness = preview_fixture().await;
+    let service = ArtifactService::new(
+        harness.store.clone(),
+        Arc::new(FakeReadBlobStore {
+            storage_key: "unused".into(),
+            mode: FakeReadMode::Missing,
+        }),
+    );
+    let previous =
+        json!({"htmlTool":{"retention":"released","releasedCopies":["/unavailable/copy.html"]}})
+            .to_string();
+    assert!(
+        service
+            .prepare_html_preview_copy_cleanup("ws_a", &previous)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn released_copy_partial_failure_retries_without_losing_remaining_paths() {
+    let harness = preview_fixture().await;
+    let root = harness.service.blob_store.local_artifact_root().unwrap();
+    let directory = crate::artifact_readable_copy_workspace_root(&root, "ws_a")
+        .unwrap()
+        .join("partial");
+    tokio::fs::create_dir_all(&directory).await.unwrap();
+    let first = directory.join("one.html");
+    let second = directory.join("two.html");
+    tokio::fs::write(&first, "one").await.unwrap();
+    // A directory in place of a file causes a real, deterministic partial I/O
+    // failure after the first copy was removed.
+    tokio::fs::create_dir(&second).await.unwrap();
+    let previous =
+        json!({"htmlTool":{"retention":"released","releasedCopies":[first,second]}}).to_string();
+    assert!(
+        harness
+            .service
+            .prepare_html_preview_copy_cleanup("ws_a", &previous)
+            .await
+            .is_err()
+    );
+    assert!(!first.exists());
+    assert!(second.exists());
+    tokio::fs::remove_dir(&second).await.unwrap();
+    tokio::fs::write(&second, "two").await.unwrap();
+    let prepared = harness
+        .service
+        .prepare_html_preview_copy_cleanup("ws_a", &previous)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!second.exists());
+    let metadata: serde_json::Value = serde_json::from_str(&prepared).unwrap();
+    assert_eq!(metadata["htmlTool"]["releasedCopies"], json!([]));
+}
+
+#[tokio::test]
+async fn physical_copy_preparation_succeeds_with_disconnected_database() {
+    let harness = preview_fixture().await;
+    let service = ArtifactService::new(
+        Arc::new(CrudStore::new(sea_orm::DatabaseConnection::Disconnected)),
+        harness.service.blob_store.clone(),
+    );
+    let root = service.blob_store.local_artifact_root().unwrap();
+    let directory = crate::artifact_readable_copy_workspace_root(&root, "ws_a")
+        .unwrap()
+        .join("no-database");
+    tokio::fs::create_dir_all(&directory).await.unwrap();
+    let path = directory.join("frame.html");
+    tokio::fs::write(&path, "retired frame").await.unwrap();
+    let previous = json!({"htmlTool":{"retention":"released","releasedCopies":[path]}}).to_string();
+    let prepared = service.prepare_html_preview_copy_cleanup("ws_a", &previous)
+        .await.unwrap().unwrap();
+    assert!(!path.exists());
+    let metadata: serde_json::Value = serde_json::from_str(&prepared).unwrap();
+    assert_eq!(metadata["htmlTool"]["releasedCopies"], json!([]));
 }
