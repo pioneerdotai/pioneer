@@ -11355,6 +11355,16 @@ mod tests {
                         },
                         None,
                     );
+                    // Completion first enters Completing, which is still in flight.
+                    // Finalize it before exercising cleanup with no current turn.
+                    assert!(core.tick_thread_conversations());
+                    assert_eq!(
+                        core.thread_coordinator_snapshot("b")
+                            .unwrap()
+                            .conversation
+                            .in_flight_turn_id(),
+                        None
+                    );
                 }
                 _ => {}
             }
