@@ -921,15 +921,32 @@ mod tests {
             "Captured message",
             2,
         );
+        // This fixture has no presentation worker. Request projection through
+        // the normal demand boundary before delivering the new timeline.
+        client.dispatch(pioneer_client::core::ClientIntent::SetScopeDemand {
+            scope: ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            demand: pioneer_client::core::ClientDemand::Visible,
+            generation: 1,
+        });
+        let timeline = client
+            .snapshot(&ClientScope::Timeline {
+                thread_id: "a".into(),
+            })
+            .unwrap();
+        assert!(
+            timeline.snapshot().sequence()
+                > binding
+                    .publication(timeline.scope())
+                    .unwrap()
+                    .snapshot()
+                    .sequence(),
+            "the handoff must deliver a newly materialized timeline"
+        );
         // Deliver only the new timeline. The Composer binding deliberately retains
         // the old captured operation, as independently scheduled views may do.
-        binding.publish(
-            client
-                .snapshot(&ClientScope::Timeline {
-                    thread_id: "a".into(),
-                })
-                .unwrap(),
-        );
+        binding.publish(timeline);
         cx.run_until_parked();
         screen.update(cx, |view, cx| {
             assert!(
