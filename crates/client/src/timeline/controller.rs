@@ -2207,12 +2207,9 @@ impl crate::core::ClientCore {
             );
         }
         for rejected in &mut plan.rejected {
-            rejected.store_generation = registry
-                .stores
-                .get(request_thread_id(semantic::semantic_timeline_request_key(
-                    &rejected.action,
-                )))
-                .map_or(0, |store| store.generation);
+            rejected.store_generation = registry.timeline_store_generation(request_thread_id(
+                semantic::semantic_timeline_request_key(&rejected.action),
+            ));
         }
         // Keep the registry -> notifications and navigation -> registry paths
         // from owning the two stores in opposite orders.

@@ -474,6 +474,10 @@ impl ThreadRegistry {
                     .is_some_and(|snapshot| snapshot.timeline_revision() == revision)
         })
     }
+    pub(crate) fn timeline_store_generation(&self, thread: &str) -> u64 {
+        self.stores.get(thread).map_or(0, |store| store.generation)
+    }
+
     pub(crate) fn timeline_workspace_matches(&self, thread: &str, workspace: &str) -> bool {
         self.stores
             .get(thread)
