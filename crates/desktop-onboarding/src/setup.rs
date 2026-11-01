@@ -2,7 +2,7 @@ use crate::{OnboardingConfig, binding::Binding, buttons::*};
 use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::{
     form::{field, v_form},
-    input::{Input, InputEvent, InputState, OtpEvent, OtpInput, OtpState},
+    input::{Input, InputEvent, InputState, OtpEvent, OtpState},
     separator::Separator,
     *,
 };
@@ -371,12 +371,12 @@ impl Render for GatewaySetupScreenView {
                             .w_full()
                             .min_w_0()
                             .on_key_down(cx.listener(Self::otp_key))
-                            .child(
-                                OtpInput::new(&self.activation)
-                                    .groups(2)
-                                    .with_size(px(32.))
-                                    .disabled(disabled),
-                            ),
+                            .child(render_activation_code(
+                                &self.activation,
+                                disabled,
+                                window,
+                                cx,
+                            )),
                     ),
             );
         }
@@ -476,12 +476,80 @@ impl Render for GatewaySetupScreenView {
                     .child(render_start_status(status)),
             );
         }
-        let _ = window;
-        h_flex()
-            .w_full()
-            .justify_center()
-            .child(div().w(px(300.)).min_w_0().child(form))
+        h_flex().w_full().justify_center().child(
+            div()
+                .w_full()
+                .when(self.dialog_owner.is_none(), |this| this.w(px(300.)))
+                .min_w_0()
+                .child(form),
+        )
     }
+}
+
+fn render_activation_code(
+    activation: &Entity<OtpState>,
+    disabled: bool,
+    window: &Window,
+    cx: &App,
+) -> impl IntoElement {
+    let state = activation.read(cx);
+    let focus = state.focus_handle(cx);
+    let focused = focus.is_focused(window) && !disabled;
+    let characters: Vec<_> = state.value().chars().collect();
+    let cursor_ix = characters.len().min(state.len().saturating_sub(1));
+    let group_len = state.len().div_ceil(2);
+
+    // Base owns editing and focus; flex groups and cells fill the form's width.
+    gpui_kit::base::OtpInput::new(activation)
+        .disabled(disabled)
+        .w_full()
+        .child(h_flex().w_full().gap_5().children((0..2).map(|group_ix| {
+            h_flex().flex_1().min_w_0().gap_1().children(
+                (group_ix * group_len..((group_ix + 1) * group_len).min(state.len())).map(|ix| {
+                    let cell_focused = focused && ix == cursor_ix;
+                    h_flex()
+                        .id(ix)
+                        .flex_1()
+                        .min_w_0()
+                        .h_8()
+                        .justify_center()
+                        .text_base()
+                        .border_1()
+                        .border_color(cx.theme().input)
+                        .rounded(cx.theme().radius)
+                        .bg(cx.theme().input_background())
+                        .text_color(cx.theme().foreground)
+                        .font_semibold()
+                        .when(disabled, |this| {
+                            this.opacity(0.5).text_color(cx.theme().muted_foreground)
+                        })
+                        .when(cell_focused, |this| this.focus_ring_style(window, cx))
+                        .when(!disabled, |this| {
+                            let focus = focus.clone();
+                            this.on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                focus.focus(window, cx);
+                            })
+                        })
+                        .when_some(characters.get(ix), |this, character| {
+                            this.child(character.to_string())
+                        })
+                        .when(
+                            cell_focused
+                                && characters.get(ix).is_none()
+                                && state.cursor_visible(cx),
+                            |this| {
+                                this.child(
+                                    div()
+                                        .h_4()
+                                        .w_0()
+                                        .border_l_3()
+                                        .border_color(cx.theme().caret),
+                                )
+                            },
+                        )
+                }),
+            )
+        })))
 }
 
 fn handle_alphanumeric_otp_key_down(
