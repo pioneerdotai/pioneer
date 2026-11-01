@@ -6761,7 +6761,7 @@ fn request_optional_fixture_tools(request: &ChatRequest, names: &[&str]) -> Opti
         tool_calls: vec![ProviderToolCall {
             id: "fixture_request_optional_tools".into(),
             name: "request_tools".into(),
-            arguments: json!({"domains": domains}).to_string(),
+            arguments: json!({"domains": domains, "reason": "Need optional tools for the fixture scenario."}).to_string(),
         }],
         termination: pioneer_provider::ProviderTermination::ToolCalls,
         ..text_response("")
@@ -40363,7 +40363,7 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         vec![ProviderToolCall {
             id: "request_task_domain".to_owned(),
             name: "request_tools".to_owned(),
-            arguments: json!({"domains": ["task"]}).to_string(),
+            arguments: json!({"domains": ["task"], "reason": "Need task tools to verify Agent mode discovery."}).to_string(),
         }],
         "done",
     ));
@@ -62331,9 +62331,19 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 )
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            if tokio::time::timeout(Duration::from_secs(5), entered.notified())
                 .await
-                .unwrap();
+                .is_err()
+            {
+                let observation = processor
+                    .agent_manager
+                    .observe_turn(thread_id, turn_id)
+                    .await;
+                let stored = crud_store_for_assert.get_turn(thread_id, turn_id).await;
+                panic!(
+                    "provider barrier was not reached in cycle {cycle}: actor={observation:?}, stored={stored:?}"
+                );
+            }
             // The provider cannot finish until release; it stays unreleased throughout cancellation.
             assert!(
                 crud_store_for_assert
