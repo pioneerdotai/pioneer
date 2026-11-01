@@ -138,6 +138,8 @@ struct OllamaChatResponse {
     #[serde(default)]
     prompt_eval_count: Option<u64>,
     #[serde(default)]
+    prompt_eval_cached_count: Option<u64>,
+    #[serde(default)]
     eval_count: Option<u64>,
 }
 
@@ -276,6 +278,8 @@ struct OllamaStreamChunk {
     done_reason: Option<String>,
     #[serde(default)]
     prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    prompt_eval_cached_count: Option<u64>,
     #[serde(default)]
     eval_count: Option<u64>,
 }
@@ -622,20 +626,38 @@ fn normalize_base_url(mut url: String) -> String {
 
 // The same decoder is used by HTTP transport and in-memory regression fixtures.
 impl OllamaProvider {
+    // Ollama /api/chat documents prompt_eval_count as the whole prompt and
+    // prompt_eval_cached_count as its cached subset. Older servers omit the
+    // latter: absence remains unknown, never an assumed cache miss.
+    fn token_usage(
+        input: Option<u64>,
+        read: Option<u64>,
+        output: Option<u64>,
+    ) -> Option<TokenUsage> {
+        if input.is_none() && read.is_none() && output.is_none() {
+            return None;
+        }
+        Some(TokenUsage {
+            input_tokens: input,
+            cache_read_input_tokens: read,
+            uncached_input_tokens: input.and_then(|total| total.checked_sub(read?)),
+            output_tokens: output,
+            raw_usage: Some(
+                serde_json::json!({"prompt_eval_count":input,"prompt_eval_cached_count":read,"eval_count":output}),
+            ),
+            semantics: Some("native_eval_counts".into()),
+            ..Default::default()
+        })
+    }
     fn normalize_chat_response(api_response: OllamaChatResponse) -> Result<ChatResponse> {
         if !api_response.done {
             return Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into());
         }
-        let usage = match (api_response.prompt_eval_count, api_response.eval_count) {
-            (None, None) => None,
-            (input, output) => Some(TokenUsage {
-                input_tokens: input,
-                output_tokens: output,
-                raw_usage: Some(serde_json::json!({"prompt_eval_count":input,"eval_count":output})),
-                semantics: Some("native_eval_counts".into()),
-                ..Default::default()
-            }),
-        };
+        let usage = Self::token_usage(
+            api_response.prompt_eval_count,
+            api_response.prompt_eval_cached_count,
+            api_response.eval_count,
+        );
 
         let reasoning_content = api_response.message.thinking.filter(|t| !t.is_empty());
         let tool_calls =
@@ -801,13 +823,11 @@ impl OllamaProvider {
                                 }
                                 if tx
                                     .send(Ok(StreamChunk::final_chunk_with(termination)
-                                        .with_usage(Some(TokenUsage {
-                                            input_tokens: chunk.prompt_eval_count,
-                                            output_tokens: chunk.eval_count,
-                                            raw_usage: Some(serde_json::json!({"prompt_eval_count":chunk.prompt_eval_count,"eval_count":chunk.eval_count})),
-                                            semantics: Some("native_eval_counts".into()),
-                    ..Default::default()
-                                        }))))
+                                        .with_usage(Self::token_usage(
+                                            chunk.prompt_eval_count,
+                                            chunk.prompt_eval_cached_count,
+                                            chunk.eval_count,
+                                        ))))
                                     .await
                                     .is_err()
                                 {
@@ -1724,5 +1744,36 @@ mod html_preview_contract_tests {
                 .await
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_usage_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn native_cached_prompt_subset_survives_json_and_stream_without_inventing_old_server_counts()
+     {
+        for cached in [None, Some(0_u64), Some(80)] {
+            let mut body = json!({"message":{"role":"assistant","content":"done"},"done":true,"done_reason":"stop","prompt_eval_count":100,"eval_count":5});
+            if let Some(cached) = cached {
+                body["prompt_eval_cached_count"] = json!(cached);
+            }
+            let response = OllamaProvider::decode_chat_fixture(body.clone()).unwrap();
+            let usage = response.usage.unwrap();
+            assert_eq!(usage.input_tokens, Some(100));
+            assert_eq!(usage.cache_read_input_tokens, cached);
+            assert_eq!(usage.uncached_input_tokens, cached.map(|read| 100 - read));
+            let bytes = bytes::Bytes::from(format!("{body}\n"));
+            let stream = futures_util::stream::iter(vec![Ok(bytes)]).boxed();
+            let chunks = OllamaProvider::decode_stream(stream)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(chunks.last().unwrap().usage, Some(usage));
+        }
     }
 }

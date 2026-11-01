@@ -6290,6 +6290,7 @@ impl MessageProcessor {
                     "runtime:provider_failure".to_owned(),
                     pioneer_protocol::TurnItemType::SystemEvent,
                     pioneer_protocol::ProviderFailureDetails {
+                        raw_response: None,
                         error_reason: None,
                         request_id: None,
                         provider: turn_binding.runtime_kind.clone(),

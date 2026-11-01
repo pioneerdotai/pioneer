@@ -564,6 +564,12 @@ fn responses_fields_from_catalog(
     provider: &str,
     request: &ChatRequest,
 ) -> Result<Fields> {
+    ensure!(
+        request
+            .temperature
+            .is_none_or(|value| value.is_finite() && (0.0..=2.0).contains(&value)),
+        "Responses temperature must be finite and within 0..=2"
+    );
     validate_cap_with_catalog(catalog, provider, request)?;
     let model = resolved_reasoning_model(catalog, provider, &request.model);
     let native = native_reasoning(provider, &request.model);
@@ -592,12 +598,13 @@ fn responses_fields_with_model(
     }
     validate_temperature(model, request)?;
     let mut fields = Fields::new();
-    if request.max_tokens.is_none() && request.reasoning.is_none() && request.temperature.is_none()
-    {
-        return Ok(fields); // Omission leaves the compatible service's defaults.
-    }
+    // This is a Responses protocol field, independent of model-specific
+    // sampling/reasoning support. Known output ceilings were checked above.
     if let Some(cap) = request.max_tokens {
         fields.insert("max_output_tokens".into(), json!(cap));
+    }
+    if request.reasoning.is_none() && request.temperature.is_none() {
+        return Ok(fields); // Omitted sampling/reasoning use the service defaults.
     }
     if let Some(reasoning) = request.reasoning {
         let model = model.ok_or_else(|| anyhow::anyhow!("unverified Responses effort contract"))?;

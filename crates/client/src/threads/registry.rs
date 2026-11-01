@@ -2773,6 +2773,7 @@ mod tests {
     use std::time::{Duration, Instant};
     fn composer_admission() -> Turn {
         let mut turn = running_turn("admission");
+        turn.work_owner = TurnWorkOwner::DetachedTask;
         turn.author = Some(TurnAuthorSnapshot {
             cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(PrincipalId::new("P".repeat(21)).unwrap()),
@@ -3399,6 +3400,7 @@ mod tests {
                 } else {
                     composer_admission()
                 };
+                turn.work_owner = TurnWorkOwner::Turn;
                 turn.turn_kind = TurnKind::Conversation;
                 turn.origin = TurnOrigin::User;
                 turn.mode = mode;
@@ -9015,6 +9017,7 @@ mod tests {
 
     fn running_turn(turn_id: &str) -> Turn {
         Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,

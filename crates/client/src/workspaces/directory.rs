@@ -1177,6 +1177,7 @@ mod tests {
         thread.reasoning_effort = effort.map(str::to_owned);
         thread.turns = ["older", "latest"]
             .map(|suffix| pioneer_protocol::Turn {
+                work_owner: Default::default(),
                 id: format!("{id}-{suffix}"),
                 status: pioneer_protocol::TurnStatus::Completed,
                 turn_kind: Default::default(),

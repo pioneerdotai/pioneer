@@ -982,6 +982,7 @@ mod tests {
 
     fn turn(id: &str, status: TurnStatus) -> pioneer_protocol::Turn {
         pioneer_protocol::Turn {
+            work_owner: Default::default(),
             id: id.to_owned(),
             status,
             turn_kind: Default::default(),

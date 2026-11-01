@@ -325,8 +325,8 @@ fn completion(value: &Value, model: &str) -> Result<ClaudeServiceCompletion> {
     let usage = &value["usage"];
     let input_tokens = usage["input_tokens"].as_u64().and_then(|input| {
         input
-            .checked_add(usage["cache_read_input_tokens"].as_u64().unwrap_or(0))?
-            .checked_add(usage["cache_creation_input_tokens"].as_u64().unwrap_or(0))
+            .checked_add(usage["cache_read_input_tokens"].as_u64()?)?
+            .checked_add(usage["cache_creation_input_tokens"].as_u64()?)
     });
     Ok(ClaudeServiceCompletion {
         observed_usage: crate::service::bounded_usage(value),
@@ -462,14 +462,7 @@ mod tests {
             let mut partial = value.clone();
             partial["usage"].as_object_mut().unwrap().remove(missing);
             let observed = completion(&partial, "claude-sonnet-4-6").unwrap();
-            assert_eq!(
-                observed.input_tokens,
-                match missing {
-                    "input_tokens" => None,
-                    "cache_read_input_tokens" => Some(4),
-                    _ => Some(3),
-                }
-            );
+            assert_eq!(observed.input_tokens, None);
             assert_eq!(observed.output_tokens, Some(4));
         }
         let mut overflow = value.clone();

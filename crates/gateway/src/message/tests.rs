@@ -50,6 +50,9 @@ mod agent_action_outbox;
 #[path = "tests/history_continuation.rs"]
 mod history_continuation;
 
+#[path = "tests/prompt_cache_sent_prefix.rs"]
+mod prompt_cache_sent_prefix;
+
 #[path = "tests/compaction_lifecycle_poll.rs"]
 mod compaction_lifecycle_poll;
 
@@ -471,6 +474,7 @@ async fn ensure_test_superuser_execution_turn(
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -3680,6 +3684,7 @@ async fn materialize_thread_episodic_ingest_turn(
             },
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::Completed,
                 turn_kind: TurnKind::Conversation,
@@ -9101,6 +9106,7 @@ async fn ensure_task_create_parent_turn_for_test(
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: parent_turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -9248,6 +9254,7 @@ async fn seed_completed_task_parent_with_inputs_at(
             },
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: parent_turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,
@@ -9277,6 +9284,7 @@ async fn seed_completed_task_parent_with_inputs_at(
                 workspace_id: workspace_id.to_owned(),
                 thread_id: parent_thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: parent_turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
@@ -10007,6 +10015,7 @@ async fn setup_progress_delta_harness(
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.clone(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12018,6 +12027,7 @@ async fn long_russian_first_message_generates_parent_title_successfully() {
         turns: Vec::new(),
     };
     let seed_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_seed_russian_0000001".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12109,6 +12119,7 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
         turns: Vec::new(),
     };
     let seed_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_seed_singleflight_01".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12380,6 +12391,7 @@ async fn title_generation_retries_after_transient_failure() {
         turns: Vec::new(),
     };
     let seed_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_seed_retry_000000001".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12472,6 +12484,7 @@ async fn child_thread_scope_skips_auto_title_generation() {
         turns: Vec::new(),
     };
     let seed_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_seed_child_scope_00001".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12570,6 +12583,7 @@ async fn materialize_loaded_test_thread_for_durable_operation(
         .await
         .expect("test thread should be loaded before materialization");
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12797,6 +12811,14 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
     let started: pioneer_protocol::TurnStartResponse =
         serde_json::from_value(response.result).expect("turn/start response should decode");
     assert_eq!(started.turn.id, turn_id);
+    assert_eq!(
+        started.turn.work_owner,
+        pioneer_protocol::TurnWorkOwner::DetachedTask
+    );
+    assert!(matches!(
+        started.turn.author.as_ref().unwrap().actor,
+        pioneer_protocol::PersistedActorRef::Principal(_)
+    ));
 
     let persisted_parent = turn::Entity::find_by_id(turn_id)
         .one(&processor.crud_store.database_connection())
@@ -14862,6 +14884,7 @@ async fn materialize_artifact_api_thread(
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -24958,6 +24981,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         turns: Vec::new(),
     };
     let parent_turn = Turn {
+        work_owner: Default::default(),
         id: parent_turn_id.to_owned(),
         status: TurnStatus::Completed,
         turn_kind: Default::default(),
@@ -26678,6 +26702,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         turns: Vec::new(),
     };
     let parent_turn = Turn {
+        work_owner: Default::default(),
         id: parent_history_turn_id.to_owned(),
         status: TurnStatus::Completed,
         turn_kind: TurnKind::Conversation,
@@ -26749,6 +26774,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         }))
         .unwrap();
         let source_turn = Turn {
+            work_owner: pioneer_protocol::TurnWorkOwner::DetachedTask,
             id: source_turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
@@ -26902,6 +26928,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     );
 
     let late_parent_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_parent_recovered_after_start".to_owned(),
         status: TurnStatus::Completed,
         turn_kind: TurnKind::Conversation,
@@ -28172,6 +28199,7 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
         turns: Vec::new(),
     };
     let creation_turn = Turn {
+        work_owner: Default::default(),
         id: creation_turn_id.to_owned(),
         status: TurnStatus::Completed,
         turn_kind: Default::default(),
@@ -28591,6 +28619,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
                 workspace_id: workspace_id.clone(),
                 thread_id: parent_thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: creation_turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
@@ -29254,6 +29283,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         turns: Vec::new(),
     };
     let parent_turn = Turn {
+        work_owner: Default::default(),
         id: parent_turn_id.to_owned(),
         status: TurnStatus::Completed,
         turn_kind: TurnKind::Conversation,
@@ -29317,6 +29347,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
             &parent_thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: planned_turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,
@@ -29342,6 +29373,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
                 workspace_id: workspace_id.clone(),
                 thread_id: parent_thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: planned_turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
@@ -36181,6 +36213,38 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
     )
     .await;
 
+    // These remain durable journal facts but must not be imported into the
+    // model-facing CLI bootstrap through a frozen Task basis.
+    crud_store
+        .materialize_item_tool_retry_resolved(
+            pioneer_protocol::ItemToolRetryResolvedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: root_thread_id.into(),
+                turn_id: root_turn_id.into(),
+                item_id: "historical-retry-item".into(),
+                item_type: pioneer_protocol::TurnItemType::DynamicToolCall,
+                tool_retry_episode_id: "historical-retry-episode".into(),
+                tool_name: "apply_patch".into(),
+                attempt_number: 2,
+                resolution: pioneer_protocol::ToolRetryResolution::Succeeded,
+                budgets: vec![],
+                reason: "CACHE_RETRY_TELEMETRY".into(),
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
+    crud_store.materialize_item_completed(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id:workspace_id.clone(), thread_id:root_thread_id.into(), turn_id:root_turn_id.into(),
+            item:pioneer_protocol::TurnItem::SystemEvent {
+                id:"historical-usage".into(), level:pioneer_protocol::SystemEventLevel::Info,
+                message:"CACHE_USAGE_TELEMETRY".into(), code:Some("agent_runtime_item".into()),
+                details:Some(json!({"nativeItemKind":"tokenUsage","input_tokens":100,"cache_read_input_tokens":80})),
+            },
+        }, phase_13_now_secs(),
+    ).await.unwrap();
+
     let mut parent_thread_id = root_thread_id.to_owned();
     let mut parent_turn_id = root_turn_id.to_owned();
     let mut lineages = Vec::new();
@@ -36224,6 +36288,8 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
         let start = &starts[level - 1];
         let input = start.input.to_string();
         assert!(input.contains(root_marker));
+        assert!(!input.contains("CACHE_RETRY_TELEMETRY"));
+        assert!(!input.contains("CACHE_USAGE_TELEMETRY"));
         for earlier in &output_markers {
             assert!(
                 input.contains(earlier),
@@ -41173,6 +41239,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread_impl() 
         .await
         .expect("owner thread should be loaded");
     let occurrence_turn = Turn {
+        work_owner: Default::default(),
         id: run.id.clone(),
         status: TurnStatus::Completed,
         turn_kind: TurnKind::TaskRun,
@@ -41680,6 +41747,7 @@ async fn task_delivery_reuses_pre_child_occurrence_without_lineage() {
             &thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: run_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::TaskRun,
@@ -43636,6 +43704,7 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -43774,6 +43843,7 @@ async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
             &thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -43949,6 +44019,7 @@ async fn user_message_lifecycle_survives_permission_profile_audit_event() {
             &thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -44080,6 +44151,7 @@ async fn direct_durable_item_completed_ingestion_failure_does_not_block_commit()
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -45402,6 +45474,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -46301,6 +46374,7 @@ async fn invalid_request_provider_failure_is_terminal_without_retry() {
             item_id.to_owned(),
             TurnItemType::Reasoning,
             ProviderFailureDetails {
+                raw_response: None,
                 error_reason: None,
                 request_id: None,
                 provider: "test-provider".to_owned(),
@@ -46542,6 +46616,7 @@ async fn durable_recovery_events_reject_ack_without_canonical_persistence() {
             item_id: "item_missing_provider_failure".to_owned(),
             item_type: TurnItemType::AgentMessage,
             failure: ProviderFailureDetails {
+                raw_response: None,
                 error_reason: None,
                 request_id: None,
                 provider: "openai".to_owned(),
@@ -51480,6 +51555,7 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
     let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
 
     let turn = Turn {
+        work_owner: Default::default(),
         id: "turn_codex_ops_rename_seed".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -52355,6 +52431,7 @@ async fn cli_runtime_turn_start_blocker_reconciles_db_only_terminal_binding() {
                 workspace_id: workspace_id.clone(),
                 thread_id: thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::default(),
@@ -53024,6 +53101,7 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -55532,6 +55610,7 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: "turn_cli_stale_db_only".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -55744,6 +55823,7 @@ async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
                 workspace_id: workspace_id.clone(),
                 thread_id: thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::default(),
@@ -59240,6 +59320,7 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: "turn_non_cli_timeout".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -60378,6 +60459,7 @@ async fn materialize_cli_runtime_turn_with_execution(
         turns: Vec::new(),
     };
     let mut turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -66762,6 +66844,7 @@ async fn historical_task_snapshot_does_not_refresh_terminal_work_summary() {
                 workspace_id: harness.workspace_id.clone(),
                 thread_id: harness.thread_id.clone(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: harness.turn_id.clone(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::default(),
@@ -66890,6 +66973,7 @@ async fn detached_task_wrapper_diagnostics_do_not_persist_parent_work_group() {
         base,
     );
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::TaskRun,
@@ -67627,6 +67711,7 @@ async fn setup_live_semantic_timeline_harness_on_store(
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.clone(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -68669,6 +68754,7 @@ fn semantic_fixture_thread(
 
 fn semantic_fixture_turn(turn_id: &str, status: TurnStatus) -> Turn {
     Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status,
         turn_kind: Default::default(),
@@ -68742,6 +68828,7 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
         serde_json::from_value(response.result).expect("thread/start result should decode");
 
     let turn = Turn {
+        work_owner: Default::default(),
         id: "turn_000000000000000099".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -77350,6 +77437,7 @@ fn phase_13_test_thread(
 
 fn phase_13_turn(turn_id: &str, status: TurnStatus) -> Turn {
     Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status,
         turn_kind: Default::default(),
@@ -77856,6 +77944,7 @@ async fn check_detached_composer_history_order(legacy: bool) {
             phase_13_test_thread(harness.workspace_id.as_str(), thread_id.as_str(), timestamp);
         let user_turn_id = format!("{thread_id}_user_{index}");
         let user_turn = Turn {
+            work_owner: Default::default(),
             id: user_turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
@@ -77904,6 +77993,7 @@ async fn check_detached_composer_history_order(legacy: bool) {
         // Its delivered AgentMessage is created later and must define the assistant history slot.
         let task_turn_id = format!("{thread_id}_task_{index}");
         let task_turn = Turn {
+            work_owner: Default::default(),
             id: task_turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,
@@ -78577,6 +78667,7 @@ async fn materialize_memory_tools_for_context(
                 &thread,
                 SandboxMode::FullAccess,
                 &Turn {
+                    work_owner: Default::default(),
                     id: context.turn_id.clone(),
                     status: TurnStatus::InProgress,
                     turn_kind: Default::default(),
@@ -79491,6 +79582,7 @@ async fn memory_provider_recall_calls_memory_service() {
             &thread_payload.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: recall_context.turn_id.clone(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -86488,6 +86580,7 @@ async fn blocked_provider_task_consumers_impl(scenario: &str, path: &str) {
         http_status: Some(502),
         provider_code: None,
         retry_after_ms: Some(2000),
+        raw_response: None,
         error_reason: Some(pioneer_protocol::ProviderErrorReason::ProviderUnavailable),
         request_id: Some(
             pioneer_protocol::ProviderRequestId::try_from("gen-task_fixture".to_owned()).unwrap(),
@@ -86873,6 +86966,7 @@ async fn recovery_failure_task_consumers_impl(
     let now = super::now_timestamp_secs();
     let private = "private-response-body https://secret.example?token=credential /private/provider-key HTTP 401";
     let mut initial = ProviderFailureDetails {
+        raw_response: None,
         error_reason: None,
         request_id: None,
         provider: "test-provider".to_owned(),
@@ -86913,6 +87007,7 @@ async fn recovery_failure_task_consumers_impl(
         );
     }
     let last = ProviderFailureDetails {
+        raw_response: None,
         error_reason: None,
         request_id: None,
         class: ProviderFailureClass::AuthOrPermission,
@@ -86920,6 +87015,7 @@ async fn recovery_failure_task_consumers_impl(
         http_status: Some(403),
         provider_code: Some(private.to_owned()),
         ..ProviderFailureDetails {
+            raw_response: None,
             error_reason: None,
             request_id: None,
             provider: private.to_owned(),
@@ -87248,6 +87344,7 @@ fn provider_replay_is_fenced_after_retryable_recovery_start_error() {
         let (processor, store, _) = setup_execution_window_terminal_turn(thread, turn).await;
         let now = super::now_timestamp_secs();
         let failure = ProviderFailureDetails {
+            raw_response: None,
             error_reason: None,
             request_id: None,
             provider: "test-provider".to_owned(),
@@ -87647,11 +87744,15 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     use futures_util::StreamExt;
     struct LateUsage {
         fail_after_usage: bool,
+        authority: Option<&'static str>,
     }
     #[async_trait::async_trait]
     impl pioneer_provider::Provider for LateUsage {
         fn name(&self) -> &str {
             "fixture"
+        }
+        fn authority_fingerprint(&self) -> Option<&str> {
+            self.authority
         }
         async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
             anyhow::bail!("unexpected non-stream fixture")
@@ -87668,6 +87769,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
                 Ok(StreamChunk::usage(pioneer_provider::TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(2),
+                    prompt_cache_diagnostics: Some(json!({"reason":"fixture"})),
                     ..Default::default()
                 })),
             ];
@@ -87683,6 +87785,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     let provider = crate::usage_journal::observe(
         Arc::new(LateUsage {
             fail_after_usage: false,
+            authority: Some("authority-a"),
         }),
         &background,
         &workspace,
@@ -87703,6 +87806,13 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
         })
         .await
         .unwrap();
+    let started = background
+        .provider_usage_page(&workspace, "late-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(started[0].status, "started");
+    let metadata: serde_json::Value = serde_json::from_str(&started[0].usage_json).unwrap();
+    assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-a");
     assert!(stream.next().await.unwrap().unwrap().is_final);
     assert_eq!(
         stream
@@ -87725,14 +87835,21 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
     assert_eq!(retained.input_tokens, Some(10));
     assert_eq!(retained.output_tokens, Some(2));
+    assert_eq!(
+        retained.prompt_cache_diagnostics,
+        Some(json!({"reason":"fixture"}))
+    );
+    let metadata: serde_json::Value = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-a");
     let failed = crate::usage_journal::observe(
         Arc::new(LateUsage {
             fail_after_usage: true,
+            authority: Some("authority-b"),
         }),
         &background,
         &workspace,
         "memory_extraction",
-        "late-failed-owner",
+        "late-owner",
     );
     let mut stream = failed
         .stream_chat(ChatRequest {
@@ -87753,14 +87870,63 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     assert!(stream.next().await.unwrap().is_err());
     assert!(stream.next().await.is_none());
     let rows = background
-        .provider_usage_page(&workspace, "late-failed-owner", "", 100)
+        .provider_usage_page(&workspace, "late-owner", "", 100)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].status, "failed");
-    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(rows.len(), 2);
+    let failed_row = rows.iter().find(|row| row.status == "failed").unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&failed_row.usage_json).unwrap();
+    assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-b");
+    let retained: pioneer_provider::TokenUsage =
+        serde_json::from_str(&failed_row.usage_json).unwrap();
     assert_eq!(retained.input_tokens, Some(10));
     assert_eq!(retained.output_tokens, Some(2));
+    assert_eq!(
+        retained.prompt_cache_diagnostics,
+        Some(json!({"reason":"fixture"}))
+    );
+    // An otherwise identical unlabelled call remains unknown, including after enrichment.
+    let legacy = crate::usage_journal::observe(
+        Arc::new(LateUsage {
+            fail_after_usage: false,
+            authority: None,
+        }),
+        &background,
+        &workspace,
+        "memory_extraction",
+        "late-owner",
+    );
+    let mut stream = legacy
+        .stream_chat(ChatRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        })
+        .await
+        .unwrap();
+    while let Some(chunk) = stream.next().await {
+        chunk.unwrap();
+    }
+    let rows = background
+        .provider_usage_page(&workspace, "late-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let unlabelled = rows
+        .iter()
+        .filter(|row| {
+            let value: serde_json::Value = serde_json::from_str(&row.usage_json).unwrap();
+            value.get("_pioneer_journal").is_none()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(unlabelled.len(), 1);
+    assert_eq!(unlabelled[0].status, "completed");
 }
 
 #[tokio::test]
