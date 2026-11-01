@@ -637,6 +637,10 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("agent_tool_result_status.json", AgentToolResultStatus),
         schema_doc!("agent_public_outcome.json", AgentPublicOutcome),
         schema_doc!("agent_tool_safe_result.json", AgentToolSafeResult),
+        schema_doc!(
+            "agent_thread_action_result.json",
+            crate::AgentThreadActionResult
+        ),
         schema_doc!("normalized_agent_action.json", NormalizedAgentAction),
         schema_doc!("administrative_actor_ref.json", AdministrativeActorRef),
         schema_doc!("authorization_subject_ref.json", AuthorizationSubjectRef),

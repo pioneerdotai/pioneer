@@ -4934,7 +4934,7 @@ where
                 let compacted = agent_action_compaction_marker(
                     AGENT_ACTION_COMPACTION_FORMAT,
                     original,
-                    serde_json::Map::new(),
+                    retained_thread_action_result(original),
                 );
                 released = released.saturating_add(compacted_bytes(original, &compacted));
                 (original.to_owned(), compacted)
@@ -4949,7 +4949,7 @@ where
                 let compacted = agent_action_compaction_marker(
                     AGENT_ACTION_RECEIPT_COMPACTION_FORMAT,
                     original,
-                    serde_json::Map::new(),
+                    retained_thread_action_result(original),
                 );
                 released = released.saturating_add(compacted_bytes(original, &compacted));
                 (original.to_owned(), compacted)
@@ -5101,6 +5101,19 @@ fn compacted_agent_action_outbox_payload(
         outbox.payload_json.as_str(),
         retained,
     ))
+}
+
+fn retained_thread_action_result(original: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut retained = serde_json::Map::new();
+    if let Some(result) = serde_json::from_str::<serde_json::Value>(original)
+        .ok()
+        .and_then(|response| response.get("threadResult").cloned())
+    {
+        // Small immutable navigation references must outlive bulky response
+        // material. Keep the exact issued value, without later enrichment.
+        retained.insert("threadResult".to_owned(), result);
+    }
+    retained
 }
 
 fn agent_action_compaction_marker(
@@ -8490,7 +8503,13 @@ mod tests {
         let now = utc_now();
         let old = now.clone() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS + 1);
         let recent = now.clone() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS - 1);
-        let old_response = serde_json::json!({"result": "x".repeat(4096)}).to_string();
+        let issued_result = serde_json::json!({
+            "workspaceId":"workspace-old", "threadId":"thread-old",
+            "turnId":"turn-old", "executionId":"spawned-old",
+        });
+        let old_response =
+            serde_json::json!({"result": "x".repeat(4096), "threadResult":issued_result})
+                .to_string();
         let old_payload = serde_json::json!({
             "action_id": "action-old",
             "execution_id": "execution-old",
@@ -8602,6 +8621,14 @@ mod tests {
             Some(old_response.as_str()),
             AGENT_ACTION_RECEIPT_COMPACTION_FORMAT,
         ));
+        for response in [
+            action.response_json.as_deref(),
+            receipt.response_json.as_deref(),
+        ] {
+            let response: serde_json::Value = serde_json::from_str(response.unwrap()).unwrap();
+            assert_eq!(response["threadResult"], issued_result);
+            assert!(response.get("result").is_none());
+        }
         assert!(compacted_agent_action_value_matches(
             Some(outbox.payload_json.as_str()),
             Some(old_payload.as_str()),
@@ -8648,6 +8675,10 @@ mod tests {
             "execution_mode":"detached_task", "task_id":"task-detached", "thread_id":"thread-detached", "turn_id":"turn-detached",
             "launch_request_fingerprint":"b".repeat(64), "normalized":{"input":"z".repeat(4096)},
         }).to_string();
+        let detached_result = serde_json::json!({
+            "workspaceId":"workspace-detached", "threadId":"thread-detached",
+            "turnId":"turn-detached", "taskId":"task-detached",
+        });
         insert_compaction_test_tuple(
             &db,
             "detached",
@@ -8655,7 +8686,7 @@ mod tests {
             1,
             utc_now() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS + 1),
             Some(utc_now() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS + 1)),
-            serde_json::json!({"taskCreation":{"taskId":"task-detached"}}).to_string(),
+            serde_json::json!({"taskCreation":{"taskId":"task-detached"},"threadResult":detached_result}).to_string(),
             detached_payload.clone(),
         )
         .await;
@@ -8680,6 +8711,13 @@ mod tests {
         assert_eq!(retained["task_id"], "task-detached");
         assert_eq!(retained["turn_id"], "turn-detached");
         assert!(retained.get("dispatch").is_none());
+        let receipt = load_agent_action_receipt(&db, "action-detached")
+            .await
+            .unwrap()
+            .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(receipt.response_json.as_deref().unwrap()).unwrap();
+        assert_eq!(response["threadResult"], detached_result);
     }
 
     async fn insert_compaction_test_tuple(

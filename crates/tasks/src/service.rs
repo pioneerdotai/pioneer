@@ -2343,6 +2343,9 @@ impl TaskService {
                 response["taskCreation"] = serde_json::json!({
                     "taskId": task_id, "triggerId": trigger_id, "runId": immediate_run.as_ref().map(|run| &run.id),
                 });
+                if detached_start && response.get("threadResult").is_some() {
+                    response["threadResult"]["taskId"] = serde_json::json!(task_id);
+                }
                 let response = serde_json::to_string(&response)?;
                 action.action_response_json = Some(response.clone());
                 action.receipt_response_json = Some(response);

@@ -4727,12 +4727,14 @@ impl ToolHandler for AgentActionToolHandler {
                 } else {
                     AgentToolResultStatus::Accepted
                 };
+                let thread_result = saved_thread_action_result(receipt.response_json.as_deref())?;
                 let safe = AgentToolSafeResult {
                     status,
                     outcome: Some(AgentPublicOutcome::AgentActionAlreadyCommitted),
                     receipt_id: Some(receipt.id),
                     outbox_id: Some(outbox.id),
                     public_message: None,
+                    thread_result,
                     target_options: if replay_kind
                         == pioneer_protocol::AgentActionKind::CreateThread
                     {
@@ -4977,7 +4979,8 @@ impl AgentActionToolHandler {
                     "agent action replay differs from its input",
                 ));
             }
-            let safe = BoundAgentActionAdapter::safe_result(&plan.projection);
+            let mut safe = BoundAgentActionAdapter::safe_result(&plan.projection);
+            safe.thread_result = saved_thread_action_result(receipt.response_json.as_deref())?;
             return Ok(Box::new(FunctionToolOutput::with_payload(
                 "thread work already committed",
                 true,
@@ -5329,7 +5332,15 @@ impl AgentActionToolHandler {
                 }
             };
             if detached_committed {
-                let safe = BoundAgentActionAdapter::safe_result(&plan.projection);
+                let receipt = pioneer_crud::load_agent_action_receipt(
+                    &processor.crud_store.database_connection(),
+                    plan.projection.action_id.as_str(),
+                )
+                .await
+                .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?
+                .ok_or_else(|| ToolError::execution_failed("committed action has no receipt"))?;
+                let mut safe = BoundAgentActionAdapter::safe_result(&plan.projection);
+                safe.thread_result = saved_thread_action_result(receipt.response_json.as_deref())?;
                 return Ok(Box::new(FunctionToolOutput::with_payload(
                     "thread work committed",
                     true,
@@ -5638,6 +5649,15 @@ impl AgentActionToolHandler {
         // coordinator is only an early backpressure hint and must not write a
         // competing permit/queue transition.
         plan.input.resource = None;
+        let thread_result = pioneer_protocol::AgentThreadActionResult {
+            workspace_id: self.context.workspace_id.clone(),
+            thread_id: thread_id.clone(),
+            turn_id: Some(turn_id.clone()),
+            task_id: None,
+            execution_id: Some(execution_id.as_str().to_owned()),
+        };
+        record_thread_action_result(&mut plan.input, &thread_result)
+            .map_err(|_| ToolError::internal("failed to encode thread result"))?;
         // Keep the in-memory Turn admission immediately adjacent to its
         // durable commit. Every fallible identity, authority, presentation,
         // graph and outbox preparation step above therefore leaves no phantom
@@ -5773,7 +5793,8 @@ impl AgentActionToolHandler {
                 )
                 .await;
         }
-        let safe = BoundAgentActionAdapter::safe_result(&plan.projection);
+        let mut safe = BoundAgentActionAdapter::safe_result(&plan.projection);
+        safe.thread_result = Some(thread_result);
         let payload = serde_json::to_value(&safe).map_err(|error| {
             ToolError::internal(format!("failed to encode agent result: {error}"))
         })?;
@@ -6044,7 +6065,17 @@ impl AgentActionToolHandler {
             );
         }
         plan.input.outbox_payload_json = outbox_payload.to_string();
+        let thread_result = pioneer_protocol::AgentThreadActionResult {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: None,
+            task_id: None,
+            execution_id: None,
+        };
+        record_thread_action_result(&mut plan.input, &thread_result)
+            .map_err(|_| ToolError::internal("failed to encode thread result"))?;
         let mut safe = BoundAgentActionAdapter::safe_result(&plan.projection);
+        safe.thread_result = Some(thread_result);
         processor
             .crud_store
             .commit_agent_thread_creation_with_action(
@@ -6119,7 +6150,7 @@ impl AgentActionToolHandler {
         input: pioneer_protocol::AgentAuthoredInput,
         execution_id: AgentExecutionId,
         author: pioneer_protocol::TurnAuthorSnapshot,
-        plan: crate::authorization::AgentActionCommitPlan,
+        mut plan: crate::authorization::AgentActionCommitPlan,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let processor = self.processor.upgrade().ok_or_else(|| {
             ToolError::execution_failed("message processor is no longer available")
@@ -6183,7 +6214,17 @@ impl AgentActionToolHandler {
             outcome.started_notification.turn.id.as_str(),
             outcome.materialization.turn.permission_profile.clone(),
         );
-        let safe = BoundAgentActionAdapter::safe_result(&plan.projection);
+        let thread_result = pioneer_protocol::AgentThreadActionResult {
+            workspace_id: outcome.materialization.thread.workspace_id.clone(),
+            thread_id: outcome.materialization.thread.id.clone(),
+            turn_id: Some(outcome.materialization.turn.id.clone()),
+            task_id: None,
+            execution_id: None,
+        };
+        record_thread_action_result(&mut plan.input, &thread_result)
+            .map_err(|_| ToolError::internal("failed to encode thread result"))?;
+        let mut safe = BoundAgentActionAdapter::safe_result(&plan.projection);
+        safe.thread_result = Some(thread_result);
         processor
             .crud_store
             .materialize_completed_agent_message_turn_with_action(
@@ -6451,6 +6492,42 @@ pub(crate) fn sanitize_agent_tool_error(error: ToolError) -> ToolError {
     }
 }
 
+/// The operation's existing action/receipt transaction owns these references.
+/// Preserve other receipt metadata (including CLI call bindings).
+pub(super) fn record_thread_action_result(
+    action: &mut pioneer_crud::AgentCommitInput,
+    result: &pioneer_protocol::AgentThreadActionResult,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let mut response: serde_json::Value =
+        serde_json::from_str(action.receipt_response_json.as_deref().unwrap_or("{}"))?;
+    response
+        .as_object_mut()
+        .context("thread action response is not an object")?
+        .insert("threadResult".to_owned(), serde_json::to_value(result)?);
+    let response = serde_json::to_string(&response)?;
+    action.action_response_json = Some(response.clone());
+    action.receipt_response_json = Some(response);
+    Ok(())
+}
+
+fn saved_thread_action_result(
+    response: Option<&str>,
+) -> Result<Option<pioneer_protocol::AgentThreadActionResult>, ToolError> {
+    let Some(response) = response else {
+        return Ok(None);
+    };
+    let response: serde_json::Value = serde_json::from_str(response)
+        .map_err(|_| ToolError::execution_failed("committed action has an invalid response"))?;
+    response
+        .get("threadResult")
+        .map(|result| {
+            serde_json::from_value(result.clone())
+                .map_err(|_| ToolError::execution_failed("committed action has invalid references"))
+        })
+        .transpose()
+}
+
 fn denied_output(outcome: AgentPublicOutcome, message: &str) -> Box<dyn ToolOutput> {
     let safe = AgentToolSafeResult {
         status: AgentToolResultStatus::Denied,
@@ -6458,6 +6535,7 @@ fn denied_output(outcome: AgentPublicOutcome, message: &str) -> Box<dyn ToolOutp
         receipt_id: None,
         outbox_id: None,
         public_message: Some(message.to_owned()),
+        thread_result: None,
         target_options: Vec::new(),
     };
     let payload = serde_json::to_value(safe).expect("safe agent result serializes");
