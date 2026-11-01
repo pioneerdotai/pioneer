@@ -1,3 +1,18 @@
+impl super::MessageProcessor {
+    // Test callers await the same owned request used by the production socket pump.
+    pub(crate) async fn process_owned_request(
+        self: std::sync::Arc<Self>,
+        connection: crate::request_context::ConnectionContext,
+        payload: String,
+    ) {
+        match self.start_owned_request(connection, payload).join().await {
+            Ok(()) => {}
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => tracing::warn!(error = %error, "RPC request task did not finish"),
+        }
+    }
+}
+
 #[path = "tests/control_rpc.rs"]
 mod control_rpc;
 

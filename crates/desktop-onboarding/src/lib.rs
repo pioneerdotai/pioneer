@@ -269,7 +269,7 @@ impl OnboardingView {
                 .overlay_closable(!pending)
                 .keyboard(!pending)
                 .title(div().text_base().child(title))
-                .child(form.clone())
+                .child(div().pt_2().child(form.clone()))
                 .on_close(move |_, _, _| {
                     client.onboarding_intent(OnboardingIntent::Setup {
                         intent: GatewaySetupIntent::Close { expected_owner },

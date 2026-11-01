@@ -92,7 +92,7 @@ impl<T> CaptureQueueSender<T> {
         if self
             .0
             .bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|next| *next <= self.0.byte_limit)
             })
