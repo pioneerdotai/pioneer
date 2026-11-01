@@ -3,7 +3,7 @@ use pioneer_entity::{turn, turn_runtime_snapshot};
 use pioneer_protocol::TurnStatus;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict, Query};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Set};
 
 use crate::convention::turn_status_to_db;
 
@@ -78,6 +78,22 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
     root: &crate::frozen_lifetime::PreparedFrozenRoot,
 ) -> Result<TurnRuntimeSnapshotRecord> {
     root.verify(db, &snapshot.workspace_id).await?;
+    // Compare only eligibility identity; refreshing a capsule must not load
+    // its historical JSON just to decide whether a producer revision is due.
+    super::task_child_producers::lock_capsule_turn(db, &snapshot.turn_id).await?;
+    let old = turn_runtime_snapshot::Entity::find_by_id(&snapshot.turn_id)
+        .select_only()
+        .columns([
+            turn_runtime_snapshot::Column::ThreadId,
+            turn_runtime_snapshot::Column::WorkspaceId,
+        ])
+        .lock_exclusive()
+        .into_tuple::<(String, String)>()
+        .one(db)
+        .await?;
+    let capsule_identity_changed = old.as_ref().is_none_or(|(thread, workspace)| {
+        thread != &snapshot.thread_id || workspace != &snapshot.workspace_id
+    });
     let turn_id = snapshot.turn_id.clone();
     turn_runtime_snapshot::Entity::insert(turn_runtime_snapshot::ActiveModel {
         turn_id: Set(snapshot.turn_id),
@@ -125,6 +141,9 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
     .await
     .context("failed to upsert turn_runtime_snapshot row")?;
 
+    if capsule_identity_changed {
+        super::task_child_producers::capsule_birth(db, &turn_id).await?;
+    }
     find_turn_runtime_snapshot(db, turn_id.as_str())
         .await?
         .context("upserted turn_runtime_snapshot row is missing")

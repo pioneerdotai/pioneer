@@ -5,7 +5,9 @@ use pioneer_entity::task_trigger;
 use pioneer_protocol::{TaskTrigger, TaskTriggerStatus};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+};
 
 use crate::convention::{task_trigger_kind_to_db, task_trigger_status_to_db};
 use crate::util::unix_to_datetime;
@@ -79,6 +81,90 @@ pub async fn list_due_active_triggers<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list due task triggers")
+}
+
+/// Bounded foreign-writer fallback; status/next_fire_at use idx_task_trigger_due.
+pub async fn list_due_active_triggers_bounded<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    after: Option<(DateTimeWithTimeZone, &str)>,
+    limit: u64,
+) -> Result<Vec<task_trigger::Model>> {
+    list_due_active_triggers_bounded_through(db, now, after, None, limit).await
+}
+
+pub async fn list_due_active_triggers_bounded_through<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    after: Option<(DateTimeWithTimeZone, &str)>,
+    upper: Option<(DateTimeWithTimeZone, &str)>,
+    limit: u64,
+) -> Result<Vec<task_trigger::Model>> {
+    let mut query = task_trigger::Entity::find()
+        .filter(task_trigger::Column::Status.eq("active"))
+        .filter(task_trigger::Column::NextFireAt.lte(now));
+    if let Some((at, id)) = after {
+        query = query.filter(
+            Condition::any()
+                .add(task_trigger::Column::NextFireAt.gt(at))
+                .add(
+                    Condition::all()
+                        .add(task_trigger::Column::NextFireAt.eq(at))
+                        .add(task_trigger::Column::Id.gt(id)),
+                ),
+        );
+    }
+    if let Some((at, id)) = upper {
+        query = query.filter(
+            Condition::any()
+                .add(task_trigger::Column::NextFireAt.lt(at))
+                .add(
+                    Condition::all()
+                        .add(task_trigger::Column::NextFireAt.eq(at))
+                        .add(task_trigger::Column::Id.lte(id)),
+                ),
+        );
+    }
+    query
+        .order_by_asc(task_trigger::Column::NextFireAt)
+        .order_by_asc(task_trigger::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("failed to list bounded due task triggers")
+}
+
+/// NULL schedules are dormant, not absent. Cursor rotates the bounded audit
+/// even if the first dormant row is permanently ineligible for recovery.
+pub async fn list_dormant_active_triggers<C: ConnectionTrait>(
+    db: &C,
+    after_id: Option<&str>,
+    limit: u64,
+) -> Result<Vec<task_trigger::Model>> {
+    list_dormant_active_triggers_through(db, after_id, None, limit).await
+}
+
+pub async fn list_dormant_active_triggers_through<C: ConnectionTrait>(
+    db: &C,
+    after_id: Option<&str>,
+    upper: Option<&str>,
+    limit: u64,
+) -> Result<Vec<task_trigger::Model>> {
+    let mut query = task_trigger::Entity::find()
+        .filter(task_trigger::Column::Status.eq("active"))
+        .filter(task_trigger::Column::NextFireAt.is_null());
+    if let Some(after_id) = after_id {
+        query = query.filter(task_trigger::Column::Id.gt(after_id));
+    }
+    if let Some(id) = upper {
+        query = query.filter(task_trigger::Column::Id.lte(id));
+    }
+    query
+        .order_by_asc(task_trigger::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("failed to audit dormant task triggers")
 }
 
 pub async fn list_active_triggers<C: ConnectionTrait>(db: &C) -> Result<Vec<task_trigger::Model>> {
@@ -155,4 +241,48 @@ fn active_model_from_trigger(trigger: &TaskTrigger) -> Result<task_trigger::Acti
         created_at: Set(unix_to_datetime(trigger.created_at)),
         updated_at: Set(unix_to_datetime(trigger.updated_at)),
     })
+}
+
+/// Addressed scheduling inputs exclude inactive historical metadata before decoding.
+pub async fn list_scheduler_active_triggers<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+) -> Result<Vec<task_trigger::Model>> {
+    task_trigger::Entity::find()
+        .filter(task_trigger::Column::TaskId.eq(task_id))
+        .filter(task_trigger::Column::Status.eq("active"))
+        .order_by_asc(task_trigger::Column::Id)
+        .all(db)
+        .await
+        .context("failed to list scheduler active triggers")
+}
+
+pub async fn scheduler_due_upper<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<(DateTimeWithTimeZone, String)>> {
+    task_trigger::Entity::find()
+        .select_only()
+        .column(task_trigger::Column::NextFireAt)
+        .column(task_trigger::Column::Id)
+        .filter(task_trigger::Column::Status.eq("active"))
+        .filter(task_trigger::Column::NextFireAt.lte(now))
+        .order_by_desc(task_trigger::Column::NextFireAt)
+        .order_by_desc(task_trigger::Column::Id)
+        .into_tuple::<(DateTimeWithTimeZone, String)>()
+        .one(db)
+        .await
+        .context("failed to capture due trigger upper")
+}
+pub async fn scheduler_dormant_upper<C: ConnectionTrait>(db: &C) -> Result<Option<String>> {
+    task_trigger::Entity::find()
+        .select_only()
+        .column(task_trigger::Column::Id)
+        .filter(task_trigger::Column::Status.eq("active"))
+        .filter(task_trigger::Column::NextFireAt.is_null())
+        .order_by_desc(task_trigger::Column::Id)
+        .into_tuple::<String>()
+        .one(db)
+        .await
+        .context("failed to capture dormant trigger upper")
 }

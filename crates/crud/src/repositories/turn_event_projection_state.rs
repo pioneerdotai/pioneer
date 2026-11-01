@@ -261,7 +261,14 @@ pub async fn repair_legacy_agent_diff_thread_owners_for_turn<C: ConnectionTrait>
         .await
         .with_context(|| format!("failed to repair liveness owner for Turn `{turn_id}`"))?;
 
-    stream_state_entity::Entity::update_many()
+    // Owner repair changes READY even when the watermark is already current.
+    // Capture the current identity inside the caller's backfill transaction;
+    // ordinary getters remain plain reads.
+    let old_stream = stream_state_entity::Entity::find_by_id(turn_id.to_owned())
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    let changed_owner = stream_state_entity::Entity::update_many()
         .col_expr(
             stream_state_entity::Column::ThreadId,
             Expr::value(canonical_thread_id.to_owned()),
@@ -270,7 +277,22 @@ pub async fn repair_legacy_agent_diff_thread_owners_for_turn<C: ConnectionTrait>
         .filter(stream_state_entity::Column::ThreadId.ne(canonical_thread_id.to_owned()))
         .exec(db)
         .await
-        .with_context(|| format!("failed to repair stream-state owner for Turn `{turn_id}`"))?;
+        .with_context(|| format!("failed to repair stream-state owner for Turn `{turn_id}`"))?
+        .rows_affected;
+    if let Some(old) = old_stream
+        .as_ref()
+        .filter(|s| s.thread_id != canonical_thread_id)
+    {
+        anyhow::ensure!(
+            changed_owner == 1,
+            "stream-state owner changed or update refused during repair of Turn `{turn_id}`"
+        );
+        // Only ThreadId was updated, so derive the after-image from the locked
+        // header rather than another snapshot read.
+        let mut new = old.clone();
+        new.thread_id = canonical_thread_id.to_owned();
+        super::task_child_producers::receipt_change(db, Some(old), Some(&new)).await?;
+    }
 
     Ok(mismatches.len())
 }

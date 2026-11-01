@@ -68,6 +68,15 @@ async fn tracker_projector_store() -> CrudStore {
     store
 }
 
+// The existing status/null/generation matrix remains the legacy trigger owner.
+async fn terminal_task_run_occurrence_fixture(
+    kind: Option<TurnKind>,
+) -> (CrudStore, Thread, TaskRun) {
+    let (store, thread, run) = super::terminal_task_run_occurrence_fixture(kind).await;
+    restore_legacy_occurrence_tracking(&store).await;
+    (store, thread, run)
+}
+
 async fn row(store: &CrudStore, id: &str) -> Option<pending::Model> {
     pending::Entity::find_by_id(id.to_owned())
         .one(&store.connection)

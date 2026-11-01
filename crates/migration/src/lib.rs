@@ -2,6 +2,8 @@ mod m20261015_000001_html_preview_retention;
 mod m20261016_000001_task_completion_inbox;
 mod m20261018_000001_frozen_sweep_work;
 mod m20261018_000001_html_preview_work_selection;
+mod m20261101_000101_idle_task_child_work;
+mod m20261101_000102_idle_task_occurrence_tracking_cutover;
 pub use sea_orm_migration::prelude::*;
 
 mod m20261023_000001_task_webhook;
@@ -231,6 +233,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261027_000004_portable_task_history::Migration),
             Box::new(m20261027_000005_portable_task_event::Migration),
             Box::new(m20261029_000001_thread_read_creation_order::Migration),
+            Box::new(m20261101_000101_idle_task_child_work::Migration),
+            Box::new(m20261101_000102_idle_task_occurrence_tracking_cutover::Migration),
         ]
     }
 }

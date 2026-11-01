@@ -1,5 +1,6 @@
 mod authorization_integrity_audit;
 mod execution_authority_integrity;
+mod task_child_work_seed;
 pub(crate) mod thread_episodic_workspace_capsule_refill;
 mod turn_event_projection_stream_state_backfill;
 mod turn_permission_profile_backfill;
@@ -464,6 +465,10 @@ async fn run_inner(
     run_stage!(
         pioneer_observability::GatewayOperationStage::DatabasePayloadCompression,
         zstd_payload_compression::run(crud_store.as_ref())
+    );
+    run_stage!(
+        pioneer_observability::GatewayOperationStage::DatabaseTaskChildSeed,
+        task_child_work_seed::run(crud_store.as_ref())
     );
     let refill_stage =
         trace.stage(pioneer_observability::GatewayOperationStage::DatabaseThreadEpisodicRefill);

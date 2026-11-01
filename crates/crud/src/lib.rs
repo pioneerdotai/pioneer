@@ -18,6 +18,7 @@ mod model_history;
 mod projector;
 mod repositories;
 pub use repositories::provider_usage::ProviderUsageObservation;
+pub use repositories::task_child_work::ChildSeedOutcome;
 pub use repositories::turn::TurnExecutionBinding;
 mod task_delivery_lifecycle;
 mod task_delivery_recovery;
@@ -32,6 +33,7 @@ pub use repositories::task_event_fanout::{
 };
 pub use task_event_context::{TaskAnchorAgent, TaskAnchorContext, TaskEventContext};
 mod task_occurrence;
+mod task_occurrence_compatibility;
 mod task_run_occurrence;
 pub use repositories::task_occurrence_reconcile::{
     TASK_OCCURRENCE_RECONCILE_BUDGET, TASK_OCCURRENCE_RUN_QUOTA, TaskOccurrenceClaimDeferral,
@@ -39,6 +41,8 @@ pub use repositories::task_occurrence_reconcile::{
     TaskOccurrenceReconcileCandidate, TaskOccurrenceReconcileClaim,
 };
 mod task_finish;
+mod task_scheduler;
+pub use task_scheduler::{TaskSchedulerPage, TaskSchedulerRowFailure};
 mod task_terminal;
 mod task_webhook;
 pub use repositories::task_run_occurrence_reconcile::{
@@ -3111,6 +3115,14 @@ pub struct TurnMcpProjectionRecord {
     pub created_at_unix: i64,
 }
 
+/// Bounded queue discovery with independent compatibility-audit status.
+/// Candidates remain usable when historical coverage could not be confirmed.
+#[derive(Debug)]
+pub struct OccurrenceReconcileDiscovery<C> {
+    pub candidates: Vec<C>,
+    pub audit_error: Option<anyhow::Error>,
+}
+
 #[derive(Clone)]
 pub struct CrudStore {
     #[cfg(any(test, feature = "test-support"))]
@@ -3125,6 +3137,8 @@ pub struct CrudStore {
     episodic_claim_discoveries: std::sync::Arc<std::sync::atomic::AtomicU64>,
     episodic_work: std::sync::Arc<tokio::sync::Notify>,
     frozen_readers: frozen_lifetime::ReaderCounts,
+    occurrence_compatibility_cursors:
+        std::sync::Arc<[tokio::sync::Mutex<task_occurrence_compatibility::AuditCursor>; 2]>,
     legacy_task_text_cursors:
         std::sync::Arc<std::sync::Mutex<repositories::portable_payload_legacy_text::Cursors>>,
     connection: SqliteDatabase,
@@ -4721,6 +4735,7 @@ impl CrudStore {
             episodic_work: std::sync::Arc::new(tokio::sync::Notify::new()),
             frozen_readers: Default::default(),
             legacy_task_text_cursors: Default::default(),
+            occurrence_compatibility_cursors: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             episodic_claim_fault: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
@@ -5065,7 +5080,13 @@ impl CrudStore {
         &self,
         entry: NewTurnLlmContextEntry,
     ) -> Result<pioneer_entity::turn_llm_context::Model> {
-        turn_llm_context::insert_turn_llm_context(&self.connection, entry).await
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            let row = turn_llm_context::insert_turn_llm_context(&tx, entry.clone()).await?;
+            tx.commit().await?;
+            Ok(row)
+        })
+        .await
     }
 
     pub async fn append_turn_llm_context(
@@ -5153,6 +5174,22 @@ impl CrudStore {
         // MySQL, not SQLite INDEXED BY. Pin the existing run_id index so each
         // run probes its own links instead of the task's entire run history.
         // Keep both ownership predicates and the single global order/limit.
+        let backend = self.connection.get_database_backend();
+        let hint = if backend == sea_orm::DbBackend::Sqlite {
+            "INDEXED BY idx_task_run_turn_run"
+        } else {
+            ""
+        };
+        let turn_table = if backend == sea_orm::DbBackend::MySql {
+            "`turn`"
+        } else {
+            "\"turn\""
+        };
+        let limit_bind = if backend == sea_orm::DbBackend::Postgres {
+            "$1"
+        } else {
+            "?"
+        };
         let rows = self
             .connection
             .query_all_raw(Statement::from_sql_and_values(
@@ -5160,8 +5197,8 @@ impl CrudStore {
                 format!("SELECT t.thread_id, t.id AS turn_id, t.status, t.error \
                  FROM task_run r \
                  INNER JOIN task task_row ON task_row.id = r.task_id \
-                 INNER JOIN task_run_turn AS trt INDEXED BY idx_task_run_turn_run ON trt.run_id = r.id AND trt.task_id = r.task_id \
-                 INNER JOIN \"turn\" t \
+                 INNER JOIN task_run_turn AS trt {hint} ON trt.run_id = r.id AND trt.task_id = r.task_id \
+                 INNER JOIN {turn_table} t \
                     ON t.id = trt.turn_id AND t.thread_id = trt.thread_id \
                  WHERE t.turn_kind = 'conversation' \
                    AND t.status IN ('completed', 'failed', 'interrupted', 'blocked') \
@@ -5172,11 +5209,11 @@ impl CrudStore {
                         OR (trt.status = 'candidate_created' AND r.status <> 'waiting_review') \
                         OR (trt.status = 'cancelled' AND t.status = 'interrupted'))) \
                     OR (r.status IN ('succeeded', 'failed', 'cancelled', 'timed_out') \
-                      AND ({ready}) \
-                      AND (EXISTS (SELECT 1 FROM turn_runtime_snapshot c WHERE c.turn_id = t.id) \
-                        OR EXISTS (SELECT 1 FROM turn_llm_context c WHERE c.turn_id = t.id AND c.source NOT IN ('assistant_round', 'tool_result_v2'))))) \
-                 ORDER BY t.updated_at ASC, t.id ASC LIMIT ?",
-                    ready = repositories::task_child_cleanup::READY),
+                      AND CASE WHEN (EXISTS (SELECT 1 FROM turn_runtime_snapshot c WHERE c.turn_id = t.id) \
+                        OR EXISTS (SELECT 1 FROM turn_llm_context c WHERE c.turn_id = t.id AND c.source NOT IN ('assistant_round', 'tool_result_v2'))) \
+                        THEN CASE WHEN ({ready}) THEN 1 ELSE 0 END ELSE 0 END = 1)) \
+                 ORDER BY t.updated_at ASC, t.id ASC LIMIT {limit_bind}",
+                    ready = repositories::task_child_cleanup::render_ready(backend)),
                 [i64::try_from(limit).unwrap_or(i64::MAX).into()],
             ))
             .await
@@ -5197,6 +5234,11 @@ impl CrudStore {
                 })
             })
             .collect()
+    }
+
+    /// Inspect whether both occurrence owners have verified typed producers.
+    pub async fn task_occurrence_tracking_is_typed(&self) -> Result<bool> {
+        repositories::task_occurrence_producers::typed(&self.connection).await
     }
 
     /// Installer inspection only: never create the migration table or run
@@ -5235,7 +5277,9 @@ impl CrudStore {
         turn_id: &str,
     ) -> Result<Option<bool>> {
         self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
+            let tx =
+                repositories::task_child_cleanup::begin_authoritative(&self.connection).await?;
+            repositories::task_child_cleanup::lock_authority(&tx, thread_id, turn_id).await?;
             let ready = repositories::task_child_cleanup::ready(&tx, thread_id, turn_id).await?;
             if ready == Some(true) {
                 turn_llm_context::delete_turn_llm_context_for_turn(&tx, turn_id).await?;
@@ -16197,8 +16241,14 @@ impl CrudStore {
     }
 
     pub async fn delete_task_run_conversation_snapshot(&self, run_id: &str) -> Result<u64> {
-        self.run_serialized_write(|| {
-            task_run_conversation_snapshot::delete_by_run(&self.connection, run_id)
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            let deleted = task_run_conversation_snapshot::delete_by_run(&tx, run_id).await?;
+            if deleted > 0 {
+                repositories::task_child_producers::run(&tx, run_id).await?;
+            }
+            tx.commit().await?;
+            Ok(deleted)
         })
         .await
     }
@@ -17182,8 +17232,9 @@ impl CrudStore {
         lease_until: i64,
     ) -> Result<Option<TaskRunExecution>> {
         self.run_serialized_write(|| async {
-            task_run_execution::claim_execution(
-                &self.connection,
+            let tx = self.connection.begin().await?;
+            let outcome = task_run_execution::claim_execution(
+                &tx,
                 execution_id,
                 worker_id,
                 unix_to_datetime(now),
@@ -17191,7 +17242,9 @@ impl CrudStore {
             )
             .await?
             .map(task_run_execution_from_db_model)
-            .transpose()
+            .transpose()?;
+            tx.commit().await?;
+            Ok(outcome)
         })
         .await
     }
@@ -17203,15 +17256,18 @@ impl CrudStore {
         lease_until: Option<i64>,
     ) -> Result<Option<TaskRunExecution>> {
         self.run_serialized_write(|| async {
-            task_run_execution::mark_execution_running(
-                &self.connection,
+            let tx = self.connection.begin().await?;
+            let outcome = task_run_execution::mark_execution_running(
+                &tx,
                 execution_id,
                 unix_to_datetime(started_at),
                 lease_until.map(unix_to_datetime),
             )
             .await?
             .map(task_run_execution_from_db_model)
-            .transpose()
+            .transpose()?;
+            tx.commit().await?;
+            Ok(outcome)
         })
         .await
     }
@@ -17482,8 +17538,9 @@ impl CrudStore {
 
     pub async fn upsert_task_run_turn(&self, turn: TaskRunTurn) -> Result<TaskRunTurn> {
         self.run_serialized_write(|| async {
+            let transaction = self.connection.begin().await?;
             task_run_turn::upsert_turn(
-                &self.connection,
+                &transaction,
                 task_run_turn::NewTaskRunTurn {
                     id: turn.id.clone(),
                     task_id: turn.task_id.clone(),
@@ -17504,9 +17561,10 @@ impl CrudStore {
                 },
             )
             .await?;
-            let row = task_run_turn::find_turn_by_id(&self.connection, &turn.id)
+            let row = task_run_turn::find_turn_by_id(&transaction, &turn.id)
                 .await?
                 .context("task run turn missing after upsert")?;
+            transaction.commit().await?;
             task_run_turn_from_db_model(row)
         })
         .await
@@ -17552,10 +17610,11 @@ impl CrudStore {
         completed_at: Option<i64>,
     ) -> Result<Option<TaskRunTurn>> {
         self.run_serialized_write(|| async {
-            task_run_turn::update_turn_status(&self.connection, id, status, completed_at)
-                .await?
-                .map(task_run_turn_from_db_model)
-                .transpose()
+            let transaction = self.connection.begin().await?;
+            let row =
+                task_run_turn::update_turn_status(&transaction, id, status, completed_at).await?;
+            transaction.commit().await?;
+            row.map(task_run_turn_from_db_model).transpose()
         })
         .await
     }
@@ -23592,14 +23651,17 @@ impl CrudStore {
             let thread_model = thread_model.clone();
             let creator = creator.clone();
             async move {
+                let tx = self.connection.begin().await?;
                 thread::upsert_thread_with_creator(
-                    &self.connection,
+                    &tx,
                     &thread_model,
                     &creator,
                     created_at,
                     updated_at,
                 )
-                .await
+                .await?;
+                tx.commit().await?;
+                Ok(())
             }
         })
         .await
@@ -26532,6 +26594,11 @@ impl CrudStore {
                             .await
                             .context("failed to begin terminal task_run repair transaction")?;
                         let now: DateTimeWithTimeZone = chrono::Utc::now().into();
+                        let occurrence_old = pioneer_entity::task_run::Entity::find()
+                            .filter(pioneer_entity::task_run::Column::Id.is_in(ids.clone()))
+                            .lock_exclusive()
+                            .all(&transaction)
+                            .await?;
                         let result = pioneer_entity::task_run::Entity::update_many()
                             .filter(pioneer_entity::task_run::Column::Id.is_in(ids))
                             .filter(pioneer_entity::task_run::Column::Status.is_in([
@@ -26549,6 +26616,18 @@ impl CrudStore {
                             .exec(&transaction)
                             .await
                             .context("failed to repair terminal runs missing completed_at")?;
+                        for old in &occurrence_old {
+                            let new = pioneer_entity::task_run::Entity::find_by_id(&old.id)
+                                .lock_exclusive()
+                                .one(&transaction)
+                                .await?;
+                            repositories::task_occurrence_producers::run_change(
+                                &transaction,
+                                Some(old),
+                                new.as_ref(),
+                            )
+                            .await?;
+                        }
                         transaction
                             .commit()
                             .await
@@ -30235,18 +30314,34 @@ impl CrudStore {
                 .context("failed to begin task-owned turn resume transaction")?;
 
             let stable_task_run_turn =
-                task_run_turn::find_turn_by_thread_and_turn(&tx, thread_id, turn_id).await?
+                pioneer_entity::task_run_turn::Entity::find_by_id(&task_run_turn_model.id)
+                    .lock_exclusive()
+                    .one(&tx)
+                    .await?
                     == Some(task_run_turn_model.clone());
-            let stable_run =
-                task_run::find_run_by_id(&tx, run.id.as_str()).await? == Some(run_model.clone());
-            let stable_task = task_repository::find_task_by_id(&tx, run.task_id.as_str()).await?
+            let stable_run = pioneer_entity::task_run::Entity::find_by_id(&run.id)
+                .lock_exclusive()
+                .one(&tx)
+                .await?
+                == Some(run_model.clone());
+            let stable_task = pioneer_entity::task::Entity::find_by_id(&run.task_id)
+                .lock_exclusive()
+                .one(&tx)
+                .await?
                 == Some(task_model.clone());
             let stable_job =
                 recovery_job::find_blocked_job_by_turn(&tx, turn_id, Some(job.id.as_str())).await?
                     == Some(job.clone());
-            let stable_turn = turn::find_turn_by_thread_and_id(&tx, thread_id, turn_id).await?
+            let stable_turn = pioneer_entity::turn::Entity::find_by_id(turn_id)
+                .filter(pioneer_entity::turn::Column::ThreadId.eq(thread_id))
+                .lock_exclusive()
+                .one(&tx)
+                .await?
                 == Some(turn_model.clone());
-            let stable_execution = task_run_execution::find_execution_by_run(&tx, run.id.as_str())
+            let stable_execution = pioneer_entity::task_run_execution::Entity::find()
+                .filter(pioneer_entity::task_run_execution::Column::TaskRunId.eq(&run.id))
+                .lock_exclusive()
+                .one(&tx)
                 .await?
                 == execution_model;
             if !(stable_task_run_turn
@@ -30597,6 +30692,39 @@ impl CrudStore {
                 .await?,
                 "task child Turn execution ownership changed while resume was committing"
             );
+
+            // Direct resume writes bypass ordinary repository transitions.
+            let new_task = task_repository::find_task_by_id(&tx, &run.task_id).await?;
+            repositories::task_child_producers::task_change(
+                &tx,
+                Some(&task_model),
+                new_task.as_ref(),
+            )
+            .await?;
+            let new_run = task_run::find_run_by_id(&tx, &run.id).await?;
+            repositories::task_occurrence_producers::run_change(
+                &tx,
+                Some(&run_model),
+                new_run.as_ref(),
+            )
+            .await?;
+            let occurrence_new_execution =
+                task_run_execution::find_execution_by_run(&tx, &run.id).await?;
+            repositories::task_occurrence_producers::execution_change(
+                &tx,
+                execution_model.as_ref(),
+                occurrence_new_execution.as_ref(),
+            )
+            .await?;
+            repositories::task_child_producers::run_change(&tx, Some(&run_model), new_run.as_ref())
+                .await?;
+            let new_link = task_run_turn::find_turn_by_id(&tx, &task_run_turn.id).await?;
+            repositories::task_child_producers::link_change(
+                &tx,
+                Some(&task_run_turn_model),
+                new_link.as_ref(),
+            )
+            .await?;
 
             tx.commit()
                 .await
@@ -34100,6 +34228,7 @@ impl CrudStore {
             || repositories::portable_payload::after_database_owners(operation()),
             |error| {
                 is_anyhow_sqlite_lock(error)
+                    || repositories::task_child_work::is_transaction_retry(error)
                     || task_event::is_idempotency_preflight_race(error)
                     || error
                         .downcast_ref::<repositories::portable_payload::PreflightRace>()
@@ -35722,6 +35851,9 @@ mod tests {
     mod authorization_reads;
     mod saved_history_read;
     mod task_child_discovery;
+    mod task_child_portable_producers;
+    mod task_child_producers;
+    mod task_child_work;
     mod task_webhook;
     mod thread_read_pages;
     mod unread_start;
@@ -35901,6 +36033,22 @@ mod tests {
             migrations.splice(tracker..tracker, storage);
         }
         migrations
+    }
+
+    // These suites own the released trigger-generation contract. Keep current
+    // orthogonal storage, but restore tracking through its normal down method;
+    // typed-cutover regressions use the default Migrator without this helper.
+    async fn restore_legacy_occurrence_tracking(store: &CrudStore) {
+        let tx = store.connection.begin().await.unwrap();
+        let manager = migration::SchemaManager::new(&*tx);
+        let cutover = Migrator::migrations()
+            .into_iter()
+            .find(|migration| {
+                migration.name() == "m20261101_000102_idle_task_occurrence_tracking_cutover"
+            })
+            .unwrap();
+        cutover.down(&manager).await.unwrap();
+        tx.commit().await.unwrap();
     }
 
     struct PreNativeDeliveryMigrator;

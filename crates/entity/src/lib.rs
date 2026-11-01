@@ -222,3 +222,6 @@ pub mod portable_payload_dictionary;
 pub mod portable_payload;
 
 pub mod portable_payload_block;
+
+pub mod task_child_reconcile_pending;
+pub mod task_child_reconcile_scope;

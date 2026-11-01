@@ -9,6 +9,10 @@ use sea_orm::{
 use crate::util::unix_to_datetime;
 
 pub async fn upsert_lineage<C: ConnectionTrait>(db: &C, lineage: &TaskThreadLineage) -> Result<()> {
+    let old = thread_lineage::Entity::find_by_id(&lineage.child_thread_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     thread_lineage::Entity::insert(thread_lineage::ActiveModel {
         child_thread_id: Set(lineage.child_thread_id.clone()),
         parent_thread_id: Set(lineage.parent_thread_id.clone()),
@@ -34,6 +38,13 @@ pub async fn upsert_lineage<C: ConnectionTrait>(db: &C, lineage: &TaskThreadLine
     .exec(db)
     .await
     .context("failed to upsert thread lineage")?;
+    let new = thread_lineage::Entity::find_by_id(&lineage.child_thread_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    if old != new {
+        super::task_child_producers::lineage(db, &lineage.child_thread_id).await?;
+    }
     Ok(())
 }
 
