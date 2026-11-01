@@ -18,6 +18,11 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub history_json: String,
     pub created_at: DateTimeWithTimeZone,
+    pub portable_revision: i64,
+    #[sea_orm(column_type = "Text")]
+    pub portable_identity: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub history_json_payload_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

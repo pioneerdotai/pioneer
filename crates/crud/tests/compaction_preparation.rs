@@ -716,6 +716,19 @@ async fn tool_output_large_unicode_chunks_survive_retry_without_snapshot_copies(
         markdown_version: None,
     };
     store.record_tool_output("large", &n).await.unwrap();
+    // Exercise the existing retry/page contract after an abandoned staging
+    // preparation and a fresh maintenance worker have converted the storage.
+    let maintenance = store.with_maintenance_access();
+    let mut progress = pioneer_crud::PortablePayloadProgress::default();
+    for _ in 0..4 {
+        progress.quantum(&maintenance).await.unwrap();
+    }
+    drop(progress);
+    let mut progress = pioneer_crud::PortablePayloadProgress::default();
+    for _ in 0..200 {
+        progress.quantum(&maintenance).await.unwrap();
+    }
+    assert!(scalar(&store,"SELECT count(*) AS n FROM tool_output_chunk WHERE text_payload_id IS NOT NULL AND text='' ").await>0);
     store.record_tool_output("large", &n).await.unwrap();
     let rows = store
         .tool_output_page("ws", "thread", "turn", "large", 0)

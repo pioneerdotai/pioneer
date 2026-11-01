@@ -14,16 +14,36 @@ use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 const POLICY: &str = "m20261024_000001_root_conversation_compaction";
 const READY: i64 = 1_792_838_000;
 
+// The policy upgrade is independent of physical CLI storage. Pre-policy
+// publications use today's timeline projector, which selects that projection
+// even when no CLI bindings exist. Keep the policy itself as the last step.
+struct PolicyFixtureMigrator;
+impl MigratorTrait for PolicyFixtureMigrator {
+    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+        let mut migrations = Migrator::migrations();
+        let policy = migrations.iter().position(|m| m.name() == POLICY).unwrap();
+        migrations.truncate(policy + 1);
+        let storage = Migrator::migrations().into_iter().filter(|migration| {
+            matches!(
+                migration.name(),
+                "m20261027_000001_portable_payload" | "m20261027_000003_portable_cli_mapping"
+            )
+        });
+        migrations.splice(policy..policy, storage);
+        migrations
+    }
+}
+
 #[tokio::test]
 async fn policy_upgrade_preserves_execution_intents_and_root_publication_survives_restart() {
     let connection = Database::connect("sqlite::memory:").await.unwrap();
     let writer = SqliteWriteExecutor::new(connection.clone());
-    let before = Migrator::migrations()
+    let before = PolicyFixtureMigrator::migrations()
         .iter()
         .position(|m| m.name() == POLICY)
         .unwrap();
     writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, Some(before as u32))
+        .run_migrations::<PolicyFixtureMigrator>(SqliteWriteClass::Maintenance, Some(before as u32))
         .await
         .unwrap();
     let store = CrudStore::new(SqliteDatabase::from_executor(connection, writer.clone()))

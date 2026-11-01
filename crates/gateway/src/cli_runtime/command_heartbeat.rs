@@ -333,6 +333,10 @@ mod tests {
 
     fn turn_binding(status: &str) -> CliRuntimeTurnBindingRecord {
         CliRuntimeTurnBindingRecord {
+            input_mapping_payload_id: None,
+            input_mapping_read_hold: None,
+            input_mapping_revision: 0,
+            input_mapping_identity: String::new(),
             turn_id: "turn".to_owned(),
             workspace_id: "workspace".to_owned(),
             runtime_id: "codex".to_owned(),

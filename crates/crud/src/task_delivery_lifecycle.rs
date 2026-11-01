@@ -6,6 +6,7 @@ use pioneer_protocol::{TaskDeliveryAttempt, TaskDeliveryAttemptStatus, TaskDeliv
 use sea_orm::{ConnectionTrait, TransactionTrait};
 
 use crate::repositories::{task_delivery, task_event};
+use crate::task_events::materialize_task_events;
 use crate::{AppendedTaskEvent, CrudStore, TaskEventPayload};
 
 /// A losing worker has no durable effect and must not be finalized again.
@@ -279,7 +280,7 @@ impl CrudStore {
         match result {
             Ok(TaskDeliveryTransitionOutcome::Applied(event)) => {
                 tx.commit().await?;
-                Ok(TaskDeliveryTransitionOutcome::Applied(event))
+                Ok(TaskDeliveryTransitionOutcome::Applied(event.into_owned()))
             }
             Ok(TaskDeliveryTransitionOutcome::Superseded) => {
                 tx.rollback().await?;
@@ -536,7 +537,7 @@ impl CrudStore {
                     if event.append_status.is_inserted()
                         && let TaskEventPayload::RunCancelled {
                             task_id, run_id, ..
-                        } = &event.payload
+                        } = event.payload.as_ref()
                         && transitioning.contains(run_id)
                     {
                         let workspace = event
@@ -564,7 +565,7 @@ impl CrudStore {
         match result {
             Ok(appended) => {
                 tx.commit().await?;
-                Ok(appended)
+                Ok(materialize_task_events(appended))
             }
             Err(error) => {
                 let _ = tx.rollback().await;

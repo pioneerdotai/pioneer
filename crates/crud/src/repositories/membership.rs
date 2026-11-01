@@ -1379,6 +1379,7 @@ mod tests {
         };
         let permission_profile = pioneer_protocol::default_turn_permission_profile_snapshot();
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),

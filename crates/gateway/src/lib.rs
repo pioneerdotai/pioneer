@@ -4,6 +4,9 @@
 //! providers continue through `pioneer-agent`, while local `CLIAgentRuntime`
 //! executions are routed through `pioneer-cli-agent-runtime`.
 
+// Portable payload observation adds nested futures to Gateway's database paths.
+#![recursion_limit = "256"]
+
 mod administrative_audit;
 mod artifact_delivery;
 mod artifact_prompt_refs;

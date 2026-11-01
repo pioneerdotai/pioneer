@@ -2,6 +2,10 @@
 use pioneer_protocol::{TaskError, TaskErrorClass, TaskValue};
 use sea_orm::{DbErr, RuntimeErr, SqlxError};
 use std::collections::BTreeMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStartStage {
@@ -56,6 +60,7 @@ pub enum TaskStartReason {
     RuntimeNotReady,
     ReadinessSnapshotMissing,
     CapabilityProjectionInvalid,
+    CapabilityResolutionUncertain,
     LaunchSourceUnavailable,
     ProviderAuthorityUnavailable,
 }
@@ -65,6 +70,7 @@ impl TaskStartReason {
             Self::RuntimeNotReady => "runtime_not_ready",
             Self::ReadinessSnapshotMissing => "readiness_snapshot_missing",
             Self::CapabilityProjectionInvalid => "capability_projection_invalid",
+            Self::CapabilityResolutionUncertain => "capability_resolution_uncertain",
             Self::LaunchSourceUnavailable => "launch_source_unavailable",
             Self::ProviderAuthorityUnavailable => "provider_authority_unavailable",
         }
@@ -78,7 +84,7 @@ pub enum TaskStartReporting {
 }
 
 /// No raw text or domain identifiers. SQLite codes are populated only by typed
-/// SQLite errors; correlation is supplied by the internal reporting boundary.
+/// SQLite errors; correlation is allocated at the typed failure boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskStartFailureDescriptor {
     pub stage: TaskStartStage,
@@ -133,7 +139,7 @@ impl TaskStartFailureDescriptor {
 #[derive(Debug)]
 pub struct TaskStartFailure {
     descriptor: TaskStartFailureDescriptor,
-    reporting: TaskStartReporting,
+    reported: Arc<AtomicBool>,
     source: Option<anyhow::Error>,
     public_error: Option<pioneer_protocol::PublicError>,
 }
@@ -147,9 +153,9 @@ impl TaskStartFailure {
                 reason: None,
                 sqlite_primary_code: None,
                 sqlite_extended_code: None,
-                correlation_id: None,
+                correlation_id: Some(pioneer_protocol::generate_id(21)),
             },
-            reporting: TaskStartReporting::Unreported,
+            reported: Arc::new(AtomicBool::new(false)),
             source: None,
             public_error: None,
         }
@@ -165,6 +171,18 @@ impl TaskStartFailure {
 
     /// Classify an existing source without consuming or formatting it.
     pub fn from_borrowed_error(stage: TaskStartStage, error: &anyhow::Error) -> Self {
+        if let Some(failure) = error.downcast_ref::<Self>().or_else(|| {
+            error
+                .chain()
+                .find_map(|source| source.downcast_ref::<Self>())
+        }) {
+            return Self {
+                descriptor: failure.descriptor.clone(),
+                reported: Arc::clone(&failure.reported),
+                source: None,
+                public_error: failure.public_error.clone(),
+            };
+        }
         let sqlite_code = sqlite_code(error);
         let storage = sqlite_code.is_some()
             || error.chain().any(|cause| {
@@ -192,7 +210,7 @@ impl TaskStartFailure {
     }
 
     pub fn with_reason(mut self, reason: TaskStartReason) -> Self {
-        self.descriptor.reason = Some(reason);
+        self.descriptor.reason.get_or_insert(reason);
         self
     }
 
@@ -200,14 +218,22 @@ impl TaskStartFailure {
         &self.descriptor
     }
 
-    pub const fn reporting(&self) -> TaskStartReporting {
-        self.reporting
+    pub fn reporting(&self) -> TaskStartReporting {
+        if self.reported.load(Ordering::Acquire) {
+            TaskStartReporting::Reported
+        } else {
+            TaskStartReporting::Unreported
+        }
     }
 
     /// Preserve the existing safe transport projection without interpreting it
     /// as a cause or as proof that reporting has happened.
-    pub fn with_public_error(mut self, public_error: pioneer_protocol::PublicError) -> Self {
-        self.descriptor.correlation_id = Some(public_error.correlation_id.clone());
+    pub fn with_public_error(mut self, mut public_error: pioneer_protocol::PublicError) -> Self {
+        if let Some(correlation) = &self.descriptor.correlation_id {
+            public_error.correlation_id = correlation.clone();
+        } else {
+            self.descriptor.correlation_id = Some(public_error.correlation_id.clone());
+        }
         self.public_error = Some(public_error);
         self
     }
@@ -217,7 +243,9 @@ impl TaskStartFailure {
     }
 
     pub fn with_correlation_id(mut self, correlation_id: String) -> Self {
-        self.descriptor.correlation_id = Some(correlation_id);
+        if self.reporting() == TaskStartReporting::Unreported {
+            self.descriptor.correlation_id = Some(correlation_id);
+        }
         self
     }
 
@@ -229,7 +257,7 @@ impl TaskStartFailure {
     }
 
     pub fn report_in_place(&mut self) {
-        if self.reporting == TaskStartReporting::Unreported {
+        if !self.reported.swap(true, Ordering::AcqRel) {
             let descriptor = &self.descriptor;
             match descriptor.cause {
                 TaskStartCause::Policy | TaskStartCause::Validation | TaskStartCause::Refusal => {
@@ -253,7 +281,6 @@ impl TaskStartFailure {
                     );
                 }
             }
-            self.reporting = TaskStartReporting::Reported;
         }
     }
 
@@ -264,9 +291,13 @@ impl TaskStartFailure {
             failure.report_in_place();
             return failure.descriptor.clone();
         }
-        Self::from_borrowed_error(TaskStartStage::ExecutorStart, error)
-            .report()
-            .descriptor
+        // Install the fallback so repeated handling of an untyped error also
+        // retains the correlation and reporting ownership, including Context.
+        let source = std::mem::replace(error, anyhow::anyhow!("start failure conversion"));
+        let failure = Self::from_error(TaskStartStage::ExecutorStart, source).report();
+        let descriptor = failure.descriptor.clone();
+        *error = failure.into();
+        descriptor
     }
 }
 
@@ -374,8 +405,14 @@ mod tests {
         assert_eq!(descriptor.cause, TaskStartCause::Storage);
         assert_eq!(descriptor.sqlite_primary_code, Some(14));
         assert!(
-            error.downcast_ref::<DbErr>().is_some(),
-            "borrowed source must survive reporting"
+            error
+                .chain()
+                .any(|source| source.downcast_ref::<DbErr>().is_some()),
+            "typed source must survive installing reporting ownership"
+        );
+        assert_eq!(
+            TaskStartFailure::report_for_scheduler(&mut error),
+            descriptor
         );
         let encoded = serde_json::to_string(&descriptor.task_error(None)).unwrap();
         assert!(!encoded.contains(temp.path().to_str().unwrap()));
@@ -390,7 +427,10 @@ mod tests {
         let failure = TaskStartFailure::from_error(TaskStartStage::CliAdmission, source);
         assert_eq!(failure.reporting(), TaskStartReporting::Unreported);
         assert_eq!(failure.descriptor().cause, TaskStartCause::Unclassified);
-        assert_eq!(failure.descriptor().correlation_id, None);
+        assert_ne!(
+            failure.descriptor().correlation_id.as_deref(),
+            Some("forged")
+        );
         assert_eq!(failure.descriptor().sqlite_primary_code, None);
         assert_eq!(
             failure.descriptor().task_error(None).class,

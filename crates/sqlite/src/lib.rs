@@ -5,12 +5,14 @@ use std::path::{Component, Path};
 use std::pin::Pin;
 use std::time::Duration;
 
+mod blob_range;
 mod database;
 mod query_scope;
 mod reader;
 pub use query_scope::DiagnosticStream;
 mod writer;
 
+pub use blob_range::SqliteBlobSource;
 pub use database::{SqliteDatabase, SqliteReadTransaction};
 pub use reader::{
     DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS, SqliteReadClass, SqliteReadEvent, SqliteReadObserver,

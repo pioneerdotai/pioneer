@@ -41,16 +41,7 @@ pub(super) async fn shrink_results(
         sum.saturating_add(full.message_input_tokens[*i])
     });
     let fixed = full.estimated_input_tokens.saturating_sub(result_tokens);
-    let window = if recovery {
-        (budget.context as u128 * 9 / 10) as u64
-    } else {
-        budget.context
-    };
-    let input_limit = window
-        .saturating_sub(full.output_reserve)
-        .saturating_sub(budget.separate_reasoning)
-        .min(budget.input_limit.unwrap_or(u64::MAX));
-    let raw_limit = (input_limit as u128 * 100 / 105) as u64;
+    let raw_limit = super::estimated_input_capacity(budget, full.output_reserve, recovery);
     // Keep enough space for an ordinary scoped reference. If even these small
     // results cannot fit, the existing whole-round compaction planner takes over.
     let per_result = (raw_limit.saturating_sub(fixed).saturating_sub(64) / candidates.len() as u64)

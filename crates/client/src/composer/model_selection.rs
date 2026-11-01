@@ -388,6 +388,7 @@ mod tests {
 
     fn with_turn(mut thread: Thread) -> Thread {
         thread.turns.push(pioneer_protocol::Turn {
+            work_owner: Default::default(),
             id: "turn".into(),
             status: pioneer_protocol::TurnStatus::Completed,
             turn_kind: Default::default(),

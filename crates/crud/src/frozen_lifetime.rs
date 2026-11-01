@@ -8,6 +8,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[path = "frozen_root_stream.rs"]
+mod stream;
+pub(crate) use stream::FrozenRootStream;
+
 pub(crate) type ReaderCounts = Arc<Mutex<BTreeMap<String, usize>>>;
 
 #[derive(Debug)]

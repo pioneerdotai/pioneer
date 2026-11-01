@@ -99,7 +99,12 @@ impl CodexService {
                 .len()
                 .saturating_add(request.instructions.len())
                 <= MAX_SERVICE_BYTES,
-            "service input exceeds transport capacity"
+            // Local hard payload overflow is typed, just like a confirmed
+            // provider context rejection. Callers must not parse raw messages.
+            ServiceFailure {
+                class: ProviderFailureClass::ContextTooLarge,
+                retry_after_ms: None,
+            }
         );
         let run = async {
             let (output, success) = self.invoke(&request, deadline, MAX_SERVICE_BYTES).await?;

@@ -454,6 +454,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -690,6 +691,10 @@ mod tests {
         };
         let now = chrono::Utc::now().fixed_offset();
         let turn_binding = CliRuntimeTurnBindingRecord {
+            input_mapping_payload_id: None,
+            input_mapping_read_hold: None,
+            input_mapping_revision: 0,
+            input_mapping_identity: String::new(),
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
             continuation_thread_id: thread_id.to_owned(),

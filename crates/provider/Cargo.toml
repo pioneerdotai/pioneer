@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+pioneer-compaction.workspace = true
 pioneer-observability.workspace = true
 pioneer-protocol.workspace = true
 anyhow.workspace = true
@@ -28,7 +29,6 @@ url.workspace = true
 mime_guess.workspace = true
 tempfile.workspace = true
 image.workspace = true
-tiktoken-rs.workspace = true
 lopdf = { version = "0.45", default-features = false }
 symphonia = { version = "0.6", default-features = false, features = ["all"] }
 mp4parse = "0.17"

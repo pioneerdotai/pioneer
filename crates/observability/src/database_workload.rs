@@ -41,10 +41,11 @@ pub enum DatabaseWorkload {
     NativeEventCleanup,
     FrozenStorageMaintenance,
     HtmlPreviewMaintenance,
+    PortablePayloadMaintenance,
 }
 
 impl DatabaseWorkload {
-    pub const CARDINALITY: usize = 21;
+    pub const CARDINALITY: usize = 22;
 
     const fn index(self) -> usize {
         match self {
@@ -69,6 +70,7 @@ impl DatabaseWorkload {
             Self::NativeEventCleanup => 18,
             Self::FrozenStorageMaintenance => 19,
             Self::HtmlPreviewMaintenance => 20,
+            Self::PortablePayloadMaintenance => 21,
         }
     }
 
@@ -95,6 +97,7 @@ impl DatabaseWorkload {
             Self::NativeEventCleanup => "cli_runtime.native_event_cleanup",
             Self::FrozenStorageMaintenance => "frozen_storage.maintenance",
             Self::HtmlPreviewMaintenance => "html_preview.maintenance",
+            Self::PortablePayloadMaintenance => "portable_payload.maintenance",
         }
     }
 }
@@ -140,6 +143,7 @@ pub enum DatabaseOperationSite {
     FrozenStorageBatch,
     NativeEventCleanupQuantum,
     ProjectionReceiptCleanupQuantum,
+    PortablePayloadQuantum,
 }
 
 impl DatabaseOperationSite {
@@ -182,6 +186,7 @@ impl DatabaseOperationSite {
             Self::FrozenStorageBatch => "frozen_storage_batch",
             Self::NativeEventCleanupQuantum => "native_event_cleanup_quantum",
             Self::ProjectionReceiptCleanupQuantum => "projection_receipt_cleanup_quantum",
+            Self::PortablePayloadQuantum => "portable_payload_quantum",
         }
     }
 }
@@ -501,7 +506,7 @@ fn anomaly_reason(snapshot: &DatabaseWorkloadSnapshot) -> Option<&'static str> {
     }
 }
 
-fn reserve_anomaly_trace(workload: DatabaseWorkload) -> bool {
+pub(crate) fn reserve_anomaly_trace(workload: DatabaseWorkload) -> bool {
     let now_millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -554,6 +559,7 @@ mod tests {
             DatabaseWorkload::NativeEventCleanup,
             DatabaseWorkload::FrozenStorageMaintenance,
             DatabaseWorkload::HtmlPreviewMaintenance,
+            DatabaseWorkload::PortablePayloadMaintenance,
         ];
         assert_eq!(workloads.len(), DatabaseWorkload::CARDINALITY);
         assert_eq!(
@@ -580,6 +586,7 @@ mod tests {
                 "cli_runtime.native_event_cleanup",
                 "frozen_storage.maintenance",
                 "html_preview.maintenance",
+                "portable_payload.maintenance",
             ]
         );
     }

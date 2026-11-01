@@ -42,6 +42,17 @@ use tokio::time::{Duration, sleep};
 
 const TASK_EXECUTION_HEARTBEAT_SECONDS: u64 = 30;
 
+// Local control-flow context, never a launch-failure descriptor. Anyhow keeps
+// the original prepare/commit/join error available for typed downcasts.
+#[derive(Debug)]
+struct RevisionCompletionFailure;
+
+impl std::fmt::Display for RevisionCompletionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("revision completion failed")
+    }
+}
+
 fn task_agent_liveness_timeouts(task: &Task) -> (i64, i64) {
     let defaults = pioneer_config::GatewayProviderStreamItemTimeoutConfig::default();
     let configured = task.timeout_policy.as_ref();
@@ -3054,50 +3065,60 @@ impl TaskAgentExecutor {
             run.task_id.clone(),
             run.id.clone(),
         );
-        let authority_processor = Arc::clone(&processor);
-        let authority_task_response = task_response.clone();
-        let root_still_has_authority = message_fresh_task(async move {
-            Self::root_collaboration_still_has_task_authority(
-                &authority_processor,
-                &authority_task_response,
-            )
-            .await
-        })
-        .await
-        .context("task revision authority revalidation task did not finish")??;
-        if !root_still_has_authority {
-            self.block_revision_dispatch_turn(
-                &processor,
-                child_runtime,
-                handle,
-                task_error(
-                    "task_root_access_revoked",
-                    "task continuation was blocked after root-thread access was revoked".to_owned(),
-                    TaskErrorClass::Policy,
-                    Some(run.id.clone()),
-                ),
-            )
-            .await?;
-            return message_future(task_revise_response_from_store(&processor, response)).await;
-        }
-        let lock_processor = Arc::clone(&processor);
-        let lock_task = task_response.task.clone();
-        let lock_run = run.clone();
-        let lock_handle = handle.clone();
-        let lock_outcome = message_fresh_task(async move {
-            Self::acquire_write_locks_owned(lock_processor, lock_task, lock_run, lock_handle).await
-        })
-        .await
-        .context("task revision write-lock phase did not finish")??;
-        match lock_outcome {
-            TaskExecutorStartOutcome::Started => {}
-            TaskExecutorStartOutcome::Queued | TaskExecutorStartOutcome::Rejected => {
-                return message_future(task_revise_response_from_store(&processor, response)).await;
-            }
-        }
         let revision_executor = Arc::clone(self);
         let revision_processor = Arc::clone(&processor);
-        message_fresh_task(async move {
+        let failed_child = child_runtime.clone();
+        let failed_handle = handle.clone();
+        let failed_run_id = run.id.clone();
+        let dispatched = message_fresh_task(async move {
+            // The snapshot/handle above are authoritative for all remaining
+            // admission phases, including ordinary authority and lock errors.
+            handle.pin_agent_attempt(&execution.id).await?;
+            let authority_processor = Arc::clone(&revision_processor);
+            let authority_task_response = task_response.clone();
+            let root_still_has_authority = message_fresh_task(async move {
+                Self::root_collaboration_still_has_task_authority(
+                    &authority_processor,
+                    &authority_task_response,
+                )
+                .await
+            })
+            .await
+            .context("task revision authority revalidation task did not finish")??;
+            if !root_still_has_authority {
+                return Ok(Some((
+                    TaskRunTurnStatus::Blocked,
+                    task_error(
+                        "task_root_access_revoked",
+                        "task continuation was blocked after root-thread access was revoked"
+                            .to_owned(),
+                        TaskErrorClass::Policy,
+                        Some(run.id.clone()),
+                    ),
+                )));
+            }
+            // The generic helper terminalizes Reject without a revision and
+            // returns Started. Here the decision must retain revision ownership
+            // and stop dispatch before any provider/action binding is prepared.
+            match revision_processor
+                .critical_task_service()
+                .acquire_write_locks_for_run(&run.id, now_timestamp_secs())
+                .await?
+            {
+                WriteLockDecision::NoLocksRequired | WriteLockDecision::Acquired(_) => {}
+                WriteLockDecision::Queued => return Ok(None),
+                WriteLockDecision::Rejected => {
+                    return Ok(Some((
+                        TaskRunTurnStatus::Failed,
+                        task_error(
+                            "write_lock_conflict",
+                            "write scope conflicts with another active task run".to_owned(),
+                            TaskErrorClass::Policy,
+                            Some(run.id.clone()),
+                        ),
+                    )));
+                }
+            }
             revision_executor
                 .dispatch_existing_revision_turn(
                     &revision_processor,
@@ -3109,9 +3130,67 @@ impl TaskAgentExecutor {
                     handle,
                 )
                 .await
+                .map(|()| None)
         })
         .await
-        .context("existing task revision turn task did not finish")??;
+        .context("task revision admission/dispatch task did not finish")
+        .and_then(|outcome| outcome);
+        match dispatched {
+            Ok(Some((status, error))) => {
+                let processor = Arc::clone(&processor);
+                message_fresh_task(async move {
+                    Self::finish_revision_dispatch_turn_owned(
+                        processor,
+                        failed_child,
+                        failed_handle,
+                        error,
+                        status,
+                    )
+                    .await
+                })
+                .await
+                .context("task revision admission completion task did not finish")??;
+            }
+            Err(mut error) => {
+                // An explicit terminal branch already attempted completion.
+                // Its rollback must not trigger a second transition with a
+                // newly classified storage/start error in place of that outcome.
+                if error.downcast_ref::<RevisionCompletionFailure>().is_some() {
+                    return Err(error);
+                }
+                // A late preparation path may already have committed this outcome.
+                // Cancellation/success also own their terminal state exclusively.
+                if !processor
+                    .crud_store
+                    .get_task_run(&failed_run_id)
+                    .await?
+                    .is_some_and(|run| run.status.is_terminal())
+                {
+                    let descriptor =
+                        pioneer_tasks::TaskStartFailure::report_for_scheduler(&mut error);
+                    let closed = self
+                        .block_revision_dispatch_turn(
+                            &processor,
+                            failed_child,
+                            failed_handle,
+                            descriptor.task_error(Some(failed_run_id)),
+                        )
+                        .await;
+                    if let Err(transition_error) = closed
+                        && transition_error
+                            .downcast_ref::<pioneer_crud::TaskTerminalConflict>()
+                            .is_none()
+                    {
+                        return Err(transition_error);
+                    }
+                    // A competing terminal/revision transition owns the winner.
+                    // Keep the original report instead of reporting the rejected
+                    // stale write as another launch failure.
+                }
+                return Err(error);
+            }
+            Ok(None) => {}
+        }
         message_future(task_revise_response_from_store(&processor, response)).await
     }
 
@@ -3136,7 +3215,8 @@ impl TaskAgentExecutor {
             match turn.status {
                 TurnStatus::Completed => {
                     self.complete_child_turn(processor, child_runtime, handle)
-                        .await?;
+                        .await
+                        .context(RevisionCompletionFailure)?;
                 }
                 TurnStatus::Failed | TurnStatus::Interrupted => {
                     let error_message = turn
@@ -3151,14 +3231,16 @@ impl TaskAgentExecutor {
                         target_status,
                         handle,
                     )
-                    .await?;
+                    .await
+                    .context(RevisionCompletionFailure)?;
                 }
                 TurnStatus::Blocked => {
                     let error_message = turn
                         .error
                         .unwrap_or_else(|| "revision child turn blocked".to_owned());
                     self.block_child_turn(child_runtime, error_message.as_str(), handle)
-                        .await?;
+                        .await
+                        .context(RevisionCompletionFailure)?;
                 }
                 TurnStatus::InProgress => {
                     revalidate_existing_task_child_execution_authorization(
@@ -3380,46 +3462,71 @@ impl TaskAgentExecutor {
                     ),
                 )
                 .await;
-            let prepared = processor
-                .prepare_task_cli_runtime_turn(
-                    TurnStartParams {
-                        agent_delegation_routes: Vec::new(),
-                        thread_id: child_thread_id.clone(),
-                        turn_id: child_turn_id.clone(),
-                        input,
-                        capabilities: turn_settings.capabilities.clone(),
-                        model: Some(effective_model.model.clone()),
-                        model_provider: Some(effective_model.model_provider.clone()),
-                        sandbox_policy: None,
-                        mode: Some(ThreadMode::Agent),
-                        agent_launch: None,
-                        reply_to_turn_id: None,
-                        mentioned_principal_ids: Vec::new(),
-                        execution_backend: Some(turn_settings.execution_backend.clone()),
-                        reasoning: turn_settings.reasoning.clone(),
-                        permission_profile: turn_settings.permission_selection.clone(),
-                        cli_runtime_options: None,
-                    },
-                    runtime_id,
-                    runtime_kind,
-                    child_permission_profile,
-                    child_security_snapshot,
-                    child_authorization_context,
-                    child_authorization_revalidation,
-                    child_thread_id.clone(),
-                    parent.parent_thread_id.clone(),
-                    run.id.clone(),
-                    execution.id.clone(),
-                    action_author,
-                    turn_response.clone(),
-                    None,
+            let prepare_processor = Arc::clone(processor);
+            let continuation_thread_id = child_thread_id.clone();
+            let context_thread_id = parent.parent_thread_id.clone();
+            let task_run_id = run.id.clone();
+            let execution_id = execution.id.clone();
+            let prepare_params = TurnStartParams {
+                agent_delegation_routes: Vec::new(),
+                thread_id: child_thread_id.clone(),
+                turn_id: child_turn_id.clone(),
+                input,
+                capabilities: turn_settings.capabilities.clone(),
+                model: Some(effective_model.model.clone()),
+                model_provider: Some(effective_model.model_provider.clone()),
+                sandbox_policy: None,
+                mode: Some(ThreadMode::Agent),
+                agent_launch: None,
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
+                execution_backend: Some(turn_settings.execution_backend.clone()),
+                reasoning: turn_settings.reasoning.clone(),
+                permission_profile: turn_settings.permission_selection.clone(),
+                cli_runtime_options: None,
+            };
+            // As with initial Task startup, CLI preparation and activation need
+            // fresh poll stacks below revision dispatch. The existing task
+            // boundary aborts the owned work if this dispatch is cancelled.
+            let prepared = message_fresh_task(async move {
+                prepare_processor
+                    .prepare_task_cli_runtime_turn(
+                        prepare_params,
+                        runtime_id,
+                        runtime_kind,
+                        child_permission_profile,
+                        child_security_snapshot,
+                        child_authorization_context,
+                        child_authorization_revalidation,
+                        continuation_thread_id,
+                        context_thread_id,
+                        task_run_id,
+                        execution_id,
+                        action_author,
+                        turn_response,
+                        None,
+                    )
+                    .await
+            })
+            .await
+            .context("revision CLI preparation task did not finish")
+            .and_then(|result| result)
+            .map_err(|error| {
+                pioneer_tasks::TaskStartFailure::from_error(
+                    pioneer_tasks::TaskStartStage::CliPreparation,
+                    error,
                 )
-                .await
-                .context("failed to prepare revision CLI runtime turn")?;
-            processor
-                .activate_prepared_task_cli_runtime_turn(prepared)
-                .await
-                .context("failed to activate revision CLI runtime turn")?;
+            })
+            .context("failed to prepare revision CLI runtime turn")?;
+            let activation_processor = Arc::clone(processor);
+            message_fresh_task(async move {
+                activation_processor
+                    .activate_prepared_task_cli_runtime_turn(prepared)
+                    .await
+            })
+            .await
+            .context("revision CLI activation task did not finish")?
+            .context("failed to activate revision CLI runtime turn")?;
             let started_at = now_timestamp_secs();
             processor
                 .crud_store
@@ -4567,13 +4674,14 @@ impl TaskAgentExecutor {
         {
             bail!("restored task turn runtime identity does not match its authoritative snapshot");
         }
-        let (hook_runtime_context, history) =
-            crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(
-                processor.crud_store.as_ref(),
-                &runtime_snapshot,
-            )
-            .await
-            .context("failed to restore frozen Task conversation scope")?;
+        let (hook_runtime_context, history) = restore_task_conversation_scope(
+            &ordinary_history_store(processor.crud_store.as_ref()),
+            task,
+            &parent,
+            &runtime_snapshot,
+        )
+        .await
+        .context("failed to restore frozen Task conversation scope")?;
         let agent_skill_overlay =
             crate::turn_runtime_snapshot::restore_agent_skill_overlay_from_snapshot(
                 processor.crud_store.as_ref(),
@@ -6610,6 +6718,13 @@ impl TaskAgentExecutor {
         let block_reason = error
             .recovery_public_message()
             .unwrap_or_else(|| reason.to_owned());
+        if child_runtime.task_run_turn.kind == TaskRunTurnKind::Revision
+            && child_runtime.task_run_turn.status == TaskRunTurnStatus::InProgress
+        {
+            return self
+                .block_revision_dispatch_turn(&processor, child_runtime, handle, error)
+                .await;
+        }
         handle
             .record_task_run_turn_blocked(
                 blocked_task_run_turn(&child_runtime.task_run_turn, blocked_at),
@@ -6632,33 +6747,59 @@ impl TaskAgentExecutor {
     ) -> Result<()> {
         let processor = Arc::clone(processor);
         message_fresh_task(async move {
-            Self::block_revision_dispatch_turn_owned(processor, child_runtime, handle, error).await
+            Self::finish_revision_dispatch_turn_owned(
+                processor,
+                child_runtime,
+                handle,
+                error,
+                TaskRunTurnStatus::Blocked,
+            )
+            .await
         })
         .await
-        .context("task revision block transition task did not finish")?
+        .context("task revision block transition task did not finish")
+        .and_then(|outcome| outcome)
+        .context(RevisionCompletionFailure)
     }
 
-    async fn block_revision_dispatch_turn_owned(
+    async fn finish_revision_dispatch_turn_owned(
         processor: Arc<MessageProcessor>,
         child_runtime: TaskRunChildRuntime,
         handle: TaskExecutionHandle,
         mut error: TaskError,
+        status: TaskRunTurnStatus,
     ) -> Result<()> {
-        let blocked_at = now_timestamp_secs();
+        let completed_at = now_timestamp_secs();
         error.details = Some(revision_dispatch_error_details(
             &child_runtime.task_run_turn,
+            error.details.take(),
         ));
         let message = error.message.clone();
-        handle
-            .record_task_run_turn_blocked(
-                blocked_task_run_turn(&child_runtime.task_run_turn, blocked_at),
-                Some(error.clone()),
-                blocked_at,
-            )
-            .await?;
-        handle.block_run(Some(error), blocked_at).await?;
-        mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, message.as_str())
-            .await?;
+        match status {
+            TaskRunTurnStatus::Blocked => {
+                handle
+                    .block_run_with_revision(
+                        child_runtime.task_run_turn.clone(),
+                        error,
+                        completed_at,
+                    )
+                    .await?;
+                mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, &message)
+                    .await?;
+            }
+            TaskRunTurnStatus::Failed => {
+                handle
+                    .fail_run_with_revision(
+                        child_runtime.task_run_turn.clone(),
+                        error,
+                        completed_at,
+                    )
+                    .await?;
+                mark_task_run_occurrence_turn_failed(&processor, &child_runtime.lineage, &message)
+                    .await?;
+            }
+            _ => bail!("unsupported revision dispatch terminal outcome"),
+        }
         Ok(())
     }
 }
@@ -7135,6 +7276,100 @@ fn task_hook_runtime_context(
     )
 }
 
+// Reconstruct routing only from trusted Task ancestry and admitted creator
+// metadata. Frozen history and permissions are never rewritten for affinity.
+pub(crate) async fn task_cache_routing_context(
+    store: &pioneer_crud::CrudStore,
+    task: &Task,
+    parent_thread_id: &str,
+    mut context: AgentTurnHookRuntimeContext,
+) -> Result<AgentTurnHookRuntimeContext> {
+    if context.cache_task_group_id.is_some() {
+        return Ok(context);
+    }
+    let mut root = task.clone();
+    let mut visited = std::collections::BTreeSet::new();
+    // Task service currently caps depth at 10. Keep corrupt/legacy chains bounded.
+    for _ in 0..16 {
+        if !visited.insert(root.id.clone()) {
+            break;
+        }
+        let ancestor = root
+            .root_task_id
+            .as_deref()
+            .filter(|id| *id != root.id.as_str())
+            .or(root.parent_task_id.as_deref());
+        let Some(id) = ancestor else { break };
+        let Some(record) = store
+            .get_task_record(id)
+            .await?
+            .filter(|record| record.workspace_id == task.workspace_id)
+        else {
+            break;
+        };
+        root = record;
+    }
+    let group = if root.parent_task_id.is_none()
+        && task_attachment(&root) == TaskAttachmentMode::Attached
+    {
+        let inherited = if let Some(turn) = root.created_by_turn_id.as_deref() {
+            store
+                .get_turn_runtime_snapshot(turn)
+                .await?
+                .filter(|snapshot| {
+                    snapshot.workspace_id == task.workspace_id
+                        && Some(snapshot.thread_id.as_str()) == root.created_by_thread_id.as_deref()
+                })
+                .and_then(|snapshot| {
+                    serde_json::from_str::<AgentTurnHookRuntimeContext>(
+                        &snapshot.hook_runtime_context_json,
+                    )
+                    .ok()
+                })
+        } else {
+            None
+        };
+        inherited
+            .as_ref()
+            .and_then(|ctx| ctx.cache_task_group_id.clone())
+            .filter(|owner| !owner.is_empty())
+            .unwrap_or_else(|| {
+                let creator = root
+                    .created_by_thread_id
+                    .as_deref()
+                    .unwrap_or(parent_thread_id);
+                let owner = inherited
+                    .as_ref()
+                    .map(|ctx| ctx.effective_conversation_thread_id(creator))
+                    .unwrap_or(creator);
+                format!("conversation:{owner}")
+            })
+    } else {
+        // Missing/corrupt ancestry cannot authorize a conversation-wide group.
+        format!("task:{}", task.root_task_id.as_deref().unwrap_or(&root.id))
+    };
+    context.cache_task_group_id = Some(group);
+    Ok(context)
+}
+
+async fn restore_task_conversation_scope(
+    store: &pioneer_crud::CrudStore,
+    task: &Task,
+    parent: &TaskParentRuntimeContext,
+    snapshot: &pioneer_crud::TurnRuntimeSnapshotRecord,
+) -> Result<(
+    AgentTurnHookRuntimeContext,
+    Vec<pioneer_provider::ChatMessage>,
+)> {
+    let (context, history) =
+        crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(store, snapshot)
+            .await?;
+    Ok((
+        task_cache_routing_context(store, task, &parent.parent_thread_id, context).await?,
+        history,
+    ))
+}
+
 fn task_history_start_failure(error: anyhow::Error) -> anyhow::Error {
     pioneer_tasks::TaskStartFailure::from_error(
         pioneer_tasks::TaskStartStage::HistoryPreparation,
@@ -7160,11 +7395,10 @@ async fn load_task_execution_conversation_scope(
     Vec<pioneer_provider::ChatMessage>,
 )> {
     let (hook_context, mut history) = scope_current_stage(Stage::TaskHistory, async {
-        let expected_hook_context = task_hook_runtime_context(task, parent, task_run_turn_kind);
+        let history_store = ordinary_history_store(processor.crud_store.as_ref());
         // The Task transition itself retains its narrow Critical writes. History
         // preparation may register legacy metadata, so give that entire operation
         // the normal class of its caller rather than inheriting Critical writes.
-        let history_store = ordinary_history_store(processor.crud_store.as_ref());
         // A Composer snapshot is the next user's root history consumer. Share
         // priority with root preparation before accepting that immutable input.
         let history_cancellation = tokio_util::sync::CancellationToken::new();
@@ -7190,15 +7424,25 @@ async fn load_task_execution_conversation_scope(
                     "task child runtime snapshot identity mismatch for turn `{execution_turn_id}`"
                 );
             }
-            let (context, projection) =
+            let (mut context, projection) =
                 crate::turn_runtime_snapshot::restored_conversation_scope_projection_from_snapshot(
                     &history_store,
                     &snapshot,
                 )
                 .await
                 .context("failed to restore frozen Task conversation scope")?;
+            context =
+                task_cache_routing_context(&history_store, task, &parent.parent_thread_id, context)
+                    .await?;
             return Ok((context, projection.messages));
         }
+        let expected_hook_context = task_cache_routing_context(
+            &history_store,
+            task,
+            &parent.parent_thread_id,
+            task_hook_runtime_context(task, parent, task_run_turn_kind),
+        )
+        .await?;
         let source_turn_id = task
             .metadata
             .as_ref()
@@ -7570,6 +7814,359 @@ mod prepared_snapshot_tests {
             background.database_connection().write_class(),
             SqliteWriteClass::Maintenance
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_task_restart_restores_standalone_and_nested_affinity_without_snapshot_rewrite()
+    {
+        use pioneer_entity::{task as task_entity, turn as turn_entity};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        let store = fixture("legacy-affinity").await;
+        let parent = TaskParentRuntimeContext {
+            parent_thread_id: "parent".into(),
+            parent_turn_id: Some("own-turn".into()),
+            presentation_thread_id: "parent".into(),
+            home_root_thread_id: "parent".into(),
+            root_thread_id: "parent".into(),
+        };
+        // Old runtime snapshots deliberately omit cache_task_group_id.
+        async fn save_legacy(
+            store: &pioneer_crud::CrudStore,
+            turn: &str,
+            thread: &str,
+            hook: &AgentTurnHookRuntimeContext,
+        ) -> pioneer_crud::TurnRuntimeSnapshotRecord {
+            let now = chrono::Utc::now().fixed_offset();
+            let encoded = serde_json::to_string(hook).unwrap();
+            assert!(!encoded.contains("cache_task_group_id"));
+            store
+                .upsert_turn_runtime_snapshot(pioneer_crud::NewTurnRuntimeSnapshot {
+                    turn_id: turn.into(),
+                    thread_id: thread.into(),
+                    workspace_id: "legacy-affinity".into(),
+                    mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
+                    model: "m".into(),
+                    provider_name: "p".into(),
+                    reasoning_effort: None,
+                    agent_skill_versions_json: None,
+                    hook_runtime_context_json: encoded,
+                    workspace_skill_policies_json: "{}".into(),
+                    input_json: "[]".into(),
+                    capabilities_json: "[]".into(),
+                    resolved_artifacts_json: "[]".into(),
+                    runtime_environment_json: "{}".into(),
+                    history_json: "[]".into(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .unwrap()
+        }
+        let main = AgentTurnHookRuntimeContext::default();
+        save_legacy(&store, "own-turn", "parent", &main).await;
+        for turn in ["loser-turn", "winner-turn"] {
+            let mut row = turn_entity::Entity::find_by_id(turn)
+                .one(&store.database_connection())
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active_model();
+            row.thread_id = Set("execution".into());
+            row.update(&store.database_connection()).await.unwrap();
+        }
+        let own = store.get_task_record("own-task").await.unwrap().unwrap();
+        let race = store.get_task_record("race-task").await.unwrap().unwrap();
+        let mut own_hook = task_hook_runtime_context(&own, &parent, TaskRunTurnKind::Initial);
+        own_hook.cache_task_group_id = None;
+        let own_snapshot = save_legacy(&store, "loser-turn", "execution", &own_hook).await;
+        let race_hook = task_hook_runtime_context(&race, &parent, TaskRunTurnKind::Initial);
+        let race_snapshot = save_legacy(&store, "winner-turn", "execution", &race_hook).await;
+        // This is the same restore owner used by restart_in_progress_child_turn.
+        let (restored, history) =
+            restore_task_conversation_scope(&store, &own, &parent, &own_snapshot)
+                .await
+                .unwrap();
+        let (unrelated, _) =
+            restore_task_conversation_scope(&store, &race, &parent, &race_snapshot)
+                .await
+                .unwrap();
+        assert!(history.is_empty());
+        assert_eq!(
+            restored.cache_task_group_id.as_deref(),
+            Some("task:own-task")
+        );
+        assert_ne!(restored.cache_task_group_id, unrelated.cache_task_group_id);
+        let mut child = own.clone();
+        child.id = "related-child".into();
+        child.parent_task_id = Some(own.id.clone());
+        child.root_task_id = Some(own.id.clone());
+        let related = task_cache_routing_context(
+            &store,
+            &child,
+            &parent.parent_thread_id,
+            AgentTurnHookRuntimeContext::task(&child.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.cache_task_group_id, related.cache_task_group_id);
+
+        // A legacy top-level attached root belongs to its initiating main,
+        // even when its own saved creator context has no new routing field.
+        let mut row = task_entity::Entity::find_by_id("race-task")
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active_model();
+        row.created_by_thread_id = Set(Some("parent".into()));
+        row.created_by_turn_id = Set(Some("own-turn".into()));
+        row.lifecycle_policy_json = Set(Some(
+            serde_json::to_string(&pioneer_protocol::TaskLifecyclePolicy {
+                attachment: TaskAttachmentMode::Attached,
+                on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
+            })
+            .unwrap(),
+        ));
+        row.update(&store.database_connection()).await.unwrap();
+        let attached = store.get_task_record("race-task").await.unwrap().unwrap();
+        let hook = task_hook_runtime_context(&attached, &parent, TaskRunTurnKind::Initial);
+        let snapshot = save_legacy(&store, "winner-turn", "execution", &hook).await;
+        let (root_context, _) =
+            restore_task_conversation_scope(&store, &attached, &parent, &snapshot)
+                .await
+                .unwrap();
+        assert_eq!(
+            root_context.cache_task_group_id.as_deref(),
+            Some("conversation:parent")
+        );
+        let mut nested = attached.clone();
+        nested.id = "nested-attached".into();
+        nested.parent_task_id = Some(attached.id.clone());
+        nested.root_task_id = Some(attached.id.clone());
+        nested.created_by_turn_id = Some("winner-turn".into());
+        nested.created_by_thread_id = Some("execution".into());
+        let nested_context = task_cache_routing_context(
+            &store,
+            &nested,
+            &parent.parent_thread_id,
+            AgentTurnHookRuntimeContext::task(&nested.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            root_context.cache_task_group_id,
+            nested_context.cache_task_group_id
+        );
+        let persisted = store
+            .get_turn_runtime_snapshot("winner-turn")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.hook_runtime_context_json,
+            snapshot.hook_runtime_context_json
+        );
+        assert_eq!(persisted.history_json, snapshot.history_json);
+        assert!(
+            serde_json::from_str::<AgentTurnHookRuntimeContext>(
+                &persisted.hook_runtime_context_json
+            )
+            .unwrap()
+            .cache_task_group_id
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn common_cold_recovery_restores_legacy_task_routing_from_durable_binding() {
+        use pioneer_entity::{
+            task as task_entity, task_run, thread as thread_entity, turn as turn_entity,
+        };
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        let store = fixture("common-cache-recovery").await;
+        let parent = TaskParentRuntimeContext {
+            parent_thread_id: "parent".into(),
+            parent_turn_id: None,
+            presentation_thread_id: "parent".into(),
+            home_root_thread_id: "parent".into(),
+            root_thread_id: "parent".into(),
+        };
+        let mut child = task_entity::Entity::find_by_id("own-task")
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active_model();
+        child.id = Set("related-task".into());
+        child.parent_task_id = Set(Some("own-task".into()));
+        child.root_task_id = Set(Some("own-task".into()));
+        child.lifecycle_policy_json = Set(Some(
+            serde_json::to_string(&pioneer_protocol::TaskLifecyclePolicy {
+                attachment: TaskAttachmentMode::Attached,
+                on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
+            })
+            .unwrap(),
+        ));
+        child.insert(&store.database_connection()).await.unwrap();
+        let mut run = task_run::Entity::find_by_id("own-run")
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active_model();
+        run.id = Set("related-run".into());
+        run.task_id = Set("related-task".into());
+        run.run_group_id = Set("related-run".into());
+        run.insert(&store.database_connection()).await.unwrap();
+        for id in ["own-execution", "race-execution"] {
+            let mut thread = thread_entity::Entity::find_by_id("execution")
+                .one(&store.database_connection())
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active_model();
+            thread.id = Set(id.into());
+            thread.insert(&store.database_connection()).await.unwrap();
+        }
+        let permission = pioneer_protocol::default_turn_permission_profile_snapshot();
+        let security = TurnExecutionSecuritySnapshot::workspace_write(
+            permission.clone(),
+            "/tmp/cache-recovery",
+            vec![
+                pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                    pioneer_protocol::TurnFilesystemAccess::Write,
+                    "/tmp/cache-recovery",
+                ),
+            ],
+            1,
+        );
+        let mut groups = Vec::new();
+        for (task_id, run_id, thread, turn) in [
+            ("own-task", "own-run", "own-execution", "own-turn"),
+            ("race-task", "race-run", "race-execution", "loser-turn"),
+            ("related-task", "related-run", "execution", "winner-turn"),
+        ] {
+            let mut turn_row = turn_entity::Entity::find_by_id(turn)
+                .one(&store.database_connection())
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active_model();
+            turn_row.thread_id = Set(thread.into());
+            turn_row.status = Set("in_progress".into());
+            turn_row.update(&store.database_connection()).await.unwrap();
+            store
+                .upsert_task_run_turn(TaskRunTurn {
+                    id: format!("binding-{task_id}"),
+                    task_id: task_id.into(),
+                    run_id: run_id.into(),
+                    execution_id: None,
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    kind: TaskRunTurnKind::Initial,
+                    round: 0,
+                    sequence: 1,
+                    status: TaskRunTurnStatus::InProgress,
+                    reviews_candidate_id: None,
+                    requested_by_candidate_id: None,
+                    requested_by_review_event_id: None,
+                    created_at: 1,
+                    started_at: Some(1),
+                    completed_at: None,
+                })
+                .await
+                .unwrap();
+            let task = store.get_task_record(task_id).await.unwrap().unwrap();
+            let hook = task_hook_runtime_context(&task, &parent, TaskRunTurnKind::Initial);
+            let history = vec![pioneer_provider::ChatMessage::user(
+                "retained accepted history",
+            )];
+            let saved = store
+                .upsert_turn_runtime_snapshot(
+                    crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
+                        thread,
+                        "common-cache-recovery",
+                        turn,
+                        ThreadMode::Agent,
+                        &hook,
+                        "m",
+                        "p",
+                        None,
+                        &Default::default(),
+                        &[],
+                        &[],
+                        &[],
+                        &Default::default(),
+                        &history,
+                        &[],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !saved
+                    .hook_runtime_context_json
+                    .contains("cache_task_group_id")
+            );
+            // Actual common recovery snapshot boundary, used by RecoveryCoordinator.
+            let cold = crate::turn_runtime_snapshot::restored_recovery_turn_request_from_snapshot(
+                &store,
+                &saved,
+                permission.clone(),
+                security.clone(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            let (ordinary, ordinary_history) =
+                restore_task_conversation_scope(&store, &task, &parent, &saved)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                cold.hook_runtime_context.cache_task_group_id,
+                ordinary.cache_task_group_id
+            );
+            assert_eq!(cold.history, history);
+            assert_eq!(cold.history, ordinary_history);
+            assert_eq!(cold.permission_profile, permission);
+            assert_eq!(cold.execution_security_snapshot.as_ref(), Some(&security));
+            assert_eq!(
+                store
+                    .get_turn_runtime_snapshot(turn)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                saved
+            );
+            if task_id == "own-task" {
+                let mut mismatch = saved.clone();
+                let mut wrong_hook = hook.clone();
+                wrong_hook.task_id = Some("unrelated-task".into());
+                mismatch.hook_runtime_context_json = serde_json::to_string(&wrong_hook).unwrap();
+                let error =
+                    crate::turn_runtime_snapshot::restored_recovery_turn_request_from_snapshot(
+                        &store,
+                        &mismatch,
+                        permission.clone(),
+                        security.clone(),
+                        vec![],
+                    )
+                    .await
+                    .err()
+                    .expect("foreign hook Task identity must not replace durable binding");
+                assert!(error.to_string().contains("recovery Task routing identity"));
+            }
+            groups.push(cold.hook_runtime_context.cache_task_group_id.unwrap());
+        }
+        assert_eq!(groups[0], "task:own-task");
+        assert_eq!(groups[1], "task:race-task");
+        assert_ne!(groups[0], groups[1]);
+        assert_eq!(groups[0], groups[2]);
     }
 
     async fn fixture(workspace: &str) -> pioneer_crud::CrudStore {
@@ -8560,6 +9157,7 @@ async fn ensure_task_run_occurrence_turn(
     let occurrence_author = exact_agent_execution_author(processor, execution.id.as_str()).await?;
     let occurrence_actor = occurrence_author.actor.clone();
     let occurrence_turn = Turn {
+        work_owner: Default::default(),
         id: run.id.clone(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::TaskRun,
@@ -9176,8 +9774,11 @@ fn blocked_task_run_turn(task_run_turn: &TaskRunTurn, completed_at: i64) -> Task
     blocked
 }
 
-fn revision_dispatch_error_details(task_run_turn: &TaskRunTurn) -> TaskValue {
-    TaskValue::Object(BTreeMap::from([
+fn revision_dispatch_error_details(
+    task_run_turn: &TaskRunTurn,
+    original: Option<TaskValue>,
+) -> TaskValue {
+    let mut fields = BTreeMap::from([
         (
             "taskRunTurnId".to_owned(),
             TaskValue::String(task_run_turn.id.clone()),
@@ -9206,7 +9807,19 @@ fn revision_dispatch_error_details(task_run_turn: &TaskRunTurn) -> TaskValue {
                 .map(TaskValue::String)
                 .unwrap_or(TaskValue::Null),
         ),
-    ]))
+    ]);
+    match original {
+        Some(TaskValue::Object(original))
+            if original.keys().all(|key| !fields.contains_key(key)) =>
+        {
+            fields.extend(original);
+        }
+        Some(original) => {
+            fields.insert("originalDetails".to_owned(), original);
+        }
+        None => {}
+    }
+    TaskValue::Object(fields)
 }
 
 async fn record_task_run_turn_failure(
@@ -11547,6 +12160,35 @@ mod tests {
     }
 
     #[test]
+    fn revision_metadata_preserves_non_object_and_colliding_original_details() {
+        let turn = test_task_run_turn();
+        for original in [
+            TaskValue::String("existing safe detail".to_owned()),
+            TaskValue::Object(BTreeMap::from([
+                (
+                    "taskRunTurnId".to_owned(),
+                    TaskValue::from("existing service field"),
+                ),
+                (
+                    "originalDetails".to_owned(),
+                    TaskValue::from("existing nested detail"),
+                ),
+            ])),
+        ] {
+            let TaskValue::Object(details) =
+                revision_dispatch_error_details(&turn, Some(original.clone()))
+            else {
+                panic!("revision details");
+            };
+            assert_eq!(details.get("originalDetails"), Some(&original));
+            assert_eq!(
+                details.get("taskRunTurnId"),
+                Some(&TaskValue::from(turn.id.clone()))
+            );
+        }
+    }
+
+    #[test]
     fn task_child_runtime_requires_exact_non_self_rooted_collaboration_lineage() {
         let task_run_turn = test_task_run_turn();
         let valid = TaskThreadLineage {
@@ -13215,6 +13857,7 @@ mod tests {
         candidate_thread.origin_kind = ThreadOriginKind::TaskRun;
         candidate_thread.sidebar_visibility = ThreadSidebarVisibility::Hidden;
         let mut source_turn = Turn {
+            work_owner: pioneer_protocol::TurnWorkOwner::Turn,
             id: candidate_turn.turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,
@@ -13390,6 +14033,7 @@ mod tests {
         thread.origin_kind = ThreadOriginKind::TaskRun;
         thread.sidebar_visibility = ThreadSidebarVisibility::Hidden;
         let turn = Turn {
+            work_owner: pioneer_protocol::TurnWorkOwner::Turn,
             id: review_turn.turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,

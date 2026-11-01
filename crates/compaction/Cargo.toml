@@ -11,5 +11,4 @@ serde_json.workspace = true
 anyhow.workspace = true
 sha2.workspace = true
 hex.workspace = true
-tiktoken-rs.workspace = true
 async-trait.workspace = true

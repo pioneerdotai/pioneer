@@ -20,9 +20,9 @@ struct ResultCursorProtection<'a> {
     scope: &'a str,
 }
 
-// Size the exact public representation, including the real random ciphertext
-// and the handler's Value serialization order. Return that same sealed cursor;
-// encrypting it again after checking would change its token count.
+// Encode the delivered representation and its protected cursor. Cursor ciphertext
+// is URL-safe ASCII: its length, rather than its random contents, determines the
+// shared UTF-16 estimate. Keep the independently checked hard byte limit.
 fn result_delivery_encoding(
     mut response: ThreadToolResultReadResponse,
     protection: Option<ResultCursorProtection<'_>>,
@@ -38,11 +38,72 @@ fn result_delivery_encoding(
     };
     Ok((response, encoded))
 }
-fn result_projection_excess(encoded: &str) -> Result<usize> {
-    Ok(
-        pioneer_tools::thread_read_page_bytes(&serde_json::from_str(encoded)?)
-            .saturating_sub(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES),
-    )
+/// Fit text using prepared empty envelopes, then serialize the selected page
+/// once. Cursor offsets use source Unicode scalars; budgets use escaped UTF-16
+/// units and bytes. The upper-offset envelope bounds every partial candidate.
+fn result_delivery_page(
+    text: &str,
+    max_tokens: u64,
+    max_bytes: usize,
+    protection: Option<ResultCursorProtection<'_>>,
+    make: impl Fn(u64, bool) -> Result<ThreadToolResultReadResponse>,
+) -> Result<ThreadToolResultReadResponse> {
+    use pioneer_compaction::estimator::{TextSize, json_string_content_size};
+    let measure = |response| -> Result<_> {
+        let (response, encoded) = result_delivery_encoding(response, protection)?;
+        let value = serde_json::from_str(&encoded)?;
+        let projection = pioneer_tools::thread_read_page_bytes(&value);
+        Ok((
+            response,
+            TextSize::of(&encoded),
+            projection.saturating_sub(encoded.len()),
+        ))
+    };
+    let finish = |mut response: ThreadToolResultReadResponse, end: usize| -> Result<_> {
+        response.text = text[..end].into();
+        let encoded = serde_json::to_string(&serde_json::to_value(&response)?)?;
+        ensure!(
+            encoded.len() <= max_bytes
+                && pioneer_compaction::text_tokens(&encoded) <= max_tokens
+                && pioneer_tools::thread_read_page_fits(&serde_json::from_str(&encoded)?),
+            "result page does not fit its delivery budget"
+        );
+        Ok(response)
+    };
+    if text.len() <= max_bytes {
+        let count = text.chars().count() as u64;
+        let (response, frame, overhead) = measure(make(count, true)?)?;
+        let size = frame.saturating_add(json_string_content_size(text));
+        if size.bytes <= max_bytes
+            && size.tokens() <= max_tokens
+            && size.bytes.saturating_add(overhead) <= pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
+        {
+            return finish(response, text.len());
+        }
+    }
+    let (_, frame, overhead) = measure(make(max_bytes as u64, false)?)?;
+    let byte_limit =
+        max_bytes.min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES.saturating_sub(overhead));
+    let mut content = TextSize::default();
+    let mut count = 0u64;
+    let mut end = 0;
+    for (offset, ch) in text.char_indices() {
+        let next_end = offset + ch.len_utf8();
+        if next_end == text.len() {
+            break;
+        } // complete candidate handled above
+        let next = content.saturating_add(json_string_content_size(&text[offset..next_end]));
+        let size = frame.saturating_add(next);
+        if size.bytes > byte_limit || size.tokens() > max_tokens {
+            break;
+        }
+        content = next;
+        count += 1;
+        end = next_end;
+    }
+    ensure!(end > 0, "result page cannot make progress within budget");
+    let (response, _, _) = measure(make(count, false)?)?;
+    finish(response, end)
 }
 
 impl MessageProcessor {
@@ -131,9 +192,10 @@ impl MessageProcessor {
             .max_bytes
             .unwrap_or(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64)
             .min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64) as usize;
+        let mut text_size = pioneer_compaction::estimator::json_string_content_size(&text);
         while let Some(next_offset) = more {
             let probe = ThreadToolResultReadResponse {
-                text: text.clone(),
+                text: String::new(),
                 next: Some(ThreadToolResultCursor {
                     version: version.clone(),
                     offset: next_offset,
@@ -141,10 +203,14 @@ impl MessageProcessor {
                 eof: false,
             };
             let (_, encoded) = result_delivery_encoding(probe, protection)?;
-            if encoded.len() >= max_bytes
-                || result_projection_excess(&encoded)? > 0
-                || (max_tokens != u64::MAX
-                    && pioneer_compaction::text_tokens(&encoded) >= max_tokens)
+            let frame = pioneer_compaction::estimator::TextSize::of(&encoded);
+            let size = frame.saturating_add(text_size);
+            let projection =
+                pioneer_tools::thread_read_page_bytes(&serde_json::from_str(&encoded)?);
+            if size.bytes >= max_bytes
+                || projection.saturating_add(text_size.bytes)
+                    >= pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
+                || size.tokens() >= max_tokens
             {
                 break;
             }
@@ -160,6 +226,9 @@ impl MessageProcessor {
                 )
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("tool result source changed"))?;
+            text_size = text_size.saturating_add(
+                pioneer_compaction::estimator::json_string_content_size(&next.text),
+            );
             text.push_str(&next.text);
             more = next.next_character;
         }
@@ -168,45 +237,30 @@ impl MessageProcessor {
             .max_bytes
             .unwrap_or(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64)
             .min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64) as usize;
-        let mut token_budget = max_tokens;
-        let mut byte_budget = max_bytes;
-        loop {
-            let page = pioneer_compaction::results::result_page_in_budget(
-                &text,
-                &version,
-                None,
-                token_budget,
-                byte_budget,
-            )?;
-            let eof = page.eof && more.is_none();
-            let next_offset = offset
-                .checked_add(page.text.chars().count() as u64)
-                .ok_or_else(|| anyhow::anyhow!("cursor overflow"))?;
-            let result = ThreadToolResultReadResponse {
-                text: page.text,
-                next: (!eof).then(|| ThreadToolResultCursor {
-                    version: version.clone(),
-                    offset: next_offset,
-                }),
-                eof,
-            };
-            let (result, encoded) = result_delivery_encoding(result, protection)?;
-            let token_excess = if max_tokens == u64::MAX {
-                0
-            } else {
-                pioneer_compaction::text_tokens(&encoded).saturating_sub(max_tokens)
-            };
-            let byte_excess = encoded.len().saturating_sub(max_bytes);
-            if token_excess == 0
-                && byte_excess == 0
-                && pioneer_tools::thread_read_page_fits(&serde_json::from_str(&encoded)?)
-            {
-                return Ok(result);
-            }
-            token_budget = token_budget.saturating_sub(token_excess);
-            byte_budget =
-                byte_budget.saturating_sub(byte_excess.max(result_projection_excess(&encoded)?));
-        }
+        result_delivery_page(
+            &text,
+            max_tokens,
+            max_bytes,
+            protection,
+            |count, complete| {
+                let next_offset = offset
+                    .checked_add(count)
+                    .ok_or_else(|| anyhow::anyhow!("cursor overflow"))?;
+                let eof = complete && more.is_none();
+                ensure!(
+                    eof || count > 0,
+                    "result page cannot advance its source cursor"
+                );
+                Ok(ThreadToolResultReadResponse {
+                    text: String::new(),
+                    eof,
+                    next: (!eof).then(|| ThreadToolResultCursor {
+                        version: version.clone(),
+                        offset: next_offset,
+                    }),
+                })
+            },
+        )
     }
 
     // Saved observation results carry ACL-protected metadata of OTHER sources.
@@ -524,46 +578,35 @@ impl MessageProcessor {
         let offset = params.cursor.as_ref().map_or(0, |c| c.offset);
         let count = text.chars().count() as u64;
         ensure!(offset <= count, "invalid tool result cursor");
-        let remaining = text
-            .chars()
-            .skip(usize::try_from(offset)?)
-            .collect::<String>();
+        let start = text
+            .char_indices()
+            .nth(usize::try_from(offset)?)
+            .map_or(text.len(), |(byte, _)| byte);
+        let remaining = &text[start..];
         let max_tokens = params.max_tokens.unwrap_or(u64::MAX);
         let max_bytes = params
             .max_bytes
             .unwrap_or(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64)
             .min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64) as usize;
-        let mut tokens = max_tokens;
-        let mut bytes = max_bytes;
-        loop {
-            let page = pioneer_compaction::results::result_page_in_budget(
-                &remaining, &version, None, tokens, bytes,
-            )?;
-            let end = offset + page.text.chars().count() as u64;
-            let response = ThreadToolResultReadResponse {
-                text: page.text,
-                eof: end == count,
-                next: (end < count).then(|| ThreadToolResultCursor {
-                    version: version.clone(),
-                    offset: end,
-                }),
-            };
-            let (response, encoded) = result_delivery_encoding(response, protection)?;
-            let token_excess = if max_tokens == u64::MAX {
-                0
-            } else {
-                pioneer_compaction::text_tokens(&encoded).saturating_sub(max_tokens)
-            };
-            let byte_excess = encoded.len().saturating_sub(max_bytes);
-            if token_excess == 0
-                && byte_excess == 0
-                && pioneer_tools::thread_read_page_fits(&serde_json::from_str(&encoded)?)
-            {
-                return Ok(response);
-            }
-            tokens = tokens.saturating_sub(token_excess);
-            bytes = bytes.saturating_sub(byte_excess.max(result_projection_excess(&encoded)?));
-        }
+        result_delivery_page(
+            remaining,
+            max_tokens,
+            max_bytes,
+            protection,
+            |count_read, complete| {
+                let end = offset
+                    .checked_add(count_read)
+                    .ok_or_else(|| anyhow::anyhow!("cursor overflow"))?;
+                Ok(ThreadToolResultReadResponse {
+                    text: String::new(),
+                    eof: complete,
+                    next: (!complete).then(|| ThreadToolResultCursor {
+                        version: version.clone(),
+                        offset: end,
+                    }),
+                })
+            },
+        )
     }
 
     async fn read_thread_tool_output_log(
@@ -611,55 +654,42 @@ impl MessageProcessor {
             offset <= text.chars().count() as u64,
             "output cursor is stale"
         );
-        let remainder = text.chars().skip(offset as usize).collect::<String>();
+        let start = text
+            .char_indices()
+            .nth(usize::try_from(offset)?)
+            .map_or(text.len(), |(byte, _)| byte);
+        let remainder = &text[start..];
         let max_tokens = params.max_tokens.unwrap_or(u64::MAX);
         let max_bytes = params
             .max_bytes
             .unwrap_or(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64)
             .min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64) as usize;
-        let mut token_budget = max_tokens;
-        let mut byte_budget = max_bytes;
-        loop {
-            let page = pioneer_compaction::results::result_page_in_budget(
-                &remainder,
-                &version,
-                None,
-                token_budget,
-                byte_budget,
-            )?;
-            let next = if !page.eof {
-                Some(ThreadToolResultCursor {
-                    version: version.clone(),
-                    offset: offset + page.text.chars().count() as u64,
+        result_delivery_page(
+            remainder,
+            max_tokens,
+            max_bytes,
+            protection,
+            |count, complete| {
+                let next = if !complete {
+                    Some(ThreadToolResultCursor {
+                        version: version.clone(),
+                        offset: offset
+                            .checked_add(count)
+                            .ok_or_else(|| anyhow::anyhow!("cursor overflow"))?,
+                    })
+                } else {
+                    rows.get(1).map(|row| ThreadToolResultCursor {
+                        version: format!("output:{}", row.0),
+                        offset: 0,
+                    })
+                };
+                Ok(ThreadToolResultReadResponse {
+                    text: String::new(),
+                    eof: next.is_none(),
+                    next,
                 })
-            } else {
-                rows.get(1).map(|row| ThreadToolResultCursor {
-                    version: format!("output:{}", row.0),
-                    offset: 0,
-                })
-            };
-            let response = ThreadToolResultReadResponse {
-                text: page.text,
-                eof: next.is_none(),
-                next,
-            };
-            let (response, encoded) = result_delivery_encoding(response, protection)?;
-            let token_excess = if max_tokens == u64::MAX {
-                0
-            } else {
-                pioneer_compaction::text_tokens(&encoded).saturating_sub(max_tokens)
-            };
-            let byte_excess = encoded.len().saturating_sub(max_bytes);
-            if token_excess == 0
-                && byte_excess == 0
-                && pioneer_tools::thread_read_page_fits(&serde_json::from_str(&encoded)?)
-            {
-                return Ok(response);
-            }
-            token_budget = token_budget.saturating_sub(token_excess);
-            byte_budget =
-                byte_budget.saturating_sub(byte_excess.max(result_projection_excess(&encoded)?));
-        }
+            },
+        )
     }
 
     pub(crate) fn thread_result_tools(
@@ -848,7 +878,7 @@ pub(crate) fn thread_result_tool_specs() -> Vec<ConfiguredToolSpec> {
                 "workspace_id":{"type":"string"},"thread_id":{"type":"string"},"turn_id":{"type":"string"},"item_id":{"type":"string"},
                 "output_log":{"type":"boolean","default":false},
                 "cursor":{"type":"object","properties":{"version":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["version","offset"]},
-                "max_tokens":{"type":"integer","minimum":1,"description":"Optional token budget for the complete returned JSON, including the protected cursor; omitted means no token ceiling."},"max_bytes":{"type":"integer","minimum":1,"description":"Optional caller page budget; the complete page always fits Pioneer’s 2 MiB response projection."}},
+                "max_tokens":{"type":"integer","minimum":1,"description":"Optional estimated token budget for the complete returned JSON, including the protected cursor; omitted means no token ceiling."},"max_bytes":{"type":"integer","minimum":1,"description":"Optional caller page budget; the complete page always fits Pioneer’s 2 MiB response projection."}},
                 "required":["workspace_id","thread_id","turn_id","item_id"],"additionalProperties":false}),
         PayloadKind::Function,
     );
@@ -909,4 +939,84 @@ fn saved_read_response(root: serde_json::Value, name: &str) -> Option<serde_json
         }
     }
     None
+}
+
+#[cfg(test)]
+mod estimation_tests {
+    use super::*;
+
+    #[test]
+    fn protected_pages_preserve_unicode_source_offsets_and_hard_delivery_bytes() {
+        let codec = super::super::thread_read_cursor::ThreadReadCursorCodec::new(&[9; 64]).unwrap();
+        let text = "漢🌍\n\"\\\u{0}e\u{301}".repeat(100);
+        let mut rebuilt = String::new();
+        let mut offset = 0u64;
+        let mut remaining = text.as_str();
+        for _ in 0..100 {
+            let page = result_delivery_page(
+                remaining,
+                100,
+                400,
+                Some(ResultCursorProtection {
+                    codec: &codec,
+                    scope: "fixture",
+                }),
+                |count, complete| {
+                    Ok(ThreadToolResultReadResponse {
+                        text: String::new(),
+                        eof: complete,
+                        next: (!complete).then(|| ThreadToolResultCursor {
+                            version: "source-v1".into(),
+                            offset: offset + count,
+                        }),
+                    })
+                },
+            )
+            .unwrap();
+            let encoded = serde_json::to_string(&serde_json::to_value(&page).unwrap()).unwrap();
+            assert!(encoded.len() <= 400 && pioneer_compaction::text_tokens(&encoded) <= 100);
+            rebuilt.push_str(&page.text);
+            offset += page.text.chars().count() as u64;
+            remaining = &remaining[page.text.len()..];
+            if page.eof {
+                break;
+            }
+            assert!(!page.text.is_empty());
+            let raw: ThreadToolResultCursor = codec
+                .decode(&page.next.unwrap().version, "fixture")
+                .unwrap();
+            assert_eq!(raw.version, "source-v1");
+            assert_eq!(raw.offset, offset);
+        }
+        assert!(remaining.is_empty());
+        assert_eq!(rebuilt, text);
+        assert!(
+            result_delivery_page("🌍", 1, 1, None, |_, _| Ok(
+                ThreadToolResultReadResponse {
+                    text: String::new(),
+                    next: None,
+                    eof: true,
+                }
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn completed_output_chunk_can_keep_a_next_row_cursor_without_losing_text() {
+        let page = result_delivery_page("last 🌍", 100, 400, None, |count, complete| {
+            Ok(ThreadToolResultReadResponse {
+                text: String::new(),
+                eof: false,
+                next: Some(ThreadToolResultCursor {
+                    version: if complete { "output:2" } else { "output:1" }.into(),
+                    offset: if complete { 0 } else { count },
+                }),
+            })
+        })
+        .unwrap();
+        assert_eq!(page.text, "last 🌍");
+        assert!(!page.eof);
+        assert_eq!(page.next.unwrap().version, "output:2");
+    }
 }

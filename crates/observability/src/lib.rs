@@ -32,6 +32,7 @@ mod metrics;
 mod operations;
 mod patch_telemetry;
 mod performance;
+pub mod portable_payload;
 #[cfg(feature = "qualification-diagnostics")]
 mod qualification_diagnostics;
 pub mod query_cpu;

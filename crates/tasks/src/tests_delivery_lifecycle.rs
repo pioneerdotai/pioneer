@@ -1963,18 +1963,17 @@ async fn recovery_local_retry_insert_failure_first_source_candidate_still_repair
 
 #[tokio::test]
 async fn recovery_failed_bookkeeping_preserves_healthy_rows_and_uses_quantum_cooldown() {
-    let (runtime, poison, observer, _directory) = physical_recovery_fixture().await;
-    let before = queue_delivery(&runtime).await;
-    started(&runtime, &before.id, DELIVERY_TIME).await;
-    let (_, missing) = started(&runtime, &poison.id, DELIVERY_TIME + 1).await;
+    let (runtime, poison, observer, _directory) = Box::pin(physical_recovery_fixture()).await;
+    let before = Box::pin(queue_delivery(&runtime)).await;
+    Box::pin(started(&runtime, &before.id, DELIVERY_TIME)).await;
+    let (_, missing) = Box::pin(started(&runtime, &poison.id, DELIVERY_TIME + 1)).await;
     delete_exact_attempt(&runtime, &missing).await;
-    let after = queue_delivery(&runtime).await;
-    started(&runtime, &after.id, DELIVERY_TIME + 2).await;
+    let after = Box::pin(queue_delivery(&runtime)).await;
+    Box::pin(started(&runtime, &after.id, DELIVERY_TIME + 2)).await;
     reject_retry_for(&runtime, &poison.id).await;
     let service = runtime.background_control_service();
     let clock_guard = pause_recovery_clock();
-    let report = service
-        .recover_stuck_deliveries(DELIVERY_TIME + 302, 64)
+    let report = Box::pin(service.recover_stuck_deliveries(DELIVERY_TIME + 302, 64))
         .await
         .unwrap();
     assert_eq!(
@@ -1997,8 +1996,7 @@ async fn recovery_failed_bookkeeping_preserves_healthy_rows_and_uses_quantum_coo
     assert!(source.attempt.is_none());
     assert_eq!(source.delivery.status, "delivering");
     observer.clear();
-    let skipped = service
-        .recover_stuck_deliveries(DELIVERY_TIME + 303, 64)
+    let skipped = Box::pin(service.recover_stuck_deliveries(DELIVERY_TIME + 303, 64))
         .await
         .unwrap();
     assert_eq!(skipped.selected, 0);
@@ -2009,8 +2007,7 @@ async fn recovery_failed_bookkeeping_preserves_healthy_rows_and_uses_quantum_coo
     assert!(observer.reads.lock().unwrap().is_empty());
     assert!(observer.writes.lock().unwrap().is_empty());
     tokio::time::advance(Duration::from_secs(5)).await;
-    let again = service
-        .recover_stuck_deliveries(DELIVERY_TIME + 307, 64)
+    let again = Box::pin(service.recover_stuck_deliveries(DELIVERY_TIME + 307, 64))
         .await
         .unwrap();
     assert_eq!((again.selected, again.failed, again.undurable), (1, 1, 1));
@@ -2019,8 +2016,7 @@ async fn recovery_failed_bookkeeping_preserves_healthy_rows_and_uses_quantum_coo
     observer.clear();
     tokio::time::advance(Duration::from_secs(9)).await;
     assert_eq!(
-        service
-            .recover_stuck_deliveries(DELIVERY_TIME + 316, 64)
+        Box::pin(service.recover_stuck_deliveries(DELIVERY_TIME + 316, 64))
             .await
             .unwrap()
             .selected,
@@ -2034,12 +2030,12 @@ async fn recovery_failed_bookkeeping_preserves_healthy_rows_and_uses_quantum_coo
 #[tokio::test]
 async fn recovery_multiple_local_snapshot_errors_use_one_cooldown_and_do_not_infer_attempt_absence()
 {
-    let (runtime, poison) = delivery_fixture().await;
-    let (_, attempt) = started(&runtime, &poison.id, DELIVERY_TIME).await;
-    let another = queue_delivery(&runtime).await;
-    started(&runtime, &another.id, DELIVERY_TIME + 1).await;
-    let healthy = queue_delivery(&runtime).await;
-    started(&runtime, &healthy.id, DELIVERY_TIME + 2).await;
+    let (runtime, poison) = Box::pin(delivery_fixture()).await;
+    let (_, attempt) = Box::pin(started(&runtime, &poison.id, DELIVERY_TIME)).await;
+    let another = Box::pin(queue_delivery(&runtime)).await;
+    Box::pin(started(&runtime, &another.id, DELIVERY_TIME + 1)).await;
+    let healthy = Box::pin(queue_delivery(&runtime)).await;
+    Box::pin(started(&runtime, &healthy.id, DELIVERY_TIME + 2)).await;
     // SQLite dynamic typing permits a row-local decode error. Raw discovery
     // reads only id/updated_at and therefore still selects the healthy row.
     for id in [&poison.id, &another.id] {
@@ -2057,8 +2053,7 @@ async fn recovery_multiple_local_snapshot_errors_use_one_cooldown_and_do_not_inf
     }
     let service = runtime.background_control_service();
     let clock_guard = pause_recovery_clock();
-    let report = service
-        .recover_stuck_deliveries(DELIVERY_TIME + 302, 64)
+    let report = Box::pin(service.recover_stuck_deliveries(DELIVERY_TIME + 302, 64))
         .await
         .unwrap();
     assert_eq!(
@@ -2106,8 +2101,7 @@ async fn recovery_multiple_local_snapshot_errors_use_one_cooldown_and_do_not_inf
         attempt.id
     );
     assert_eq!(
-        service
-            .recover_stuck_deliveries(DELIVERY_TIME + 303, 64)
+        Box::pin(service.recover_stuck_deliveries(DELIVERY_TIME + 303, 64))
             .await
             .unwrap()
             .selected,
@@ -2115,8 +2109,7 @@ async fn recovery_multiple_local_snapshot_errors_use_one_cooldown_and_do_not_inf
     );
     tokio::time::advance(Duration::from_secs(5)).await;
     assert_eq!(
-        service
-            .recover_stuck_deliveries(DELIVERY_TIME + 307, 64)
+        Box::pin(service.recover_stuck_deliveries(DELIVERY_TIME + 307, 64))
             .await
             .unwrap()
             .recovered,

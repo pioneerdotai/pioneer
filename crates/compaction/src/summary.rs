@@ -118,7 +118,7 @@ impl SummaryValidationError {
         match self {
             Self::IncompleteResponse => "Summary response did not complete",
             Self::EmptyText => "Summary text is empty",
-            Self::OutputCapExceeded => "Summary exceeds the output cap",
+            Self::OutputCapExceeded => "Summary exceeds the estimated output cap",
             Self::InvalidSections => "Summary sections are missing, duplicated or out of order",
             Self::EmptySection => "Summary section is empty",
             Self::IncompleteMarkdown => "Summary Markdown fence is not closed",
@@ -158,6 +158,8 @@ pub fn validate_summary_classified(
     if text.is_empty() {
         return Err(SummaryValidationError::EmptyText);
     }
+    // Local estimated cap; provider completion and summary structure remain
+    // independent acceptance checks. This is not an exact tokenizer limit.
     if text_tokens(text) > cap {
         return Err(SummaryValidationError::OutputCapExceeded);
     }
@@ -236,6 +238,7 @@ impl std::error::Error for SummaryFailure {}
 #[async_trait::async_trait]
 pub trait Summarizer: Send + Sync {
     fn model_budget(&self) -> crate::ModelBudget;
+    /// Local estimate of the complete framed input; never measured provider usage.
     fn input_tokens(&self, request: &SummaryRequest) -> anyhow::Result<u64>;
     async fn summarize(&self, request: SummaryRequest)
     -> Result<SummaryCompletion, SummaryFailure>;

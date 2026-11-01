@@ -50,6 +50,9 @@ mod agent_action_outbox;
 #[path = "tests/history_continuation.rs"]
 mod history_continuation;
 
+#[path = "tests/prompt_cache_sent_prefix.rs"]
+mod prompt_cache_sent_prefix;
+
 #[path = "tests/compaction_lifecycle_poll.rs"]
 mod compaction_lifecycle_poll;
 
@@ -471,6 +474,7 @@ async fn ensure_test_superuser_execution_turn(
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -785,10 +789,10 @@ async fn wait_for_episodic_ingestor_item(
 }
 
 #[derive(Default)]
-struct RecordingCliRuntimeSession {
+pub(super) struct RecordingCliRuntimeSession {
     thread_starts: TokioMutex<Vec<CLIAgentRuntimeThreadOpenParams>>,
     thread_resumes: TokioMutex<Vec<(String, CLIAgentRuntimeThreadOpenParams)>>,
-    turn_starts: TokioMutex<Vec<CLIAgentRuntimeTurnStartParams>>,
+    pub(super) turn_starts: TokioMutex<Vec<CLIAgentRuntimeTurnStartParams>>,
     turn_start_pause: TokioMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     next_turn_start_error: TokioMutex<Option<String>>,
     provider_history: TokioMutex<HashMap<String, Vec<String>>>,
@@ -2092,19 +2096,19 @@ fn skill_pack_turn_normalization_is_authoritative_ordered_and_fail_closed() {
         });
 }
 
-struct CliRuntimeSkillPreflightHarness {
+pub(super) struct CliRuntimeSkillPreflightHarness {
     _temp: tempfile::TempDir,
     rx: mpsc::Receiver<Message>,
-    connection_id: ConnectionId,
+    pub(super) connection_id: ConnectionId,
     thread_manager: Arc<ThreadManager>,
-    crud_store: Arc<CrudStore>,
+    pub(super) crud_store: Arc<CrudStore>,
     workspace_id: String,
-    cli_session: Arc<RecordingCliRuntimeSession>,
+    pub(super) cli_session: Arc<RecordingCliRuntimeSession>,
     cli_manager: Arc<CLIAgentRuntimeManager>,
-    processor: MessageProcessor,
-    runtime_id: String,
+    pub(super) processor: MessageProcessor,
+    pub(super) runtime_id: String,
     runtime_kind: CLIAgentRuntimeKind,
-    runtime_home: std::path::PathBuf,
+    pub(super) runtime_home: std::path::PathBuf,
     native_home: std::path::PathBuf,
     system_root: std::path::PathBuf,
     user_root: std::path::PathBuf,
@@ -2112,7 +2116,7 @@ struct CliRuntimeSkillPreflightHarness {
     event_log: Arc<TokioMutex<Vec<String>>>,
 }
 
-async fn setup_cli_runtime_skill_preflight_harness(
+pub(super) async fn setup_cli_runtime_skill_preflight_harness(
     runtime_kind: CLIAgentRuntimeKind,
     native_home_is_file: bool,
 ) -> CliRuntimeSkillPreflightHarness {
@@ -2233,7 +2237,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
     harness
 }
 
-fn cli_runtime_turn_start_request_with_capabilities(
+pub(super) fn cli_runtime_turn_start_request_with_capabilities(
     request_id: &str,
     thread_id: &str,
     turn_id: &str,
@@ -2344,7 +2348,7 @@ fn write_test_skill_with_declared_name(
     skill_dir
 }
 
-async fn seed_cli_runtime_skill_preflight_thread(
+pub(super) async fn seed_cli_runtime_skill_preflight_thread(
     harness: &CliRuntimeSkillPreflightHarness,
     thread_id: &str,
 ) {
@@ -3680,6 +3684,7 @@ async fn materialize_thread_episodic_ingest_turn(
             },
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::Completed,
                 turn_kind: TurnKind::Conversation,
@@ -9101,6 +9106,7 @@ async fn ensure_task_create_parent_turn_for_test(
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: parent_turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -9248,6 +9254,7 @@ async fn seed_completed_task_parent_with_inputs_at(
             },
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: parent_turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,
@@ -9277,6 +9284,7 @@ async fn seed_completed_task_parent_with_inputs_at(
                 workspace_id: workspace_id.to_owned(),
                 thread_id: parent_thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: parent_turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
@@ -10007,6 +10015,7 @@ async fn setup_progress_delta_harness(
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.clone(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12018,6 +12027,7 @@ async fn long_russian_first_message_generates_parent_title_successfully() {
         turns: Vec::new(),
     };
     let seed_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_seed_russian_0000001".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12109,6 +12119,7 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
         turns: Vec::new(),
     };
     let seed_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_seed_singleflight_01".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12380,6 +12391,7 @@ async fn title_generation_retries_after_transient_failure() {
         turns: Vec::new(),
     };
     let seed_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_seed_retry_000000001".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12472,6 +12484,7 @@ async fn child_thread_scope_skips_auto_title_generation() {
         turns: Vec::new(),
     };
     let seed_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_seed_child_scope_00001".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12570,6 +12583,7 @@ async fn materialize_loaded_test_thread_for_durable_operation(
         .await
         .expect("test thread should be loaded before materialization");
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -12797,6 +12811,14 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
     let started: pioneer_protocol::TurnStartResponse =
         serde_json::from_value(response.result).expect("turn/start response should decode");
     assert_eq!(started.turn.id, turn_id);
+    assert_eq!(
+        started.turn.work_owner,
+        pioneer_protocol::TurnWorkOwner::DetachedTask
+    );
+    assert!(matches!(
+        started.turn.author.as_ref().unwrap().actor,
+        pioneer_protocol::PersistedActorRef::Principal(_)
+    ));
 
     let persisted_parent = turn::Entity::find_by_id(turn_id)
         .one(&processor.crud_store.database_connection())
@@ -14862,6 +14884,7 @@ async fn materialize_artifact_api_thread(
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -24958,6 +24981,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         turns: Vec::new(),
     };
     let parent_turn = Turn {
+        work_owner: Default::default(),
         id: parent_turn_id.to_owned(),
         status: TurnStatus::Completed,
         turn_kind: Default::default(),
@@ -26678,6 +26702,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         turns: Vec::new(),
     };
     let parent_turn = Turn {
+        work_owner: Default::default(),
         id: parent_history_turn_id.to_owned(),
         status: TurnStatus::Completed,
         turn_kind: TurnKind::Conversation,
@@ -26749,6 +26774,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         }))
         .unwrap();
         let source_turn = Turn {
+            work_owner: pioneer_protocol::TurnWorkOwner::DetachedTask,
             id: source_turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
@@ -26902,6 +26928,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     );
 
     let late_parent_turn = Turn {
+        work_owner: Default::default(),
         id: "turn_parent_recovered_after_start".to_owned(),
         status: TurnStatus::Completed,
         turn_kind: TurnKind::Conversation,
@@ -28172,6 +28199,7 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
         turns: Vec::new(),
     };
     let creation_turn = Turn {
+        work_owner: Default::default(),
         id: creation_turn_id.to_owned(),
         status: TurnStatus::Completed,
         turn_kind: Default::default(),
@@ -28591,6 +28619,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
                 workspace_id: workspace_id.clone(),
                 thread_id: parent_thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: creation_turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
@@ -28796,15 +28825,16 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         "background root question",
     )
     .await;
+    // Keep the root above the unknown model's 128k fallback context even with
+    // UTF-16 estimation, so the summarizer barrier requires a provider call.
+    let history_answer = "🧪 ".repeat(180_000);
+    assert!(pioneer_compaction::text_tokens(&history_answer) > 128_000);
     root_conversation_compaction::answer(
         &history,
         history_thread,
         history_turn,
         history_at,
-        // Exceed the context budget with dense tokens, rather than megabytes
-        // of low-density text that require many incremental fragment fits.
-        // The spaces keep tokenizer pieces bounded as well.
-        &"🧪 ".repeat(60_000),
+        &history_answer,
     )
     .await;
     let pending = crud_store
@@ -29253,6 +29283,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         turns: Vec::new(),
     };
     let parent_turn = Turn {
+        work_owner: Default::default(),
         id: parent_turn_id.to_owned(),
         status: TurnStatus::Completed,
         turn_kind: TurnKind::Conversation,
@@ -29316,6 +29347,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
             &parent_thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: planned_turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,
@@ -29341,6 +29373,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
                 workspace_id: workspace_id.clone(),
                 thread_id: parent_thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: planned_turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
@@ -31895,7 +31928,7 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     .await;
     // Make the edited unit exceed the transfer token target so it must enter
     // the summary, even if its replacement row sorts into the retained tail.
-    let edited_body = format!("EDITED ACCEPTED SOURCE 00 {}", "b ".repeat(70_000));
+    let edited_body = format!("EDITED ACCEPTED SOURCE 00 {}", "b ".repeat(120_000));
     assert!(pioneer_compaction::text_tokens(&edited_body) > max_input_tokens);
     store
         .edit_turn_message(pioneer_crud::EditTurnMessageRequest {
@@ -32601,7 +32634,10 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
             .await;
         let thread = format!("pending-heartbeat-{case}");
         let history_created_at = super::now_timestamp_secs().saturating_sub(1);
+        let mut history_tokens = 0;
         for index in 0..12 {
+            let text = format!("PENDING HEARTBEAT CHUNK {index:02} {}", "a ".repeat(10_000));
+            history_tokens += pioneer_compaction::text_tokens(&text);
             seed_completed_task_parent_with_inputs_at(
                 &processor,
                 &workspace,
@@ -32609,13 +32645,17 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
                 &format!("pending-heartbeat-source-{index:02}"),
                 "accepted history",
                 vec![UserInput::Text {
-                    text: format!("PENDING HEARTBEAT CHUNK {index:02} {}", "a ".repeat(6_500)),
+                    text,
                     text_elements: Vec::new(),
                 }],
                 history_created_at,
             )
             .await;
         }
+        assert!(
+            history_tokens > 50_000,
+            "heartbeat requires foreground compaction"
+        );
         open_persisted_child_for_test(
             &processor,
             connection,
@@ -33160,7 +33200,10 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
         )))
         .await;
     let thread = "cancelled-oversized-cli-transfer";
+    let mut history_tokens = 0;
     for index in 0..12 {
+        let text = format!("CHUNK {index:02} {}", "a ".repeat(10_000));
+        history_tokens += pioneer_compaction::text_tokens(&text);
         seed_completed_task_parent_with_inputs(
             &processor,
             &workspace,
@@ -33168,12 +33211,16 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
             &format!("source-{index:02}"),
             "large history",
             vec![UserInput::Text {
-                text: format!("CHUNK {index:02} {}", "a ".repeat(6_500)),
+                text,
                 text_elements: Vec::new(),
             }],
         )
         .await;
     }
+    assert!(
+        history_tokens > 50_000,
+        "cancellation requires foreground compaction"
+    );
     open_persisted_child_for_test(
         &processor,
         connection,
@@ -33673,22 +33720,22 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             .insert("openai", summary_provider.clone())
             .expect("CLI test provider should register");
         discover_native_capture_models(&provider_registry, workspace_id.as_str()).await;
-        let mut processor = Arc::new(with_enabled_test_cli_runtime_catalog(
-            MessageProcessor::new(
-                thread_manager,
-                provider_registry.clone(),
-                session_manager.clone(),
-                workspace_manager.clone(),
-                crud_store.clone(),
-                test_gateway_secrets(),
-                test_summary_config(),
-                test_tool_loop_config(),
-            )
-            .with_cli_runtime_manager_for_tests(cli_manager.clone())
-            .with_cli_mcp_readiness_override_for_tests(
-                supported_test_cli_mcp_readiness(runtime_kind),
-            ),
-        ));
+        let processor = MessageProcessor::new(
+            thread_manager,
+            provider_registry.clone(),
+            session_manager.clone(),
+            workspace_manager.clone(),
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone())
+        .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(runtime_kind));
+        // The CLI settings helper changes the configuration home, but the
+        // artifact service still owns the blob directory from construction.
+        let artifact_store_home = processor.artifact_runtime_home.clone();
+        let mut processor = Arc::new(with_enabled_test_cli_runtime_catalog(processor));
         processor
             .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
             .await
@@ -34901,7 +34948,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 // skill receipts and identity source fingerprints intact.
                 let runtime_home = processor.artifact_runtime_home.clone();
                 processor = Arc::new(
-                    MessageProcessor::new(
+                    MessageProcessor::new_with_memory_runtime(
                         cold_thread_manager.clone(),
                         provider_registry.clone(),
                         session_manager.clone(),
@@ -34910,6 +34957,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         test_gateway_secrets(),
                         test_summary_config(),
                         test_tool_loop_config(),
+                        Arc::new(GatewayMemoryRuntime::disabled(crud_store.clone())),
+                        artifact_store_home.clone(),
+                        pioneer_config::GatewayArtifactsConfig::default(),
                     )
                     .with_cli_runtime_manager_for_tests(cli_manager.clone())
                     .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
@@ -34971,8 +35021,8 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 .connection_context(connection)
                 .await
                 .expect("manual child connection context must remain available");
-            Arc::clone(&processor)
-                .process_owned_request(
+            let (_, admission_events) = crate::public_error::test_support::capture_events_async(
+                Arc::clone(&processor).process_owned_request(
                     context,
                     json!({
                         "jsonrpc": "2.0",
@@ -34996,9 +35046,22 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         }
                     })
                     .to_string(),
-                )
-                .await;
-            let response = recv_response_by_id(&mut rx, &request_id).await;
+                ),
+            )
+            .await;
+            let payload = recv_jsonrpc_payload_by_id(&mut rx, &request_id).await;
+            let response: JsonRpcResponse = match serde_json::from_str(&payload) {
+                Ok(response) => response,
+                Err(error) => {
+                    let progress = pioneer_entity::compaction_runner_state::Entity::find()
+                        .all(&crud_store.database_connection())
+                        .await
+                        .unwrap();
+                    panic!(
+                        "manual {runtime_id} child follow-up {followup_index} rejected: {error}; payload: {payload}; compaction: {progress:?}; admission_reports: {admission_events:#?}"
+                    );
+                }
+            };
             let accepted: TurnStartResponse = serde_json::from_value(response.result)
                 .expect("manual child follow-up must be accepted as a foreground turn");
             assert_eq!(accepted.turn.id, followup_turn_id);
@@ -36150,6 +36213,38 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
     )
     .await;
 
+    // These remain durable journal facts but must not be imported into the
+    // model-facing CLI bootstrap through a frozen Task basis.
+    crud_store
+        .materialize_item_tool_retry_resolved(
+            pioneer_protocol::ItemToolRetryResolvedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: root_thread_id.into(),
+                turn_id: root_turn_id.into(),
+                item_id: "historical-retry-item".into(),
+                item_type: pioneer_protocol::TurnItemType::DynamicToolCall,
+                tool_retry_episode_id: "historical-retry-episode".into(),
+                tool_name: "apply_patch".into(),
+                attempt_number: 2,
+                resolution: pioneer_protocol::ToolRetryResolution::Succeeded,
+                budgets: vec![],
+                reason: "CACHE_RETRY_TELEMETRY".into(),
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
+    crud_store.materialize_item_completed(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id:workspace_id.clone(), thread_id:root_thread_id.into(), turn_id:root_turn_id.into(),
+            item:pioneer_protocol::TurnItem::SystemEvent {
+                id:"historical-usage".into(), level:pioneer_protocol::SystemEventLevel::Info,
+                message:"CACHE_USAGE_TELEMETRY".into(), code:Some("agent_runtime_item".into()),
+                details:Some(json!({"nativeItemKind":"tokenUsage","input_tokens":100,"cache_read_input_tokens":80})),
+            },
+        }, phase_13_now_secs(),
+    ).await.unwrap();
+
     let mut parent_thread_id = root_thread_id.to_owned();
     let mut parent_turn_id = root_turn_id.to_owned();
     let mut lineages = Vec::new();
@@ -36193,6 +36288,8 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
         let start = &starts[level - 1];
         let input = start.input.to_string();
         assert!(input.contains(root_marker));
+        assert!(!input.contains("CACHE_RETRY_TELEMETRY"));
+        assert!(!input.contains("CACHE_USAGE_TELEMETRY"));
         for earlier in &output_markers {
             assert!(
                 input.contains(earlier),
@@ -41142,6 +41239,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread_impl() 
         .await
         .expect("owner thread should be loaded");
     let occurrence_turn = Turn {
+        work_owner: Default::default(),
         id: run.id.clone(),
         status: TurnStatus::Completed,
         turn_kind: TurnKind::TaskRun,
@@ -41649,6 +41747,7 @@ async fn task_delivery_reuses_pre_child_occurrence_without_lineage() {
             &thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: run_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::TaskRun,
@@ -43605,6 +43704,7 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -43743,6 +43843,7 @@ async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
             &thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -43918,6 +44019,7 @@ async fn user_message_lifecycle_survives_permission_profile_audit_event() {
             &thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -44049,6 +44151,7 @@ async fn direct_durable_item_completed_ingestion_failure_does_not_block_commit()
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -45371,6 +45474,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -46269,6 +46373,7 @@ async fn invalid_request_provider_failure_is_terminal_without_retry() {
             item_id.to_owned(),
             TurnItemType::Reasoning,
             ProviderFailureDetails {
+                raw_response: None,
                 error_reason: None,
                 request_id: None,
                 provider: "test-provider".to_owned(),
@@ -46510,6 +46615,7 @@ async fn durable_recovery_events_reject_ack_without_canonical_persistence() {
             item_id: "item_missing_provider_failure".to_owned(),
             item_type: TurnItemType::AgentMessage,
             failure: ProviderFailureDetails {
+                raw_response: None,
                 error_reason: None,
                 request_id: None,
                 provider: "openai".to_owned(),
@@ -51448,6 +51554,7 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
     let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
 
     let turn = Turn {
+        work_owner: Default::default(),
         id: "turn_codex_ops_rename_seed".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -52323,6 +52430,7 @@ async fn cli_runtime_turn_start_blocker_reconciles_db_only_terminal_binding() {
                 workspace_id: workspace_id.clone(),
                 thread_id: thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::default(),
@@ -52992,6 +53100,7 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -55500,6 +55609,7 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: "turn_cli_stale_db_only".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -55712,6 +55822,7 @@ async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
                 workspace_id: workspace_id.clone(),
                 thread_id: thread_id.to_owned(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: turn_id.to_owned(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::default(),
@@ -59208,6 +59319,7 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
         turns: Vec::new(),
     };
     let turn = Turn {
+        work_owner: Default::default(),
         id: "turn_non_cli_timeout".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -60346,6 +60458,7 @@ async fn materialize_cli_runtime_turn_with_execution(
         turns: Vec::new(),
     };
     let mut turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
@@ -66734,6 +66847,7 @@ async fn historical_task_snapshot_does_not_refresh_terminal_work_summary() {
                 workspace_id: harness.workspace_id.clone(),
                 thread_id: harness.thread_id.clone(),
                 turn: Turn {
+                    work_owner: Default::default(),
                     id: harness.turn_id.clone(),
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::default(),
@@ -66862,6 +66976,7 @@ async fn detached_task_wrapper_diagnostics_do_not_persist_parent_work_group() {
         base,
     );
     let turn = Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::TaskRun,
@@ -67599,6 +67714,7 @@ async fn setup_live_semantic_timeline_harness_on_store(
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: turn_id.clone(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -68641,6 +68757,7 @@ fn semantic_fixture_thread(
 
 fn semantic_fixture_turn(turn_id: &str, status: TurnStatus) -> Turn {
     Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status,
         turn_kind: Default::default(),
@@ -68714,6 +68831,7 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
         serde_json::from_value(response.result).expect("thread/start result should decode");
 
     let turn = Turn {
+        work_owner: Default::default(),
         id: "turn_000000000000000099".to_owned(),
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
@@ -77322,6 +77440,7 @@ fn phase_13_test_thread(
 
 fn phase_13_turn(turn_id: &str, status: TurnStatus) -> Turn {
     Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status,
         turn_kind: Default::default(),
@@ -77828,6 +77947,7 @@ async fn check_detached_composer_history_order(legacy: bool) {
             phase_13_test_thread(harness.workspace_id.as_str(), thread_id.as_str(), timestamp);
         let user_turn_id = format!("{thread_id}_user_{index}");
         let user_turn = Turn {
+            work_owner: Default::default(),
             id: user_turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
@@ -77876,6 +77996,7 @@ async fn check_detached_composer_history_order(legacy: bool) {
         // Its delivered AgentMessage is created later and must define the assistant history slot.
         let task_turn_id = format!("{thread_id}_task_{index}");
         let task_turn = Turn {
+            work_owner: Default::default(),
             id: task_turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,
@@ -78549,6 +78670,7 @@ async fn materialize_memory_tools_for_context(
                 &thread,
                 SandboxMode::FullAccess,
                 &Turn {
+                    work_owner: Default::default(),
                     id: context.turn_id.clone(),
                     status: TurnStatus::InProgress,
                     turn_kind: Default::default(),
@@ -79463,6 +79585,7 @@ async fn memory_provider_recall_calls_memory_service() {
             &thread_payload.thread,
             SandboxMode::FullAccess,
             &Turn {
+                work_owner: Default::default(),
                 id: recall_context.turn_id.clone(),
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
@@ -81801,6 +81924,14 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
         .await;
     let tool_fixture = tempfile::tempdir().unwrap();
     let executions = tool_fixture.path().join("executions");
+    #[derive(Debug)]
+    struct ConfirmedContextOverflow;
+    impl std::fmt::Display for ConfirmedContextOverflow {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("provider context limit exceeded")
+        }
+    }
+    impl std::error::Error for ConfirmedContextOverflow {}
     struct OverflowProvider(std::sync::Mutex<Vec<ChatRequest>>, Vec<ProviderToolCall>);
     #[async_trait::async_trait]
     impl Provider for OverflowProvider {
@@ -81834,7 +81965,7 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
                     tool_calls: self.1.clone(),
                 });
             }
-            anyhow::bail!("provider error: maximum context length exceeded")
+            Err(anyhow::Error::new(ConfirmedContextOverflow))
         }
         async fn stream_chat(
             &self,
@@ -81842,6 +81973,16 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
         ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
         {
             anyhow::bail!("non-stream fixture")
+        }
+        fn classify_failure(
+            &self,
+            error: &anyhow::Error,
+        ) -> Option<pioneer_provider::ProviderFailureClassification> {
+            error.downcast_ref::<ConfirmedContextOverflow>().map(|_| {
+                pioneer_provider::ProviderFailureClassification::new(
+                    pioneer_protocol::ProviderFailureClass::ContextTooLarge,
+                )
+            })
         }
     }
     let calls = if with_tool {
@@ -84184,7 +84325,9 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
                         id: format!("background-answer-{index}"),
                         text: format!(
                             "background answer {index} {}",
-                            "retained ".repeat(if index == 0 { 60_000 } else { 80 })
+                            // Keep the baseline below the 128k fallback window with UTF-16
+                            // estimation; fixed input below exercises the exact boundary.
+                            "retained ".repeat(if index == 0 { 20_000 } else { 80 })
                         ),
                         phase: Default::default(),
                         markdown: None,
@@ -84464,11 +84607,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
             .count(),
         2
     );
-    let available = std::cmp::min(
-        baseline.context_tokens.unwrap().saturating_sub(reserve),
-        baseline.input_limit.unwrap_or(u64::MAX),
-    );
-    let raw_boundary = (available as u128 * 100 / 105).min(u64::MAX as u128) as u64;
+    let raw_boundary = crate::compaction::estimated_input_capacity(&budget, reserve, false);
     let fitting_fixed = raw_boundary.saturating_sub(estimate);
     assert!(budget.fits(estimate + fitting_fixed, reserve, false));
     assert!(!budget.fits(duplicated_estimate + fitting_fixed, reserve, false));
@@ -85926,7 +86065,10 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
 
     let context = fitting.context_tokens.unwrap();
     let reserve = fitting.output_reserve.unwrap();
-    let fixed = (context - reserve) * 100 / 105 - 6_000;
+    let model_budget =
+        pioneer_compaction::ModelBudget::new(Some(context), fitting.input_limit, None);
+    let fixed = crate::compaction::estimated_input_capacity(&model_budget, reserve, false)
+        .saturating_sub(6_000);
     let mut compacted = HistoryCheckDiagnostic::default();
     let outcome = crate::compaction::prepare_completed_history_owned(
         &harness.processor,
@@ -86441,6 +86583,7 @@ async fn blocked_provider_task_consumers_impl(scenario: &str, path: &str) {
         http_status: Some(502),
         provider_code: None,
         retry_after_ms: Some(2000),
+        raw_response: None,
         error_reason: Some(pioneer_protocol::ProviderErrorReason::ProviderUnavailable),
         request_id: Some(
             pioneer_protocol::ProviderRequestId::try_from("gen-task_fixture".to_owned()).unwrap(),
@@ -86826,6 +86969,7 @@ async fn recovery_failure_task_consumers_impl(
     let now = super::now_timestamp_secs();
     let private = "private-response-body https://secret.example?token=credential /private/provider-key HTTP 401";
     let mut initial = ProviderFailureDetails {
+        raw_response: None,
         error_reason: None,
         request_id: None,
         provider: "test-provider".to_owned(),
@@ -86866,6 +87010,7 @@ async fn recovery_failure_task_consumers_impl(
         );
     }
     let last = ProviderFailureDetails {
+        raw_response: None,
         error_reason: None,
         request_id: None,
         class: ProviderFailureClass::AuthOrPermission,
@@ -86873,6 +87018,7 @@ async fn recovery_failure_task_consumers_impl(
         http_status: Some(403),
         provider_code: Some(private.to_owned()),
         ..ProviderFailureDetails {
+            raw_response: None,
             error_reason: None,
             request_id: None,
             provider: private.to_owned(),
@@ -87201,6 +87347,7 @@ fn provider_replay_is_fenced_after_retryable_recovery_start_error() {
         let (processor, store, _) = setup_execution_window_terminal_turn(thread, turn).await;
         let now = super::now_timestamp_secs();
         let failure = ProviderFailureDetails {
+            raw_response: None,
             error_reason: None,
             request_id: None,
             provider: "test-provider".to_owned(),
@@ -87600,11 +87747,15 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     use futures_util::StreamExt;
     struct LateUsage {
         fail_after_usage: bool,
+        authority: Option<&'static str>,
     }
     #[async_trait::async_trait]
     impl pioneer_provider::Provider for LateUsage {
         fn name(&self) -> &str {
             "fixture"
+        }
+        fn authority_fingerprint(&self) -> Option<&str> {
+            self.authority
         }
         async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
             anyhow::bail!("unexpected non-stream fixture")
@@ -87621,6 +87772,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
                 Ok(StreamChunk::usage(pioneer_provider::TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(2),
+                    prompt_cache_diagnostics: Some(json!({"reason":"fixture"})),
                     ..Default::default()
                 })),
             ];
@@ -87636,6 +87788,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     let provider = crate::usage_journal::observe(
         Arc::new(LateUsage {
             fail_after_usage: false,
+            authority: Some("authority-a"),
         }),
         &background,
         &workspace,
@@ -87656,6 +87809,13 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
         })
         .await
         .unwrap();
+    let started = background
+        .provider_usage_page(&workspace, "late-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(started[0].status, "started");
+    let metadata: serde_json::Value = serde_json::from_str(&started[0].usage_json).unwrap();
+    assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-a");
     assert!(stream.next().await.unwrap().unwrap().is_final);
     assert_eq!(
         stream
@@ -87678,14 +87838,21 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
     assert_eq!(retained.input_tokens, Some(10));
     assert_eq!(retained.output_tokens, Some(2));
+    assert_eq!(
+        retained.prompt_cache_diagnostics,
+        Some(json!({"reason":"fixture"}))
+    );
+    let metadata: serde_json::Value = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-a");
     let failed = crate::usage_journal::observe(
         Arc::new(LateUsage {
             fail_after_usage: true,
+            authority: Some("authority-b"),
         }),
         &background,
         &workspace,
         "memory_extraction",
-        "late-failed-owner",
+        "late-owner",
     );
     let mut stream = failed
         .stream_chat(ChatRequest {
@@ -87706,14 +87873,63 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     assert!(stream.next().await.unwrap().is_err());
     assert!(stream.next().await.is_none());
     let rows = background
-        .provider_usage_page(&workspace, "late-failed-owner", "", 100)
+        .provider_usage_page(&workspace, "late-owner", "", 100)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].status, "failed");
-    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(rows.len(), 2);
+    let failed_row = rows.iter().find(|row| row.status == "failed").unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&failed_row.usage_json).unwrap();
+    assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-b");
+    let retained: pioneer_provider::TokenUsage =
+        serde_json::from_str(&failed_row.usage_json).unwrap();
     assert_eq!(retained.input_tokens, Some(10));
     assert_eq!(retained.output_tokens, Some(2));
+    assert_eq!(
+        retained.prompt_cache_diagnostics,
+        Some(json!({"reason":"fixture"}))
+    );
+    // An otherwise identical unlabelled call remains unknown, including after enrichment.
+    let legacy = crate::usage_journal::observe(
+        Arc::new(LateUsage {
+            fail_after_usage: false,
+            authority: None,
+        }),
+        &background,
+        &workspace,
+        "memory_extraction",
+        "late-owner",
+    );
+    let mut stream = legacy
+        .stream_chat(ChatRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        })
+        .await
+        .unwrap();
+    while let Some(chunk) = stream.next().await {
+        chunk.unwrap();
+    }
+    let rows = background
+        .provider_usage_page(&workspace, "late-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let unlabelled = rows
+        .iter()
+        .filter(|row| {
+            let value: serde_json::Value = serde_json::from_str(&row.usage_json).unwrap();
+            value.get("_pioneer_journal").is_none()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(unlabelled.len(), 1);
+    assert_eq!(unlabelled[0].status, "completed");
 }
 
 #[tokio::test]

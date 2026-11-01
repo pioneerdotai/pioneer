@@ -450,10 +450,13 @@ impl CrudStore {
                     .context("failed to commit TaskRun occurrence terminalization transaction")?;
                 Ok(outcome)
             }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
+            Err(error) => Err(
+                crate::repositories::portable_payload::rollback_with_hold_refusal(
+                    transaction,
+                    error,
+                )
+                .await,
+            ),
         }
     }
 }

@@ -53,7 +53,9 @@ pub const AGENT_ACTION_OUTBOX_MAX_ATTEMPTS: i64 = 8;
 const _: () = assert!(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS == 8);
 const AGENT_ACTION_OUTBOX_BATCH_LIMIT: u64 = 64;
 const AGENT_ACTION_OUTBOX_RANGE_LIMIT: u64 = 32;
-const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 AND (status='pending' OR last_error IS NULL OR last_error NOT IN ('outbox_start_integrity_rejected','outbox_start_authority_denied','outbox_start_runtime_unavailable','outbox_foreground_conflict','outbox_start_outcome_unknown')) ORDER BY created_at,id LIMIT ?";
+// Keep the existing partial-index predicate intact; the additional exclusion
+// closes corrupt detached bindings without ACKing or retrying them forever.
+const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 AND (status='pending' OR last_error IS NULL OR last_error NOT IN ('outbox_start_integrity_rejected','outbox_start_authority_denied','outbox_start_runtime_unavailable','outbox_foreground_conflict','outbox_start_outcome_unknown')) AND (status!='failed' OR COALESCE(last_error,'')!='outbox_detached_binding_rejected') ORDER BY created_at,id LIMIT ?";
 const AGENT_ACTION_OUTBOX_TIMED_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NOT NULL AND (status='pending' OR (status='failed' AND attempts<8)) AND next_attempt_at<=? ORDER BY next_attempt_at,created_at,id LIMIT ?";
 const AGENT_ACTION_OUTBOX_FAILURE_CLASS: &str = "outbox_delivery_failed";
 // An exhausted StartAgent still owes outcome reconciliation, never delivery.
@@ -64,9 +66,10 @@ pub const AGENT_START_RECONCILIATION_REQUIRED: &str = "outbox_start_reconciliati
 // terminal generation/resources and never redelivers an exhausted model start.
 // The immutable payload kind narrows the index; missing/invalid kind remains a
 // candidate. The action join remains authoritative, never payload authorization.
-const AGENT_START_RECONCILIATION_SQL: &str = "SELECT o.id FROM agent_action_outbox o JOIN agent_action a ON a.id=o.action_id WHERE a.action_kind='start_agent' AND o.status IN ('pending','failed') AND o.attempts=8 AND COALESCE(CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.kind') END,'start_agent')='start_agent' AND (o.next_attempt_at IS NULL OR o.next_attempt_at<=?) ORDER BY o.next_attempt_at,o.created_at,o.id LIMIT ?";
+const AGENT_START_RECONCILIATION_SQL: &str = "SELECT o.id FROM agent_action_outbox o JOIN agent_action a ON a.id=o.action_id WHERE a.action_kind='start_agent' AND o.status IN ('pending','failed') AND o.attempts=8 AND NOT (o.status='failed' AND o.next_attempt_at IS NULL AND COALESCE(o.last_error,'')='outbox_detached_binding_rejected') AND COALESCE(CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.kind') END,'start_agent')='start_agent' AND (o.next_attempt_at IS NULL OR o.next_attempt_at<=?) ORDER BY o.next_attempt_at,o.created_at,o.id LIMIT ?";
 
-const AGENT_START_TERMINAL_FAILURE_CLASSES: [&str; 5] = [
+const AGENT_START_TERMINAL_FAILURE_CLASSES: [&str; 6] = [
+    "outbox_detached_binding_rejected",
     "outbox_start_integrity_rejected",
     "outbox_start_authority_denied",
     "outbox_start_runtime_unavailable",
@@ -5056,7 +5059,23 @@ fn compacted_agent_action_outbox_payload(
             spawned_execution_id.clone(),
         );
     }
-    if action.action_kind == "start_agent" {
+    if original
+        .get("execution_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("detached_task")
+    {
+        // Preserve the accepted execution strategy and Task binding. Replaying
+        // this action must never reinterpret it as a direct model launch.
+        for field in ["execution_mode", "task_id", "thread_id", "turn_id"] {
+            retained.insert(
+                field.to_owned(),
+                original
+                    .get(field)
+                    .context("detached action binding is missing")?
+                    .clone(),
+            );
+        }
+    } else if action.action_kind == "start_agent" {
         // Keep only the immutable binding required for terminal reconciliation;
         // input, launch parameters and the runtime dispatch payload are released.
         let turn_id = original
@@ -5400,6 +5419,13 @@ async fn transition_agent_action_outbox<C: ConnectionTrait>(
     {
         return Ok(false);
     }
+    if candidate.status == "failed"
+        && candidate.next_attempt_at.is_none()
+        && candidate.last_error.as_deref()
+            == Some(AgentActionOutboxFailure::InvalidDetachedBinding.safe_name())
+    {
+        return Ok(false);
+    }
     let exhausted = candidate.attempts >= AGENT_ACTION_OUTBOX_MAX_ATTEMPTS;
     let reconcile_start = exhausted
         && agent_action::Entity::find_by_id(candidate.action_id.clone())
@@ -5519,6 +5545,7 @@ pub enum AgentActionOutboxFailure {
     DeliveryFailed,
     StorageUnavailable,
     InvalidStart,
+    InvalidDetachedBinding,
     AuthorityDenied,
     RuntimeUnavailable,
     PreparationUnavailable,
@@ -5532,6 +5559,7 @@ impl AgentActionOutboxFailure {
             Self::DeliveryFailed => "outbox_delivery_failed",
             Self::StorageUnavailable => "outbox_storage_unavailable",
             Self::InvalidStart => "outbox_start_integrity_rejected",
+            Self::InvalidDetachedBinding => "outbox_detached_binding_rejected",
             Self::AuthorityDenied => "outbox_start_authority_denied",
             Self::RuntimeUnavailable => "outbox_start_runtime_unavailable",
             Self::PreparationUnavailable => "outbox_start_preparation_unavailable",
@@ -8615,6 +8643,43 @@ mod tests {
                 .contains("_pioneer_compacted"),
             false
         );
+        let detached_payload = serde_json::json!({
+            "action_id":"action-detached", "execution_id":"execution-detached", "kind":"start_agent",
+            "execution_mode":"detached_task", "task_id":"task-detached", "thread_id":"thread-detached", "turn_id":"turn-detached",
+            "launch_request_fingerprint":"b".repeat(64), "normalized":{"input":"z".repeat(4096)},
+        }).to_string();
+        insert_compaction_test_tuple(
+            &db,
+            "detached",
+            "delivered",
+            1,
+            utc_now() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS + 1),
+            Some(utc_now() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS + 1)),
+            serde_json::json!({"taskCreation":{"taskId":"task-detached"}}).to_string(),
+            detached_payload.clone(),
+        )
+        .await;
+        assert_eq!(
+            compact_terminal_agent_action_ledger(&db, utc_now(), 1)
+                .await
+                .unwrap()
+                .compacted_rows,
+            1
+        );
+        let detached = load_agent_action_outbox(&db, "action-detached")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(compacted_agent_action_value_matches(
+            Some(&detached.payload_json),
+            Some(&detached_payload),
+            AGENT_ACTION_OUTBOX_COMPACTION_FORMAT
+        ));
+        let retained: serde_json::Value = serde_json::from_str(&detached.payload_json).unwrap();
+        assert_eq!(retained["execution_mode"], "detached_task");
+        assert_eq!(retained["task_id"], "task-detached");
+        assert_eq!(retained["turn_id"], "turn-detached");
+        assert!(retained.get("dispatch").is_none());
     }
 
     async fn insert_compaction_test_tuple(

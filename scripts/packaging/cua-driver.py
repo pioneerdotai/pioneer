@@ -460,7 +460,9 @@ def package(target, binary, prepared, archive, notary_log_dir=None):
             # Apple Events integration. Screen capture/accessibility remain TCC
             # grants; this is not an App Sandbox or upstream provisioning profile.
             entitlements.write_bytes(plistlib.dumps({"com.apple.security.automation.apple-events": True}))
-            for executable in [gateway, daemon, *gateway.parent.glob("*.dylib")]:
+            # Sign nested code first; signing the app below also signs its main
+            # executable and seals the bundle with the completed nested signatures.
+            for executable in [daemon, *gateway.parent.glob("*.dylib")]:
                 options = ["--entitlements", str(entitlements)] if executable.suffix != ".dylib" else []
                 subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",
                                 *options, "--sign", identity, str(executable)], check=True)

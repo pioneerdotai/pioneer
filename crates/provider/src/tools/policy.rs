@@ -366,8 +366,17 @@ fn prepare_history_for_api(
             message.tool_call_id = Some(normalized);
             continue;
         }
+        // Responses has an ordered, heterogeneous input item list; results
+        // bind by call_id rather than by a Chat/Messages role boundary. Keep
+        // real user input in its source position while awaiting those results.
+        // A new assistant round still requires every pending result, and all
+        // orphan/duplicate/name checks above remain in force.
+        // https://developers.openai.com/api/reference/resources/responses/methods/create
         ensure!(
-            pending.is_empty(),
+            pending.is_empty()
+                || (responses
+                    && message.role == Role::User
+                    && message.tool_calls.as_ref().is_none_or(Vec::is_empty)),
             "provider `{provider}`: missing results before next message/round"
         );
         for call in message.tool_calls.iter_mut().flatten() {
@@ -674,6 +683,48 @@ mod tests {
         let hashed = wire_id("mistral", "foreign/id").unwrap();
         collision.extend(round(&[&hashed]));
         assert!(prepare_history("mistral", &mut collision).is_err());
+    }
+
+    #[test]
+    fn responses_keeps_intermediate_user_input_and_still_requires_exact_results() {
+        let mut history = round(&["one", "two"]);
+        history.insert(
+            1,
+            ChatMessage::user("genuine input while tools were running"),
+        );
+        let expected = history.clone();
+        prepare_responses_history("openai", &mut history).unwrap();
+        assert_eq!(
+            serde_json::to_value(&history).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        for mut invalid in [
+            history[..2].to_vec(),
+            {
+                let mut copy = history.clone();
+                copy.push(history[2].clone());
+                copy
+            },
+            {
+                let mut copy = history.clone();
+                copy[2].tool_call_id = Some("foreign".into());
+                copy
+            },
+            {
+                let mut copy = history.clone();
+                copy[2].name = Some("wrong".into());
+                copy
+            },
+            {
+                let mut copy = history.clone();
+                copy.insert(2, ChatMessage::assistant("next assistant round"));
+                copy
+            },
+        ] {
+            assert!(prepare_responses_history("openai", &mut invalid).is_err());
+        }
+        // The Responses item contract does not change stricter adapters.
+        assert!(prepare_history("anthropic", &mut expected.clone()).is_err());
     }
 
     #[test]

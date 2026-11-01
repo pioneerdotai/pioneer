@@ -56,6 +56,12 @@ pub enum WorkState {
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ActiveWork {
+    /// Fixed portable payload operation detail; absent for other work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portable_payload: Option<crate::portable_payload::LiveOperation>,
+    /// Last pre-scope hold refusal on this caller; not a completed payload read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portable_hold_rejection: Option<crate::portable_payload::Family>,
     #[serde(skip)]
     pending_outcome: Option<Outcome>,
     #[serde(skip)]
@@ -271,6 +277,8 @@ impl WorkGuard {
                 return false;
             }
             let entry = ActiveWork {
+                portable_payload: None,
+                portable_hold_rejection: None,
                 pending_outcome: None,
                 wait_stack: [None; 4],
                 wait_overflow: 0,
@@ -376,6 +384,37 @@ pub fn progress(stage: Stage) {
                 let entry = *entry;
                 record_work(state, entry, now);
             }
+        }
+    });
+}
+/// Uses the existing bounded work registry/journal. Callers aggregate hot-loop
+/// phases locally and throttle these updates rather than recording each block.
+pub(crate) fn portable_progress(
+    context: Option<WorkContext>,
+    detail: crate::portable_payload::LiveOperation,
+) {
+    let Some(context) = context else { return };
+    let now = monotonic_ms();
+    with_store(context.consent_generation, |state| {
+        if let Some(entry) = state.active.get_mut(&context.token) {
+            entry.portable_payload = Some(detail);
+            entry.last_progress_ms = now;
+            let entry = *entry;
+            record_work(state, entry, now);
+        }
+    });
+}
+pub(crate) fn portable_hold_rejected(
+    context: Option<WorkContext>,
+    family: crate::portable_payload::Family,
+) {
+    let Some(context) = context else { return };
+    let now = monotonic_ms();
+    with_store(context.consent_generation, |state| {
+        if let Some(entry) = state.active.get_mut(&context.token) {
+            entry.portable_hold_rejection = Some(family);
+            let entry = *entry;
+            record_work(state, entry, now);
         }
     });
 }
@@ -746,6 +785,8 @@ impl QueuedWork {
                 return None;
             }
             let entry = ActiveWork {
+                portable_payload: None,
+                portable_hold_rejection: None,
                 pending_outcome: None,
                 wait_stack: [None; 4],
                 wait_overflow: 0,

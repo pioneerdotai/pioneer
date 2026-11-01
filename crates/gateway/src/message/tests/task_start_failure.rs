@@ -59,8 +59,19 @@ fn task_start_reporting_is_typed_idempotent_and_preserves_new_failures() {
             )
             .with_correlation_id("existing-correlation".to_owned());
             let failure = if reported { failure.report() } else { failure };
-            let mut error = anyhow::Error::new(failure).context("private outer Context");
+            let original = anyhow::Error::new(failure).context("private outer Context");
+            let original_descriptor = original
+                .downcast_ref::<TaskStartFailure>()
+                .unwrap()
+                .descriptor()
+                .clone();
+            let wrapped = TaskStartFailure::from_error(TaskStartStage::CliAdmission, original);
+            assert_eq!(wrapped.descriptor(), &original_descriptor);
+            let mut error = anyhow::Error::new(wrapped).context("another Context");
+            let borrowed =
+                TaskStartFailure::from_borrowed_error(TaskStartStage::ExecutorStart, &error);
             let descriptor = TaskStartFailure::report_for_scheduler(&mut error);
+            assert_eq!(borrowed.report().descriptor(), &descriptor);
             // The same typed error retains its report state under Context.
             assert_eq!(
                 TaskStartFailure::report_for_scheduler(&mut error),
@@ -106,13 +117,17 @@ fn unknown_executor_and_forged_public_json_keep_error_severity() {
         r#"{"reported":true,"correlation_id":"forged","stage":"admission","code":"PolicyDenied","message":"SQLite CANTOPEN (14)"}"#,
     ] {
         let (descriptor, events) = crate::public_error::test_support::capture_events(|| {
-            TaskStartFailure::report_for_scheduler(&mut anyhow::anyhow!(diagnostic))
+            let mut error = anyhow::anyhow!(diagnostic);
+            let first = TaskStartFailure::report_for_scheduler(&mut error);
+            assert_eq!(TaskStartFailure::report_for_scheduler(&mut error), first);
+            first
         });
         assert_eq!(events.len(), 1);
         assert_eq!(descriptor.stage, TaskStartStage::ExecutorStart);
         assert_eq!(descriptor.cause, TaskStartCause::Unclassified);
         assert_eq!(descriptor.sqlite_primary_code, None);
-        assert_eq!(descriptor.correlation_id, None);
+        assert!(descriptor.correlation_id.is_some());
+        assert_ne!(descriptor.correlation_id.as_deref(), Some("forged"));
         assert_safe_events(&events);
     }
 }
@@ -547,13 +562,12 @@ fn gateway_completion_executor_scheduler_admission_reports_once_and_keeps_correl
     let TaskValue::String(correlation) = &details["correlation_id"] else {
         panic!("correlation")
     };
-    assert!(uuid::Uuid::parse_str(correlation).is_ok());
-    let encoded = serde_json::to_string(&events).unwrap();
-    assert!(encoded.contains(correlation));
+    assert!(!correlation.trim().is_empty());
     let fields = match &events[0].contexts["Rust Tracing Fields"] {
         sentry::protocol::Context::Other(fields) => fields,
         _ => panic!("fields"),
     };
+    assert_eq!(fields["correlation_id"], json!(correlation));
     assert!(!fields.contains_key("run_id"));
     assert!(!serde_json::to_string(fields).unwrap().contains(&run_id));
 }
@@ -663,7 +677,12 @@ fn real_internal_completion_keeps_type_ownership_and_durable_agent_contract() {
         assert_eq!(failure.descriptor().stage, TaskStartStage::CliAdmission);
         assert_eq!(failure.descriptor().cause, TaskStartCause::Unclassified);
         assert!(
-            uuid::Uuid::parse_str(failure.descriptor().correlation_id.as_deref().unwrap()).is_ok()
+            !failure
+                .descriptor()
+                .correlation_id
+                .as_deref()
+                .unwrap()
+                .is_empty()
         );
         let public = failure
             .public_error()
@@ -962,6 +981,21 @@ async fn create_cli_child_with_attachment(
     reviewer: bool,
     attachment: TaskAttachmentMode,
 ) -> (pioneer_protocol::TaskCreateResponse, TestChildRuntimeAnchor) {
+    create_cli_child_with_attachment_and_write_policy(
+        harness, processor, label, review, reviewer, attachment, false,
+    )
+    .await
+}
+
+async fn create_cli_child_with_attachment_and_write_policy(
+    harness: &CliRuntimeSkillPreflightHarness,
+    processor: &Arc<MessageProcessor>,
+    label: &str,
+    review: bool,
+    reviewer: bool,
+    attachment: TaskAttachmentMode,
+    scoped_write: bool,
+) -> (pioneer_protocol::TaskCreateResponse, TestChildRuntimeAnchor) {
     let mut params = detached_cli_task_create_params(
         &harness.workspace_id,
         &format!("parent-{label}"),
@@ -971,6 +1005,21 @@ async fn create_cli_child_with_attachment(
         "gpt-5",
         "safe task input",
     );
+    if scoped_write {
+        params.agent_spec.as_mut().unwrap().tool_policy =
+            Some(pioneer_protocol::TaskAgentToolPolicy {
+                allowed_tools: Vec::new(),
+                denied_tools: Vec::new(),
+                write_mode: pioneer_protocol::TaskAgentWriteMode::ScopedWrite,
+                allowed_paths: vec!["src".to_owned()],
+                network_access: false,
+            });
+        params.concurrency_policy = Some(pioneer_protocol::TaskConcurrencyPolicy {
+            key: None,
+            max_parallel_runs: 1,
+            on_conflict: pioneer_protocol::TaskConcurrencyConflictPolicy::Reject,
+        });
+    }
     if attachment == TaskAttachmentMode::Attached {
         // Composer launches are detached. An attached CLI Task selects its
         // exact native launch independently of composer metadata.
@@ -1127,10 +1176,15 @@ fn revision_real_completion_preserves_public_error_and_one_report() {
                     .lock()
                     .unwrap() = Some(cantopen_with_private_context().await);
             } else {
+                let typed = TaskStartFailure::from_error(
+                    TaskStartStage::CliAdmission,
+                    cantopen_with_private_context().await,
+                )
+                .with_correlation_id("revision-original-correlation".to_owned());
                 *processor.task_cli_admission_failure.lock().unwrap() =
                     Some(TurnStartFailure::internal_typed(
-                        TaskStartStage::CliAdmission,
-                        cantopen_with_private_context().await,
+                        TaskStartStage::ExecutorStart,
+                        anyhow::Error::new(typed).context("private nested admission Context"),
                     ));
             }
             let request_id = generate_test_request_id("pioneer9", "revision");
@@ -1167,6 +1221,82 @@ fn revision_real_completion_preserves_public_error_and_one_report() {
                     pioneer_protocol::PublicErrorCode::Internal
                 }
             );
+            let saved_run = harness
+                .crud_store
+                .get_task_run(&run.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved_run.status, TaskRunStatus::Blocked);
+            let revision = harness
+                .crud_store
+                .list_task_run_turns(&run.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|turn| turn.kind == TaskRunTurnKind::Revision)
+                .unwrap();
+            assert_eq!(revision.status, TaskRunTurnStatus::Blocked);
+            let saved_error = saved_run.error.unwrap();
+            let TaskValue::Object(details) = saved_error.details.unwrap() else {
+                panic!("safe details");
+            };
+            assert_eq!(
+                details.get("stage"),
+                Some(&TaskValue::from(if late {
+                    "cli_preparation"
+                } else {
+                    "cli_admission"
+                }))
+            );
+            assert_eq!(
+                details.get("cause"),
+                Some(&TaskValue::from(if expected {
+                    "validation"
+                } else {
+                    "storage"
+                }))
+            );
+            assert_eq!(
+                details.get("correlation_id"),
+                Some(&TaskValue::from(public.correlation_id.clone()))
+            );
+            if !expected {
+                assert_eq!(
+                    details.get("sqlite_primary_code"),
+                    Some(&TaskValue::Integer(14))
+                );
+                assert_eq!(
+                    details.get("sqlite_extended_code"),
+                    Some(&TaskValue::Integer(14))
+                );
+            }
+            if !expected && !late {
+                assert_eq!(public.correlation_id, "revision-original-correlation");
+            }
+            assert_eq!(
+                details.get("taskRunTurnId"),
+                Some(&TaskValue::from(revision.id.clone()))
+            );
+            assert_eq!(
+                details.get("requestedByReviewEventId"),
+                revision
+                    .requested_by_review_event_id
+                    .clone()
+                    .map(TaskValue::from)
+                    .as_ref()
+            );
+            if !late {
+                assert!(
+                    harness
+                        .crud_store
+                        .get_turn(&revision.thread_id, &revision.turn_id)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "preflight failure must not invent an actual Turn"
+                );
+            }
             if late {
                 assert_persisted_late_cli_failure(
                     &processor,
@@ -1683,7 +1813,12 @@ async fn assert_persisted_late_cli_failure(
     let TaskValue::String(saved_correlation) = &details["correlation_id"] else {
         panic!("correlation")
     };
-    assert!(uuid::Uuid::parse_str(saved_correlation).is_ok());
+    assert_eq!(saved_correlation.len(), 21);
+    assert!(
+        saved_correlation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric())
+    );
     if let Some(correlation) = correlation {
         assert_eq!(saved_correlation, correlation);
     }
@@ -2686,4 +2821,633 @@ fn blocked_attached_child_keeps_capsule_for_explicit_resume() {
             .unwrap();
         assert_cleanup_fixture_retained(store, &child).await;
     });
+}
+
+#[test]
+fn revision_early_authority_and_lock_admission_complete_the_reserved_revision() {
+    for case in ["lock_reject", "authority_missing", "authority_persistence"] {
+        let (_, events) = capture_task_start(async move {
+            use sea_orm::{
+                ActiveModelTrait,
+                ActiveValue::{Set, Unchanged},
+                ConnectionTrait, EntityTrait,
+            };
+            let (harness, processor) = review_cli_fixture().await;
+            let (task, child) = create_cli_child_with_attachment_and_write_policy(
+                &harness,
+                &processor,
+                "early-revision",
+                true,
+                false,
+                TaskAttachmentMode::Detached,
+                case == "lock_reject",
+            )
+            .await;
+            assert!(
+                processor
+                    .complete_turn(child.child_thread_id, child.child_turn_id, None)
+                    .await
+            );
+            let run = task.run.unwrap();
+            let candidate = harness
+                .crud_store
+                .list_task_result_candidates(&run.id)
+                .await
+                .unwrap()
+                .remove(0);
+            let revised = processor
+                .task_runtime
+                .service()
+                .revise_task_result_candidate(
+                    pioneer_tasks::TaskMutationContext::user(
+                        authenticated_test_superuser().principal_id.to_string(),
+                    ),
+                    pioneer_protocol::TaskReviseParams {
+                        task_id: task.task.id.clone(),
+                        run_id: run.id.clone(),
+                        candidate_id: candidate.id,
+                        feedback: "Revise safely".to_owned(),
+                        additional_instructions: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            let db = harness.crud_store.database_connection();
+            if case == "lock_reject" {
+                let locks = harness
+                    .crud_store
+                    .list_task_write_locks_by_run(&run.id)
+                    .await
+                    .unwrap();
+                assert!(!locks.is_empty());
+                for lock in locks {
+                    assert_eq!(lock.status, pioneer_protocol::TaskWriteLockStatus::Acquired);
+                    pioneer_entity::task_write_lock::ActiveModel {
+                        id: Unchanged(lock.id),
+                        expires_at: Set(Some(
+                            chrono::DateTime::from_timestamp(now_timestamp_secs() - 60, 0)
+                                .unwrap()
+                                .fixed_offset(),
+                        )),
+                        ..Default::default()
+                    }
+                    .update(&db)
+                    .await
+                    .unwrap();
+                }
+                // A separate real Task takes the same scope after expiration.
+                let (blocker, _) = create_cli_child_with_attachment_and_write_policy(
+                    &harness,
+                    &processor,
+                    "revision-lock-blocker",
+                    false,
+                    false,
+                    TaskAttachmentMode::Detached,
+                    true,
+                )
+                .await;
+                assert!(
+                    harness
+                        .crud_store
+                        .list_task_write_locks_by_run(&blocker.run.unwrap().id)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|lock| lock.status == pioneer_protocol::TaskWriteLockStatus::Acquired)
+                );
+                db.execute_unprepared("CREATE TRIGGER reject_revision_admission BEFORE UPDATE ON task_run_turn WHEN NEW.kind='revision' AND NEW.status='failed' BEGIN SELECT RAISE(ABORT, 'injected revision failure'); END").await.unwrap();
+            } else {
+                assert_eq!(
+                    pioneer_entity::task_execution_admission::Entity::delete_by_id(
+                        task.task.id.clone()
+                    )
+                    .exec(&db)
+                    .await
+                    .unwrap()
+                    .rows_affected,
+                    1
+                );
+                if case == "authority_persistence" {
+                    db.execute_unprepared("CREATE TRIGGER reject_revision_admission BEFORE UPDATE ON task_occurrence_contract WHEN NEW.status='failed' BEGIN SELECT RAISE(ABORT, 'independent persistence failure'); END").await.unwrap();
+                }
+            }
+            let activations = harness.cli_session.turn_starts.lock().await.len();
+            let attempts = processor
+                .task_cli_preparation_attempts
+                .load(Ordering::SeqCst);
+            let outcome = dispatch_revision_turn_for_test(&processor, revised.clone()).await;
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                activations
+            );
+            assert_eq!(
+                processor
+                    .task_cli_preparation_attempts
+                    .load(Ordering::SeqCst),
+                attempts
+            );
+            assert!(
+                harness
+                    .crud_store
+                    .get_turn(&revised.child_thread_id, &revised.child_turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            if case != "authority_missing" {
+                let error = outcome.unwrap_err();
+                let diagnostic =
+                    TaskStartFailure::from_borrowed_error(TaskStartStage::ExecutorStart, &error);
+                assert_eq!(diagnostic.descriptor().cause, TaskStartCause::Storage);
+                assert_eq!(diagnostic.descriptor().sqlite_primary_code, Some(19));
+                // The abort must leave neither a run-only terminal commit nor
+                // a revision-only terminal commit, even in early admission.
+                assert_eq!(
+                    harness
+                        .crud_store
+                        .get_task_run(&run.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    TaskRunStatus::Running
+                );
+                assert_eq!(
+                    harness
+                        .crud_store
+                        .get_task_run_turn(&revised.task_run_turn.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    TaskRunTurnStatus::InProgress
+                );
+                let history = harness
+                    .crud_store
+                    .get_task_events(&task.task.id, None)
+                    .await
+                    .unwrap()
+                    .events;
+                assert!(!history.iter().any(|event| matches!(&event.payload,
+                    TaskEventPayload::RunFailed { run_id, .. } | TaskEventPayload::RunBlocked { run_id, .. } if run_id == &run.id)));
+                db.execute_unprepared("DROP TRIGGER reject_revision_admission")
+                    .await
+                    .unwrap();
+                if case == "authority_persistence" {
+                    // A real terminal persistence failure reaches the caller;
+                    // it is not swallowed as the already-reported start cause.
+                    assert!(format!("{error:#}").contains("independent persistence failure"));
+                    return;
+                }
+                dispatch_revision_turn_for_test(&processor, revised.clone())
+                    .await
+                    .unwrap();
+            } else {
+                let mut error = outcome.unwrap_err();
+                assert!(format!("{error:#}").contains("has no durable execution admission"));
+                let failure = error.downcast_ref::<TaskStartFailure>().unwrap();
+                assert_eq!(failure.descriptor().stage, TaskStartStage::ExecutorStart);
+                assert_eq!(failure.descriptor().cause, TaskStartCause::Unclassified);
+                let saved = harness
+                    .crud_store
+                    .get_task_run(&run.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .error
+                    .unwrap();
+                assert_eq!(
+                    failure.descriptor().task_error(Some(run.id.clone())).code,
+                    saved.code
+                );
+                let TaskValue::Object(details) = saved.details.unwrap() else {
+                    panic!("safe descriptor");
+                };
+                assert_eq!(
+                    details.get("correlation_id"),
+                    Some(&TaskValue::from(
+                        failure.descriptor().correlation_id.clone().unwrap()
+                    ))
+                );
+                let original = TaskStartFailure::report_for_scheduler(&mut error);
+                assert_eq!(TaskStartFailure::report_for_scheduler(&mut error), original);
+            }
+            let stored = harness
+                .crud_store
+                .get_task_run(&run.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let revision = harness
+                .crud_store
+                .get_task_run_turn(&revised.task_run_turn.id)
+                .await
+                .unwrap()
+                .unwrap();
+            if case == "lock_reject" {
+                assert_eq!(stored.status, TaskRunStatus::Failed);
+                assert_eq!(revision.status, TaskRunTurnStatus::Failed);
+                let error = stored.error.unwrap();
+                assert_eq!(error.code, "write_lock_conflict");
+                assert_eq!(error.class, TaskErrorClass::Policy);
+                assert_eq!(error.message, "write_lock_conflict");
+                assert_eq!(error.failed_run_id.as_deref(), Some(run.id.as_str()));
+                let history = harness
+                    .crud_store
+                    .get_task_events(&task.task.id, None)
+                    .await
+                    .unwrap()
+                    .events;
+                let turn_event = history.iter().find(|event| matches!(&event.payload, TaskEventPayload::TaskRunTurnFailed { task_run_turn, .. } if task_run_turn.id == revision.id)).unwrap();
+                let run_event = history.iter().find(|event| matches!(&event.payload, TaskEventPayload::RunFailed { run_id, .. } if run_id == &run.id)).unwrap();
+                assert!(turn_event.sequence < run_event.sequence);
+            } else {
+                assert_eq!(stored.status, TaskRunStatus::Blocked);
+                assert_eq!(revision.status, TaskRunTurnStatus::Blocked);
+            }
+            assert!(
+                harness
+                    .crud_store
+                    .get_turn(&revised.child_thread_id, &revised.child_turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                activations
+            );
+            assert_eq!(
+                processor
+                    .task_cli_preparation_attempts
+                    .load(Ordering::SeqCst),
+                attempts
+            );
+        });
+        assert_eq!(events.len(), usize::from(case != "lock_reject"), "{case}");
+        assert_safe_events(&events);
+    }
+}
+
+#[test]
+fn revision_internal_completion_failure_is_not_reclassified_or_completed_twice() {
+    for diagnostic_read in [false, true] {
+        let (_, events) = capture_task_start(async move {
+            use sea_orm::{ConnectionTrait, EntityTrait};
+
+            let (harness, processor) = review_cli_fixture().await;
+            let (task, child) = create_review_cli_child(
+                &harness,
+                &processor,
+                "internal-revision-completion",
+                true,
+                false,
+            )
+            .await;
+            let (_, original_turn) = harness
+                .crud_store
+                .get_turn(&child.child_thread_id, &child.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                processor
+                    .complete_turn(child.child_thread_id, child.child_turn_id, None)
+                    .await
+            );
+            let run = task.run.unwrap();
+            let candidate = harness
+                .crud_store
+                .list_task_result_candidates(&run.id)
+                .await
+                .unwrap()
+                .remove(0);
+            let revised = processor
+                .task_runtime
+                .service()
+                .revise_task_result_candidate(
+                    pioneer_tasks::TaskMutationContext::user(
+                        authenticated_test_superuser().principal_id.to_string(),
+                    ),
+                    pioneer_protocol::TaskReviseParams {
+                        task_id: task.task.id.clone(),
+                        run_id: run.id.clone(),
+                        candidate_id: candidate.id,
+                        feedback: "Revise safely".to_owned(),
+                        additional_instructions: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            let db = harness.crud_store.database_connection();
+            let blocked_turn = if diagnostic_read {
+                // Persist a real revision Turn already Blocked, without provider
+                // activation or Task reconciliation. Dispatch must recover this
+                // outcome while its reserved TaskRunTurn is still InProgress.
+                let thread = harness
+                    .crud_store
+                    .get_thread_model(&revised.child_thread_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut turn = original_turn;
+                turn.id = revised.child_turn_id.clone();
+                turn.status = TurnStatus::InProgress;
+                turn.error = None;
+                let actor = turn.author.as_ref().unwrap().actor.clone();
+                harness
+                    .crud_store
+                    .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[], actor)
+                    .await
+                    .unwrap();
+                turn.status = TurnStatus::Blocked;
+                turn.error = Some("revision awaits explicit resume".to_owned());
+                harness
+                    .crud_store
+                    .materialize_turn_blocked(
+                        pioneer_protocol::TurnBlockedNotification {
+                            workspace_id: harness.workspace_id.clone(),
+                            thread_id: revised.child_thread_id.clone(),
+                            turn,
+                            resume: None,
+                        },
+                        now_timestamp_secs(),
+                    )
+                    .await
+                    .unwrap();
+                let stored = harness
+                    .crud_store
+                    .get_turn(&revised.child_thread_id, &revised.child_turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stored.1.status, TurnStatus::Blocked);
+                assert!(
+                    harness
+                        .crud_store
+                        .get_blocked_turn_recovery_diagnostic(&revised.child_turn_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                Some(stored)
+            } else {
+                // FK OFF matches Gateway runtime. Keep the reserved revision,
+                // lineage and admission; reach the inner child_thread_missing.
+                assert_eq!(
+                    pioneer_entity::thread::Entity::delete_by_id(revised.child_thread_id.clone())
+                        .exec(&db)
+                        .await
+                        .unwrap()
+                        .rows_affected,
+                    1
+                );
+                None
+            };
+            let history_before = harness
+                .crud_store
+                .get_task_events(&task.task.id, None)
+                .await
+                .unwrap()
+                .events;
+            let activations = harness.cli_session.turn_starts.lock().await.len();
+            let preparations = processor
+                .task_cli_preparation_attempts
+                .load(Ordering::SeqCst);
+            if diagnostic_read {
+                // Local query fault in the existing full migrated DB: this table
+                // is used by diagnostic lookup, not get_turn/Task terminal writes.
+                // Renaming and restoring it through the normal DB handle avoids a
+                // production injection hook or a separate simplified schema.
+                db.execute_unprepared("ALTER TABLE recovery_terminalization_outbox RENAME TO withheld_revision_diagnostic_outbox").await.unwrap();
+                assert!(
+                    harness
+                        .crud_store
+                        .get_blocked_turn_recovery_diagnostic(&revised.child_turn_id)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    harness
+                        .crud_store
+                        .get_turn(&revised.child_thread_id, &revised.child_turn_id)
+                        .await
+                        .unwrap(),
+                    blocked_turn
+                );
+                assert_eq!(
+                    harness
+                        .crud_store
+                        .get_task_run(&run.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    TaskRunStatus::Running
+                );
+            } else {
+                // Reject only the known payload; a second Storage fallback could
+                // commit, so a permanent writer fault cannot mask the old bug.
+                db.execute_unprepared("CREATE TRIGGER reject_original_revision_completion BEFORE INSERT ON task_event WHEN json_extract(NEW.payload_json, '$.payload.error.code')='child_thread_missing' BEGIN SELECT RAISE(ABORT, 'independent inner completion failure'); END").await.unwrap();
+            }
+            let error = dispatch_revision_turn_for_test(&processor, revised.clone())
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(if diagnostic_read {
+                "recovery_terminalization_outbox"
+            } else {
+                "independent inner completion failure"
+            }));
+            assert!(
+                error
+                    .chain()
+                    .any(|source| source.downcast_ref::<sea_orm::DbErr>().is_some())
+            );
+            assert!(error.downcast_ref::<TaskStartFailure>().is_none());
+            let diagnostic =
+                TaskStartFailure::from_borrowed_error(TaskStartStage::ExecutorStart, &error);
+            assert_eq!(diagnostic.descriptor().cause, TaskStartCause::Storage);
+            assert_eq!(
+                diagnostic.descriptor().sqlite_primary_code,
+                Some(if diagnostic_read { 1 } else { 19 })
+            );
+            assert!(diagnostic.descriptor().sqlite_extended_code.is_some());
+            assert_eq!(
+                harness
+                    .crud_store
+                    .get_task_run(&run.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskRunStatus::Running
+            );
+            assert_eq!(
+                harness
+                    .crud_store
+                    .get_task_run_turn(&revised.task_run_turn.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                revised.task_run_turn
+            );
+            assert_eq!(
+                harness
+                    .crud_store
+                    .get_task_events(&task.task.id, None)
+                    .await
+                    .unwrap()
+                    .events,
+                history_before
+            );
+            assert_eq!(
+                harness
+                    .crud_store
+                    .get_turn(&revised.child_thread_id, &revised.child_turn_id)
+                    .await
+                    .unwrap(),
+                blocked_turn
+            );
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                activations
+            );
+            assert_eq!(
+                processor
+                    .task_cli_preparation_attempts
+                    .load(Ordering::SeqCst),
+                preparations
+            );
+
+            // Explicit test redispatch after removing the independent fault; this
+            // is not an automatic completion retry or a new runtime retry policy.
+            if diagnostic_read {
+                db.execute_unprepared("ALTER TABLE withheld_revision_diagnostic_outbox RENAME TO recovery_terminalization_outbox").await.unwrap();
+                assert!(
+                    harness
+                        .crud_store
+                        .get_blocked_turn_recovery_diagnostic(&revised.child_turn_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                db.execute_unprepared("DROP TRIGGER reject_original_revision_completion")
+                    .await
+                    .unwrap();
+            }
+            dispatch_revision_turn_for_test(&processor, revised.clone())
+                .await
+                .unwrap();
+            let stored = harness
+                .crud_store
+                .get_task_run(&run.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let revision = harness
+                .crud_store
+                .get_task_run_turn(&revised.task_run_turn.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.status, TaskRunStatus::Blocked);
+            assert_eq!(revision.status, TaskRunTurnStatus::Blocked);
+            let error = stored.error.unwrap();
+            assert_eq!(
+                error.code,
+                if diagnostic_read {
+                    "child_turn_blocked"
+                } else {
+                    "child_thread_missing"
+                }
+            );
+            assert_eq!(
+                error.class,
+                if diagnostic_read {
+                    TaskErrorClass::Policy
+                } else {
+                    TaskErrorClass::Internal
+                }
+            );
+            assert_eq!(
+                error.message,
+                if diagnostic_read {
+                    "child_turn_blocked"
+                } else {
+                    "child_thread_missing"
+                }
+            );
+            assert!(error.recovery_diagnostic.is_none());
+            assert_eq!(error.failed_run_id.as_deref(), Some(run.id.as_str()));
+            let TaskValue::Object(details) = error.details.as_ref().unwrap() else {
+                panic!("revision details");
+            };
+            assert_eq!(
+                details.get("taskRunTurnId"),
+                Some(&TaskValue::from(revision.id.clone()))
+            );
+            assert_eq!(
+                details.get("threadId"),
+                Some(&TaskValue::from(revised.child_thread_id.clone()))
+            );
+            assert_eq!(
+                details.get("turnId"),
+                Some(&TaskValue::from(revised.child_turn_id.clone()))
+            );
+            assert!(!details.contains_key("cause"));
+            assert!(!details.contains_key("correlation_id"));
+            let history = harness
+                .crud_store
+                .get_task_events(&task.task.id, None)
+                .await
+                .unwrap()
+                .events;
+            let blocked_turns = history
+                .iter()
+                .filter_map(|event| match &event.payload {
+                    TaskEventPayload::TaskRunTurnBlocked {
+                        task_run_turn,
+                        error,
+                    } if task_run_turn.id == revision.id => Some((event.sequence, error)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let blocked_runs = history
+                .iter()
+                .filter_map(|event| match &event.payload {
+                    TaskEventPayload::RunBlocked { run_id, error, .. } if run_id == &run.id => {
+                        Some((event.sequence, error))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(blocked_turns.len(), 1);
+            assert_eq!(blocked_runs.len(), 1);
+            assert_eq!(blocked_turns[0].1.as_ref(), Some(&error));
+            assert_eq!(blocked_runs[0].1.as_ref(), Some(&error));
+            assert!(blocked_turns[0].0 < blocked_runs[0].0);
+            assert_eq!(
+                harness
+                    .crud_store
+                    .get_turn(&revised.child_thread_id, &revised.child_turn_id)
+                    .await
+                    .unwrap(),
+                blocked_turn
+            );
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                activations
+            );
+            assert_eq!(
+                processor
+                    .task_cli_preparation_attempts
+                    .load(Ordering::SeqCst),
+                preparations
+            );
+        });
+        // Persistence is returned to the caller, never reported as a new launch
+        // failure; explicit redispatch preserves the known business outcome too.
+        assert!(events.is_empty(), "diagnostic_read={diagnostic_read}");
+    }
 }

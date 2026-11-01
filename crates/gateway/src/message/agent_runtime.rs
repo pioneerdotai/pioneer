@@ -9692,6 +9692,11 @@ impl MessageProcessor {
         self.mcp_service
             .cancel_turn_mcp_invocations(turn.id.as_str());
         self.retire_execution_progress_state(turn.id.as_str()).await;
+        // Admission completes the handoff, never the AgentExecution that
+        // authored it. The Task owns the responding execution and resources.
+        if turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask {
+            return;
+        }
         let database = self.crud_store.database_connection();
         let responding_execution_id =
             match pioneer_crud::load_agent_turn_response(&database, turn.id.as_str()).await {
@@ -9765,6 +9770,11 @@ impl MessageProcessor {
         turn: &pioneer_protocol::Turn,
         reason: &str,
     ) -> anyhow::Result<bool> {
+        // A detached admission records provenance, not a responding execution.
+        // Its Task owns cancellation through the ordinary Task lifecycle.
+        if turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask {
+            return Ok(false);
+        }
         let database = self.crud_store.database_connection();
         let responding_execution_id =
             pioneer_crud::load_agent_turn_response(&database, turn.id.as_str())
@@ -10034,14 +10044,15 @@ impl MessageProcessor {
             .await
     }
 
-    pub(super) async fn mark_turn_blocked(
+    // CLI launch has many terminal error branches. Keep their large recovery
+    // futures on the heap even when the successful path never polls them.
+    pub(super) fn mark_turn_blocked(
         &self,
         thread_id: String,
         turn_id: String,
         reason: String,
-    ) -> bool {
-        self.mark_turn_blocked_with_transition(thread_id, turn_id, reason, None)
-            .await
+    ) -> MessageFuture<'_, bool> {
+        message_future(self.mark_turn_blocked_with_transition(thread_id, turn_id, reason, None))
     }
 
     pub(super) async fn mark_turn_blocked_with_transition(
@@ -10504,17 +10515,35 @@ impl MessageProcessor {
             return false;
         }
 
-        let task_reconciliation_succeeded = match self
-            .task_agent_executor
-            .reconcile_child_turn_blocked_with_start_failure(
-                thread_id.as_str(),
-                turn_id.as_str(),
-                turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
-                TaskChildReconciliationOrigin::Live,
-                start_failure,
-            )
+        // Like Completed reconciliation, this durable Task transition needs a
+        // fresh poll stack below CLI preparation and terminal Turn cleanup.
+        // Await the owned task; cancellation leaves durable reconciliation pending.
+        let task_reconciliation = {
+            let executor = Arc::clone(&self.task_agent_executor);
+            let reconciliation_thread_id = thread_id.clone();
+            let reconciliation_turn_id = turn_id.clone();
+            let reason = turn_blocked
+                .turn
+                .error
+                .clone()
+                .unwrap_or_else(|| "turn blocked".to_owned());
+            let start_failure = start_failure.cloned();
+            message_fresh_task(async move {
+                executor
+                    .reconcile_child_turn_blocked_with_start_failure(
+                        reconciliation_thread_id.as_str(),
+                        reconciliation_turn_id.as_str(),
+                        reason.as_str(),
+                        TaskChildReconciliationOrigin::Live,
+                        start_failure.as_ref(),
+                    )
+                    .await
+            })
             .await
-        {
+            .context("blocked child task reconciliation task did not finish")
+            .and_then(|result| result)
+        };
+        let task_reconciliation_succeeded = match task_reconciliation {
             Ok(reconciled) => reconciled,
             Err(error) => {
                 warn!(
@@ -10706,17 +10735,35 @@ impl MessageProcessor {
             return false;
         }
 
-        let task_reconciliation_succeeded = match self
-            .task_agent_executor
-            .reconcile_child_turn_blocked_with_start_failure(
-                thread_id.as_str(),
-                turn_id.as_str(),
-                turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
-                TaskChildReconciliationOrigin::Live,
-                start_failure,
-            )
+        // Like Completed reconciliation, this durable Task transition needs a
+        // fresh poll stack below CLI preparation and terminal Turn cleanup.
+        // Await the owned task; cancellation leaves durable reconciliation pending.
+        let task_reconciliation = {
+            let executor = Arc::clone(&self.task_agent_executor);
+            let reconciliation_thread_id = thread_id.clone();
+            let reconciliation_turn_id = turn_id.clone();
+            let reason = turn_blocked
+                .turn
+                .error
+                .clone()
+                .unwrap_or_else(|| "turn blocked".to_owned());
+            let start_failure = start_failure.cloned();
+            message_fresh_task(async move {
+                executor
+                    .reconcile_child_turn_blocked_with_start_failure(
+                        reconciliation_thread_id.as_str(),
+                        reconciliation_turn_id.as_str(),
+                        reason.as_str(),
+                        TaskChildReconciliationOrigin::Live,
+                        start_failure.as_ref(),
+                    )
+                    .await
+            })
             .await
-        {
+            .context("blocked child task reconciliation task did not finish")
+            .and_then(|result| result)
+        };
+        let task_reconciliation_succeeded = match task_reconciliation {
             Ok(reconciled) => reconciled,
             Err(error) => {
                 warn!(

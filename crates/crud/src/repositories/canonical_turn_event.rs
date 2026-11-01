@@ -848,6 +848,8 @@ async fn load_decoded_turn_events<C: ConnectionTrait>(
         owning_turn.initiated_by_actor_id.as_deref(),
     )
     .with_context(|| format!("canonical turn `{turn_id}` has an invalid owning actor"))?;
+    let work_owner =
+        crate::TurnWorkOwner::from_db_str(&owning_turn.work_owner).map_err(anyhow::Error::msg)?;
     let current_message_input = if owning_turn.send_mode.as_deref() == Some("message") {
         let input = if owning_turn.message_deleted_at.is_some() {
             Vec::new()
@@ -885,6 +887,7 @@ async fn load_decoded_turn_events<C: ConnectionTrait>(
         .map(|row| {
             let mut record = decode_event(row, workspace_id)?;
             hydrate_legacy_turn_start_actor(&mut record, owning_actor.as_ref())?;
+            record.payload.project_work_owner(work_owner);
             if let Some(input) = current_message_input.as_deref() {
                 project_current_message_input(&mut record, input)?;
             }
@@ -955,6 +958,7 @@ pub(super) fn decode_event(
         bail!("canonical turn event `{}` payload type mismatch", row.id);
     }
     if let CanonicalTurnEventPayload::TurnStarted(started) = &mut payload {
+        started.turn.work_owner = started.work_owner;
         // The persisted event carries a client-facing Thread snapshot. Its preview and turn list
         // can contain unrelated concurrent exchanges, while the canonical history record is
         // scoped to the exact `started.turn` and `started.input` below.
@@ -1016,6 +1020,7 @@ mod tests {
 
     fn message_start_record(mode: ThreadMode) -> CanonicalTurnEventRecord {
         let turn = Turn {
+            work_owner: Default::default(),
             id: "turn_message".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,

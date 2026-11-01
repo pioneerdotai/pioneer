@@ -13,7 +13,6 @@ use pioneer_compaction::{
     summary::{
         CompletionKind, INSTRUCTIONS, Summarizer, SummaryCompletion, SummaryFailure, SummaryRequest,
     },
-    text_tokens,
 };
 use pioneer_config::GatewayCliAgentRuntimeKindConfig;
 use pioneer_protocol::ProviderFailureClass;
@@ -25,12 +24,12 @@ pub(super) async fn make_summarizer(
     store: &pioneer_crud::CrudStore,
     processor: Option<&crate::message::MessageProcessor>,
     workspace: &str,
+    thread: &str,
     selection: ModelSelection,
 ) -> Result<Arc<dyn Summarizer>> {
     if selection.transport == Transport::Api {
         let provider = providers.get_or_create_for_workspace(workspace, &selection.instance)?;
-        let provider =
-            crate::usage_journal::observe(provider, store, workspace, "summary", workspace);
+        let provider = crate::usage_journal::observe(provider, store, workspace, "summary", thread);
         let limits = provider.model_limits(&selection.model).await?;
         return Ok(Arc::new(NativeSummarizer::new(
             provider,
@@ -162,6 +161,25 @@ impl CliSummarizer {
         );
         request.data_json()
     }
+    fn framed_tokens(&self, request: &SummaryRequest, input: &str) -> Result<u64> {
+        #[derive(serde::Serialize)]
+        struct Frame<'a> {
+            model: &'a str,
+            effort: &'a Option<String>,
+            instructions: &'a str,
+            input: &'a str,
+            output_cap: u64,
+        }
+        Ok(pioneer_compaction::estimator::json_size(&Frame {
+            model: &request.selection.model,
+            effort: &request.selection.effort,
+            instructions: INSTRUCTIONS,
+            input,
+            output_cap: request.output_cap,
+        })?
+        .tokens()
+        .saturating_add(32))
+    }
 }
 fn service_diagnostic(error: &anyhow::Error) -> pioneer_compaction::runner::FailureDiagnostic {
     use pioneer_cli_agent_runtime::codex::CodexJsonlRpcClientError;
@@ -286,15 +304,25 @@ fn failure(error: anyhow::Error) -> SummaryFailure {
                 | ProviderFailureClass::Provider5xx
         )
     });
+    let overflow = typed.is_some_and(|failure| {
+        matches!(
+            failure.class,
+            ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+        )
+    });
     SummaryFailure {
         diagnostic: Some(service_diagnostic(&error)),
-        kind: if transient {
+        kind: if overflow {
+            FailureKind::InputOverflow
+        } else if transient {
             FailureKind::Transient
         } else {
             FailureKind::Permanent
         },
         retry_after_ms: typed.and_then(|failure| failure.retry_after_ms),
-        code: if transient {
+        code: if overflow {
+            "summary_cli_input_overflow"
+        } else if transient {
             "summary_cli_transient"
         } else {
             "summary_cli_rejected"
@@ -308,15 +336,14 @@ impl Summarizer for CliSummarizer {
     }
     fn input_tokens(&self, request: &SummaryRequest) -> Result<u64> {
         let input = self.input(request)?;
-        let framed = serde_json::json!({"model":request.selection.model,"effort":request.selection.effort,
-            "instructions":INSTRUCTIONS,"input":input,"output_cap":request.output_cap});
-        Ok(text_tokens(&framed.to_string()).saturating_add(32))
+        self.framed_tokens(request, &input)
     }
     async fn summarize(
         &self,
         request: SummaryRequest,
     ) -> Result<SummaryCompletion, SummaryFailure> {
-        let input_tokens = self.input_tokens(&request).map_err(failure)?;
+        let input = self.input(&request).map_err(failure)?;
+        let input_tokens = self.framed_tokens(&request, &input).map_err(failure)?;
         if !self.budget.fits(input_tokens, request.output_cap, false) {
             return Err(SummaryFailure {
                 diagnostic: None,
@@ -325,7 +352,6 @@ impl Summarizer for CliSummarizer {
                 code: "summary_cli_input_overflow",
             });
         }
-        let input = self.input(&request).map_err(failure)?;
         // Runner owns the tighter remaining operation/attempt deadline and drops
         // this call on Stop. The service retains its owner for awaitable cleanup.
         let timeout = Duration::from_millis(pioneer_compaction::ATTEMPT_MILLIS);
@@ -470,8 +496,8 @@ pub(crate) fn apply_cli_usage(
     observed.input_tokens = if claude {
         observed.uncached_input_tokens.and_then(|input| {
             input
-                .checked_add(observed.cache_read_input_tokens.unwrap_or(0))?
-                .checked_add(observed.cache_write_input_tokens.unwrap_or(0))
+                .checked_add(observed.cache_read_input_tokens?)?
+                .checked_add(observed.cache_write_input_tokens?)
         })
     } else {
         raw["input_tokens"].as_u64()
@@ -616,7 +642,9 @@ mod tests {
             &mut usage,
             &serde_json::json!({"input_tokens":10,"cache_read_input_tokens":20,"output_tokens":0,"total_cost_usd":0.02}),
         );
-        assert_eq!(usage.input_tokens, Some(30));
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.uncached_input_tokens, Some(10));
+        assert_eq!(usage.cache_read_input_tokens, Some(20));
         assert_eq!(usage.cache_write_input_tokens, None);
         assert!(usage.accounting.as_ref().unwrap()["reported_cost"].is_null());
         assert_eq!(
@@ -631,6 +659,36 @@ mod tests {
         summary::{HEADINGS, SummaryInput, SummaryPart, validate_summary},
     };
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn cli_shrinking_requires_a_confirmed_input_failure() {
+        for (class, expected) in [
+            (
+                ProviderFailureClass::PromptTooLong,
+                FailureKind::InputOverflow,
+            ),
+            (
+                ProviderFailureClass::ContextTooLarge,
+                FailureKind::InputOverflow,
+            ),
+            (
+                ProviderFailureClass::AuthOrPermission,
+                FailureKind::Permanent,
+            ),
+            (ProviderFailureClass::InvalidRequest, FailureKind::Permanent),
+            (ProviderFailureClass::RateLimit, FailureKind::Transient),
+        ] {
+            let failure = super::failure(anyhow::Error::new(ServiceFailure {
+                class,
+                retry_after_ms: None,
+            }));
+            assert_eq!(failure.kind, expected);
+        }
+        assert_eq!(
+            super::failure(anyhow::anyhow!("context too large")).kind,
+            FailureKind::Permanent
+        );
+    }
 
     #[test]
     fn cli_failure_diagnostic_preserves_stage_and_rpc_code_without_raw_payloads() {
@@ -699,7 +757,7 @@ mod tests {
                 environment: SensitiveEnvironment::new(),
             })),
         };
-        let marker = "cli-summary-command-output ".repeat(32);
+        let marker = "cli-summary-command-output \"\\\n🌍\u{0}".repeat(32);
         let request = SummaryRequest {
             selection,
             output_cap: 512,
@@ -723,8 +781,16 @@ mod tests {
             },
         };
         let input = summarizer.input(&request).unwrap();
-        assert_eq!(input.matches(&marker).count(), 1);
-        assert!(summarizer.input_tokens(&request).unwrap() > 0);
+        let decoded: SummaryInput = serde_json::from_str(&input).unwrap();
+        assert_eq!(decoded.compact_units.len(), 1);
+        assert_eq!(decoded.compact_units[0].text, marker);
+        let actual = summarizer.input_tokens(&request).unwrap();
+        let mut fixed = request.clone();
+        fixed.input.compact_units.clear();
+        let sizing = super::super::PortionSizing::new(summarizer.input_tokens(&fixed).unwrap());
+        let estimate = sizing
+            .with(super::super::summary_component_units(&request.input.compact_units[0]).unwrap());
+        assert!(actual <= estimate && estimate <= actual + 1);
     }
 
     #[tokio::test]
