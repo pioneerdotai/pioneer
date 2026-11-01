@@ -1112,7 +1112,7 @@ async fn released_copy_partial_failure_retries_without_losing_remaining_paths() 
 async fn physical_copy_preparation_succeeds_with_disconnected_database() {
     let harness = preview_fixture().await;
     let service = ArtifactService::new(
-        Arc::new(CrudStore::new(sea_orm::DatabaseConnection::Disconnected)),
+        Arc::new(CrudStore::new(sea_orm::DatabaseConnection::default())),
         harness.service.blob_store.clone(),
     );
     let root = service.blob_store.local_artifact_root().unwrap();
