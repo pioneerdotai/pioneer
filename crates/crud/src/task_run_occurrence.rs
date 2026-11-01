@@ -461,6 +461,12 @@ impl CrudStore {
             )
             .await?;
 
+            // Unknown legacy producers may not retire the queue row when the
+            // projection becomes consistent. ACK this exact claim in the same
+            // transaction; a superseding generation/token remains protected.
+            if let Some(claim) = claim.as_ref() {
+                queue::remove_if_consistent(&transaction, claim).await?;
+            }
             Ok(TaskRunOccurrenceTerminalizationOutcome::Changed)
         }
         .await;

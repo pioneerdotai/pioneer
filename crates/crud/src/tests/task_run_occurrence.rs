@@ -72,9 +72,11 @@ async fn tracker_projector_store() -> CrudStore {
 async fn terminal_task_run_occurrence_fixture(
     kind: Option<TurnKind>,
 ) -> (CrudStore, Thread, TaskRun) {
-    let (store, thread, run) = super::terminal_task_run_occurrence_fixture(kind).await;
+    // Install legacy producers before the domain births, so this trigger suite
+    // does not inherit conservative tickets from the current typed producers.
+    let store = test_store_with_workspace("ws_task").await;
     restore_legacy_occurrence_tracking(&store).await;
-    (store, thread, run)
+    super::terminal_task_run_occurrence_fixture_with_store(store, kind).await
 }
 
 async fn row(store: &CrudStore, id: &str) -> Option<pending::Model> {

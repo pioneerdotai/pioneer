@@ -48212,6 +48212,14 @@ mod tests {
         let (store, _thread, run) =
             terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
 
+        let ticket = pioneer_entity::task_run_occurrence_reconcile_pending::Entity::find_by_id(
+            run.id.clone(),
+        )
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .expect("terminal mismatch must publish a ticket");
+        assert!(ticket.generation > 0);
         assert_eq!(
             store
                 .discover_task_run_occurrence_reconcile(i64::MAX, 10)
@@ -48219,7 +48227,7 @@ mod tests {
                 .expect("due tracked occurrences should list"),
             vec![TaskRunOccurrenceReconcileCandidate {
                 run_id: run.id.clone(),
-                generation: 1
+                generation: ticket.generation
             }],
         );
         assert_eq!(

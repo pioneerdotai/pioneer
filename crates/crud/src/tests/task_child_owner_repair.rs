@@ -100,7 +100,7 @@ async fn owner_only_backfill_revives_parked_child_with_already_covered_terminal_
     db.execute_unprepared("CREATE TRIGGER test_owner_repair_refusal BEFORE UPDATE ON turn_event_projection_stream_state WHEN OLD.turn_id='r00000000000000000091' BEGIN SELECT RAISE(IGNORE); END").await.unwrap();
     assert!(
         store
-            .backfill_turn_event_projection_stream_states_batch(None, 64)
+            .backfill_turn_event_projection_stream_states_batch(None, 32)
             .await
             .is_err()
     );
@@ -161,7 +161,7 @@ async fn owner_only_backfill_revives_parked_child_with_already_covered_terminal_
     );
     assert_parked(&store, &claim.turn_id).await;
     let batch = store
-        .backfill_turn_event_projection_stream_states_batch(None, 64)
+        .backfill_turn_event_projection_stream_states_batch(None, 32)
         .await
         .unwrap();
     assert_eq!(batch.events_repaired, 1);
@@ -202,7 +202,7 @@ async fn owner_only_backfill_revives_parked_child_with_already_covered_terminal_
     // Idempotent public rerun has no owner change and publishes no new Run work.
     assert_eq!(
         store
-            .backfill_turn_event_projection_stream_states_batch(None, 64)
+            .backfill_turn_event_projection_stream_states_batch(None, 32)
             .await
             .unwrap()
             .events_repaired,

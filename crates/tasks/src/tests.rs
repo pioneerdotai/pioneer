@@ -8690,8 +8690,17 @@ async fn compatibility_audit_error_repairs_healthy_work_before_returning_and_set
     let store = runtime.service().store();
     let db = store.database_connection();
     pioneer_sqlite::apply_sqlite_pragmas(&db).await.unwrap();
-    // Exercise the typed producer through its public source mutation API.
+    // Model historical drift independently of the public terminal fence.
+    // Then exercise the real typed producer with a permitted nonterminal
+    // transition, retaining a durable healthy ticket for the audit to drain.
     for id in &runs {
+        db.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE task_occurrence_contract SET status='running' WHERE run_id=?",
+            [id.clone().into()],
+        ))
+        .await
+        .unwrap();
         let mut occurrence = store
             .get_task_occurrence_contract_by_run(id)
             .await

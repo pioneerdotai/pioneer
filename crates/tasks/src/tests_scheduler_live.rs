@@ -840,26 +840,27 @@ async fn foreign_expired_cache_refresh_replaces_deadlines_without_rebuild() {
 
 #[tokio::test]
 async fn malformed_discovery_rows_preserve_executor_dispatch_and_terminal_repair() {
-    let runtime = runtime().await;
+    // Keep the large composed setup/dispatch futures off the test thread stack.
+    let runtime = Box::pin(runtime()).await;
     let store = runtime.service().store();
     let now = chrono::Utc::now().timestamp();
-    let terminal = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::Immediate),
-        )
-        .await
-        .unwrap();
+    let terminal = Box::pin(runtime.service().create_task(
+        TaskCreateContext::default(),
+        create_params(TaskTriggerSpec::Immediate),
+    ))
+    .await
+    .unwrap();
     let terminal_run = terminal.run.unwrap();
     let setup_executors = Arc::new(TaskExecutorRegistry::new());
     setup_executors
         .register(Arc::new(CompletingSystemExecutor))
         .await;
-    TaskScheduler::new(store.clone(), runtime.event_bus(), setup_executors)
-        .process_due_once(now)
-        .await
-        .unwrap();
+    Box::pin(
+        TaskScheduler::new(store.clone(), runtime.event_bus(), setup_executors)
+            .process_due_once(now),
+    )
+    .await
+    .unwrap();
     store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
@@ -869,28 +870,24 @@ async fn malformed_discovery_rows_preserve_executor_dispatch_and_terminal_repair
         ))
         .await
         .unwrap();
-    let bad_run = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::Immediate),
-        )
-        .await
-        .unwrap()
-        .run
-        .unwrap();
-    let bad_trigger = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::ScheduledAt {
-                scheduled_at: now,
-                timezone: None,
-                catch_up_policy: None,
-            }),
-        )
-        .await
-        .unwrap();
+    let bad_run = Box::pin(runtime.service().create_task(
+        TaskCreateContext::default(),
+        create_params(TaskTriggerSpec::Immediate),
+    ))
+    .await
+    .unwrap()
+    .run
+    .unwrap();
+    let bad_trigger = Box::pin(runtime.service().create_task(
+        TaskCreateContext::default(),
+        create_params(TaskTriggerSpec::ScheduledAt {
+            scheduled_at: now,
+            timezone: None,
+            catch_up_policy: None,
+        }),
+    ))
+    .await
+    .unwrap();
     let db = store.database_connection();
     pioneer_entity::task_run::Entity::update_many()
         .filter(pioneer_entity::task_run::Column::Id.eq(bad_run.id.clone()))
@@ -914,14 +911,12 @@ async fn malformed_discovery_rows_preserve_executor_dispatch_and_terminal_repair
         .exec(&db)
         .await
         .unwrap();
-    let inflight = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::Immediate),
-        )
-        .await
-        .unwrap();
+    let inflight = Box::pin(runtime.service().create_task(
+        TaskCreateContext::default(),
+        create_params(TaskTriggerSpec::Immediate),
+    ))
+    .await
+    .unwrap();
     let inflight_run = inflight.run.unwrap();
     TaskExecutionHandle::new(
         store.clone(),
@@ -932,16 +927,14 @@ async fn malformed_discovery_rows_preserve_executor_dispatch_and_terminal_repair
     .mark_started(now)
     .await
     .unwrap();
-    let healthy = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::Immediate),
-        )
-        .await
-        .unwrap()
-        .run
-        .unwrap();
+    let healthy = Box::pin(runtime.service().create_task(
+        TaskCreateContext::default(),
+        create_params(TaskTriggerSpec::Immediate),
+    ))
+    .await
+    .unwrap()
+    .run
+    .unwrap();
     let count = Arc::new(AtomicUsize::new(0));
     let executors = Arc::new(TaskExecutorRegistry::new());
     executors
@@ -954,7 +947,7 @@ async fn malformed_discovery_rows_preserve_executor_dispatch_and_terminal_repair
         executors,
         scheduler.handle(),
     );
-    assert!(reconciler.reconcile(now).await.is_err());
+    assert!(Box::pin(reconciler.reconcile(now)).await.is_err());
     assert_eq!(count.load(Ordering::SeqCst), 1);
     let execution = store
         .load_execution_for_run(&inflight_run.id)
@@ -971,7 +964,7 @@ async fn malformed_discovery_rows_preserve_executor_dispatch_and_terminal_repair
             .status,
         TaskOccurrenceStatus::Delivered
     );
-    assert!(scheduler.process_due_once(now).await.is_err());
+    assert!(Box::pin(scheduler.process_due_once(now)).await.is_err());
     assert_eq!(
         store
             .get_task_run(&healthy.id)
@@ -996,17 +989,15 @@ async fn malformed_discovery_rows_preserve_executor_dispatch_and_terminal_repair
         .await
         .unwrap();
     runtime.event_bus().publish(event).await;
-    let later = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::Immediate),
-        )
-        .await
-        .unwrap()
-        .run
-        .unwrap();
-    assert!(reconciler.reconcile(now + 6).await.is_err());
+    let later = Box::pin(runtime.service().create_task(
+        TaskCreateContext::default(),
+        create_params(TaskTriggerSpec::Immediate),
+    ))
+    .await
+    .unwrap()
+    .run
+    .unwrap();
+    assert!(Box::pin(reconciler.reconcile(now + 6)).await.is_err());
     assert!(store.get_task_events(&later.task_id, None).await.unwrap().events.iter().any(|event|
         matches!(&event.payload, TaskEventPayload::TaskRecovered { run_id: Some(id), .. } if id == &later.id)));
     assert_eq!(
@@ -1015,24 +1006,22 @@ async fn malformed_discovery_rows_preserve_executor_dispatch_and_terminal_repair
         "the valid lease prevents duplicate recovery"
     );
     assert!(
-        scheduler.process_due_once(now + 6).await.is_err(),
+        Box::pin(scheduler.process_due_once(now + 6)).await.is_err(),
         "poison remains visible on live passes"
     );
-    let startup_run = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::Immediate),
-        )
-        .await
-        .unwrap()
-        .run
-        .unwrap();
+    let startup_run = Box::pin(runtime.service().create_task(
+        TaskCreateContext::default(),
+        create_params(TaskTriggerSpec::Immediate),
+    ))
+    .await
+    .unwrap()
+    .run
+    .unwrap();
     runtime
         .register_executor(Arc::new(CompletingSystemExecutor))
         .await;
     assert!(
-        runtime.start().await.is_err(),
+        Box::pin(runtime.start()).await.is_err(),
         "partial startup remains visible to the caller"
     );
     assert_eq!(
