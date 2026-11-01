@@ -257,7 +257,7 @@ pub(crate) async fn request_at<C: sea_orm::ConnectionTrait>(
                 .col_expr(
                     work::Column::DueAt,
                     Expr::val(if row.state == "ready" {
-                        row.due_at.unwrap_or(now_ms).min(now_ms)
+                        std::cmp::min(row.due_at.unwrap_or(now_ms), now_ms)
                     } else {
                         now_ms
                     }),
