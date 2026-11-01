@@ -828,6 +828,7 @@ fn non_empty(value: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use super::SentryEventKind;
     use super::{
         database_metrics_target_enabled, sentry_enabled_for_environment, sentry_event_filter,
         should_demote_gpui_asset_cache_http_not_found,
@@ -839,7 +840,6 @@ mod tests {
         should_demote_tantivy_reader_commit_reload_not_found, should_ignore_otlp_internal_event,
         should_keep_otlp_network_diagnostic,
     };
-    use super::SentryEventKind;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing::{Event, Subscriber};
