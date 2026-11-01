@@ -201,7 +201,11 @@ fn keyboard_navigation_reaches_virtualized_history_without_reading_it(cx: &mut T
                 .all(|item| item.is_actionable())
         );
     });
-    assert_eq!(cx.debug_bounds("task-inbox-header").unwrap(), header);
+    assert_eq!(
+        cx.debug_bounds("task-inbox-viewport").unwrap(),
+        viewport,
+        "keyboard scrolling keeps the viewport fixed"
+    );
     assert_eq!(
         cx.debug_bounds("task-inbox-footer").unwrap(),
         footer,
