@@ -2,6 +2,7 @@
 use super::*;
 use crate::rpc::{JsonRpcRequestTransport, JsonRpcResponseResult};
 use serde_json::{Value, json};
+use std::future::Future;
 use std::{
     io,
     pin::Pin,
@@ -228,10 +229,32 @@ impl AsyncWrite for GatedSocket {
     }
 }
 
+#[derive(Default)]
+struct MonitorIdle {
+    epoch: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+impl MonitorIdle {
+    fn epoch(&self) -> usize {
+        self.epoch.load(Ordering::Acquire)
+    }
+    async fn after(&self, epoch: usize) {
+        loop {
+            let changed = self.changed.notified();
+            if self.epoch() > epoch {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
 struct Fixture {
     peer: WebSocketStream<DuplexStream>,
     commands: WsSender<ConnectionRpcCommand>,
+    renewals: RenewalSender,
     gate: Arc<WriteGate>,
+    idle: Arc<MonitorIdle>,
     task: JoinHandle<String>,
     spec: GatewayWsConnectSpec,
     receipt: SocketReceipt,
@@ -277,27 +300,45 @@ impl Fixture {
         let events = GatewayWsEventSender::from(events);
         let (commands, command_rx) = work_channel(Boundary::ClientRpc);
         let mut command_rx = ConnectionCommandReceiver(command_rx);
+        let (renewals, mut renewal_rx) = renewal_channel();
         let (receipt, cancels) = SocketReceipt::new(7);
         let monitor_receipt = receipt.clone();
         let (start, started) = tokio::sync::oneshot::channel();
+        let idle = Arc::new(MonitorIdle::default());
+        let monitor_idle = idle.clone();
         let task = tokio::spawn(async move {
             started.await.expect("start monitor fixture");
-            monitor_connection(
+            let monitor = monitor_connection(
                 stream,
                 &mut active_spec,
                 7,
                 &events,
                 &mut command_rx.0,
+                &mut renewal_rx.0,
                 monitor_receipt,
                 cancels,
-            )
+            );
+            // A Pending poll with cooperative yielding disabled means all ready
+            // ingress was serviced, rather than merely exhausting Tokio's budget.
+            let monitor = tokio::task::unconstrained(monitor);
+            tokio::pin!(monitor);
+            futures_util::future::poll_fn(|cx| {
+                let result = monitor.as_mut().poll(cx);
+                if result.is_pending() {
+                    monitor_idle.epoch.fetch_add(1, Ordering::Release);
+                    monitor_idle.changed.notify_one();
+                }
+                result
+            })
             .await
         });
         (
             Self {
                 peer,
                 commands,
+                renewals,
                 gate,
+                idle,
                 task,
                 spec,
                 receipt,
@@ -508,10 +549,12 @@ async fn renewal_keeps_its_reserve_with_full_data_handoff_and_pending_cancel() {
         let expires = next.session.as_ref().unwrap().access_expires_at_unix;
         let (tx, rx) = mpsc::channel();
         let renewal = JsonRpcResponseSender::new(tx, std::time::Instant::now() + Duration::from_secs(30));
-        f.commands.send(ConnectionRpcCommand::RenewAccess {
+        let epoch = f.idle.epoch();
+        f.renewals.send(ConnectionRpcCommand::RenewAccess {
             spec: next, refresh_generation: 2, deadline: Instant::now() + Duration::from_secs(30), response_tx: renewal.clone(),
         }).unwrap();
-        // FIFO command marker proves renewal admission while data is still full.
+        f.idle.after(epoch).await;
+        // Ordinary overload remains unchanged with independent renewal ingress.
         let marker = request(&f.commands, "synthetic/after-renewal-admission");
         assert!(receive(marker.rx).await.is_err());
         f.gate.release(false);
@@ -631,6 +674,10 @@ struct QueueTransport {
 async fn delayed_voice_tail_and_finalize_keep_socket_order_without_per_packet_ack() {
     timeout(Duration::from_secs(10), async {
         let mut fixture = Fixture::start().await;
+        fixture.consume_initial_heartbeat().await;
+        let first = request(&fixture.commands, "synthetic/inbound-progress");
+        assert_eq!(fixture.next_request().await["id"], first.id);
+        fixture.gate.wait_flushed().await;
         let pcm = crate::transport::ws::frames::encode_voice_audio_chunk_frame(
             "voice_session_integrity".into(),
             0,
@@ -651,11 +698,56 @@ async fn delayed_voice_tail_and_finalize_keep_socket_order_without_per_packet_ac
         fixture.gate.wait_entered().await;
         // The in-flight socket write still owns its capacity reservation.
         assert!(budget.admit(vec![0; 256 * 1024]).is_err());
+        let epoch = fixture.idle.epoch();
+        let mut frames = vec![pcm.clone()];
+        for sequence in 1..3 {
+            let frame = crate::transport::ws::frames::encode_voice_audio_chunk_frame(
+                "voice_session_integrity".into(),
+                sequence,
+                pioneer_protocol::VoiceAudioFormat::pioneer_streaming_target(),
+                None,
+                None,
+                &[sequence as u8; 14],
+            )
+            .unwrap();
+            fixture
+                .commands
+                .send(ConnectionRpcCommand::VoiceBinaryChunk {
+                    payload: budget.admit(frame.clone()).unwrap(),
+                })
+                .unwrap();
+            frames.push(frame);
+        }
+        fixture.idle.after(epoch).await;
+        // A is at the gate, B fills the handoff, C prevents further FIFO dequeue.
+        fixture.reply(&first.id).await;
+        assert!(receive(first.rx).await.is_ok());
+        assert!(fixture.gate.state.lock().unwrap().blocked);
+        let cancel = cancel_request(&fixture.receipt);
+        let mut next = fixture.spec.clone();
+        next.auth_token = Some(AuthSecretString::new("burst-renewal"));
+        next.session.as_mut().unwrap().access_expires_at_unix += 600;
+        let expires = next.session.as_ref().unwrap().access_expires_at_unix;
+        let (renewal_tx, renewal_rx) = mpsc::channel();
+        let epoch = fixture.idle.epoch();
+        fixture
+            .renewals
+            .send(ConnectionRpcCommand::RenewAccess {
+                spec: next,
+                refresh_generation: 2,
+                deadline: Instant::now() + Duration::from_secs(30),
+                response_tx: JsonRpcResponseSender::new(
+                    renewal_tx,
+                    std::time::Instant::now() + Duration::from_secs(30),
+                ),
+            })
+            .unwrap();
+        fixture.idle.after(epoch).await;
         let finalize = crate::rpc::build_json_rpc_request_payload(
             "voice/session/finalize",
             json!({
                 "session_id":"voice_session_integrity",
-                "audio_integrity":{"next_sequence":1,"normalized_samples":7}
+                "audio_integrity":{"next_sequence":3,"normalized_samples":21}
             }),
         )
         .unwrap();
@@ -676,12 +768,37 @@ async fn delayed_voice_tail_and_finalize_keep_socket_order_without_per_packet_ac
             Err(mpsc::TryRecvError::Empty)
         ));
         fixture.gate.release(false);
-        assert_eq!(fixture.next_data().await, Message::Binary(pcm.into()));
+        assert_eq!(
+            fixture.next_data().await,
+            Message::Binary(frames.remove(0).into())
+        );
+        let renewed = fixture.next_request().await;
+        assert_eq!(
+            renewed["method"],
+            pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW
+        );
+        assert_eq!(fixture.next_request().await["id"], cancel.id);
+        fixture
+            .peer
+            .send(Message::Text(
+                json!({"jsonrpc":"2.0","id":renewed["id"],
+            "result":{"access_expires_at_unix":expires}})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(receive(renewal_rx).await.is_ok());
+        fixture.reply(&cancel.id).await;
+        assert!(receive(cancel.rx).await.is_ok());
+        for frame in frames {
+            assert_eq!(fixture.next_data().await, Message::Binary(frame.into()));
+        }
         let observed = fixture.next_request().await;
         assert_eq!(observed["method"], "voice/session/finalize");
         assert_eq!(
             observed["params"]["audio_integrity"],
-            json!({"next_sequence":1,"normalized_samples":7})
+            json!({"next_sequence":3,"normalized_samples":21})
         );
         assert!(matches!(
             response_rx.try_recv(),
@@ -689,12 +806,169 @@ async fn delayed_voice_tail_and_finalize_keep_socket_order_without_per_packet_ac
         ));
         fixture.reply(&finalize.request_id).await;
         assert!(receive(response_rx).await.is_ok());
+        assert!(budget.admit(vec![0; 256 * 1024]).is_ok());
+        assert!(!fixture.task.is_finished());
         fixture.task.abort();
         let _ = fixture.task.await;
     })
     .await
     .unwrap();
 }
+// Gate A and settle B/C before exercising either progress or terminal cleanup.
+async fn blocked_voice_burst(
+    f: &mut Fixture,
+    budget: &Arc<super::super::voice_budget::VoiceTransportBudget>,
+) {
+    f.consume_initial_heartbeat().await;
+    f.gate.block();
+    f.commands
+        .send(ConnectionRpcCommand::VoiceBinaryChunk {
+            payload: budget.admit(vec![1]).unwrap(),
+        })
+        .unwrap();
+    f.gate.wait_entered().await;
+    let epoch = f.idle.epoch();
+    for byte in [2, 3] {
+        f.commands
+            .send(ConnectionRpcCommand::VoiceBinaryChunk {
+                payload: budget.admit(vec![byte]).unwrap(),
+            })
+            .unwrap();
+    }
+    f.idle.after(epoch).await;
+}
+
+#[tokio::test]
+async fn pending_voice_teardown_releases_budget_and_never_migrates_frames() {
+    for termination in [
+        Termination::WriteFailure,
+        Termination::PeerClose,
+        Termination::OwnerAbort,
+    ] {
+        timeout(Duration::from_secs(10), async {
+            let mut f = Fixture::start().await;
+            let budget = Arc::new(super::super::voice_budget::VoiceTransportBudget::default());
+            blocked_voice_burst(&mut f, &budget).await;
+            // Three reservations span writer, handoff and pending; the rest stay
+            // in the existing FIFO. Neither stage bypasses the frame/byte limits.
+            for _ in 3..128 {
+                f.commands
+                    .send(ConnectionRpcCommand::VoiceBinaryChunk {
+                        payload: budget.admit(vec![4]).unwrap(),
+                    })
+                    .unwrap();
+            }
+            assert!(budget.admit(vec![5]).is_err());
+            assert!(budget.admit(vec![0; 256 * 1024]).is_err());
+            let finalize = request(
+                &f.commands,
+                pioneer_protocol::constants::methods::VOICE_SESSION_FINALIZE,
+            );
+            match termination {
+                Termination::WriteFailure => f.gate.release(true),
+                Termination::PeerClose => f.peer.send(Message::Close(None)).await.unwrap(),
+                Termination::OwnerAbort => f.task.abort(),
+                _ => unreachable!(),
+            }
+            let reason = (&mut f.task).await;
+            match termination {
+                Termination::WriteFailure => assert!(reason.unwrap().contains("write")),
+                Termination::PeerClose => {
+                    assert_eq!(reason.unwrap(), WEBSOCKET_CLOSED_BY_PEER_MESSAGE)
+                }
+                Termination::OwnerAbort => assert!(reason.unwrap_err().is_cancelled()),
+                _ => unreachable!(),
+            }
+            assert!(receive(finalize.rx).await.is_err());
+            assert!(budget.admit(vec![0; 256 * 1024]).is_ok());
+            // A fresh physical owner has no old deferred data. Its first data
+            // is a marker, even while the old command sender remains retained.
+            let mut replacement = Fixture::start().await;
+            let marker = request(&replacement.commands, "synthetic/new-owner");
+            assert_eq!(replacement.next_request().await["id"], marker.id);
+            replacement.task.abort();
+            let _ = replacement.task.await;
+        })
+        .await
+        .expect("pending voice terminal cleanup");
+    }
+}
+
+#[tokio::test]
+async fn pending_finalize_preserves_completion_cancellation_and_deadline() {
+    for retire in [None, Some(false), Some(true)] {
+        timeout(Duration::from_secs(10), async {
+            let mut f = Fixture::start().await;
+            f.consume_initial_heartbeat().await;
+            f.gate.block();
+            let budget = Arc::new(super::super::voice_budget::VoiceTransportBudget::default());
+            f.commands
+                .send(ConnectionRpcCommand::VoiceBinaryChunk {
+                    payload: budget.admit(vec![1]).unwrap(),
+                })
+                .unwrap();
+            f.gate.wait_entered().await;
+            let epoch = f.idle.epoch();
+            f.commands
+                .send(ConnectionRpcCommand::VoiceBinaryChunk {
+                    payload: budget.admit(vec![2]).unwrap(),
+                })
+                .unwrap();
+            let rpc = crate::rpc::build_json_rpc_request_payload(
+                pioneer_protocol::constants::methods::VOICE_SESSION_FINALIZE,
+                Value::Null,
+            )
+            .unwrap();
+            let (tx, rx) = mpsc::channel();
+            let deadline = std::time::Instant::now()
+                + if retire == Some(true) {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::from_secs(30)
+                };
+            let response = JsonRpcResponseSender::new(tx, deadline);
+            f.commands
+                .send(ConnectionRpcCommand::Request {
+                    request_id: rpc.request_id.clone(),
+                    payload: rpc.payload,
+                    response_tx: response.clone(),
+                })
+                .unwrap();
+            f.idle.after(epoch).await;
+            assert!(
+                response.is_active(),
+                "Finalize must still be active after admission"
+            );
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            match retire {
+                Some(true) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                }
+                Some(false) => response.cancel(),
+                None => {}
+            }
+            f.gate.release(false);
+            assert_eq!(f.next_data().await, Message::Binary(vec![1].into()));
+            assert_eq!(f.next_data().await, Message::Binary(vec![2].into()));
+            if retire.is_none() {
+                assert_eq!(f.next_request().await["id"], rpc.request_id);
+                assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+                f.reply(&rpc.request_id).await;
+                assert!(receive(rx).await.is_ok());
+            } else {
+                let marker = request(&f.commands, "synthetic/after-retired-finalize");
+                assert_eq!(f.next_request().await["id"], marker.id);
+                assert!(receive(rx).await.is_err());
+            }
+            assert!(budget.admit(vec![0; 256 * 1024]).is_ok());
+            f.task.abort();
+            let _ = f.task.await;
+        })
+        .await
+        .expect("retired pending Finalize");
+    }
+}
+
 impl JsonRpcRequestTransport for QueueTransport {
     fn send_json_rpc_request(
         &self,
@@ -918,7 +1192,7 @@ async fn assert_teardown(termination: Termination) {
         renewal_tx,
         std::time::Instant::now() + Duration::from_secs(30),
     );
-    f.commands
+    f.renewals
         .send(ConnectionRpcCommand::RenewAccess {
             spec: next,
             refresh_generation: 2,
@@ -1027,6 +1301,7 @@ async fn connection_teardown_completes_rpc_renewal_and_both_binary_ack_owners() 
 #[test]
 fn dropping_unpolled_connection_completes_queued_waiters_with_retained_handles() {
     let (commands, command_rx) = work_channel(Boundary::ClientRpc);
+    let (renewals, renewal_commands) = renewal_channel();
     let spec = super::tests::connect_spec("https://synthetic.invalid".into());
     let (events, _event_rx) = mpsc::channel();
     let connection = run_connection_task(
@@ -1036,6 +1311,7 @@ fn dropping_unpolled_connection_completes_queued_waiters_with_retained_handles()
         false,
         events.into(),
         ConnectionCommandReceiver(command_rx),
+        renewal_commands,
         None,
         Arc::default(),
     );
@@ -1066,7 +1342,7 @@ fn dropping_unpolled_connection_completes_queued_waiters_with_retained_handles()
         renewal_tx,
         std::time::Instant::now() + Duration::from_secs(30),
     );
-    commands
+    renewals
         .send(ConnectionRpcCommand::RenewAccess {
             spec,
             refresh_generation: 2,
