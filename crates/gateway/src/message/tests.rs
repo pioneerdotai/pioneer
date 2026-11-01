@@ -33120,6 +33120,13 @@ async fn cli_predispatch_read_failure_cancel_and_shutdown_release_session_lease_
 
 #[test]
 fn cancelling_cli_transfer_while_waiting_for_coordinator_releases_session() {
+    // Nextest runs this case in its own process. Preserve the internal failure
+    // behind a redacted persistence response, including async runtime workers.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init();
     run_standard_stack_message_test(
         "cancel CLI transfer waiting for compaction coordinator",
         cancelling_cli_history_transfer_stops_before_provider_start_and_releases_session_impl(
