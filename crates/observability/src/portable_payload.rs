@@ -145,7 +145,7 @@ impl Metrics {
 }
 
 fn add(slot: &AtomicU64, value: u64) {
-    let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+    let _ = slot.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
         Some(old.saturating_add(value))
     });
 }
@@ -271,7 +271,7 @@ impl Aggregate {
         };
         let _ = self
             .outcome
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 (priority(next) > priority(Outcome::ALL[old])).then_some(next as usize)
             });
     }
@@ -299,7 +299,7 @@ impl Aggregate {
         if !force && !first_stage {
             if self
                 .last_live_ms
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                     (old == 0 || now.saturating_sub(old) >= LIVE_INTERVAL_MS).then_some(now.max(1))
                 })
                 .is_err()

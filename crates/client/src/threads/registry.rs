@@ -16403,7 +16403,6 @@ impl ClientCore {
             flight.response = Some(response.clone());
             response
         };
-        use crate::rpc::JsonRpcRequestTransport;
         let result = (|| -> anyhow::Result<()> {
             let params =
                 super::start::thread_start_params(request.id.clone(), request.workspace.clone());

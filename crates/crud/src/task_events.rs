@@ -30,15 +30,6 @@ pub struct AppendedTaskEvent {
     pub parent_task_id: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub append_status: TaskEventAppendStatus,
-    pub(crate) candidate_gate_resolution:
-        Option<crate::repositories::native_terminal_effect_outbox::PreparedCandidateGateResolution>,
-    pub(crate) candidate_projection:
-        Option<crate::repositories::task_result_candidate::PreparedTaskResultCandidate>,
-    pub(crate) review_projection:
-        Option<crate::repositories::task_result_review_event::PreparedTaskResultReviewEvent>,
-    pub(crate) delivery_authority:
-        Option<crate::repositories::task_actor_contract::PreparedTaskDeliveryAuthority>,
-    pub(crate) projection: crate::task_projector::PreparedTaskProjection,
 }
 
 // Internal writer result: retain the selected, fenced winner without copying its
@@ -87,11 +78,6 @@ impl DeferredAppendedTaskEvent {
             parent_task_id: self.parent_task_id,
             created_at: self.created_at,
             append_status: self.append_status,
-            candidate_gate_resolution: self.candidate_gate_resolution,
-            candidate_projection: self.candidate_projection,
-            review_projection: self.review_projection,
-            delivery_authority: self.delivery_authority,
-            projection: self.projection,
         }
     }
 }

@@ -260,20 +260,6 @@ fn vector_provider_key_name(
 }
 
 impl MessageProcessor {
-    /// Ordered callers retain completion ownership. The normal socket pump also
-    /// retains the handle so terminal outcomes can abort AND join before teardown.
-    pub(crate) async fn process_owned_request(
-        self: Arc<Self>,
-        connection: crate::request_context::ConnectionContext,
-        payload: String,
-    ) {
-        match self.start_owned_request(connection, payload).join().await {
-            Ok(()) => {}
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => warn!(error = %error, "RPC request task did not finish"),
-        }
-    }
-
     pub(crate) fn start_owned_request(
         self: Arc<Self>,
         connection: crate::request_context::ConnectionContext,
