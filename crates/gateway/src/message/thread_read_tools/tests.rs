@@ -1769,7 +1769,7 @@ async fn list_conversation_boundary_excludes_internal_quanta_but_keeps_visible_a
         make_conversation(&processor, id).await;
         harness.database.execute_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
-            "UPDATE thread SET origin_kind=?,created_by_actor_kind='agent_execution',created_by_actor_id='read-root-turn',created_at='2050-01-01 00:00:00+00:00' WHERE id=?",
+            "UPDATE thread SET origin_kind=?,created_by_actor_kind='agent_execution',created_by_actor_id='E00000000000000000001',created_at='2050-01-01 00:00:00+00:00' WHERE id=?",
             [origin.into(), id.into()],
         )).await.unwrap();
     }
