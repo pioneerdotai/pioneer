@@ -130,7 +130,11 @@ fn request_missing_fixture_tools(request: &ChatRequest, names: &[String]) -> Opt
         tool_calls: vec![ProviderToolCall {
             id: "fixture_request_tools".to_owned(),
             name: "request_tools".to_owned(),
-            arguments: json!({"domains": domains}).to_string(),
+            arguments: json!({
+                "domains": domains,
+                "reason": "Expose the tools needed by this test scenario."
+            })
+            .to_string(),
         }],
         provider_replay_state: None,
         termination: pioneer_provider::ProviderTermination::Complete,
