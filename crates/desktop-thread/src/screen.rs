@@ -928,7 +928,7 @@ mod tests {
                 thread_id: "a".into(),
             },
             demand: pioneer_client::core::ClientDemand::Visible,
-            generation: 1,
+            generation: pioneer_client::core::ClientGeneration::new(1),
         });
         let timeline = client
             .snapshot(&ClientScope::Timeline {
