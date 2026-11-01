@@ -137,7 +137,7 @@ fn request_missing_fixture_tools(request: &ChatRequest, names: &[String]) -> Opt
             .to_string(),
         }],
         provider_replay_state: None,
-        termination: pioneer_provider::ProviderTermination::Complete,
+        termination: pioneer_provider::ProviderTermination::ToolCalls,
     })
 }
 
