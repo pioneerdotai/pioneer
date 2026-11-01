@@ -6,7 +6,7 @@ Use current callable schemas as the authority. Canonical names below are mapped 
 
 | Tool | Input | Continuation and result |
 | --- | --- | --- |
-| `threads_list` | Required `limit` (1–100); optional string/null `cursor` | `threads`, `nextCursor`, `eof`; creation order `created_at DESC, id DESC`, including accessible internal/archived threads |
+| `threads_list` | Required `limit` (1–100); optional string/null `cursor` | `threads`, `nextCursor`, `eof`; creation order `created_at DESC, id DESC`, standalone conversations including archived ones; internal children via history `childReference` or `threads_children_list` |
 | `threads_history_read` | Required `threadId`, `limit` (1–100); optional `anchor:{turnId,itemId?}`, `direction:"older"` or `"newer"` (default older), string/null `cursor` | `events`, `nextCursor`, `eof`, `reverseCursor`, `reverseDirection`, `direction` in a saved snapshot |
 | `threads_children_list` | Required `threadId`, `recursive`, `limit` (1–100); optional string/null `cursor` | `threads`, `nextCursor`, `eof`; direct children or recursive descendants |
 | `threads_search` | Required nonblank `query`, `limit` (1–100); optional string/null `cursor` | `threads`, `nextCursor`, `eof`, `coverageIncomplete`, `warnings`, optional `pageFragment` |

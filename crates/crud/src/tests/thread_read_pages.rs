@@ -109,8 +109,8 @@ fn thread(id: &str, workspace: &str) -> Thread {
         created_at: 1_700_000_000,
         updated_at: 1_700_000_000,
         status: ThreadStatus::Closed,
-        origin_kind: ThreadOriginKind::System,
-        sidebar_visibility: ThreadSidebarVisibility::Hidden,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
         visibility: None,
@@ -119,7 +119,7 @@ fn thread(id: &str, workspace: &str) -> Thread {
 }
 
 #[tokio::test]
-async fn observation_pages_include_hidden_archived_and_keep_position_after_updates() {
+async fn conversation_pages_include_archived_and_keep_exact_position_after_updates() {
     let store = test_store_with_workspace("read-pages").await;
     // IDs deliberately disagree with chronology. Adjacent dates differ by one
     // nanosecond; b/c tie and must cross the first page boundary by descending ID.
@@ -143,6 +143,34 @@ async fn observation_pages_include_hidden_archived_and_keep_position_after_updat
                 .into();
         row.created_at = Set(chrono::DateTime::parse_from_rfc3339(date).unwrap());
         row.update(&store.connection).await.unwrap();
+    }
+    // Excluded rows sort before every ordinary conversation. They must be
+    // removed before LIMIT, so the first page still contains two full keys.
+    for (id, origin, visibility) in [
+        (
+            "hidden",
+            ThreadOriginKind::User,
+            ThreadSidebarVisibility::Hidden,
+        ),
+        (
+            "task",
+            ThreadOriginKind::TaskRun,
+            ThreadSidebarVisibility::Visible,
+        ),
+        (
+            "service",
+            ThreadOriginKind::System,
+            ThreadSidebarVisibility::Visible,
+        ),
+    ] {
+        let mut internal = thread(id, "read-pages");
+        internal.origin_kind = origin;
+        internal.sidebar_visibility = visibility;
+        internal.created_at = 1_900_000_001;
+        store
+            .upsert_thread_model(&internal, PersistedActorRef::System)
+            .await
+            .unwrap();
     }
     let first = store
         .list_thread_read_candidates_page("read-pages", None, 2)
