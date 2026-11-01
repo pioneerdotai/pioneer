@@ -66348,10 +66348,14 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
             },
             sent: std::cell::Cell::new(false),
         };
-        assert!(
-            core.execute_thread_semantic_request(&transport, request)
-                .is_none()
-        );
+        let mut next = Some(request);
+        for _ in 0..128 {
+            let Some(request) = next else {
+                break;
+            };
+            next = core.execute_thread_semantic_request(&transport, request);
+        }
+        assert!(next.is_none(), "authorized page reconciliation must finish");
         assert!(transport.sent.get());
         let state = core.thread_semantic_snapshot(&harness.thread_id);
         let timeline = &state.thread(&harness.thread_id).unwrap().top_level;

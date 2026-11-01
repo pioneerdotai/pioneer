@@ -7704,6 +7704,17 @@ mod tests {
                     assert!(transport.calls.borrow().is_empty());
                 }
                 complete_semantic_operation(&core, &transport, request);
+                if queued {
+                    // A different explicit anchor needs ordinary scheduler admission
+                    // after the recovery quantum releases its reserved slot.
+                    let other = reconciliation_request(&receiver);
+                    assert!(matches!(
+                        &other.action,
+                        SemanticTimelineRequestAction::ThreadTimelinePage { params: other, .. }
+                            if other == &params
+                    ));
+                    complete_semantic_operation(&core, &transport, other);
+                }
                 let deadline = core
                     .thread_registry
                     .lock()
@@ -11016,9 +11027,10 @@ mod tests {
                 },
             )
             .unwrap();
+        // The snapshot-only quantum retains the owner without publishing a page.
         assert!(
-            core.thread_coordinator_snapshot("b")
-                .unwrap()
+            core.thread_registry.lock().unwrap().stores["b"]
+                .coordinator
                 .resume
                 .in_progress
         );
@@ -11094,7 +11106,7 @@ mod tests {
                 response: crate::rpc::JsonRpcResponseSender,
             ) -> Result<(), String> {
                 let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
-                assert_eq!(request["params"]["turnId"], "new");
+                assert_eq!(request["params"]["turn_id"], "new");
                 let method = request["method"].as_str().unwrap();
                 self.0.borrow_mut().push(method.into());
                 let result = match method {
@@ -11269,7 +11281,7 @@ mod tests {
             ) -> Result<(), String> {
                 let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
                 let method = request["method"].as_str().unwrap();
-                let after = request["params"]["afterSequence"].as_i64();
+                let after = request["params"]["after_sequence"].as_i64();
                 self.0.borrow_mut().push((method.into(), after));
                 let value = if method == "turn/get" {
                     let mut turn = running_turn("turn-b");
