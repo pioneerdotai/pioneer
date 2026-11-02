@@ -181,7 +181,11 @@ fn keyboard_navigation_reaches_virtualized_history_without_reading_it(cx: &mut T
         viewport.right(),
         "scroll viewport reaches popup edge"
     );
-    assert!(popup.top() <= viewport.top());
+    assert_eq!(
+        popup.top(),
+        viewport.top(),
+        "history starts at the top of the headerless popup"
+    );
     assert!(viewport.bottom() <= footer.top());
     assert!(cx.debug_bounds("task-inbox-read-all").is_some());
     for _ in 0..32 {
@@ -204,7 +208,7 @@ fn keyboard_navigation_reaches_virtualized_history_without_reading_it(cx: &mut T
     assert_eq!(
         cx.debug_bounds("task-inbox-viewport").unwrap(),
         viewport,
-        "keyboard scrolling keeps the viewport fixed"
+        "keyboard navigation scrolls rows inside the fixed viewport"
     );
     assert_eq!(
         cx.debug_bounds("task-inbox-footer").unwrap(),

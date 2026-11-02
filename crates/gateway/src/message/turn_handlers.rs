@@ -11668,7 +11668,7 @@ impl MessageProcessor {
                 };
 
                 drop(transition);
-                match self.recovery_coordinator.run_ready_jobs(now_unix, 16).await {
+                match self.recovery_coordinator.run_due_jobs(now_unix, 16).await {
                     Ok(events) => {
                         for event in events {
                             self.handle_recovery_event(event, now_unix).await;

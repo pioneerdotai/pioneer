@@ -259,8 +259,19 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<client_binding::ClientIntentDispatchDto>(input_json)
             .map_err(|_| "invalid Client intent request".to_owned())?;
         client_binding::validate_schema_version(request.schema_version)?;
+        let begin = matches!(
+            &request.intent,
+            pioneer_client::core::ClientIntent::Composer {
+                intent: pioneer_client::composer::store::ComposerIntent::BeginOperation { .. }
+            }
+        )
+        .then(|| request.intent.clone());
         let transition = self.core.dispatch(request.intent);
-        Ok(client_binding::transition_dto(transition))
+        Ok(if let Some(begin) = begin {
+            client_binding::intent_transition_dto(&begin, transition)
+        } else {
+            client_binding::transition_dto(transition)
+        })
     }
 
     fn observe_client_scope(&self, scope: ClientScope) -> Result<(), String> {

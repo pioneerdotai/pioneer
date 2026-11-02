@@ -429,3 +429,53 @@ async fn heartbeat_time_is_evaluated_after_writer_wait_and_again_on_internal_ret
         }
     }
 }
+
+#[tokio::test]
+async fn parked_empty_heartbeat_releases_processor_and_is_cancellable() {
+    let (_directory, processor, store, _workspace) = fixture(None).await;
+    let weak = Arc::downgrade(&processor);
+    let barrier = processor.turn_execution_heartbeat_barrier.clone();
+    barrier.arm(HEARTBEAT_WRITTEN);
+    let worker = tokio::spawn(MessageProcessor::run_turn_execution_owner_heartbeat_worker(
+        weak.clone(),
+    ));
+    timeout(Duration::from_secs(5), barrier.wait_until_reached())
+        .await
+        .unwrap();
+    drop(processor);
+    assert!(
+        weak.upgrade().is_none(),
+        "an empty heartbeat must not retain its processor"
+    );
+    barrier.release();
+    tokio::task::yield_now().await;
+    // The owner has proved Empty; a closed DB cannot turn parked cycles into
+    // an error-driven poll. Lifetime is controlled by its owning worker guard.
+    store.database_connection().close().await.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::resume();
+    assert!(!worker.is_finished());
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn recovery_due_worker_releases_original_and_scoped_processor_before_wait() {
+    let (_directory, processor, _store, _workspace) = fixture(None).await;
+    let weak = Arc::downgrade(&processor);
+    let barrier = processor.recovery_due_wait_barrier.clone();
+    barrier.arm("__recovery_due_before_wait__");
+    let worker = tokio::spawn(MessageProcessor::run_recovery_due_worker(weak.clone()));
+    timeout(Duration::from_secs(5), barrier.wait_until_reached())
+        .await
+        .unwrap();
+    drop(processor);
+    assert!(
+        weak.upgrade().is_none(),
+        "both processor Arcs must be dropped before waiting"
+    );
+    // The owner handle aborts the parked worker, as IsolatedWorkerGuard does.
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+}

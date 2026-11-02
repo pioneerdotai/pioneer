@@ -334,3 +334,4 @@
 "timeline.web_search.results_count" = "%{count} परिणाम"
 "timeline.web_search.running" = "वेब पर खोज रहा है"
 "timeline.work_group.completed" = "काम किया"
+"chat.composer.preparing_send" = "संदेश तैयार हो रहा है"

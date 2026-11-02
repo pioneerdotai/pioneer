@@ -334,3 +334,4 @@
 "timeline.web_search.results_count" = "%{count} 件の結果"
 "timeline.web_search.running" = "Web を検索中"
 "timeline.work_group.completed" = "作業済み"
+"chat.composer.preparing_send" = "メッセージを準備中"

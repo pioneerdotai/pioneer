@@ -334,3 +334,4 @@
 "timeline.web_search.results_count" = "%{count} 个结果"
 "timeline.web_search.running" = "正在搜索网页"
 "timeline.work_group.completed" = "已工作"
+"chat.composer.preparing_send" = "正在准备消息"

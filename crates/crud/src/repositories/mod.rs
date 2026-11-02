@@ -143,6 +143,8 @@ pub(crate) mod portable_payload_legacy_text;
 
 mod portable_payload_json;
 
+pub mod html_preview_io_work;
+pub(crate) mod recovery_watchdog;
 pub(crate) mod task_child_producers;
 
 pub mod task_child_work;

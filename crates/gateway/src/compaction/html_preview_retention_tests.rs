@@ -151,7 +151,21 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
 }
 
 async fn preview_history_replay(format_version: u32) {
-    let f = fixture("answer", vec![Reply::Success], true, false).await;
+    let database_observer = Arc::new(HistoryReadObserver::default());
+    let f = fixture_with_database_observer(
+        "answer",
+        vec![Reply::Success],
+        true,
+        false,
+        Some(database_observer.clone()),
+    )
+    .await;
+    f.store
+        .database_connection()
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+
     // The shared fixture starts a raw compaction operation. Publish its exact
     // checkpoint before adding preview history, so it does not remain an
     // unresolved legacy owner that correctly blocks frozen input retirement.
@@ -489,10 +503,12 @@ async fn preview_history_replay(format_version: u32) {
             .is_err()
     );
     // A changed owner cannot publish a receipt even if preparation was skipped.
-    f.store
-        .record_html_preview_archive_witness(&wrong_owner, &"a".repeat(64))
-        .await
-        .unwrap();
+    assert!(
+        f.store
+            .record_html_preview_archive_witness(&wrong_owner, &"a".repeat(64))
+            .await
+            .is_err()
+    );
     let stored = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "SELECT archive_wire_sha256 FROM html_preview_frozen_result WHERE manifest_id=?1 AND ordinal=?2",
         [witness.manifest.clone().into(),witness.ordinal.into()])).await.unwrap().unwrap();
@@ -502,9 +518,56 @@ async fn preview_history_replay(format_version: u32) {
             .unwrap()
             .is_none()
     );
-    super::super::frozen::prepare_html_preview_archive_witness(&f.store, &witness)
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = checks.clone();
+    let audit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let reads = database_observer.reads();
+        let acquired = reads
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    pioneer_sqlite::SqliteReadEvent::AdmissionAcquired { .. }
+                )
+            })
+            .count();
+        let released = reads
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    pioneer_sqlite::SqliteReadEvent::AdmissionReleased { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            acquired, released,
+            "witness digest must not retain reader capacity"
+        );
+        let writes = database_observer.writes();
+        let acquired = writes
+            .iter()
+            .filter(|event| matches!(event, pioneer_sqlite::SqliteWriteEvent::Acquired { .. }))
+            .count();
+        let released = writes
+            .iter()
+            .filter(|event| matches!(event, pioneer_sqlite::SqliteWriteEvent::Released { .. }))
+            .count();
+        assert_eq!(
+            acquired, released,
+            "witness digest must not retain writer capacity"
+        );
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let witness_store = f.store.with_maintenance_access();
+    super::super::frozen::HTML_PREVIEW_HASH_CAPACITY_AUDIT
+        .scope(
+            audit,
+            super::super::frozen::prepare_html_preview_archive_witness(&witness_store, &witness),
+        )
         .await
         .unwrap();
+    assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(preview_paths.iter().all(|p| p.exists()));
     let mut progress = crate::database::maintenance::html_previews::Progress::default();
     // Complete several bounded passes: index, verification and blob discovery
