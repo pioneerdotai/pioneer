@@ -62419,8 +62419,15 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                     .observe_turn(thread_id, turn_id)
                     .await;
                 let stored = crud_store_for_assert.get_turn(thread_id, turn_id).await;
+                let authority = processor.guard_execution_commit(turn_id).await;
+                let execution = crud_store_for_assert.get_turn_execution(turn_id).await;
+                let recovery = if let Some(job_id) = resumed_job_id.as_deref() {
+                    Some(crud_store_for_assert.get_recovery_job(job_id).await)
+                } else {
+                    None
+                };
                 panic!(
-                    "provider barrier was not reached in cycle {cycle}: actor={observation:?}, stored={stored:?}"
+                    "provider barrier was not reached in cycle {cycle}: actor={observation:?}, stored={stored:?}, authority={authority:?}, execution={execution:?}, recovery={recovery:?}"
                 );
             }
             // The provider cannot finish until release; it stays unreleased throughout cancellation.
@@ -88606,6 +88613,12 @@ fn native_gateway_cancellation_persists_and_processes_hook_cleanup_without_repea
 
 #[test]
 fn native_direct_cancellation_after_activated_blocked_resume_preserves_old_worker_rows() {
+    // nextest runs this test in its own process; include rejection codes from
+    // spawned actor/listener tasks when the provider barrier is never reached.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_test_writer()
+        .try_init();
     run_standard_stack_message_test(
         "direct cancellation after activated Blocked resume",
         assert_turn_cancel_with_optional_busy_native_actor(true, true, true),
