@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 
 use sea_orm::DbErr;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::Span;
 
 pub const DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS: usize = 1;
 
@@ -84,6 +83,12 @@ pub enum SqliteReadEvent {
 /// been snapshotted, although never while the limiter state lock is held.
 pub trait SqliteReadObserver: Send + Sync + 'static {
     fn observe(&self, event: SqliteReadEvent);
+
+    /// Atomic observation adapter. Called after the native state lock is released.
+    fn observe_admission(&self, event: SqliteReadEvent, snapshot: crate::SqliteAdmissionSnapshot) {
+        self.observe(event);
+        self.observe_queue_snapshot(snapshot);
+    }
     /// Source-ordered current state; milestone depths above remain historical.
     fn observe_queue_snapshot(&self, _snapshot: crate::SqliteAdmissionSnapshot) {}
 }
@@ -141,12 +146,14 @@ impl MaintenanceReadLimiter {
             state.queue_depth = state.queue_depth.saturating_add(1);
             state.snapshot()
         };
-        self.observer.observe(SqliteReadEvent::AdmissionEnqueued {
-            class: SqliteReadClass::Maintenance,
-            queue_depth: snapshot.queue_depth,
-            active: snapshot.active,
-        });
-        self.observer.observe_queue_snapshot(snapshot.current);
+        self.observer.observe_admission(
+            SqliteReadEvent::AdmissionEnqueued {
+                class: SqliteReadClass::Maintenance,
+                queue_depth: snapshot.queue_depth,
+                active: snapshot.active,
+            },
+            snapshot.current,
+        );
 
         let mut registration = ReadWaitRegistration {
             limiter: self.clone(),
@@ -169,13 +176,15 @@ impl MaintenanceReadLimiter {
         };
         registration.armed = false;
         let acquired_at = Instant::now();
-        self.observer.observe(SqliteReadEvent::AdmissionAcquired {
-            class: SqliteReadClass::Maintenance,
-            waited: acquired_at.saturating_duration_since(enqueued_at),
-            queue_depth: snapshot.queue_depth,
-            active: snapshot.active,
-        });
-        self.observer.observe_queue_snapshot(snapshot.current);
+        self.observer.observe_admission(
+            SqliteReadEvent::AdmissionAcquired {
+                class: SqliteReadClass::Maintenance,
+                waited: acquired_at.saturating_duration_since(enqueued_at),
+                queue_depth: snapshot.queue_depth,
+                active: snapshot.active,
+            },
+            snapshot.current,
+        );
         Ok(SqliteMaintenanceReadPermit {
             limiter: self.clone(),
             raw: Some(raw),
@@ -190,13 +199,15 @@ impl MaintenanceReadLimiter {
             state.queue_depth = state.queue_depth.saturating_sub(1);
             state.snapshot()
         };
-        self.observer.observe(SqliteReadEvent::AdmissionCancelled {
-            class: SqliteReadClass::Maintenance,
-            waited: enqueued_at.elapsed(),
-            queue_depth: snapshot.queue_depth,
-            active: snapshot.active,
-        });
-        self.observer.observe_queue_snapshot(snapshot.current);
+        self.observer.observe_admission(
+            SqliteReadEvent::AdmissionCancelled {
+                class: SqliteReadClass::Maintenance,
+                waited: enqueued_at.elapsed(),
+                queue_depth: snapshot.queue_depth,
+                active: snapshot.active,
+            },
+            snapshot.current,
+        );
     }
 
     fn release(&self, raw: &mut Option<OwnedSemaphorePermit>, acquired_at: Instant) {
@@ -211,13 +222,15 @@ impl MaintenanceReadLimiter {
             state.active = state.active.saturating_sub(1);
             state.snapshot()
         };
-        self.observer.observe(SqliteReadEvent::AdmissionReleased {
-            class: SqliteReadClass::Maintenance,
-            held: acquired_at.elapsed(),
-            queue_depth: snapshot.queue_depth,
-            active: snapshot.active,
-        });
-        self.observer.observe_queue_snapshot(snapshot.current);
+        self.observer.observe_admission(
+            SqliteReadEvent::AdmissionReleased {
+                class: SqliteReadClass::Maintenance,
+                held: acquired_at.elapsed(),
+                queue_depth: snapshot.queue_depth,
+                active: snapshot.active,
+            },
+            snapshot.current,
+        );
     }
 
     fn lock(&self) -> MutexGuard<'_, ReadAdmissionState> {
@@ -304,19 +317,13 @@ impl Drop for SqliteReadOperation {
     }
 }
 
-/// Parent span used only to attribute SQLx pool-acquisition events. The five
-/// possible names are fixed and consumed by pioneer-observability; SQL and
-/// request data never enter this span.
-pub(crate) fn reader_pool_span(class: SqliteReadClass) -> Span {
+pub(crate) fn reader_pool_context(
+    class: SqliteReadClass,
+) -> pioneer_observability::pool_context::PoolContext {
+    use pioneer_observability::pool_context::PoolContext;
     match class {
-        SqliteReadClass::Interactive => tracing::trace_span!(
-            target: "pioneer_sqlite::pool",
-            "pioneer.sqlite.reader.interactive"
-        ),
-        SqliteReadClass::Maintenance => tracing::trace_span!(
-            target: "pioneer_sqlite::pool",
-            "pioneer.sqlite.reader.maintenance"
-        ),
+        SqliteReadClass::Interactive => PoolContext::ReaderInteractive,
+        SqliteReadClass::Maintenance => PoolContext::ReaderMaintenance,
     }
 }
 

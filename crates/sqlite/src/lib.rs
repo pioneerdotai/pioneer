@@ -254,3 +254,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod query_scope_tests;

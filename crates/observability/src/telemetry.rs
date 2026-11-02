@@ -312,9 +312,21 @@ pub fn shutdown_observability(timeout: Duration) -> Result<()> {
 /// waiting for the periodic metrics reader would risk losing the only startup
 /// sample. Callers that run on a UI thread must execute it in the background.
 pub fn force_flush_observability() -> Result<()> {
-    let Some(state) = OBSERVABILITY.get() else {
+    let Some(state) = state() else {
         return Ok(());
     };
+
+    if !super::telemetry_enabled() {
+        // Consent stays closed until the enable worker finishes this discard.
+        // Drain recorders that passed their epoch check before opt-out. Later
+        // recorders fail the check under the read guard, even after re-enable.
+        // No SDK callback, collection or exporter runs under this barrier.
+        drop(
+            super::metrics::DB_RECORD_GATE
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
 
     let trace_result = state
         .tracer_provider
@@ -369,6 +381,10 @@ pub fn schedule_observability_flush() {
 }
 
 pub(crate) fn state() -> Option<&'static ObservabilityState> {
+    #[cfg(test)]
+    if let Some(state) = tests::fixture_state() {
+        return Some(state);
+    }
     OBSERVABILITY.get()
 }
 
@@ -724,15 +740,19 @@ where
 pub(crate) mod tests {
     use super::{
         ConsentGatedMetricExporter, ConsentGatedSpanExporter, EXPORT_OUTAGE_REPORT_COOLDOWN,
-        ExportAvailability, ExportDiagnostic, ExportOutageSummary, OtlpTelemetryConfig,
-        otlp_retry_policy, validate_config,
+        ExportAvailability, ExportDiagnostic, ExportOutageSummary, ObservabilityState,
+        OtlpTelemetryConfig, TelemetryTarget, force_flush_observability, otlp_retry_policy,
+        validate_config,
     };
+    use crate::metrics::{GatewayMetrics, StartupMetrics};
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
-    use opentelemetry_sdk::metrics::Temporality;
     use opentelemetry_sdk::metrics::data::ResourceMetrics;
     use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
-    use opentelemetry_sdk::trace::{SpanData, SpanExporter};
+    use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
+    use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
     use std::future::Future;
     use std::pin::pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -742,12 +762,239 @@ pub(crate) mod tests {
 
     pub(crate) static TELEMETRY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    // Private unit-test provider override. Fixed test fixtures have process
+    // lifetime because production state() lends a static reference. Providers
+    // must be explicitly shut down by their owner; no runtime observer starts.
+    thread_local! {
+        static FIXTURE_STATE: std::cell::Cell<Option<&'static ObservabilityState>> = const { std::cell::Cell::new(None) };
+    }
+    pub(super) fn fixture_state() -> Option<&'static ObservabilityState> {
+        FIXTURE_STATE.with(std::cell::Cell::get)
+    }
+    pub(crate) fn with_test_state<R>(
+        state: &'static ObservabilityState,
+        callback: impl FnOnce() -> R,
+    ) -> R {
+        struct Reset(Option<&'static ObservabilityState>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FIXTURE_STATE.with(|slot| slot.set(self.0));
+            }
+        }
+        let _reset = Reset(FIXTURE_STATE.with(|slot| slot.replace(Some(state))));
+        callback()
+    }
+    pub(crate) fn gateway_test_state(provider: SdkMeterProvider) -> &'static ObservabilityState {
+        let meter = provider.meter("db-integration-fixture");
+        let tracer_provider = SdkTracerProvider::builder().build();
+        Box::leak(Box::new(ObservabilityState {
+            target: TelemetryTarget::Gateway,
+            resource_sampler: None,
+            diagnostics: Mutex::new(None),
+            availability: Arc::new(ExportAvailability::default()),
+            tracer: tracer_provider.tracer("db-integration-fixture"),
+            tracer_provider,
+            startup_metrics: StartupMetrics::new(
+                &meter,
+                "fixture.startup",
+                "fixture.stage",
+                "fixture.failure",
+                "Gateway",
+            ),
+            meter_provider: provider,
+            mobile_thread_open_duration: None,
+            desktop_update_metrics: None,
+            desktop_gateway_lifecycle_metrics: None,
+            gateway_metrics: Some(GatewayMetrics::new(meter)),
+            gateway_markdown_metrics: None,
+            desktop_timeline_metrics: None,
+        }))
+    }
+
     struct TelemetryEnabledReset(bool);
 
     impl Drop for TelemetryEnabledReset {
         fn drop(&mut self) {
             super::super::set_telemetry_enabled(self.0);
         }
+    }
+
+    // This exporter deliberately stalls the real PeriodicReader, without a
+    // network or timing-based throughput assertion. recv_timeout below is only
+    // a deadlock watchdog; release always runs before joining/asserting.
+    #[derive(Clone)]
+    struct DelayedDbExporter {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+        delay_once: Arc<AtomicBool>,
+        counts: Arc<Mutex<Vec<u64>>>,
+    }
+    impl PushMetricExporter for DelayedDbExporter {
+        async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
+            use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+            if self.delay_once.swap(false, Ordering::AcqRel) {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+            for metric in metrics.scope_metrics().flat_map(|scope| scope.metrics()) {
+                if metric.name() == "pioneer.gateway.db.operations"
+                    && let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data()
+                {
+                    self.counts
+                        .lock()
+                        .unwrap()
+                        .extend(sum.data_points().map(|point| point.value()));
+                }
+            }
+            Ok(())
+        }
+        fn force_flush(&self) -> OTelSdkResult {
+            Ok(())
+        }
+        fn shutdown_with_timeout(&self, _: Duration) -> OTelSdkResult {
+            Ok(())
+        }
+        fn temporality(&self) -> Temporality {
+            Temporality::Delta
+        }
+    }
+    fn db_metric() -> crate::DatabaseOperationMetric {
+        crate::DatabaseOperationMetric {
+            role: crate::DatabaseRole::Reader,
+            operation: crate::DatabaseOperation::Select,
+            workload: crate::DatabaseWorkload::Unclassified,
+            query_fingerprint: 31,
+            elapsed: Duration::from_millis(2),
+            failed: false,
+        }
+    }
+
+    #[test]
+    fn enabled_export_does_not_hold_db_recorders_until_network_completion() {
+        use crate::metrics::DatabaseOperationSeries;
+        let _lock = TELEMETRY_TEST_LOCK.lock().unwrap();
+        let _reset = TelemetryEnabledReset(crate::telemetry_enabled());
+        crate::set_telemetry_gate(true);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let counts = Arc::new(Mutex::new(Vec::new()));
+        let provider = SdkMeterProvider::builder()
+            .with_reader(
+                PeriodicReader::builder(DelayedDbExporter {
+                    entered: entered_tx,
+                    release: Arc::new(Mutex::new(release_rx)),
+                    delay_once: Arc::new(AtomicBool::new(true)),
+                    counts: counts.clone(),
+                })
+                .with_interval(Duration::from_secs(86400))
+                .build(),
+            )
+            .build();
+        let state = gateway_test_state(provider.clone());
+        let series = Arc::new(DatabaseOperationSeries::default());
+        with_test_state(state, || series.record(db_metric()));
+        let flush = std::thread::spawn(move || with_test_state(state, force_flush_observability));
+        entered_rx.recv().unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            with_test_state(state, || series.record(db_metric()));
+            finished_tx.send(()).unwrap();
+        });
+        let recorded_while_export_pending = finished_rx.recv_timeout(Duration::from_secs(10));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        flush.join().unwrap().unwrap();
+        assert!(
+            recorded_while_export_pending.is_ok(),
+            "DB recorder waited for exporter release"
+        );
+        with_test_state(state, force_flush_observability).unwrap();
+        assert_eq!(*counts.lock().unwrap(), [1, 1]);
+        provider.shutdown().unwrap();
+    }
+
+    #[test]
+    fn closed_discard_drains_inflight_writer_and_rejects_late_source_epoch() {
+        use crate::metrics::{DB_RECORD_GATE, DatabaseOperationSeries};
+        let _lock = TELEMETRY_TEST_LOCK.lock().unwrap();
+        let _reset = TelemetryEnabledReset(crate::telemetry_enabled());
+        crate::set_telemetry_gate(true);
+        let old_epoch = crate::telemetry_consent_snapshot().1;
+        let (entered_tx, _) = std::sync::mpsc::channel();
+        let (_, release_rx) = std::sync::mpsc::channel();
+        let counts = Arc::new(Mutex::new(Vec::new()));
+        let provider = SdkMeterProvider::builder()
+            .with_reader(
+                PeriodicReader::builder(ConsentGatedMetricExporter {
+                    inner: DelayedDbExporter {
+                        entered: entered_tx,
+                        release: Arc::new(Mutex::new(release_rx)),
+                        delay_once: Arc::new(AtomicBool::new(false)),
+                        counts: counts.clone(),
+                    },
+                    availability: Arc::new(ExportAvailability::default()),
+                })
+                .with_interval(Duration::from_secs(86400))
+                .build(),
+            )
+            .build();
+        let state = gateway_test_state(provider.clone());
+        // Represent a recorder already admitted under its read guard. The
+        // actual SDK write is allowed to finish after consent closes. It must
+        // be drained before the discard returns, rather than relabelled G2.
+        let old_write = DB_RECORD_GATE.read().unwrap();
+        assert!(crate::telemetry_sample_allowed(Some(old_epoch)));
+        crate::set_telemetry_gate(false);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let flush = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = with_test_state(state, force_flush_observability);
+            finished_tx.send(()).unwrap();
+            result
+        });
+        started_rx.recv().unwrap();
+        // Hold the admitted writer suspended until we have checked discard's
+        // completion channel. Without the drain, a closed, empty provider can
+        // finish flush here; SDK output alone could miss that lost ordering.
+        // This is a blocking-contract watchdog, not a latency/performance test.
+        let before_writer_release = finished_rx.recv_timeout(Duration::from_secs(1));
+        let metrics = state.gateway_metrics.as_ref().unwrap();
+        metrics.database_operations.add(1, &[]);
+        metrics.database_operation_duration.record(2.0, &[]);
+        drop(old_write);
+        // Always release the guard and join before asserting, including on the
+        // missing-barrier failure path, so a failure cannot strand the worker.
+        flush.join().unwrap().unwrap();
+        assert!(
+            matches!(
+                before_writer_release,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "discard completed or its worker disconnected before the admitted writer released"
+        );
+        assert!(
+            counts.lock().unwrap().is_empty(),
+            "closed exporter transmitted data"
+        );
+        crate::set_telemetry_gate(true);
+        let fresh_epoch = crate::telemetry_consent_snapshot().1;
+        let series = DatabaseOperationSeries::default();
+        with_test_state(state, || {
+            series.record_for_consent(db_metric(), Some(old_epoch));
+            series.record_for_consent(db_metric(), None);
+        });
+        with_test_state(state, force_flush_observability).unwrap();
+        assert!(
+            counts.lock().unwrap().is_empty(),
+            "late callback survived discard"
+        );
+        with_test_state(state, || {
+            series.record_for_consent(db_metric(), Some(fresh_epoch))
+        });
+        with_test_state(state, force_flush_observability).unwrap();
+        assert_eq!(*counts.lock().unwrap(), [1]);
+        provider.shutdown().unwrap();
     }
 
     struct CountingMetricExporter {
