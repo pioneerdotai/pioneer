@@ -247,9 +247,8 @@ pub struct AgentToolThreadCreationOption {
     pub label: String,
 }
 
-/// Opaque action target projected by the server. The model never receives a
-/// thread, route, workspace, capsule or Gateway identifier and therefore
-/// cannot turn guessed infrastructure IDs into an existence oracle.
+/// Opaque action target projected by the server. Returned navigation IDs do
+/// not replace this option or grant authority to write or launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentToolTargetOption {
@@ -488,9 +487,31 @@ pub struct AgentToolSafeResult {
     pub outbox_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_message: Option<String>,
+    /// Durable references from a committed thread action. IDs do not grant access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_result: Option<AgentThreadActionResult>,
     /// Refreshed opaque destinations after thread creation, including replay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_options: Vec<AgentToolTargetOption>,
+}
+
+/// References fixed at the thread action commit, preserved on replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentThreadActionResult {
+    pub workspace_id: String,
+    /// Created conversation or the target conversation of send/start.
+    pub thread_id: String,
+    /// Saved message or admitted turn in threadId. For a detached launch this
+    /// is the parent admission, never the executing child turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// Task atomically created by the shared detached launch mechanism.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Execution committed for turnId in threadId by foreground admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1072,5 +1093,25 @@ mod tests {
             launch.execution.profile,
             AgentExecutionProfileSelection::InheritParent
         ));
+    }
+
+    #[test]
+    fn thread_action_references_are_additive_and_preserve_wire_casing() {
+        let legacy = json!({"status":"accepted","receiptId":"receipt","outboxId":"outbox"});
+        let result: AgentToolSafeResult = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(result.thread_result.is_none());
+        assert_eq!(serde_json::to_value(result).unwrap(), legacy);
+        let wire = json!({
+            "status":"accepted", "receiptId":"receipt", "outboxId":"outbox",
+            "threadResult":{"workspaceId":"workspace","threadId":"thread","turnId":"admission","taskId":"task"}
+        });
+        let result: AgentToolSafeResult = serde_json::from_value(wire.clone()).unwrap();
+        let references = result.thread_result.as_ref().unwrap();
+        assert_eq!(references.workspace_id, "workspace");
+        assert_eq!(references.thread_id, "thread");
+        assert_eq!(references.turn_id.as_deref(), Some("admission"));
+        assert_eq!(references.task_id.as_deref(), Some("task"));
+        assert!(references.execution_id.is_none());
+        assert_eq!(serde_json::to_value(result).unwrap(), wire);
     }
 }

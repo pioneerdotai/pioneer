@@ -5556,6 +5556,16 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 1,
                 "receipt replay must not append a second completion"
             );
+            assert_eq!(replay["threadResult"], created["threadResult"]);
+            assert_eq!(created["threadResult"]["workspaceId"], harness.workspace_id);
+            let created_thread = processor
+                .crud_store
+                .get_thread_model(created["threadResult"]["threadId"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(created_thread.workspace_id, harness.workspace_id);
+            assert!(created["threadResult"].get("turnId").is_none());
             let target = created["targetOptions"]
                 .as_array()
                 .unwrap()
@@ -5578,6 +5588,8 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 .call("send-reconnected", "send", "thread_message_send", send_args)
                 .await;
             assert_eq!(sent["receiptId"], replay["receiptId"]);
+            assert_eq!(sent["threadResult"], replay["threadResult"]);
+            assert_eq!(sent["threadResult"]["threadId"], created_thread.id);
             let listed = facade
                 .call("read", "read", "threads_list", json!({"limit":100}))
                 .await;
@@ -5594,13 +5606,13 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 1,
                 "replayed creation must not add another thread"
             );
-            let child = children[0]["threadId"].clone();
+            assert_eq!(children[0]["threadId"], created["threadResult"]["threadId"]);
             let history = facade
                 .call(
                     "history",
                     "history",
                     "threads_history_read",
-                    json!({"threadId":child,"limit":100}),
+                    json!({"threadId":sent["threadResult"]["threadId"],"anchor":{"turnId":sent["threadResult"]["turnId"]},"limit":100}),
                 )
                 .await;
             assert_eq!(
@@ -5671,6 +5683,22 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
             let payload: JsonValue = serde_json::from_str(&outbox.payload_json).unwrap();
             let params: pioneer_protocol::TurnStartParams =
                 serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+            assert_eq!(
+                started["threadResult"],
+                json!({"workspaceId":harness.workspace_id,"threadId":params.thread_id,"turnId":params.turn_id,"executionId":payload["spawned_execution_id"]})
+            );
+            assert_eq!(replay["threadResult"], started["threadResult"]);
+            let response = pioneer_crud::load_agent_turn_response(
+                &processor.crud_store.database_connection(),
+                &params.turn_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                started["threadResult"]["executionId"],
+                response.execution_id
+            );
             assert_eq!(params.model.as_deref(), model["id"].as_str());
             assert_eq!(
                 params.model_provider.as_deref(),
@@ -5817,6 +5845,11 @@ fn cli_threads_permission_matrix_preserves_restricted_names_denies_and_missing_g
         assert_ne!(
             limited["error"]["data"]["kind"], "invalid_request",
             "correlation must reach the restricted binding"
+        );
+        assert!(
+            limited["result"]["structuredContent"]
+                .get("threadResult")
+                .is_none()
         );
         processor
             .register_agent_action_binding(turn.clone(), original_binding)
@@ -6450,6 +6483,14 @@ fn cli_threads_collaborative_admission_uses_one_detached_task_and_normal_stop() 
         assert_eq!(payload["execution_mode"], "detached_task");
         assert!(payload.get("dispatch").is_none());
         let task_id = payload["task_id"].as_str().unwrap();
+        assert_eq!(
+            started["threadResult"],
+            json!({"workspaceId":harness.workspace_id,"threadId":payload["thread_id"],"turnId":payload["turn_id"],"taskId":task_id})
+        );
+        assert_eq!(
+            created["threadResult"]["threadId"],
+            started["threadResult"]["threadId"]
+        );
         let task = processor
             .crud_store
             .get_task(task_id)
@@ -6467,6 +6508,8 @@ fn cli_threads_collaborative_admission_uses_one_detached_task_and_normal_stop() 
             .launch;
         let child = wait_for_task_cli_child(&processor, &task.runs[0].id, None).await;
         assert_ne!(child.thread_id, launch.thread_id);
+        assert_ne!(started["threadResult"]["threadId"], child.thread_id);
+        assert_ne!(started["threadResult"]["turnId"], child.turn_id);
         assert_eq!(
             processor
                 .crud_store
@@ -6531,6 +6574,7 @@ fn cli_threads_collaborative_admission_uses_one_detached_task_and_normal_stop() 
             )
             .await;
         assert_eq!(started["receiptId"], replay["receiptId"]);
+        assert_eq!(started["threadResult"], replay["threadResult"]);
         crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
             .await
             .unwrap();
@@ -6582,6 +6626,24 @@ fn cli_threads_collaborative_admission_uses_one_detached_task_and_normal_stop() 
             serde_json::from_str(&continuation_outbox.payload_json).unwrap();
         assert!(continuation.get("task_id").is_none());
         assert_eq!(continuation["dispatch"]["thread_id"], child.thread_id);
+        assert_eq!(
+            continued["threadResult"],
+            json!({"workspaceId":harness.workspace_id,"threadId":child.thread_id,"turnId":continuation["dispatch"]["turn_id"],"executionId":continuation["spawned_execution_id"]})
+        );
+        let (_, continued_turn) = processor
+            .crud_store
+            .get_turn(
+                continued["threadResult"]["threadId"].as_str().unwrap(),
+                continued["threadResult"]["turnId"].as_str().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            continued_turn.work_owner,
+            pioneer_protocol::TurnWorkOwner::Turn
+        );
+        assert_ne!(continued_turn.id, child.turn_id);
         assert!(
             processor
                 .crud_store

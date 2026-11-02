@@ -2357,6 +2357,16 @@ impl MessageProcessor {
                     .remove("spawned_execution_id");
                 action.outbox_payload_json = payload.to_string();
                 action.resource = None;
+                super::agent_action_tools::record_thread_action_result(
+                    &mut action,
+                    &pioneer_protocol::AgentThreadActionResult {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: Some(turn_id.clone()),
+                        task_id: None,
+                        execution_id: None,
+                    },
+                )?;
                 pioneer_tasks::TaskCreateContext {
                     actor_id: task_creator_actor_id(&request_actor),
                     creator_presentation_snapshot: agent.author.agent.clone(),
