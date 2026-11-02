@@ -786,19 +786,12 @@ impl MessageProcessor {
             received_bytes: updated.received_bytes,
             next_offset: updated.received_bytes,
         };
-        let notification = match JsonRpcNotification::from_params(
+        self.send_notification_to_connections(
             events::ARTIFACT_UPLOAD_CHUNK_ACK,
             &ack,
-        ) {
-            Ok(notification) => notification,
-            Err(error) => {
-                error!(connection_id, error = %error, "failed to encode artifact upload chunk ack");
-                return;
-            }
-        };
-        if let Err(error) = self.send_json(connection_id, &notification).await {
-            warn!(connection_id, error = %format!("{error:#}"), "failed to send artifact upload chunk ack");
-        }
+            vec![connection_id],
+        )
+        .await;
     }
 
     pub(in crate::message) async fn validate_artifact_workspace(

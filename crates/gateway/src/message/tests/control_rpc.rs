@@ -44,7 +44,7 @@ struct Fixture {
     processor: Arc<MessageProcessor>,
     auth: Arc<crate::auth::GatewayAuthService>,
     connection: ConnectionId,
-    responses: mpsc::Receiver<Message>,
+    responses: crate::session::test_support::OutboundTestReceiver,
     outbound: crate::session::SessionOutbound,
     workspace: String,
     gate: Arc<ModelGate>,
@@ -120,7 +120,7 @@ impl Fixture {
         });
         processor.provider_registry =
             Arc::new(ProviderRegistry::with_provider("openai", gate.clone()));
-        let (outbound, responses) = mpsc::channel(128);
+        let (outbound, responses) = crate::session::test_support::outbound_channel(128);
         let connection = processor
             .session_manager
             .register_connection(outbound.clone(), authenticated_test_superuser())
@@ -582,7 +582,7 @@ async fn wait_reauthorizes_original_task_and_run_targets_after_initial_proof() {
                         .unwrap()
                         + if matches!(loss, Loss::Expiry) { 1 } else { 60 };
                 }
-                let (tx, mut responses) = mpsc::channel(16);
+                let (tx, mut responses) = crate::session::test_support::outbound_channel(16);
                 let connection = f
                     .processor
                     .session_manager
@@ -683,7 +683,7 @@ async fn wait_reauthorizes_original_task_and_run_targets_after_initial_proof() {
                         Loss::None => {}
                     }
                     let replacement = if matches!(loss, Loss::Disconnect) {
-                        let (new_tx, new_rx) = mpsc::channel(4);
+                        let (new_tx, new_rx) = crate::session::test_support::outbound_channel(4);
                         let new = f
                             .processor
                             .session_manager

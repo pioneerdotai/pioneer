@@ -1183,7 +1183,7 @@ async fn oauth_scope_phase(phase: &'static str) {
         .unwrap(),
     );
     let processor = processor.with_auth_service(auth);
-    let (sender, mut recipient) = tokio::sync::mpsc::channel(1024);
+    let (sender, mut recipient) = crate::session::test_support::outbound_channel(1024);
     let mut principal = (*authenticated_test_superuser()).clone();
     principal.access_expires_at_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

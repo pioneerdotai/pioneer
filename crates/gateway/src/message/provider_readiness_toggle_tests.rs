@@ -479,7 +479,7 @@ struct Harness {
     failures: Arc<StdMutex<BTreeSet<String>>>,
     _home: tempfile::TempDir,
     _wake: mpsc::Receiver<()>,
-    _notifications: mpsc::Receiver<axum::extract::ws::Message>,
+    _notifications: crate::session::test_support::OutboundTestReceiver,
 }
 
 impl Harness {
@@ -489,7 +489,7 @@ impl Harness {
         sessions.unregister_connection(connection).await;
         // Keep the complete notification sequence across repeated saves and
         // probes without evicting this fixture's settings connection.
-        let (tx, notifications) = mpsc::channel(512);
+        let (tx, notifications) = crate::session::test_support::outbound_channel(512);
         let connection = crate::session::test_support::register_authenticated_test_connection(
             sessions.as_ref(),
             tx,

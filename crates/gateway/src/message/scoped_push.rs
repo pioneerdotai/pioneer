@@ -708,7 +708,7 @@ impl MessageProcessor {
                             text
                         };
                         outbound
-                            .try_send(Message::Text(payload.into()))
+                            .try_send_data(Message::Text(payload.into()))
                             .map_err(|_| anyhow!("push outbound full or closed"))?;
                         if !recover {
                             if let Some(inbox) = &packet.inbox {

@@ -127,7 +127,7 @@ pub(crate) async fn consume_oauth_events(
                         let _ = service
                             .inner
                             .session_manager
-                            .send_text(client, payload)
+                            .try_send_notification_text(client, payload)
                             .await;
                     }
                 }

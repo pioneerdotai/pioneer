@@ -264,6 +264,10 @@ async fn run_gateway_until_shutdown_inner(
         .auth
         .validate_session_security()
         .context("invalid Gateway session security configuration")?;
+    config
+        .gateway
+        .validate_outbound()
+        .context("invalid Gateway outbound configuration")?;
     security_validate_stage.succeed();
     let voice_models = voice_model_catalog();
     info!(
