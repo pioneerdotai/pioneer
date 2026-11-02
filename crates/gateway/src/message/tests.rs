@@ -62340,13 +62340,24 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                     .run_claimed_recovery_job_for_test(claimed.remove(0), now)
                     .await
                     .unwrap();
-                assert!(events.iter().any(|event| matches!(
-                    event,
-                    crate::resilience::RecoveryCoordinatorEvent::RetryAttemptStarted {
-                        job_id: started_job_id,
-                        ..
-                    } if started_job_id == job_id
-                )));
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        crate::resilience::RecoveryCoordinatorEvent::RetryAttemptStarted {
+                            job_id: started_job_id,
+                            ..
+                        } if started_job_id == job_id
+                    )),
+                    "blocked cancellation fixture should restart through recovery: events={events:?}, job={:?}, execution={:?}",
+                    crud_store_for_assert
+                        .get_recovery_job(job_id)
+                        .await
+                        .unwrap(),
+                    crud_store_for_assert
+                        .get_turn_execution(turn_id)
+                        .await
+                        .unwrap(),
+                );
             } else {
                 processor
                     .agent_manager
