@@ -1072,31 +1072,38 @@ impl StoreThreadEpisodicIndexPayloadProvider {
                     "canonical thread item is missing for thread episodic indexing",
                 )
             })?;
-        if !canonical.committed {
-            return Err(ThreadEpisodicIndexResolutionError::source_changed(
-                "canonical source is not committed",
-            ));
+        canonical_source_text(index_item, canonical)
+    }
+}
+
+fn canonical_source_text(
+    index_item: &ThreadEpisodicItemRecord,
+    canonical: pioneer_crud::ThreadEpisodicCanonicalItem,
+) -> std::result::Result<(String, String), ThreadEpisodicIndexResolutionError> {
+    if !canonical.committed {
+        return Err(ThreadEpisodicIndexResolutionError::source_changed(
+            "canonical source is not committed",
+        ));
+    }
+    let committed = ThreadEpisodicCommittedItem {
+        workspace_id: index_item.workspace_id.clone(),
+        thread_id: index_item.thread_id.clone(),
+        turn_id: index_item.turn_id.clone(),
+        item_id: index_item.item_id.clone(),
+        item_type: canonical.item.item_type(),
+        source_actor_role: committed_item_source_actor_role(&canonical.item),
+        source_context: committed_item_source_context(&canonical.item),
+        item: canonical.item,
+    };
+    match select_committed_item_source(&committed) {
+        ThreadEpisodicSourceSelection::Indexable(source) => {
+            Ok((source.text.trim().to_owned(), canonical.source_payload))
         }
-        let committed = ThreadEpisodicCommittedItem {
-            workspace_id: index_item.workspace_id.clone(),
-            thread_id: index_item.thread_id.clone(),
-            turn_id: index_item.turn_id.clone(),
-            item_id: index_item.item_id.clone(),
-            item_type: canonical.item.item_type(),
-            source_actor_role: committed_item_source_actor_role(&canonical.item),
-            source_context: committed_item_source_context(&canonical.item),
-            item: canonical.item,
-        };
-        match select_committed_item_source(&committed) {
-            ThreadEpisodicSourceSelection::Indexable(source) => {
-                Ok((source.text.trim().to_owned(), canonical.source_payload))
-            }
-            ThreadEpisodicSourceSelection::Rejected { reason } => {
-                Err(ThreadEpisodicIndexResolutionError::source_changed(format!(
-                    "canonical thread item is no longer indexable: {}",
-                    reason.as_str()
-                )))
-            }
+        ThreadEpisodicSourceSelection::Rejected { reason } => {
+            Err(ThreadEpisodicIndexResolutionError::source_changed(format!(
+                "canonical thread item is no longer indexable: {}",
+                reason.as_str()
+            )))
         }
     }
 }

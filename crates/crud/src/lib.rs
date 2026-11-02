@@ -11944,6 +11944,45 @@ impl CrudStore {
         .transpose()
     }
 
+    /// Preliminary bounded snapshot for search. The final disclosure check stays fresh.
+    pub async fn thread_search_source_batch(
+        &self,
+        workspace_id: &str,
+        ids: &[String],
+    ) -> Result<
+        Vec<(
+            ThreadEpisodicItemRecord,
+            ThreadEpisodicCanonicalItem,
+            Option<String>,
+        )>,
+    > {
+        let rows =
+            thread_episodic_repository::search_source_batch(&self.connection, workspace_id, ids)
+                .await?;
+        let mut result = Vec::with_capacity(rows.len());
+        for (item, canonical, title) in rows {
+            let item = crate::thread_episodic::thread_episodic_item_record_from_model(item)?;
+            let Ok(source) = serde_json::from_str::<TurnItem>(&canonical.payload) else {
+                continue;
+            };
+            if source.item_id() != item.item_id {
+                continue;
+            }
+            result.push((
+                item,
+                ThreadEpisodicCanonicalItem {
+                    committed: thread_episodic_source::source_status_is_committed(
+                        canonical.status.as_deref(),
+                    ),
+                    item: source,
+                    source_payload: canonical.payload,
+                },
+                title,
+            ));
+        }
+        Ok(result)
+    }
+
     pub async fn find_thread_episodic_item(
         &self,
         index_item_id: &str,

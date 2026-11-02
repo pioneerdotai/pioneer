@@ -812,6 +812,86 @@ pub async fn remove_thread_episodic_capsule_file(
     .map_err(std::io::Error::other)?
 }
 
+// Idle readers release their OS lock. Local mutations still evict under the
+// capsule lock so no pre-mutation handle can be returned after invalidation.
+// The bounded idle cache is independent of corpus size: eviction only reopens.
+const IDLE_READER_CAPACITY: usize = 8;
+struct IdleReader {
+    path: PathBuf,
+    owner: (String, String),
+    reader: memvid_core::ReadOnlyReader,
+    embedding_identity: Option<ThreadEpisodicEmbeddingIdentity>,
+}
+#[derive(Default)]
+struct ReaderCache {
+    idle: std::sync::Mutex<Vec<IdleReader>>,
+    #[cfg(test)]
+    opens: std::sync::atomic::AtomicUsize,
+}
+fn reader_cache() -> &'static ReaderCache {
+    static READERS: OnceLock<ReaderCache> = OnceLock::new();
+    READERS.get_or_init(ReaderCache::default)
+}
+fn take_idle_reader(cache: &ReaderCache, path: &Path) -> Option<IdleReader> {
+    let mut readers = cache.idle.lock().unwrap_or_else(|e| e.into_inner());
+    let index = readers.iter().position(|entry| entry.path == path)?;
+    Some(readers.remove(index))
+}
+fn with_segment_reader<T>(
+    cache: &ReaderCache,
+    path: &Path,
+    workspace_id: &str,
+    capsule_id: &str,
+    operation: impl FnOnce(
+        &mut Memvid,
+        &mut Option<ThreadEpisodicEmbeddingIdentity>,
+    ) -> Result<T, ThreadEpisodicMemvidError>,
+) -> Result<T, ThreadEpisodicMemvidError> {
+    // Caller owns the capsule lock throughout checkout, validation and return.
+    let path = normalized_capsule_lock_path(path);
+    let owner = (workspace_id.to_owned(), capsule_id.to_owned());
+    let cached = take_idle_reader(cache, &path).filter(|entry| entry.owner == owner);
+    let mut entry = match cached {
+        Some(entry) => entry,
+        None => IdleReader {
+            reader: memvid_core::ReadOnlyReader::new(&path),
+            embedding_identity: None,
+            path,
+            owner,
+        },
+    };
+    let identity = &mut entry.embedding_identity;
+    let result = entry
+        .reader
+        .read(|reader, reopened| {
+            if reopened {
+                *identity = None;
+                #[cfg(test)]
+                cache
+                    .opens
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            operation(reader, identity)
+        })
+        .map_err(classify_memvid_error)?;
+    // Do not retain a possibly damaged handle after a failed search.
+    if result.is_ok() {
+        let evicted = {
+            let mut readers = cache.idle.lock().unwrap_or_else(|e| e.into_inner());
+            let evicted = if readers.len() >= IDLE_READER_CAPACITY {
+                Some(readers.remove(0))
+            } else {
+                None
+            };
+            readers.push(entry);
+            evicted
+        };
+        // Closing a reader is never work for the global registry lock.
+        drop(evicted);
+    }
+    result
+}
+
 type CapsuleLock = Arc<Mutex<()>>;
 type CapsuleLockRegistry = Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>;
 
@@ -837,6 +917,7 @@ async fn lock_for_capsule_path(path: &Path) -> CapsuleLock {
     if let Some(lock) = locks.get(&path).and_then(Weak::upgrade) {
         return lock;
     }
+    locks.retain(|_, lock| lock.strong_count() > 0);
     let lock = Arc::new(Mutex::new(()));
     locks.insert(path, Arc::downgrade(&lock));
     lock
@@ -847,11 +928,27 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    run_capsule_blocking_mode(path, true, operation).await
+}
+
+async fn run_capsule_blocking_mode<T, F>(
+    path: &Path,
+    invalidate: bool,
+    operation: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let key = normalized_capsule_lock_path(path);
     let guard = lock_for_capsule_path(path).await.lock_owned().await;
     pioneer_observability::work::spawn_blocking(move || {
         // Keep ownership inside the blocking task. Cancelling the async waiter detaches the
         // task but cannot expose the capsule to another operation while this closure is running.
         let _guard = guard;
+        if invalidate {
+            drop(take_idle_reader(reader_cache(), &key));
+        }
         operation()
     })
     .await
@@ -875,6 +972,23 @@ impl MemvidThreadEpisodicBackend {
     pub fn with_workspace_ownership(mut self, ownership: ThreadEpisodicWorkspaceOwnership) -> Self {
         self.workspace_ownership = Some(ownership);
         self
+    }
+
+    async fn run_read_blocking<T, F>(
+        &self,
+        path: &Path,
+        operation: F,
+    ) -> Result<T, tokio::task::JoinError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let ownership = self.workspace_ownership.clone();
+        run_capsule_blocking_mode(path, false, move || {
+            let _ownership = ownership;
+            operation()
+        })
+        .await
     }
 
     async fn run_blocking<T, F>(
@@ -1077,7 +1191,7 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
         let segment = request.segments[0].clone();
         let path = path_from_storage_uri(&segment.storage_uri)?;
         let task_path = path.clone();
-        self.run_blocking(&path, move || {
+        self.run_read_blocking(&path, move || {
             search_segment_page_blocking(
                 task_path, request, segment, page_size, cursor, embedding, false,
             )
@@ -1126,7 +1240,7 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
                 let segment = segment.clone();
                 let embedding = embedding.clone();
                 let size = request.profile.max_candidates as usize;
-                self.run_blocking(&path, move || {
+                self.run_read_blocking(&path, move || {
                     search_segment_page_blocking(
                         task_path,
                         segment_request,
@@ -1495,60 +1609,70 @@ fn search_segment_page_blocking(
     embedding: Option<ThreadEpisodicMemvidIndexEmbedding>,
     semantic_only: bool,
 ) -> Result<ThreadEpisodicMemvidSearchPage, ThreadEpisodicMemvidError> {
-    let mut memvid = Memvid::open_read_only(&path).map_err(classify_memvid_error)?;
-    let mut search = memvid_thread_episodic_search_request(
-        &request.profile,
-        &request.query,
-        request.scope.as_deref(),
-    );
-    search.top_k = page_size;
-    search.cursor = cursor;
-    if let Some(embedding) = embedding {
-        validate_index_embedding(&embedding)?;
-        validate_segment_embedding_identity(&path, &embedding)?;
-        search.query_embedding = Some(embedding.vector);
-    }
-    let response = if semantic_only {
-        memvid
-            .vec_search_with_embedding_acl(
-                &search.query,
-                search.query_embedding.as_deref().unwrap_or_default(),
-                search.top_k,
-                search.snippet_chars,
-                search.scope.as_deref(),
-                search.acl_context.as_ref(),
-                search.acl_enforcement_mode,
-                search.cursor.as_deref(),
-            )
-            .map_err(classify_memvid_error)?
-    } else {
-        memvid.search(search).map_err(classify_memvid_error)?
-    };
+    with_segment_reader(
+        reader_cache(),
+        &path,
+        &request.workspace_id,
+        &segment.capsule_id,
+        |memvid, identity| {
+            let mut search = memvid_thread_episodic_search_request(
+                &request.profile,
+                &request.query,
+                request.scope.as_deref(),
+            );
+            search.top_k = page_size;
+            search.cursor = cursor;
+            if let Some(embedding) = embedding {
+                validate_index_embedding(&embedding)?;
+                if identity.as_ref() != Some(&embedding.identity) {
+                    validate_segment_embedding_identity(&path, &embedding)?;
+                    *identity = Some(embedding.identity.clone());
+                }
+                search.query_embedding = Some(embedding.vector);
+            }
+            let response = if semantic_only {
+                memvid
+                    .vec_search_with_embedding_acl(
+                        &search.query,
+                        search.query_embedding.as_deref().unwrap_or_default(),
+                        search.top_k,
+                        search.snippet_chars,
+                        search.scope.as_deref(),
+                        search.acl_context.as_ref(),
+                        search.acl_enforcement_mode,
+                        search.cursor.as_deref(),
+                    )
+                    .map_err(classify_memvid_error)?
+            } else {
+                memvid.search(search).map_err(classify_memvid_error)?
+            };
 
-    let engine = response.engine;
-    let hits = response
-        .hits
-        .into_iter()
-        .filter_map(|mut hit| {
-            hydrate_search_hit_metadata(&memvid, &mut hit);
-            // The public engine snippet is sufficient; the canonical source is
-            // opened through its real history reference when more text is needed.
-            hit.chunk_text = None;
-            search_hit_to_thread_episodic_hit(
-                hit,
-                engine.clone(),
-                &segment,
-                &request.workspace_id,
-                &request.thread_id,
-            )
-        })
-        .collect();
-    Ok(ThreadEpisodicMemvidSearchPage {
-        hits,
-        next_cursor: response.next_cursor,
-        unavailable_segment_ids: Vec::new(),
-        warnings: Vec::new(),
-    })
+            let engine = response.engine;
+            let hits = response
+                .hits
+                .into_iter()
+                .filter_map(|mut hit| {
+                    hydrate_search_hit_metadata(memvid, &mut hit);
+                    // The public engine snippet is sufficient; the canonical source is
+                    // opened through its real history reference when more text is needed.
+                    hit.chunk_text = None;
+                    search_hit_to_thread_episodic_hit(
+                        hit,
+                        engine.clone(),
+                        &segment,
+                        &request.workspace_id,
+                        &request.thread_id,
+                    )
+                })
+                .collect();
+            Ok(ThreadEpisodicMemvidSearchPage {
+                hits,
+                next_cursor: response.next_cursor,
+                unavailable_segment_ids: Vec::new(),
+                warnings: Vec::new(),
+            })
+        },
+    )
 }
 
 fn hydrate_search_hit_metadata(memvid: &Memvid, hit: &mut SearchHit) {
@@ -2165,8 +2289,145 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    // The adapter must preserve engine continuation even when the legacy
-    // profile permits fewer candidates than the requested page.
+    // Local cache isolates capacity/open observations from parallel tests while
+    // exercising the same Memvid open and search boundary as production.
+    fn cached_lexical_page(
+        cache: &ReaderCache,
+        path: &Path,
+        cursor: Option<String>,
+    ) -> memvid_core::SearchResponse {
+        with_segment_reader(cache, path, "workspace", "capsule", |reader, _| {
+            let profile = ThreadEpisodicSearchProfile::for_kind(
+                ThreadEpisodicSearchProfileKind::DefaultContext,
+            );
+            let mut query =
+                memvid_thread_episodic_search_request(&profile, "paginationneedle", None);
+            query.top_k = 2;
+            query.cursor = cursor;
+            reader.search(query).map_err(classify_memvid_error)
+        })
+        .unwrap()
+    }
+
+    fn lexical_fixture(path: &Path, count: usize) {
+        for number in 0..count {
+            let mut item = concurrent_index_request(path, &number.to_string(), vec![1.0, 0.0, 0.0]);
+            item.embedding = None;
+            item.text = format!("paginationneedle document {number}");
+            index_item_blocking(path.to_owned(), item).unwrap();
+        }
+    }
+
+    #[test]
+    fn idle_reader_reuses_real_open_across_queries_and_pages_and_reopens_after_eviction() {
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pages.mv2");
+        lexical_fixture(&path, 5);
+        let cache = ReaderCache::default();
+        let first = cached_lexical_page(&cache, &path, None);
+        assert_eq!(first.hits.len(), 2);
+        let second = cached_lexical_page(&cache, &path, first.next_cursor);
+        assert_eq!(second.hits.len(), 2);
+        assert_eq!(
+            cached_lexical_page(&cache, &path, second.next_cursor)
+                .hits
+                .len(),
+            1
+        );
+        assert_eq!(cached_lexical_page(&cache, &path, None).hits.len(), 2);
+        assert_eq!(cache.opens.load(Ordering::Relaxed), 1);
+        for n in 0..IDLE_READER_CAPACITY {
+            let other = temp.path().join(format!("other-{n}.mv2"));
+            lexical_fixture(&other, 1);
+            assert_eq!(cached_lexical_page(&cache, &other, None).hits.len(), 1);
+        }
+        assert_eq!(cache.idle.lock().unwrap().len(), IDLE_READER_CAPACITY);
+        assert_eq!(cached_lexical_page(&cache, &path, None).hits.len(), 2);
+        assert_eq!(
+            cache.opens.load(Ordering::Relaxed),
+            IDLE_READER_CAPACITY + 2
+        );
+        // The evicted file remains writable; idle snapshots retain no OS lock.
+        let evicted = temp.path().join("other-0.mv2");
+        drop(Memvid::open(&evicted).unwrap());
+        with_segment_reader(
+            &cache,
+            &path,
+            "another-workspace",
+            "capsule",
+            |reader, _| {
+                assert_eq!(reader.frame_count(), 5);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cache.opens.load(Ordering::Relaxed),
+            IDLE_READER_CAPACITY + 3
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_reader_open_is_coalesced_by_capsule_ownership() {
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("concurrent.mv2");
+        lexical_fixture(&path, 1);
+        let cache = Arc::new(ReaderCache::default());
+        let mut tasks = Vec::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(5));
+        for _ in 0..4 {
+            let cache = cache.clone();
+            let path = path.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let task_path = path.clone();
+                run_capsule_blocking_mode(&path, false, move || {
+                    cached_lexical_page(&cache, &task_path, None).hits.len()
+                })
+                .await
+                .unwrap()
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), 1);
+        }
+        assert_eq!(cache.opens.load(Ordering::Relaxed), 1);
+        drop(cache);
+        drop(Memvid::open(&path).unwrap());
+    }
+
+    #[test]
+    fn reader_open_failure_recovers_and_external_replacement_discards_old_inode() {
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("recover.mv2");
+        let cache = ReaderCache::default();
+        assert!(with_segment_reader(&cache, &path, "workspace", "capsule", |_, _| Ok(())).is_err());
+        lexical_fixture(&path, 1);
+        assert_eq!(cached_lexical_page(&cache, &path, None).hits.len(), 1);
+        let replacement = temp.path().join("replacement.mv2");
+        lexical_fixture(&replacement, 3);
+        std::fs::rename(&replacement, &path).unwrap();
+        let first = cached_lexical_page(&cache, &path, None);
+        assert_eq!(first.hits.len(), 2);
+        assert_eq!(
+            cached_lexical_page(&cache, &path, first.next_cursor)
+                .hits
+                .len(),
+            1
+        );
+        assert_eq!(cache.opens.load(Ordering::Relaxed), 2);
+        std::fs::remove_file(&path).unwrap();
+        assert!(with_segment_reader(&cache, &path, "workspace", "capsule", |_, _| Ok(())).is_err());
+        lexical_fixture(&path, 1);
+        assert_eq!(cached_lexical_page(&cache, &path, None).hits.len(), 1);
+    }
+
+    // The adapter preserves continuation even with a smaller legacy candidate cap.
     #[tokio::test]
     async fn segment_page_preserves_continuation_and_ignores_profile_candidate_cap() {
         let temp = tempfile::tempdir().expect("temporary directory");
@@ -2213,6 +2474,57 @@ mod tests {
         }
         assert_eq!(sizes, vec![3, 3, 1]);
         assert_eq!(ids.len(), 7);
+        let mut appended = concurrent_index_request(&path, "appended", vec![1.0, 0.0, 0.0]);
+        appended.embedding = None;
+        appended.text = "paginationneedle after committed write".into();
+        backend.index_item(appended).await.unwrap();
+        assert_eq!(
+            backend
+                .search_segment_page(request.clone(), 20, None, None)
+                .await
+                .unwrap()
+                .hits
+                .len(),
+            8
+        );
+        // The same mutation boundary covers open-time WAL recovery/repair.
+        let repair_path = path.clone();
+        backend
+            .run_blocking(&path, move || {
+                let mut repaired = Memvid::open(&repair_path).unwrap();
+                repaired.commit().unwrap();
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .search_segment_page(request.clone(), 20, None, None)
+                .await
+                .unwrap()
+                .hits
+                .len(),
+            8
+        );
+        let ownership = lock_thread_episodic_workspace("reader-delete-regression").await;
+        remove_thread_episodic_capsule_file(&path, ownership)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .search_segment_page(request.clone(), 20, None, None)
+                .await
+                .is_err()
+        );
+        let mut recreated = concurrent_index_request(&path, "recreated", vec![1.0, 0.0, 0.0]);
+        recreated.embedding = None;
+        recreated.text = "paginationneedle replacement".into();
+        backend.index_item(recreated).await.unwrap();
+        let page = backend
+            .search_segment_page(request, 20, None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.hits[0].index_item_id, "index_recreated");
     }
 
     #[tokio::test]
@@ -2355,6 +2667,7 @@ mod tests {
     async fn independent_backends_share_capsule_lock_after_async_cancellation() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let path = temp_dir.path().join("shared-capsule.mv2");
+        lexical_fixture(&path, 1);
         let refill_backend = Arc::new(MemvidThreadEpisodicBackend::new());
         let indexer_backend = Arc::new(MemvidThreadEpisodicBackend::new());
         let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
@@ -2365,10 +2678,24 @@ mod tests {
         let first_backend = refill_backend.clone();
         let first = tokio::spawn(async move {
             first_backend
-                .run_blocking(first_path.as_path(), move || {
-                    let _ = first_started_tx.send(());
-                    release_first_rx.recv().expect("release first writer");
-                    let _ = first_finished_tx.send(());
+                .run_read_blocking(first_path.as_path(), {
+                    let task_path = first_path.clone();
+                    move || {
+                        with_segment_reader(
+                            reader_cache(),
+                            &task_path,
+                            "workspace",
+                            "capsule",
+                            |reader, _| {
+                                assert_eq!(reader.frame_count(), 1);
+                                let _ = first_started_tx.send(());
+                                release_first_rx.recv().expect("release first reader");
+                                let _ = first_finished_tx.send(());
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                    }
                 })
                 .await
         });
@@ -2411,8 +2738,12 @@ mod tests {
         let second = tokio::spawn(async move {
             let _ = second_attempting_tx.send(());
             second_backend
-                .run_blocking(second_path.as_path(), move || {
-                    let _ = second_started_tx.send(());
+                .run_blocking(second_path.as_path(), {
+                    let task_path = second_path.clone();
+                    move || {
+                        drop(Memvid::open(&task_path).unwrap());
+                        let _ = second_started_tx.send(());
+                    }
                 })
                 .await
         });
@@ -2421,18 +2752,19 @@ mod tests {
             .expect("second task attempt timeout")
             .expect("second task reached the lock attempt");
         assert!(
-            tokio::time::timeout(Duration::from_millis(150), second_started_rx)
-                .await
-                .is_err(),
-            "cancelling the async waiter must not release a running blocking writer's lock"
+            lock_for_capsule_path(&path).await.try_lock_owned().is_err(),
+            "canceled reader still owns the capsule until its blocking operation finishes"
         );
 
-        release_first_tx.send(()).expect("finish first writer");
+        release_first_tx.send(()).expect("finish first reader");
         tokio::time::timeout(Duration::from_secs(2), second)
             .await
             .expect("second writer completion timeout")
             .expect("second async task")
             .expect("second blocking task");
+        second_started_rx
+            .await
+            .expect("actual writer acquired exclusive OS lock");
         tokio::time::timeout(Duration::from_secs(2), first_finished_rx)
             .await
             .expect("detached blocking writer completion timeout")
