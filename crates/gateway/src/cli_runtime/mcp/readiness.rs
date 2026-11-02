@@ -7,8 +7,8 @@ use pioneer_cli_agent_runtime::claude::{
 use pioneer_cli_agent_runtime::codex::CODEX_MCP_SCHEMA_TRANSFORM_CONTRACT_VERSION;
 use pioneer_cli_agent_runtime::codex_attestation::{
     CodexExecutableAttestation, CodexExecutableCacheIdentity, attest_codex_executable_identity,
-    codex_executable_cache_identity, sha256_file_contents, sha256_json,
-    validate_recorded_codex_mcp_decoder_fixtures, validate_unknown_codex_request_response,
+    codex_executable_cache_identity, sha256_json, validate_recorded_codex_mcp_decoder_fixtures,
+    validate_unknown_codex_request_response,
 };
 use pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig;
 use pioneer_protocol::{
@@ -626,7 +626,6 @@ async fn build_or_load_codex_local_attestation(
     let probe_identity = cache_identity.clone();
     let result = global_codex_mcp_readiness_cache()
         .get_or_probe(cache_identity.clone(), |slot| async move {
-            let _slot = slot;
             probe_codex_local_attestation(
                 instance,
                 runtime_home,
@@ -634,6 +633,7 @@ async fn build_or_load_codex_local_attestation(
                 max_tools,
                 max_schema_bytes,
                 probe_identity,
+                slot,
             )
             .await
         })
@@ -657,10 +657,18 @@ async fn probe_codex_local_attestation(
     max_tools: usize,
     max_schema_bytes: usize,
     cache_identity: CodexExecutableCacheIdentity,
+    slot: tokio::sync::OwnedSemaphorePermit,
 ) -> Option<CodexMcpLocalAttestation> {
     let contract_hash = cache_identity.probe_contract_hash.clone();
     let provider_version = cache_identity.provider_version.as_str();
-    let executable = attest_codex_executable_identity(cache_identity.clone()).ok()?;
+    let hash_identity = cache_identity.clone();
+    let (executable, _slot) = pioneer_observability::work::spawn_blocking(move || {
+        let result = attest_codex_executable_identity(hash_identity);
+        (result, slot)
+    })
+    .await
+    .ok()?;
+    let executable = executable.ok()?;
     let provider_probe = crate::cli_runtime::codex_session::run_codex_mcp_local_provider_probe(
         instance,
         runtime_home,
@@ -1195,8 +1203,8 @@ async fn build_or_load_claude_local_attestation(
     let probe_identity = cache_identity.clone();
     let result = global_claude_mcp_readiness_cache()
         .get_or_probe(cache_identity.clone(), |slot| async move {
-            let _slot = slot;
-            probe_claude_local_attestation(instance, runtime_home, proxy_url, probe_identity).await
+            probe_claude_local_attestation(instance, runtime_home, proxy_url, probe_identity, slot)
+                .await
         })
         .await;
     // The executable/helper contract can change while this caller waits for
@@ -1218,10 +1226,18 @@ async fn probe_claude_local_attestation(
     runtime_home: &Path,
     proxy_url: Option<&str>,
     cache_identity: ClaudeExecutableCacheIdentity,
+    slot: tokio::sync::OwnedSemaphorePermit,
 ) -> Option<ClaudeMcpLocalAttestation> {
     let contract_hash = cache_identity.probe_contract_hash.clone();
     let provider_version = cache_identity.provider_version.as_str();
-    let executable = attest_claude_executable_identity(cache_identity.clone()).ok()?;
+    let hash_identity = cache_identity.clone();
+    let (executable, _slot) = pioneer_observability::work::spawn_blocking(move || {
+        let result = attest_claude_executable_identity(hash_identity);
+        (result, slot)
+    })
+    .await
+    .ok()?;
+    let executable = executable.ok()?;
     let wait = std::time::Duration::from_millis(instance.startup_probe_timeout_ms.max(1));
     let help = probe_claude_help_contract(executable.cache_identity.realpath.as_path(), wait).await;
     let provider_probe = crate::cli_runtime::claude_session::run_claude_mcp_local_provider_probe(
@@ -1433,6 +1449,11 @@ pub(crate) async fn opencode_mcp_readiness_for_instance(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static OPENCODE_AFTER_DIGEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) fn opencode_executable_fingerprints(
     configured_binary: &str,
     _version: Option<&str>,
@@ -1440,7 +1461,23 @@ pub(crate) fn opencode_executable_fingerprints(
     let base_contract =
         crate::cli_runtime::opencode_session::opencode_provider_contract_fingerprint();
     let identity = codex_executable_cache_identity(configured_binary, "", &base_contract)?;
-    let binary_sha256 = sha256_file_contents(identity.realpath.as_path())?;
+    let binary_sha256 = pioneer_cli_agent_runtime::executable_digest::executable_sha256(
+        identity.realpath.as_path(),
+        identity.size,
+        identity.modified_unix_nanos,
+    )?;
+    #[cfg(test)]
+    OPENCODE_AFTER_DIGEST.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    // Also fence the configured name (including PATH resolution and symlinks).
+    // The digest worker can only validate the canonical path it was given.
+    anyhow::ensure!(
+        codex_executable_cache_identity(configured_binary, "", &base_contract)? == identity,
+        "OpenCode executable target changed during fingerprint validation"
+    );
     let local_executable_fingerprint = sha256_json(&json!({
         "provider": "opencode",
         "realpath": identity.realpath,
@@ -1491,6 +1528,162 @@ mod tests {
     use pioneer_cli_agent_runtime::codex_attestation::CodexExecutableCacheIdentity;
     use pioneer_config::GatewayCliAgentRuntimeKindConfig;
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_frozen_projection_check_rejects_retarget_during_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        let link = root.path().join("cli");
+        std::fs::write(&a, b"first").unwrap();
+        std::fs::write(&b, b"other").unwrap();
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let frozen = opencode_executable_fingerprints(link.to_str().unwrap(), None).unwrap();
+        let changed_link = link.clone();
+        OPENCODE_AFTER_DIGEST.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&changed_link).unwrap();
+                std::os::unix::fs::symlink(&b, &changed_link).unwrap();
+            }))
+        });
+        // Session startup calls this exact function before comparing with frozen.
+        assert!(opencode_executable_fingerprints(link.to_str().unwrap(), None).is_err());
+        assert_ne!(
+            opencode_executable_fingerprints(link.to_str().unwrap(), None).unwrap(),
+            frozen
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_wiring_and_failed_downstream_probe_retry() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("provider");
+        std::fs::write(&path, b"provider fixture bytes").unwrap();
+        let binary = path.to_str().unwrap();
+        let scope = pioneer_cli_agent_runtime::executable_digest::DigestTestScope::default();
+        // Cold isolated checks detect a provider bypassing the shared mechanism;
+        // repeated calls detect rehashing even when their output SHA is equal.
+        for provider in ["claude", "codex", "opencode"] {
+            let isolated = pioneer_cli_agent_runtime::executable_digest::DigestTestScope::default();
+            for version in ["v1", "v2"] {
+                let worker_scope = isolated.clone();
+                let worker_binary = binary.to_owned();
+                pioneer_observability::work::spawn_blocking(move || {
+                    worker_scope.run_sync(|| match provider {
+                        "claude" => {
+                            let identity = claude_executable_cache_identity(
+                                &worker_binary,
+                                version,
+                                &"b".repeat(64),
+                            )
+                            .unwrap();
+                            attest_claude_executable_identity(identity).unwrap();
+                        }
+                        "codex" => {
+                            let identity = codex_executable_cache_identity(
+                                &worker_binary,
+                                version,
+                                &"a".repeat(64),
+                            )
+                            .unwrap();
+                            attest_codex_executable_identity(identity).unwrap();
+                        }
+                        _ => {
+                            opencode_executable_fingerprints(&worker_binary, Some(version))
+                                .unwrap();
+                        }
+                    })
+                })
+                .await
+                .unwrap();
+                assert_eq!(isolated.hash_invocations(), 1, "{provider} digest wiring");
+            }
+        }
+        let contract = "a".repeat(64);
+        let identity = codex_executable_cache_identity(binary, "v1", &contract).unwrap();
+        let hash_identity = identity.clone();
+        let worker_scope = scope.clone();
+        let codex = pioneer_observability::work::spawn_blocking(move || {
+            worker_scope.run_sync(|| attest_codex_executable_identity(hash_identity).unwrap())
+        })
+        .await
+        .unwrap();
+        let claude_identity =
+            claude_executable_cache_identity(binary, "v2", &"b".repeat(64)).unwrap();
+        let worker_scope = scope.clone();
+        let claude = pioneer_observability::work::spawn_blocking(move || {
+            worker_scope.run_sync(|| attest_claude_executable_identity(claude_identity).unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!(codex.binary_sha256, claude.binary_sha256);
+        assert_ne!(
+            codex.local_executable_fingerprint,
+            claude.local_executable_fingerprint
+        );
+        // This is the same entry point used by readiness and frozen session
+        // projection validation. Version remains excluded from its contract.
+        let fingerprint_path = binary.to_owned();
+        let worker_scope = scope.clone();
+        let (first, second) = pioneer_observability::work::spawn_blocking(move || {
+            worker_scope.run_sync(|| {
+                (
+                    opencode_executable_fingerprints(&fingerprint_path, Some("v1")).unwrap(),
+                    opencode_executable_fingerprints(&fingerprint_path, Some("v2")).unwrap(),
+                )
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(scope.hash_invocations(), 1);
+        let scope = pioneer_cli_agent_runtime::executable_digest::DigestTestScope::default();
+        let cache = CodexMcpReadinessCache::default();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        for fail in [true, false] {
+            let next_identity = identity.clone();
+            let attempts = &attempts;
+            let worker_scope = scope.clone();
+            let local = cache
+                .get_or_probe(identity.clone(), |slot| async move {
+                    let (executable, _slot) =
+                        pioneer_observability::work::spawn_blocking(move || {
+                            worker_scope.run_sync(|| {
+                                (
+                                    attest_codex_executable_identity(next_identity).unwrap(),
+                                    slot,
+                                )
+                            })
+                        })
+                        .await
+                        .unwrap();
+                    // The downstream probe runs after successful executable
+                    // attestation. Its failure must leave readiness retryable.
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut local = local_attestation('a');
+                    local.executable = executable;
+                    if fail {
+                        local.probes.insert(
+                            CodexMcpLocalProbeKind::ExactRawToolFiltering,
+                            CodexMcpLocalProbeResult::failed("injected downstream probe failure"),
+                        );
+                    }
+                    Some(local)
+                })
+                .await
+                .unwrap();
+            assert_eq!(local.all_probes_passed(), !fail);
+            assert_eq!(cache.len(), usize::from(!fail));
+            assert_eq!(
+                scope.hash_invocations(),
+                1,
+                "digest survives failed downstream probe"
+            );
+        }
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
 
     fn all_passed_probes() -> BTreeMap<CodexMcpLocalProbeKind, CodexMcpLocalProbeResult> {
         CodexMcpLocalProbeKind::ALL

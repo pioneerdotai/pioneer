@@ -112,4 +112,11 @@ Start optionally accepts `launch`:
 
 Omitted launch inherits current identity, provider/executor, model, reasoning under server rules, without a preliminary catalog lookup. A targetOptionId remains mandatory.
 
-Mutation results: `status` (`accepted`, `queued`, `completed`, `denied`, `failed`), optional `outcome`, `receiptId`, `outboxId`, `publicMessage`, and `targetOptions`. Creation refreshes permitted targets, including on replay. Do not expect a result `threadId`. Existing call identity and Agent ledger/outbox handle replay; these JSON schemas declare no idempotencyKey.
+Mutation results: `status` (`accepted`, `queued`, `completed`, `denied`, `failed`), optional `outcome`, `receiptId`, `outboxId`, `publicMessage`, `threadResult`, and `targetOptions`. Creation refreshes permitted targets, including on replay. `threadResult` contains confirmed navigation references:
+
+- Create: `{workspaceId,threadId}` for the created thread.
+- Send: `{workspaceId,threadId,turnId}` for the saved message.
+- Start in Collaborative: `{workspaceId,threadId,turnId,taskId}`. `threadId/turnId` refer to the target's parent admission. The Task's executing child is created separately; read parent history near this turn to follow its later child reference.
+- Foreground start: `{workspaceId,threadId,turnId,executionId}` for the actual admitted turn and execution in the target thread.
+
+For send/start, call `threads_history_read` with the returned `threadResult.threadId` and `anchor:{turnId:threadResult.turnId}`. No workspace listing or index is needed. No speculative child ID is returned. Accepted/queued does not mean the model finished. References are fixed at commit and retained by replay; they grant no additional access and cannot replace `targetOptionId`. Older receipts without these fields remain readable but cannot supply references they never saved. Existing call identity and Agent ledger/outbox handle replay; these JSON schemas declare no idempotencyKey.

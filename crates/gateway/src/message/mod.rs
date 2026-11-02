@@ -608,6 +608,8 @@ pub struct MessageProcessor {
     gateway_listen_addr: Arc<std::sync::RwLock<Option<std::net::SocketAddr>>>,
     summary_config: Arc<summary::SummaryConfig>,
     compaction_settings: Arc<StdRwLock<pioneer_compaction::CompactionSettings>>,
+    task_child_point_cursor: Arc<Mutex<tasks::ChildDiscoveryPass<(i64, String)>>>,
+    task_child_scope_cursor: Arc<Mutex<tasks::ChildDiscoveryPass<(i64, String, String)>>>,
     completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
     compaction_lifecycle_not_before: Arc<StdRwLock<Option<tokio::time::Instant>>>,
     #[cfg(test)]
@@ -615,6 +617,9 @@ pub struct MessageProcessor {
         Arc<compaction_background::CompletedHistoryPreparationBarrier>,
     #[cfg(test)]
     turn_execution_heartbeat_barrier:
+        Arc<compaction_background::CompletedHistoryPreparationBarrier>,
+    #[cfg(test)]
+    recovery_due_wait_barrier:
         Arc<compaction_background::CompletedHistoryPreparationBarrier>,
     #[cfg(test)]
     task_history_preparation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
@@ -1265,12 +1270,16 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
+            task_child_point_cursor: Arc::new(Mutex::new(Default::default())),
+            task_child_scope_cursor: Arc::new(Mutex::new(Default::default())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
             compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             turn_execution_heartbeat_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            recovery_due_wait_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -2461,17 +2470,18 @@ impl MessageProcessor {
             };
             let store = this.crud_store.with_maintenance_reads_and_critical_writes();
             let owner = this.turn_execution_owner_id.clone();
+            let notification = store.turn_execution_heartbeat_notification(owner.as_ref());
             #[cfg(test)]
             let barrier = this.turn_execution_heartbeat_barrier.clone();
             // Keep only the DB scope and owner identity during I/O, retry and
             // sleep. The heartbeat must not keep MessageProcessor alive.
             drop(this);
             let cycle = AssertUnwindSafe(async {
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
                     pioneer_observability::DatabaseOperationSite::ExecutionOwnerHeartbeat,
                     retry_transient_storage_access(|| {
-                        store.heartbeat_turn_executions_owned_by(
+                        store.supervise_turn_execution_heartbeat(
                             owner.as_ref(),
                             TURN_EXECUTION_OWNER_LEASE_SECONDS,
                         )
@@ -2479,11 +2489,15 @@ impl MessageProcessor {
                 )
                 .await
                 {
-                    record_resilience_worker_error(
-                        "Turn execution owner heartbeat",
-                        &error,
-                        ResilienceWorkerFailureImpact::CriticalPoll,
-                    );
+                    Ok(parked) => parked,
+                    Err(error) => {
+                        record_resilience_worker_error(
+                            "Turn execution owner heartbeat",
+                            &error,
+                            ResilienceWorkerFailureImpact::CriticalPoll,
+                        );
+                        false
+                    }
                 }
             })
             .catch_unwind()
@@ -2500,7 +2514,77 @@ impl MessageProcessor {
                 .await;
             // Retries are bounded by the existing storage policy; subsequent
             // polls remain serial and use the existing short service interval.
-            sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            // Drop the scoped DB handle before waiting; neither branch retains
+            // MessageProcessor. notify_one retains a permit across the final
+            // empty check and waiter registration (including admission races).
+            drop(store);
+            if matches!(cycle, Ok(true)) {
+                notification.notified().await;
+            } else {
+                tokio::select! {
+                    _ = notification.notified() => {},
+                    _ = sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)) => {},
+                }
+            }
+        }
+    }
+
+    async fn run_recovery_due_worker(processor: Weak<Self>) {
+        loop {
+            let Some(original) = processor.upgrade() else {
+                break;
+            };
+            let this = original.for_background_reconciliation();
+            drop(original);
+            #[cfg(test)]
+            let wait_barrier = this.recovery_due_wait_barrier.clone();
+            let wake = this.recovery_coordinator.due_wake();
+            let mut transient_storage_poll_failed = false;
+            let cycle = AssertUnwindSafe(async {
+                let now = now_timestamp_secs();
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::RecoveryJobs,
+                    retry_transient_storage_access(|| {
+                        this.recovery_coordinator.run_due_jobs(now, 64)
+                    }),
+                )
+                .await
+                {
+                    Ok(events) => {
+                        for event in events {
+                            this.handle_recovery_event(event, now).await;
+                        }
+                    }
+                    Err(error) => record_resilience_worker_poll_error(
+                        "recovery due jobs",
+                        &error,
+                        &mut transient_storage_poll_failed,
+                    ),
+                }
+            })
+            .catch_unwind()
+            .await;
+            if cycle.is_err() {
+                error!("contained panic in recovery due worker");
+            }
+            // notify_one retains a permit across the drain/wait boundary. No
+            // processor or database resource is held during the fallback wait.
+            drop(this);
+            #[cfg(test)]
+            wait_barrier
+                .wait_if_armed(
+                    "__recovery_due_before_wait__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                continue;
+            }
+            tokio::select! {
+                _ = wake.notified() => {},
+                _ = sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)) => {},
+            }
         }
     }
 
@@ -2552,7 +2636,7 @@ impl MessageProcessor {
                     }),
                 )
                 .await;
-                finalization_reporting.observe(&result, Instant::now());
+                finalization_reporting.observe_finalizations(&result, Instant::now());
                 match result {
                     Ok(summary) => {
                         let committed = summary.committed_count();
@@ -2595,6 +2679,8 @@ impl MessageProcessor {
             if cycle.is_err() {
                 error!("contained panic in projection/delivery resilience worker");
             }
+            // Fixed fallback also discovers foreign writes and restored streams.
+            // No second deadline SELECT and no acceleration of shared callbacks.
             sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
         }
     }
@@ -2794,14 +2880,25 @@ impl MessageProcessor {
 
         let task_runtime_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ResilienceTaskRuntimeStart);
-        if let Err(error) = self.task_runtime.start().await {
-            drop(task_runtime_stage);
-            error!(error = %format!("{error:#}"), "failed to start task runtime");
-            trace.finish_failure();
-            return Err(error).context("failed to start task runtime");
-        } else {
-            task_runtime_stage.succeed();
-        }
+        let partial_startup = match self.task_runtime.start().await {
+            Ok(()) => {
+                task_runtime_stage.succeed();
+                None
+            }
+            Err(error) => {
+                drop(task_runtime_stage);
+                error!(error = %format!("{error:#}"), "failed to start task runtime");
+                if error
+                    .downcast_ref::<pioneer_tasks::PartialTaskStartup>()
+                    .is_some()
+                {
+                    Some(error)
+                } else {
+                    trace.finish_failure();
+                    return Err(error).context("failed to start task runtime");
+                }
+            }
+        };
 
         let task_events_stage = trace
             .stage(pioneer_observability::GatewayOperationStage::ResilienceTaskEventListenerStart);
@@ -2813,7 +2910,13 @@ impl MessageProcessor {
         self.start_hook_recovery_worker().await;
         hook_recovery_stage.succeed();
 
-        trace.finish_success();
+        if partial_startup.is_some() {
+            // Keep explicit failure diagnostics/trace, but do not trap Gateway
+            // initialization in a retry loop on classified row-local poison.
+            trace.finish_failure();
+        } else {
+            trace.finish_success();
+        }
         Ok(())
     }
 
@@ -2911,6 +3014,7 @@ impl MessageProcessor {
                 tokio::spawn(Self::run_turn_execution_owner_heartbeat_worker(
                     processor.clone(),
                 )),
+                tokio::spawn(Self::run_recovery_due_worker(processor.clone())),
                 tokio::spawn(Self::run_projection_delivery_resilience_worker(
                     processor.clone(),
                 )),
@@ -3278,7 +3382,7 @@ impl MessageProcessor {
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
                     pioneer_observability::DatabaseOperationSite::RecoveryJobs,
                     retry_transient_storage_access(|| {
-                        this.recovery_coordinator.run_ready_jobs(now, 64)
+                        this.recovery_coordinator.run_supervision_audits(now, 64)
                     }),
                 )
                 .await
@@ -4945,12 +5049,16 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
+            task_child_point_cursor: Arc::new(Mutex::new(Default::default())),
+            task_child_scope_cursor: Arc::new(Mutex::new(Default::default())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
             compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             turn_execution_heartbeat_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            recovery_due_wait_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]

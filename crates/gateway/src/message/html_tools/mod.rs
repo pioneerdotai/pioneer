@@ -704,7 +704,7 @@ impl ToolHandler for HtmlHandler {
         };
         let activity = tokio::select! { biased;
             _ = invocation.cancellation.cancelled() => return Err(ToolError::cancelled("HTML invocation cancelled")),
-            guard = self.processor.artifact_service.html_preview_activity() => guard,
+            guard = self.processor.artifact_service.html_preview_activity_signaled() => guard,
         };
         let value = self
             .processor
@@ -727,7 +727,7 @@ impl ToolHandler for HtmlHandler {
 // context/snapshots then protect the subsequent provider request and recovery.
 struct HtmlOutput {
     inner: FunctionToolOutput,
-    _activity: tokio::sync::OwnedRwLockReadGuard<()>,
+    _activity: pioneer_artifacts::HtmlPreviewActivityGuard,
 }
 impl ToolOutput for HtmlOutput {
     fn success(&self) -> bool {

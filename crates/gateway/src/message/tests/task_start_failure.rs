@@ -3451,3 +3451,538 @@ fn revision_internal_completion_failure_is_not_reclassified_or_completed_twice()
         assert!(events.is_empty(), "diagnostic_read={diagnostic_read}");
     }
 }
+
+#[test]
+fn task_child_consumer_rotates_past_more_than_a_page_of_undeferable_claim_failures() {
+    run_standard_stack_message_test("child poison claim rotation", async {
+        use pioneer_entity::task_child_reconcile_pending as point;
+        use sea_orm::{ConnectionTrait, EntityTrait, TransactionTrait};
+        let (workspaces, store, _) = setup_workspace_manager().await;
+        let processor = Arc::new(MessageProcessor::new(
+            Arc::new(ThreadManager::new("test-model", "openai")),
+            test_provider(),
+            Arc::new(SessionManager::new()),
+            workspaces,
+            store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        ));
+        let tx = store.database_connection().begin().await.unwrap();
+        for n in 0..40 {
+            {
+                let id: String = (&format!("poison_{n:03}")).to_string();
+                point::Entity::insert(point::ActiveModel {
+                    turn_id: sea_orm::Set(id.clone()),
+                    thread_id: sea_orm::Set("missing-thread".into()),
+                    revision: sea_orm::Set(format!("fixture-{id}")),
+                    next_attempt_at: sea_orm::Set(Some(1)),
+                    attempt_count: sea_orm::Set(0),
+                    claim_token: sea_orm::Set(None),
+                })
+                .exec(&tx)
+                .await
+                .unwrap();
+            }
+        }
+        {
+            let id: String = ("z_healthy_tail").to_string();
+            point::Entity::insert(point::ActiveModel {
+                turn_id: sea_orm::Set(id.clone()),
+                thread_id: sea_orm::Set("missing-thread".into()),
+                revision: sea_orm::Set(format!("fixture-{id}")),
+                next_attempt_at: sea_orm::Set(Some(1)),
+                attempt_count: sea_orm::Set(0),
+                claim_token: sea_orm::Set(None),
+            })
+            .exec(&tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+        // Fail BOTH claim and independent deferral, so only the real consumer's
+        // retained cursor can expose the healthy tail beyond its 16-row page.
+        store.database_connection().execute_unprepared("CREATE TRIGGER test_child_claim_poison BEFORE UPDATE ON task_child_reconcile_pending WHEN OLD.turn_id GLOB 'poison_*' BEGIN SELECT RAISE(FAIL,'point write refused'); END").await.unwrap();
+        for _ in 0..3 {
+            assert!(
+                processor
+                    .for_background_reconciliation()
+                    .reconcile_terminal_task_child_turns(16)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            point::Entity::find_by_id("z_healthy_tail")
+                .one(&store.database_connection())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            point::Entity::find_by_id("poison_000")
+                .one(&store.database_connection())
+                .await
+                .unwrap()
+                .unwrap()
+                .claim_token
+                .is_none()
+        );
+    });
+}
+
+#[test]
+fn task_child_consumer_ack_and_deferral_failure_does_not_lease_or_suppress_healthy_tail() {
+    run_standard_stack_message_test("child poison ACK isolation", async {
+        use pioneer_entity::task_child_reconcile_pending as point;
+        use sea_orm::{ConnectionTrait, EntityTrait, TransactionTrait};
+        let (workspaces, store, _) = setup_workspace_manager().await;
+        let processor = Arc::new(MessageProcessor::new(
+            Arc::new(ThreadManager::new("test-model", "openai")),
+            test_provider(),
+            Arc::new(SessionManager::new()),
+            workspaces,
+            store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        ));
+        let tx = store.database_connection().begin().await.unwrap();
+        for id in ["a_ack_poison", "z_after_ack"] {
+            {
+                let id: String = (id).to_string();
+                point::Entity::insert(point::ActiveModel {
+                    turn_id: sea_orm::Set(id.clone()),
+                    thread_id: sea_orm::Set("missing-thread".into()),
+                    revision: sea_orm::Set(format!("fixture-{id}")),
+                    next_attempt_at: sea_orm::Set(Some(1)),
+                    attempt_count: sea_orm::Set(0),
+                    claim_token: sea_orm::Set(None),
+                })
+                .exec(&tx)
+                .await
+                .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+        store.database_connection().execute_unprepared("CREATE TRIGGER test_child_ack_poison BEFORE DELETE ON task_child_reconcile_pending WHEN OLD.turn_id='a_ack_poison' BEGIN SELECT RAISE(FAIL,'ACK refused'); END").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE TRIGGER test_child_defer_poison BEFORE UPDATE ON task_child_reconcile_pending WHEN OLD.turn_id='a_ack_poison' AND OLD.claim_token IS NOT NULL AND NEW.claim_token IS NULL BEGIN SELECT RAISE(FAIL,'deferral refused'); END").await.unwrap();
+        assert!(
+            processor
+                .reconcile_terminal_task_child_turns(16)
+                .await
+                .is_err()
+        );
+        assert!(
+            point::Entity::find_by_id("z_after_ack")
+                .one(&store.database_connection())
+                .await
+                .unwrap()
+                .is_none(),
+            "ACK failure must not leave a later healthy row claimed for 60 seconds"
+        );
+        let poisoned = point::Entity::find_by_id("a_ack_poison")
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(poisoned.claim_token.is_some());
+        assert!(poisoned.next_attempt_at.unwrap() > chrono::Utc::now().timestamp());
+    });
+}
+
+#[test]
+fn task_child_scope_rotation_survives_undeferable_heads_and_wraps() {
+    run_standard_stack_message_test("child scope poison rotation", async {
+        use pioneer_entity::{
+            task_child_reconcile_pending as point, task_child_reconcile_scope as scope,
+        };
+        use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+        let (workspaces, store, _) = setup_workspace_manager().await;
+        let processor = Arc::new(MessageProcessor::new(
+            Arc::new(ThreadManager::new("test-model", "openai")),
+            test_provider(),
+            Arc::new(SessionManager::new()),
+            workspaces,
+            store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        ));
+        // A real Run fanout locator with a persisted link. Its stale/missing
+        // Turn is deliberately ACKed by the production point consumer.
+        store
+            .upsert_task_run_turn(pioneer_protocol::TaskRunTurn {
+                id: "scope-fanout-link".into(),
+                task_id: "scope-task".into(),
+                run_id: "healthy-run".into(),
+                execution_id: None,
+                thread_id: "missing-thread".into(),
+                turn_id: "scope_healthy_child".into(),
+                kind: TaskRunTurnKind::Initial,
+                round: 0,
+                sequence: 0,
+                status: TaskRunTurnStatus::CandidateCreated,
+                reviews_candidate_id: None,
+                requested_by_candidate_id: None,
+                requested_by_review_event_id: None,
+                created_at: 1,
+                started_at: None,
+                completed_at: Some(1),
+            })
+            .await
+            .unwrap();
+        point::Entity::delete_many()
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+        scope::Entity::delete_many()
+            .filter(scope::Column::ScopeKind.ne("historical-seed"))
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+        while store
+            .expand_child_scope(chrono::Utc::now().timestamp(), true)
+            .await
+            .unwrap()
+        {}
+        assert!(store.child_work_queues_ready().await.unwrap());
+        point::Entity::delete_many()
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+        for n in 0..41 {
+            let (kind, key, due) = if n == 40 {
+                ("run", "healthy-run".to_owned(), 2)
+            } else {
+                ("task", format!("poison_{n:03}"), 1)
+            };
+            scope::Entity::insert(scope::ActiveModel {
+                scope_kind: Set(kind.into()),
+                scope_key: Set(key.clone()),
+                incarnation_token: Set(format!("inc-{key}")),
+                requested_revision: Set(format!("rev-{key}")),
+                pass_revision: Set(None),
+                cursor: Set(None),
+                upper_watermark: Set(None),
+                next_attempt_at: Set(Some(due)),
+                attempt_count: Set(0),
+                claim_token: Set(None),
+            })
+            .exec_without_returning(&store.database_connection())
+            .await
+            .unwrap();
+        }
+        // Observe actual point ACK, so merely failing to publish a point cannot
+        // satisfy the assertion. Faults remain row-specific on scope UPDATE.
+        store
+            .database_connection()
+            .execute_unprepared("CREATE TABLE test_scope_acks (turn_id TEXT PRIMARY KEY)")
+            .await
+            .unwrap();
+        store.database_connection().execute_unprepared("CREATE TRIGGER test_scope_ack AFTER DELETE ON task_child_reconcile_pending WHEN OLD.turn_id='scope_healthy_child' BEGIN INSERT INTO test_scope_acks VALUES (OLD.turn_id); END").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE TRIGGER test_scope_refusal BEFORE UPDATE ON task_child_reconcile_scope WHEN OLD.scope_key GLOB 'poison_*' BEGIN SELECT RAISE(FAIL,'scope write refused'); END").await.unwrap();
+        for _ in 0..40 {
+            let error = processor
+                .for_background_reconciliation()
+                .reconcile_terminal_task_child_turns(16)
+                .await
+                .unwrap_err();
+            assert!(format!("{error:?}").contains("deferral also failed"));
+        }
+        processor
+            .for_background_reconciliation()
+            .reconcile_terminal_task_child_turns(16)
+            .await
+            .unwrap();
+        let ack = store
+            .database_connection()
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT turn_id FROM test_scope_acks".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ack.try_get::<String>("", "turn_id").unwrap(),
+            "scope_healthy_child"
+        );
+        // The next quantum wraps to the still-due prefix; failure remains
+        // visible and no durable poison obligation was dropped/quarantined.
+        assert!(
+            processor
+                .for_background_reconciliation()
+                .reconcile_terminal_task_child_turns(16)
+                .await
+                .is_err()
+        );
+        store
+            .database_connection()
+            .execute_unprepared("DROP TRIGGER test_scope_refusal")
+            .await
+            .unwrap();
+        for _ in 0..41 {
+            processor
+                .for_background_reconciliation()
+                .reconcile_terminal_task_child_turns(16)
+                .await
+                .unwrap();
+        }
+        assert!(
+            scope::Entity::find()
+                .filter(scope::Column::ScopeKind.ne("historical-seed"))
+                .all(&store.database_connection())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn child_due_passes_revisit_behind_cursor_work_despite_continuous_suffix_growth() {
+    run_standard_stack_message_test("finite child due passes", async {
+        use pioneer_entity::{
+            task_child_reconcile_pending as point, task_child_reconcile_scope as scope,
+        };
+        use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+        let (workspaces, store, _) = setup_workspace_manager().await;
+        let processor = Arc::new(MessageProcessor::new(
+            Arc::new(ThreadManager::new("test-model", "openai")),
+            test_provider(),
+            Arc::new(SessionManager::new()),
+            workspaces,
+            store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        ));
+        store
+            .upsert_task_run_turn(pioneer_protocol::TaskRunTurn {
+                id: "finite-link".into(),
+                task_id: "finite-task".into(),
+                run_id: "finite-run".into(),
+                execution_id: None,
+                thread_id: "missing-thread".into(),
+                turn_id: "finite-fanout".into(),
+                kind: TaskRunTurnKind::Initial,
+                round: 0,
+                sequence: 0,
+                status: TaskRunTurnStatus::CandidateCreated,
+                reviews_candidate_id: None,
+                requested_by_candidate_id: None,
+                requested_by_review_event_id: None,
+                created_at: 1,
+                started_at: None,
+                completed_at: Some(1),
+            })
+            .await
+            .unwrap();
+        while store
+            .expand_child_scope(chrono::Utc::now().timestamp(), true)
+            .await
+            .unwrap()
+        {}
+        assert!(store.child_work_queues_ready().await.unwrap());
+        let db = store.database_connection();
+        point::Entity::delete_many().exec(&db).await.unwrap();
+        scope::Entity::delete_many()
+            .filter(scope::Column::ScopeKind.ne("historical-seed"))
+            .exec(&db)
+            .await
+            .unwrap();
+        async fn add_point(db: &impl ConnectionTrait, id: &str, due: i64) {
+            point::Entity::insert(point::ActiveModel {
+                turn_id: Set(id.into()),
+                thread_id: Set("missing-thread".into()),
+                revision: Set(format!("rev-{id}")),
+                next_attempt_at: Set(Some(due)),
+                attempt_count: Set(0),
+                claim_token: Set(None),
+            })
+            .exec_without_returning(db)
+            .await
+            .unwrap();
+        }
+        async fn add_scope(db: &impl ConnectionTrait, kind: &str, key: &str, due: i64) {
+            scope::Entity::insert(scope::ActiveModel {
+                scope_kind: Set(kind.into()),
+                scope_key: Set(key.into()),
+                incarnation_token: Set(format!("inc-{key}")),
+                requested_revision: Set(format!("rev-{key}")),
+                pass_revision: Set(None),
+                cursor: Set(None),
+                upper_watermark: Set(None),
+                next_attempt_at: Set(Some(due)),
+                attempt_count: Set(0),
+                claim_token: Set(None),
+            })
+            .exec_without_returning(db)
+            .await
+            .unwrap();
+        }
+        for n in 0..32 {
+            add_point(&db, &format!("poison_point_{n:03}"), 1).await;
+        }
+        for n in 0..2 {
+            add_scope(&db, "task", &format!("poison_scope_{n:03}"), 1).await;
+        }
+        db.execute_unprepared("CREATE TABLE test_finite_acks (turn_id TEXT PRIMARY KEY)")
+            .await
+            .unwrap();
+        db.execute_unprepared("CREATE TRIGGER test_finite_ack AFTER DELETE ON task_child_reconcile_pending WHEN OLD.turn_id='behind-point' BEGIN INSERT INTO test_finite_acks VALUES (OLD.turn_id); END").await.unwrap();
+        db.execute_unprepared("CREATE TRIGGER test_finite_point_refusal BEFORE UPDATE ON task_child_reconcile_pending WHEN OLD.turn_id GLOB 'poison_*' BEGIN SELECT RAISE(FAIL,'point refused'); END").await.unwrap();
+        db.execute_unprepared("CREATE TRIGGER test_finite_scope_refusal BEFORE UPDATE ON task_child_reconcile_scope WHEN OLD.scope_key GLOB 'poison_*' BEGIN SELECT RAISE(FAIL,'scope refused'); END").await.unwrap();
+        assert!(
+            processor
+                .for_background_reconciliation()
+                .reconcile_terminal_task_child_turns(16)
+                .await
+                .is_err()
+        );
+        // Both locators arrive behind their retained raw cursors, with no hint,
+        // rebuild or compatibility scan to rescue them after durable seed EOF.
+        add_point(&db, "behind-point", 0).await;
+        add_scope(&db, "run", "finite-run", 0).await;
+        for quantum in 0..2 {
+            // Supply more than a full new suffix before EVERY quantum. A cursor
+            // that waits for a short suffix would never revisit either locator.
+            for n in 0..32 {
+                add_point(&db, &format!("zz_suffix_{quantum}_{n:03}"), 2 + quantum).await;
+            }
+            add_scope(&db, "task", &format!("zz_suffix_{quantum}"), 2 + quantum).await;
+            assert!(
+                processor
+                    .for_background_reconciliation()
+                    .reconcile_terminal_task_child_turns(16)
+                    .await
+                    .is_err()
+            );
+        }
+        let ack = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT turn_id FROM test_finite_acks".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ack.try_get::<String>("", "turn_id").unwrap(),
+            "behind-point"
+        );
+        assert!(
+            scope::Entity::find_by_id(("run".to_owned(), "finite-run".to_owned()))
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            point::Entity::find_by_id("finite-fanout")
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some(),
+            "real run fanout must publish a point, not merely advance a cursor"
+        );
+        assert!(
+            point::Entity::find_by_id("poison_point_000")
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some(),
+            "failed work remains durable for subsequent passes"
+        );
+    });
+}
+
+#[test]
+fn gateway_partial_task_startup_keeps_independent_registrations_and_unknown_failure_stops() {
+    run_standard_stack_message_test("partial task startup integration", async {
+        use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
+        for partial in [true, false] {
+            let (workspaces, store, workspace) = setup_workspace_manager().await;
+            let processor = Arc::new(MessageProcessor::new(
+                Arc::new(ThreadManager::new("test-model", "openai")),
+                test_provider(),
+                Arc::new(SessionManager::new()),
+                workspaces,
+                store.clone(),
+                test_gateway_secrets(),
+                test_summary_config(),
+                test_tool_loop_config(),
+            ));
+            let mut params =
+                test_task_create_params(&workspace, "unused", "unused", "startup fixture", 1);
+            params.owner_kind = TaskOwnerKind::Workspace;
+            params.owner_id = Some(workspace);
+            params.created_by_thread_id = None;
+            params.created_by_turn_id = None;
+            params.executor_kind = TaskExecutorKind::System;
+            params.agent_spec = None;
+            params.lifecycle_policy = None;
+            params.trigger.spec = TaskTriggerSpec::Manual {
+                allowed_actor: None,
+            };
+            let task = processor
+                .task_runtime
+                .service()
+                .create_task(pioneer_tasks::TaskCreateContext::default(), params)
+                .await
+                .unwrap();
+            let db = store.database_connection();
+            if partial {
+                pioneer_entity::task_trigger::Entity::update_many()
+                    .filter(pioneer_entity::task_trigger::Column::Id.eq(task.trigger.id))
+                    .col_expr(
+                        pioneer_entity::task_trigger::Column::SpecJson,
+                        sea_orm::sea_query::Expr::value("invalid JSON"),
+                    )
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                let error = processor
+                    .task_runtime
+                    .start()
+                    .await
+                    .unwrap_err()
+                    .context("caller context");
+                assert!(
+                    error
+                        .downcast_ref::<pioneer_tasks::PartialTaskStartup>()
+                        .is_some()
+                );
+                processor.initialize_resilience_workers().await.unwrap();
+                assert!(
+                    processor
+                        .task_runtime
+                        .start()
+                        .await
+                        .unwrap_err()
+                        .downcast_ref::<pioneer_tasks::PartialTaskStartup>()
+                        .is_some(),
+                    "persistent poison was not repaired or hidden by independent Gateway startup"
+                );
+                assert!(processor.task_event_listener_worker.lock().await.is_some());
+                assert!(processor.hook_recovery_worker.lock().await.is_some());
+            } else {
+                db.execute_unprepared("CREATE TRIGGER test_startup_storage_refusal BEFORE INSERT ON task_event BEGIN SELECT RAISE(FAIL,'startup storage unavailable'); END").await.unwrap();
+                let error = processor.initialize_resilience_workers().await.unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("failed to start task runtime"),
+                    "negative control must reach the runtime startup boundary"
+                );
+                assert!(
+                    error
+                        .downcast_ref::<pioneer_tasks::PartialTaskStartup>()
+                        .is_none()
+                );
+                assert!(processor.task_event_listener_worker.lock().await.is_none());
+                assert!(processor.hook_recovery_worker.lock().await.is_none());
+            }
+            processor.shutdown_resilience_workers().await;
+        }
+    });
+}

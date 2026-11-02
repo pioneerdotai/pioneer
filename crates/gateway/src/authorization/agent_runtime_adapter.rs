@@ -949,6 +949,7 @@ impl BoundAgentActionAdapter {
             receipt_id: Some(projection.receipt_id.clone()),
             outbox_id: Some(projection.outbox_id.clone()),
             public_message: None,
+            thread_result: None,
             target_options: Vec::new(),
         }
     }

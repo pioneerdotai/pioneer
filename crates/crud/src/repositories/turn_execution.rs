@@ -188,6 +188,30 @@ pub async fn find<C: ConnectionTrait>(
         .transpose()
 }
 
+/// Bounded bootstrap of the owner registry, never an every-heartbeat preflight.
+pub async fn list_owned_active<C: ConnectionTrait>(
+    db: &C,
+    owner_id: &str,
+    limit: u64,
+) -> Result<Vec<TurnExecutionRecord>> {
+    turn_execution::Entity::find()
+        .filter(turn_execution::Column::OwnerId.eq(owner_id.to_owned()))
+        .filter(turn_execution::Column::Status.is_in([
+            "queued",
+            "starting",
+            "running",
+            "recovering",
+        ]))
+        .order_by_asc(turn_execution::Column::TurnId)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("failed to bootstrap execution heartbeat ownership")?
+        .into_iter()
+        .map(record_from_model)
+        .collect()
+}
+
 pub async fn heartbeat_owner<C: ConnectionTrait>(
     db: &C,
     owner_id: &str,

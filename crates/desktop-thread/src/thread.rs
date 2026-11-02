@@ -1047,6 +1047,46 @@ mod tests {
             (0, 0),
             "controlled composer text notified the root or timeline"
         );
+        // Send feedback is a Composer-only publication too, but it must redraw
+        // the mounted surface even though the edit target and text stay equal.
+        client.composer_intent(
+            pioneer_client::composer::store::ComposerIntent::BeginOperation {
+                thread_id: "a".into(),
+                draft_id: input.draft_id(),
+                operation: pioneer_client::composer::store::ComposerOperationKind::Send,
+            },
+        );
+        let identity = client
+            .composer_snapshot("a")
+            .unwrap()
+            .preparing_send()
+            .unwrap()
+            .identity()
+            .clone();
+        deliver();
+        cx.run_until_parked();
+        assert!(
+            notifications.get().1 > 0,
+            "captured Send did not notify the timeline binding"
+        );
+        let before_cancel = notifications.get().1;
+        client.complete_composer_operation(
+            identity,
+            pioneer_client::composer::store::ComposerOperationCompletion::Cancelled,
+        );
+        deliver();
+        cx.run_until_parked();
+        assert!(
+            notifications.get().1 > before_cancel,
+            "retired Send did not notify the timeline binding"
+        );
+        assert!(
+            client
+                .composer_snapshot("a")
+                .unwrap()
+                .preparing_send()
+                .is_none()
+        );
         drop(observers);
         cx.update(|window, cx| {
             let layout = ThreadPanelLayoutStore::for_window(window, cx);

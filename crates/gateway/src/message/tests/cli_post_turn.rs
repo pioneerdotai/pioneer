@@ -530,3 +530,95 @@ async fn failed_gate_bookkeeping_dispatches_independent_hooks_and_defers_worker(
     assert_eq!(row.attempt_count, 0);
     assert_eq!(row.status, "waiting_acceptance");
 }
+
+#[tokio::test]
+async fn terminal_effect_single_kick_drains_more_than_one_full_quantum() {
+    for (rotation, first_wave) in [(0_i64, 3_usize), (1, 8), (2, 4)] {
+        let (processor, _, _rx, workspace, store, _) = cli_runtime_approval_processor().await;
+        let processor = Arc::new(processor);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        install_recoverable_test_hook_runtime(
+            &processor,
+            task_post_turn_recording_hook_runtime(calls.clone()),
+        )
+        .await;
+        for index in 0..17 {
+            let turn_id = format!("terminal-drain-{index}");
+            seed_cli_runtime_turn_with_text(
+                &store,
+                &workspace,
+                "codex",
+                "codex",
+                &format!("thread-{turn_id}"),
+                &turn_id,
+                &format!("native-{turn_id}"),
+                "input",
+            )
+            .await;
+            let binding = store
+                .get_cli_runtime_turn_binding(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            processor
+                .prepare_cli_post_turn_hook(&binding, 1, Some(&final_answer("done")))
+                .await
+                .unwrap();
+            commit_turn(&store, &binding).await;
+            assert_eq!(
+                store
+                    .native_terminal_effect_status(&format!("{turn_id}:terminal-effect:post-turn"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "ready"
+            );
+        }
+        // Each rotation gets a fresh ready-only backlog. Fix the discovery clock
+        // after seeding, far enough ahead that every prepared row is due. The
+        // existing cfg(test) claim path also uses this time after writer admission.
+        let discovery_now = (now_timestamp_secs() + 3600).div_euclid(6) * 6 + rotation * 2;
+        let wave_starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_starts = wave_starts.clone();
+        let observed_calls = calls.clone();
+        // No resilience worker is started. This is one kick into the real owner,
+        // with no producer kicks between bounded waves. Observe completed hook
+        // calls at the next discovery to verify the actual first claim quota.
+        processor.spawn_native_terminal_effect_kick(Some(Box::new(move || {
+            observed_starts
+                .lock()
+                .unwrap()
+                .push(observed_calls.lock().unwrap().len());
+            discovery_now
+        })));
+        timeout(Duration::from_secs(10), async {
+            while processor
+                .native_terminal_effect_kick_running
+                .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 17, "rotation {rotation}");
+        let starts = wave_starts.lock().unwrap();
+        assert_eq!(starts[0], 0);
+        assert_eq!(starts[1], first_wave, "rotation {rotation}: {starts:?}");
+        drop(starts);
+        for index in 0..17 {
+            assert_eq!(
+                store
+                    .native_terminal_effect_status(&format!(
+                        "terminal-drain-{index}:terminal-effect:post-turn"
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "succeeded"
+            );
+        }
+    }
+}

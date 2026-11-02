@@ -628,9 +628,27 @@ pub async fn list_recoverable_hook_runs<C: ConnectionTrait>(
             i64::try_from(scan.stale_running_after_ms).unwrap_or(i64::MAX),
         ))
         .unwrap_or(now);
+    // Apply eligibility before LIMIT: future running/queued rows must not
+    // starve a due run, and only selected due runs need their attempts loaded.
     let mut condition = Condition::any()
-        .add(hook_run::Column::Status.eq(hook_run_status_to_db(HookRunStatus::Queued)))
-        .add(hook_run::Column::Status.eq(hook_run_status_to_db(HookRunStatus::Running)));
+        .add(
+            Condition::all()
+                .add(hook_run::Column::Status.eq(hook_run_status_to_db(HookRunStatus::Queued)))
+                .add(
+                    Condition::any()
+                        .add(hook_run::Column::QueuedAt.is_null())
+                        .add(hook_run::Column::QueuedAt.lte(now)),
+                ),
+        )
+        .add(
+            Condition::all()
+                .add(hook_run::Column::Status.eq(hook_run_status_to_db(HookRunStatus::Running)))
+                .add(
+                    Condition::any()
+                        .add(hook_run::Column::DeadlineAt.lte(now))
+                        .add(hook_run::Column::StartedAt.lte(stale_started_before)),
+                ),
+        );
     if let Some(phases) = scan.phases {
         let phase_values = phases
             .into_iter()
@@ -646,27 +664,13 @@ pub async fn list_recoverable_hook_runs<C: ConnectionTrait>(
         .filter(hook_run::Column::ResumeStateJson.is_not_null())
         .order_by_asc(hook_run::Column::QueuedAt)
         .order_by_asc(hook_run::Column::CreatedAt)
-        .limit(limit.saturating_mul(4))
+        .limit(limit)
         .all(db)
         .await
         .context("failed to list recoverable hook runs")?;
 
     let mut records = Vec::new();
     for row in rows {
-        let due = match row.status.as_str() {
-            "queued" => row.queued_at.is_none_or(|queued_at| queued_at <= now),
-            "running" => {
-                row.deadline_at
-                    .is_some_and(|deadline_at| deadline_at <= now)
-                    || row
-                        .started_at
-                        .is_some_and(|started_at| started_at <= stale_started_before)
-            }
-            _ => false,
-        };
-        if !due {
-            continue;
-        }
         let run = hook_run_record_from_model(row)?;
         let attempts = list_hook_run_attempts(db, &run.id).await?;
         records.push(RecoverableHookRunRecord {
@@ -674,9 +678,6 @@ pub async fn list_recoverable_hook_runs<C: ConnectionTrait>(
             run,
             attempts,
         });
-        if records.len() >= scan.batch_size.max(1) {
-            break;
-        }
     }
     Ok(records)
 }
@@ -1412,6 +1413,163 @@ mod tests {
             safe_for_user,
             redacted: false,
         }
+    }
+
+    fn resumable_run(key: &str) -> NewHookRunRecord {
+        let mut run = new_run(key);
+        run.resume_state = Some(HookRunResumeState::input_snapshot(
+            pioneer_hooks::HookExecutionPolicy::default(),
+            pioneer_hooks::HookFailurePolicy::BestEffort,
+            pioneer_hooks::HookRetryPolicy::default(),
+            1,
+            1,
+            1,
+            pioneer_hooks::HookRunInputSnapshot::new(
+                run.phase,
+                HookContext::default(),
+                pioneer_hooks::HookInput::empty(pioneer_hooks::HookInputKind::TurnPostTurn),
+                pioneer_hooks::HookPolicySet::empty(),
+                pioneer_hooks::HookPromptContextSet::empty(),
+            ),
+        ));
+        run
+    }
+
+    fn recovery_scan(batch_size: usize) -> HookRecoveryScan {
+        HookRecoveryScan {
+            now_unix_ms: timestamp(100).timestamp_millis(),
+            stale_running_after_ms: 10_000,
+            batch_size,
+            phases: Some(vec![HookPhase::TurnPostTurn]),
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_due_row_is_not_hidden_by_more_than_four_batches_of_future_runs() {
+        let (_connection, store) = migrated_store().await;
+        for index in 0..9 {
+            let mut run = resumable_run(&format!("future-{index}"));
+            run.status = HookRunStatus::Running;
+            run.queued_at = Some(timestamp(0));
+            run.started_at = Some(timestamp(99));
+            run.deadline_at = Some(timestamp(200));
+            store
+                .create_hook_run(run, timestamp(0))
+                .await
+                .expect("future run");
+        }
+        let mut due = resumable_run("due-after-future");
+        due.queued_at = Some(timestamp(100));
+        let due = store
+            .create_hook_run(due, timestamp(100))
+            .await
+            .expect("due run");
+        let selected = store
+            .list_recoverable_hook_runs(recovery_scan(2))
+            .await
+            .expect("discovery");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].run.id, due.id);
+    }
+
+    #[tokio::test]
+    async fn recovery_filters_null_times_phase_resume_and_due_boundaries() {
+        let (connection, store) = migrated_store().await;
+        let cases = [
+            (HookRunStatus::Queued, None, None, None, true),
+            (HookRunStatus::Queued, Some(100), None, None, true),
+            (HookRunStatus::Queued, Some(101), None, Some(0), false),
+            (HookRunStatus::Running, Some(0), None, Some(100), true),
+            (HookRunStatus::Running, Some(0), Some(90), None, true),
+            (HookRunStatus::Running, Some(0), Some(91), Some(101), false),
+            (HookRunStatus::Running, Some(0), None, None, false),
+            (HookRunStatus::Succeeded, Some(0), Some(0), Some(0), false),
+        ];
+        let mut expected = Vec::new();
+        for (index, (status, queued, started, deadline, eligible)) in cases.into_iter().enumerate()
+        {
+            let mut run = resumable_run(&format!("boundary-{index}"));
+            run.status = status;
+            run.queued_at = queued.map(timestamp);
+            run.started_at = started.map(timestamp);
+            run.deadline_at = deadline.map(timestamp);
+            let created = store.create_hook_run(run, timestamp(0)).await.expect("run");
+            // create defaults NULL queued_at; restore a legacy NULL explicitly.
+            if queued.is_none() {
+                hook_run::Entity::update_many()
+                    .col_expr(
+                        hook_run::Column::QueuedAt,
+                        Expr::value(Option::<DateTimeWithTimeZone>::None),
+                    )
+                    .filter(hook_run::Column::Id.eq(created.id.as_str()))
+                    .exec(&connection)
+                    .await
+                    .expect("legacy null queued_at");
+            }
+            if eligible {
+                expected.push(created.id);
+            }
+        }
+        store
+            .create_hook_run(new_run("no-resume"), timestamp(0))
+            .await
+            .expect("no capsule");
+        let mut wrong_phase = resumable_run("other-phase");
+        wrong_phase.phase = HookPhase::TurnPrePromptCompile;
+        store
+            .create_hook_run(wrong_phase, timestamp(0))
+            .await
+            .expect("other phase");
+        let selected = store
+            .list_recoverable_hook_runs(recovery_scan(32))
+            .await
+            .expect("discovery");
+        let mut actual = selected
+            .into_iter()
+            .map(|row| row.run.id)
+            .collect::<Vec<_>>();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        let mut scan = recovery_scan(1);
+        scan.phases = Some(Vec::new());
+        assert!(
+            store
+                .list_recoverable_hook_runs(scan)
+                .await
+                .expect("empty phase scope")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_ignores_future_payload_but_reports_due_storage_decode_error() {
+        let (connection, store) = migrated_store().await;
+        let mut run = resumable_run("corrupt-future");
+        run.queued_at = Some(timestamp(101));
+        let created = store
+            .create_hook_run(run, timestamp(0))
+            .await
+            .expect("future run");
+        hook_run::Entity::update_many()
+            .col_expr(
+                hook_run::Column::ResumeStateJson,
+                Expr::value(Some("invalid json".to_owned())),
+            )
+            .filter(hook_run::Column::Id.eq(created.id.as_str()))
+            .exec(&connection)
+            .await
+            .expect("corrupt capsule");
+        assert!(
+            store
+                .list_recoverable_hook_runs(recovery_scan(2))
+                .await
+                .expect("not due")
+                .is_empty()
+        );
+        let mut scan = recovery_scan(2);
+        scan.now_unix_ms = timestamp(101).timestamp_millis();
+        assert!(store.list_recoverable_hook_runs(scan).await.is_err());
     }
 
     #[tokio::test]

@@ -1,10 +1,12 @@
 use crate::TaskRuntimeResult;
 use crate::actor_contract::build_occurrence_contract;
-use crate::event_bus::TaskEventBus;
+use crate::event_bus::{TaskEventBus, TaskEventSubscription, TaskEventWakeDelivery};
 use crate::executor::{
     TaskExecutionContext, TaskExecutionHandle, TaskExecutorRegistry, TaskExecutorStartOutcome,
 };
-use crate::service::{is_terminal_task, now_timestamp_secs, task_error};
+use crate::service::{
+    LIVE_RECONCILIATION_INTERVAL, is_terminal_task, now_timestamp_secs, task_error,
+};
 use crate::trigger::{TaskTriggerCalculator, TaskTriggerCatchUpPlan};
 use anyhow::Context;
 use pioneer_crud::CrudStore;
@@ -18,6 +20,7 @@ use pioneer_sqlite::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, warn};
@@ -32,6 +35,16 @@ const TASK_FINISH_QUEUE_TASK_LIMIT: u64 = 64;
 #[derive(Debug)]
 struct TriggerScheduleError(anyhow::Error);
 
+/// Discovery completed, but these addressed locators remain retryable.
+#[derive(Debug)]
+pub(crate) struct PartialDiscoveryError(Vec<pioneer_crud::TaskSchedulerRowFailure>);
+impl std::fmt::Display for PartialDiscoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "incomplete scheduler rows: {:?}", self.0)
+    }
+}
+impl std::error::Error for PartialDiscoveryError {}
+
 impl std::fmt::Display for TriggerScheduleError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{:#}", self.0)
@@ -43,11 +56,44 @@ impl std::error::Error for TriggerScheduleError {}
 #[derive(Clone)]
 pub struct TaskSchedulerHandle {
     notify: Arc<Notify>,
+    dirty_tasks: Arc<Mutex<HashMap<String, u64>>>,
+    needs_rebuild: Arc<AtomicBool>,
 }
 
 impl TaskSchedulerHandle {
     pub fn wake(&self) {
-        self.notify.notify_waiters();
+        self.notify.notify_one();
+    }
+
+    /// Mark the exact inputs before polling a fresh mutation future. Wake only
+    /// after it returns and releases DB owners; cancellation/unknown outcome
+    /// keeps SchedulerPass's rebuild flag without sending under DB capacity.
+    pub(crate) async fn track_task_mutation<T>(
+        &self,
+        task_id: &str,
+        operation: impl std::future::Future<Output = TaskRuntimeResult<T>>,
+    ) -> TaskRuntimeResult<T> {
+        {
+            let mut dirty = self.dirty_tasks.lock().await;
+            let revision = dirty.entry(task_id.to_owned()).or_default();
+            *revision = revision.wrapping_add(1);
+        }
+        let mut pass = SchedulerPass {
+            needs_rebuild: &self.needs_rebuild,
+            complete: false,
+        };
+        let outcome = operation.await;
+        // A concurrent refresh may have consumed the pre-write revision. Keep
+        // a fresh addressed observation even when no new event was appended.
+        {
+            let mut dirty = self.dirty_tasks.lock().await;
+            let revision = dirty.entry(task_id.to_owned()).or_default();
+            *revision = revision.wrapping_add(1);
+        }
+        pass.complete = outcome.is_ok();
+        drop(pass);
+        self.notify.notify_one();
+        outcome
     }
 }
 
@@ -58,6 +104,14 @@ pub struct TaskScheduler {
     notify: Arc<Notify>,
     due_queue: Mutex<Vec<TaskTriggerQueueItem>>,
     process_lock: Mutex<()>,
+    events: Mutex<TaskEventSubscription>,
+    needs_rebuild: Arc<AtomicBool>,
+    dirty_tasks: Arc<Mutex<HashMap<String, u64>>>,
+    due_run_cursor: Mutex<Option<String>>,
+    due_run_upper: Mutex<Option<String>>,
+    due_trigger_upper: Mutex<Option<(chrono::DateTime<chrono::FixedOffset>, String)>>,
+    expired_task_cursor: Mutex<Option<(String, String)>>,
+    due_trigger_cursor: Mutex<Option<(chrono::DateTime<chrono::FixedOffset>, String)>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,34 +124,59 @@ struct TaskTriggerQueueItem {
     armed_trigger: Option<TaskTrigger>,
 }
 
+/// Cancellation or an error after possible mutation makes the next pass
+/// reconstruct durable state; only a completed pass may disarm this guard.
+struct SchedulerPass<'a> {
+    needs_rebuild: &'a AtomicBool,
+    complete: bool,
+}
+impl Drop for SchedulerPass<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.needs_rebuild.store(true, Ordering::Release);
+        }
+    }
+}
+
 impl TaskScheduler {
     pub fn new(
         store: Arc<CrudStore>,
         event_bus: Arc<TaskEventBus>,
         executors: Arc<TaskExecutorRegistry>,
     ) -> Self {
+        let events = event_bus.subscribe(Default::default());
+        let notify = event_bus.scheduler_notify();
         Self {
             store: Arc::new(store.with_maintenance_access()),
             event_bus,
             executors,
-            notify: Arc::new(Notify::new()),
+            notify,
             due_queue: Mutex::new(Vec::new()),
             process_lock: Mutex::new(()),
+            events: Mutex::new(events),
+            needs_rebuild: Arc::new(AtomicBool::new(true)),
+            dirty_tasks: Arc::new(Mutex::new(HashMap::new())),
+            due_run_cursor: Mutex::new(None),
+            due_run_upper: Mutex::new(None),
+            due_trigger_upper: Mutex::new(None),
+            expired_task_cursor: Mutex::new(None),
+            due_trigger_cursor: Mutex::new(None),
         }
     }
 
     pub fn handle(&self) -> TaskSchedulerHandle {
         TaskSchedulerHandle {
             notify: self.notify.clone(),
+            dirty_tasks: self.dirty_tasks.clone(),
+            needs_rebuild: self.needs_rebuild.clone(),
         }
     }
 
     pub fn wake(&self) {
-        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 
     pub async fn run(self: Arc<Self>) {
-        let mut events = self.event_bus.subscribe(Default::default());
         loop {
             let now = now_timestamp_secs();
             let processing = self
@@ -106,6 +185,8 @@ impl TaskScheduler {
             let sleep_duration = match processing {
                 Ok(_) => self.next_sleep_duration(now).await,
                 Err(error) => {
+                    // SchedulerPass already records unknown outcomes. Partial row
+                    // errors preserve discovery progress and addressed retries.
                     let is_transient_storage = is_transient_scheduler_storage_error(&error);
                     if is_transient_storage {
                         warn!(
@@ -124,7 +205,6 @@ impl TaskScheduler {
             };
             tokio::select! {
                 _ = self.notify.notified() => {}
-                _ = events.recv() => {}
                 _ = sleep(sleep_duration) => {}
             }
         }
@@ -145,6 +225,10 @@ impl TaskScheduler {
 
     pub async fn process_due_once(&self, now: i64) -> TaskRuntimeResult<usize> {
         let _guard = self.process_lock.lock().await;
+        let mut pass = SchedulerPass {
+            needs_rebuild: &self.needs_rebuild,
+            complete: false,
+        };
         // Recover a stop committed before queue disposal, without waiting for
         // a retry's old ready_at. One bounded disposal quantum per Task keeps
         // transactions small; any remaining queue is rediscovered next pass.
@@ -153,14 +237,42 @@ impl TaskScheduler {
             .list_task_finish_queue_candidates(TASK_FINISH_QUEUE_TASK_LIMIT)
             .await?
         {
+            self.mark_task_dirty(&task_id).await;
             let events = self
                 .store
                 .discard_finished_task_queue(&task_id, now)
                 .await?;
             self.event_bus.publish_many(events).await;
         }
-        self.rebuild_due_queue(now).await?;
-        let due = self.store.list_due_active_task_triggers(now).await?;
+        let mut row_failures = self.refresh_inputs(now).await?;
+        let after = self.due_trigger_cursor.lock().await.clone();
+        let upper = self.due_trigger_upper.lock().await.clone();
+        let (due, upper) = self
+            .store
+            .list_due_active_task_triggers_page_finite(
+                now,
+                after.as_ref().map(|(at, id)| (*at, id.as_str())),
+                upper.as_ref().map(|(at, id)| (*at, id.as_str())),
+                1024,
+            )
+            .await?;
+        // Advance from discovery, including no-op and failed rows. A short
+        // page wraps next pass; neither poison nor an unchanged head can pin it.
+        // SQL already bounds and orders the page. Equality is sufficient;
+        // remote database collation need not match Rust byte ordering.
+        let more = due.scanned == 1024 && due.last.as_ref() != upper.as_ref();
+        // Acquire both advisory guards before publishing the pair: cancellation
+        // cannot leave an advanced cursor with an uncaptured/replaced upper.
+        {
+            let mut cursor = self.due_trigger_cursor.lock().await;
+            let mut upper_state = self.due_trigger_upper.lock().await;
+            *cursor = if more { due.last.clone() } else { None };
+            *upper_state = if more { upper } else { None };
+        }
+        for failure in &due.failures {
+            self.mark_task_dirty(&failure.task_id).await;
+        }
+        row_failures.extend(due.failures);
         let armed = self
             .due_queue
             .lock()
@@ -170,42 +282,81 @@ impl TaskScheduler {
             .map(|trigger| (trigger.id.clone(), trigger.clone()))
             .collect::<HashMap<_, _>>();
         let mut created = 0usize;
-        for trigger in due {
+        let mut failure = None;
+        for trigger in due.records {
+            // Mark before attempting a write: a failed/unknown commit is not empty.
+            self.mark_task_dirty(&trigger.task_id).await;
             let is_armed = armed
                 .get(&trigger.id)
                 .is_some_and(|previous| same_scheduled_occurrence(previous, &trigger));
             match self.process_trigger(trigger.clone(), now, is_armed).await {
                 Ok(count) => created = created.saturating_add(count),
                 Err(error) if error.downcast_ref::<TriggerScheduleError>().is_some() => {
-                    self.block_task_for_trigger_failure(
-                        &trigger,
-                        now,
-                        "task_trigger_schedule_invalid",
-                        &error,
-                    )
-                    .await?;
+                    if let Err(error) = self
+                        .block_task_for_trigger_failure(
+                            &trigger,
+                            now,
+                            "task_trigger_schedule_invalid",
+                            &error,
+                        )
+                        .await
+                    {
+                        failure = Some(error);
+                    }
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    failure = Some(error);
+                }
             }
         }
-        for run in self.store.list_due_retry_task_runs(now, 1024).await? {
-            if self.process_retry_run(run, now).await? {
-                created = created.saturating_add(1);
-            }
-        }
-        for run in self
+        let after_id = self.due_run_cursor.lock().await.clone();
+        let upper = self.due_run_upper.lock().await.clone();
+        let (runs, upper) = self
             .store
-            .list_task_runs_by_status(TaskRunStatus::Queued, 1024)
-            .await?
-            .into_iter()
-            .filter(|run| run.retry_of_run_id.is_none())
-            .filter(|run| run.ready_at.is_none_or(|ready_at| ready_at <= now))
+            .list_scheduler_due_task_runs_finite(now, after_id.as_deref(), upper.as_deref(), 1024)
+            .await?;
+        let more = runs.scanned == 1024 && runs.last.as_ref() != upper.as_ref();
+        // Acquire both advisory guards before publishing the pair: cancellation
+        // cannot leave an advanced cursor with an uncaptured/replaced upper.
         {
-            if self.process_queued_run(&self.store, run).await? {
-                created = created.saturating_add(1);
+            let mut cursor = self.due_run_cursor.lock().await;
+            let mut upper_state = self.due_run_upper.lock().await;
+            *cursor = if more { runs.last.clone() } else { None };
+            *upper_state = if more { upper } else { None };
+        }
+        for failure in &runs.failures {
+            self.mark_task_dirty(&failure.task_id).await;
+        }
+        row_failures.extend(runs.failures);
+        for run in runs.records {
+            self.mark_task_dirty(&run.task_id).await;
+            let outcome = if run.retry_of_run_id.is_some() {
+                self.process_retry_run(run, now).await
+            } else {
+                self.process_queued_run(&self.store, run).await
+            };
+            match outcome {
+                Ok(true) => created = created.saturating_add(1),
+                Ok(false) => {}
+                Err(error) => {
+                    failure = Some(error);
+                }
             }
         }
-        self.rebuild_due_queue(now).await?;
+        row_failures.extend(self.refresh_inputs(now).await?);
+        if let Some(error) = failure {
+            return Err(error.context(format!("discovery row failures: {:?}", row_failures)));
+        }
+        if self.needs_rebuild.load(Ordering::Acquire) {
+            return Err(anyhow::anyhow!(
+                "unknown addressed scheduler discovery: {:?}",
+                row_failures
+            ));
+        }
+        pass.complete = true;
+        if !row_failures.is_empty() {
+            return Err(PartialDiscoveryError(row_failures).into());
+        }
         Ok(created)
     }
 
@@ -219,7 +370,18 @@ impl TaskScheduler {
         // Do not queue the caller behind an unrelated global due sweep. A
         // concurrent scheduler wake is safe: claim_task_run_for_dispatch is
         // the per-run CAS and exactly one contender can own the dispatch.
-        self.process_queued_run(store, run).await
+        let mut pass = SchedulerPass {
+            needs_rebuild: &self.needs_rebuild,
+            complete: false,
+        };
+        let task_id = run.task_id.clone();
+        self.mark_task_dirty(&task_id).await;
+        self.notify.notify_one();
+        let outcome = self.process_queued_run(store, run).await?;
+        self.mark_task_dirty(&task_id).await;
+        self.notify.notify_one();
+        pass.complete = true;
+        Ok(outcome)
     }
 
     async fn load_due_task_actor_contract(
@@ -350,7 +512,166 @@ impl TaskScheduler {
         Ok(())
     }
 
-    async fn rebuild_due_queue(&self, now: i64) -> TaskRuntimeResult<()> {
+    async fn mark_task_dirty(&self, task_id: &str) {
+        let mut dirty = self.dirty_tasks.lock().await;
+        let revision = dirty.entry(task_id.to_owned()).or_default();
+        *revision = revision.wrapping_add(1);
+    }
+
+    /// The subscription is created with the scheduler, before startup work. A
+    /// bounded broadcast retains exact task hints; overflow requests durable
+    /// reconstruction. Notifications only wake the loop and never imply empty.
+    async fn refresh_inputs(
+        &self,
+        now: i64,
+    ) -> TaskRuntimeResult<Vec<pioneer_crud::TaskSchedulerRowFailure>> {
+        let mut failures = Vec::new();
+        {
+            let mut events = self.events.lock().await;
+            let mut dirty = self.dirty_tasks.lock().await;
+            // One channel quantum. A saturated channel reports lag on the next
+            // pass rather than keeping the scheduler in an unbounded drain.
+            for _ in 0..1024 {
+                match events.try_recv() {
+                    Some(TaskEventWakeDelivery::Wake(wake)) => {
+                        let version = dirty.entry(wake.task_id).or_default();
+                        *version = version.wrapping_add(1);
+                    }
+                    Some(TaskEventWakeDelivery::Lagged(_)) => {
+                        self.needs_rebuild.store(true, Ordering::Release);
+                    }
+                    Some(TaskEventWakeDelivery::Closed) | None => break,
+                }
+            }
+        }
+        if self.needs_rebuild.load(Ordering::Acquire) {
+            failures.extend(self.rebuild_due_queue(now).await?);
+            self.needs_rebuild.store(false, Ordering::Release);
+        }
+        // Positive due SQL cannot observe foreign pause/delete/move-later. Rotate
+        // addressed expired cache tasks, bounded independently of dirty hints.
+        let mut expired = self
+            .due_queue
+            .lock()
+            .await
+            .iter()
+            .filter(|item| item.next_fire_at <= now)
+            .map(|item| item.task_id.clone())
+            .collect::<Vec<_>>();
+        expired.sort();
+        expired.dedup();
+        let mut cursor = self.expired_task_cursor.lock().await;
+        // Capture a finite cache pass; newly appended suffix tasks cannot defer
+        // revisiting an older expired locator indefinitely.
+        let upper = cursor
+            .as_ref()
+            .map(|(_, upper)| upper.clone())
+            .or_else(|| expired.last().cloned());
+        let selected = expired
+            .iter()
+            .filter(|id| {
+                cursor.as_ref().is_none_or(|(after, _)| *id > after)
+                    && upper.as_ref().is_some_and(|upper| *id <= upper)
+            })
+            .take(64)
+            .cloned()
+            .collect::<Vec<_>>();
+        *cursor = match (selected.last(), upper) {
+            (Some(last), Some(upper)) if selected.len() == 64 && last < &upper => {
+                Some((last.clone(), upper))
+            }
+            _ => None,
+        };
+        drop(cursor);
+        for id in selected {
+            self.mark_task_dirty(&id).await;
+        }
+        // Keep each locator until its reload succeeds, including cancellation.
+        let tasks = self.dirty_tasks.lock().await.clone();
+        for (task_id, revision) in tasks {
+            let (triggers, runs) = match self.store.task_scheduler_inputs_partial(&task_id).await {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    self.needs_rebuild.store(true, Ordering::Release);
+                    failures.push(pioneer_crud::TaskSchedulerRowFailure {
+                        id: task_id.clone(),
+                        task_id: task_id.clone(),
+                        error,
+                    });
+                    continue;
+                }
+            };
+            let incomplete = !triggers.failures.is_empty() || !runs.failures.is_empty();
+            let bad_ids = triggers
+                .failures
+                .iter()
+                .chain(&runs.failures)
+                .map(|row| row.id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            failures.extend(triggers.failures);
+            failures.extend(runs.failures);
+            let mut queue = self.due_queue.lock().await;
+            let armed = queue
+                .iter()
+                .filter_map(|item| item.armed_trigger.clone())
+                .map(|trigger| (trigger.id.clone(), trigger))
+                .collect::<HashMap<_, _>>();
+            queue.retain(|item| item.task_id != task_id || bad_ids.contains(&item.wake_id));
+            {
+                for trigger in triggers.records {
+                    if trigger.status == TaskTriggerStatus::Active {
+                        if let Some(next_fire_at) = trigger.next_fire_at {
+                            let is_armed = next_fire_at > now
+                                || armed
+                                    .get(&trigger.id)
+                                    .is_some_and(|old| same_scheduled_occurrence(old, &trigger));
+                            queue.push(TaskTriggerQueueItem {
+                                task_id: task_id.clone(),
+                                wake_id: trigger.id.clone(),
+                                next_fire_at,
+                                armed_trigger: is_armed.then_some(trigger),
+                            });
+                        }
+                    }
+                }
+                for run in runs.records {
+                    if run.status == TaskRunStatus::Queued {
+                        queue.push(TaskTriggerQueueItem {
+                            task_id: task_id.clone(),
+                            wake_id: run.id,
+                            next_fire_at: run.ready_at.unwrap_or(now),
+                            armed_trigger: None,
+                        });
+                    }
+                }
+            }
+            queue.sort_by_key(|item| {
+                (
+                    item.next_fire_at,
+                    item.task_id.clone(),
+                    item.wake_id.clone(),
+                )
+            });
+            drop(queue);
+            let mut dirty = self.dirty_tasks.lock().await;
+            if !incomplete && dirty.get(&task_id) == Some(&revision) {
+                dirty.remove(&task_id);
+            }
+        }
+        Ok(failures)
+    }
+
+    async fn rebuild_due_queue(
+        &self,
+        now: i64,
+    ) -> TaskRuntimeResult<Vec<pioneer_crud::TaskSchedulerRowFailure>> {
+        let triggers = self.store.list_active_task_triggers_partial().await?;
+        let runs = self.store.list_queued_task_schedule_partial(1024).await?;
+        let mut failures = triggers.failures;
+        failures.extend(runs.failures);
+        for row in &failures {
+            self.mark_task_dirty(&row.task_id).await;
+        }
         let armed = self
             .due_queue
             .lock()
@@ -359,10 +680,8 @@ impl TaskScheduler {
             .filter_map(|item| item.armed_trigger.as_ref())
             .map(|trigger| (trigger.id.clone(), trigger.clone()))
             .collect::<HashMap<_, _>>();
-        let mut items = self
-            .store
-            .list_active_task_triggers()
-            .await?
+        let mut items = triggers
+            .records
             .into_iter()
             .filter_map(|trigger| {
                 let next_fire_at = trigger.next_fire_at?;
@@ -378,40 +697,51 @@ impl TaskScheduler {
                 })
             })
             .collect::<Vec<_>>();
-        items.extend(
-            self.store
-                .list_task_runs_by_status(TaskRunStatus::Queued, 1024)
-                .await?
-                .into_iter()
-                .filter(|run| run.retry_of_run_id.is_some())
-                .filter_map(|run| {
-                    let ready_at = run.ready_at?;
-                    Some(TaskTriggerQueueItem {
-                        task_id: run.task_id,
-                        wake_id: run.id,
-                        next_fire_at: ready_at,
-                        armed_trigger: None,
-                    })
-                }),
-        );
+        items.extend(runs.records.into_iter().filter_map(|run| {
+            let ready_at = run.ready_at.unwrap_or(now);
+            Some(TaskTriggerQueueItem {
+                task_id: run.task_id,
+                wake_id: run.id,
+                next_fire_at: ready_at,
+                armed_trigger: None,
+            })
+        }));
         items.sort_by(|left, right| {
             left.next_fire_at
                 .cmp(&right.next_fire_at)
                 .then_with(|| left.task_id.cmp(&right.task_id))
                 .then_with(|| left.wake_id.cmp(&right.wake_id))
         });
-        *self.due_queue.lock().await = items;
-        Ok(())
+        let bad_ids = failures
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut queue = self.due_queue.lock().await;
+        items.extend(
+            queue
+                .iter()
+                .filter(|item| bad_ids.contains(item.wake_id.as_str()))
+                .cloned(),
+        );
+        items.sort_by_key(|item| {
+            (
+                item.next_fire_at,
+                item.task_id.clone(),
+                item.wake_id.clone(),
+            )
+        });
+        *queue = items;
+        Ok(failures)
     }
 
-    async fn next_sleep_duration(&self, now: i64) -> Duration {
+    pub(crate) async fn next_sleep_duration(&self, now: i64) -> Duration {
         self.due_queue
             .lock()
             .await
             .first()
             .map(|item| {
                 if item.next_fire_at <= now {
-                    Duration::from_secs(0)
+                    Duration::ZERO
                 } else {
                     Duration::from_secs(
                         u64::try_from(item.next_fire_at.saturating_sub(now)).unwrap_or(u64::MAX),
@@ -420,6 +750,10 @@ impl TaskScheduler {
             })
             .map(|duration| duration.min(Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS)))
             .unwrap_or_else(|| Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS))
+            // The former unconditional live-reconcile pulse supplied this
+            // foreign-writer discovery ceiling. Keep it without empty wakes.
+            // Transient storage backoff in run() retains its separate 60s path.
+            .min(LIVE_RECONCILIATION_INTERVAL)
     }
 
     async fn process_trigger(
@@ -1116,5 +1450,18 @@ mod tests {
         );
 
         assert!(is_transient_scheduler_storage_error(&error));
+    }
+    #[tokio::test]
+    async fn scheduler_wake_survives_before_wait_registration() {
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let handle = super::TaskSchedulerHandle {
+            notify: notify.clone(),
+            dirty_tasks: Default::default(),
+            needs_rebuild: Default::default(),
+        };
+        handle.wake();
+        tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
+            .await
+            .expect("post-commit wake must retain a permit before a wait exists");
     }
 }

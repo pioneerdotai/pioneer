@@ -130,6 +130,7 @@ pub async fn upsert_task_occurrence_contract<C: ConnectionTrait>(
     let requested_at = unix_to_datetime(now);
     let persisted_row =
         task_occurrence_contract::Entity::find_by_id(contract.occurrence_id.clone())
+            .lock_exclusive()
             .one(db)
             .await
             .context("failed to load task occurrence contract before upsert")?;
@@ -217,6 +218,23 @@ pub async fn upsert_task_occurrence_contract<C: ConnectionTrait>(
             contract.occurrence_id
         );
     }
+    if persisted_row.as_ref().is_none_or(|r| {
+        r.run_id != contract.run_id
+            || r.task_id != contract.task_id
+            || r.trigger_id != contract.trigger_id
+            || r.occurrence_key != contract.occurrence_key
+    }) {
+        if let Some(old) = persisted_row.as_ref() {
+            super::task_child_producers::occurrence_identity(db, &old.run_id).await?;
+        }
+        super::task_child_producers::occurrence_identity(db, &contract.run_id).await?;
+    }
+    let new = task_occurrence_contract::Entity::find_by_id(contract.occurrence_id.clone())
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_occurrence_producers::contract_change(db, persisted_row.as_ref(), new.as_ref())
+        .await?;
     Ok(())
 }
 
@@ -653,6 +671,10 @@ pub(crate) async fn repair_terminal_task_occurrence_status<C: ConnectionTrait>(
     expected_status: TaskOccurrenceStatus,
     now: i64,
 ) -> Result<bool> {
+    let occurrence_old = task_occurrence_contract::Entity::find_by_id(&current.occurrence_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     if !is_terminal_task_occurrence_status(&expected_status) {
         bail!("terminal Task occurrence repair requires a terminal status");
     }
@@ -699,6 +721,16 @@ pub(crate) async fn repair_terminal_task_occurrence_status<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to repair terminal Task occurrence status")?;
+    let occurrence_new = task_occurrence_contract::Entity::find_by_id(&current.occurrence_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_occurrence_producers::contract_change(
+        db,
+        occurrence_old.as_ref(),
+        occurrence_new.as_ref(),
+    )
+    .await?;
     Ok(result.rows_affected == 1)
 }
 
@@ -762,6 +794,10 @@ pub async fn apply_prepared_task_occurrence_retry<C: ConnectionTrait>(
     db: &C,
     prepared: &PreparedTaskOccurrenceRetry,
 ) -> Result<bool> {
+    let occurrence_old = task_occurrence_contract::Entity::find_by_id(&prepared.occurrence_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     let result = task_occurrence_contract::Entity::update_many()
         .filter(task_occurrence_contract::Column::OccurrenceId.eq(prepared.occurrence_id.clone()))
         .filter(task_occurrence_contract::Column::TaskId.eq(prepared.task_id.clone()))
@@ -795,6 +831,16 @@ pub async fn apply_prepared_task_occurrence_retry<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to apply prepared task occurrence retry")?;
+    let occurrence_new = task_occurrence_contract::Entity::find_by_id(&prepared.occurrence_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_occurrence_producers::contract_change(
+        db,
+        occurrence_old.as_ref(),
+        occurrence_new.as_ref(),
+    )
+    .await?;
     Ok(result.rows_affected == 1)
 }
 
@@ -869,9 +915,16 @@ pub(crate) async fn finalize_task_occurrence<C: ConnectionTrait>(
     reason: Option<String>,
     now: sea_orm::entity::prelude::DateTimeWithTimeZone,
 ) -> Result<()> {
-    let persisted = find_task_occurrence_by_run_id(db, run_id)
-        .await?
-        .context("terminal Task run has no occurrence")?;
+    let occurrence_old = task_occurrence_contract::Entity::find()
+        .filter(task_occurrence_contract::Column::RunId.eq(run_id))
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    let persisted = task_occurrence_contract_from_model(
+        occurrence_old
+            .clone()
+            .context("terminal Task run has no occurrence")?,
+    )?;
     let mut candidate = persisted.clone();
     candidate.status = status.clone();
     candidate.terminal_reason = reason.clone();
@@ -910,6 +963,17 @@ pub(crate) async fn finalize_task_occurrence<C: ConnectionTrait>(
     if update.rows_affected != 1 {
         bail!("terminal Task occurrence changed during finalization");
     }
+    let occurrence_new = task_occurrence_contract::Entity::find()
+        .filter(task_occurrence_contract::Column::RunId.eq(run_id))
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_occurrence_producers::contract_change(
+        db,
+        occurrence_old.as_ref(),
+        occurrence_new.as_ref(),
+    )
+    .await?;
     Ok(())
 }
 

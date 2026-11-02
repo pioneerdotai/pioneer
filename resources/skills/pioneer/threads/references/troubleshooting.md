@@ -30,6 +30,8 @@ A short native working-context excerpt is not the full search page. Read its sav
 
 Creation, message append, and turn start have effects. An interrupted transport or missing response does not prove failure. Preserve the existing logical call identity and use the runtime's Agent action ledger/outbox replay; inspect the recovered result before deciding whether another distinct operation is necessary. Do not invent a JSON idempotencyKey, issue fresh create/send/start merely to see if the previous one worked, or claim completion without confirmation.
 
+Recovered `threadResult` retains the committed workspace/thread/turn and Task or execution references. Open the returned thread directly, anchoring history at `turnId` when present; do not search by title or guess the newest object. Collaborative start identifies the parent admission and Task, not a speculative executing child. Follow its saved parent history for later child references. Old receipts without saved references do not acquire invented IDs on replay.
+
 `status:denied` and an authorization outcome differ from `status:failed` or an execution/runtime-integrity failure. `accepted`/`queued` acknowledge admission or queued work; they do not prove execution or a final model answer. Outcomes such as agent_route_required, agent_route_revoked, agent_route_expired, agent_destination_unavailable, agent_execution_stale, agent_action_conflict, and agent_runtime_integrity_lost should be reported according to the actual safe result. Public unavailable outcomes may intentionally combine source disappearance and access loss; do not infer hidden existence.
 
 ## Identity Or Reasoning Rejected
