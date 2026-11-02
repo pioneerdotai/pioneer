@@ -4839,7 +4839,8 @@ impl Provider for ConcurrentComposerHistoryProvider {
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         let current_command = request.messages.last().and_then(|message| {
-            (message.role == pioneer_provider::Role::User).then(|| message.content.clone())
+            (message.role == pioneer_provider::Role::User)
+                .then(|| prepared_user_text(message).to_owned())
         });
         self.requests
             .lock()
@@ -6481,6 +6482,36 @@ fn canonical_provider_messages_for_artifact_parity(
     messages
 }
 
+fn prepared_user_text(message: &pioneer_provider::ChatMessage) -> &str {
+    let Some(metadata) = message
+        .application_context
+        .as_ref()
+        .filter(|metadata| metadata["kind"] == "turn_input")
+    else {
+        return &message.content;
+    };
+    let context = metadata["context"].as_str().expect("turn context text");
+    message
+        .content
+        .strip_prefix(&format!(
+            "<pioneer_turn_context>\n{context}\n</pioneer_turn_context>\n\n"
+        ))
+        .expect("prepared input must contain its exact saved context prefix")
+}
+
+fn assert_prepared_user_text(message: &pioneer_provider::ChatMessage, original: &str) {
+    let metadata = message
+        .application_context
+        .as_ref()
+        .expect("prepared input metadata");
+    assert_eq!(metadata["kind"], "turn_input");
+    let context = metadata["context"].as_str().expect("turn context text");
+    assert_eq!(
+        message.content,
+        format!("<pioneer_turn_context>\n{context}\n</pioneer_turn_context>\n\n{original}")
+    );
+}
+
 fn canonical_prompt_text_for_parity(text: &str, turn_private_paths: &[&str]) -> String {
     let mut canonical = text
         .split('\n')
@@ -6523,10 +6554,10 @@ fn assert_exact_chat_request_parity(stage: &str, direct: &ChatRequest, child: &C
 }
 
 fn canonical_execution_thread_for_parity(text: &str, expected_thread_id: &str) -> String {
-    let expected = format!("Execution thread: {expected_thread_id}");
+    let expected = format!("Thread: {expected_thread_id}");
     assert_eq!(
         text.lines()
-            .filter(|line| line.starts_with("Execution thread: "))
+            .filter(|line| line.starts_with("Thread: "))
             .collect::<Vec<_>>(),
         vec![expected.as_str()],
         "runtime prompt must identify the actual execution thread before parity normalization"
@@ -6534,7 +6565,7 @@ fn canonical_execution_thread_for_parity(text: &str, expected_thread_id: &str) -
     text.split('\n')
         .map(|line| {
             if line == expected {
-                "Execution thread: <verified execution thread>"
+                "Thread: <verified execution thread>"
             } else {
                 line
             }
@@ -6624,16 +6655,99 @@ fn canonical_main_request_execution_thread_for_parity(
     // Independent executions must advertise their own thread, not the same ID.
     // Validate that identity against the fixture/lineage before comparing content.
     let mut request = request.clone();
-    let prompt = request
-        .compiled_prompt
-        .as_mut()
-        .expect("main parity request must have a compiled prompt");
-    prompt.dynamic_system_text =
-        canonical_execution_thread_for_parity(&prompt.dynamic_system_text, expected_thread_id);
-    prompt.full_system_text =
-        canonical_execution_thread_for_parity(&prompt.full_system_text, expected_thread_id);
+    assert!(
+        request.compiled_prompt.is_some(),
+        "main parity request must have a compiled prompt"
+    );
+    let current_turn = request
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| {
+            let metadata = message.application_context.as_ref()?;
+            (metadata["kind"] == "turn_input").then(|| {
+                let context = metadata["context"].as_str().expect("prepared context");
+                assert_eq!(
+                    context
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Thread: ")),
+                    Some(expected_thread_id)
+                );
+                context
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Turn: "))
+                    .expect("current turn identity")
+                    .to_owned()
+            })
+        })
+        .expect("main parity request must carry turn input");
     for message in &mut request.messages {
         canonical_recorded_history_identity_for_parity(message, history_thread_id, history_turn_id);
+        let Some(metadata) = message.application_context.as_ref() else {
+            continue;
+        };
+        // Origins are runtime ownership metadata rather than provider-wire content.
+        // Verify the owner before removing this copy from the wire comparison.
+        if let Some(origin) = metadata.get("origin") {
+            let owner = origin["thread_id"].as_str().expect("context origin thread");
+            assert!(owner == expected_thread_id || owner == history_thread_id);
+            let unit = origin["unit_id"].as_str().expect("context origin unit");
+            assert!(
+                unit.starts_with(&format!("{current_turn}:"))
+                    || unit.starts_with(&format!("{history_turn_id}:"))
+            );
+        }
+        if metadata["kind"] == "turn_input" {
+            let original = prepared_user_text(message).to_owned();
+            let context = metadata["context"].as_str().expect("prepared context");
+            let actual_thread = context
+                .lines()
+                .find_map(|line| line.strip_prefix("Thread: "))
+                .expect("context thread");
+            let actual_turn = context
+                .lines()
+                .find_map(|line| line.strip_prefix("Turn: "))
+                .expect("context turn");
+            assert!(actual_thread == expected_thread_id || actual_thread == history_thread_id);
+            assert!(actual_turn == current_turn || actual_turn == history_turn_id);
+            let origin = &metadata["origin"];
+            assert_eq!(origin["thread_id"].as_str(), Some(actual_thread));
+            assert_eq!(
+                origin["unit_id"],
+                format!("{actual_turn}:turn-input-projection")
+            );
+            let thread_canonical = canonical_execution_thread_for_parity(context, actual_thread);
+            let expected_turn_line = format!("Turn: {actual_turn}");
+            assert_eq!(
+                context
+                    .lines()
+                    .filter(|line| line.starts_with("Turn: "))
+                    .collect::<Vec<_>>(),
+                vec![expected_turn_line.as_str()]
+            );
+            let canonical = thread_canonical
+                .split('\n')
+                .map(|line| {
+                    if line == expected_turn_line {
+                        "Turn: <verified execution turn>"
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            message.content = format!(
+                "<pioneer_turn_context>\n{canonical}\n</pioneer_turn_context>\n\n{original}"
+            );
+            message.application_context.as_mut().unwrap()["context"] = json!(canonical);
+        }
+        message
+            .application_context
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .expect("application metadata object")
+            .remove("origin");
     }
     request
 }
@@ -6642,17 +6756,17 @@ fn canonical_main_request_execution_thread_for_parity(
 fn prompt_parity_normalizes_only_verified_execution_identity() {
     assert_eq!(
         canonical_execution_thread_for_parity(
-            "Initiating thread: unavailable\nExecution thread: actual\nOther: actual\n",
+            "Initiating thread: unavailable\nThread: actual\nOther: actual\n",
             "actual",
         ),
-        "Initiating thread: unavailable\nExecution thread: <verified execution thread>\nOther: actual\n"
+        "Initiating thread: unavailable\nThread: <verified execution thread>\nOther: actual\n"
     );
 }
 
 #[test]
 #[should_panic(expected = "runtime prompt must identify the actual execution thread")]
 fn prompt_parity_rejects_wrong_execution_identity() {
-    canonical_execution_thread_for_parity("Execution thread: unrelated", "actual");
+    canonical_execution_thread_for_parity("Thread: unrelated", "actual");
 }
 
 fn assert_exact_chat_request_parity_with_turn_private_paths(
@@ -13005,14 +13119,14 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             request
                 .messages
                 .last()
-                .is_some_and(|message| message.content == "ASYNC_TASK_B")
+                .is_some_and(|message| prepared_user_text(message) == "ASYNC_TASK_B")
         })
         .expect("Task B main request should be captured");
     assert_eq!(
         task_b_request
             .messages
             .iter()
-            .filter(|message| message.content == "ASYNC_TASK_B")
+            .filter(|message| prepared_user_text(message) == "ASYNC_TASK_B")
             .count(),
         1,
         "Task B must receive exactly one actionable current command"
@@ -13309,9 +13423,9 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         later
             .iter()
             .filter(|message| {
-                matches!(message.content.as_str(), "ASYNC_TASK_A" | "ASYNC_TASK_B")
+                matches!(prepared_user_text(message), "ASYNC_TASK_A" | "ASYNC_TASK_B")
             })
-            .map(|message| message.content.as_str())
+            .map(prepared_user_text)
             .collect::<Vec<_>>(),
         vec!["ASYNC_TASK_A", "ASYNC_TASK_B"]
     );
@@ -13346,7 +13460,9 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     .await
     .unwrap();
     assert_eq!(
-        last.iter().filter(|m| m.content == "ASYNC_TASK_B").count(),
+        last.iter()
+            .filter(|m| prepared_user_text(m) == "ASYNC_TASK_B")
+            .count(),
         1
     );
     assert_eq!(
@@ -13357,7 +13473,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     );
     assert!(
         last.iter()
-            .all(|m| m.content != "ASYNC_TASK_A" && !m.content.contains("A complete"))
+            .all(|m| prepared_user_text(m) != "ASYNC_TASK_A" && !m.content.contains("A complete"))
     );
     assert!(last.iter().any(
         |m| m.provenance.as_ref().unwrap().logical_turn_id.as_deref()
@@ -15422,7 +15538,7 @@ async fn detached_composer_live_ordering_impl() {
         .first()
         .expect("large Composer input must reach the recording provider");
     let user = main.messages.last().unwrap();
-    assert_eq!(user.content, full_text);
+    assert_prepared_user_text(user, &full_text);
     assert!(matches!(user.content_parts.as_slice(),
         [pioneer_provider::MessageContentPart::File { file }]
             if file.name.as_deref() == Some("large-composer-context.pdf")));
@@ -15848,7 +15964,7 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
         .messages
         .last()
         .expect("provider request should include user message");
-    assert_eq!(user_message.content, "summarize");
+    assert_prepared_user_text(user_message, "summarize");
     assert!(matches!(
         user_message.content_parts.as_slice(),
         [pioneer_provider::MessageContentPart::File { file }]
@@ -29501,7 +29617,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         .messages
         .last()
         .expect("main request should include composer user input");
-    assert_eq!(user_message.content, "Use the exact composer request");
+    assert_prepared_user_text(user_message, "Use the exact composer request");
     assert!(matches!(
         user_message.content_parts.as_slice(),
         [pioneer_provider::MessageContentPart::File { file }]
@@ -29511,9 +29627,8 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         .compiled_prompt
         .as_ref()
         .expect("child main request should carry a compiled prompt");
-    assert!(compiled_prompt.full_system_text.contains("[Skills]"));
-    assert!(compiled_prompt.full_system_text.contains("composer-launch"));
-    assert!(compiled_prompt.full_system_text.contains(&format!(
+    assert!(user_message.content.contains("composer-launch"));
+    assert!(user_message.content.contains(&format!(
         "Exact skill reference for read_skill: `skill:{skill_id}`"
     )));
     assert!(
@@ -37419,13 +37534,19 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
         adapter_input.len(),
         adapter_messages.len() + skill_names.len()
     );
-    assert_eq!(adapter_messages.len(), 2);
+    assert_eq!(adapter_messages.len(), 3);
+    assert!(
+        adapter_messages[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<pioneer_turn_context>")
+    );
     assert!(
         !adapter_messages[0].to_string().contains(current_marker),
         "the current command must not be replayed as accepted history"
     );
     assert!(
-        adapter_messages[1]
+        adapter_messages[2]
             .get("text")
             .and_then(serde_json::Value::as_str)
             .is_some_and(
@@ -38737,9 +38858,9 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         .messages
         .last()
         .expect("full main request should include a user message");
-    assert_eq!(
-        user_message.content,
-        "Verify the complete parent and detached child LLM request."
+    assert_prepared_user_text(
+        user_message,
+        "Verify the complete parent and detached child LLM request.",
     );
     assert!(matches!(
         user_message.content_parts.as_slice(),
@@ -38750,17 +38871,12 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
                         && reference.artifact_version_id == direct_artifact.version_id
                 })
     ));
-    let compiled_prompt = direct_main
-        .compiled_prompt
-        .as_ref()
-        .expect("full main request should include a compiled prompt");
-    assert!(compiled_prompt.full_system_text.contains("[Skills]"));
     assert!(
-        compiled_prompt
-            .full_system_text
-            .contains("full-parity-skill")
+        direct_main.compiled_prompt.is_some(),
+        "full main request should include a compiled prompt"
     );
-    assert!(compiled_prompt.full_system_text.contains(&format!(
+    assert!(user_message.content.contains("full-parity-skill"));
+    assert!(user_message.content.contains(&format!(
         "Exact skill reference for read_skill: `skill:{skill_id}`"
     )));
 
@@ -40866,14 +40982,17 @@ async fn task_create_inherits_exact_turn_capabilities_for_attached_and_backgroun
                     })
             })
             .expect("child model request should contain its task marker");
-        let compiled_prompt = child_request
-            .compiled_prompt
-            .as_ref()
-            .expect("child model request should contain its compiled prompt");
         assert!(
-            compiled_prompt.full_system_text.contains(&format!(
-                "Exact skill reference for read_skill: `skill:{skill_id}`"
-            )),
+            child_request.compiled_prompt.is_some(),
+            "child model request should contain its compiled prompt"
+        );
+        assert!(
+            child_request
+                .messages
+                .iter()
+                .any(|message| message.content.contains(&format!(
+                    "Exact skill reference for read_skill: `skill:{skill_id}`"
+                ))),
             "selected Skill must appear in the child runtime prompt"
         );
         let tool_names = child_request
@@ -60944,9 +61063,9 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             .last()
             .and_then(|request| request.compiled_prompt.as_ref())
             .expect("root provider request should include compiled prompt")
-            .dynamic_system_text
+            .full_system_text
             .clone();
-        assert!(root_prompt.contains("## AGENTS.md"));
+        assert!(root_prompt.contains("### AGENTS.md"));
         assert!(root_prompt.contains("effective AGENTS.md for this thread tree scope"));
         assert!(root_prompt.contains("Root only instruction"));
 
@@ -60989,7 +61108,7 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             .last()
             .and_then(|request| request.compiled_prompt.as_ref())
             .expect("inherited provider request should include compiled prompt")
-            .dynamic_system_text
+            .full_system_text
             .clone();
         assert!(inherited_prompt.contains("Root only instruction"));
         assert!(inherited_prompt.contains("explicit user messages take precedence"));
@@ -61019,7 +61138,7 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             .last()
             .and_then(|request| request.compiled_prompt.as_ref())
             .expect("folder provider request should include compiled prompt")
-            .dynamic_system_text
+            .full_system_text
             .clone();
         assert!(folder_prompt.contains("effective AGENTS.md for this thread tree scope"));
         assert!(folder_prompt.contains("Folder only instruction"));
@@ -71542,7 +71661,12 @@ async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
     let item_delta: ItemDeltaNotification =
         serde_json::from_value(item_delta_params).expect("item delta params must decode");
     assert_eq!(item_delta.item_id, agent_item_id);
-    assert_eq!(item_delta.delta, "Echo this back");
+    assert!(item_delta.delta.starts_with("<pioneer_turn_context>\n"));
+    assert!(
+        item_delta
+            .delta
+            .ends_with("</pioneer_turn_context>\n\nEcho this back")
+    );
 
     assert_eq!(item_completed_notification.method, events::ITEM_COMPLETED);
     let item_completed_params = item_completed_notification
@@ -71553,7 +71677,7 @@ async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
     match item_completed.item {
         pioneer_protocol::TurnItem::AgentMessage { id, text, .. } => {
             assert_eq!(id, agent_item_id);
-            assert_eq!(text, "Echo this back");
+            assert_eq!(text, item_delta.delta);
         }
         other => panic!("expected agent message item, got {other:?}"),
     }
@@ -82981,10 +83105,17 @@ async fn compaction_native_controller_runs_on_real_turn_and_checks_short_complet
     let request = requests
         .iter()
         .find(|request| {
-            request
-                .messages
-                .iter()
-                .any(|message| message.content == "native controller current input")
+            request.messages.iter().any(|message| {
+                message
+                    .content
+                    .ends_with("\n\nnative controller current input")
+                    && message
+                        .application_context
+                        .as_ref()
+                        .and_then(|value| value.get("kind"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("turn_input")
+            })
         })
         .unwrap();
     assert!(
@@ -82995,7 +83126,15 @@ async fn compaction_native_controller_runs_on_real_turn_and_checks_short_complet
         request
             .messages
             .iter()
-            .find(|message| message.content == "native controller current input")
+            .find(|message| message
+                .content
+                .ends_with("\n\nnative controller current input")
+                && message
+                    .application_context
+                    .as_ref()
+                    .and_then(|value| value.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("turn_input"))
             .unwrap()
             .provenance
             .as_ref()

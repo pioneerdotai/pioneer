@@ -5336,9 +5336,9 @@ async fn phase_07_no_and_empty_hook_runtime_preserve_agent_request() {
 
     let empty_runtime_observed = start_simple_turn(
         &empty_runtime_manager,
-        "thr_phase07_empty_runtime",
+        "thr_phase07_no_runtime",
         "ws_phase07_request",
-        "turn_phase07_empty_runtime",
+        "turn_phase07_no_runtime",
         ThreadMode::Agent,
         "capture",
         "phase 07 request baseline",
@@ -5699,9 +5699,9 @@ async fn phase_07_non_prompt_section_contributions_do_not_affect_agent_request()
 
     let hook_observed = start_simple_turn(
         &hook_manager,
-        "thr_phase07_contrib_hook",
+        "thr_phase07_contrib_baseline",
         "ws_phase07_contrib",
-        "turn_phase07_contrib_hook",
+        "turn_phase07_contrib_baseline",
         ThreadMode::Agent,
         "capture",
         "phase 07 ignored contributions",
@@ -7811,9 +7811,9 @@ async fn phase_09_context_contribution_does_not_change_provider_prompt_yet() {
 
     let hook_observed = start_simple_turn(
         &hook_manager,
-        "thr_phase09_prompt_hook",
+        "thr_phase09_prompt_baseline",
         "ws_phase09_prompt",
-        "turn_phase09_prompt_hook",
+        "turn_phase09_prompt_baseline",
         ThreadMode::Agent,
         "capture",
         "phase 09 prompt stability",
@@ -8125,6 +8125,16 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
     assert!(
         prompt
             .full_system_text
+            .contains("When request_tools is available, open hidden tools by domain")
+    );
+    let user_input = requests[0]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .expect("prepared user input");
+    assert!(
+        user_input
+            .content
             .contains("For hidden tools, call request_tools to open their domain.")
     );
     assert!(

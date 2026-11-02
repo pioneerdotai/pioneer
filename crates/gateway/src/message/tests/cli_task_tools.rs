@@ -2324,9 +2324,16 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                 );
                 let starts = harness.cli_session.turn_starts.lock().await;
                 let start = &starts[0];
-                let instructions = start.elevated_instructions.text();
+                let turn_text = start
+                    .input
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 if kind == CLIAgentRuntimeKind::Claude {
-                    assert!(instructions.contains(&format!("Selected skills:\n- {user_name}\n- pioneer-system-tasks\n- pioneer-system-subagents\n- pioneer-system-html\n- pioneer-system-threads")),
+                    assert!(turn_text.contains(&format!("Selected skills:\n- {user_name}\n- pioneer-system-tasks\n- pioneer-system-subagents\n- pioneer-system-html\n- pioneer-system-threads")),
                         "application order must retain the user's selected skill before automatic system skills");
                 }
                 for name in [
@@ -2336,7 +2343,7 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                     "pioneer-system-threads",
                     user_name,
                 ] {
-                    assert!(instructions.contains(name), "{kind:?}: {name}");
+                    assert!(turn_text.contains(name), "{kind:?}: {name}");
                     if kind != CLIAgentRuntimeKind::Claude {
                         assert!(start.input.as_array().unwrap().iter().any(|item| {
                             item["type"] == "skill"

@@ -477,17 +477,20 @@ async fn queued_cleanup_revalidates_late_lineage_receipt_and_capsule_without_sel
     tx.commit().await.unwrap();
     // These durable model-history rows outlive the transient child capsule.
     // Exercise the real insert/cleanup/discovery paths, not a copied source predicate.
-    for source in [
+    for (sequence, source) in [
         "turn_input_projection_v1",
         "runtime_context_v1",
         "system_snapshot_v1",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         store
             .insert_turn_llm_context(NewTurnLlmContextEntry {
                 turn_id: "gated_child".into(),
                 item_id: Some(source.into()),
                 attempt_id: None,
-                sequence: 0,
+                sequence: sequence as i64,
                 source: source.into(),
                 tool_name: None,
                 payload: "{}".into(),

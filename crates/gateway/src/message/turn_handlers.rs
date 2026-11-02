@@ -10649,13 +10649,9 @@ impl MessageProcessor {
                     let Some(artifact) = attachment.artifact.as_ref() else {
                         continue;
                     };
-                    if !matches!(
-                        &attachment.source,
-                        pioneer_provider::AttachmentDataSource::Reference { reference }
-                            if reference == &format!("pioneer-artifact:{}", artifact.artifact_id)
-                    ) {
-                        continue;
-                    }
+                    // Prepared input history may already contain resolved bytes or a
+                    // path. The accepted artifact identity still requires a fresh
+                    // availability check before another provider delivery.
                     anyhow::ensure!(
                         artifact.workspace_id.is_empty() || artifact.workspace_id == workspace_id,
                         "historical attachment {message_index}:{part_index} belongs to another workspace"
