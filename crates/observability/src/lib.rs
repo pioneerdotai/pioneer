@@ -10,9 +10,7 @@ use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, Once};
 
-use sentry::integrations::tracing::{
-    EventFilter, EventMapping, breadcrumb_from_event, event_from_event,
-};
+use sentry::integrations::tracing::{BreadcrumbLayer, ErrorLayer, SpanLayer};
 use sentry::{ClientInitGuard, ClientOptions};
 use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer as _;
@@ -419,39 +417,88 @@ fn load_local_dotenv() {
     });
 }
 
-/// Production event mapper, also usable with thread-local subscribers for local capture.
+/// Sentry spans and routed error/breadcrumb events, also usable for local capture.
 #[doc(hidden)]
 pub fn sentry_tracing_layer<S>() -> impl tracing_subscriber::Layer<S>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
-    sentry::integrations::tracing::layer().event_mapper(sentry_event_mapper)
+    SpanLayer::new()
+        .with_filter(filter_fn(|metadata| {
+            metadata.is_span()
+                && matches!(
+                    *metadata.level(),
+                    tracing::Level::ERROR | tracing::Level::WARN | tracing::Level::INFO
+                )
+        }))
+        .and_then(SentryEventLayer)
 }
 
-fn sentry_event_mapper<S>(event: &tracing::Event<'_>, _ctx: TracingContext<'_, S>) -> EventMapping
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SentryEventKind {
+    Ignore,
+    Breadcrumb,
+    Error,
+}
+
+struct SentryEventLayer;
+
+impl<S> tracing_subscriber::Layer<S> for SentryEventLayer
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span>,
 {
-    if !telemetry_enabled() {
-        return EventMapping::Ignore;
+    fn on_event(&self, event: &tracing::Event<'_>, cx: TracingContext<'_, S>) {
+        if !telemetry_enabled() {
+            return;
+        }
+        let fields = tracing_event_fields(event);
+        match sentry_event_kind(event, &fields) {
+            SentryEventKind::Ignore => {}
+            SentryEventKind::Breadcrumb => BreadcrumbLayer::new().on_event(event, cx),
+            SentryEventKind::Error => {
+                if effective_event_target(event.metadata().target(), fields.log_target.as_deref())
+                    == "pioneer::memory_post_turn_extractor"
+                    && let Some(root_error_code) = fields.root_error_code
+                {
+                    // Keep grouping local to this error; do not modify the shared scope.
+                    sentry::with_scope(
+                        |scope| {
+                            scope.add_event_processor(move |mut event| {
+                                event.fingerprint = vec![
+                                    Cow::Borrowed("memory-post-turn-extractor"),
+                                    Cow::Owned(root_error_code.clone()),
+                                ]
+                                .into();
+                                Some(event)
+                            });
+                        },
+                        || ErrorLayer::new().on_event(event, cx),
+                    );
+                } else {
+                    ErrorLayer::new().on_event(event, cx);
+                }
+            }
+        }
     }
-    let fields = tracing_event_fields(event);
+}
+
+fn sentry_event_kind(event: &tracing::Event<'_>, fields: &EventFieldVisitor) -> SentryEventKind {
+    if !telemetry_enabled() {
+        return SentryEventKind::Ignore;
+    }
     if should_ignore_otlp_internal_event(
         event.metadata().level(),
         event.metadata().target(),
         fields.name.as_deref(),
     ) {
-        return EventMapping::Ignore;
+        return SentryEventKind::Ignore;
     }
     if should_keep_otlp_network_diagnostic(
         event.metadata().level(),
         event.metadata().target(),
         fields.name.as_deref(),
     ) {
-        return EventMapping::Breadcrumb(breadcrumb_from_event(
-            event,
-            None::<&TracingContext<'_, S>>,
-        ));
+        return SentryEventKind::Breadcrumb;
     }
     if should_demote_rmcp_transport_worker_failure(
         event.metadata().level(),
@@ -491,42 +538,17 @@ where
         fields.log_target.as_deref(),
         fields.message.as_deref(),
     ) {
-        return EventMapping::Breadcrumb(breadcrumb_from_event(
-            event,
-            None::<&TracingContext<'_, S>>,
-        ));
+        return SentryEventKind::Breadcrumb;
     }
 
-    let filter = sentry_event_filter(event.metadata().level());
-    let mut items = Vec::new();
-    if filter.contains(EventFilter::Breadcrumb) {
-        items.push(EventMapping::Breadcrumb(breadcrumb_from_event(
-            event,
-            None::<&TracingContext<'_, S>>,
-        )));
-    }
-    if filter.contains(EventFilter::Event) {
-        let mut sentry_event = event_from_event(event, None::<&TracingContext<'_, S>>);
-        if effective_event_target(event.metadata().target(), fields.log_target.as_deref())
-            == "pioneer::memory_post_turn_extractor"
-            && let Some(root_error_code) = fields.root_error_code.as_deref()
-        {
-            sentry_event.fingerprint = vec![
-                Cow::Borrowed("memory-post-turn-extractor"),
-                Cow::Owned(root_error_code.to_owned()),
-            ]
-            .into();
-        }
-        items.push(EventMapping::Event(Box::new(sentry_event)));
-    }
-    EventMapping::Combined(items.into())
+    sentry_event_filter(event.metadata().level())
 }
 
-fn sentry_event_filter(level: &tracing::Level) -> EventFilter {
+fn sentry_event_filter(level: &tracing::Level) -> SentryEventKind {
     match *level {
-        tracing::Level::ERROR => EventFilter::Event,
-        tracing::Level::TRACE => EventFilter::Ignore,
-        _ => EventFilter::Breadcrumb,
+        tracing::Level::ERROR => SentryEventKind::Error,
+        tracing::Level::TRACE => SentryEventKind::Ignore,
+        _ => SentryEventKind::Breadcrumb,
     }
 }
 
@@ -817,7 +839,7 @@ mod tests {
         should_demote_tantivy_reader_commit_reload_not_found, should_ignore_otlp_internal_event,
         should_keep_otlp_network_diagnostic,
     };
-    use sentry::integrations::tracing::EventFilter;
+    use super::SentryEventKind;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing::{Event, Subscriber};
@@ -1397,16 +1419,16 @@ mod tests {
     #[test]
     fn preserves_default_event_filtering() {
         assert_eq!(
-            sentry_event_filter(&tracing::Level::ERROR).bits(),
-            EventFilter::Event.bits()
+            sentry_event_filter(&tracing::Level::ERROR),
+            SentryEventKind::Error
         );
         assert_eq!(
-            sentry_event_filter(&tracing::Level::TRACE).bits(),
-            EventFilter::Ignore.bits()
+            sentry_event_filter(&tracing::Level::TRACE),
+            SentryEventKind::Ignore
         );
         assert_eq!(
-            sentry_event_filter(&tracing::Level::INFO).bits(),
-            EventFilter::Breadcrumb.bits()
+            sentry_event_filter(&tracing::Level::INFO),
+            SentryEventKind::Breadcrumb
         );
     }
 

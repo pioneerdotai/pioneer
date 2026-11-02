@@ -387,7 +387,7 @@ fn validate_architecture(path: &Path) -> Result<()> {
 }
 #[cfg(test)]
 pub(super) mod tests {
-    use super::{ArchiveInstaller, extract_archive, installer_member};
+    use super::{extract_archive, installer_member};
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::Path;

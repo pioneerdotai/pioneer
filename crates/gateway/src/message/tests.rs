@@ -1,3 +1,18 @@
+impl super::MessageProcessor {
+    // Test callers await the same owned request used by the production socket pump.
+    pub(crate) async fn process_owned_request(
+        self: std::sync::Arc<Self>,
+        connection: crate::request_context::ConnectionContext,
+        payload: String,
+    ) {
+        match self.start_owned_request(connection, payload).join().await {
+            Ok(()) => {}
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => tracing::warn!(error = %error, "RPC request task did not finish"),
+        }
+    }
+}
+
 #[path = "tests/control_rpc.rs"]
 mod control_rpc;
 
@@ -9,6 +24,9 @@ mod workspace_scope;
 
 #[path = "tests/authorization_reads.rs"]
 mod authorization_reads;
+
+#[path = "tests/fanout_facts.rs"]
+mod fanout_facts;
 
 #[cfg(unix)]
 #[path = "tests/title_recovery.rs"]
@@ -33117,6 +33135,13 @@ async fn cli_predispatch_read_failure_cancel_and_shutdown_release_session_lease_
 
 #[test]
 fn cancelling_cli_transfer_while_waiting_for_coordinator_releases_session() {
+    // Nextest runs this case in its own process. Preserve the internal failure
+    // behind a redacted persistence response, including async runtime workers.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init();
     run_standard_stack_message_test(
         "cancel CLI transfer waiting for compaction coordinator",
         cancelling_cli_history_transfer_stops_before_provider_start_and_releases_session_impl(
@@ -45985,13 +46010,14 @@ async fn setup_execution_window_terminal_turn(
     thread_id: &str,
     turn_id: &str,
 ) -> (MessageProcessor, Arc<CrudStore>, String) {
-    setup_execution_window_terminal_turn_with_input(thread_id, turn_id, &[]).await
+    setup_execution_window_terminal_turn_with_input_and_mode(thread_id, turn_id, &[], None).await
 }
 
-async fn setup_execution_window_terminal_turn_with_input(
+async fn setup_execution_window_terminal_turn_with_input_and_mode(
     thread_id: &str,
     turn_id: &str,
     input: &[UserInput],
+    mode: Option<ThreadMode>,
 ) -> (MessageProcessor, Arc<CrudStore>, String) {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -46047,7 +46073,7 @@ async fn setup_execution_window_terminal_turn_with_input(
                 model: None,
                 model_provider: None,
                 sandbox_policy: None,
-                mode: None,
+                mode,
                 agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),

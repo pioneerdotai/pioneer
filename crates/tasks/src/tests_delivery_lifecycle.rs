@@ -1963,8 +1963,7 @@ async fn recovery_local_retry_insert_failure_first_source_candidate_still_repair
 
 #[tokio::test]
 async fn recovery_failed_bookkeeping_preserves_healthy_rows_and_uses_quantum_cooldown() {
-    // Several recovery quanta share this fixture. Keep their large futures
-    // on the heap instead of embedding every call in the test's poll frame.
+    // Keep large fixture and storage futures out of this test poll frame.
     let (runtime, poison, observer, _directory) = Box::pin(physical_recovery_fixture()).await;
     let before = Box::pin(queue_delivery(&runtime)).await;
     Box::pin(started(&runtime, &before.id, DELIVERY_TIME)).await;

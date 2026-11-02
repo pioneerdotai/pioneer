@@ -444,6 +444,13 @@ impl MessageProcessor {
             stage.succeed();
         }
 
+        // Keep this tail inside the ordinary completion barrier. Enqueueing the
+        // reply is not physical receipt. Subscription principal/session identity
+        // does not fence unsubscribe/resubscribe, and collaborator delivery has
+        // no subscription-incarnation check at actual enqueue. Offloading also
+        // requires terminal opened/resolved ordering for every native/CLI replay
+        // branch (including durable native orphans), alongside live delivery.
+        // A bounded task owner alone cannot establish those delivery contracts.
         let post_response_replay_stage = trace.map(|trace| {
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadOpenPostResponseReplay)
         });
